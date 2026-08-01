@@ -1395,12 +1395,17 @@ after the generation-7 cut.
 **Files:**
 - Modify: `.../Formats/CasRefCatalogFormat.{h,cpp}` (`removal_started_round` on `Removing`),
   `.../Formats/CasFoldSealFormat.{h,cpp}` (the unified ref-life-row grammar),
-  `.../Formats/CasGcStateFormat.{h,cpp}` (the one cleanup-only `cas/ns/` pagination token),
+  `.../Formats/CasFormat.{h,cpp}` (register `FormatId::GcMaintenanceState = 25`),
+  `.../Formats/CasLayout.{h,cpp}` (the separate `<prefix>/gc/maintenance_state` key),
+  `.../Formats/README.md`,
   `.../Pool/CasRefCatalog.{h,cpp}`, `.../Pool/CasRefLedger.{h,cpp}`, `.../Pool/CasPool.{h,cpp}`,
   `.../Gc/CasGc.cpp`, `.../Gc/CasGcShardPlan.h`, `.../Tools/CasFsck.cpp` (REBUILD's universe)
-- Create: `src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp`
+- Create: `.../Gc/CatalogLifecycleReconciler.{h,cpp}`;
+  `.../Formats/CasGcMaintenanceStateFormat.{h,cpp}` (the one cleanup-only `cas/ns/` pagination token,
+  stored independently of safety/adoption state); `src/Disks/tests/gtest_cas_gc_maintenance_state_format.cpp`;
+  `src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp`
 - Models: `docs/superpowers/models/CaRefCatalogCore.tla`, `CaRefPreFoldDrainCore.tla`,
-  `CaRefDeltaIntakeCore.tla`, `CaRefNsCleanupStaleLeaderCore.tla`
+  `CaRefDeltaIntakeCore.tla`, `CaRefNsCleanupStaleLeaderCore.tla`, `CaRefLaneCore.tla`
 
 **Interfaces:**
 - Consumes: Tasks 2–4d, and step 1 below, which is already landed as `a600c2e433c`.
@@ -1501,8 +1506,9 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   logged and dropped. The hot LIST completes before the sole authoritative cut; a listed id absent
   from that later cut is counted as inert dead-life debris, is not admitted and does not cause
   `DEFER`. None sets pool-wide suppression merely because an old ref-life row exists. Freeze the
-  returned plan's key set and expose only lookup/enrichment of existing rows; the sole `emplace` remains
-  inside the catalog loop, while folding can still attach newly earned cleanup evidence.
+  returned plan's key set and all admitted input evidence; the sole target `emplace` remains inside the
+  catalog loop. Folding consumes the plan as const input and writes newly earned cleanup evidence only
+  into its separate `FoldResult`/successor-row output, never back into the plan.
 - [ ] **C++ cleanup pin for cp2/cp6.** Rewrite the stale comment in `Pool/CasRefCatalog.h` which says
   production does not enforce catalog `Creating` before life objects and `Live` before the first stream
   PUT. The production ordering is already authoritative; this formal amendment records the pending
@@ -1631,17 +1637,80 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   Assert the new `life_id` receives a new row with zero coverage,
   while the predecessor id is absent. Keying by `life_id`, not logical name, makes inheritance
   structurally impossible.
-- [ ] **Invalidate the cached life when the entry is removed**, against **both** writers of
-  `RefTableRuntime::life` — recovery, and the read-path resolution. **Test:** drop and rebirth with the
-  same runtime object provably still resident and no LRU eviction; a test that evicts first passes for
-  the wrong reason.
+- [ ] **Rebirth runtime acceptance contract.** A runtime captured under the predecessor remains bound
+  to that life and never observes or mutates successor state; a fresh name lookup after rebirth gets a
+  distinct runtime. Stop an old reader before its state lock, an old append before enqueue, and an old
+  publisher before completion; delete and rebirth the same `RootNamespace`; prove each old operation
+  stays on the predecessor and returns its stale-or-`NotFound`/retry outcome. A late predecessor
+  invalidation must not detach the successor. A self-remount creates a new runtime for the same durable
+  life, and `confirmExactRef` on a missing name creates neither slot nor runtime. Checkpoint 7.5 is the
+  sole implementation owner of this contract; Step 7 adds no second cache/runtime mechanism.
+
+#### Checkpoint 7.5 — semantic boundaries before the janitor {#t5-checkpoint-7-5}
+
+**This checkpoint is mandatory after the focused `FencedOut` + N+1 drain fix is independently reviewed
+and before any Step-8 code.** It creates semantic ownership boundaries now; Task 13 remains the later
+behavior-preserving mechanical split of the large translation units after the performance baseline.
+
+- [ ] **Extract one synchronous `CatalogLifecycleReconciler`.** It alone owns selection of an eligible
+  adopted-parent `Removing` row, the exact catalog CAS, the mandatory resolution read and the N+1
+  rescan loop. Its result keeps two facts orthogonal: `AuthorityStatus::{Authoritative,FencedOut}` and
+  `CatalogResolution::{DrainComplete,ExactRowAbsent,ExactRowReplaced,ExactRowStillPresent}`; it also
+  carries the exact `retired_lives` proved by completed per-row resolutions and the final catalog cut
+  only for `DrainComplete`. An unreadable resolution propagates and produces no result. `DrainComplete`
+  covers both N=0 and the final clean rescan after N deletions.
+  `FencedOut` remains the control outcome even when the resolution cut proves the predecessor absent or
+  replaced. Either conclusive per-row resolution appends exact-life retirement independently, but it
+  can never restore authority. Inside the component, an authoritative absent/replaced resolution
+  permits the next deterministic scan and `ExactRowStillPresent` retries within the bound or aborts.
+  At the caller boundary only `{Authoritative,DrainComplete}` permits LIST,
+  plan construction, fold or successor publication. The component performs no hot LIST, ref walk,
+  fold, seal publication, `gc/state` mutation or janitor work. **Tests:** retain the direct absent and
+  replacement winner races, the stale-leader no-successor-work journal pins and the exact N-row N+1
+  catalog-read assertion as the component's contract.
+- [ ] **Freeze `RoundInput` and `RefPlan` after construction.** After the reconciler returns an
+  authoritative conclusive drain, one completed hot stream LIST and its later full-catalog cut build a
+  single `RoundInput`. The sole `buildRefWalkPlan` consumes it and returns one `RefPlan`; downstream
+  DEFER, fold, frontier and publication paths receive const views and may not rediscover, append,
+  reinterpret or enrich walk targets. Newly earned cleanup evidence is written to the separate
+  `FoldResult`/successor rows. Normal and healthy `REBUILD` use the same builder. **Tests:** every
+  producer named by the proof changes only the builder's input, and a stale/pre-drain cut or post-build
+  target injection cannot affect the consumed plan.
+- [ ] **Install the name-slot plus immutable-life runtime cache.** Keep logical routing separate from
+  physical mutable state: `RootNamespace -> RefNameSlot -> RefLifeRuntime`, with the runtime indexed by
+  `(life_id, admitted_fence_generation)`. `admitted_fence_generation` is the existing local mount-fence
+  generation captured when the runtime is created. The raw generation advances on both
+  `tripMountLost` and `armMountFence`; no runtime may be published while fenced, and the replacement is
+  published only after `check_fence_or_throw` accepts the value produced by the successful re-arm. A
+  failed remount or a fence-loss-only generation cannot mint/select a usable runtime generation. The
+  name slot is a non-authoritative single-flight cache; only a
+  catalog observation may bind it. It does not keep an evicted runtime alive. Remove in-place
+  `prepareInvalidatedRuntimeForReuse`, preserve exact-life capture for long operations, and make old
+  handles structurally unable to target a successor. Extend `CaRefLaneCore` with simultaneous old/new
+  runtime identities and sabotages for old-handle-to-current-slot retargeting; prove immutable runtime
+  identity and that predecessor work cannot mutate successor objects.
+- [ ] **Create a separate leak-only `GcMaintenanceState`.** Store the janitor's opaque pagination token
+  under `<prefix>/gc/maintenance_state` with `FormatId::GcMaintenanceState = 25` and its own token-CAS
+  discipline, never inside `gc/state`, the adopted seal or any
+  safety/adoption CAS. Losing, repeating or resetting maintenance progress may leak or repeat work only;
+  it cannot change round authority, frontier completeness, DEFER, catalog lifecycle or successor
+  publication. Corrupt/oversized/backend-rejected progress makes the current janitor page delete
+  nothing. An absent object means an empty cursor; first publication uses conditional create. A create
+  conflict or token-CAS conflict adopts no local progress and leaves a later scheduled attempt to
+  reread/repeat. Corrupt progress is replaced with canonical empty progress only by exact-token CAS;
+  losing that reset changes nothing else. Pin format-registry, codec, layout, absent/create-conflict and
+  corrupt-reset tests before Step 8 consumes the type.
+- [ ] **Checkpoint gate:** focused reconciler tests, immutable-runtime races, cache/remount/shutdown
+  tests, `CaRefLaneCore` safe/sabotage configurations, the full prefold TLA runner, and the complete CA
+  unit gate are GREEN and independently reviewed before Step 8 begins.
 
 #### Step 8 — the perpetual janitor {#t5-step8}
 
 - [ ] **One bounded scan over the ownership tree, separate from the hot stream LIST.** Task 4d makes the
   round's correctness/performance enumeration `LIST(cas/ns/stream/)`; it deliberately does not pay for
   `_files` or `_ckpt`. The janitor alone walks `LIST(cas/ns/)`, at a fixed page/key budget per round,
-  storing ONE cleanup-only backend cursor in `gc/state`. The cursor is opaque, size-bounded and reset at
+  storing ONE cleanup-only backend cursor in the separate `GcMaintenanceState` object. The cursor has no
+  field, alias or publication path in `gc/state` or an adopted seal. It is opaque, size-bounded and reset at
   end-of-tree so a later cycle can see an object omitted from an earlier one. A malformed, oversized or
   backend-rejected cursor fails closed for that page/round: surface the error, perform zero janitor
   deletes from a substituted cursor, reset only the durable cleanup progress safely, and let a later
@@ -2838,6 +2907,12 @@ Why after 12 rather than sooner:
 - **Not between Task 11's gates and Task 12's measurements**, which would invalidate the performance baseline
   the report is built on.
 - Both files were still changing throughout Stage B, so any earlier split would have been re-split.
+
+Task 5 Checkpoint 7.5 deliberately creates `CatalogLifecycleReconciler`, immutable `RoundInput`/`RefPlan`,
+the immutable-life runtime boundary and a separate `GcMaintenanceState` before this task. Those are semantic
+ownership changes required for correctness and for the janitor's safe implementation, not this task's
+mechanical line-count split. Task 13 must preserve those interfaces and move the remaining lane/install/fold
+regions around them without redesigning their behaviour or invalidating the Task-11/12 baseline.
 
 - [ ] **Write the equivalence goldens BEFORE moving anything.** This campaign's standing rule: a fence added
   after an extraction tests the new shape rather than the preserved behaviour. Capture request-count and

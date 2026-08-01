@@ -143,8 +143,9 @@ unpublishable until the deletion is already resolved.
 optional cleanup evidence}`. The pure `buildRefWalkPlan(catalog_cut, inputs)` constructor creates rows
 only in its catalog loop, and only for `Live` or `Removing`. Its input bundle contains parent coverage,
 stream-LIST hints, carried holds and `_ckpt` observations; the corresponding internal adapters may
-enrich an existing row but have no insertion API. The returned plan freezes its key set and exposes
-only lookup/enrichment of an existing row, which lets folding attach newly earned cleanup evidence. REBUILD
+enrich a row only while the constructor is building it and have no insertion API. The returned plan
+freezes both its key set and admitted evidence. Folding consumes that plan as const input and places
+newly earned cleanup evidence only in its separate `FoldResult`/successor-row output. REBUILD
 calls the same constructor rather than rebuilding a second lifecycle predicate. Therefore
 `Creating` and absent ids are structurally unable to acquire a walk, coverage or hold.
 The old independent `per_ns_shard` and `ns_cleanup_items` collections, the string `"<namespace>/0"`
@@ -167,6 +168,33 @@ absent from its fresh catalog cut and omits the whole row. This is bounded contr
 deletion precondition: every consumer joins through the new cut before an input row can become work,
 and a new life has a different key.
 
+**Runtime identity is life-scoped, never rebound in place.** Logical routing uses a small name slot,
+but the mutable append/recovery runtime belongs to exactly `(life_id, admitted_fence_generation)`.
+The latter is the existing local mount-fence generation captured at runtime creation. The raw token
+advances at both `tripMountLost` and `armMountFence`; no runtime is published while fenced, and a
+replacement is published only after the value produced by the successful re-arm passes the fence
+check. A failed remount or a fence-loss-only generation cannot select a usable runtime. Its life is
+assigned at most once; removal admission, catalog retirement and remount supersession are monotone for
+that runtime. Exact predecessor deletion detaches only the matching runtime from the name slot. Existing
+holders remain on that predecessor under the stale-or-`NotFound` contract, while a fresh catalog-backed
+name resolution may install a distinct successor runtime. The name slot is a cache, not authority, and
+a delayed predecessor invalidation cannot detach a successor. In particular no cache object is cleared,
+reopened or rebound from one physical life to another.
+
+**GC lifecycle reconciliation and round planning have one owner each.** A synchronous
+`CatalogLifecycleReconciler` owns the adopted-parent catalog-only drain and returns orthogonal
+`AuthorityStatus::{Authoritative,FencedOut}` and
+`CatalogResolution::{DrainComplete,ExactRowAbsent,ExactRowReplaced,ExactRowStillPresent}`, plus exact
+`retired_lives`; an unreadable resolution throws and produces no result. `DrainComplete` represents
+both N=0 and the final clean rescan after N resolved rows and alone carries the final catalog cut.
+Absent/replaced may add the exact predecessor to `retired_lives` independently, but can never turn
+`FencedOut` into authority to continue. Internally only an authoritative absent/replaced resolution
+permits another scan; at the caller boundary only `{Authoritative,DrainComplete}` permits the completed
+hot LIST and its later catalog cut to form one immutable `RoundInput`; the
+sole `buildRefWalkPlan` produces one immutable `RefPlan` consumed by DEFER, frontier, fold and successor
+publication. No downstream consumer may rediscover, append or enrich a target; fold output, including
+newly earned cleanup evidence, is a separate value.
+
 No physical-empty proof is required anywhere: surviving old-incarnation objects are structurally inert
 (an opaque life id absent from the authoritative catalog; the fold works only off catalog entries) and a
 **perpetual** janitor deletes dead-life debris whenever listed. **Discovery is a separately paced,
@@ -184,6 +212,15 @@ janitor rechecks the GC fence and uses the token captured for that exact object.
 `life_id`, an unreadable catalog or a lost fence suppresses the page's deletes. Unparseable keys are
 surfaced and skipped. This janitor is the only reclaimer of a dead life's objects; a LIST omission defers
 its work but can never affect visibility, rebirth or deletion safety.
+
+The cursor lives in a separate leak-only `GcMaintenanceState` object at
+`<prefix>/gc/maintenance_state`, registered as `FormatId::GcMaintenanceState = 25`, not in `gc/state`,
+an adopted seal or any safety/adoption CAS. Losing, repeating or resetting this progress may repeat work
+or leak bytes until a later scheduled page; it cannot affect GC authority, frontier completeness,
+DEFER, catalog lifecycle or successor publication. Absence means an empty cursor and first publication
+uses conditional create; a create/token conflict adopts no local progress. A corrupt progress object
+suppresses deletes for the current page and may be reset to canonical empty only by exact-token CAS;
+losing that reset changes only maintenance progress.
 
 **Layout rule: object keys carry an OPAQUE life id, and the hot enumeration sees only the stream.**
 A life's physical identity is the catalog's `incarnation` used as a pool-wide opaque `life_id`; keys do
