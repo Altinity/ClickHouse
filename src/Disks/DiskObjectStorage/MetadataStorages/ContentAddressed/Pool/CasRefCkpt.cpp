@@ -168,7 +168,7 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
         else if (!result.base || *result.base < *greatest_hinted_snapshot)
             result.base = greatest_hinted_snapshot;
     }
-    if (result.base && *result.base < *result.committed_through)
+    if (result.base)
     {
         if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())
             throw Exception(ErrorCodes::CORRUPTED_DATA,

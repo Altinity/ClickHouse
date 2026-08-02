@@ -79,6 +79,18 @@ TEST(CasRecoveryGrounding, ChoosesGreatestEligibleBaseAndArithmeticWalkStart)
     EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
 }
 
+TEST(CasRecoveryGrounding, BaseAtFrontierStillStartsAtItsExactSuccessor)
+{
+    /// A writer recovery probes exactly this slot for its sole possible unfrontiered successor. The
+    /// grounding contract must supply the arithmetic start even when the committed replay tail is empty.
+    const RecoveryGrounding grounding = chooseRecoveryGrounding(
+        catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 8}), std::nullopt);
+
+    EXPECT_EQ(grounding.base, (RefTxnId{7, 8}));
+    EXPECT_EQ(grounding.walk_from, (RefTxnId{7, 9}));
+    EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
+}
+
 TEST(CasRecoveryGrounding, IgnoresHintAboveFrontierAndRecordsDiagnostic)
 {
     const RecoveryGrounding grounding = chooseRecoveryGrounding(

@@ -716,7 +716,11 @@ private:
         /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
         RefTableState state;
-        /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.
+        /// Exact attempt owned by `Writing` or `Wedged`, and retained by `NeedsRecovery` while an
+        /// otherwise-admitted writer recovery must still adjudicate the precise durable successor it
+        /// expected. It is cleared only when recovery installs its result or the attempt reaches a
+        /// conclusive terminal outcome; losing these bytes would turn a foreign replacement into an
+        /// indistinguishable ordinary recovery transaction.
         std::optional<RefAppendAttempt> append_attempt;
         RefLaneState lane_state = RefLaneState::Ready;
         /// The `EpochSeal` transaction that closed this namespace's PREVIOUS writer epoch -- exactly the
@@ -1005,13 +1009,17 @@ private:
     /// `admitted_generation` is the ONE fence generation this whole recovery was admitted under: the
     /// walk presents it to every `slotOccupy` and to the `_ckpt` CAS, and the caller presents the same
     /// value once more immediately before installing.
+    /// `retained_attempt` is copied under `state_mutex` before the unlocked walk. It is evidence from
+    /// this runtime's admitted writer, not a second recovery authority: only the exact slot it names
+    /// is compared byte-for-byte, and a successor seal remains the existing conclusive-loss case.
     /// `cancelled` is the CALLER's latch, threaded in rather than kept locally: a cancellation is
     /// reported through the retry-later class (the caller should retry, against the FRESH incarnation),
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
-        std::optional<String> & hole_detail, bool & cancelled);
+        const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
+        bool & cancelled);
 
     /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Two independent
     /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, or a self-remount
