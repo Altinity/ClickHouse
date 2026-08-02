@@ -1587,6 +1587,50 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
     return probe;
 }
 
+uint64_t Gc::FoldResult::FrontierDeficit::total() const
+{
+    return no_catalog_entry + checkpoint_unusable + checkpoint_frontier_empty + committed_below_cursor
+        + held + append_above_frozen_tail + probe_budget + fold_aborted + unattributed;
+}
+
+String Gc::FoldResult::FrontierDeficit::describe() const
+{
+    String out;
+    const auto add = [&](const char * name, uint64_t count)
+    {
+        if (count == 0)
+            return;
+        if (!out.empty())
+            out += ", ";
+        out += fmt::format("{}={}", name, count);
+    };
+    add("no_catalog_entry", no_catalog_entry);
+    add("checkpoint_unusable", checkpoint_unusable);
+    add("checkpoint_frontier_empty", checkpoint_frontier_empty);
+    add("committed_below_cursor", committed_below_cursor);
+    add("held", held);
+    add("append_above_frozen_tail", append_above_frozen_tail);
+    add("probe_budget", probe_budget);
+    add("fold_aborted", fold_aborted);
+    add("unattributed", unattributed);
+    return out;
+}
+
+void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
+{
+    switch (reason)
+    {
+        case FrontierUnproven::Proven: return;
+        case FrontierUnproven::NoCatalogEntry: ++no_catalog_entry; return;
+        case FrontierUnproven::CheckpointUnusable: ++checkpoint_unusable; return;
+        case FrontierUnproven::CheckpointFrontierEmpty: ++checkpoint_frontier_empty; return;
+        case FrontierUnproven::CommittedBelowCursor: ++committed_below_cursor; return;
+        case FrontierUnproven::Held: ++held; return;
+        case FrontierUnproven::AppendAboveFrozenTail: ++append_above_frozen_tail; return;
+        case FrontierUnproven::Unattributed: ++unattributed; return;
+    }
+}
+
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
                         uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy)
 {
@@ -2178,6 +2222,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// `checkpoints.life_epochs` for exactly this case; a namespace with neither has a genuinely
         /// unknown genesis, so no probe is taken, nothing is proved, and fail-closed says unproven).
         bool frontier_proven = false;
+        /// Which exit left this namespace unproven, for the round's deficit tally. It starts at
+        /// `Unattributed` so that an exit which forgets to name itself is reported as such instead of
+        /// being silently absorbed into some other bucket.
+        FoldResult::FrontierUnproven unproven_reason = FoldResult::FrontierUnproven::Unattributed;
 
         /// Use the same frozen catalog row + decoded checkpoint authority as read-only recovery. The
         /// ref LIST is only a bounded-work hint; it may neither choose this life's genesis nor extend
@@ -2329,6 +2377,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 "ref intake: this namespace has no catalog entry (Live/Removing) this round -- its "
                 "frontier cannot be proven from a real key space, so it is treated as unproven rather "
                 "than walked at a fabricated one");
+            unproven_reason = FoldResult::FrontierUnproven::NoCatalogEntry;
             expected.reset();
         }
 
@@ -2364,6 +2413,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             else
                 report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                     "ref intake: the catalog life has no usable `_ckpt` (no authoritative walk position)");
+            unproven_reason = FoldResult::FrontierUnproven::CheckpointUnusable;
             expected.reset();   /// the cursor rides verbatim into this round's seal
         }
 
@@ -2372,8 +2422,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             if (cursor == RefTxnId{})
                 frontier_proven = true;
             else
+            {
                 report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                     "ref intake: an empty checkpoint frontier cannot explain a nonzero sealed cursor");
+                unproven_reason = FoldResult::FrontierUnproven::CheckpointFrontierEmpty;
+            }
             expected.reset();
         }
 
@@ -2403,8 +2456,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 if (resolved_through == *grounding->committed_through)
                     frontier_proven = true;
                 else
+                {
                     report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                         "ref intake: checkpoint committed_through precedes the sealed cursor");
+                    unproven_reason = FoldResult::FrontierUnproven::CommittedBelowCursor;
+                }
                 break;
             }
 
@@ -2474,7 +2530,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// false, so the namespace is merely unproven this round and the round suppresses.
             if (target.frozen_tail && *target.frozen_tail < *expected
                 && *grounding->committed_through < *expected)
+            {
+                unproven_reason = FoldResult::FrontierUnproven::AppendAboveFrozenTail;
                 break;
+            }
 
             const RefTxnId log_id = *expected;
 
@@ -2703,6 +2762,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// the loop's control flow: a carried hold rides forward on a round whose own walk ended
             /// quietly, and that quiet end must not be mistaken for a proof.
             frontier_proven = false;
+            unproven_reason = FoldResult::FrontierUnproven::Held;
         }
         else
             cov.classification = table_changed ? 2 : 1;
@@ -2711,6 +2771,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ++result.frontier_namespaces;
         if (frontier_proven)
             ++result.frontier_proven;
+        else
+            result.frontier_deficit.count(unproven_reason);
         if (table_changed)
         {
             folded_any = true;
@@ -2738,6 +2800,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (intake_unprobed_budget > 0)
     {
         result.frontier_namespaces += intake_unprobed_budget;
+        result.frontier_deficit.probe_budget += intake_unprobed_budget;
         LOG_WARNING(logger,
             "CAS GC ref intake: the frontier-probe budget ({}) ran out with {} known namespace(s) "
             "unprobed; their cursors ride unchanged and ALL destructive work is suppressed this round",
@@ -2756,6 +2819,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// An abort discards this round's walk, so it discards its proofs with it: nothing this round
         /// observed may be offered as a frontier proof to the destructive gate.
         result.frontier_proven = 0;
+        result.frontier_deficit = FoldResult::FrontierDeficit{};
+        result.frontier_deficit.fold_aborted = result.frontier_namespaces;
         for (const WalkTarget & target : walk_targets)
         {
             RefCoverage cov;
@@ -3055,22 +3120,27 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             || (universe_authoritative && result.frontier_namespaces == 0);
         const char * const universe_note =
             universe_authoritative ? "" : "; the universe itself is not provable this stage";
+        /// The per-cause breakdown of the unproven namespaces. Without it "N of M proven" names a
+        /// deficit but not its cause, and the causes want opposite operator responses.
+        const String deficit_note = result.frontier_deficit.total() == 0
+            ? String{}
+            : fmt::format("; unproven: {}", result.frontier_deficit.describe());
         if (per_round_cause)
             LOG_WARNING(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}). Graduations and pending "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}). Graduations and pending "
                 "deletes are carried; nothing irreversible runs until a pass that clears all three.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
-                result.frontier_proven, result.frontier_namespaces, universe_note);
+                result.frontier_proven, result.frontier_namespaces, universe_note, deficit_note);
         else
             LOG_INFO(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}). Graduations and pending "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}). Graduations and pending "
                 "deletes are carried; nothing irreversible runs until a pass that clears all three.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
-                result.frontier_proven, result.frontier_namespaces, universe_note);
+                result.frontier_proven, result.frontier_namespaces, universe_note, deficit_note);
     }
 
     std::vector<BlobSourceRetirement> orphan_source_retirements;

@@ -598,6 +598,49 @@ private:
         /// because the round's frontier-probe budget ran out first. Each one is an unproven frontier.
         uint64_t frontier_unprobed_budget = 0;
 
+        /// WHY the unproven namespaces are unproven, one bucket each, so the buckets sum to
+        /// `frontier_namespaces - frontier_proven`. Without this an operator reading "N of M proven"
+        /// can see that the round suppressed but not which of the several unrelated causes did it,
+        /// and the causes want opposite responses: a hold or a missing catalog entry is something to
+        /// chase, an exhausted probe budget is something to raise.
+        ///
+        /// `unattributed` exists so that an exit which leaves a namespace unproven WITHOUT naming
+        /// itself surfaces as a number rather than disappearing into the total. It is expected to be
+        /// zero on every round; a nonzero value means this enumeration has stopped being exhaustive.
+        /// The reason ONE namespace ended its walk unproven. `Proven` is the absence of a reason;
+        /// every other value names the exit that produced it.
+        enum class FrontierUnproven : uint8_t
+        {
+            Proven,
+            NoCatalogEntry,
+            CheckpointUnusable,
+            CheckpointFrontierEmpty,
+            CommittedBelowCursor,
+            Held,
+            AppendAboveFrozenTail,
+            Unattributed,
+        };
+
+        struct FrontierDeficit
+        {
+            uint64_t no_catalog_entry = 0;
+            uint64_t checkpoint_unusable = 0;
+            uint64_t checkpoint_frontier_empty = 0;
+            uint64_t committed_below_cursor = 0;
+            uint64_t held = 0;
+            uint64_t append_above_frozen_tail = 0;
+            uint64_t probe_budget = 0;
+            uint64_t fold_aborted = 0;
+            uint64_t unattributed = 0;
+
+            void count(FrontierUnproven reason);
+            uint64_t total() const;
+            /// The nonzero buckets, as `name=count` pairs, for the suppression warning.
+            String describe() const;
+        };
+
+        FrontierDeficit frontier_deficit;
+
         /// Every hold this round SEALED, as `(life id, hold)` — both the ones it detected and the
         /// ones it carried from the parent seal because their offending position is still unresolved.
         /// It reads the seal that is about to become durable, so it is the round's final answer rather
