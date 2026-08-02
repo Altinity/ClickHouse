@@ -696,11 +696,12 @@ inline DB::Cas::PoolPtr openPoolForTest(
 /// have already populated their catalog must mandatory-read and validate it instead of re-running a
 /// new-pool initializer. The default `blob_header_len`/`blob_hash_algo` match `PoolConfig`'s defaults,
 /// so a later `Pool::open` with a default config validates cleanly.
-inline void seedPoolMetaForRestart(DB::Cas::Backend & backend, const String & pool_prefix = "p")
+inline void seedPoolMetaForRestart(
+    DB::Cas::Backend & backend, const String & pool_prefix = "p", uint64_t gc_shards = 1)
 {
     const DB::Cas::Layout layout(pool_prefix);
     DB::Cas::PoolMeta::createOrValidate(
-        backend, layout, /*blob_header_len=*/256,
+        backend, layout, /*blob_header_len=*/256, gc_shards,
         DB::Cas::BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
     if (!backend.get(layout.refCatalogKey()))
         DB::Cas::CasRefCatalog::initializeEmptyForNewPool(backend, layout);
@@ -892,7 +893,7 @@ inline void seedFoldCursorForTest(
         entry.ns = ns;
         entry.state = DB::Cas::NsState::Live;
         entry.incarnation = DB::Cas::NamespaceLifeId::stageATransition(ns).incarnation;
-        DB::Cas::CasRefCatalog::casAdmitEntry(backend, layout, entry);
+        DB::Cas::CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
         life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, entry.incarnation);
     }
     else
@@ -1046,7 +1047,7 @@ inline void casAdmitEntry(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     entry.ns = ns;
     entry.state = NsState::Live;
     entry.incarnation = NamespaceLifeId::stageATransition(ns).incarnation;
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 }
 
 /// Writes `txn` at `_log/<txn_id>` (create-if-absent). Admits `txn.ns` into the catalog first

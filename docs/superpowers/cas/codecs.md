@@ -31,7 +31,7 @@ Notation:
 | Format | Stored at | Body family | Producer | Consumer | Purpose |
 |---|---|---|---|---|---|
 | Blob object, magic `CABL` | `<prefix>/blobs/<shard>/<blob-id>` | Fixed binary `CasEnvelope` header plus raw payload | `Build::putBlob`, `Build::uploadFromSource` | read path, GC, `fsck` | Deduplicated content-addressed bytes for part files. |
-| Pool metadata, magic `CAPM` | `<prefix>/_pool_meta` | `PoolMetaProto` protobuf | `PoolMeta::createOrValidate` | pool open path | Pool identity and creation-time constants. |
+| Pool metadata, type `cas_pool_meta` | `<prefix>/_pool_meta` | Strict text object | `PoolMeta::createOrValidate` | pool open path | Pool identity and creation-time constants, including authoritative `gc_shards`. |
 | Root shard, magic `CARS` | `<prefix>/cas/refs/<ns>/<shard>` | `RootShardManifest` protobuf | `Store::mutateShard` through `encodeRootShard` | `Store::resolveRef`, GC fold, `fsck`, orphan sweep | Namespace ref state and journal; the commit point. |
 | Part manifest, magic `CAPT` | `<prefix>/cas/manifests/<ns>/<writer_epoch>/<build_sequence>/<ordinal>.proto` | Custom binary; entries currently reuse the `CARN` block-framed record format | `Build::stageManifest` path through `encodePartManifest` | `Store::readManifest`, read path, GC, `fsck`, orphan sweep | Immutable description of one part's files. |
 | Block-framed record stream, magic `CARN` | Embedded in `PartManifest`; also under GC attempt prefixes | Custom sorted-record binary, implemented as `RunFile` | `RunFileWriter` callers | `RunFileReader`, `RunMerger` | Ordered record streams for manifests and GC data-plane data. |
@@ -51,11 +51,11 @@ Notation:
 
 The current system has six families:
 
-- Protobuf metadata with `CasHeader`: the default for mutable/control/write-once metadata.
+- Protobuf metadata with `CasHeader`: used by older mutable/control/write-once metadata.
 - Fixed binary envelope: currently only `CABL` blobs.
 - Block-framed record format: `CARN`, implemented by `RunFile`.
 - Binary part manifest: `CAPT` `PartManifest`.
-- Strict raw tagged text control objects: `cas_fold_seal`.
+- Strict raw tagged text control objects, including `cas_pool_meta` and `cas_fold_seal`.
 - Raw passthrough bytes: namespace verbatim files and mountpoint objects.
 
 There is also one exceptional fixed binary control record: `GcHeartbeat`. It is not raw user data,
@@ -112,16 +112,17 @@ content hash over payload bytes, not a hash of the whole object.
 - `ObjectKind::Blob` is the only live object kind. Future kinds should not be predeclared without a
   producer and reader.
 
-## Pool Metadata `CAPM` {#pool-metadata-capm}
+## Pool Metadata `cas_pool_meta` {#pool-metadata-capm}
 
 **Storage path:** `<prefix>/_pool_meta`.
 
-**Body:** `PoolMetaProto` protobuf with `CasHeader` magic `CAPM`. It stores:
+**Body:** a strict versioned text object. It stores:
 
 - `pool_id`: raw 16-byte pool identity.
-- `root_shards`: root-shard count.
 - `blob_header_len`: fixed blob payload offset, normally 256.
+- `gc_shards`: immutable blob-target shard count used by GC and catalog capacity admission.
 - `min_reader_generation`: pool-level startup gate.
+- `algos_used`: the pool's admitted content-hash algorithms.
 
 **Producer:** `PoolMeta::createOrValidate`. On first creation it mints `pool_id` and writes with a
 CAS create. On reopen it reads the object and treats the pool values as authoritative.
@@ -132,14 +133,13 @@ needs pool constants.
 **Purpose:** establish pool identity and creation-time constants. The pool id doubles as the blob
 envelope `domain_id`.
 
-**Versioning and integrity:** protobuf with `CasHeader`; decode checks magic and
-`compatibility_version`. It also validates constant invariants such as non-zero shard counts and a
-valid blob header length.
+**Versioning and integrity:** the generation-8 recreate-only cut requires `gc_shards` in every pool
+metadata body. Decode rejects an older header, a missing or zero value, and invalid creation-time
+constants. A node reopening with a different local `PoolConfig::gc_shards` uses the persisted value;
+local configuration cannot make two nodes charge different fold-seal bounds.
 
 **Notes:**
 
-- The C++ header comment still describes strict JSON. The implementation is protobuf and the comment
-  should be updated.
 - The format is necessary and not redundant; it is the one authoritative source for constants that
   cannot safely come from local config after pool creation.
 
@@ -402,13 +402,18 @@ blob-target-run, and condemned-summary records.
 its catalog-admitted ref-life state and blob-target runs.
 
 **Versioning and integrity:** strict tagged text with a generation-gated format header, line and object
-byte caps, deterministic ordering, duplicate-key rejection, and pinned raw storage.
+byte caps, deterministic ordering, duplicate-key rejection, and pinned raw storage. Adoption validates
+`btr` keys against `Layout`, allows at most one run per shard, and requires `cnd` rows to cover exactly
+`[0, gc_shards)`. Summary counts and the oldest-nonpending sentinel are validated together.
 
 **Notes:**
 
 - The coverage classification set `{0, 1, 2, 4}` is closed and validated before narrowing to its byte.
 - A classification-4 `rfl` record requires a canonical hold; other classifications forbid one.
 - Every `btr` row carries the whole-object checksum that readers verify before acting on the run.
+- Catalog admission reserves the full worst-case seal shape with saturating arithmetic: the widest
+  fixed frame, one widest `rfl` row per catalog entry, and one widest `btr` plus `cnd` row per persisted
+  `gc_shards` value.
 
 ## Run Reference Subformat {#run-reference-subformat}
 

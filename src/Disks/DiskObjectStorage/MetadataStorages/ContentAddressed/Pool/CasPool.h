@@ -229,6 +229,7 @@ struct PoolConfig
     {
         return RefLedgerConfig{
             .server_root_id = server_root_id,
+            .gc_shards = gc_shards,
             .snapshot_log_count_threshold = snapshot_log_count_threshold,
             .snapshot_log_bytes_threshold = snapshot_log_bytes_threshold,
             .snapshot_publish_backoff_initial_ms = snapshot_publish_backoff_initial_ms,

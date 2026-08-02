@@ -153,6 +153,7 @@ struct DropNamespaceStats
 struct RefLedgerConfig
 {
     String server_root_id;
+    uint64_t gc_shards = 1;
     uint64_t snapshot_log_count_threshold = 256;
     uint64_t snapshot_log_bytes_threshold = 1ULL << 20;
     uint64_t snapshot_publish_backoff_initial_ms = 200;

@@ -123,7 +123,8 @@ public:
     /// caller (Task 3's creation lifecycle owns checking that first) and surfaces as
     /// `encodeRefCatalog`'s own canonical-order/no-duplicate grammar check, inside
     /// `checkCatalogAdmission`.
-    static RefCatalog casAdmitEntry(Backend & backend, const Layout & layout, const CatalogEntry & entry);
+    static RefCatalog casAdmitEntry(
+        Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry);
 
     enum class BeginRemovingOutcome : uint8_t
     {
@@ -263,7 +264,8 @@ public:
     /// `completeCreation` are for; a namespace already `Live`/`Removing` is a caller bug (recreating an
     /// existing name is Task 5's -- removal's -- business, not creation's).
     static NamespaceCreationOutcome createNamespace(
-        Backend & backend, const Layout & layout, const RootNamespace & ns, const CreatorFence & creator,
+        Backend & backend, const Layout & layout, uint64_t gc_shards,
+        const RootNamespace & ns, const CreatorFence & creator,
         uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
         const CkptDeadline & deadline);
 

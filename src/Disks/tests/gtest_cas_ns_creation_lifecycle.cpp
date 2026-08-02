@@ -87,7 +87,7 @@ TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
     const CreatorFence creator = creatorFence("srv1", /*writer_epoch=*/5);
 
     const auto outcome = CasRefCatalog::createNamespace(
-        backend, layout, ns, creator, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
+        backend, layout, 1, ns, creator, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
     EXPECT_EQ(outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
@@ -118,12 +118,12 @@ TEST(CasNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
-    ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, ns, creator, 1, ALWAYS_ADMITTED, generousDeadline()),
+    ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, 1, ns, creator, 1, ALWAYS_ADMITTED, generousDeadline()),
                CasRefCatalog::NamespaceCreationOutcome::Live);
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
     {
-        CasRefCatalog::createNamespace(backend, layout, ns, creatorFence("srv2", 2), 1, ALWAYS_ADMITTED, generousDeadline());
+        CasRefCatalog::createNamespace(backend, layout, 1, ns, creatorFence("srv2", 2), 1, ALWAYS_ADMITTED, generousDeadline());
     });
 }
 #endif
@@ -135,12 +135,12 @@ TEST(CasNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEnt
     Layout layout("p");
     const RootNamespace ns{"a"};
     const CreatorFence creator = creatorFence("srv1", 1);
-    ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, ns, creator, 1, ALWAYS_ADMITTED, generousDeadline()),
+    ASSERT_EQ(CasRefCatalog::createNamespace(backend, layout, 1, ns, creator, 1, ALWAYS_ADMITTED, generousDeadline()),
                CasRefCatalog::NamespaceCreationOutcome::Live);
 
     EXPECT_DEATH(
         {
-            CasRefCatalog::createNamespace(backend, layout, ns, creatorFence("srv2", 2), 1, ALWAYS_ADMITTED, generousDeadline());
+            CasRefCatalog::createNamespace(backend, layout, 1, ns, creatorFence("srv2", 2), 1, ALWAYS_ADMITTED, generousDeadline());
         },
         "already carries a catalog entry");
 }
@@ -197,7 +197,7 @@ TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
     const CreatorFence creator = creatorFence("srv1", 5);
 
     const auto outcome = CasRefCatalog::createNamespace(
-        backend, layout, ns, creator, /*admitted_generation=*/1, admittedOnceThenFenced(), generousDeadline());
+        backend, layout, 1, ns, creator, /*admitted_generation=*/1, admittedOnceThenFenced(), generousDeadline());
     EXPECT_EQ(outcome, CasRefCatalog::NamespaceCreationOutcome::FencedOut);
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
@@ -227,7 +227,7 @@ TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
 
     /// Write 1 only -- models "crash after write 1": no _ckpt yet, entry still Creating.
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 
     /// `check_fence_or_throw` is the seam this driver calls on EVERY attempt -- once inside step 2's
     /// `publishCkpt`, once more inside step 3's own `mutate` -- so smuggling a REAL concurrent write
@@ -274,7 +274,7 @@ TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
     const CreatorFence thief = creatorFence("srv2", 9);
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(42), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 
     /// Same steal as the test above, landing on the SECOND `check_fence_or_throw` call (step 3's own
     /// `mutate`, not step 2's `publishCkpt`) -- but this one ALSO throws on that same second call, so
@@ -315,7 +315,7 @@ TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStill
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
                               .creator = creatorFence("srv1", 5)};
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 
     const auto outcome = CasRefCatalog::reconcileStaleCreator(
         backend, layout, entry, creatorFence("srv2", 9), fixedTerminality(false), /*admitted_generation=*/1, ALWAYS_ADMITTED);
@@ -335,7 +335,7 @@ TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
     const CreatorFence original_creator = creatorFence("srv1", 5);
     const CreatorFence new_creator = creatorFence("srv2", 9);
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7), .creator = original_creator};
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);   /// "crash after write 1" -- no _ckpt yet
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);   /// "crash after write 1" -- no _ckpt yet
 
     ASSERT_EQ(CasRefCatalog::reconcileStaleCreator(backend, layout, entry, new_creator, fixedTerminality(true), /*admitted_generation=*/1, ALWAYS_ADMITTED),
                CasRefCatalog::ReconcileCreatorOutcome::Reconciled);
@@ -371,7 +371,7 @@ TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
     const RootNamespace ns{"a"};
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating, .incarnation = UInt128(7),
                               .creator = creatorFence("srv1", 5)};
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 
     const CreatorFence first_reconciler = creatorFence("srv2", 9);
     const CreatorFence second_reconciler = creatorFence("srv3", 11);

@@ -3868,7 +3868,7 @@ TEST(RefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/existing-live-assignment"};
-    CasRefCatalog::casAdmitEntry(*backend, store->layout(), CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, store->layout(), 1, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = UInt128{41}});
 
     backend->resetCounts();

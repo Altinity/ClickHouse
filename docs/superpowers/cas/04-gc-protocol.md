@@ -67,11 +67,16 @@ GcState {
     snap_attempt: uint64                      // attempt id that produced snap_generation (attempt-scoped gen)
     snap_pruned_through: uint64               // retention cursor for old gc/gen generations
     retired_refs: { gc_shard → retired_list_object_key }   // current retired-list runs (ack-floor)
-    gc_shards: uint64                         // immutable creation-time blob-target shard count
+    gc_shards: uint64                         // mirror of `_pool_meta`'s authoritative creation-time count
 }
 ```
 
 `retired_refs` maps each blob-target gc-shard to the object key of the **current** retired-list run (the outstanding-candidate set); it is published in the same `gc/state` CAS that advances `round`, so a reader that observes round K can always load the retired list of version K (the publish-order invariant, §3.6). The former per-round `fence_seq` epoch and the `fence_version` map are **removed** with the fence phase (see the History note below).
+
+The pool-wide authority for `gc_shards` is the generation-8 `_pool_meta` object, established before
+namespace admission is exposed. `gc/state` mirrors that value once GC state exists; it is not the
+bootstrap authority because namespace admission can precede the first GC lease. Reopen ignores a
+different local shard count and uses the persisted value without a per-admission `GET(gc/state)`.
 
 The steal is a single **atomic CAS** on `gc/state` that bumps `lease.owner` and `lease.seq` together. Safety of every round step is independent of who holds the lease; the CAS-steal merely prevents redundant work.
 

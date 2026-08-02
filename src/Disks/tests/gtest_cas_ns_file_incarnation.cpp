@@ -60,7 +60,7 @@ void admitLifeAt(Backend & backend, const Layout & layout, const RootNamespace &
     entry.ns = ns;
     entry.state = NsState::Live;
     entry.incarnation = incarnation;
-    CasRefCatalog::casAdmitEntry(backend, layout, entry);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
 }
 
 /// Complete the catalog-only half of removal through the production exact-deletion authority. This
@@ -156,14 +156,14 @@ TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
     const RootNamespace removing{"00/removing@cas@"};
     const RootNamespace absent{"00/absent@cas@"};
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
         .ns = creating,
         .state = NsState::Creating,
         .incarnation = UInt128{31},
         .creator = CreatorFence{.server_root_id = "foreign", .writer_epoch = 7, .fence_generation = 1}});
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
         .ns = live, .state = NsState::Live, .incarnation = UInt128{32}});
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
         .ns = removing, .state = NsState::Live, .incarnation = UInt128{33}});
     CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
     {

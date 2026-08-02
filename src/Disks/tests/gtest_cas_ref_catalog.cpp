@@ -191,7 +191,7 @@ TEST(CasFormatBattery, RefCatalog)
     runFormatBattery({FormatId::RefCatalog,
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
-        "{\"type\":\"cas_ref_catalog\",\"v\":7}\n"
+        "{\"type\":\"cas_ref_catalog\",\"v\":8}\n"
         "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
         "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
         "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"
@@ -573,19 +573,23 @@ TEST(CasRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
 
 TEST(CasRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
 {
+    const Layout layout("p");
+    constexpr uint64_t gc_shards = 1;
     /// The exact boundary is expressed in ENTRIES (predicate (2) is a sum over admitted entries), so
     /// the boundary count is derived from the real registry constants rather than assumed.
     const uint64_t cap = foldSealCaps().object_cap;
     const uint64_t fixed = foldSealFixedBytes();
     const uint64_t reservation = worstCaseEntryFoldReservationBytes();
     ASSERT_GT(reservation, 0u);
-    const uint64_t max_entries = (cap - fixed) / reservation;
+    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
+        + widestCondemnedSummaryReservationBytes(gc_shards);
+    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
 
     const RootNamespace ns{"admitted"};
-    EXPECT_NO_THROW(checkFoldSealReservation(max_entries, ns));
+    EXPECT_NO_THROW(checkFoldSealReservation(max_entries, gc_shards, layout, ns));
     try
     {
-        checkFoldSealReservation(max_entries + 1, ns);
+        checkFoldSealReservation(max_entries + 1, gc_shards, layout, ns);
         FAIL() << "expected LIMIT_EXCEEDED";
     }
     catch (const DB::Exception & e)
@@ -604,10 +608,11 @@ TEST(CasRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
 /// regardless of the wraparound arithmetic underneath.
 TEST(CasRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWrapping)
 {
+    const Layout layout("p");
     const uint64_t reservation = worstCaseEntryFoldReservationBytes();
     const uint64_t entry_count = std::numeric_limits<uint64_t>::max() / reservation + 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
-        [&] { checkFoldSealReservation(entry_count, RootNamespace{"huge"}); });
+        [&] { checkFoldSealReservation(entry_count, 1, layout, RootNamespace{"huge"}); });
 }
 
 TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
@@ -618,22 +623,72 @@ TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
     RefCatalog candidate;
     candidate.entries.push_back(liveEntry("a", 1));
     candidate.entries.push_back(liveEntry("b", 2));
-    const String encoded = checkCatalogAdmission(candidate, RootNamespace{"b"});
+    const Layout layout("p");
+    const String encoded = checkCatalogAdmission(candidate, 1, layout, RootNamespace{"b"});
     EXPECT_EQ(encoded, encodeRefCatalog(candidate));
+}
+
+TEST(CasRefCatalogAdmission, ReservationCoversActualWidestRowsAcrossDecimalTransitions)
+{
+    const Layout layout("p/quoted-\"prefix");
+    constexpr uint64_t gc_shards = 100;
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+
+    for (const uint64_t entry_count : {9, 10, 99, 100})
+    {
+        CasFoldSeal seal;
+        seal.generation = max;
+        seal.parent_generation = max;
+        for (uint64_t i = 0; i < entry_count; ++i)
+        {
+            seal.ref_lives.emplace(std::numeric_limits<UInt128>::max() - i, RefLifeFoldState{
+                .coverage = RefCoverage{
+                    .classification = 4,
+                    .last_folded_ref_id = RefTxnId{max, max},
+                    .hold = RefHold{
+                        .reason = HoldReason::UnconsumedSealCrossing,
+                        .offending_position = RefTxnId{max, max},
+                        .retry_count = std::numeric_limits<uint32_t>::max(),
+                        .next_retry_round = max}},
+                .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{max, max}}});
+        }
+        for (uint64_t shard = 0; shard < gc_shards; ++shard)
+        {
+            seal.blob_target_runs.push_back(RunRef{
+                .key = layout.blobTargetRunKey(max, max, shard, 0),
+                .checksum = std::numeric_limits<UInt128>::max(),
+                .shard = shard,
+                .generation = max});
+            seal.condemned_summary.emplace(shard, CondemnedSummary{
+                .condemned_total = max,
+                .pending_total = max,
+                .oldest_nonpending_condemn_round = max});
+        }
+
+        const uint64_t bound = foldSealFixedBytes()
+            + entry_count * worstCaseEntryFoldReservationBytes()
+            + gc_shards * widestBlobTargetRunReservationBytes(layout, gc_shards)
+            + gc_shards * widestCondemnedSummaryReservationBytes(gc_shards);
+        EXPECT_LE(encodeFoldSeal(seal).size(), bound) << "entry_count=" << entry_count;
+    }
 }
 
 /// ---------- Constraint 13: removal is never refused, even at the admission boundary ----------
 
 TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
 {
+    const Layout layout("p");
+    constexpr uint64_t gc_shards = 1;
     const uint64_t cap = foldSealCaps().object_cap;
     const uint64_t fixed = foldSealFixedBytes();
     const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t max_entries = (cap - fixed) / reservation;
+    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, gc_shards)
+        + widestCondemnedSummaryReservationBytes(gc_shards);
+    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
 
     /// Confirm the boundary is real: one entry beyond it is refused through admission.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED,
-        [&] { checkFoldSealReservation(max_entries + 1, RootNamespace{"z"}); });
+        [&] { checkFoldSealReservation(max_entries + 1, gc_shards, layout, RootNamespace{"z"}); });
 
     /// Build a catalog carrying exactly `max_entries` Live entries -- as full as admission ever
     /// permits -- directly (a fixture, not itself an admission call).
@@ -643,7 +698,6 @@ TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
         full.entries.push_back(liveEntry(fmt::format("ns{:012}", i), i + 1));
 
     InMemoryBackend backend;
-    Layout layout("p");
     backend.putIfAbsent(layout.refCatalogKey(), encodeRefCatalog(full));
 
     /// The removal transition (Live -> Removing) on one entry goes through the PLAIN update path
@@ -687,7 +741,7 @@ TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
 
     const RefCatalog updated = CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & cur)
     {
@@ -707,7 +761,7 @@ TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
     {
         InMemoryBackend backend;
         CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
         {
             (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &) { return RefCatalog{}; });
@@ -717,7 +771,7 @@ TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
     {
         InMemoryBackend backend;
         CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
         DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
         {
             (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
@@ -735,7 +789,7 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
 
     backend.failNextCasPut(layout.refCatalogKey());   /// one-shot artificial Conflict on the next write
 
@@ -763,7 +817,7 @@ TEST(CasRefCatalog, BeginRemovingRechecksFenceAfterCatalogCasConflict)
     const Layout layout("p");
     const CatalogEntry observed = liveEntry("a", 1);
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, observed);
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, observed);
 
     uint64_t current_fence_generation = 7;
     size_t fence_checks = 0;
@@ -804,7 +858,7 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
@@ -832,7 +886,7 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
     const CasRefCatalog::Snapshot seeded = CasRefCatalog::read(backend, layout);
     ASSERT_TRUE(seeded.token.has_value());
 
@@ -879,7 +933,7 @@ TEST(CasRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
-    const RefCatalog created = CasRefCatalog::casAdmitEntry(backend, layout,
+    const RefCatalog created = CasRefCatalog::casAdmitEntry(backend, layout, 1,
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1),
             .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 1, .fence_generation = 1}});
     ASSERT_EQ(created.entries.size(), 1u);
@@ -892,8 +946,8 @@ TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
 
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("b", 1));
-    const RefCatalog after = CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("b", 1));
+    const RefCatalog after = CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 2));
     ASSERT_EQ(after.entries.size(), 2u);
     EXPECT_EQ(after.entries[0].ns.string(), "a");   /// inserted BEFORE "b", not appended
     EXPECT_EQ(after.entries[1].ns.string(), "b");
@@ -908,9 +962,9 @@ TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); });
+        [&] { CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 2)); });
 }
 #endif
 
@@ -920,8 +974,8 @@ TEST(CasRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
     InMemoryBackend backend;
     Layout layout("p");
     CasRefCatalog::initializeEmptyForNewPool(backend, layout);
-    CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 1));
-    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("a", 2)); }, "not canonically ordered");
+    CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
+    EXPECT_DEATH({ CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 2)); }, "not canonically ordered");
 }
 #endif
 
@@ -933,7 +987,9 @@ TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
     const uint64_t cap = foldSealCaps().object_cap;
     const uint64_t fixed = foldSealFixedBytes();
     const uint64_t reservation = worstCaseEntryFoldReservationBytes();
-    const uint64_t max_entries = (cap - fixed) / reservation;
+    const uint64_t nonentry = widestBlobTargetRunReservationBytes(layout, 1)
+        + widestCondemnedSummaryReservationBytes(1);
+    const uint64_t max_entries = (cap - fixed - nonentry) / reservation;
 
     /// Seed the catalog directly at the admission boundary (a fixture -- not itself an admission call).
     RefCatalog full;
@@ -946,7 +1002,7 @@ TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
     /// so the backend object is untouched.
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LIMIT_EXCEEDED, [&]
     {
-        CasRefCatalog::casAdmitEntry(backend, layout, liveEntry("zzz", 999999999));
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("zzz", 999999999));
     });
 
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
@@ -1037,7 +1093,7 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
         .removal_started_round = 13};
 #ifndef DEBUG_OR_SANITIZER_BUILD
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { (void)CasRefCatalog::casAdmitEntry(backend, layout, removing); });
+        [&] { (void)CasRefCatalog::casAdmitEntry(backend, layout, 1, removing); });
 #endif
 
     const CatalogEntry current{
@@ -1073,7 +1129,7 @@ TEST(CasRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
         .removal_started_round = 13};
 
     EXPECT_DEATH(
-        { (void)CasRefCatalog::casAdmitEntry(backend, layout, removing); },
+        { (void)CasRefCatalog::casAdmitEntry(backend, layout, 1, removing); },
         "cannot admit namespace.*directly as Removing");
 }
 #endif

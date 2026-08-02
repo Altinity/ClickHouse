@@ -1140,7 +1140,8 @@ NamespaceLifeId CasRefLedger::resolveNamespaceLife(
             /// catalog on the next loop iteration to learn it -- one extra GET, paid once per birth,
             /// never per write.
             const auto outcome = CasRefCatalog::createNamespace(
-                backend, layout, ns, our_fence, admitted_generation, check_fence_or_throw, deadline);
+                backend, layout, config.gc_shards, ns, our_fence,
+                admitted_generation, check_fence_or_throw, deadline);
             if (outcome == CasRefCatalog::NamespaceCreationOutcome::FencedOut)
                 throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}': the mount incarnation moved while "

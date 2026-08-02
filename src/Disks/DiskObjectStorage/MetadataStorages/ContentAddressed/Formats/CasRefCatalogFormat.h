@@ -11,6 +11,8 @@
 namespace DB::Cas
 {
 
+class Layout;
+
 /// The byte bound every namespace name admitted into `ref_catalog` must satisfy (spec INV-3:
 /// "namespace names get a byte bound"). This is not merely a sanity limit -- the admission check's
 /// predicate (2) charges every entry's fold-seal reservation at EXACTLY this bound, worst-case
@@ -126,13 +128,8 @@ RefCatalog decodeRefCatalog(std::string_view data);
 /// (`LIMIT_EXCEEDED`, naming `ns`) one byte over.
 void checkCatalogObjectBytes(uint64_t encoded_bytes, const RootNamespace & ns);
 
-/// A FLOOR on the fold seal's fixed frame cost (header + meta + trailer, zero entries), not a
-/// constant: measured at `generation = 0` and `n = 0`, so a real seal's larger decimal widths for
-/// `generation`/`parent_generation`/`n` add a few more bytes than this returns. Harmless for
-/// `checkFoldSealReservation`'s admission math -- the reservation is already an over-estimate --
-/// but a caller after the EXACT fixed-frame cost must not treat this as one. Measured through
-/// `encodeFoldSeal` itself rather than a hand-kept formula, so a later change to the fold seal's wire
-/// shape is felt here automatically.
+/// Worst-case bytes for the fold-seal frame with no records: maximal generation fields plus the
+/// widest possible `uint64_t` trailer count. Measured through the real encoder.
 uint64_t foldSealFixedBytes();
 
 /// The worst-case bytes ONE admitted catalog entry could ever add to a fold seal: one ref-life row
@@ -140,14 +137,20 @@ uint64_t foldSealFixedBytes();
 /// through `encodeFoldSeal` itself, like `foldSealFixedBytes`.
 uint64_t worstCaseEntryFoldReservationBytes();
 
-/// PRE-PUT GATE, predicate (2) of INV-3's additive admission:
-/// `foldSealFixedBytes() + entry_count * worstCaseEntryFoldReservationBytes() <= fold_seal_object_cap`.
-/// Equality is accepted; refuses (`LIMIT_EXCEEDED`, naming `ns`) one entry over. `entry_count` is the
-/// CANDIDATE catalog's entry count -- the count AFTER the admission under consideration. The
-/// multiplication saturates (`mulByteBudget`, `CasByteBudget.h`) before the addition does, same
-/// discipline, one step earlier: an unreachable-in-practice but unbounded `entry_count` must not wrap
-/// the product into something that reads as "fits".
-void checkFoldSealReservation(uint64_t entry_count, const RootNamespace & ns);
+/// Worst-case incremental bytes for one canonical blob-target run row. The serialized physical key
+/// includes `layout`'s pool prefix, so layout is part of the bound.
+uint64_t widestBlobTargetRunReservationBytes(const Layout & layout, uint64_t gc_shards);
+
+/// Worst-case incremental bytes for one condemned-summary row at the greatest configured shard.
+uint64_t widestCondemnedSummaryReservationBytes(uint64_t gc_shards);
+
+/// PRE-PUT GATE, predicate (2) of INV-3's additive admission. Reserves the widest fixed frame, one
+/// widest ref-life row per candidate catalog entry, and one widest blob-target plus condemned-summary
+/// row per authoritative GC shard. Equality is accepted; refuses (`LIMIT_EXCEEDED`, naming `ns`) one
+/// entry over. Every multiplication and addition saturates, so an unreachable-in-practice count can
+/// never wrap into something that reads as "fits".
+void checkFoldSealReservation(
+    uint64_t entry_count, uint64_t gc_shards, const Layout & layout, const RootNamespace & ns);
 
 /// Runs BOTH admission predicates against `candidate` -- the catalog state as it would read
 /// immediately AFTER the admission under consideration -- naming `admitting_ns` in whichever
@@ -159,6 +162,8 @@ void checkFoldSealReservation(uint64_t entry_count, const RootNamespace & ns);
 /// Constraint 13 (removal is never refused): this function is for entry-ADMITTING mutations only.
 /// A removal transition (`Live` -> `Removing`) must go through the catalog's plain update path
 /// instead, never through here.
-String checkCatalogAdmission(const RefCatalog & candidate, const RootNamespace & admitting_ns);
+String checkCatalogAdmission(
+    const RefCatalog & candidate, uint64_t gc_shards, const Layout & layout,
+    const RootNamespace & admitting_ns);
 
 }

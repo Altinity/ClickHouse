@@ -232,7 +232,7 @@ TEST(CasGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/removing-without-parent@cas@"};
     const UInt128 life_id{91};
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = life_id});
     CasRefCatalog::casUpdate(*backend, layout, [](const RefCatalog & current)
     {

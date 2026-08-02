@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -288,7 +289,15 @@ void checkCatalogObjectBytes(uint64_t encoded_bytes, const RootNamespace & ns)
 
 uint64_t foldSealFixedBytes()
 {
-    static const uint64_t bytes = encodeFoldSeal(CasFoldSeal{}).size();
+    static const uint64_t bytes = []
+    {
+        CasFoldSeal seal;
+        seal.generation = std::numeric_limits<uint64_t>::max();
+        seal.parent_generation = std::numeric_limits<uint64_t>::max();
+        const uint64_t empty_bytes = encodeFoldSeal(seal).size();
+        /// The empty trailer is `{"n":0}`. A real seal may carry a 20-digit record count.
+        return addByteBudget(empty_bytes, std::numeric_limits<uint64_t>::digits10);
+    }();
     return bytes;
 }
 
@@ -314,32 +323,72 @@ uint64_t worstCaseEntryFoldReservationBytes()
                                  .next_retry_round = kU64Max}},
             .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{kU64Max, kU64Max}}};
 
-        return encodeFoldSeal(seal).size() - foldSealFixedBytes();
+        return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
     }();
     return bytes;
 }
 
-void checkFoldSealReservation(uint64_t entry_count, const RootNamespace & ns)
+uint64_t widestBlobTargetRunReservationBytes(const Layout & layout, uint64_t gc_shards)
+{
+    if (gc_shards == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS ref catalog: gc_shards must be nonzero when reserving blob-target rows");
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    CasFoldSeal seal;
+    seal.blob_target_runs.push_back(RunRef{
+        .key = layout.blobTargetRunKey(max, max, gc_shards - 1, 0),
+        .checksum = std::numeric_limits<UInt128>::max(),
+        .shard = gc_shards - 1,
+        .generation = max});
+    return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
+}
+
+uint64_t widestCondemnedSummaryReservationBytes(uint64_t gc_shards)
+{
+    if (gc_shards == 0)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS ref catalog: gc_shards must be nonzero when reserving condemned-summary rows");
+
+    constexpr uint64_t max = std::numeric_limits<uint64_t>::max();
+    CasFoldSeal seal;
+    seal.condemned_summary.emplace(gc_shards - 1, CondemnedSummary{
+        .condemned_total = max,
+        .pending_total = max,
+        .oldest_nonpending_condemn_round = max});
+    return encodeFoldSeal(seal).size() - encodeFoldSeal(CasFoldSeal{}).size();
+}
+
+void checkFoldSealReservation(
+    uint64_t entry_count, uint64_t gc_shards, const Layout & layout, const RootNamespace & ns)
 {
     const uint64_t cap = foldSealCaps().object_cap;
     const uint64_t fixed = foldSealFixedBytes();
     /// Saturating, like `fitsObjectCap`'s own addition one step later: an unsaturated product can
     /// wrap to a remainder far smaller than the true reservation, which would answer "fits" for an
     /// `entry_count` that plainly does not.
-    const uint64_t reservation = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
+    const uint64_t ref_lives = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
+    const uint64_t blob_target_runs = mulByteBudget(
+        gc_shards, widestBlobTargetRunReservationBytes(layout, gc_shards));
+    const uint64_t condemned_summaries = mulByteBudget(
+        gc_shards, widestCondemnedSummaryReservationBytes(gc_shards));
+    const uint64_t reservation = addByteBudget(
+        ref_lives, addByteBudget(blob_target_runs, condemned_summaries));
     if (!fitsObjectCap(fixed, reservation, cap))
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-            "CAS ref catalog: admitting '{}' would need a fold seal reserving {} bytes for {} entries "
-            "plus the {}-byte fixed frame, over the {}-byte fold-seal object cap (predicate 2: "
-            "fold_fixed_bytes + entry_count * worst_case_entry_reservation <= fold_seal_object_cap) -- "
-            "refused before the write", ns.string(), reservation, entry_count, fixed, cap);
+            "CAS ref catalog: admitting '{}' would need a fold seal reserving fixed={} + ref_lives={} "
+            "+ blob_target_runs={} + condemned_summaries={} bytes (entries={}, gc_shards={}), over "
+            "the {}-byte fold-seal object cap (predicate 2) -- refused before the write",
+            ns.string(), fixed, ref_lives, blob_target_runs, condemned_summaries, entry_count, gc_shards, cap);
 }
 
-String checkCatalogAdmission(const RefCatalog & candidate, const RootNamespace & admitting_ns)
+String checkCatalogAdmission(
+    const RefCatalog & candidate, uint64_t gc_shards, const Layout & layout,
+    const RootNamespace & admitting_ns)
 {
     const String encoded = encodeRefCatalog(candidate);   /// grammar-checked; LOGICAL_ERROR on our own bug
     checkCatalogObjectBytes(encoded.size(), admitting_ns);           /// predicate (1)
-    checkFoldSealReservation(candidate.entries.size(), admitting_ns); /// predicate (2)
+    checkFoldSealReservation(candidate.entries.size(), gc_shards, layout, admitting_ns); /// predicate (2)
     return encoded;
 }
 

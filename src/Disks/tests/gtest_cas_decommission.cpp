@@ -391,7 +391,7 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
         entry.ns = ns;
         entry.state = NsState::Live;
         entry.incarnation = UInt128{next_test_life.fetch_add(1)};
-        CasRefCatalog::casAdmitEntry(backend, layout, entry);
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
     }
 
     for (uint64_t i = 0; i < committed; ++i)

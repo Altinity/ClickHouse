@@ -205,7 +205,8 @@ RefCatalog CasRefCatalog::casUpdate(
         backend, layout, identity_preserving_mutate, [](const RefCatalog & c) { return encodeRefCatalog(c); });
 }
 
-RefCatalog CasRefCatalog::casAdmitEntry(Backend & backend, const Layout & layout, const CatalogEntry & entry)
+RefCatalog CasRefCatalog::casAdmitEntry(
+    Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
 {
     if (entry.state == NsState::Removing)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -228,7 +229,10 @@ RefCatalog CasRefCatalog::casAdmitEntry(Backend & backend, const Layout & layout
         return next;
     };
     return casUpdateImpl(backend, layout, mutate,
-        [&entry](const RefCatalog & c) { return checkCatalogAdmission(c, entry.ns); });
+        [&entry, gc_shards, &layout](const RefCatalog & c)
+        {
+            return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+        });
 }
 
 CasRefCatalog::BeginRemovingOutcome CasRefCatalog::beginRemoving(
@@ -485,7 +489,8 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
 }
 
 CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
-    Backend & backend, const Layout & layout, const RootNamespace & ns, const CreatorFence & creator,
+    Backend & backend, const Layout & layout, uint64_t gc_shards,
+    const RootNamespace & ns, const CreatorFence & creator,
     uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
     const CkptDeadline & deadline)
 {
@@ -507,7 +512,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
                               .incarnation = mintFreshIncarnation(), .creator = creator};
-    casAdmitEntry(backend, layout, entry);   /// step 1
+    casAdmitEntry(backend, layout, gc_shards, entry);   /// step 1
     return completeCreation(backend, layout, entry, admitted_generation, check_fence_or_throw, deadline);
 }
 
