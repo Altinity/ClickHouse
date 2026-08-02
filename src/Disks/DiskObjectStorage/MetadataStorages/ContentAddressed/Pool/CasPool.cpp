@@ -1574,9 +1574,9 @@ RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
     return ref_ledger.appendRefOps(ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
 }
 
-bool Pool::trySnapshotPublishOnce(const RootNamespace & ns)
+bool Pool::tryPublishSnapshotAndAdvanceCheckpointOnce(const RootNamespace & ns)
 {
-    return ref_ledger.trySnapshotPublishOnce(ns);
+    return ref_ledger.tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
 }
 
 size_t Pool::wedgedRefLaneCount()

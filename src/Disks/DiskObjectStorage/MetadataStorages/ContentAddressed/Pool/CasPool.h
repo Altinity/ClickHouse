@@ -579,7 +579,7 @@ public:
     /// "Snapshot create fails: keep all logs; writer recovery remains unchanged"). Public so tests can
     /// drive one attempt deterministically without depending on the background dispatch's timing;
     /// production reaches it only through `maybeScheduleSnapshotPublish`.
-    bool trySnapshotPublishOnce(const RootNamespace & ns);
+    bool tryPublishSnapshotAndAdvanceCheckpointOnce(const RootNamespace & ns);
 
     /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
     /// Every one of them names ONE LIFE of the namespace (directive §2): the caller passes the life it
@@ -835,7 +835,7 @@ public:
     /// test seam: blocks until every background snapshot-publish attempt dispatched so far for
     /// `ns` has settled. Needed only by tests that exercise the REAL background dispatch (production
     /// concurrency); tests that just want deterministic publish-logic coverage call
-    /// `trySnapshotPublishOnce` directly instead.
+    /// `tryPublishSnapshotAndAdvanceCheckpointOnce` directly instead.
     void waitForSnapshotPublishSettleForTest(const RootNamespace & ns);
 
     /// test seam: the count of in-flight background snapshot-publish attempts for resident `ns` (the

@@ -3681,8 +3681,8 @@ bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
 void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
     /// `admitSnapshotPublishUnderStateLock` already incremented `pending_snapshot_publishes` for THIS
-    /// dispatch. Off the mutation hot path: `trySnapshotPublishOnce` never touches the append queue, so
-    /// dispatching it onto an unrelated global-pool thread can never deadlock a flush leader.
+    /// dispatch. Off the mutation hot path: `tryPublishSnapshotAndAdvanceCheckpointOnce` never touches
+    /// the append queue, so dispatching it onto an unrelated global-pool thread can never deadlock a flush leader.
     /// `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and hence this ledger member --
     /// alive for the thread's lifetime.
     ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishDispatched);
@@ -3694,7 +3694,7 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
             setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
             try
             {
-                trySnapshotPublishOnceOnRuntime(ns, rt);
+                tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt);
             }
             catch (...)
             {
@@ -3862,8 +3862,9 @@ std::set<std::pair<String, ManifestRef>> CasRefLedger::livePrecommitsForTest(con
 
 namespace
 {
-/// A clamped-to-zero fetch-subtract for the tail counters. `trySnapshotPublishOnce` is public and NOT
-/// serialized against itself (two overlapping attempts can finish out of order), so the monotonic guard
+/// A clamped-to-zero fetch-subtract for the tail counters.
+/// `tryPublishSnapshotAndAdvanceCheckpointOnce` is public and NOT serialized against itself (two
+/// overlapping attempts can finish out of order), so the monotonic guard
 /// below
 /// skips a stale (superseded) adoption's subtraction outright, but it cannot see a SMALLER-candidate
 /// attempt that lands its adoption BEFORE a larger-candidate one already in flight: that ordering would
@@ -3902,14 +3903,14 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId &
     return outcome;
 }
 
-bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
+bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnce(const RootNamespace & ns)
 {
     const auto rt = acquireMutableRefTableRuntime(ns);
-    return trySnapshotPublishOnceOnRuntime(ns, rt);
+    return tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt);
 }
 
 
-bool CasRefLedger::trySnapshotPublishOnceOnRuntime(
+bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
     const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
     ensureRefTableRecovered(ns, *rt);
@@ -4067,8 +4068,9 @@ bool CasRefLedger::trySnapshotPublishOnceOnRuntime(
     catch (...)
     {
         /// Swallowed deliberately, and ONLY here: the snapshot body is already durable, so there is
-        /// nothing to undo and nothing for a caller to decide -- `trySnapshotPublishOnce` is one
-        /// best-effort attempt whose every other failure arm also returns false with a backoff. The
+        /// nothing to undo and nothing for a caller to decide --
+        /// `tryPublishSnapshotAndAdvanceCheckpointOnce` is one best-effort attempt whose every other
+        /// failure arm also returns false with a backoff. The
         /// counter and the log line are what keep it from being silent.
         tryLogCurrentException(getLogger("CasPool"),
             "CAS ref table '" + ns.string() + "': the snapshot body is durable but its _ckpt checkpoint "

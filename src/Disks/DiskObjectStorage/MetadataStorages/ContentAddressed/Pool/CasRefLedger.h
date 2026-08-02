@@ -223,7 +223,7 @@ public:
     /// Attempts one snapshot publication from a copy of the live state. The copy is made under
     /// `state_mutex`, the conditional `PUT` is performed without that mutex, and counters are adopted
     /// only when this attempt successfully publishes the captured snapshot.
-    bool trySnapshotPublishOnce(const RootNamespace & ns);
+    bool tryPublishSnapshotAndAdvanceCheckpointOnce(const RootNamespace & ns);
 
     /// Counts tables with an unresolved append `PUT`; the walk takes each table lock briefly and never
     /// waits for the network operation that caused a wedge.
@@ -811,7 +811,7 @@ private:
     /// Publishes only from the exact runtime captured by the caller. Background dispatch carries this
     /// pointer across the thread hand-off; it must never resolve the logical name again and accidentally
     /// publish a same-name successor while settling the predecessor's in-flight accounting.
-    bool trySnapshotPublishOnceOnRuntime(
+    bool tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// The logical-name cache owns no lifecycle identity. It merely points at the runtime currently
@@ -1122,8 +1122,8 @@ private:
     ///     `commitRefChunk` passes that prepared value here. The split is deliberate -- DECIDING the
     ///     contribution is pure preparation, while THIS call is a birth chunk's first durable effect, so
     ///     the publish had to stay behind when preparation moved out;
-    ///   - `trySnapshotPublishOnce` contributes `checkpoint_snapshot_id` once the snapshot body is
-    ///     durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
+    ///   - `tryPublishSnapshotAndAdvanceCheckpointOnce` contributes `checkpoint_snapshot_id` once the
+    ///     snapshot body is durable, and contributes NOTHING about `life_epoch` (an absence, which the semantic-max
     ///     merge leaves alone) because the publisher does not know it and must never guess;
     ///   - `runRecoveryWalkOnce` contributes `last_epoch_seal` once its own CAS-walk minted or adopted
     ///     one -- it is the only writer that mints seals, so it is the only writer that can record

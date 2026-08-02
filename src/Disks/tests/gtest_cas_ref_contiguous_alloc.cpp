@@ -471,7 +471,7 @@ TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
     const RootNamespace ns{"srv1/contig_poison_publish"};
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns)) << "a healthy table must publish, or the refusal "
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns)) << "a healthy table must publish, or the refusal "
                                                      "asserted below would prove nothing";
     const auto published_before = store->newestPublishedSnapshotIdForTest(ns);
     ASSERT_TRUE(published_before.has_value());
@@ -495,7 +495,7 @@ TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
     EXPECT_EQ(publishRef(store, ns, "ref_3", 3), (RefTxnId{epoch, 3}));
 
     /// Publication is safe because recovery installed the stranded transaction first.
-    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
         << "the stranded transaction is durable and was re-derived -- publishing is safe precisely "
            "because there is nothing left to omit";

@@ -670,7 +670,7 @@ TEST(CasRefCkpt, ACommittedSnapshotPublishAdvancesTheCheckpoint)
     const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
     ASSERT_FALSE(readCkptOrFail(*backend, store->layout(), life).checkpoint_snapshot_id.has_value());
 
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const auto published = store->newestPublishedSnapshotIdForTest(ns);
     ASSERT_TRUE(published.has_value());
 
@@ -696,7 +696,7 @@ TEST(CasRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewS
 
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{epoch, 1}));
     const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const RefTxnId first_snapshot = *store->newestPublishedSnapshotIdForTest(ns);
 
     ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{epoch, 2}));
@@ -705,7 +705,7 @@ TEST(CasRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewS
     const std::optional<RefTxnId> stale_checkpoint = readCkptOrFail(*backend, store->layout(), life).checkpoint_snapshot_id;
     ASSERT_EQ(stale_checkpoint, first_snapshot);
 
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const RefTxnId second_snapshot = *store->newestPublishedSnapshotIdForTest(ns);
     ASSERT_LT(first_snapshot, second_snapshot);
 
@@ -734,7 +734,7 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     const uint64_t writes_after_birth = backend->casPutCount(key);
     EXPECT_EQ(writes_after_birth, 1u) << "the birth creates the object with exactly one CAS";
 
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_birth + 1) << "one publication, one checkpoint CAS";
     const uint64_t writes_after_publish = backend->casPutCount(key);
     const auto after_publish = readCkpt(*backend, store->layout(), life);
@@ -742,8 +742,8 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
 
     /// Nothing was appended since, so there is nothing above the newest snapshot: the publisher declines
     /// before it reaches the checkpoint at all, and repeating the attempt changes nothing.
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns));
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_publish);
     EXPECT_EQ(readCkptOrFail(*backend, store->layout(), life), after_publish->ckpt);
 }
@@ -780,7 +780,7 @@ TEST(CasRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
 
     /// The publish entry point recovers first, so the snapshot covers the stranded transaction.
-    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_TRUE(store->resolveRef(ns, "ref_2", /*allow_stale=*/false).has_value())
         << "the stranded transaction is durable; the re-derivation must have applied it";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
@@ -826,7 +826,7 @@ TEST(CasRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
         DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
     };
 
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns))
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
         << "a publish whose checkpoint could not be advanced must not report success";
     EXPECT_TRUE(hook_fired) << "the checkpoint read-then-CAS seam was never exercised";
     backend->on_get = nullptr;

@@ -1788,7 +1788,7 @@ TEST(RefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameRebi
 
     auto publisher = std::async(std::launch::async, [&]() -> bool
     {
-        return store->trySnapshotPublishOnce(ns);
+        return store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
     });
     SCOPE_EXIT({
         {
@@ -1877,7 +1877,7 @@ TEST(RefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapshotP
 
     auto publisher = std::async(std::launch::async, [&]() -> bool
     {
-        return store->trySnapshotPublishOnce(ns);
+        return store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
     });
     SCOPE_EXIT({
         {
@@ -2203,7 +2203,7 @@ TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
     /// The ONE committed txn under test.
     build->promote(ns, "a", build->buildId(), id);
 
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns))
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
         << "publish-from-live: a just-committed txn is immediately coverable, with no grace window";
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
@@ -2255,7 +2255,7 @@ TEST(RefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurrentA
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
 
     backend->armPutBlock("_snap/");
-    std::thread publisher([&] { store->trySnapshotPublishOnce(ns); });
+    std::thread publisher([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
     backend->awaitBlockEntered();   /// the candidate (count=2) is captured; the PUT is now in flight, no lock held
 
     publishEmptyPart(store, ns, "b");   /// +2 more commits land WHILE the publish's PUT is in flight
@@ -2346,8 +2346,8 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     const Layout layout("p");
     const RootNamespace ns{"srv1/concurrent_publish_monotonic"};
     PoolConfig config;
-    /// High thresholds: NO automatic background dispatch -- we drive `trySnapshotPublishOnce` directly
-    /// for full determinism.
+    /// High thresholds: NO automatic background dispatch -- we drive
+    /// `tryPublishSnapshotAndAdvanceCheckpointOnce` directly for full determinism.
     config.snapshot_log_count_threshold = 1ULL << 40;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     auto store = openPoolWithConfig(backend, config);
@@ -2359,13 +2359,13 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     /// different `_snap/<id>` key proceeds unblocked.
     backend->armPutBlockFirstMatchOnly("_snap/");
 
-    std::thread publisher1([&] { store->trySnapshotPublishOnce(ns); });
+    std::thread publisher1([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
     backend->awaitBlockEntered();   /// #1 is parked mid-PUT on `_snap/<older>`, holding no lock
 
     /// While #1 is parked, commit more txns and run publish #2 to COMPLETION: it PUTs a strictly higher
     /// `_snap/<newer>` (unblocked) and adopts it, resetting the tail counters through its own candidate.
     publishEmptyPart(store, ns, "c");
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const auto newest_after_2 = store->newestPublishedSnapshotIdForTest(ns);
     ASSERT_TRUE(newest_after_2.has_value());
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "publish #2 covers everything committed so far";
@@ -2387,7 +2387,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     /// Independent proof no committed txn was lost: the NEXT publish's bytes must equal a full log replay.
     /// A regressed base would omit the txns committed while publish #1 was parked.
     publishEmptyPart(store, ns, "d");
-    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
     const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
@@ -2416,8 +2416,8 @@ TEST(RefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOut
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/clamp_out_of_order"};
     PoolConfig config;
-    /// High thresholds: NO automatic background dispatch -- we drive `trySnapshotPublishOnce` directly
-    /// for full determinism.
+    /// High thresholds: NO automatic background dispatch -- we drive
+    /// `tryPublishSnapshotAndAdvanceCheckpointOnce` directly for full determinism.
     config.snapshot_log_count_threshold = 1ULL << 40;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     auto store = openPoolWithConfig(backend, config);
@@ -2426,13 +2426,13 @@ TEST(RefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOut
 
     backend->armPutBlockIndependently("_snap/");
 
-    std::thread publisher_a([&] { store->trySnapshotPublishOnce(ns); });
+    std::thread publisher_a([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
     backend->awaitAtLeastNKeysBlocked(1);   /// A has captured (candidate=2 txns, count=2) and parked mid-PUT
     const String key_a = *backend->blockedKeysSnapshot().begin();
 
     publishEmptyPart(store, ns, "b");   /// tail: 4 -- publisher B's (larger) candidate, captured BELOW
 
-    std::thread publisher_b([&] { store->trySnapshotPublishOnce(ns); });
+    std::thread publisher_b([&] { store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns); });
     backend->awaitAtLeastNKeysBlocked(2);   /// B has ALSO captured (candidate=4 txns, count=4) and parked
     const auto blocked = backend->blockedKeysSnapshot();
     ASSERT_EQ(blocked.size(), 2u) << "both publishers must be parked past their own capture before either adopts";

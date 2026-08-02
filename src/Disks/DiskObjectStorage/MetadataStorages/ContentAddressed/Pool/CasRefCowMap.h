@@ -152,8 +152,9 @@ public:
     ///    the caller's exclusivity denies while `materialize` runs -- so no new sharer can appear.
     ///  - No racing decrement: every copy of a live state that lives on a DIFFERENT thread (the
     ///    background snapshot publisher's `candidate_state`) is BOTH created and destroyed under the same
-    ///    `state_mutex` this fold holds (see `CasRefLedger::trySnapshotPublishOnce`, which resets its copy
-    ///    under the lock rather than at function return). So no cross-thread `shared_ptr` release can run
+    ///    `state_mutex` this fold holds (see
+    ///    `CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnce`, which resets its copy under the lock
+    ///    rather than at function return). So no cross-thread `shared_ptr` release can run
     ///    concurrently with -- and form a data race against -- this relaxed `use_count()` load. The
     ///    flush's OWN same-thread scratch copy (`working`) is released BEFORE this fold by program order
     ///    on the one thread, which is a happens-before all its own.
