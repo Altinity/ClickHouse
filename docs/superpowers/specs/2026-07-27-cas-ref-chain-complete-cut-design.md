@@ -1,5 +1,5 @@
 ---
-description: 'v9 CORE design for the LIST-incompleteness release blocker: per-namespace contiguous ref ids, in-band epoch seals, a namespace catalog with opaque life identities, a per-namespace checkpoint object, a mandatory destructive-round frontier proof and a REBUILD-surviving hold — LIST is a zero-trust hint; two new object kinds, both off the append hot path. Adjacent pre-existing defects surfaced by eight review rounds live in the companion register, not here.'
+description: 'v9 CORE design for the LIST-incompleteness release blocker: per-namespace contiguous ref ids, in-band epoch seals, a namespace catalog with opaque life identities, an exact committed-through checkpoint frontier, a mandatory destructive-round frontier proof and a REBUILD-surviving hold — LIST is a zero-trust hint. Adjacent pre-existing defects surfaced by eight review rounds live in the companion register, not here.'
 sidebar_label: 'CAS ref contiguous-chain'
 sidebar_position: 20260727
 slug: /superpowers/specs/cas-ref-chain-complete-cut-design
@@ -16,8 +16,11 @@ user delegated the proceed decision to convergence (unattended directive). **Bra
 
 Fixes BACKLOG `{#list-as-journal-dataloss-2026-07-25}` (observed:
 `reports/2026-07-26-list-incompleteness-investigation.md`) and closes the rev.4 `Late Predecessor
-PUT` limitation. Realizes P4 of `cas/draft-fixes-20260726.md`: zero added requests on the append path
-and the fold's per-record path. Two new object kinds (`ref_catalog`, `_ckpt`), both off the hot path.
+PUT` limitation. The original P4 target in `cas/draft-fixes-20260726.md` asked for zero added append
+requests. That target was tried and rejected after the recovery audit: without one exact durable
+committed-through fact, an incomplete `LIST` cannot tell recovery where acknowledged history ends,
+while serial `GET N+1` has neither a bounded stop nor acceptable S3 cost. The catalog and `_ckpt`
+remain the only new mutable object kinds; `_ckpt` is deliberately on the chunk-commit path.
 
 ## 1. Problem {#problem}
 
@@ -28,9 +31,8 @@ sparse id space** — the pool-wide `next_ref_sequence` makes per-namespace gaps
 hole demands a certificate. The fix is invariants under which absence and committed-ness are decided
 by arithmetic, point reads and conditional writes — the operations the store performed honestly even
 while its LIST lied. Stated up front: blob in-degree is POOL-WIDE, so destructive rounds need a
-frontier proof for EVERY catalog namespace — one exact 404 `GET` per quiet namespace per destructive
-round is the honest price (fold-only rounds are free; at extreme namespace counts this is the knob
-where the head-CAS alternative re-enters, §8).
+frontier proof for EVERY catalog namespace. The exact `_ckpt.committed_through` value supplies the
+finite bound; a quiet namespace no longer proves absence with an unbounded or LIST-nominated chase.
 
 **Why the namespace universe is an object and not a listing — stated precisely, because the loose
 version invites a correct rebuttal.** The claim is NOT "LIST is unreliable". It is that a paginated
@@ -346,10 +348,26 @@ obligation that has to be re-derived on every format change; do not restore it.
 > alive with no reader.
 
 **INV-4 — `_ckpt`.** `cas/ns/state/<life_id>/_ckpt`, token-CAS,
-`{life_epoch, checkpoint_snapshot_id | none, last_epoch_seal | none}` — forced by prefix cleaning
-(a cleaned prefix plus a hidden snapshot is indistinguishable from empty). One update algorithm for
-both writers (snapshot publisher; sealer): read → validate → merge by semantic maximum per field →
-token-CAS; identical merged body → return without a CAS; retries bound to the recovery deadline.
+`{life_epoch, committed_through | none, checkpoint_snapshot_id | none, last_epoch_seal | none}`.
+`committed_through` is the greatest transaction in durable logical history, not the greatest key a
+writer or `LIST` happened to observe. Every acknowledged chunk is at or below it. One update
+algorithm serves the append lane, snapshot publisher and sealer: read → validate → merge a bounded
+monotone contribution → token-CAS; identical merged body → return without a CAS; retries are bound to
+the recovery deadline. A checkpoint snapshot and `last_epoch_seal` may never exceed
+`committed_through`; a contribution that would do so is corruption rather than a partial update.
+The append order is immutable log PUT → `_ckpt.committed_through` CAS → in-memory install/acknowledge →
+allocation of the next id. A birth first publishes `life_epoch`, as required by creation ordering,
+then writes the birth log and advances `committed_through`. An epoch-seal contribution advances
+`last_epoch_seal` and `committed_through` in the same checkpoint CAS.
+
+This field is forced by recovery, not prefix cleaning: a cleaned prefix plus a hidden snapshot is
+indistinguishable from empty, and a listed or exact-read log proves that object exists but not that
+the transaction was acknowledged. If a log PUT is durable while frontier publication is unresolved,
+the lane remains `NeedsRecovery`, allocates no successor, and returns no success. Writer-mount
+recovery may exact-read and validate the single deterministic successor, then advance the frontier
+under its admitted fence. Read-only recovery stops at the durable frontier. It never probes numeric
+keys until a 404 happens to answer.
+
 Snapshots are deletable only STRICTLY BELOW `_ckpt.checkpoint` (a stale pointer can only
 under-clean). Missing sampled base → reread `_ckpt`: token advanced → restart; unchanged →
 corruption. Removal does not synchronously delete `_ckpt`: once the completed, unheld ref-life row is
@@ -435,9 +453,10 @@ barrier between catalog deletion and successor-seal adoption. **Recovery ownersh
 generation is captured at admission and required on every `slot-occupy`, `_ckpt` CAS and install;
 self-remount cancels or waits out recovery before rearming. **Migration: recreate-only.** Task 4d's
 layout is generation 6 and Task 5's incompatible `ref_lives`/`_cleanup` wire removal is generation 7;
-each pool format bump advances writer generation AND backward floor. Older-format startup fails closed
-at pool open naming recreation; there is no dual reader or migration, and recreation must be quiesced
-so no old writer touches the reused prefix.
+Task 5 capacity authority is generation 8; Task 5b's `committed_through` checkpoint field is
+generation 9. Each pool format bump advances writer generation AND backward floor. Older-format
+startup fails closed at pool open naming recreation; there is no dual reader or migration, and
+recreation must be quiesced so no old writer touches the reused prefix.
 
 **Same-name reuse is supported, and no database engine is forbidden.** A namespace derived from a
 table UUID effectively never recurs, because a recreated table mints a fresh UUID — but three routes
@@ -456,10 +475,22 @@ still leave the explicit-UUID route unguarded.
 
 ## 4. Recovery {#recovery}
 
-Catalog (state + incarnation) → `_ckpt` → exact-key snapshot (revalidation rule) → arithmetic tail
-(`last + 1`; hint omissions fetched by exact key; a 404 below a durable same-epoch higher id →
-vanish-restart, then fail closed) → CAS-walk + seal → `_ckpt` CAS → install. Acked ⇒ durable ⇒
-dense ⇒ found.
+Catalog (state + opaque life id) → exact `_ckpt` → exact-key snapshot (revalidation rule) → finite
+arithmetic replay ending exactly at `committed_through` → CAS-walk + seal → install. A stream `LIST`
+may offer a newer snapshot candidate, diagnostics and garbage nominations; it never supplies genesis,
+the committed frontier or a stop condition. A hinted snapshot above `committed_through` is ignored and
+surfaced, not adopted. Without a base, replay starts at `{life_epoch, 1}`. With a base, it starts at
+the base's successor. A readable checkpoint with no `committed_through` represents a life with no
+committed transaction and needs no read-only replay. Missing a required key at or below a present
+`committed_through`, an invalid chain link, or an unreadable required checkpoint is corruption.
+
+Writer-mount recovery has one additional bounded duty. If the append attempt may have landed after
+the durable frontier, it exact-reads the single deterministic successor. Matching bytes and a valid
+chain permit the same fenced checkpoint contribution; different bytes or an invalid successor are
+corruption, and absence permits the existing conditional retry. The lane cannot have allocated a
+second unfrontiered transaction. Read-only recovery never adopts this successor. A lost frontier-CAS
+response is resolved by exact-reading `_ckpt` and validating the transaction through the exact chain,
+not by retrying blindly or consulting `LIST`.
 
 ## 5. GC fold and deletion safety {#fold}
 
@@ -475,17 +506,20 @@ current `life_id`, or inability to obtain the one coherent token/value pair abor
 DEFER, fold or successor publication; there is no parent-evidence fallback or second fold catalog GET.
 The separately paced dead-life janitor is not part of this hot enumeration; when scheduled, it takes
 one bounded `LIST(cas/ns/)` page and its own later post-page catalog cut as specified by INV-3. Fold
-work advances hinted namespaces by arithmetic (`cursor + 1`; the `GET` per record was always owed;
-hint holes — including the observed `0x1430c`/`0x1430d` shape — fold through unnoticed); epochs are
-crossed only by consuming seals; impossible shapes (a 404 below a same-epoch witness — including one
-that DISAPPEARS later: an above-cursor witness cannot be legitimately cleaned, so its disappearance
-is corruption, never grounds for clearing — or an unconsumed-seal crossing) HOLD the namespace.
+work advances every catalog-admitted namespace by arithmetic from its adopted cursor through the
+exact `_ckpt.committed_through` bound. `LIST` may prioritize work and offer snapshots, but an omitted
+life receives the same finite exact walk. Hint holes — including the observed
+`0x1430c`/`0x1430d` shape — therefore fold through unnoticed. Epochs are crossed only by consuming
+seals. A 404 at or below the committed frontier, a checkpoint field above that frontier, or an
+unconsumed-seal crossing HOLDs the namespace.
 
 **Destructive-round frontier proof.** A round may run destructive work (condemnation, graduation,
-deletion, sweep deletes, ref cleanup) only holding a frontier proof for EVERY `Live`/`Removing`
-entry: hinted-active namespaces prove theirs by walking to an absent expected-next; every other
-namespace gets one exact `GET cursor+1` (present → it was wrongly quiet, walk it). Budget exhausted
-first → cursor advances may seal, all destruction suppressed. **The temporal lemma, normative (split per r9-2):** the proof is a snapshot, and the existing
+deletion, sweep deletes, ref cleanup) only after EVERY `Live`/`Removing` entry reaches the
+`committed_through` value from the same checkpoint observation admitted for that round. A missing or
+unreadable checkpoint, a walk that stops below a present frontier, or budget exhaustion may still publish
+safe cursor progress, but suppresses all destruction. There is no expected-next 404 proof and no
+special quiet-namespace branch. A checkpoint with no frontier proves an empty committed stream.
+**The temporal lemma, normative (split per r9-2):** the proof is a snapshot, and the existing
 machinery closes each window — a `+1` landing after its namespace's probe cannot lose data because a
 newly condemned blob is not deleted in the same round, and for the already-delete-pending case each
 writer path has its own closure: SOURCE-BACKED/TOKENED adoption reads `Condemned` meta and
@@ -498,18 +532,12 @@ only delays reclamation. **Third arm, found by the phase-0 model** (`CaRefDeltaI
 condemnation hits a still-LIVE blob — no rematerialization triggers — and a later round folds it
 while the pending exact-token delete still fires; the closure is the DELETE-SITE in-degree re-read
 (the existing `deleteExact` liveness re-check), which is hereby NORMATIVE, not an optimization.
-The model also proves a listing cannot be the SOLE witness source (it is a snapshot; a witness
-durable after the enumeration is invisible to that round's probes) — `_ckpt.checkpoint` doubles as a
-hint-independent second witness for the below-witness-404 hold, at zero cost (the fold already reads
-it for cleanup ranges), closing the premature-cleanup class (`_fix_ckptwitness` green) but NOT the
-general case: a gap above `_ckpt.checkpoint` in a namespace the hint never mentions stays invisible.
-**Named residual (`_witness_corruptgap`, committed RED):** if an above-cursor record is lost to
-CORRUPTION before any round observed a witness above it, and the hint never mentions the namespace,
-the exact `GET cursor+1` honestly answers absent, the frontier proof is granted, and a `-1`
-elsewhere can delete a blob an intact acked `+1` above the gap still names. The precondition
-(silent loss of a durable object to point reads) is outside §1's trust model; the residual is
-recorded here so it is a named exposure, not a silent one — the structural closure remains the
-head-CAS alternative (§10 north star).
+The model also proves a listing cannot be the sole witness source: a record durable after enumeration
+is invisible to that observation. `_ckpt.committed_through` is instead the exact witness for all
+acknowledged history. A missing object below it is corruption and keeps destruction shut. The former
+`_witness_corruptgap` residual and its expected-next-404 proof are retired only after Task 5b's
+frontier model and full/empty/partial/reordered-LIST equivalence tests land; until then production
+deletion for catalog-named namespaces remains conservatively disabled.
 
 **The hold is durable and survives REBUILD.** `ShardCoverage::classification == 4` carries
 `{reason, offending position, retry/backoff}` per `(namespace, incarnation)` — a strict grammar:
@@ -550,9 +578,20 @@ R2/R3 and lands as one coherent change referencing them):
   epochs; grants do not);
 - on ANY uncertainty — unreached frontier, budget exhaustion, hold — retain; delay is never damage.
 
+An eligible orphan manifest is exact-read and decoded before it becomes a candidate. Its blob/source
+edge identities enter a separate accounting-neutral retirement input: the reducer removes those exact
+manifest-source edges, but consumes no ref-transaction ordinal and does not count an already-absent
+edge as an unmatched ref removal. The resulting run and nomination cursor become durable in the
+round's `gc/state` CAS before the manifest's exact-token delete. Other sources for the same blobs
+survive; blobs whose current count becomes zero enter the ordinary condemnation pipeline. “Neutral”
+does not mean touch-only, and deletion is not gated on every blob having zero total in-degree — that
+shape would permanently retain the measured S42 manifest whose six blobs included four shared with
+other live sources.
+
 ## 7. REBUILD and fsck {#rebuild-fsck}
 
-REBUILD rebuilds ref-life coverage and edges from catalog + `_ckpt` + arithmetic tails, **condemns nothing**,
+REBUILD rebuilds ref-life coverage and edges from catalog + exact `_ckpt.committed_through` + finite
+arithmetic tails, **condemns nothing**,
 and preserves holds (§5). REBUILD uses the same catalog-only walk-plan constructor as an ordinary fold;
 every listed physical id is joined through its one catalog cut, and no other input can create a
 `ref_lives` row. It therefore constructs coverage only for an id that cut names as `Live`/`Removing`,
@@ -560,31 +599,35 @@ never creates a phantom logical namespace from an absent id, and refuses an ambi
 takes the same catalog-authoritative
 universe and reverse-index rule, but as a read-only diagnostic it reports duplicate rows, malformed
 keys and absent physical ids and continues over unrelated unique lives. It walks streams by arithmetic
-(`chain-broken` fatal in summary AND exit code), checks tails above `_ckpt.checkpoint`, reserves
+to the exact committed frontier (`chain-broken` fatal in summary AND exit code), reports physical
+objects above that frontier as uncommitted debris, reserves
 `unchecked` for the genuinely unproven, and returns clean for a healthy pool.
 
 ## 8. Costs, honestly {#costs}
 
-Append path: +0 requests (the allocator gets simpler). Recovery: +1 conditional PUT per touched
-namespace per epoch transition, and each adopted straggler costs a conditional PUT PLUS an exact
-`GET` (`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
+Append path: one additional `_ckpt` GET plus one token-CAS per committed chunk, about +2 serial S3
+round trips; batching amortizes them across all mutations in the chunk. No next id is allocated until
+that contribution is resolved. Recovery: +1 conditional PUT per touched namespace per epoch
+transition, and each adopted straggler costs a conditional PUT PLUS an exact `GET`
+(`putIfAbsent` conflicts return no bytes — r9-6) + one `_ckpt` CAS. Snapshot publication:
 +1 `_ckpt` CAS (async). DDL: three conditional writes to create; removal = one `gc/state` GET for the
 diagnostic start round + append-lane-admitted `Live→Removing` CAS + terminal append; the next GC
 invocation adds one adopted-seal GET and, for N eligible drain rows, at least N+1 complete catalog GETs
 (the initial scan plus a rescan after every resolved outcome) and N exact catalog-entry CASes in its
 pre-fold drain. Conflicts and ambiguity can add complete retry GETs and CASes before the hot LIST.
-Fold: +1 catalog `GET` per fold round, after its ONE hot LIST and before plan construction; destructive
-rounds add one exact `GET` per quiet namespace (the frontier proof). When scheduled, the perpetual
+Fold: +1 catalog `GET` per fold round, after its ONE hot LIST and before plan construction; each
+catalog-admitted life exact-reads `_ckpt` and performs only the finite replay through
+`committed_through`. There is no extra absent-next probe. When scheduled, the perpetual
 janitor adds one bounded page of the separately paced leak-only
 `cas/ns/` enumeration plus one catalog GET after that page; it never widens or repeats the round's hot
 `stream/` LIST and never reads the catalog per key. Deep arithmetic walks
 dominate backlog cost and share one pool-level concurrency budget with cleanup. Performance interactions
 with the measured GC study (3.42 M serial trips/round, 256 logs/s, 39.6 % manifest re-reads): P1 prefetch
 becomes arithmetic (mispredictions impossible); ONE strict ref enumeration per round; range cleanup;
-fsck replays tails. P2's round-scoped manifest cache and the
+fsck replays finite tails. P2's round-scoped manifest cache and the
 HEAD-per-edge veto are untouched; snapshot-diff folding is a BACKLOG future lever. At extreme
-namespace counts the per-namespace frontier `GET` approaches the head-CAS design's read cost — the
-recorded point to revisit that trade (§10).
+namespace counts the exact checkpoint reads remain linear in active lives, but they replace the
+former quiet-namespace 404 probes and are required by recovery as well as GC.
 
 ## 9. Verification {#verification}
 
@@ -634,7 +677,8 @@ after the probe during condemnation/graduation/deletion rounds;
 paused across `Live→Removing` cannot append positive ownership, including CAS-retry and fence-change
 admission cases;
 ambiguous-then-definite id reuse; CAS-walk both directions incl. clean transitions and `T+1` retry;
-`_ckpt` races (cleanup between PUT and CAS; stale base three-way; merge; no-op skip); recovery
+`_ckpt` races (cleanup between PUT and CAS; stale base three-way; merge; no-op skip; log durable
+before frontier; frontier response lost; checkpoint snapshot or seal above frontier); recovery
 across self-remount; incarnation inertness at rebirth under churn (create/drop per second: catalog
 size stays flat); legacy-pool open fails closed; hold grammar strict codec; max-size seal write
 check; and the four r9-5 sabotages: REBUILD with a missing/undecodable `gc/state` publishes only an
@@ -650,7 +694,9 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | alternative | disposition |
 |---|---|
 | v1–v4 certificate stack (prev links, seal intervals, pointers, authorities, generations, `R*`, tombstones) | Rejected by the user as accretion; deleted. |
-| Full head-CAS commit chain (blinded consult) | North star: revisit when the wedge is worth deleting or namespace counts make the frontier sweep expensive. v9 carries its catalog, checkpoint and opaque life identities. |
+| Full head-CAS commit chain (blinded consult) | Rejected for Task 5b: it adds a second mutable authority and a new object graph while expressing the same committed-through fact now carried by `_ckpt`. Revisit only if independently desired multi-chunk segment batching justifies that surface. |
+| Serial exact `GET N+1` until absence | Rejected: every probe is a full S3 round trip, a concurrent writer makes the stop unstable, and a 404 proves object absence rather than committed-history completeness. |
+| Recovery from a complete stream `LIST` | Rejected: completeness is the premise under test and cannot be a recovery fallback. The list remains scheduling, diagnostics and leak-only cleanup input. |
 | `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so an entry deletes as soon as its removal completes rather than waiting on one. |
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
 | Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert under its unreferenced opaque life id, and the catalog stays O(active). |
@@ -662,7 +708,10 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 
 History in one paragraph: contiguity is the project's own I7 (2026-07-10) resurrected; the ghost was
 the documented `Late Predecessor PUT` (rev.4), closed here within its own "no extra request per
-ordinary mutation" constraint; eight adversarial rounds (`gpt-5.6-sol` `xhigh`) plus one blinded
+ordinary mutation" constraint. The later LIST-independent recovery audit proved that constraint
+incompatible with bounded ordinary crash recovery: exact immutable logs have no committed stop fact,
+so Task 5b deliberately spends the `_ckpt` GET/CAS pair. Eight adversarial rounds (`gpt-5.6-sol`
+`xhigh`) plus one blinded
 simplification consult shaped the invariants — the full round-by-round record, including the two
 user scope interventions that cut certificate accretion (after round 4) and scope accretion (after
 round 8), lives in the review logs and this file's git history. Everything the rounds surfaced that
