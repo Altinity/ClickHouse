@@ -113,7 +113,8 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | v9 contiguous ref stream: state-derived dense ids, every-attempt reuse rule, `_ckpt`-based recovery base + arithmetic walk, in-band `slot-occupy` epoch seal — `LatePredecessorPut` FLIPPED from rev.4 expected-fail to green, with `_sab_noseal` as the control | CURRENT (v9 rewrite 2026-07-28; gates the ref-chain implementation) | `run_refsnaplog.sh` |
-| `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: arithmetic walk, destructive-round frontier proof, durable hold, and catalog-cut key-set semantics; consumes the pre-fold cut interface without owning its lifecycle | CURRENT | `run_deltaintake.sh` |
+| `CaWriterEpochBackfillCore.tla` | mandatory numeric epoch closure for an inactive namespace: every skipped global epoch receives its own sequence-1 empty `EpochSeal`; recovery, fold and destruction share a complete-chain gate | CURRENT (Task 5b focused gate) | `run_writer_epoch_backfill.sh` |
+| `CaRefDeltaIntakeCore.tla` | pool-wide GC fold: catalog-mandatory targets, exact same-round `_ckpt.committed_through`, arithmetic walk, committed-gap hold/retry, and catalog-cut key-set semantics | CURRENT (Task 5b amendment 2026-08-02) | `run_deltaintake.sh` |
 | `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
 | `CaRefLaneCore.tla` | append-lane ownership plus a bounded two-runtime name-cache composition: real attempt/resolver runtime capture, per-runtime cache/durable projections, immutable `(life_id, admitted_fence_generation)` identity, exact invalidation, accepted post-arm publication, and allocation-free missing-name confirmation | CURRENT (review-hardened 2026-08-01; gates checkpoint 7.5c runtime identity) | `run_reflane.sh` |
 | `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: opaque life id separate from lifecycle state, adopted-parent proof, conclusive identity-exact catalog drain, completed hot LIST, ONE fresh authoritative cut, life-id ref-plan intake, then fold/`REBUILD`/`DEFER`; red-controls consequential stale-cut omission, absent-listed debris deferral, predecessor-proof deletion of successor `Removing`, stale row and stale token independently; witness adopts successor `Removing` while an old request conflicts and predecessor bytes remain LIST-visible; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (amended 2026-08-01; sole owner of cross-object removal order, post-LIST cut provenance, identity-exact admission/deletion and inert-debris classification) | `run_prefold_drain.sh` |
@@ -255,11 +256,11 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
 - **`CaRefDeltaIntakeCore.tla`** — the GC's fold over ref deltas, POOL-WIDE (v9): two namespaces
   with contiguous ids share one blob, so the oracle is "was an acked `+1` still unaccounted when
   the blob was deleted", which no per-namespace invariant can see. The LIST is a zero-trust hint
-  consumed nowhere for correctness; the fold advances by arithmetic point reads; a destructive
-  round needs a frontier proof for EVERY namespace; an impossible shape HOLDS the namespace
-  durably, and REBUILD must carry the hold. Reproduces the r7-1 (cross-namespace hidden `+1`) and
-  r8 (REBUILD forgets the hold) blockers as counterexamples, and records one residual exposure of
-  v9 as a runnable witness. Full verdicts and traces: `CaRefDeltaIntakeCore_RESULTS.md`.
+  consumed nowhere for correctness. The catalog-built plan makes every `Live`/`Removing` life a
+  mandatory target; the fold snapshots exact `_ckpt.committed_through`, advances arithmetically only
+  through that bound, and treats any missing required key as a durable hold independent of LIST.
+  `ScanComplete` requires every target to reach the bound or reassert its gap, including every carried
+  hold on every later round. Full verdicts and traces: `CaRefDeltaIntakeCore_RESULTS.md`.
 - **`CaRefCatalogCore.tla`** — the local namespace lifecycle: one logical name lived repeatedly
   through `Creating`, `Live`, `Removing`, and absence. Fresh opaque life ids make surviving physical
   residue inert and keep the catalog bounded under churn. Creation and reconciliation retain their
