@@ -165,6 +165,9 @@ public:
     int fail_get_skip = 0;
     int fail_get_count = 0;
 
+    String fail_cas_substr;
+    int fail_cas_count = 0;
+
     std::optional<GetResult> get(const String & key, Range range) override
     {
         if (fail_get_count > 0 && !fail_get_substr.empty() && key.find(fail_get_substr) != String::npos)
@@ -178,6 +181,17 @@ public:
             }
         }
         return CountingBackend::get(key, range);
+    }
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        if (fail_cas_count > 0 && !fail_cas_substr.empty() && key.find(fail_cas_substr) != String::npos)
+        {
+            --fail_cas_count;
+            throw Poco::TimeoutException("WedgeTestBackend: simulated ambiguous checkpoint CAS");
+        }
+        return CountingBackend::casPut(key, bytes, expected, meta);
     }
 
     /// Park a matching PUT until `releaseBlock()`, notifying `awaitBlockEntered()` on arrival, so a
@@ -405,6 +419,39 @@ TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before + 2)
         << "the adopted wedge and the ordinary commit must each join the tail exactly once";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
+}
+
+TEST(CasRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCannotBePublished)
+{
+    auto backend = std::make_shared<WedgeTestBackend>();
+    auto store = openPool(backend, singleAttemptBudget());
+    const RootNamespace ns{"srv1/wedge_created_frontier_failed"};
+    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    backend->ambiguous_substr = logPrefix(store, ns);
+    backend->ambiguous_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(backend->get(wedged_key));
+    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
+
+    const NamespaceLifeId life = *store->refTableLifeForTest(ns);
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const RefCkpt ckpt_before = decodeRefCkpt(backend->get(ckpt_key)->bytes);
+    backend->fail_cas_substr = ckpt_key;
+    backend->fail_cas_count = 200;
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "y"); });
+
+    EXPECT_TRUE(backend->get(wedged_key)) << "the exact wedged log was proven durable";
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
+        << "a durable log without a confirmed frontier must not return to Ready";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
+        << "the unfrontiered wedge must not be installed into the resident table";
+    EXPECT_EQ(decodeRefCkpt(backend->get(ckpt_key)->bytes), ckpt_before);
 }
 
 TEST(CasRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)

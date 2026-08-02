@@ -15,6 +15,8 @@
 #include <Common/SipHash.h>
 #include <base/hex.h>
 
+#include <Poco/Exception.h>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -163,6 +165,84 @@ public:
 
 private:
     String watched_key;
+};
+
+/// Records the exact `_ckpt` recovery protocol and injects an ambiguous CAS response. The fault is
+/// armed only after fixture setup, so the journal contains solely the operation under test.
+class AmbiguousCkptBackend : public CountingBackend
+{
+public:
+    enum class Fault : uint8_t
+    {
+        None,
+        CommitThenThrow,
+        ThrowWithoutCommit,
+        AlwaysThrowWithoutCommit,
+    };
+
+    using CountingBackend::casPut;
+    using CountingBackend::get;
+
+    String watched_key;
+    Fault fault = Fault::None;
+    String dominating_bytes;
+    bool fail_resolution_get = false;
+    std::function<void()> before_resolution_get;
+    std::function<void()> after_resolution_get;
+    std::vector<String> journal;
+
+    void arm(const String & key, Fault fault_)
+    {
+        watched_key = key;
+        fault = fault_;
+        watched_get_count = 0;
+        journal.clear();
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (key != watched_key)
+            return CountingBackend::get(key, range);
+
+        journal.push_back("GET");
+        ++watched_get_count;
+        if (watched_get_count >= 2 && before_resolution_get)
+            before_resolution_get();
+        if (watched_get_count == 2 && fail_resolution_get)
+            throw Poco::TimeoutException("AmbiguousCkptBackend: exact-read response lost");
+        auto result = CountingBackend::get(key, range);
+        if (watched_get_count >= 2 && after_resolution_get)
+            after_resolution_get();
+        return result;
+    }
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        if (key != watched_key)
+            return CountingBackend::casPut(key, bytes, expected, meta);
+
+        journal.push_back("CAS");
+        if (fault == Fault::None)
+            return CountingBackend::casPut(key, bytes, expected, meta);
+        const Fault this_fault = fault;
+        if (fault != Fault::AlwaysThrowWithoutCommit)
+            fault = Fault::None;
+        if (this_fault == Fault::CommitThenThrow)
+        {
+            const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
+            if (result.outcome == CasOutcome::Committed && !dominating_bytes.empty())
+            {
+                const HeadResult head_result = CountingBackend::head(key);
+                EXPECT_EQ(CountingBackend::putOverwrite(key, dominating_bytes, head_result.token).outcome,
+                          PutOutcome::Done);
+            }
+        }
+        throw Poco::TimeoutException("AmbiguousCkptBackend: CAS response lost");
+    }
+
+private:
+    size_t watched_get_count = 0;
 };
 
 }
@@ -595,6 +675,146 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
                                                              "committed the complete merged body or wrote nothing";
 }
 
+TEST(CasRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_committed"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
+}
+
+TEST(CasRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_retry"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->arm(key, AmbiguousCkptBackend::Fault::ThrowWithoutCommit);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET", "CAS"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
+}
+
+TEST(CasRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_dominating"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt dominating{.life_epoch = 5, .committed_through = ID_2_1,
+                             .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->dominating_bytes = encodeRefCkpt(dominating);
+    backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), dominating);
+}
+
+TEST(CasRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_read_failed"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->fail_resolution_get = true;
+    backend->arm(key, AmbiguousCkptBackend::Fault::ThrowWithoutCommit);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        publishCkpt(*backend, layout, life, RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                    .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 7,
+                    ALWAYS_ADMITTED, generousDeadline());
+    });
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), base);
+}
+
+TEST(CasRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
+{
+    for (const bool move_before_read : {true, false})
+    {
+        auto backend = std::make_shared<AmbiguousCkptBackend>();
+        const Layout layout{"p"};
+        const NamespaceLifeId life = NamespaceLifeId::stageATransition(
+            RootNamespace{move_before_read ? "srv1/ckpt_fence_before_resolution" : "srv1/ckpt_fence_after_resolution"});
+        const String key = layout.refCkptKey(life);
+        const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                           .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+        ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+        bool admitted = true;
+        const auto move_fence = [&] { admitted = false; };
+        if (move_before_read)
+            backend->before_resolution_get = move_fence;
+        else
+            backend->after_resolution_get = move_fence;
+        backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+        const auto check_admission = [&](uint64_t)
+        {
+            if (!admitted)
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "fence moved");
+        };
+        EXPECT_EQ(publishCkpt(*backend, layout, life,
+                              RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                                      .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 7,
+                              check_admission, generousDeadline()), CkptPublishOutcome::FencedOut);
+        EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    }
+}
+
+TEST(CasRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCasAttempts)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguity_deadline"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    uint64_t now = 0;
+    backend->after_resolution_get = [&] { ++now; };
+    backend->arm(key, AmbiguousCkptBackend::Fault::AlwaysThrowWithoutCommit);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        publishCkpt(*backend, layout, life,
+                    RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
+                    7, ALWAYS_ADMITTED, CkptDeadline{[&] { return now; }, 3});
+    });
+    EXPECT_EQ(backend->journal,
+              (std::vector<String>{"GET", "CAS", "GET", "CAS", "GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), base);
+}
+
 /// A `_ckpt` that does not decode is NEVER overwritten. It is the only record of recovery's base and
 /// of what cleanup may delete, so replacing it with a body derived from the contribution alone would
 /// erase the base and leave a well-formed object a reader would trust.
@@ -752,7 +972,8 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
     const String key = store->layout().refCkptKey(life);
     const uint64_t writes_after_birth = backend->casPutCount(key);
-    EXPECT_EQ(writes_after_birth, 1u) << "the birth creates the object with exactly one CAS";
+    EXPECT_EQ(writes_after_birth, 2u)
+        << "birth publishes `life_epoch` before its log, then the durable log's committed frontier";
 
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_birth + 1) << "one publication, one checkpoint CAS";
@@ -908,7 +1129,9 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
 
 /// The directive's "preserve backend request counts", asserted rather than assumed: preparation is pure,
 /// so lifting it out must not add or remove a single request. One birth chunk = exactly one write-once
-/// `PUT` at the ref-log key, no read-back, and exactly one `_ckpt` CAS.
+/// `PUT` at the ref-log key, no read-back, plus the two ordered `_ckpt` CASes required by the protocol:
+/// creation publishes `life_epoch` before the log and the append lane publishes `committed_through`
+/// after the log is durable.
 ///
 /// COUNTS per key. Request ORDER is not checked here and cannot be with these counters; the ordering
 /// that matters for a birth -- `_ckpt` before the ref-log `PUT` -- is argued at the call site and would
@@ -932,9 +1155,9 @@ TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
     /// itself, the position the birth chunk is about to occupy. That GET precedes the Committed PUT;
     /// the PUT itself still owes no read-back.
     EXPECT_EQ(backend->getCount(log_key), 1u) << "one grounding probe from recovery, before the birth PUT";
-    EXPECT_EQ(backend->casPutCount(ckpt_key), 1u)
-        << "the birth contributes `life_epoch` in exactly one `_ckpt` CAS -- deciding that contribution "
-           "earlier must not publish it twice, nor move the publish off the birth path";
+    EXPECT_EQ(backend->casPutCount(ckpt_key), 2u)
+        << "the birth contributes `life_epoch` before its log and `committed_through` after the durable "
+           "log; these are two different ordering obligations, not a duplicate publication";
 }
 
 /// The post-durable install region is the reason preparation has to happen where it does: once "this

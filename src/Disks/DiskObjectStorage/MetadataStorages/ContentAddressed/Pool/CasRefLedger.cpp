@@ -2161,6 +2161,84 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         : Occupant::NotOccupied;
     const bool exact_attempt_is_durable
         = occupied.kind == SlotOccupyResult::Kind::Created || occupant == Occupant::Ours;
+    /// Caller holds `state_mutex`. Keeping the identity predicate in one place is part of the safety
+    /// rule: adding a frontier must not create yet another subtly different notion of "same attempt".
+    const auto same_wedge_under_lock = [&]
+    {
+        return rt->append_attempt
+            && rt->lane_state == RefLaneState::Wedged
+            && rt->append_attempt->txn_id == wedge.txn_id
+            && rt->append_attempt->bytes == wedge.bytes
+            && rt->append_attempt->admitted_fence_generation == wedge.admitted_fence_generation;
+    };
+
+    /// A durable ref-log object is not yet admissible history. Exactly as on the ordinary committed
+    /// append path, publish its frontier under the SAME admission before the cached table can install
+    /// it, return to `Ready`, or wake a surviving caller. This deliberately runs only for `Created` or
+    /// byte-identical `Ours`: a successor seal is conclusive evidence that OUR transaction did not land
+    /// and retains the rejection path below without publishing our frontier.
+    bool same_wedge_before_frontier = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        same_wedge_before_frontier = same_wedge_under_lock();
+    }
+    if (exact_attempt_is_durable && same_wedge_before_frontier)
+    {
+        const auto check_wedge_admitted = [this, &rt, &same_wedge_under_lock](uint64_t expected_generation)
+        {
+            check_fence_or_throw(expected_generation);
+            if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
+                || rt->superseded_by_remount.load(std::memory_order_acquire))
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace '{}': its captured runtime was retired before wedged-frontier publication",
+                    rt->life.ns.string()));
+
+            bool same_wedge = false;
+            {
+                std::lock_guard lock(rt->state_mutex);
+                same_wedge = same_wedge_under_lock();
+            }
+            if (!same_wedge)
+                throwCasWriteRetryLater(fmt::format(
+                    "CAS namespace '{}': the captured wedge changed before frontier publication",
+                    rt->life.ns.string()));
+        };
+
+        const RefCkpt frontier{
+            .life_epoch = std::nullopt,
+            .committed_through = wedge.txn_id,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = refLogTxnIsEpochSeal(wedged_txn)
+                ? std::optional<RefTxnId>{wedge.txn_id} : wedged_txn.prev_epoch_seal};
+
+        CkptPublishOutcome frontier_outcome;
+        try
+        {
+            frontier_outcome = publishCkptContribution(
+                rt->life, frontier, wedge.admitted_fence_generation, check_wedge_admitted);
+        }
+        catch (...)
+        {
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = std::current_exception();
+            std::lock_guard lock(rt->state_mutex);
+            if (same_wedge_under_lock())
+                requireRecovery(*rt, ns, "wedged-frontier publication");
+            return result;
+        }
+        if (frontier_outcome == CkptPublishOutcome::FencedOut)
+        {
+            result.kind = WedgeResolution::StillWedged;
+            result.survivor_error = makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                "CAS ref-log append for namespace '{}': wedged txn {}-{} is durable, but its admitted "
+                "fence moved before checkpoint-frontier publication; the lane needs recovery",
+                ns.string(), wedge.txn_id.writer_epoch, wedge.txn_id.ref_sequence));
+            std::lock_guard lock(rt->state_mutex);
+            if (same_wedge_under_lock())
+                requireRecovery(*rt, ns, "wedged-frontier publication fence");
+            return result;
+        }
+    }
 
     /// ---- POST-I/O RECHECK, then act, in ONE hold of `state_mutex` ----
     /// Everything above ran on an I/O result that took an unbounded amount of time to come back. Before
@@ -2199,11 +2277,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
         /// installing one attempt's candidate because the other's key resolved is the acked-then-lost
         /// class itself. One leader per table makes this unreachable today; it is checked, not assumed,
         /// because the cost is a comparison and the failure mode is silent data loss.
-        const bool same_wedge = rt->append_attempt
-            && rt->lane_state == RefLaneState::Wedged
-            && rt->append_attempt->txn_id == wedge.txn_id
-            && rt->append_attempt->bytes == wedge.bytes
-            && rt->append_attempt->admitted_fence_generation == wedge.admitted_fence_generation;
+        const bool same_wedge = same_wedge_under_lock();
 
         if ((fence_moved || superseded) && same_wedge && exact_attempt_is_durable)
         {
@@ -2941,7 +3015,7 @@ CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
             .life_epoch = std::nullopt,
             .committed_through = id,
             .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt},
+            .last_epoch_seal = chain_link},
     };
     prepared.candidate_base_id = prepared.candidate.getGreatestApplied();
 

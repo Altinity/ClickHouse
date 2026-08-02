@@ -47,11 +47,13 @@ std::optional<RefTxnId> mergeCommittedThrough(const RefCkpt & a, const RefCkpt &
         return std::max(*a.committed_through, *b.committed_through);
 
     const RefCkpt & higher = *a.committed_through < *b.committed_through ? b : a;
+    const RefCkpt & lower = *a.committed_through < *b.committed_through ? a : b;
     if (!higher.last_epoch_seal
-        || higher.last_epoch_seal->writer_epoch != higher.committed_through->writer_epoch
+        || *higher.last_epoch_seal < *lower.committed_through
         || *higher.committed_through < *higher.last_epoch_seal)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS _ckpt: cross-epoch committed_through requires a same-epoch seal at or below the higher frontier");
+            "CAS _ckpt: cross-epoch committed_through requires a seal covering the lower frontier and "
+            "not exceeding the higher frontier");
     return higher.committed_through;
 }
 
@@ -196,6 +198,8 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
                                const CkptDeadline & deadline)
 {
     const String key = layout.refCkptKey(life);
+    std::optional<CkptSample> current;
+    bool have_current = false;
 
     for (size_t attempt = 0; attempt < MAX_CKPT_CAS_ATTEMPTS; ++attempt)
     {
@@ -205,7 +209,11 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// Read the WHOLE body every attempt. A retry after a conflict must merge against what is
         /// there NOW: reusing the previous attempt's reading is precisely the read-modify-write with
         /// the merge left out, one round later.
-        const std::optional<CkptSample> current = readCkpt(backend, layout, life);
+        if (!have_current)
+        {
+            current = readCkpt(backend, layout, life);
+            have_current = true;
+        }
 
         /// The one rule the commutative merge cannot state, and it has to be decided HERE, before the
         /// merge: the semantic maximum turns a decrease into a body identical to the stored one, which
@@ -241,7 +249,17 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// so issuing the write anyway would mint a fresh token per no-op and turn every other writer's
         /// in-flight CAS into a conflict, for a body byte-identical to the one already stored.
         if (current && merged == current->ckpt)
+        {
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                return CkptPublishOutcome::FencedOut;
+            }
             return CkptPublishOutcome::IdenticalSkip;
+        }
 
         /// AFTER the read, BEFORE the CAS, on EVERY attempt (spec §3). A generation that moved since
         /// admission means this writer's lease incarnation is gone and the body it just merged is
@@ -260,10 +278,57 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
 
         const std::optional<Token> expected =
             current ? std::optional<Token>{current->token} : std::nullopt;
-        if (backend.casPut(key, encodeRefCkpt(merged), expected).outcome == CasOutcome::Committed)
-            return CkptPublishOutcome::Published;
+        /// Encode before entering the ambiguity catch. Allocation or invariant failures happen before
+        /// any request is sent and must propagate as themselves, not trigger a needless resolution GET.
+        const String merged_bytes = encodeRefCkpt(merged);
+        try
+        {
+            if (backend.casPut(key, merged_bytes, expected).outcome == CasOutcome::Committed)
+                return CkptPublishOutcome::Published;
+        }
+        catch (...)
+        {
+            /// A thrown CAS response does not say whether the object changed. Never retry its bytes
+            /// from memory: first point-read the exact mutable object, including its fresh token. If
+            /// that observation includes this contribution under the semantic join, the write is
+            /// resolved durable; otherwise that exact observation is the only valid base for a retry.
+            try
+            {
+                current = readCkpt(backend, layout, life);
+                have_current = true;
+            }
+            catch (...)
+            {
+                throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string()
+                    + "': a CAS response was ambiguous and the mandatory exact-read resolution failed ("
+                    + getCurrentExceptionMessage(/*with_stacktrace*/ false) + ")");
+            }
+
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                return CkptPublishOutcome::FencedOut;
+            }
+
+            if (current && lifeEpochWouldDecrease(current->ckpt, contribution))
+                throwLifeEpochDecrease(current->ckpt, contribution, key);
+
+            const RefCkpt resolved_merge = current ? mergeCkpt(current->ckpt, contribution) : contribution;
+            if (current && resolved_merge == current->ckpt)
+                return CkptPublishOutcome::Published;
+
+            /// `current` is the exact observation made after the ambiguous response. The next loop
+            /// iteration retries the SAME contribution against its token (or expected absence), with
+            /// no blind CAS and no redundant intervening GET.
+            continue;
+        }
         /// `Conflict`: the incarnation we read is no longer current, so another writer's merge landed
         /// first. Nothing of ours was written; re-read and merge against the winner.
+        current.reset();
+        have_current = false;
     }
 
     /// Fail closed. Every attempt was all-or-nothing, so there is no partial state -- only an

@@ -78,6 +78,11 @@ struct CkptDeadline
 /// re-check the fence -> token-CAS. A CAS conflict means another writer's read-modify-write landed
 /// between our GET and our CAS, so the whole attempt repeats against the NEW body -- never against the
 /// one we already read, which is the point of re-reading rather than retrying the same bytes.
+/// A THROWN CAS response is ambiguous rather than a conflict: exact-read the object, validate its body
+/// and token, then check admission again. If the durable body semantically includes the contribution,
+/// the write is resolved; otherwise retry the same contribution against that exact-read token. An
+/// unreadable resolution fails retry-later, and no path issues two CAS attempts without an intervening
+/// exact observation.
 ///
 /// An ABSENT object is created from `contribution` as it stands. Every writer may create it and none
 /// may complete it: a publisher that knows only the checkpoint creates one that knows only the
