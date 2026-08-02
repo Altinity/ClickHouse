@@ -63,7 +63,7 @@ PoolPtr openPool(const BackendPtr & backend)
 /// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch, mirroring the same fix in
 /// `gtest_cas_ref_writer.cpp`'s `startBuildFor` and `gtest_cas_ref_chunked_flush.cpp`'s
 /// `publishEmptyPart` -- every test in this file births its namespace here before any fault
-/// injection/verification that separately computes a key via `NamespaceLifeId::stageATransition(ns)`.
+/// injection/verification that separately computes a key via `DB::Cas::tests::fixture::fixtureLife(ns)`.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     DB::Cas::tests::casAdmitRecoverableEntry(s->backend(), s->layout(), ns, s->liveWriterEpoch());
@@ -100,11 +100,11 @@ std::optional<RefLogTxn> newestLogTxn(DB::Cas::Backend & backend, const DB::Cas:
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+            if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
                 && parsed->kind == RefObjectKind::Log
                 && (!newest || *newest < parsed->txn_id))
                 newest = parsed->txn_id;
@@ -115,7 +115,7 @@ std::optional<RefLogTxn> newestLogTxn(DB::Cas::Backend & backend, const DB::Cas:
     }
     if (!newest)
         return std::nullopt;
-    const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *newest));
+    const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), *newest));
     if (!got)
         return std::nullopt;
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *newest);
@@ -130,14 +130,14 @@ size_t committedRemovalCountForRef(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (!parsed || parsed->life_id != NamespaceLifeId::stageATransition(ns).incarnation
+            if (!parsed || parsed->life_id != DB::Cas::tests::fixture::fixtureLife(ns).incarnation
                 || parsed->kind != RefObjectKind::Log)
                 continue;
-            const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), parsed->txn_id));
+            const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), parsed->txn_id));
             if (!got)
                 continue;
             const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), parsed->txn_id);

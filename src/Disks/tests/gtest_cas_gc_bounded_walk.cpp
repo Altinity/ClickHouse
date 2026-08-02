@@ -105,7 +105,7 @@ uint64_t refLogGetsFor(const CountingBackend & backend, const Layout & layout, c
 {
     uint64_t total = 0;
     for (uint64_t i = first; i <= last; ++i)
-        total += backend.getCount(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch, i}));
+        total += backend.getCount(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{epoch, i}));
     return total;
 }
 
@@ -161,7 +161,7 @@ public:
         auto result = CountingBackend::get(key, range);
         if (!layout || appending || published >= limit)
             return result;
-        if (key != layout->refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, published}))
+        if (key != layout->refLogKey(fixture::fixtureLife(ns), RefTxnId{1, published}))
             return result;
 
         /// The walk just consumed the tail; the writer answers with the next record. Guarded against
@@ -287,7 +287,7 @@ TEST(CasGcBoundedWalk, ACTEAuthorizedUnchangedNamespaceFoldsNothingWithoutAProbe
 
     EXPECT_EQ(refLogGetsFor(*backend, layout, still, 1, 8), 0u)
         << "the CTE already proves the unchanged namespace's sealed frontier";
-    EXPECT_EQ(backend->getCount(layout.refLogKey(NamespaceLifeId::stageATransition(still), RefTxnId{1, 3})), 0u)
+    EXPECT_EQ(backend->getCount(layout.refLogKey(fixture::fixtureLife(still), RefTxnId{1, 3})), 0u)
         << "a valid CTE needs no successor probe";
     EXPECT_EQ(metric(intake, "tails_unchanged"), 1u);
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
@@ -430,7 +430,7 @@ TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
     /// tail is now nothing at all, while `{1, 3}` is durable and readable by exact key.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0x1a3));
     advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 3});
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(ns)));
 
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3}))

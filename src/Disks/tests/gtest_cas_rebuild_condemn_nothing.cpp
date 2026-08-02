@@ -159,7 +159,7 @@ RefTableState stateAfter(Backend & backend, const Layout & layout, const RootNam
     RefReplayBuilder builder(std::nullopt);
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        const auto got = backend.get(layout.refLogKey(fixture::fixtureLife(ns), id));
         if (!got)
             throw std::runtime_error("stateAfter: fixture log " + std::to_string(id.writer_epoch) + "-"
                                      + std::to_string(id.ref_sequence) + " is missing");
@@ -219,11 +219,11 @@ TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
     writeCkptRaw(*backend, layout, kNsA,
                  RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 2},
                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2}));
     backend->hide(hidden_manifest);
 
     /// Precondition: both objects really are durable and really are hidden.
-    ASSERT_TRUE(backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2})).has_value());
+    ASSERT_TRUE(backend->get(layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2})).has_value());
     ASSERT_TRUE(backend->get(hidden_manifest).has_value());
 
     Gc gc(store, kGc);
@@ -348,7 +348,7 @@ TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
 
     /// Hand-built, and planted AFTER the round so the round itself is clean: one segment too deep under
     /// the life prefix, so the segment where the incarnation belongs holds `x`. No helper mints this.
-    const String nested = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(kNsA))
+    const String nested = layout.namespaceStreamPrefix(fixture::fixtureLife(kNsA))
         + "x/_log/" + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
     ASSERT_EQ(backend->putIfAbsent(nested, "garbage").outcome, PutOutcome::Done);
 
@@ -482,7 +482,7 @@ TEST(CasRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     /// Punch the hole: {1,2} is gone while {1,3} stays durable and listed.
-    const String holed = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2});
+    const String holed = layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2});
     const HeadResult h = backend->head(holed);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(holed, h.token);
@@ -525,8 +525,8 @@ TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
                          .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = std::nullopt});
 
     /// The store stops listing the tail. It stays perfectly readable by exact key.
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 4}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 4}));
 
     const FsckReport rep = runFsck(*store, /*detail=*/true);
     ASSERT_GT(backend->holesServed(), 0u) << "the tail was never actually hidden from a LIST";
@@ -590,7 +590,7 @@ TEST(CasRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChai
     ASSERT_NO_THROW(rep = runFsck(*store, /*detail=*/true));
     EXPECT_EQ(rep.unchecked, 0u) << "the exact frontier proves this crossing inconsistent";
     EXPECT_EQ(rep.chain_broken, 1u) << "exactly the malformed namespace must be reported";
-    const String missing_key = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 4});
+    const String missing_key = layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 4});
     EXPECT_EQ(std::count_if(rep.objects.begin(), rep.objects.end(), [&](const FsckObject & object)
     {
         return object.cls == FsckClass::ChainBroken && object.key == missing_key;
@@ -618,7 +618,7 @@ TEST(CasRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
     writeCkptRaw(*backend, layout, kNsA,
                  RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
-    const String holed = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2});
+    const String holed = layout.refLogKey(fixture::fixtureLife(kNsA), RefTxnId{1, 2});
     const HeadResult h = backend->head(holed);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(holed, h.token);

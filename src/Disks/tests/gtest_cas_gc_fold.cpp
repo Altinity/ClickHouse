@@ -560,7 +560,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     /// which is the physical life that owns the eventual janitor work. Spelling the sentinel here instead
     /// would plant debris under the wrong life and make the retention assertion vacuous.
     const String debris_key
-        = layout.namespaceFilesPrefix(CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns_removed))
+        = layout.namespaceFilesPrefix(CasRefCatalog::lifeIfCataloged(*backend, layout, ns_removed).value())
         + "leftover_verbatim_file";
     backend->putIfAbsent(debris_key, "debris");
     const ManifestRef removed_body = ref("srv-r:1", 1, 0xEE);
@@ -584,7 +584,7 @@ TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
         .checkpoint_snapshot_id = RefTxnId{1, cv2},
         .last_epoch_seal = std::nullopt,
     });
-    const String covered_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns_covered), RefTxnId{1, cv1});
+    const String covered_log_key = layout.refLogKey(fixture::fixtureLife(ns_covered), RefTxnId{1, cv1});
     ASSERT_TRUE(backend->head(covered_log_key).exists);
 
     /// Trigger the clamp in ns_clamp: drop committed A, add precommit B whose body is absent.

@@ -66,7 +66,6 @@ using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
 using DB::Cas::tests::runRegularRoundReclaiming;
-using DB::Cas::tests::writeRefLogTxnRaw;
 using DB::Cas::tests::writeRefSnapshotRaw;
 using DB::Cas::tests::writeSealAt;
 
@@ -151,7 +150,7 @@ PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 /// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch -- ONE choke point for
 /// every test in this file, since every real-path setup here funnels through `startBuildFor` (directly,
 /// or via `publishEmptyPart` below). Many of this file's tests separately compute an expected key via
-/// `NamespaceLifeId::stageATransition(ns)` for fault injection/verification; without this the real
+/// `DB::Cas::tests::fixture::fixtureLife(ns)` for fault injection/verification; without this the real
 /// production birth mints a random incarnation and those computed keys land nowhere real.
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
@@ -295,11 +294,11 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
                 && (!up_to || !(*up_to < parsed->txn_id)))
                 ids.push_back(parsed->txn_id);
         }
@@ -312,7 +311,7 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     RefTableState state;
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
         applyRefLogTxn(state, decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
     }
     return state;
@@ -326,11 +325,11 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Snap
+            if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Snap
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -861,7 +860,7 @@ TEST(RefWriterRuntimeIdentity, ColdReadRejectsUnrelatedCatalogMutationBetweenObs
 
     store->setReadableCatalogAfterObservationHookForTest([&]
     {
-        DB::Cas::tests::casAdmitEntry(*backend, layout, unrelated);
+        DB::Cas::tests::fixture::admitLive(*backend, layout, unrelated);
     });
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
@@ -941,7 +940,7 @@ TEST(RefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
     const Layout layout("p");
     const RootNamespace ns{"srv1/birth_only"};
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
@@ -962,9 +961,9 @@ TEST(RefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     const RootNamespace ns{"srv1/birth_then_promote"};
     const ManifestRef m1 = manifestRef(1, 1, 1);
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}, std::nullopt});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
         {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
@@ -990,13 +989,13 @@ TEST(RefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSameLif
     const Layout layout("p");
     const RootNamespace ns{"srv1/writer_terminal_gap"};
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
     RefOp remove;
     remove.kind = RefOpKind::RemoveNamespace;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         ns.string(), RefTxnId{1, 2}, {std::move(remove)}, std::nullopt});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         ns.string(), RefTxnId{2, 1}, {namespaceBirthOp()}, std::nullopt});
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
@@ -1033,9 +1032,9 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
 
     /// A stale log BELOW the snapshot id would, if wrongly replayed, try to add "a" a second time
     /// (the snapshot already contains it) and throw -- proving it must be ignored, not merely benign.
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 3},
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 3},
         {namespaceBirthOp(), publishCommittedOps("a", ma)[0], publishCommittedOps("a", ma)[1]}, std::nullopt});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = RefTxnId{1, 5},
         .ops = publishCommittedOps("a", ma),
@@ -1047,7 +1046,7 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
         op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, "a", ma}; return op; }());
     tail_ops.push_back(publishCommittedOps("b", mb)[0]);
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
@@ -1083,10 +1082,10 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     /// further down is a real production read that triggers `resolveNamespaceLife`, which for an
     /// UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the sentinel the raw
     /// fixture writes at.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = snap_x,
         .ops = publishCommittedOps("a", ma),
@@ -1103,7 +1102,7 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     {
         vanish_fired = true;
         const RefTxnId snap_y{1, 20};
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
             .ns = ns.string(),
             .txn_id = snap_y,
             .ops = publishCommittedOps("b", mb),
@@ -1146,10 +1145,10 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     /// Stage B (Task 4-C): pin `ns` to the sentinel before the raw write below -- `store->resolveRef`
     /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation
     /// for this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RootNamespace other_ns{"srv1/other"};
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = snap_x,
         .ops = publishCommittedOps("anchor", manifestRef(1, 10, 1)),
@@ -1190,7 +1189,7 @@ TEST(RefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     ASSERT_TRUE(store->resolveRef(ns, "part_1").has_value());
     ASSERT_TRUE(store->resolveRef(ns, "part_2").has_value());
 
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
     const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
     const String ckpt_key = store->layout().refCkptKey(life);
     const auto ckpt_before = readCkpt(*backend, store->layout(), life);
@@ -1334,7 +1333,7 @@ TEST(RefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWithou
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/frontier-conflict"};
     publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
     const String ckpt_key = store->layout().refCkptKey(life);
     const auto before = readCkpt(*backend, store->layout(), life);
     ASSERT_TRUE(before);
@@ -1366,7 +1365,7 @@ TEST(RefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWi
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/frontier-fenced"};
     publishEmptyPart(store, ns, "x");
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
     const String ckpt_key = store->layout().refCkptKey(life);
     const auto before = readCkpt(*backend, store->layout(), life);
     ASSERT_TRUE(before);
@@ -1520,7 +1519,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     publishEmptyPart(store, ns_a, "x_second");
     publishEmptyPart(store, ns_b, "y");
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -1556,7 +1555,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
@@ -1599,7 +1598,7 @@ TEST(RefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
     const size_t tail_after_setup = store->tailSinceSnapshotCountForTest(ns);
 
     /// Wedge the lane: the single-attempt budget turns the ambiguous log PUT into an Unresolved outcome.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1643,7 +1642,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     publishEmptyPart(store, ns_b, "p");
     ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_a)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_a)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
@@ -1695,7 +1694,7 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 
     /// The next `_log` PUT for `ns` has a foreign different object land at its key; resolve-before-reissue
     /// then observes the mismatch and raises CORRUPTED_DATA.
-    backend->corrupt_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->corrupt_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
@@ -1764,7 +1763,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1833,7 +1832,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     store->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
     /// Wedge the lane with an ambiguous PUT that never landed.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1896,11 +1895,11 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log)
+                if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log)
                     ++n;
             }
             if (page.next_cursor.empty())
@@ -2046,7 +2045,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     publishEmptyPart(store, ns_w, "x");
 
     /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns_w)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns_w)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
@@ -2088,7 +2087,7 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     EXPECT_TRUE(store->newestPublishedSnapshotIdForTest(ns) == snap_id);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "a snapshot covering everything prunes the whole tail";
 
-    const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
 
     /// The independent oracle: replay every `_log/` object directly, ignoring the snapshot entirely.
@@ -2533,7 +2532,7 @@ TEST(RefWriterSnapshotPublish, MountTimeRecoveredLargeTailPublishesAfterOrdinary
         << "the ordinary successor must make the inherited mount-time tail publishable";
     EXPECT_EQ(successor->tailSinceSnapshotCountForTest(ns), 0u);
 
-    const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
@@ -2569,7 +2568,7 @@ TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
         << "publish-from-live: a just-committed txn is immediately coverable, with no grace window";
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
-    const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snap_id);
     ASSERT_EQ(snap.committed.size(), 1u);
@@ -2752,7 +2751,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
-    const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
+    const auto got = backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
@@ -2896,7 +2895,7 @@ TEST(RefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntil
         predecessor_config.snapshot_log_count_threshold = 1ULL << 40;
         predecessor_config.snapshot_log_bytes_threshold = 1ULL << 40;
         auto predecessor = openPoolWithConfig(backend, predecessor_config);
-        DB::Cas::tests::casAdmitEntry(*backend, predecessor->layout(), ns);
+        DB::Cas::tests::fixture::admitLive(*backend, predecessor->layout(), ns);
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, predecessor->layout(), ns);
         ASSERT_EQ(backend->putIfAbsent(predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
             .life_epoch = predecessor->liveWriterEpoch(),
@@ -3148,7 +3147,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
             op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops1.push_back(op);
         }
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1, std::nullopt});
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1, std::nullopt});
 
         std::vector<RefOp> ops2;
         for (int i = 700; i < kTotalStale; ++i)
@@ -3158,7 +3157,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
             op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops2.push_back(op);
         }
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2, std::nullopt});
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2, std::nullopt});
     }
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = e1,
@@ -3181,7 +3180,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     config.cas_request_budget = budget;
     auto successor = openPoolWithConfig(backend, config);
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the dead predecessor
     /// epoch `e1` (its durable ids are `{e1,1}` and `{e1,2}`, so the seal lands at `{e1,3}`) -- that PUT
     /// shares this same `_log/` prefix, so it would eat the fault before the sweep ever gets a chance.
@@ -3233,11 +3232,11 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+                if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
                     && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
                     ++new_log_objects;
             }
@@ -3309,7 +3308,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     /// The successor's own recovery runs first and mints one in-band seal for the predecessor's now-dead
     /// epoch (its three precommits are its only durable ids, so the seal takes the very next slot) --
     /// that PUT shares this same `_log/` prefix, so it would eat the fault before the sweep gets a turn.
@@ -3423,11 +3422,11 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
+            if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
                 && (!greatest || *greatest < parsed->txn_id))
                 greatest = parsed->txn_id;
         }
@@ -3452,7 +3451,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 {
     uint64_t greatest_in_previous_epoch = 0;
     uint64_t previous_epoch = 0;
-    forEachListedKey(backend, layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), [&](const ListedKey & lk)
+    forEachListedKey(backend, layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), [&](const ListedKey & lk)
     {
         const auto parsed = layout.parseRefObjectKey(lk.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -3474,7 +3473,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
     drop.kind = RefOpKind::OwnerTransition;
     drop.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, old_ref};
     twin.ops = {drop};
-    writeRefLogTxnRaw(backend, layout, twin);
+    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, twin);
     return twin_epoch;
 }
 
@@ -3621,7 +3620,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     publishEmptyPart(store, ns, "y");
 
     /// Wedge the lane with an ambiguous PUT that never landed server-side.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -3821,11 +3820,11 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation && parsed->kind == RefObjectKind::Log
+                if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation && parsed->kind == RefObjectKind::Log
                     && (!newest_log || *newest_log < parsed->txn_id))
                     newest_log = parsed->txn_id;
             }
@@ -3835,7 +3834,7 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
         }
     }
     ASSERT_TRUE(newest_log.has_value());
-    const auto got = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), *newest_log));
+    const auto got = backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), *newest_log));
     ASSERT_TRUE(got.has_value());
     const RefLogTxn removal_txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *newest_log);
 
@@ -3872,7 +3871,7 @@ TEST(RefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSnapsh
         << "the terminal transaction remains ordinary immutable stream work until GC folds it";
 
     size_t terminal_logs = 0;
-    for (const ListedKey & listed : backend->list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), "", 1000).keys)
+    for (const ListedKey & listed : backend->list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), "", 1000).keys)
     {
         const auto parsed = layout.parseRefObjectKey(listed.key);
         if (!parsed || parsed->kind != RefObjectKind::Log)
@@ -4124,7 +4123,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryComple
     const ManifestId id = build->stageManifest({});
     build->precommitAdd(ns, "inflight", id);
 
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
@@ -4580,7 +4579,7 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
     birth.txn_id = RefTxnId{1, 1};
     birth.ops = {namespaceBirthOp(), publishCommittedOps("a", manifestRef(1, 1, 1))[0],
                  publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
-    writeRefLogTxnRaw(backend, layout, birth);
+    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, birth);
 
     RefLogTxn mut;
     mut.ns = ns.string();
@@ -4591,7 +4590,7 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
     mut.prev_epoch_seal = RefTxnId{1, 2};
     mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
                publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
-    writeRefLogTxnRaw(backend, layout, mut);
+    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, mut);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
         /// The namespace was born in epoch 1 and only `{1,1}` is fronted initially. Recovery must mint
         /// the missing required seal `{1,2}` before it may adopt the already durable `{2,1}` successor.
@@ -4685,7 +4684,7 @@ TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     /// attempt lands. The seal is a LOG transaction at `{2,2}` -- the slot after the dead epoch's last
     /// durable id -- because INV-2 closes an epoch in-band, at the key a straggler would have taken.
     const RefTxnId seal_id{2, 2};
-    backend->fault_key_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), seal_id);
+    backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->fault_count = 2;
 
     using ProfileEvents::global_counters;
@@ -4772,7 +4771,7 @@ TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     /// The seal is an in-band LOG transaction at the slot after the dead epoch's last durable id, not a
     /// snapshot at a synthetic id: epoch 1 closes at `{1,2}`, which is the FIRST write the walk attempts.
     const RefTxnId seal_id{1, 2};
-    backend->fault_key_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), seal_id);
+    backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->fault_count = 1000;   /// never stops failing within the budget
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
@@ -4801,7 +4800,7 @@ TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     /// A foreign writer lands DIFFERENT valid bytes at the seal key; resolve-before-reissue then throws
     /// CORRUPTED_DATA (a real cross-process seal conflict), which must NOT be retried.
     const RefTxnId seal_id{1, 2};
-    backend->corrupt_key_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), seal_id);
+    backend->corrupt_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
@@ -4820,12 +4819,12 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     /// Stage B (Task 4-C): pin `ns` to the sentinel before the raw snapshot below -- `store->listRefs`
     /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation for
     /// this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
     std::vector<RefOp> base_ops{namespaceBirthOp()};
     const auto publish_a = publishCommittedOps("a", ma);
     base_ops.insert(base_ops.end(), publish_a.begin(), publish_a.end());
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), snap_x, std::move(base_ops), std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), snap_x, std::move(base_ops), std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
@@ -4842,7 +4841,7 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     /// A checkpoint-named snapshot belongs to the caller's immutable authority cut. If that exact
     /// object is absent, recovery must report corruption immediately; it must neither reinterpret a
     /// transient disappearance as a new authority cut nor enter the outer transient-retry loop.
-    const String vkey = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x);
+    const String vkey = layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), snap_x);
     backend->vanish_once_keys.insert(vkey);
 
     using ProfileEvents::global_counters;
@@ -4887,7 +4886,7 @@ TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
             throw std::runtime_error("injected backoff-sleep failure");
     });
     const RefTxnId seal_id{1, 2};
-    backend->fault_key_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), seal_id);
+    backend->fault_key_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), seal_id);
     backend->fault_count = 1;
 
     EXPECT_ANY_THROW(store->listRefs(ns));   /// the sleep failure propagates

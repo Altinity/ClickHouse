@@ -140,7 +140,7 @@ TEST(CasRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtI
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
     EXPECT_TRUE(backend->head(store->layout().refLogKey(life, id)).exists)
         << "the birth transaction must be keyed at the REAL minted incarnation, not the Stage-A sentinel";
-    EXPECT_FALSE(backend->head(store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), id)).exists)
+    EXPECT_FALSE(backend->head(store->layout().refLogKey(fixture::fixtureLife(ns), id)).exists)
         << "and must NOT be keyed at the sentinel any more";
 }
 

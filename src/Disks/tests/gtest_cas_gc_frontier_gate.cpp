@@ -502,7 +502,7 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
     }
 
     publish(*backend, layout, hidden, "kept_ref", 1, blob);
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(hidden)));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
@@ -592,7 +592,7 @@ TEST(CasGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier
     /// exact key alone -- the arithmetic-intake mechanism this whole file is about, exercised honestly
     /// rather than declared past by fiat.
     dropRefTransition(*backend, layout, hidden, "kept_ref", kept);
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(hidden)));
 
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
@@ -785,8 +785,8 @@ TEST(CasGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
     /// `_ckpt` with `life_epoch` set directly, at the same sentinel key `casAdmitEntry` pinned the
     /// namespace's incarnation to -- proving the namespace's own genesis, not guessing it.
     const RootNamespace empty_ns{"00/empty@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, empty_ns);
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(empty_ns)),
+    fixture::admitLive(*backend, layout, empty_ns);
+    backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(empty_ns)),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
     drive(store, gc, /*rounds*/ 8, UniversePolicy::AuthoritativeForTest);
@@ -918,8 +918,8 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     /// The control arm below needs a recoverable catalog life whose frontier is exactly the carried
     /// cursor. An empty non-seal transaction is a valid genesis that recovers to an empty table while
     /// leaving the manifest epoch below the cursor's epoch.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::admitLive(*backend, layout, ns);
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = RefTxnId{6, 1},
         .ops = {},
@@ -1003,7 +1003,7 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
     /// All three go unhinted at once. Their valid checkpoint frontiers still prove their carried
     /// cursors, so this does not consume the successor-probe budget.
     for (const RootNamespace & ns : {a, b, c})
-        backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
+        backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(ns)));
 
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1065,7 +1065,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSucces
     ASSERT_NE(sealed, (RefTxnId{})) << "the seeding round must have sealed a cursor to carry";
 
     /// Now the store stops listing the namespace entirely.
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
     backend->resetCounts();
     std::map<String, UInt64> intake;
     gc.setPhaseSink([&](const GcPhaseRecord & rec)
@@ -1077,7 +1077,7 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSucces
     gc.setPhaseSink({});
 
     const String expected_next =
-        layout.refLogKey(NamespaceLifeId::stageATransition(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
+        layout.refLogKey(fixture::fixtureLife(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
     EXPECT_EQ(backend->getCount(expected_next), 0u)
         << "the inclusive checkpoint boundary proves this quiet life without a successor probe";
     EXPECT_TRUE(report.anomalies.empty());
@@ -1095,7 +1095,7 @@ TEST(CasGcFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint-behind-inherited-cursor@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfb));
     publish(*backend, layout, ns, "second", 2, DB::UInt128(0xfc));
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
@@ -1145,7 +1145,7 @@ TEST(CasGcFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
     const RootNamespace ns{"00/checkpoint-inherited-seal-crossing@cas@"};
     const DB::UInt128 crossed_blob(0xfd);
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "birth", 1, DB::UInt128(0xfe), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
@@ -1196,7 +1196,7 @@ TEST(CasGcFrontierGate, CheckpointFrontierRejectsWrongPredecessorAfterFreshEpoch
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint-wrong-fresh-seal-predecessor@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "birth", 1, DB::UInt128(0xff), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "wrong_predecessor", 2, DB::UInt128(0x100),
@@ -1259,7 +1259,7 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt,
     }), checkpoint_head.token).outcome, PutOutcome::Done);
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
 
     runRegularRoundReclaiming(gc);
 
@@ -1282,12 +1282,12 @@ TEST(CasGcFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccess
     const DB::UInt128 committed_blob(0xf1);
     const DB::UInt128 beyond_frontier_blob(0xf2);
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "committed", 1, committed_blob);
     const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
     writeBlobBody(*backend, layout, beyond_frontier_blob);
     writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = RefTxnId{1, 2},
         .ops = publishCommittedOps("durable_but_uncommitted", uncommitted),
@@ -1336,7 +1336,7 @@ TEST(CasGcFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSucce
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint-complete-fold@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf3));
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
@@ -1377,12 +1377,12 @@ TEST(CasGcFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
     const RootNamespace ns{"00/checkpoint-hidden-successor@cas@"};
     const DB::UInt128 beyond_frontier_blob(0xf4);
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf5));
     const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
     writeBlobBody(*backend, layout, beyond_frontier_blob);
     writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = RefTxnId{1, 2},
         .ops = publishCommittedOps("hidden_durable_but_uncommitted", uncommitted),
@@ -1429,7 +1429,7 @@ TEST(CasGcFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFro
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/missing-committed-checkpoint-log@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "first", 1, DB::UInt128(0xf6));
     publish(*backend, layout, ns, "missing_but_committed", 2, DB::UInt128(0xf7));
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
@@ -1472,7 +1472,7 @@ TEST(CasGcFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityC
     const RootNamespace ns{"00/hidden-committed-checkpoint-log@cas@"};
     const DB::UInt128 hidden_blob(0xf8);
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "first", 1, DB::UInt128(0xf9));
     publish(*backend, layout, ns, "hidden_but_committed", 2, hidden_blob);
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
@@ -1540,7 +1540,7 @@ TEST(CasGcFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/empty-checkpoint-after-cursor@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfa));
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
@@ -1589,7 +1589,7 @@ TEST(CasGcFrontierGate, CatalogLifeWithoutCheckpointDefersWithoutUsingListedFron
     const RootNamespace ns{"00/missing-checkpoint-fold@cas@"};
     const DB::UInt128 blob(0xc7);
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     const ManifestRef manifest{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
     writeBlobBody(*backend, layout, blob);
     writeManifestRaw(*backend, layout, ns, manifest, {blobEntryFor("data.bin", blob)});
@@ -1644,7 +1644,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 
     /// The quiet namespace goes unhinted and the budget is zero. Its CTE still proves the carried
     /// cursor, while the busy namespace drops its ref and may proceed through reclamation.
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
@@ -1689,7 +1689,7 @@ TEST(CasGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
     txn.ns = held.string();
     txn.txn_id = RefTxnId{1, 4};
     txn.ops = publishCommittedOps("ref_4", orphan_ref);
-    writeRefLogTxnRaw(*backend, layout, txn);
+    fixture::writeRefLogRaw(*backend, layout, txn);
     replaceRecoverableCkptForRawFixture(*backend, layout, held, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 4},
@@ -1721,7 +1721,7 @@ TEST(CasGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
 
     /// Hiding `{1,4}` from LIST does not hide the committed CTE frontier. The next round exact-reads
     /// the missing `{1,3}`, re-detects the gap, and seals a fresh hold.
-    backend->hidePrefix(layout.refLogKey(NamespaceLifeId::stageATransition(held), RefTxnId{1, 4}));
+    backend->hidePrefix(layout.refLogKey(fixture::fixtureLife(held), RefTxnId{1, 4}));
 
     /// Meanwhile a blob elsewhere becomes condemnable, so the round has real destructive work to decline.
     const ManifestRef mref = publish(*backend, layout, busy, "busy_ref", 9, blob);
@@ -2000,22 +2000,22 @@ TEST(CasGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnap
 
     {
         const RootNamespace ns{"00/cleanup-missing-base-log@cas@"};
-        casAdmitEntry(*backend, layout, ns);
-        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        fixture::admitLive(*backend, layout, ns);
+        const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
         EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
     {
         const RootNamespace ns{"00/cleanup-missing-base-snapshot@cas@"};
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
             .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
-        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
         EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
     {
         const RootNamespace ns{"00/cleanup-seal-is-not-base@cas@"};
         writeSealAt(*backend, layout, ns, base);
-        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
         EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
@@ -2031,14 +2031,14 @@ TEST(CasGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCa
 
     const auto expect_no_deletion_authority = [&](const RootNamespace & ns, std::optional<RefTxnId> backlink)
     {
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
             .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
             .prev_epoch_seal = std::nullopt});
         writeSealAt(*backend, layout, ns, seal_id);
-        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
             .ns = ns.string(), .txn_id = base_id, .ops = {}, .prev_epoch_seal = backlink});
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
-        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
 
         std::optional<RefTxnId> validated_base;
         try
@@ -2077,11 +2077,11 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     const RefOp birth_op = namespaceBirthOp();
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {birth_op}, .prev_epoch_seal = std::nullopt});
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = removed.string(), .txn_id = RefTxnId{1, 2}, .ops = {remove_op}, .prev_epoch_seal = std::nullopt});
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, removed).value();
     CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
     {
         RefCatalog next = current;
@@ -2141,15 +2141,15 @@ TEST(CasGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
     const RootNamespace removed{"00/post-fold-unreadable@cas@"};
     const RootNamespace progressing{"00/post-fold-progress@cas@"};
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
         .prev_epoch_seal = std::nullopt});
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = removed.string(), .txn_id = RefTxnId{1, 2}, .ops = {remove_op},
         .prev_epoch_seal = std::nullopt});
-    const NamespaceLifeId removed_life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
+    const NamespaceLifeId removed_life = CasRefCatalog::lifeIfCataloged(*backend, layout, removed).value();
     CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
     {
         RefCatalog next = current;

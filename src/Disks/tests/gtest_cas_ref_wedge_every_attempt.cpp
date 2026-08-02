@@ -284,7 +284,7 @@ private:
 /// The `_log/` key prefix of one namespace -- what every fault seam here matches on.
 String logPrefix(const PoolPtr & store, const RootNamespace & ns)
 {
-    return store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    return store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
 }
 
 CatalogEntry catalogEntryOrThrow(Backend & backend, const Layout & layout, const RootNamespace & ns)
@@ -307,7 +307,7 @@ void admitProperlyBornEntry(Backend & backend, const Layout & layout, const Root
     const CatalogEntry creating{
         .ns = ns,
         .state = NsState::Creating,
-        .incarnation = NamespaceLifeId::stageATransition(ns).incarnation,
+        .incarnation = DB::Cas::tests::fixture::fixtureLife(ns).incarnation,
         .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1},
     };
     CasRefCatalog::casAdmitEntry(backend, layout, /*gc_shards=*/1, creating);
@@ -350,7 +350,7 @@ CatalogEntry replaceCatalogLifeForWedgeRace(
 /// hand-rolled parse), so an assertion about `prev_epoch_seal` is an assertion about the WIRE.
 RefLogTxn readRefLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & id)
 {
-    const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+    const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
     if (!got)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "no ref-log object at {}-{}", id.writer_epoch, id.ref_sequence);
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
@@ -626,7 +626,7 @@ TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
     backend->definite_count = 0;
     EXPECT_NO_THROW(store->dropRef(ns, "y"));
     EXPECT_EQ(store->layout().parseRefObjectKey(
-        store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), wedged_id))->txn_id, wedged_id);
+        store->layout().refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), wedged_id))->txn_id, wedged_id);
     EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "the create-based resolution still settles it afterwards";
 }
 
@@ -786,7 +786,7 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
     /// wedge-resolve site does.
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "y"); });
-    EXPECT_EQ(backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch, seal_id.ref_sequence + 1})), std::nullopt)
+    EXPECT_EQ(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch, seal_id.ref_sequence + 1})), std::nullopt)
         << "nothing of ours may exist above the seal in the closed epoch";
     EXPECT_TRUE(store->mayMutate()) << "meeting a successor's seal is the protocol working, not an anomaly";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before)
@@ -912,7 +912,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemou
     /// Occupy the id the next append will derive with a foreign object, so its create conflicts and
     /// the controller's resolve-before-reissue proves the occupant is not ours.
     const RefTxnId next{store->liveWriterEpoch(), 3};
-    ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), next),
+    ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next),
                                    "a different object entirely").outcome, PutOutcome::Done);
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
 
@@ -1126,7 +1126,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendSealRejected].load();
 
     /// The successor's seal lands at exactly the id this table's next append derives.
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->conflict_bytes = epochSealBytes(ns, next);
     backend->conflict_count = 1;
 
@@ -1169,12 +1169,12 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejectio
     admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
-    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
     /// A successor's epoch seal lands at exactly the id this first `NamespaceBirth` transaction derives.
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), genesis);
     backend->conflict_bytes = epochSealBytes(ns, genesis);
     backend->conflict_count = 1;
 
@@ -1209,12 +1209,12 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
     /// (from a different test in this file) would derive a different id and never trigger the conflict.
     publishEmptyPart(store, ns, "x");
 
-    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation step must have published a real _ckpt";
 
     const RefTxnId next{store->liveWriterEpoch(), 3};
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->conflict_bytes = epochSealBytes(ns, next);
     backend->conflict_count = 1;
 
@@ -1242,7 +1242,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAm
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/birth_ckpt_ambiguous"};
     admitProperlyBornEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
-    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
@@ -1279,17 +1279,17 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthOccu
     admitProperlyBornEntry(*backend, store->layout(), ns);
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
-    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), genesis);
     backend->conflict_bytes = epochSealBytes(ns, genesis);
     backend->conflict_count = 1;
     /// Proper birth makes recovery first probe this absent log key. Skip that probe and the resolve
     /// read that PROVES the conflict; fail only the adjudication read after it, so the occupant's
     /// identity (seal vs. breach) cannot be determined.
-    backend->fail_get_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->fail_get_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), genesis);
     backend->fail_get_skip = 2;
     backend->fail_get_count = 1;
 
@@ -1312,7 +1312,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
     admitProperlyBornEntry(*backend, store->layout(), ns);
 
     const RefTxnId genesis{store->liveWriterEpoch(), 1};
-    const String ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(ns));
+    const String ckpt_key = layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     const auto ckpt_before = backend->get(ckpt_key);
     ASSERT_TRUE(ckpt_before.has_value()) << "the fixture's creation checkpoint must exist before the first ref-log attempt";
 
@@ -1321,7 +1321,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
     RefOp birth;
     birth.kind = RefOpKind::NamespaceBirth;
     const RefLogTxn foreign_txn{ns.string(), genesis, {birth}, std::nullopt};
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), genesis);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), genesis);
     backend->conflict_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign_txn));
     backend->conflict_count = 1;
 
@@ -1349,11 +1349,11 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
     const RefTxnId next{store->liveWriterEpoch(), 3};
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
 
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->conflict_bytes = epochSealBytes(ns, next);
     backend->conflict_count = 1;
     /// Skip the resolve read that PROVES the conflict; fail only the adjudication read after it.
-    backend->fail_get_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->fail_get_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->fail_get_skip = 1;
     backend->fail_get_count = 1;
 
@@ -1391,7 +1391,7 @@ TEST(CasRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
     RefOp birth;
     birth.kind = RefOpKind::NamespaceBirth;
     const RefLogTxn foreign_txn{ns.string(), next, {birth}, std::nullopt};
-    backend->conflict_substr = layout.refLogKey(NamespaceLifeId::stageATransition(ns), next);
+    backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
     backend->conflict_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign_txn));
     backend->conflict_count = 1;
 
@@ -1446,7 +1446,7 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     ///   3. NOTHING is written, so no self-pointer can have been stamped and no request was spent;
     ///   4. a SECOND flush behaves identically instead of looping or degrading.
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
-    const size_t puts_before = backend->putCount(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch + 1, 1}));
+    const size_t puts_before = backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1}));
     try
     {
         store->dropRef(ns, "x");
@@ -1458,15 +1458,15 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
         EXPECT_NE(e.message().find("resumes only under a later epoch"), String::npos)
             << "the deposition must be surfaced, not just the failure: " << e.message();
     }
-    EXPECT_FALSE(backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch + 1, 1})).has_value())
+    EXPECT_FALSE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})).has_value())
         << "nothing may be written: the lane could not construct a legal transaction, so it sent none";
-    EXPECT_EQ(backend->putCount(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch + 1, 1})), puts_before)
+    EXPECT_EQ(backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})), puts_before)
         << "and no request was spent learning what the lane could already prove about itself";
 
     /// The second flush: same conclusive answer, still no traffic. A lane that re-derived and re-sent
     /// here would be exactly the spin this arm exists to prevent.
     expectThrowsCode(DB::ErrorCodes::INVALID_STATE, [&] { store->dropRef(ns, "x"); });
-    EXPECT_EQ(backend->putCount(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{epoch + 1, 1})), puts_before);
+    EXPECT_EQ(backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1})), puts_before);
 
     /// NO remount is scheduled, matching the collision arm exactly. A successor closing our epoch is a
     /// legitimate handover, not an anomaly to react to: the mount lease is what resolves it, and

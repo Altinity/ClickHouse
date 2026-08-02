@@ -161,8 +161,8 @@ void seedFiveRecordStream(Backend & backend, const Layout & layout, const RootNa
 /// The exact defect shape: ids 3 and 4 invisible while the LATER id 5 is visible.
 std::vector<String> hiddenMiddleOf(const Layout & layout, const RootNamespace & ns)
 {
-    return {layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}),
-            layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4})};
+    return {layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3}),
+            layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 4})};
 }
 
 PoolConfig recoveryPoolConfig()
@@ -276,7 +276,7 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/dataloss@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const DB::UInt128 shared(0x5ade);
 
     /// `ref_a` and `ref_b` both pin `shared`; `ref_b`'s publish is the record the store will hide.
@@ -290,7 +290,7 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
         .last_epoch_seal = std::nullopt,
     });
 
-    backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2})});
+    backend->setListOmissions({layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2})});
 
     Gc gc(store, kGc);
     const RoundEvidence first = runRoundCapturing(gc, UniversePolicy::AuthoritativeForTest);
@@ -331,7 +331,7 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/leak@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const DB::UInt128 released(0xdea1);
     const DB::UInt128 unrelated(0xb00c);
 
@@ -348,7 +348,7 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
         .last_epoch_seal = std::nullopt,
     });
 
-    backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2})});
+    backend->setListOmissions({layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2})});
 
     Gc gc(store, kGc);
     const RoundEvidence condemning = runRoundCapturing(gc, UniversePolicy::AuthoritativeForTest);
@@ -403,8 +403,8 @@ ManifestRef buildKillShot(const std::shared_ptr<LiarBackend> & backend, const La
 
     /// The whole of `hidden`'s ref stream goes invisible -- the namespace itself is what the listing
     /// stops mentioning, not a record inside it.
-    backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(hidden), RefTxnId{1, 1}),
-                               layout.refCkptKey(NamespaceLifeId::stageATransition(hidden))});
+    backend->setListOmissions({layout.refLogKey(fixture::fixtureLife(hidden), RefTxnId{1, 1}),
+                               layout.refCkptKey(fixture::fixtureLife(hidden))});
     return dropped;
 }
 }
@@ -510,7 +510,7 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
     /// how many rounds ran.)
     dropAt(*backend, layout, hidden, RefTxnId{1, 2}, "kept_ref", kept);
     advanceRecoverableCkptForRawFixture(*backend, layout, hidden, RefTxnId{1, 2});
-    backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(hidden)));
 
     publishAt(*backend, layout, visible, RefTxnId{1, 1}, "dropped_ref", 2, blob, /*birth=*/true);
     const ManifestRef dropped = publishedManifest(RefTxnId{1, 1}, 2);
@@ -605,7 +605,7 @@ TEST(CasListLiarEndToEnd, FsckReachabilityRecoveryMatchesTruthUnderAHiddenTailTr
 
     auto lying_backend = std::make_shared<LiarBackend>();
     seedFiveRecordStream(*lying_backend, layout, ns);
-    lying_backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 5})});
+    lying_backend->setListOmissions({layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 5})});
     auto lying = openRecoveryPool(lying_backend);
     const FsckReport under_lie = runFsck(*lying, /*detail=*/true);
 

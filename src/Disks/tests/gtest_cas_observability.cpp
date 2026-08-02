@@ -263,9 +263,9 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
     const RefTxnId snap_id{1, 7};
     const RefTableSnapshot snap = minimalLiveSnapshot(ns.string(), snap_id,
         {committedRow("all_0_0_0", ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1})});
-    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_id);
+    const String key = layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), snap_id);
     const String json = caInspectToJson(
-        layout, key, encodeRefTableSnapshot(snap), NamespaceLifeId::stageATransition(ns));
+        layout, key, encodeRefTableSnapshot(snap), DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_snapshot")"), String::npos) << json;
     EXPECT_NE(json.find(R"("ns":"srv/tbl@cas@")"), String::npos) << json;
     EXPECT_NE(json.find(R"("snapshot_id":{"writer_epoch":1,"ref_sequence":7})"), String::npos) << json;
@@ -289,9 +289,9 @@ TEST(CasObservability, CaInspectDecodesRefLogToJson)
     add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "all_0_0_0",
         ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1}};
     txn.ops = {add};
-    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), txn_id);
+    const String key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), txn_id);
     const String json = caInspectToJson(
-        layout, key, encodeRefLogTxn(txn), NamespaceLifeId::stageATransition(ns));
+        layout, key, encodeRefLogTxn(txn), DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find("ref_log"), String::npos);
     EXPECT_NE(json.find("OwnerTransition"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);

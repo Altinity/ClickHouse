@@ -251,12 +251,12 @@ TEST(CasGcRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
     std::vector<RefOp> first_ops{namespaceBirthOp()};
     const auto admitted_ops = publishCommittedOps("admitted", admitted);
     first_ops.insert(first_ops.end(), admitted_ops.begin(), admitted_ops.end());
-    writeRefLogTxnRaw(*backend, layout,
+    fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(first_ops), .prev_epoch_seal = std::nullopt});
 
     /// This record is real and listable, but the writer never published it through `_ckpt`.
     const ManifestRef unfrontiered = ref(2, 0xB2);
-    writeRefLogTxnRaw(*backend, layout,
+    fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = publishCommittedOps("unfrontiered", unfrontiered),
                   .prev_epoch_seal = std::nullopt});
     ASSERT_TRUE(backend->head(layout.refLogKey(life, RefTxnId{1, 2})).exists);
@@ -292,7 +292,7 @@ TEST(CasGcRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
     std::vector<RefOp> ops{namespaceBirthOp()};
     const auto admitted_ops = publishCommittedOps("admitted", admitted);
     ops.insert(ops.end(), admitted_ops.begin(), admitted_ops.end());
-    writeRefLogTxnRaw(*backend, layout,
+    fixture::writeRefLogRaw(*backend, layout,
         RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(ops), .prev_epoch_seal = std::nullopt});
 
     Gc gc(store, kGc);
@@ -321,16 +321,16 @@ TEST(CasGcRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
     const RefLogTxn birth{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, birth);
+    fixture::writeRefLogRaw(*backend, layout, birth);
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
     const RefLogTxn seal_txn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, seal_txn);
+    fixture::writeRefLogRaw(*backend, layout, seal_txn);
     RefOp later_seal;
     later_seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{2, 1}, .ops = {later_seal},
         .prev_epoch_seal = RefTxnId{1, 2}});
     RefTableState through_seal;

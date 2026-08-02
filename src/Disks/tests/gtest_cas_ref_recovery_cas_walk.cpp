@@ -73,7 +73,6 @@ using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
 using DB::Cas::tests::rearmMountFenceAfterAnomalyForTest;
-using DB::Cas::tests::writeRefLogTxnRaw;
 using DB::Cas::tests::writeRefSnapshotRaw;
 
 namespace
@@ -395,7 +394,7 @@ RefLogTxn makeSealTxn(const RootNamespace & ns, RefTxnId id,
 void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId id,
              const String & ref, bool birth)
 {
-    writeRefLogTxnRaw(backend, layout, makeOrdinaryTxn(ns, id, ref, birth));
+    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, makeOrdinaryTxn(ns, id, ref, birth));
 }
 
 /// Seeds the `_ckpt` a real namespace birth would have created, so recovery can ground its walk at the
@@ -403,7 +402,7 @@ void seedTxn(Backend & backend, const Layout & layout, const RootNamespace & ns,
 /// never run a birth through the append lane.
 void seedCkpt(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
-    backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt));
+    backend.putIfAbsent(layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt));
 }
 
 RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_through = std::nullopt)
@@ -418,7 +417,7 @@ RefCkpt lifeEpochCkpt(uint64_t life_epoch, std::optional<RefTxnId> committed_thr
 /// disengaged optional: an aborted binary would take every later suite's result with it.
 std::optional<RefLogTxn> readLogTxn(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId id)
 {
-    const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+    const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
     if (!got)
         return std::nullopt;
     return decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
@@ -510,14 +509,14 @@ TEST(CasRefRecoveryCasWalk, HiddenMiddleLogDoesNotAffectCheckpointRecovery)
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
     seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
-    backend->hidden_keys.insert(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}));
+    backend->hidden_keys.insert(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 2}));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
     backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
-    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns))), 0u);
     EXPECT_EQ(refs.size(), 3u) << "the arithmetic walk must fetch {1,2} by exact key";
     EXPECT_TRUE(refs.contains("a"));
     EXPECT_TRUE(refs.contains("b")) << "'b' is the ref the omitted transaction published";
@@ -535,14 +534,14 @@ TEST(CasRefRecoveryCasWalk, HiddenTailLogDoesNotAffectCheckpointRecovery)
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 2}));
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "b", /*birth=*/false);
-    backend->hidden_keys.insert(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}));
+    backend->hidden_keys.insert(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 2}));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
     backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
-    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns))), 0u);
     EXPECT_EQ(refs.size(), 2u) << "an omitted TAIL id is indistinguishable from the end of the stream to a "
                                   "listing; recovery never enumerates it and exact-reads the checkpoint range";
     EXPECT_TRUE(refs.contains("b"));
@@ -565,14 +564,14 @@ TEST(CasRefRecoveryCasWalk, CkptNamedBaseIsRecoveredWithoutStreamList)
                                            .committed_through = base,
                                            .checkpoint_snapshot_id = base,
                                            .last_epoch_seal = std::nullopt});
-    backend->hidden_keys.insert(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), base));
+    backend->hidden_keys.insert(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), base));
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
     backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
-    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns))), 0u);
     EXPECT_EQ(refs.size(), 2u) << "the checkpoint names the base; the listing's omission is irrelevant";
     EXPECT_TRUE(refs.contains("a")) << "'a' exists inside the checkpoint-named snapshot";
     EXPECT_TRUE(refs.contains("c"));
@@ -585,7 +584,7 @@ TEST(CasRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
     const RootNamespace ns{"srv1/missing_below_frontier"};
     const RefTxnId frontier{1, 2};
 
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(*backend, layout, ns);
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
@@ -613,7 +612,7 @@ TEST(CasRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
     const RefTxnId frontier{1, 1};
     const RefTxnId uncommitted_snapshot_id{1, 2};
 
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(*backend, layout, ns);
     seedTxn(*backend, layout, ns, frontier, "committed", /*birth=*/true);
     writeRefSnapshotRaw(*backend, layout,
@@ -643,7 +642,7 @@ TEST(CasRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
     const RefTxnId frontier{1, 2};
     auto seed = std::make_shared<HidingListBackend>();
 
-    DB::Cas::tests::casAdmitEntry(*seed, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*seed, layout, ns);
     seedTxn(*seed, layout, ns, base, "a", /*birth=*/true);
     writeRefSnapshotRaw(*seed, layout,
         minimalLiveSnapshot(ns.string(), base, {committedRow("a", manifestRef(1, 1, 1))}));
@@ -752,7 +751,7 @@ TEST(CasRefRecoveryCasWalk, ListedFPlusTwoWithoutFPlusOneIsInertUncommittedDebri
     backend->resetCounts();
     const auto refs = store->listRefs(ns);
 
-    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns))), 0u);
     EXPECT_TRUE(refs.contains("a"));
     EXPECT_FALSE(refs.contains("debris"));
 }
@@ -825,7 +824,7 @@ TEST(CasRefRecoveryCasWalk, LiveCatalogLifeWithoutReadableCheckpointIsCorruption
     const Layout layout("p");
     const RootNamespace ns{"srv1/live_without_ckpt"};
 
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(*backend, layout, ns);
     seedTxn(*backend, layout, ns, RefTxnId{7, 1}, "hint-must-not-be-genesis", /*birth=*/true);
     ASSERT_FALSE(readCkpt(*backend, layout, life));
@@ -904,7 +903,7 @@ TEST(CasRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     /// The peer's seal lands between our read of {1,2} and our create of it, so we meet it as an
     /// OCCUPANT rather than as a tail entry.
-    backend->late_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 2});
     backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(makeSealTxn(ns, RefTxnId{1, 2})));
 
     auto store = openWalkPool(backend);
@@ -932,7 +931,7 @@ TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
     /// The dying epoch's last append materializes between our read of {1,2} and our create of it -- the
     /// straggler, arriving exactly where the every-attempt rule says it can.
-    backend->late_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 2});
     backend->late_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, RefTxnId{1, 2}, "late", /*birth=*/false)));
 
@@ -1309,7 +1308,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    const auto ckpt_before = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
+    const auto ckpt_before = readCkpt(*backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_before.has_value());
 
     backend->watched_substr = "_log/";
@@ -1317,7 +1316,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
 
     EXPECT_ANY_THROW(store->listRefs(ns));
 
-    const auto ckpt_after = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
+    const auto ckpt_after = readCkpt(*backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::nullopt)
         << "the seal is durable but the checkpoint must not record it under a generation that moved";
@@ -1348,7 +1347,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState
 
     EXPECT_ANY_THROW(store->listRefs(ns)) << "the install recheck must refuse a result from a moved generation";
 
-    const auto ckpt_after = readCkpt(*backend, layout, NamespaceLifeId::stageATransition(ns));
+    const auto ckpt_after = readCkpt(*backend, layout, DB::Cas::tests::fixture::fixtureLife(ns));
     ASSERT_TRUE(ckpt_after.has_value());
     EXPECT_EQ(ckpt_after->ckpt.last_epoch_seal, std::optional<RefTxnId>(RefTxnId{1, 2}))
         << "the checkpoint advance already landed and is harmless -- the merge is a semantic maximum";
@@ -1598,7 +1597,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
     /// Create the catalog life explicitly, then retain exactly the checkpoint fragment published by
     /// production birth before its first log. This makes `{1,1}` the first durable transaction above a
     /// readable checkpoint whose `committed_through` is absent.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = catalogLife(*backend, layout, ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(lifeEpochCkpt(1))).outcome,
               PutOutcome::Done);
@@ -1837,7 +1836,7 @@ TEST(CasRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStor
     const RefTxnId ghost_id{1, 2};
     const String ghost_bytes = sealObject(FormatId::RefLog,
         encodeRefLogTxn(makeOrdinaryTxn(ns, ghost_id, "ghost", /*birth=*/false)));
-    const PutResult put = backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), ghost_id), ghost_bytes);
+    const PutResult put = backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), ghost_id), ghost_bytes);
     EXPECT_EQ(put.outcome, PutOutcome::PreconditionFailed)
         << "the seal occupies the ghost's own key, so the store itself is the fence";
 
@@ -1861,7 +1860,7 @@ TEST(CasRefRecoveryCasWalk, UndecodableOccupantAtTheSealSlotFailsClosedAndLeaves
     burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/2);
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{1, 1}));
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
-    backend->late_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2});
+    backend->late_key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 2});
     backend->late_bytes = "not a ref-log object at all";
 
     auto store = openWalkPool(backend);
@@ -1964,7 +1963,7 @@ TEST(CasRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredece
     removal.ops = {DB::Cas::tests::ownerTransitionOp(
                        RefOwnerBinding{RefOwnerKind::Committed, "a", manifestRef(1, 1, 1u)}, std::nullopt),
                    removeNamespaceOp()};
-    writeRefLogTxnRaw(*backend, layout, removal);
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, removal);
 
     /// The current life starts in epoch 2. Its birth is sequence 1 of its own genesis epoch, so it
     /// carries no chain link to the predecessor life.

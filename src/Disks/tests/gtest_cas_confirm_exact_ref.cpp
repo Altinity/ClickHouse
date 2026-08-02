@@ -387,7 +387,7 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
 
     const size_t cached_before = store->refTablesCachedCountForTest();
-    backend->fail_get_once_key = store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns));
+    backend->fail_get_once_key = store->layout().refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_THROW(store->resolveRef(ns, "x"), DB::Exception);
 
     ASSERT_EQ(store->refTablesCachedCountForTest(), cached_before + 1u)
@@ -413,7 +413,7 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_recovering"};
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
-    backend->armBlockedGet(store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns)));
+    backend->armBlockedGet(store->layout().refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)));
     std::exception_ptr recovery_error;
     std::thread recoverer([&]
     {
@@ -598,7 +598,7 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
     ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);
 
     store->forceWedgeForTest(ns, /*writer_epoch=*/1, /*ref_sequence=*/9999,
-                             store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 9999}), "synthetic");
+                             store->layout().refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{1, 9999}), "synthetic");
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     backend->resetCounts();

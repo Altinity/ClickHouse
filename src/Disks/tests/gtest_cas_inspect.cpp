@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
+#include "cas_test_helpers.h"
 
 using namespace DB::Cas;
 
@@ -46,10 +47,10 @@ TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
     op.published_at_ms = 42;
     txn.ops.push_back(op);
 
-    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
+    const String key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
-    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
+    const String json = caInspectToJson(layout, key, bytes, DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("kind":"SetPublishedAt")"), String::npos) << json;
     EXPECT_EQ(json.find("payload"), String::npos) << json;
 }
@@ -70,10 +71,10 @@ TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
     op.kind = RefOpKind::EpochSeal;
     txn.ops.push_back(op);
 
-    const String key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), id);
+    const String key = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id);
     const String bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(txn));
 
-    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
+    const String json = caInspectToJson(layout, key, bytes, DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("kind":"EpochSeal")"), String::npos) << json;
     EXPECT_NE(json.find(R"("prev_epoch_seal":{"writer_epoch":2,"ref_sequence":9})"), String::npos) << json;
 }
@@ -93,10 +94,10 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
     row.published_at_ms = 42;
     snap.committed.push_back(row);
 
-    const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), id);
+    const String key = layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), id);
     const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(snap));
 
-    const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
+    const String json = caInspectToJson(layout, key, bytes, DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_EQ(json.find("payload"), String::npos) << json;
     EXPECT_EQ(json.find("lifecycle"), String::npos) << json;
     EXPECT_EQ(json.find("remove_txn_id"), String::npos) << json;
@@ -169,8 +170,8 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
                        .last_epoch_seal = RefTxnId{6, 4}};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt),
-        NamespaceLifeId::stageATransition(ns));
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(ckpt),
+        DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
     EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
@@ -189,8 +190,8 @@ TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
     const RootNamespace ns{"srv1/db/fresh"};
 
     const String json = caInspectToJson(
-        layout, layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(RefCkpt{}),
-        NamespaceLifeId::stageATransition(ns));
+        layout, layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)), encodeRefCkpt(RefCkpt{}),
+        DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":null)"), String::npos) << json;
     EXPECT_NE(json.find(R"("checkpoint_snapshot_id":null)"), String::npos) << json;

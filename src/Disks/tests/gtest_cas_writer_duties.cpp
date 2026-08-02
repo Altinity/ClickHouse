@@ -105,7 +105,7 @@ TEST(CasWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
     const uint64_t abandoned_seq = abandoned->buildSeq();
     const String abandoned_manifest_key = store->layout().manifestKey(abandoned_id);
 
-    backend->fault_substr = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(

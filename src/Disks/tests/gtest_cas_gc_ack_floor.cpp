@@ -150,7 +150,7 @@ TEST(CasSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
     EXPECT_THROW(advanceRecoverableCkptForRawFixture(*backend, store->layout(), ns, id), DB::Exception);
 
     const RootNamespace invalid_ns{"00/semantic-invalid@cas@"};
-    casAdmitEntry(*backend, store->layout(), invalid_ns);
+    fixture::admitLive(*backend, store->layout(), invalid_ns);
     const NamespaceLifeId invalid_life = *CasRefCatalog::lifeIfCataloged(*backend, store->layout(), invalid_ns);
     const String invalid_key = store->layout().refCkptKey(invalid_life);
     ASSERT_EQ(backend->putIfAbsent(invalid_key, "not a checkpoint").outcome, PutOutcome::Done);
@@ -165,7 +165,7 @@ TEST(CasRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
     const RootNamespace ns{"00/raw-no-ckpt@cas@"};
     const RefTxnId id{1, 1};
 
-    writeRefLogTxnRaw(*backend, store->layout(), RefLogTxn{
+    fixture::writeRefLogRaw(*backend, store->layout(), RefLogTxn{
         .ns = ns.string(),
         .txn_id = id,
         .ops = {namespaceBirthOp()},
@@ -632,7 +632,7 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
         String cursor;
         for (;;)
         {
-            const ListPage page = backend->list(store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+            const ListPage page = backend->list(store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)), cursor, 1000);
             for (const ListedKey & lk : page.keys)
                 keys.insert(lk.key);
             if (page.next_cursor.empty())

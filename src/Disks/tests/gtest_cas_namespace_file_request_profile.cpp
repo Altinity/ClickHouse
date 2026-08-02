@@ -65,12 +65,12 @@ const String kFile = "format_version.txt";
 const String kSegment1 = "deduplication_logs/deduplication_log_1.txt";
 const String kSegment2 = "deduplication_logs/deduplication_log_2.txt";
 
-/// The identity every case below operates under. `stageATransition` is the transitional mint Task 6
+/// The identity every case below operates under. `fixture::fixtureLife` is the transitional mint Task 6
 /// deletes; what matters to this file is only that ONE life is used throughout, so a count is not
 /// split across two prefixes.
 NamespaceLifeId testLife()
 {
-    return NamespaceLifeId::stageATransition(RootNamespace{kNsString});
+    return fixture::fixtureLife(RootNamespace{kNsString});
 }
 
 /// A pool over `CountingBackend`, with the counts reset AFTER open: `Pool::open` runs its own

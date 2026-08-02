@@ -383,7 +383,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
 
-    backend->fault_key_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
     backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
     backend->fault_count = 1;  /// fault exactly promote's ref-log append
     const int attempts_before = backend->matching_put_attempts;
@@ -474,7 +474,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
 
     publishPart(store, ns, "src", {inlineEntry("f", "same")});
 
-    backend->fault_key_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
     backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
     backend->fault_count = 2;  /// fault promote's append AND the cleanup append that follows it
     const int attempts_before = backend->matching_put_attempts;
@@ -1208,7 +1208,7 @@ TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
 
     /// The promotion's own ref-log object lands; only the acknowledgement, and the controller's
     /// verifying read, are lost. Scoped to this namespace's ref log so nothing else consumes the fault.
-    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = store->layout().namespaceStreamPrefix(fixture::fixtureLife(ns)) + "_log/";
     backend->mode = Cas::tests::ChunkFaultBackend::Mode::LandedThenLost;
     backend->fault_count = 1;
     expectThrowsCode(ErrorCodes::NETWORK_ERROR, [&] { prepared.promote(); });

@@ -204,7 +204,7 @@ TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
         remove_op.kind = RefOpKind::RemoveNamespace;
         appendRefLogSeed(*backend, layout, ns, {remove_op});
     }
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
     writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},

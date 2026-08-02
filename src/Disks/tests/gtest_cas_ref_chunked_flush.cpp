@@ -93,7 +93,7 @@ PoolPtr openPool(const BackendPtr & backend)
 /// Stage B (Task 4-C): pin `ns` to the sentinel before the first real touch -- the ONE choke point
 /// every test in this file uses to birth its namespace, before any `launchAppendOps`/`launchAppend`/
 /// `launchDrop` call. Several tests separately compute an expected key via
-/// `NamespaceLifeId::stageATransition(ns)` for verification/fault injection; without this the real
+/// `DB::Cas::tests::fixture::fixtureLife(ns)` for verification/fault injection; without this the real
 /// production birth mints a random incarnation and those computed keys land nowhere real.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
@@ -357,7 +357,7 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     /// `dropNamespace` further down are real production reads that trigger `resolveNamespaceLife`,
     /// which for an UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the
     /// sentinel the raw fixture wrote at. Pinning first makes them adopt it instead.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
 
     /// Ids are PER-NAMESPACE and derived from the table's own `greatest_applied` (INV-1), so seeding
     /// `ns` at `{epoch, 1}` is all this fixture has to do: the `dropNamespace` below derives `{epoch, 2}`
@@ -371,7 +371,7 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
     /// Recovery's checkpoint anchor includes the same-id ordinary log. The synthetic snapshot stands
     /// for a long prior history, while this genesis record supplies the retained non-seal witness the
     /// real publisher would necessarily leave at the selected id.
-    DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(),
         .txn_id = RefTxnId{epoch, 1},
         .ops = {DB::Cas::tests::namespaceBirthOp()},
@@ -383,7 +383,7 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
         .checkpoint_snapshot_id = RefTxnId{epoch, 1},
         .last_epoch_seal = std::nullopt,
     });
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, layout, ns).value();
     backend->resetCounts();
     ASSERT_EQ(store->listRefs(ns).size(), kTotalRefs);
     EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{epoch, 1})), 1u);
@@ -488,11 +488,11 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     String cursor;
     for (;;)
     {
-        const ListPage page = backend.list(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = backend.list(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & lk : page.keys)
         {
             const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->life_id == NamespaceLifeId::stageATransition(ns).incarnation
+            if (parsed && parsed->life_id == DB::Cas::tests::fixture::fixtureLife(ns).incarnation
                 && parsed->kind == RefObjectKind::Log)
                 ids.push_back(parsed->txn_id);
         }
@@ -504,7 +504,7 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
     std::vector<RefLogTxn> txns;
     for (const RefTxnId & id : ids)
     {
-        const auto got = backend.get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        const auto got = backend.get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), id));
         if (!got)
             continue;
         try
@@ -692,7 +692,7 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
 
     /// Fault ONLY chunk 2's `_log/` PUT: skip chunk 1's (the first match), fault the second. Armed AFTER
     /// the seed so only the flush's two log PUTs are counted.
-    backend->fault_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->mode = mode;
     backend->fault_skip = 1;
     backend->fault_count = 1;
@@ -759,7 +759,7 @@ TEST(RefWriterChunkedFlush, ChunkFailureWedge)
     EXPECT_TRUE(out.store->refLaneWedgedForTest(ns)) << "chunk 2's unresolved PUT must wedge the lane";
     RefTxnId chunk2_id = out.chunk1_id;
     ++chunk2_id.ref_sequence;
-    EXPECT_EQ(out.store->wedgedKeyForTest(ns), out.store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), chunk2_id))
+    EXPECT_EQ(out.store->wedgedKeyForTest(ns), out.store->layout().refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), chunk2_id))
         << "the wedge must contain ONLY chunk 2's key";
 
     const auto logs = listLogTxns(*out.backend, out.store->layout(), ns);
@@ -875,7 +875,7 @@ TEST(RefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
 
     /// Latch the FIRST `_snap/` PUT (chunk 1's publisher) at its conditional PUT -- i.e. AFTER it has
     /// captured chunk 1's prefix under state_mutex.
-    backend->armBlock(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_snap/");
+    backend->armBlock(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_snap/");
     /// Gate the leader at the chunk boundary until that publisher has parked on its PUT, so its captured
     /// candidate is EXACTLY chunk 1's prefix (not chunk 1 + chunk 2).
     store->setCarveHookForTest([backend](CasRefLedger::CarvePhaseForTest ph)

@@ -115,7 +115,7 @@ TEST(CasGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     for (uint64_t i = 1; i <= 5; ++i)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
@@ -127,8 +127,8 @@ TEST(CasGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
         .last_epoch_seal = std::nullopt,
     });
 
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 4}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -186,7 +186,7 @@ TEST(CasGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
@@ -203,8 +203,8 @@ TEST(CasGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
 
     /// The hint hides the seal AND the new epoch's first record: neither the epoch boundary nor its
     /// start may depend on the listing.
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -225,7 +225,7 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -239,7 +239,7 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
         .last_epoch_seal = RefTxnId{2, 1},
     });
 
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1}));
 
     const auto intake = runRoundAndReadIntakeMetrics(store);
     ASSERT_FALSE(intake.empty()) << "no fold_ref_intake row";
@@ -431,7 +431,7 @@ TEST(CasGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -452,7 +452,7 @@ TEST(CasGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
 
     /// Arm only after seeding, so the fixture's own writes are undisturbed and the read counter starts
     /// at the round's first read of this key (`crossFromSeal`'s, which must succeed).
-    backend->flaky = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1});
+    backend->flaky = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);   /// must RETURN -- the spin is the failure mode
@@ -479,11 +479,11 @@ TEST(CasGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const RootNamespace ns_b{"00/bb@cas@"};
 
     publishAt(*backend, layout, ns_a, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    backend->putIfAbsent(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
     writeRecoverableCkptForRawFixture(*backend, layout, ns_a, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 2},
@@ -528,7 +528,7 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
@@ -543,7 +543,7 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
         .last_epoch_seal = RefTxnId{1, 3},
     });
 
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2}));
 
     const auto intake = runRoundAndReadIntakeMetrics(store);
     ASSERT_FALSE(intake.empty()) << "no fold_ref_intake row";
@@ -575,7 +575,7 @@ TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheck
         .last_epoch_seal = std::nullopt,
     });
     for (uint64_t i = 1; i <= 3; ++i)
-        backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, i}));
+        backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, i}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);

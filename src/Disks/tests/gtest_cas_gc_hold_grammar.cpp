@@ -735,10 +735,10 @@ TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    backend->putIfAbsent(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
     writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 2});
 
     Gc gc(store, kGc);
@@ -802,7 +802,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
@@ -817,7 +817,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = RefTxnId{2, 1},
     });
-    backend->flaky = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1});
+    backend->flaky = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -847,7 +847,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
         publishAt(backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
         /// {1,3} is missing and {1,4}, though durable, is invisible to every LIST.
         publishAt(backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
-        backend.hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4}));
+        backend.hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 4}));
     };
 
     /// Hint-only: nothing above {1,2} is visible, so the walk honestly reads a frontier and does not hold.
@@ -875,7 +875,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
         const Layout & layout = store->layout();
         seed(*backend, layout);
         writeCkptAt(*backend, layout, ns, RefTxnId{1, 4});
-        backend->hide(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
+        backend->hide(layout.refCkptKey(fixture::fixtureLife(ns)));
 
         Gc gc(store, kGc);
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -912,7 +912,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         publishAt(backend, layout, ns, RefTxnId{1, 6}, "ref_6", 6, DB::UInt128(6));
         for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 3}, RefTxnId{1, 4},
                                     RefTxnId{1, 6}})
-            backend.hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+            backend.hide(layout.refLogKey(fixture::fixtureLife(ns), id));
     };
 
     /// Hold-witness only: it witnesses {1,3}, which the walk has now passed, so the absent {1,5} above it
@@ -938,7 +938,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         Gc gc(store, kGc);
         seedPool(*backend, layout, gc);
         advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 6});
-        backend->hide(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
+        backend->hide(layout.refCkptKey(fixture::fixtureLife(ns)));
 
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
         const RefHold hold = holdOf(*backend, layout, ns);
@@ -962,7 +962,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     const RootNamespace bad{"00/aa@cas@"};
     /// Stage B (Task 4-C): no pin needed -- `publishAt(..., birth=true)` below (draining into
     /// `writeRefLogTxnRaw`) admits `bad` into the catalog itself, pinned to the same sentinel this
-    /// test's own `stageATransition(bad)` key computations already assume.
+    /// test's own `fixture::fixtureLife(bad)` key computations already assume.
     const RootNamespace good{"00/bb@cas@"};
 
     auto backend = std::make_shared<HintHoleCountingBackend>();
@@ -985,7 +985,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 
     /// Corrupt EXACTLY ONE OBJECT: the first namespace's `_ckpt` body. Nothing else in the pool changes,
     /// so everything the next round does differently is attributable to this one object.
-    const String bad_ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(bad));
+    const String bad_ckpt_key = layout.refCkptKey(fixture::fixtureLife(bad));
     const HeadResult ckpt_head = backend->head(bad_ckpt_key);
     ASSERT_TRUE(ckpt_head.exists);
     ASSERT_EQ(backend->putOverwrite(bad_ckpt_key, "this is not a cas_ref_ckpt", ckpt_head.token).outcome,
@@ -993,7 +993,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 
     /// Work only a round that COMPLETES can fold.
     publishAt(*backend, layout, good, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(12));
-    const String good_ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(good));
+    const String good_ckpt_key = layout.refCkptKey(fixture::fixtureLife(good));
     const HeadResult good_ckpt_head = backend->head(good_ckpt_key);
     ASSERT_TRUE(good_ckpt_head.exists);
     ASSERT_EQ(backend->putOverwrite(good_ckpt_key, encodeRefCkpt(RefCkpt{
@@ -1024,7 +1024,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
     /// its ref objects — including the ones a cleanup range computed WITHOUT the unreadable checkpoint
     /// would have widened onto — are all still there.
     for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}})
-        EXPECT_TRUE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(bad), id)).exists)
+        EXPECT_TRUE(backend->head(layout.refLogKey(fixture::fixtureLife(bad), id)).exists)
             << "ref log " << renderRefTxnId(id) << " of the held namespace was deleted";
 }
 
@@ -1063,10 +1063,10 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     /// would be silently defeated. Admitting it here (still with no `_ckpt` of its own) is what keeps
     /// `phantom` reachable by `readCheckpointWitnesses` without giving it the birth this test deliberately
     /// withholds.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, phantom);
+    fixture::admitLive(*backend, layout, phantom);
 
     /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
-    backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom)), "this is not a cas_ref_ckpt");
+    backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(phantom)), "this is not a cas_ref_ckpt");
     publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
     writeCommittedCkptAt(*backend, layout, good, RefTxnId{1, 1});
 
@@ -1102,7 +1102,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
 
     /// The unreadable object itself is never deleted as debris — repairing it is the operator's move,
     /// and GC removing it would erase the only evidence of what stopped the namespace.
-    EXPECT_TRUE(backend->head(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom))).exists);
+    EXPECT_TRUE(backend->head(layout.refCkptKey(fixture::fixtureLife(phantom))).exists);
 }
 
 /// ===================== THE HOLD IS DURABLE =====================
@@ -1128,7 +1128,7 @@ RefHold seedHeldThenUnhinted(
     /// Every one of the namespace's objects vanishes from every LIST while staying readable by key:
     /// the round that follows has no hint entry for this namespace at all.
     for (const RefTxnId & id : {RefTxnId{1, 1}, RefTxnId{1, 2}, RefTxnId{1, 4}})
-        backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), id));
+        backend->hide(layout.refLogKey(fixture::fixtureLife(ns), id));
     return hold;
 }
 
@@ -1159,11 +1159,11 @@ TEST(CasGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
     auto backend = std::make_shared<HintHoleCountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Gc gc(store, kGc);
     seedHeldThenUnhinted(backend, store, ns, gc);
 
-    const String offending = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3});
+    const String offending = store->layout().refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3});
     const uint64_t before = backend->getCount(offending);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1182,7 +1182,7 @@ TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     Gc gc(store, kGc);
     seedHeldThenUnhinted(backend, store, ns, gc);
 
@@ -1193,7 +1193,7 @@ TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
     /// The record appears at last (still invisible to every LIST — the hold is the only thing that
     /// knows to look there).
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(3));
-    backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
+    backend->hide(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 3}));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const auto cov = coverageOf(*backend, layout, ns);

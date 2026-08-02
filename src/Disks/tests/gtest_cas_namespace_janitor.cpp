@@ -577,8 +577,8 @@ TEST(CasNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace live_namespace{"00/live@cas@"};
-    casAdmitEntry(*backend, layout, live_namespace);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(live_namespace)),
+    fixture::admitLive(*backend, layout, live_namespace);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(live_namespace)),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt})).outcome,
         PutOutcome::Done);

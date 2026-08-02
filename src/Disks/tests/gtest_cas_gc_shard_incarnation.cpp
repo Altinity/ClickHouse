@@ -60,7 +60,7 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
         const RootNamespace ns_uncataloged{"srv1/tblUncataloged"};
 
         /// (a) Admitted Live, nothing else ever written under it.
-        casAdmitEntry(*backend, layout, ns_live_empty);
+        fixture::admitLive(*backend, layout, ns_live_empty);
 
         /// (b) A genuinely Creating entry, admitted directly (step 1 alone -- never completed to Live).
         CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
@@ -179,7 +179,7 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
     std::vector<RefOp> current_ops{namespaceBirthOp()};
     const auto committed_ops = publishCommittedOps("part_current", current_ref);
     current_ops.insert(current_ops.end(), committed_ops.begin(), committed_ops.end());
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(current_ops), .prev_epoch_seal = std::nullopt});
     replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = std::optional<uint64_t>{1},
@@ -325,8 +325,8 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     /// walk. Catalog and checkpoint admission keep this traffic out of the janitor's dead-life set,
     /// isolating the one deliberately unowned checkpoint below.
     const RootNamespace ordinary_ns{"srv1/tblOrdinaryTraffic"};
-    casAdmitEntry(*backend, layout, ordinary_ns);
-    const NamespaceLifeId ordinary_life = NamespaceLifeId::stageATransition(ordinary_ns);
+    fixture::admitLive(*backend, layout, ordinary_ns);
+    const NamespaceLifeId ordinary_life = fixture::fixtureLife(ordinary_ns);
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(ordinary_life),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);

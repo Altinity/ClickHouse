@@ -532,14 +532,14 @@ TEST(CasPool, VerbatimFilesLifecycle)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "abc");
-    EXPECT_EQ(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt"), String("1\n"));
-    EXPECT_FALSE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "absent").has_value());
-    auto names = s->listNamespaceFiles(NamespaceLifeId::stageATransition(ns));
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "uuid.txt", "abc");
+    EXPECT_EQ(s->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt"), String("1\n"));
+    EXPECT_FALSE(s->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "absent").has_value());
+    auto names = s->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_EQ(names, (std::vector<String>{"format_version.txt", "uuid.txt"}));
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "def");                     /// overwrite allowed (head + putOverwrite)
-    EXPECT_EQ(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt"), String("def"));
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "uuid.txt", "def");                     /// overwrite allowed (head + putOverwrite)
+    EXPECT_EQ(s->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "uuid.txt"), String("def"));
 }
 
 TEST(CasPool, ListNamespaceFilesEmpty)
@@ -547,7 +547,7 @@ TEST(CasPool, ListNamespaceFilesEmpty)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
-    EXPECT_TRUE(s->listNamespaceFiles(NamespaceLifeId::stageATransition(ns)).empty());
+    EXPECT_TRUE(s->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns)).empty());
 }
 
 /// ---------- read side (spec §6): resolveRef / readManifest / findEntry / entryRange / listRefs ----------
@@ -657,7 +657,7 @@ TEST(CasPool, ReadManifestValidatesBodyAndFailsClosed)
     /// body exists at promote) is the only way to construct this state.
     {
         const ManifestRef missing_ref = manifestRefFor("never-staged");
-        DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+        DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
             {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[0],
              DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[1]}, std::nullopt});
         DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
@@ -796,7 +796,7 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
         std::vector<DB::Cas::RefOp> ops = i == 0 ? birth_ops : std::vector<DB::Cas::RefOp>{};
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref_name, ref);
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
-        DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops, std::nullopt});
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops, std::nullopt});
     }
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
@@ -882,7 +882,7 @@ TEST(CasPool, ListRefsMergesAllShards)
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
@@ -970,7 +970,7 @@ TEST(CasPool, ListRefsReturnsSameContentAsBefore)
         const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
+    DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = RefTxnId{1, 1},
@@ -1001,7 +1001,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
 
     const String ref = "legit";
     const ManifestRef mref = manifestRefFor("manifest-" + ref);
-    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+    DB::Cas::tests::fixture::writeRefLogRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps(ref, mref)[0],
          DB::Cas::tests::publishCommittedOps(ref, mref)[1]}, std::nullopt});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
@@ -1013,7 +1013,7 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
-    b->putIfAbsent(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "garbage", "not-a-ref-object");
+    b->putIfAbsent(layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "garbage", "not-a-ref-object");
 
     std::map<String, Resolved> refs;
     EXPECT_NO_THROW(refs = s->listRefs(ns));
@@ -1113,8 +1113,8 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
     for (const String & name : ref_names)
         ASSERT_TRUE(s->resolveRef(ns, name).has_value());
 
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt", "abc");
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "uuid.txt", "abc");
 
     s->dropNamespace(ns);
 
@@ -1124,8 +1124,8 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
 
     /// The writer performs NO physical deletion; verbatim files survive until the perpetual janitor
     /// reclaims the dead life.
-    EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt").has_value());
-    EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt").has_value());
+    EXPECT_TRUE(s->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt").has_value());
+    EXPECT_TRUE(s->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "uuid.txt").has_value());
 
     /// Repeated drop is idempotent: no throw, no second transaction (nothing left to observe changing).
     EXPECT_NO_THROW(s->dropNamespace(ns));
@@ -1171,7 +1171,7 @@ TEST(CasPool, ListNamespacesDoesNotMintLogicalNamesFromFileKeys)
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"test/tbl@cas@"};
 
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt", "1\n");
     /// A second life of the SAME name, written by exact key because no helper mints two lives yet.
     const NamespaceLifeId other = NamespaceLifeId::fromCatalogEntry(ns, DB::UInt128(0x5eed));
     ASSERT_EQ(b->putIfAbsent(s->layout().namespaceFileKey(other, "format_version.txt"), "1\n").outcome,
@@ -1193,7 +1193,7 @@ TEST(CasPool, ListNamespacesDoesNotTreatPhysicalDebrisAsCatalogAuthority)
     /// One well-formed key per family, so the namespace is attributable either way.
     DB::Cas::tests::publishCommittedTransition(*b, s->layout(), ns,
         "ref1", std::nullopt, DB::Cas::ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
-    s->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt", "1\n");
+    s->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "format_version.txt", "1\n");
 
     /// Hand-built un-incarnated keys: no helper can mint either shape any more.
     const String lifeless_ref = s->layout().casRefsPrefix() + ns.string() + "/_log/"
@@ -1222,8 +1222,8 @@ TEST(CasPool, ListMirroredChildren)
     auto b = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// Seed two catalog-authoritative shadow archives; physical files alone carry no logical path.
-    DB::Cas::tests::casAdmitEntry(*b, store->layout(), RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"});
-    DB::Cas::tests::casAdmitEntry(*b, store->layout(), RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"});
+    DB::Cas::tests::fixture::admitLive(*b, store->layout(), RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"});
+    DB::Cas::tests::fixture::admitLive(*b, store->layout(), RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"});
     auto children = store->listMirroredChildren("shadow/");
     std::sort(children.begin(), children.end());
     ASSERT_EQ(children.size(), 2u);
@@ -1620,7 +1620,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
 
     /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
     /// wedge tests in gtest_cas_ref_writer.cpp): the single attempt the budget allows fails ambiguously.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1916,7 +1916,7 @@ TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
     /// `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
     /// ambiguously.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -1972,7 +1972,7 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     const RootNamespace ns2{"srv/table_b"};
     /// Stage B (Task 4-C): `ns1` is pinned because the fault below targets its key by exact sentinel
     /// match. `ns2` must ALSO be pinned: the epoch-close assertions further down read its ref-log keys
-    /// directly at `NamespaceLifeId::stageATransition(ns2)`.
+    /// directly at `DB::Cas::tests::fixture::fixtureLife(ns2)`.
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns1, store->liveWriterEpoch());
     DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns2, store->liveWriterEpoch());
     publishPart(store, ns1.string(), "x", "payload-a");
@@ -1984,7 +1984,7 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors
     /// `UnresolvedWedgeRemountPaysNoWaitEither` above).
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns1)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns1)) + "_log/";
     backend->fault_count = 1;
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns1, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns1));
@@ -2012,12 +2012,12 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2)
         << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
            "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
-    EXPECT_TRUE(backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns2), RefTxnId{1, 2})).has_value())
+    EXPECT_TRUE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())
         << "epoch 1 closes at the slot right after its last durable id, in-band";
-    EXPECT_TRUE(backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns2), RefTxnId{2, 1})).has_value())
+    EXPECT_TRUE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{2, 1})).has_value())
         << "empty epoch 2 closes at its own sequence 1, chained to the epoch-1 seal";
     const RefTxnId retired_sentinel_id{2, std::numeric_limits<uint64_t>::max()};
-    EXPECT_FALSE(backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns2), retired_sentinel_id)).has_value())
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns2), retired_sentinel_id)).has_value())
         << "and NO synthetic seal snapshot is written: that shape is retired";
 }
 
@@ -2030,7 +2030,7 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
     const auto id = DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref,
         {DB::Cas::tests::blobEntryFor("data.bin", DB::UInt128(7))});
-    DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
          DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}, std::nullopt});
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{

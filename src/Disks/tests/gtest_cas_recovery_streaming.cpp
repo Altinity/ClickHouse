@@ -109,7 +109,7 @@ SeededTail seedBigTail(
         const uint64_t footprint = decodedRefLogTxnFootprint(txn);
         seeded.max_single_footprint = std::max(seeded.max_single_footprint, footprint);
         seeded.total_footprint += footprint;
-        writeRefLogTxnRaw(backend, layout, txn);
+        fixture::writeRefLogRaw(backend, layout, txn);
     }
     /// This helper always builds a recoverable `Live` life. Tests that need the distinct missing-
     /// checkpoint corruption shape use the lower-level raw writers directly instead.
@@ -307,7 +307,7 @@ TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
     int64_t held = 0;
     for (size_t t = 1; t <= kTxns; ++t)
     {
-        const auto got = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, t}));
+        const auto got = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, t}));
         ASSERT_TRUE(got.has_value());
         RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), RefTxnId{1, t});
         const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
@@ -349,8 +349,8 @@ TEST(CasRecoveryStreaming, MidTailVanishedObjectFailsClosedAgainstStableAuthorit
     /// Semantic publication already durably advances the exact checkpoint frontier to `seq3`.
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
-    backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq2});   /// vanish a mid-tail object
+    backend->refs_prefix = layout.namespaceStreamPrefix(fixture::fixtureLife(ns));
+    backend->target_log_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, seq2});   /// vanish a mid-tail object
     backend->armed = true;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
@@ -383,8 +383,8 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
     backend->corrupt_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(foreign));
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
-    backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq2});
+    backend->refs_prefix = layout.namespaceStreamPrefix(fixture::fixtureLife(ns));
+    backend->target_log_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, seq2});
     backend->armed = true;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "a"); });
@@ -408,7 +408,7 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
     /// Semantic publication already durably advances the exact checkpoint frontier.
 
     auto store = openPoolForTest(backend);
-    backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
+    backend->refs_prefix = layout.namespaceStreamPrefix(fixture::fixtureLife(ns));
 
     /// Gate the first exact replay GET. The leader reaches it with `state_mutex` released, which is
     /// the window in which a second caller must be able to park on `recovery_cv`.
@@ -416,7 +416,7 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
     std::promise<void> entered_promise;
     std::promise<void> release_promise;
     std::shared_future<void> release_future = release_promise.get_future().share();
-    backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 1});
+    backend->target_log_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 1});
     backend->on_first_target_get = [&]
     {
         if (!get_entered.exchange(true))
@@ -569,9 +569,9 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     base_txn.ns = ns.string();
     base_txn.txn_id = base.snapshot_id;
     base_txn.ops = publishCommittedOps("c_two", mref(12));
-    writeRefLogTxnRaw(*backend, layout, base_txn);
+    fixture::writeRefLogRaw(*backend, layout, base_txn);
     writeRefSnapshotRaw(*backend, layout, base);
-    const auto base_got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), base.snapshot_id));
+    const auto base_got = backend->get(layout.refSnapshotKey(fixture::fixtureLife(ns), base.snapshot_id));
     ASSERT_TRUE(base_got.has_value());
     const uint64_t base_stored_bytes = base_got->bytes.size();
 
@@ -580,20 +580,20 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     t6.ns = ns.string();
     t6.txn_id = RefTxnId{1, 6};
     t6.ops = publishCommittedOps("c_three", mref(21));
-    writeRefLogTxnRaw(*backend, layout, t6);
+    fixture::writeRefLogRaw(*backend, layout, t6);
     RefLogTxn t7;
     t7.ns = ns.string();
     t7.txn_id = RefTxnId{1, 7};
     t7.ops = publishCommittedOps("c_four", mref(22));
-    writeRefLogTxnRaw(*backend, layout, t7);
+    fixture::writeRefLogRaw(*backend, layout, t7);
 
     writeRecoverableCkptForRawFixture(
         *backend, layout, ns, RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 7},
                                        .checkpoint_snapshot_id = RefTxnId{1, 5},
                                        .last_epoch_seal = std::nullopt});
 
-    const uint64_t tail6 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 6}))->bytes.size();
-    const uint64_t tail7 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 7}))->bytes.size();
+    const uint64_t tail6 = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 6}))->bytes.size();
+    const uint64_t tail7 = backend->get(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, 7}))->bytes.size();
 
     backend->resetCounts();
     auto store = openPoolForTest(backend);
@@ -605,7 +605,7 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     /// left for LAST (after `needs_stale_precommit_sweep` has been observed).
 
     ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
     EXPECT_EQ(backend->getCount(layout.refLogKey(life, base.snapshot_id)), 1u)
         << "recovery must validate the selected base's matching ordinary log";
     EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, base.snapshot_id)), 1u)

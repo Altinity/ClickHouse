@@ -155,7 +155,7 @@ std::set<String> listRefKeys(Backend & b, const Layout & layout, const RootNames
 {
     /// Stage B (Task 4-C): `ns` is born through the REAL append lane here, so its objects sit at a
     /// real catalog-minted incarnation, not the Stage-A sentinel.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(b, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(b, layout, ns).value();
     std::set<String> keys;
     forEachListedKey(b, layout.namespaceStreamPrefix(life), [&](const ListedKey & k) { keys.insert(k.key); });
     return keys;

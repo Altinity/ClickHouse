@@ -164,7 +164,7 @@ NamespaceLifeId liveLifeOrFail(Backend & backend, const Layout & layout, const R
         if (entry.ns.string() == ns.string())
             return NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
     ADD_FAILURE() << "expected a catalog entry for namespace '" << ns.string() << "', found none";
-    return NamespaceLifeId::stageATransition(ns);
+    return DB::Cas::tests::fixture::fixtureLife(ns);
 }
 
 /// Births `ns` and publishes `ref_count` committed refs through the REAL append lane, in ONE

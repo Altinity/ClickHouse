@@ -26,12 +26,10 @@ namespace
 {
 
 using DB::Cas::tests::CountingBackend;
-using DB::Cas::tests::casAdmitEntry;
 using DB::Cas::tests::minimalLiveSnapshot;
 using DB::Cas::tests::namespaceBirthOp;
 using DB::Cas::tests::publishCommittedOps;
 using DB::Cas::tests::seedPoolMetaForRestart;
-using DB::Cas::tests::writeRefLogTxnRaw;
 using DB::Cas::tests::writeRefSnapshotRaw;
 
 enum class ListingMode : uint8_t
@@ -93,21 +91,21 @@ void seedAuthoritativeStream(Backend & backend, const Layout & layout, const Roo
     const auto first_publish = publishCommittedOps("a", first);
     birth.insert(birth.end(), first_publish.begin(), first_publish.end());
     const RefLogTxn first_txn = txn(ns, {1, 1}, std::move(birth));
-    writeRefLogTxnRaw(backend, layout, first_txn);
+    DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, first_txn);
 
     if (committed_through > RefTxnId{1, 1})
     {
         RefOp seal_op;
         seal_op.kind = RefOpKind::EpochSeal;
-        writeRefLogTxnRaw(backend, layout, txn(ns, {1, 2}, {std::move(seal_op)}));
+        DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, txn(ns, {1, 2}, {std::move(seal_op)}));
         const ManifestRef second{2, 1, 1};
-        writeRefLogTxnRaw(backend, layout,
+        DB::Cas::tests::fixture::writeRefLogRaw(backend, layout,
             txn(ns, {2, 1}, publishCommittedOps("b", second), RefTxnId{1, 2}));
     }
     if (include_f_plus_one)
     {
         const ManifestRef extra{1, 2, 1};
-        writeRefLogTxnRaw(backend, layout, txn(ns, {1, 2}, publishCommittedOps("uncommitted", extra)));
+        DB::Cas::tests::fixture::writeRefLogRaw(backend, layout, txn(ns, {1, 2}, publishCommittedOps("uncommitted", extra)));
     }
 
     RefTableState snapshot_state;
@@ -346,7 +344,7 @@ TEST(CasRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
 
     {
         auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
-        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
     }
     {
@@ -376,7 +374,7 @@ TEST(CasRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
     }
     {
         auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
-        backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
+        backend->putIfAbsent(layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)),
             encodeRefCkpt(RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
                                   .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
         expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::INVALID_STATE);
@@ -483,7 +481,7 @@ TEST(CasRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAf
     std::vector<RefOp> ops{namespaceBirthOp()};
     const auto publish = publishCommittedOps("committed", manifest);
     ops.insert(ops.end(), publish.begin(), publish.end());
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, std::move(ops)));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 1}, std::move(ops)));
 
     RefTableSnapshot malformed = minimalLiveSnapshot(
         ns.string(), {1, 1}, {DB::Cas::tests::committedRow("committed", manifest)});
@@ -559,10 +557,10 @@ TEST(CasRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
     const Layout layout("p");
     const RootNamespace ns{"srv1/frontier_after_seal"};
 
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 2}, {std::move(seal)}));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 2}, {std::move(seal)}));
 
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     String malformed_ckpt = encodeRefCkpt(RefCkpt{
@@ -588,8 +586,8 @@ TEST(CasRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
 
     RefOp second_seal;
     second_seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {2, 2}, {std::move(second_seal)}));
-    writeRefLogTxnRaw(*backend, layout,
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {2, 2}, {std::move(second_seal)}));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout,
         txn(ns, {3, 1}, publishCommittedOps("c", ManifestRef{3, 1, 1}), RefTxnId{2, 2}));
 
     RefTableState through_first_seal;
@@ -625,11 +623,11 @@ TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
     const Layout layout("p");
     const RootNamespace ns{"srv1/terminal_gap"};
     const RefLogTxn birth = txn(ns, {1, 1}, {namespaceBirthOp()});
-    writeRefLogTxnRaw(*backend, layout, birth);
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, birth);
     RefOp remove;
     remove.kind = RefOpKind::RemoveNamespace;
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 2}, {std::move(remove)}));
-    writeRefLogTxnRaw(*backend, layout, txn(ns, {2, 1}, {namespaceBirthOp()}));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 2}, {std::move(remove)}));
+    DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {2, 1}, {namespaceBirthOp()}));
 
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     String malformed_ckpt = encodeRefCkpt(RefCkpt{
@@ -654,11 +652,11 @@ TEST(CasRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink
 
     const auto expect_rejected = [&](const RootNamespace & ns, std::optional<RefTxnId> backlink)
     {
-        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
         RefOp seal;
         seal.kind = RefOpKind::EpochSeal;
-        writeRefLogTxnRaw(*backend, layout, txn(ns, seal_id, {std::move(seal)}));
-        writeRefLogTxnRaw(*backend, layout, txn(ns, base_id, {}, backlink));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, seal_id, {std::move(seal)}));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, base_id, {}, backlink));
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
 
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
@@ -678,10 +676,10 @@ TEST(CasRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink
 
     const auto expect_predecessor_rejected = [&](const RootNamespace & ns, bool write_ordinary_predecessor)
     {
-        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
         if (write_ordinary_predecessor)
-            writeRefLogTxnRaw(*backend, layout, txn(ns, seal_id, {}));
-        writeRefLogTxnRaw(*backend, layout, txn(ns, base_id, {}, seal_id));
+            DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, seal_id, {}));
+        DB::Cas::tests::fixture::writeRefLogRaw(*backend, layout, txn(ns, base_id, {}, seal_id));
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
 
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);

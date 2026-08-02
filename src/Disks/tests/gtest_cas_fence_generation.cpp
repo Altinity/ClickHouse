@@ -229,11 +229,11 @@ TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDu
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        store->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "somefile", "hello");
+        store->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "somefile", "hello");
     });
 
     /// No durable write ever landed -- assert via the Emulated backend listing.
-    EXPECT_TRUE(store->listNamespaceFiles(NamespaceLifeId::stageATransition(ns)).empty());
+    EXPECT_TRUE(store->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns)).empty());
 }
 
 /// `casRemoveObject`'s delete sibling, same shape: the fence trips between admission and the durable
@@ -245,18 +245,18 @@ TEST(CasFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
     const RootNamespace ns{"test/ns"};
 
     /// Seed the victim BEFORE arming the trigger -- the seeding write itself must not trip the fence.
-    store->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "victim", "still here");
+    store->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim", "still here");
     ASSERT_TRUE(store->mayMutate());
 
     backend->trigger = [&] { store->tripMountLost(); };
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        store->removeNamespaceFile(NamespaceLifeId::stageATransition(ns), "victim");
+        store->removeNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
     });
 
     /// The durable delete never ran -- the object survives (reads are not fence-gated by this task).
-    const auto still_there = store->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "victim");
+    const auto still_there = store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "victim");
     ASSERT_TRUE(still_there.has_value());
     EXPECT_EQ(*still_there, "still here");
 }
@@ -278,11 +278,11 @@ TEST(CasFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJust
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
-        store->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "somefile", "hello");
+        store->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "somefile", "hello");
     });
 
     EXPECT_EQ(backend->head_calls, 2);
-    EXPECT_TRUE(store->listNamespaceFiles(NamespaceLifeId::stageATransition(ns)).empty());
+    EXPECT_TRUE(store->listNamespaceFiles(DB::Cas::tests::fixture::fixtureLife(ns)).empty());
 }
 
 /// (b) The S3-native staging-buffer finalize: the fence trips AFTER the buffer is constructed
@@ -334,13 +334,13 @@ TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
     auto store = openTestPool(backend);
     const RootNamespace ns{"test/ns"};
 
-    store->putNamespaceFile(NamespaceLifeId::stageATransition(ns), "a", "hello");
-    const auto got = store->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "a");
+    store->putNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "a", "hello");
+    const auto got = store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "a");
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(*got, "hello");
 
-    store->removeNamespaceFile(NamespaceLifeId::stageATransition(ns), "a");
-    EXPECT_FALSE(store->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "a").has_value());
+    store->removeNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "a");
+    EXPECT_FALSE(store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "a").has_value());
 }
 
 TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)

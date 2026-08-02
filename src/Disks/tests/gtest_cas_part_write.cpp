@@ -1809,7 +1809,7 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     build->precommitAdd(ns, "part_1", mid);
 
-    b->corrupt_key_substr = s->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    b->corrupt_key_substr = s->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     b->corrupt_count = 1;
 
     /// First abandon(): the precommit-removal appendRefOps' single PUT observes a foreign object at its

@@ -312,12 +312,12 @@ FsckReport runCheckpointBaseFsckWithListingMode(
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/listing_base_" + String(suffix) + "@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefTxnId base{1, 1};
     const RefLogTxn birth{
         .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, birth);
+    fixture::writeRefLogRaw(*backend, layout, birth);
     RefTableState base_state;
     applyRefLogTxn(base_state, birth);
     writeRefSnapshotRaw(*backend, layout, snapshotOf(base_state, ns.string()));
@@ -343,7 +343,7 @@ FsckReport runCheckpointBaseFsckWithListingMode(
             .txn_id = unadopted,
             .ops = {ownerTransitionOp(std::nullopt, listed_binding)},
             .prev_epoch_seal = std::nullopt};
-        writeRefLogTxnRaw(*backend, layout, listed_log);
+        fixture::writeRefLogRaw(*backend, layout, listed_log);
         RefTableState listed_state = base_state;
         applyRefLogTxn(listed_state, listed_log);
         RefTableSnapshot unadopted_snapshot = snapshotOf(listed_state, ns.string());
@@ -497,7 +497,7 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/hidden_from_list@cas@"};
 
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     const uint64_t sequence = appendRefLogSeed(
         *backend, layout, ns, {});   // one real record: a birth-only ref-log transaction
 
@@ -510,7 +510,7 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
     /// first, so the anchor is published directly, by exact key, before the hide -- the exact-key GET
     /// this enables is unaffected by list-hiding either way.
     writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
 
     backend->hidePrefix(layout.namespaceStreamPrefix(life));
 
@@ -627,12 +627,12 @@ TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/skipped_writer_epoch@cas@"};
 
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
         .prev_epoch_seal = std::nullopt});
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
         .prev_epoch_seal = std::nullopt});
 
@@ -670,7 +670,7 @@ TEST(CasFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/missing_checkpoint_base_log@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefTxnId base{1, 1};
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
@@ -690,11 +690,11 @@ TEST(CasFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/missing_checkpoint_base_snapshot@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefTxnId base{1, 1};
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
     writeFsckCheckpointWithBase(*backend, layout, ns, base);
 
@@ -715,21 +715,21 @@ TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint_base_seal@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefLogTxn birth{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, birth);
+    fixture::writeRefLogRaw(*backend, layout, birth);
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
     const RefLogTxn seal_txn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, seal_txn);
+    fixture::writeRefLogRaw(*backend, layout, seal_txn);
     RefOp later_seal;
     later_seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{2, 1}, .ops = {later_seal},
         .prev_epoch_seal = RefTxnId{1, 2}});
 
@@ -761,11 +761,11 @@ TEST(CasFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint_base_transport@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefTxnId base{1, 1};
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
     RefTableState state;
     applyRefLogTxn(state, RefLogTxn{
@@ -790,7 +790,7 @@ TEST(CasFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/checkpoint_base_advanced@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const RefTxnId old_base{1, 1};
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);

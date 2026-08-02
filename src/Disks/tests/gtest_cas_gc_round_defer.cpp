@@ -388,9 +388,9 @@ TEST(CasGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     /// Give the forced fold a nonempty, fully proved authoritative universe. The R11 floor correctly
     /// refuses to open the destructive gate for an empty 0-of-0 universe even in the test-only policy.
     const RootNamespace live_namespace{"live/frontier@cas@"};
-    casAdmitEntry(*backend, layout, live_namespace);
+    fixture::admitLive(*backend, layout, live_namespace);
     ASSERT_EQ(backend->putIfAbsent(
-        layout.refCkptKey(NamespaceLifeId::stageATransition(live_namespace)),
+        layout.refCkptKey(fixture::fixtureLife(live_namespace)),
         encodeRefCkpt(RefCkpt{
             .life_epoch = std::optional<uint64_t>{1},
             .checkpoint_snapshot_id = std::nullopt,

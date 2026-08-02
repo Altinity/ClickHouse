@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
 
@@ -184,7 +185,7 @@ TEST(CasRefIntake, GroupRefKeys)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"db/t"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
 
     std::vector<String> keys{
         layout.refSnapshotKey(life, rid(1, 4)),

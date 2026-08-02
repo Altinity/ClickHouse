@@ -60,7 +60,7 @@ void seedCommittedAt(
     txn.ns = ns.string();
     txn.txn_id = RefTxnId{1, seq};
     txn.ops = std::move(ops);
-    writeRefLogTxnRaw(backend, layout, txn);
+    fixture::writeRefLogRaw(backend, layout, txn);
 }
 
 /// Drive regular rounds, renewing the mount ack after each, until quiescent or `max_rounds`.
@@ -193,7 +193,7 @@ RefCleanupFixture seedTwoCoveredLogs(
     RefCleanupAuthorityRaceBackend & backend, const Layout & layout,
     const RootNamespace & ns)
 {
-    DB::Cas::tests::casAdmitEntry(backend, layout, ns);
+    fixture::admitLive(backend, layout, ns);
     const ManifestRef r1 = mref(1);
     const ManifestRef r2 = mref(2);
     const ManifestRef r3 = mref(3);
@@ -212,7 +212,7 @@ RefCleanupFixture seedTwoCoveredLogs(
         .checkpoint_snapshot_id = RefTxnId{1, v3},
         .last_epoch_seal = std::nullopt,
     });
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
     return {
         .first_log_key = layout.refLogKey(life, RefTxnId{1, v1}),
         .second_log_key = layout.refLogKey(life, RefTxnId{1, v2})};
@@ -385,7 +385,7 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     /// Two committed publishes -> logs {1,1} and {1,2}.
     const ManifestRef r1 = mref(1);
@@ -410,10 +410,10 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
         .last_epoch_seal = std::nullopt,
     });
 
-    const String log_v1_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v1});
-    const String log_v2_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v2});
-    const String old_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v1});
-    const String new_snap_key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v2});
+    const String log_v1_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, v1});
+    const String log_v2_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, v2});
+    const String old_snap_key = layout.refSnapshotKey(fixture::fixtureLife(ns), RefTxnId{1, v1});
+    const String new_snap_key = layout.refSnapshotKey(fixture::fixtureLife(ns), RefTxnId{1, v2});
     ASSERT_TRUE(backend->head(log_v1_key).exists);
     ASSERT_TRUE(backend->head(log_v2_key).exists);
     ASSERT_TRUE(backend->head(old_snap_key).exists);
@@ -438,8 +438,8 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/cross-epoch-cleanup@cas@"};
-    casAdmitEntry(*backend, layout, ns);
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    fixture::admitLive(*backend, layout, ns);
+    const NamespaceLifeId life = fixture::fixtureLife(ns);
     const RefTxnId birth_id{1, 1};
     const RefTxnId seal_id{1, 2};
     const RefTxnId base_id{2, 1};
@@ -461,9 +461,9 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
         .txn_id = base_id,
         .ops = {},
         .prev_epoch_seal = seal_id};
-    writeRefLogTxnRaw(*backend, layout, birth);
-    writeRefLogTxnRaw(*backend, layout, seal);
-    writeRefLogTxnRaw(*backend, layout, base);
+    fixture::writeRefLogRaw(*backend, layout, birth);
+    fixture::writeRefLogRaw(*backend, layout, seal);
+    fixture::writeRefLogRaw(*backend, layout, base);
 
     RefTableState state;
     applyRefLogTxn(state, birth);
@@ -623,7 +623,7 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns_a);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
     const RootNamespace ns_b{"00/bb@cas@"};
 
     /// Two tables with committed refs naming present manifests + blobs (insert-like). ns_a's ref is then
@@ -660,9 +660,9 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
 
     /// Snapshot lifecycle: the covering snapshot is retained; the covered logs (folded + snapshot-covered)
     /// are cleaned; the replaced manifest's blob is reclaimed while the live blobs survive.
-    EXPECT_TRUE(backend->head(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, va2})).exists)
+    EXPECT_TRUE(backend->head(layout.refSnapshotKey(fixture::fixtureLife(ns_a), RefTxnId{1, va2})).exists)
         << "covering snapshot retained";
-    EXPECT_FALSE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, va1})).exists) << "covered log cleaned";
+    EXPECT_FALSE(backend->head(layout.refLogKey(fixture::fixtureLife(ns_a), RefTxnId{1, va1})).exists) << "covered log cleaned";
     EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1))) << "replaced blob reclaimed";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
@@ -771,7 +771,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    fixture::admitLive(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
 
     const ManifestRef r = mref(1);
     writeBlobBody(*backend, layout, DB::UInt128(1));
@@ -790,7 +790,7 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 
     /// A canonical `_log` key (groupRefKeys accepts it) whose body cannot be decoded: the fold GETs it
     /// and `decodeRefLogTxn` throws.
-    const String garbage_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, dropped + 1});
+    const String garbage_key = layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, dropped + 1});
     backend->putIfAbsent(garbage_key, "garbage-not-a-valid-reflog-body");
     /// The corruption claims the next committed position. Advance only the durable frontier, not the
     /// log body, so recovery must exact-GET and hold this malformed object instead of ignoring F+1.
@@ -877,7 +877,7 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
     /// build a table with no catalog entry on purpose), so without this `ns_b` would never enter the
     /// catalog at all and would be invisible to the round -- the baseline guard below could then never
     /// fire, since it never runs on a namespace outside the universe.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns_b);
+    fixture::admitLive(*backend, layout, ns_b);
     const ManifestRef rb = mref(2);
     writeBlobBody(*backend, layout, DB::UInt128(2));
     writeManifestRaw(*backend, layout, ns_b, rb, {blobEntryFor("b", DB::UInt128(2))});
@@ -902,7 +902,7 @@ TEST(CasRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
 
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
     ASSERT_EQ(catalog_cut.catalog.entries.size(), 1u);

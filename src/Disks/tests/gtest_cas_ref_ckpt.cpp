@@ -124,7 +124,7 @@ NamespaceLifeId liveLifeOrFail(Backend & backend, const Layout & layout, const R
         if (entry.ns.string() == ns.string())
             return NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
     ADD_FAILURE() << "expected a catalog entry for namespace '" << ns.string() << "', found none";
-    return NamespaceLifeId::stageATransition(ns);
+    return DB::Cas::tests::fixture::fixtureLife(ns);
 }
 
 /// Replaces the whole body of one key, minting a new incarnation -- how a test installs a deliberately
@@ -428,7 +428,7 @@ TEST(CasRefCkpt, KeyIsTheLifeLeafAndParsesBack)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_key"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     EXPECT_EQ(layout.refCkptKey(ns_id),
         "p/cas/ns/state/" + renderIncarnation(ns_id.incarnation) + "/_ckpt");
     EXPECT_EQ(layout.parseRefCkptKey(layout.refCkptKey(ns_id)), ns_id.incarnation);
@@ -450,20 +450,20 @@ TEST(CasRefCkpt, GroupRefKeysScopesHotIntakeToTheStreamTree)
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_group"};
     const std::vector<String> keys = {
-        layout.refLogKey(NamespaceLifeId::stageATransition(ns), ID_1_1),
-        layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), ID_1_1),
-        layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
+        layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), ID_1_1),
+        layout.refSnapshotKey(DB::Cas::tests::fixture::fixtureLife(ns), ID_1_1),
+        layout.refCkptKey(DB::Cas::tests::fixture::fixtureLife(ns)),
     };
 
     const auto grouped = groupRefKeys(layout, keys);
     ASSERT_EQ(grouped.size(), 1u);
-    const RefTableListing & listing = grouped.at(NamespaceLifeId::stageATransition(ns).incarnation);
+    const RefTableListing & listing = grouped.at(DB::Cas::tests::fixture::fixtureLife(ns).incarnation);
     EXPECT_EQ(listing.logs, std::vector<RefTxnId>{ID_1_1});
     EXPECT_EQ(listing.snapshots, std::vector<RefTxnId>{ID_1_1});
 
     /// A genuinely unrecognizable key inside this life stream is still corruption.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { groupRefKeys(layout, {layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_bogus"}); });
+        [&] { groupRefKeys(layout, {layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_bogus"}); });
 }
 
 /// ---------------------------------------------------------------------------------------------
@@ -528,7 +528,7 @@ TEST(CasRefCkpt, CreatesTheObjectWhenItIsAbsent)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_create"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const RefCkpt birth{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
     EXPECT_EQ(publishCkpt(*backend, layout, life, birth, 1, ALWAYS_ADMITTED, generousDeadline()),
@@ -548,7 +548,7 @@ TEST(CasRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_partial_create"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const RefCkpt publisher{.life_epoch = std::nullopt, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, publisher, 1, ALWAYS_ADMITTED, generousDeadline()),
@@ -575,7 +575,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_conflict"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
@@ -618,7 +618,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_noop"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
     const RefCkpt full{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
 
@@ -646,7 +646,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_fenced"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, base, 1, ALWAYS_ADMITTED, generousDeadline()),
@@ -678,7 +678,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_exhausted"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
@@ -709,7 +709,7 @@ TEST(CasRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_committed"});
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_ambiguous_committed"});
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -728,7 +728,7 @@ TEST(CasRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_retry"});
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_ambiguous_retry"});
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -747,7 +747,7 @@ TEST(CasRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_dominating"});
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_ambiguous_dominating"});
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -769,7 +769,7 @@ TEST(CasRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_read_failed"});
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_ambiguous_read_failed"});
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -793,7 +793,7 @@ TEST(CasRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
     {
         auto backend = std::make_shared<AmbiguousCkptBackend>();
         const Layout layout{"p"};
-        const NamespaceLifeId life = NamespaceLifeId::stageATransition(
+        const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(
             RootNamespace{move_before_read ? "srv1/ckpt_fence_before_resolution" : "srv1/ckpt_fence_after_resolution"});
         const String key = layout.refCkptKey(life);
         const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
@@ -824,7 +824,7 @@ TEST(CasRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCa
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguity_deadline"});
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/ckpt_ambiguity_deadline"});
     const String key = layout.refCkptKey(life);
     const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -853,7 +853,7 @@ TEST(CasRefCkpt, ACorruptCheckpointIsNeverOverwritten)
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_corrupt"};
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId life = DB::Cas::tests::fixture::fixtureLife(ns);
     const String key = layout.refCkptKey(life);
     ASSERT_EQ(publishCkpt(*backend, layout, life,
                           RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},

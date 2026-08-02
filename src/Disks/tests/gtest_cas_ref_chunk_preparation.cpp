@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
+#include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
@@ -46,7 +47,7 @@ const Layout kLayout{"p"};
 /// is deliberately backend-free (no catalog to resolve one from), so it threads the Stage-A sentinel
 /// through EXPLICITLY as its own test input -- the same value production minted internally before
 /// Task 4-C, so every golden byte/key assertion below is unchanged.
-const NamespaceLifeId kLife = NamespaceLifeId::stageATransition(kNs);
+const NamespaceLifeId kLife = DB::Cas::tests::fixture::fixtureLife(kNs);
 
 RefOp birthOp()
 {

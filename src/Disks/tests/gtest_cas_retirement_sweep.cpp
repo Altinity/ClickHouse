@@ -198,7 +198,7 @@ std::set<String> listRefLogKeys(Backend & b, const Layout & l, const RootNamespa
     String cursor;
     while (true)
     {
-        const ListPage page = b.list(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)), cursor, 1000);
+        const ListPage page = b.list(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)), cursor, 1000);
         for (const ListedKey & k : page.keys)
             if (const auto parsed = l.parseRefObjectKey(k.key); parsed && parsed->kind == RefObjectKind::Log)
                 out.insert(k.key);
@@ -260,7 +260,7 @@ TEST(CasRetirementSweep, ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway)
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
     /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
     /// as a completed production birth before `publishOneBlobPart` invokes recovery.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
@@ -354,7 +354,7 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
     /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
     /// as a completed production birth before `publishOneBlobPart` invokes recovery.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
@@ -504,7 +504,7 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     const RootNamespace ns{"srv/straggler"};
     /// Pin to the transition life before the first real touch, and give that raw `Live` row the exact
     /// empty checkpoint authority that production birth would have published before recovery.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
     DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
         .life_epoch = 1,
         .committed_through = std::nullopt,
@@ -518,7 +518,7 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// Drive the next ref-log append into the Unresolved/wedge outcome: the single attempt the budget
     /// allows fails ambiguously, so this process can never learn whether its conditional PUT landed.
     /// That undecidability is the whole reason the resolution is a conditional CREATE and not a GET.
-    backend->fault_key_substr = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     backend->fault_count = 1;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
@@ -528,7 +528,7 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     const RefTxnId greatest = greatestLoggedId(*backend, layout, ns);
     ASSERT_EQ(greatest.writer_epoch, 1u);
     const RefTxnId straggler_slot{greatest.writer_epoch, greatest.ref_sequence + 1};
-    ASSERT_FALSE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(ns), straggler_slot)).exists)
+    ASSERT_FALSE(backend->head(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)).exists)
         << "the slot must be empty before recovery -- otherwise this test proves nothing about who won";
 
     /// Fence and remount. No wait: this is the case that used to cost 30 seconds.
@@ -544,12 +544,12 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     /// landed, which is precisely the state that leaves a straggler outstanding.
     backend->fault_key_substr.clear();
     EXPECT_EQ(store->listRefs(ns).size(), 1u);
-    ASSERT_TRUE(backend->head(layout.refLogKey(NamespaceLifeId::stageATransition(ns), straggler_slot)).exists)
+    ASSERT_TRUE(backend->head(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot)).exists)
         << "recovery did not seal the dead epoch at the slot a straggler would take -- without that "
            "seal there is nothing for the straggler's create to lose to";
 
     /// THE STRAGGLER ARRIVES. Its conditional create is refused, whenever it happens to land.
-    const PutResult put = backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), straggler_slot), "ghost-body");
+    const PutResult put = backend->putIfAbsent(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), straggler_slot), "ghost-body");
     EXPECT_EQ(put.outcome, PutOutcome::PreconditionFailed)
         << "the dying epoch's straggler overwrote (or joined) a slot the successor had already sealed";
 }

@@ -182,22 +182,22 @@ TEST(CasOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/sweep-checkpoint-base-seal@cas@"};
-    casAdmitEntry(*backend, layout, ns);
+    fixture::admitLive(*backend, layout, ns);
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
 
     const RefLogTxn birth{
         .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, birth);
+    fixture::writeRefLogRaw(*backend, layout, birth);
     RefOp seal;
     seal.kind = RefOpKind::EpochSeal;
     const RefLogTxn seal_txn{
         .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
         .prev_epoch_seal = std::nullopt};
-    writeRefLogTxnRaw(*backend, layout, seal_txn);
+    fixture::writeRefLogRaw(*backend, layout, seal_txn);
     RefOp later_seal;
     later_seal.kind = RefOpKind::EpochSeal;
-    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+    fixture::writeRefLogRaw(*backend, layout, RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{2, 1}, .ops = {later_seal},
         .prev_epoch_seal = RefTxnId{1, 2}});
     RefTableState through_seal;
@@ -457,7 +457,7 @@ TEST(CasOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/authority-required@cas@"};
-    casAdmitEntry(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xB0);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
@@ -483,7 +483,7 @@ TEST(CasOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/seal-cursor-tail@cas@"};
-    casAdmitEntry(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -531,7 +531,7 @@ TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/missing-next-epoch@cas@"};
-    casAdmitEntry(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -591,7 +591,7 @@ TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/exact-next-epoch@cas@"};
-    casAdmitEntry(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const CatalogEntry entry = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation);
 
@@ -637,7 +637,7 @@ TEST(CasOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
     auto backend = std::make_shared<CatalogChangingOnSecondReadBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/frozen-catalog-cut@cas@"};
-    casAdmitEntry(*backend, store->layout(), ns);
+    fixture::admitLive(*backend, store->layout(), ns);
     const CatalogEntry predecessor = CasRefCatalog::read(*backend, store->layout()).catalog.entries.front();
 
     const ManifestRef r = ref(5, 0xB1);

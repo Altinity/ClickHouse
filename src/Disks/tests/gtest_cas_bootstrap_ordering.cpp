@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_test_helpers.h"
 #include <Common/Exception.h>
 
 #include <mutex>
@@ -228,7 +229,7 @@ namespace
 {
 String residualRefLogKey()
 {
-    return Layout{"p"}.refLogKey(NamespaceLifeId::stageATransition(RootNamespace{"test%2Fabcd"}), RefTxnId{1, 1});
+    return Layout{"p"}.refLogKey(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"test%2Fabcd"}), RefTxnId{1, 1});
 }
 }
 
@@ -305,7 +306,7 @@ TEST(CasBootstrapOrdering, CatalogWithAnyOtherCasResidueRefusesWithoutPoolMeta)
     const Layout layout{kPrefix};
     const std::vector<String> residuals{
         layout.ownerKey("test"), layout.epochKey("test"), layout.mountKey("test"),
-        layout.refLogKey(NamespaceLifeId::stageATransition(RootNamespace{"test/ns"}), RefTxnId{1, 1}),
+        layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"test/ns"}), RefTxnId{1, 1}),
         layout.manifestKey(ManifestId{RootNamespace{"test/ns"}, ManifestRef{1, 1, 1}}),
         layout.serverRootDataPrefix("test") + "residual", kPrefix + "/unknown"};
     for (const String & residual : residuals)

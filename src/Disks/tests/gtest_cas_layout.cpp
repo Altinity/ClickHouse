@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
+#include "cas_test_helpers.h"
 
 using namespace DB::Cas;
 
@@ -60,7 +61,7 @@ TEST(CasLayout, RootNamespaceKeys)
 {
     Layout l("p");
     RootNamespace ns{"srv1/3f2e-uuid"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     EXPECT_EQ(l.namespaceStreamPrefix(ns_id),
         "p/cas/ns/stream/" + renderIncarnation(ns_id.incarnation) + "/");
     EXPECT_EQ(l.namespaceFileKey(ns_id, "format_version.txt"),
@@ -95,7 +96,7 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
 {
     Layout l("p");
     const RootNamespace ns{"srid/store/ab/uuid@cas@"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     EXPECT_EQ(l.namespaceStreamPrefix(ns_id),
         "p/cas/ns/stream/" + renderIncarnation(ns_id.incarnation) + "/");
     EXPECT_EQ(l.casRefsPrefix(), "p/cas/ns/stream/");
@@ -124,7 +125,7 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.manifestNamespacePrefix(RootNamespace{"trail/"}), DB::Exception);
     /// File names may be NESTED relative paths (M-W T2: deduplication_logs/...); only unclean
     /// shapes are rejected (empty, leading/trailing '/', empty segments, '..' escapes).
-    const NamespaceLifeId ok_id = NamespaceLifeId::stageATransition(RootNamespace{"ok"});
+    const NamespaceLifeId ok_id = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"ok"});
     EXPECT_NO_THROW(l.namespaceFileKey(ok_id, "a/b"));
     EXPECT_THROW(l.namespaceFileKey(ok_id, ""), DB::Exception);
     EXPECT_THROW(l.namespaceFileKey(ok_id, "/lead"), DB::Exception);
@@ -165,9 +166,9 @@ TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
     /// The `_registry` namespace segment is not reserved (it was only reserved while the registry lived
     /// under `roots/_registry`, which was already relocated to `gc/registry` before being deleted).
     Layout l("p");
-    EXPECT_NO_THROW(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(RootNamespace{"a/_registry@cas@"})));
+    EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"a/_registry@cas@"})));
     /// Opaque stream keys are independent of namespace-segment reservations.
-    EXPECT_NO_THROW(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(RootNamespace{"a/_files"})));
+    EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"a/_files"})));
 }
 
 TEST(CasLayout, CasArchiveSuffixConstant)
@@ -207,8 +208,8 @@ TEST(CasLayout, ManifestsSegmentReserved)
     bad.root_namespace = RootNamespace("srv-a/_manifests/x");
     EXPECT_THROW(l.manifestKey(bad), DB::Exception);
     /// Opaque life prefixes ignore the logical spelling; manifests still enforce the reservation.
-    EXPECT_NO_THROW(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(RootNamespace{"srv-a/_manifests/tbl"})));
-    EXPECT_NO_THROW(l.namespaceStreamPrefix(NamespaceLifeId::stageATransition(RootNamespace{"my_manifests/tbl"})));
+    EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv-a/_manifests/tbl"})));
+    EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"my_manifests/tbl"})));
 }
 
 TEST(CasLayout, ManifestKeyHexRoundTrip)
@@ -250,7 +251,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     const RefTxnId id{7, 0x8e};
     const String life = "p/cas/ns/stream/" + renderIncarnation(ns_id.incarnation) + "/";
 
@@ -275,7 +276,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
 TEST(CasLayout, RefObjectKeyLexicalOrder)
 {
     Layout l("p");
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(RootNamespace{"srv1/tbl@cas@"});
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/tbl@cas@"});
     const RefTxnId id{7, 0x8e};
     EXPECT_LT(l.refLogKey(ns_id, id), l.refSnapshotKey(ns_id, id));
 }
@@ -284,7 +285,7 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     const RefTxnId id{7, 0x8e};
     const String log_key = l.refLogKey(ns_id, id);
     const String snap_key = l.refSnapshotKey(ns_id, id);
@@ -326,14 +327,14 @@ TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
-    const NamespaceLifeId ns_id = NamespaceLifeId::stageATransition(ns);
+    const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(ns);
     const RefTxnId id{7, 0x8e};
 
     /// The state prefix plus the bare leaf, with no compression suffix (the format is raw), so the key
     /// is exactly `cas/ns/state/<life_id>/_ckpt`.
     EXPECT_EQ(l.refCkptKey(ns_id), l.namespaceStatePrefix(ns_id) + "_ckpt");
     EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(ns_id)), ns_id.incarnation);
-    const NamespaceLifeId deep = NamespaceLifeId::stageATransition(RootNamespace{"a/b/c"});
+    const NamespaceLifeId deep = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"a/b/c"});
     EXPECT_EQ(l.parseRefCkptKey(l.refCkptKey(deep)), deep.incarnation);
 
     /// Foreign pool prefix.
