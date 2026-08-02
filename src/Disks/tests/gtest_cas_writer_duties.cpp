@@ -41,6 +41,15 @@ PoolPtr openSingleAttemptPool(const BackendPtr & backend)
     return Pool::open(backend, singleAttemptConfig());
 }
 
+PoolPtr openFrozenSingleAttemptPool(const BackendPtr & backend)
+{
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    PoolConfig config = singleAttemptConfig();
+    config.boot_ms_fn = [] { return uint64_t{0}; };
+    config.mount_renew_period = std::chrono::hours{1};
+    return Pool::open(backend, config);
+}
+
 PartWriteTxnPtr stageEmptyManifest(
     const PoolPtr & store, const RootNamespace & ns, const String & ref_name, ManifestId & id)
 {
@@ -50,6 +59,32 @@ PartWriteTxnPtr stageEmptyManifest(
     auto build = store->beginPartWrite(std::move(info));
     id = build->stageManifest({});
     return build;
+}
+
+void publishEmptyRef(const PoolPtr & store, const RootNamespace & ns, const String & ref_name)
+{
+    ManifestId id;
+    auto build = stageEmptyManifest(store, ns, ref_name, id);
+    build->precommitAdd(ns, ref_name, id);
+    build->promote(ns, ref_name, build->buildId(), id);
+}
+
+uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & ns)
+{
+    ManifestId rejected_id;
+    auto rejected = stageEmptyManifest(store, ns, "rejected", rejected_id);
+    const uint64_t rejected_seq = rejected->buildSeq();
+
+    store->setMountDeadline(100);
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::NETWORK_ERROR,
+        [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    EXPECT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
+
+    rejected.reset();
+    EXPECT_EQ(store->minActive(), rejected_seq);
+    store->setMountDeadline(30000);
+    return rejected_seq;
 }
 
 }
@@ -143,6 +178,91 @@ TEST(CasWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
 
     successor->abandon();
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+}
+
+/// Removing `mutateRefsAfterWriterCleanup` from the `dropRef` delegate leaves the rejected build at
+/// `minActive` even though the ref removal succeeds. The observable floor proves the direct API
+/// serviced the inherited cleanup duty before performing its own mutation.
+TEST(CasWriterDuties, DropRefServicesPendingDutyBeforeRemovingTheRef)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = openFrozenSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_drop_ref"};
+    publishEmptyRef(store, ns, "target");
+    leaveRejectedCleanupDuty(store, ns);
+
+    store->dropRef(ns, "target");
+
+    EXPECT_FALSE(store->resolveRef(ns, "target").has_value());
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+}
+
+/// Removing the shared drain seam from `updateRefPublishedAt` lets the timestamp mutation overtake a
+/// pending writer duty. The update remains observable, while the independent watermark assertion
+/// catches that bypass.
+TEST(CasWriterDuties, UpdateRefPublishedAtServicesPendingDutyBeforeUpdatingTheRef)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = openFrozenSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_update_ref"};
+    publishEmptyRef(store, ns, "target");
+    leaveRejectedCleanupDuty(store, ns);
+
+    store->updateRefPublishedAt(ns, "target", [](RefPublishedAtUpdate & update) { update.published_at_ms = 17; });
+
+    const auto resolved = store->resolveRef(ns, "target");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->published_at_ms, 17);
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+}
+
+/// Each public namespace-removal overload has its own Pool delegate. Omitting the shared seam from
+/// either one still removes the namespace but strands the rejected build at the active floor, so the
+/// two independent cases protect both forwarding paths.
+TEST(CasWriterDuties, DropNamespaceOverloadsServicePendingDutyBeforeRemoval)
+{
+    {
+        auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+        auto store = openFrozenSingleAttemptPool(backend);
+        const RootNamespace ns{"srv1/writer_duty_drop_namespace"};
+        publishEmptyRef(store, ns, "target");
+        leaveRejectedCleanupDuty(store, ns);
+
+        store->dropNamespace(ns);
+
+        EXPECT_TRUE(store->listRefs(ns).empty());
+        EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+    }
+
+    {
+        auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+        auto store = openFrozenSingleAttemptPool(backend);
+        const RootNamespace ns{"srv1/writer_duty_drop_namespace_life"};
+        publishEmptyRef(store, ns, "target");
+        const NamespaceLifeId life = store->namespaceLife(ns);
+        leaveRejectedCleanupDuty(store, ns);
+
+        store->dropNamespace(life);
+
+        EXPECT_TRUE(store->listRefs(ns).empty());
+        EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+    }
+}
+
+/// The explicit snapshot/checkpoint attempt is the audited sibling mutation: without the common seam
+/// it may publish ledger state while leaving the older writer duty pinned. Its return value is allowed
+/// to be false; advancing the active floor is the cleanup contract under test.
+TEST(CasWriterDuties, SnapshotAttemptServicesPendingDutyBeforePublishingLedgerState)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = openFrozenSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_snapshot"};
+    publishEmptyRef(store, ns, "target");
+    leaveRejectedCleanupDuty(store, ns);
+
+    static_cast<void>(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
 }
 
 /// Removing the pending-duty term from `Pool` teardown makes this test fail at the farewell

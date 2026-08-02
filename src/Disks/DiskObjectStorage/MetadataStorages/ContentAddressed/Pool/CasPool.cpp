@@ -1647,23 +1647,35 @@ bool Pool::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix
 
 void Pool::dropRef(const RootNamespace & ns, const String & ref_name)
 {
-    ref_ledger.dropRef(ns, ref_name);
+    mutateRefsAfterWriterCleanup(ns, [&]
+    {
+        ref_ledger.dropRef(ns, ref_name);
+    });
 }
 
 void Pool::updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
                              std::function<void(RefPublishedAtUpdate &)> mutator)
 {
-    ref_ledger.updateRefPublishedAt(ns, ref_name, std::move(mutator));
+    mutateRefsAfterWriterCleanup(ns, [&]
+    {
+        ref_ledger.updateRefPublishedAt(ns, ref_name, std::move(mutator));
+    });
 }
 
 DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
 {
-    return ref_ledger.dropNamespace(ns);
+    return mutateRefsAfterWriterCleanup(ns, [&]
+    {
+        return ref_ledger.dropNamespace(ns);
+    });
 }
 
 DropNamespaceStats Pool::dropNamespace(const NamespaceLifeId & life)
 {
-    return ref_ledger.dropNamespace(life);
+    return mutateRefsAfterWriterCleanup(life.ns, [&]
+    {
+        return ref_ledger.dropNamespace(life);
+    });
 }
 
 NamespaceLifeId Pool::namespaceLife(const RootNamespace & ns)
@@ -1691,13 +1703,19 @@ RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
-    drainWriterCleanupDuties(ns);
-    return ref_ledger.appendRefOps(ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
+    return mutateRefsAfterWriterCleanup(ns, [&]
+    {
+        return ref_ledger.appendRefOps(
+            ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
+    });
 }
 
 bool Pool::tryPublishSnapshotAndAdvanceCheckpointOnce(const RootNamespace & ns)
 {
-    return ref_ledger.tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
+    return mutateRefsAfterWriterCleanup(ns, [&]
+    {
+        return ref_ledger.tryPublishSnapshotAndAdvanceCheckpointOnce(ns);
+    });
 }
 
 size_t Pool::wedgedRefLaneCount()

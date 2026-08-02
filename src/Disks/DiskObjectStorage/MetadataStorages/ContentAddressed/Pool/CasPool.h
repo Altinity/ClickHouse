@@ -32,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
 namespace DB::Cas
 {
@@ -992,6 +993,16 @@ private:
     /// watermark floor. The drain calls `ref_ledger` directly to avoid re-entering this Pool wrapper.
     void drainWriterCleanupDuties(const RootNamespace & ns);
     bool writerCleanupDutiesPending() const;
+
+    /// The single admission seam for durable ref mutations exposed by `Pool`. Keeping drain-before-call
+    /// here makes a new forwarding entry point visibly choose between servicing writer cleanup and
+    /// deliberately bypassing it; the cleanup implementation itself uses `ref_ledger` directly.
+    template <typename Mutation>
+    decltype(auto) mutateRefsAfterWriterCleanup(const RootNamespace & ns, Mutation && mutation)
+    {
+        drainWriterCleanupDuties(ns);
+        return std::forward<Mutation>(mutation)();
+    }
 
     BackendPtr pool_backend;
     PoolConfig config;
