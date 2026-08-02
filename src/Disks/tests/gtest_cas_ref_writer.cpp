@@ -362,6 +362,24 @@ public:
     using CountingBackend::putOverwrite;
     using CountingBackend::casPut;
 
+    void clearRequestJournal()
+    {
+        std::lock_guard lock(request_journal_mutex);
+        request_journal.clear();
+    }
+
+    void recordRequestJournalEvent(String event)
+    {
+        std::lock_guard lock(request_journal_mutex);
+        request_journal.push_back(std::move(event));
+    }
+
+    std::vector<String> requestJournal() const
+    {
+        std::lock_guard lock(request_journal_mutex);
+        return request_journal;
+    }
+
     std::set<String> vanish_once_keys;
     std::function<void()> on_vanish_fire;
 
@@ -402,6 +420,11 @@ public:
     int corrupt_count = 0;
     String corrupt_foreign_bytes;
 
+    String ckpt_conflict_key;
+    size_t ckpt_conflict_count = 0;
+    String ckpt_get_hook_key;
+    std::function<void()> ckpt_get_hook;
+
     /// Force the recovery namespace LIST to throw a transient object-store error (S3_ERROR) a bounded
     /// number of times -- exercises Layer 1's transient-retry over the LIST leg of recovery (not just
     /// the seal PUT). Mirrors what a real object-storage backend surfaces for a network/throttle blip.
@@ -419,6 +442,12 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
+        recordRequestJournalEvent("GET " + key);
+        if (key == ckpt_get_hook_key && ckpt_get_hook)
+        {
+            auto hook = std::exchange(ckpt_get_hook, nullptr);
+            hook();
+        }
         if (key == catalog_fault_key && catalog_get_fault_count > 0 && catalog_gets_before_fault >= 0)
         {
             if (catalog_gets_before_fault == 0)
@@ -452,6 +481,12 @@ public:
         const String & key, const String & bytes, const std::optional<Token> & expected,
         const ObjectMeta & meta) override
     {
+        recordRequestJournalEvent("CAS " + key);
+        if (key == ckpt_conflict_key && ckpt_conflict_count > 0)
+        {
+            --ckpt_conflict_count;
+            return {CasOutcome::Conflict, {}};
+        }
         if (key == catalog_fault_key && catalog_cas_fault != CatalogCasFault::None)
         {
             const CatalogCasFault fault = std::exchange(catalog_cas_fault, CatalogCasFault::None);
@@ -476,6 +511,7 @@ public:
 
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
+        recordRequestJournalEvent("PUT " + key);
         if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
         {
             --corrupt_count;
@@ -658,6 +694,8 @@ public:
     }
 
 private:
+    mutable std::mutex request_journal_mutex;
+    std::vector<String> request_journal;
     std::mutex block_mutex;
     std::condition_variable block_cv;
     String block_substr;
@@ -1032,7 +1070,7 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================
 
-TEST(RefWriterAppendLane, WarmIsolatedMutationCostsOneCreateZeroReads)
+TEST(RefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1040,16 +1078,111 @@ TEST(RefWriterAppendLane, WarmIsolatedMutationCostsOneCreateZeroReads)
     publishEmptyPart(store, ns, "part_1");   /// setup: births + populates the table (not measured)
     ASSERT_TRUE(store->resolveRef(ns, "part_1").has_value());
 
-    const uint64_t get_before = backend->getTotal();
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const auto ckpt_before = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(ckpt_before);
+    ASSERT_TRUE(ckpt_before->ckpt.committed_through);
+    const RefTxnId expected_frontier{
+        ckpt_before->ckpt.committed_through->writer_epoch,
+        ckpt_before->ckpt.committed_through->ref_sequence + 1};
+    backend->clearRequestJournal();
     const uint64_t list_before = backend->listTotal();
     const uint64_t put_before = backend->putTotal();
+    const uint64_t ckpt_get_before = backend->getCount(ckpt_key);
+    const uint64_t ckpt_cas_before = backend->casPutCount(ckpt_key);
+    store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
+    {
+        if (phase == CasRefLedger::CarvePhaseForTest::PostDurableInstall)
+            backend->recordRequestJournalEvent("INSTALL");
+    });
 
     store->dropRef(ns, "part_1");
+    backend->recordRequestJournalEvent("ACK");
+    store->setCarveHookForTest(nullptr);
 
-    EXPECT_EQ(backend->getTotal(), get_before) << "a warm mutation performs no read request";
     EXPECT_EQ(backend->listTotal(), list_before) << "a warm mutation performs no LIST";
     EXPECT_EQ(backend->putTotal(), put_before + 1) << "exactly one body PUT with create-if-absent";
+    EXPECT_EQ(backend->getCount(ckpt_key), ckpt_get_before + 1)
+        << "one committed chunk pays exactly one checkpoint GET";
+    EXPECT_EQ(backend->casPutCount(ckpt_key), ckpt_cas_before + 1)
+        << "one committed chunk pays exactly one checkpoint CAS";
     EXPECT_FALSE(store->resolveRef(ns, "part_1").has_value());
+
+    const std::vector<String> journal = backend->requestJournal();
+    ASSERT_EQ(journal.size(), 5u);
+    EXPECT_EQ(journal[0].find("PUT " + log_prefix), 0u) << journal[0];
+    EXPECT_EQ(journal[1], "GET " + ckpt_key);
+    EXPECT_EQ(journal[2], "CAS " + ckpt_key);
+    EXPECT_EQ(journal[3], "INSTALL");
+    EXPECT_EQ(journal[4], "ACK");
+
+    const auto durable_ckpt = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(durable_ckpt);
+    EXPECT_EQ(durable_ckpt->ckpt.committed_through, expected_frontier);
+}
+
+TEST(RefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/frontier-conflict"};
+    publishEmptyPart(store, ns, "x");
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const auto before = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(before);
+    ASSERT_TRUE(before->ckpt.committed_through);
+    const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
+                             before->ckpt.committed_through->ref_sequence + 1};
+    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
+
+    backend->ckpt_conflict_key = ckpt_key;
+    backend->ckpt_conflict_count = 100;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
+        << "the durable log was not installed or acknowledged";
+    const auto after = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
+    EXPECT_TRUE(backend->get(store->layout().refLogKey(life, candidate)))
+        << "the log PUT committed before checkpoint publication failed";
+    EXPECT_FALSE(backend->get(store->layout().refLogKey(
+        life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})))
+        << "no later id may be allocated above an unfrontiered durable transaction";
+}
+
+TEST(RefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/frontier-fenced"};
+    publishEmptyPart(store, ns, "x");
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
+    const String ckpt_key = store->layout().refCkptKey(life);
+    const auto before = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(before);
+    ASSERT_TRUE(before->ckpt.committed_through);
+    const RefTxnId candidate{before->ckpt.committed_through->writer_epoch,
+                             before->ckpt.committed_through->ref_sequence + 1};
+    const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
+
+    backend->ckpt_get_hook_key = ckpt_key;
+    backend->ckpt_get_hook = [&] { store->tripMountLost(); };
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), tail_before)
+        << "the fenced frontier attempt must not install or acknowledge the durable log";
+    const auto after = readCkpt(*backend, store->layout(), life);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->ckpt.committed_through, before->ckpt.committed_through);
+    EXPECT_TRUE(backend->get(store->layout().refLogKey(life, candidate)));
+    EXPECT_FALSE(backend->get(store->layout().refLogKey(
+        life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})));
 }
 
 /// Phase 3 (spec 2026-07-17-cas-reftable-cow-map-design.md §Materialization): each of these N

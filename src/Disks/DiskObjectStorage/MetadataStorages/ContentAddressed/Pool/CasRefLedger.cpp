@@ -2937,6 +2937,11 @@ CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
         .chunk_txn = RefLogTxn{life.ns.string(), id, std::vector<RefOp>(ops.begin(), ops.end()), chain_link},
         .prepared_attempt = {},
         .birth_contribution = std::nullopt,
+        .commit_contribution = RefCkpt{
+            .life_epoch = std::nullopt,
+            .committed_through = id,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt},
     };
     prepared.candidate_base_id = prepared.candidate.getGreatestApplied();
 
@@ -2995,6 +3000,9 @@ CasRefLedger::PreparedRefChunk CasRefLedger::prepareRefChunk(
                                               .committed_through = std::nullopt,
                                               .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt};
+
+    if (refLogTxnIsEpochSeal(prepared.chunk_txn))
+        prepared.commit_contribution.last_epoch_seal = id;
 
     return prepared;
 }
@@ -3231,7 +3239,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
 
     /// Preparation is ONE pure call, and it is everything decided before this chunk can have any durable
     /// effect: the candidate, the transaction with its chain link, the complete attempt (key + sealed
-    /// bytes), and -- for a birth -- the `_ckpt` contribution as a VALUE.
+    /// bytes), the post-log committed-frontier contribution, and -- for a birth -- the pre-log
+    /// `life_epoch` contribution as VALUES.
     ///
     /// THE PLACEMENT IS THE CORRECTNESS ARGUMENT, and it has to hold for BOTH chunk shapes, because
     /// `commitRefChunk` has two different first durable effects. An ordinary chunk's is the ref-log
@@ -3516,11 +3525,69 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     {
         case CasWriteOutcome::Committed:
         {
+            /// A durable log object is not yet admitted to logical history. Publish its exact frontier
+            /// under the SAME admission generation before any local consequence can make a later id
+            /// observable or wake a waiter. `Published` and `IdenticalSkip` both prove the contribution
+            /// durable. `FencedOut`, contention exhaustion, decode failure, or any other unresolved
+            /// publication leaves the log known durable but uninstalled, which is exactly
+            /// `NeedsRecovery`; recovery owns resolution of that window.
+            const auto check_commit_admitted = [this, &rt](uint64_t expected_generation)
+            {
+                check_fence_or_throw(expected_generation);
+                if (rt->catalog_life_invalidated.load(std::memory_order_acquire)
+                    || rt->superseded_by_remount.load(std::memory_order_acquire))
+                    throwCasWriteRetryLater(fmt::format(
+                        "CAS namespace '{}': its captured runtime was retired before committed-frontier publication",
+                        rt->life.ns.string()));
+            };
+            CkptPublishOutcome frontier_outcome;
+            try
+            {
+                frontier_outcome = publishCkptContribution(
+                    rt->life, prepared->commit_contribution, admitted_fence_generation, check_commit_admitted);
+            }
+            catch (...)
+            {
+                const std::exception_ptr frontier_error = std::current_exception();
+                {
+                    std::lock_guard lock(rt->state_mutex);
+                    requireRecovery(*rt, ns, "committed-frontier publication");
+                }
+                complete_error(chunk_survivors, frontier_error);
+                return false;
+            }
+            if (frontier_outcome == CkptPublishOutcome::FencedOut)
+            {
+                {
+                    std::lock_guard lock(rt->state_mutex);
+                    requireRecovery(*rt, ns, "committed-frontier publication fence");
+                }
+                complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
+                    "CAS ref-log append for namespace '{}': txn {}-{} is durable, but the mount fence "
+                    "moved before its checkpoint frontier was published; the lane needs recovery",
+                    ns.string(), id.writer_epoch, id.ref_sequence)));
+                return false;
+            }
+
             if (carve_hook_for_test)
                 carve_hook_for_test(CarvePhaseForTest::PostDurableInstall);
             bool install_refused = false;
+            std::exception_ptr install_admission_error;
             {
                 std::lock_guard lock(rt->state_mutex);
+                /// The checkpoint CAS can succeed and the fence can move before the state lock is
+                /// reached. Re-present the same admission INSIDE the install hold, immediately before
+                /// inspecting and swapping the candidate. A stale runtime may leave both log and
+                /// frontier durable, but it must neither install nor acknowledge them.
+                try
+                {
+                    check_commit_admitted(admitted_fence_generation);
+                }
+                catch (...)
+                {
+                    install_admission_error = std::current_exception();
+                    requireRecovery(*rt, ns, "post-frontier install admission");
+                }
                 /// Only this leader mutates `rt->state`, so the candidate's base snapshot is still the
                 /// current one: there is one append-lane leader per table at a time (the `leader_active`
                 /// baton), the wedge-resolution apply ran earlier in this same flush on this same thread,
@@ -3531,12 +3598,13 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                 /// enough that even the failure path's message is inline-buffered rather than heap
                 /// allocated, so no build can turn the assert itself into an allocation in the region.
                 const bool state_unchanged
-                    = rt->lane_state == RefLaneState::Writing
+                    = !install_admission_error
+                    && rt->lane_state == RefLaneState::Writing
                     && rt->append_attempt
                     && rt->append_attempt->txn_id == id
                     && rt->append_attempt->bytes == active_attempt.bytes
                     && rt->state.getGreatestApplied() == candidate_base_id;
-                if (!state_unchanged)
+                if (!install_admission_error && !state_unchanged)
                 {
                     /// RELEASE-mode counterpart of the `chassert` inside the region below, which is a
                     /// no-op in a release build and therefore no guard at all for a window that spans a
@@ -3551,7 +3619,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     requireRecovery(*rt, ns, "commitRefChunk install");
                     install_refused = true;
                 }
-                else
+                else if (!install_admission_error)
                 {
                     std::optional<RefAppendAttempt> completed_attempt;
                     try
@@ -3585,6 +3653,11 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                             ns.string(), id.writer_epoch, id.ref_sequence));
                     }
                 }
+            }
+            if (install_admission_error)
+            {
+                complete_error(chunk_survivors, install_admission_error);
+                return false;
             }
             if (install_refused)
             {

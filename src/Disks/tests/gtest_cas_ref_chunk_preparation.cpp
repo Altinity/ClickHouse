@@ -55,6 +55,13 @@ RefOp birthOp()
     return op;
 }
 
+RefOp epochSealOp()
+{
+    RefOp op;
+    op.kind = RefOpKind::EpochSeal;
+    return op;
+}
+
 /// A minimal content op: the `AddPrecommit` shape (a pure add of a PRECOMMIT owner). A committed owner
 /// is only ever reached by promoting a precommit, so this is the smallest legal content transition.
 RefOp addPrecommitOp(const String & ref_name, const ManifestRef & manifest)
@@ -225,6 +232,25 @@ TEST(CasRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
                                {birthOp(), addPrecommitOp("r1", mref(3))});
     ASSERT_TRUE(mixed.birth_contribution.has_value());
     EXPECT_EQ(*mixed.birth_contribution->life_epoch, 5u);
+}
+
+TEST(CasRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSeal)
+{
+    const RefTxnId ordinary_id{1, 2};
+    const auto ordinary = prepare(bornState(), ordinary_id, std::nullopt,
+                                  {addPrecommitOp("r1", mref(3))});
+    EXPECT_EQ(ordinary.commit_contribution.committed_through, ordinary_id);
+    EXPECT_FALSE(ordinary.commit_contribution.life_epoch.has_value());
+    EXPECT_FALSE(ordinary.commit_contribution.checkpoint_snapshot_id.has_value());
+    EXPECT_FALSE(ordinary.commit_contribution.last_epoch_seal.has_value());
+
+    const RefTxnId seal_id{1, 2};
+    const auto seal = prepare(bornState(), seal_id, std::nullopt, {epochSealOp()});
+    EXPECT_EQ(seal.commit_contribution.committed_through, seal_id);
+    EXPECT_EQ(seal.commit_contribution.last_epoch_seal, seal_id)
+        << "an epoch seal and its committed frontier must be one checkpoint contribution";
+    EXPECT_FALSE(seal.commit_contribution.life_epoch.has_value());
+    EXPECT_FALSE(seal.commit_contribution.checkpoint_snapshot_id.has_value());
 }
 
 /// The attempt exists so that an `Unresolved` PUT -- an object that may be durable -- can be recorded by

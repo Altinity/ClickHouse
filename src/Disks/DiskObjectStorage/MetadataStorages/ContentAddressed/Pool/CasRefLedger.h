@@ -565,11 +565,15 @@ public:
         /// because for a birth chunk that publish IS the first durable effect and preparation is by
         /// definition everything strictly before it.
         std::optional<RefCkpt> birth_contribution;
+        /// Published after the log object commits and before this candidate may be installed or
+        /// acknowledged. Every transaction advances `committed_through`; an epoch-seal transaction
+        /// contributes the same id as `last_epoch_seal` in this one atomic checkpoint merge.
+        RefCkpt commit_contribution;
     };
 
     /// The pure half of `commitRefChunk`: derive the candidate state, the transaction, the canonical key
-    /// and sealed bytes, the complete attempt, and a namespace birth's `_ckpt` contribution -- all of it
-    /// decided before anything can be durable.
+    /// and sealed bytes, the complete attempt, a namespace birth's pre-log `_ckpt` contribution, and
+    /// the post-log committed-frontier contribution -- all decided before anything can be durable.
     ///
     /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` no MEMBER backend
     /// is reachable, and `static` is what removes the injected one -- so "backend-free" is
