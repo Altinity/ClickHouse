@@ -219,7 +219,7 @@ CompletedRemovingFixture seedCompletedRemoving(
         .ns = RootNamespace{"00/drain-race@cas@"},
         .life_id = UInt128{177},
         .checkpoint_key = {}};
-    CasRefCatalog::casAdmitEntry(backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(backend, layout, store->poolConfig().gc_shards, CatalogEntry{
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
     EXPECT_TRUE(store->namespaceFilesLifeIfReadable(fixture.ns));
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
@@ -265,7 +265,7 @@ void seedCompletedRemovingBatch(
             .ns = RootNamespace{fmt::format("00/drain-batch-{}@cas@", i)},
             .state = NsState::Live,
             .incarnation = UInt128{200 + i}};
-        CasRefCatalog::casAdmitEntry(backend, layout, entry);
+        CasRefCatalog::casAdmitEntry(backend, layout, store->poolConfig().gc_shards, entry);
         entries.push_back(std::move(entry));
     }
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
@@ -1621,7 +1621,7 @@ TEST(CasGcFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/damaged-rebuild-removing@cas@"};
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = UInt128{901}});
     CasRefCatalog::casUpdate(*backend, layout, [](const RefCatalog & current)
     {
@@ -1647,7 +1647,7 @@ TEST(CasGcFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     const Layout & layout = store->layout();
     const RootNamespace removed{"00/deferred-removed@cas@"};
     const UInt128 life_id{77};
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{
         .ns = removed, .state = NsState::Live, .incarnation = life_id});
     CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
     {
@@ -1889,7 +1889,8 @@ INSTANTIATE_TEST_SUITE_P(
 
 /// One initial full catalog read selects the first row; each successful erase's mandatory resolution
 /// read becomes the next selection snapshot. Therefore N uncontended deletes cost N+1 reads before
-/// the hot LIST, plus the ordinary round's one post-LIST catalog cut.
+/// the hot LIST. The round then takes one post-LIST walk-plan cut and, later in the separate
+/// `namespace_cleanup` phase, one post-page janitor cut.
 TEST(CasGcFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
@@ -1909,6 +1910,17 @@ TEST(CasGcFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
     const String catalog_get = "get " + layout.refCatalogKey();
     EXPECT_EQ(std::count(journal.begin(), journal.begin() + static_cast<ptrdiff_t>(stream_list), catalog_get),
         deletes + 1);
-    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), deletes + 2)
-        << "the only read after the N+1 drain is the post-LIST catalog cut";
+    const size_t walk_plan_cut = findJournalAfter(journal, catalog_get, stream_list);
+    ASSERT_LT(walk_plan_cut, journal.size());
+    const size_t janitor_list
+        = findJournalAfter(journal, "list " + layout.namespaceRootPrefix(), walk_plan_cut);
+    ASSERT_LT(janitor_list, journal.size());
+    const size_t janitor_cut = findJournalAfter(journal, catalog_get, janitor_list);
+    ASSERT_LT(janitor_cut, journal.size());
+    EXPECT_EQ(findJournalAfter(journal, catalog_get, janitor_cut + 1), journal.size())
+        << "one hot walk-plan cut and one janitor page cut are the only post-drain catalog reads";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), deletes + 3)
+        << "N+1 drain reads, one post-hot-LIST cut, and one separate post-janitor-page cut";
 }

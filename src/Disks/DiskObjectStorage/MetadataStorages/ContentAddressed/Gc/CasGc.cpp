@@ -424,6 +424,38 @@ void Gc::forgetCondemnMarker(const BlobRef & ref, const Token & token)
     condemn_markers_confirmed.erase({ref, token.value});
 }
 
+void Gc::runNamespaceJanitorPage(
+    const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows)
+{
+    GcPhaseTimer t(phase_sink, "namespace_cleanup");
+    t.metric("evidence_rows", cleanup_evidence_rows);
+    NamespaceJanitorResult janitor_result;
+    try
+    {
+        Backend & backend = store->backend();
+        const Layout & layout = store->layout();
+        NamespaceJanitor janitor(backend, layout, 1000);
+        const uint64_t admitted_generation = leased_state.lease.seq;
+        janitor_result = janitor.runOnePage(suppress_destructive, [&]
+        {
+            const auto got = backend.get(layout.gcStateKey());
+            if (!got)
+                return false;
+            const GcState current = decodeGcState(got->bytes);
+            return current.lease.owner == gc_id && current.lease.seq == admitted_generation;
+        });
+        for (const String & anomaly : janitor_result.anomalies)
+            LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+    }
+    catch (const std::exception & e)
+    {
+        LOG_WARNING(logger, "CAS namespace janitor skipped this round: {}", e.what());
+    }
+    t.metric("janitor_pages", janitor_result.pages);
+    t.metric("janitor_keys", janitor_result.keys);
+    t.metric("janitor_deleted", janitor_result.deleted);
+}
+
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)
 {
     RoundReport report;
@@ -550,15 +582,16 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// the round's reads of the adopted fold seal (`graduationDue` and `listRefPrefix` each read the
     /// same key) -- see `fold_seal_reads` below.
     std::optional<RefPlan> walk_plan;
+    bool defer_round = false;
     {
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
         walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
         const RefScanSummary & ref_scan = walk_plan->refScan();
         const size_t changed = walk_plan->changedRows();
-        const bool defer = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
-                                            store->poolConfig().gc_fold_threshold,
-                                            store->poolConfig().gc_fold_max_defer_rounds);
+        defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
+                                       store->poolConfig().gc_fold_threshold,
+                                       store->poolConfig().gc_fold_max_defer_rounds);
         uint64_t ref_log_keys = 0;
         for (const auto & [scanned_life, ids] : ref_scan.logs_by_life)
             ref_log_keys += ids.size();
@@ -573,7 +606,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("walk_plan_dropped_parent_rows", walk_plan->droppedParentRows());
         t.metric("walk_plan_dropped_listed_lives", walk_plan->droppedListedLives());
         t.metric("walk_plan_dropped_tails", walk_plan->droppedTails());
-        t.metric("deferred", defer ? 1 : 0);
+        t.metric("deferred", defer_round ? 1 : 0);
         /// The number of consecutive rounds already deferred BEFORE this one (this round's own verdict is
         /// `deferred` above), so the pair reads unambiguously against `gc_fold_max_defer_rounds`.
         t.metric("rounds_deferred_before", rounds_since_last_fold_);
@@ -582,7 +615,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// the other duplicate pair; the round GETs that one key FIVE times on a folding round.
         t.metric("fold_seal_reads", 2);
 
-        if (defer)
+        if (defer_round)
         {
             ++rounds_since_last_fold_;
             report.deferred = true;
@@ -608,9 +641,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.detail = {{"changed_shards", std::to_string(changed)},
                             {"rounds_since_last_fold", std::to_string(rounds_since_last_fold_)}};
             });
-            return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
+            /// Return after the timer scope so the independently timed janitor phase is not nested
+            /// inside `defer_decision`.
         }
-        rounds_since_last_fold_ = 0;   /// this round folds
+        else
+            rounds_since_last_fold_ = 0;   /// this round folds
+    }
+
+    if (defer_round)
+    {
+        /// DEFER has no `FoldResult`, hence no complete global destructive verdict. The janitor still
+        /// takes its bounded page and catalog cut, but suppression keeps both deletes and valid-page
+        /// cursor progress at the same position for the bounded forced fold to retry.
+        runNamespaceJanitorPage(state, /*suppress_destructive=*/true, /*cleanup_evidence_rows=*/0);
+        return report;   /// no fold, no pre-CAS deletes, no gc/state CAS — sealed generation stays pinned
     }
 
     /// PHASE 4/19 `ref_list_probe`. The sampled store-quality detector, and the only thing in the round
@@ -1089,36 +1133,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// Removal completion has no physical pass. The terminal fold placed positive evidence in the
     /// life row; a later invocation's catalog-only pre-fold drain owns lifecycle deletion, while the
     /// perpetual janitor owns dead-life bytes.
-    {
-        GcPhaseTimer t(phase_sink, "namespace_cleanup");
-        uint64_t evidence_rows = 0;
-        for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
-            evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
-        t.metric("evidence_rows", evidence_rows);
-        NamespaceJanitorResult janitor_result;
-        try
-        {
-            NamespaceJanitor janitor(backend, layout, 1000);
-            const uint64_t admitted_generation = state.lease.seq;
-            janitor_result = janitor.runOnePage(suppress_destructive, [&]
-            {
-                const auto got = backend.get(layout.gcStateKey());
-                if (!got)
-                    return false;
-                const GcState current = decodeGcState(got->bytes);
-                return current.lease.owner == gc_id && current.lease.seq == admitted_generation;
-            });
-            for (const String & anomaly : janitor_result.anomalies)
-                LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
-        }
-        catch (const std::exception & e)
-        {
-            LOG_WARNING(logger, "CAS namespace janitor skipped this round: {}", e.what());
-        }
-        t.metric("janitor_pages", janitor_result.pages);
-        t.metric("janitor_keys", janitor_result.keys);
-        t.metric("janitor_deleted", janitor_result.deleted);
-    }
+    uint64_t cleanup_evidence_rows = 0;
+    for (const auto & [life_id, ref_life_state] : folded.fold_seal.ref_lives)
+        cleanup_evidence_rows += ref_life_state.cleanup_evidence ? 1 : 0;
+    runNamespaceJanitorPage(state, suppress_destructive, cleanup_evidence_rows);
     /// PHASE 18/19 `ref_object_cleanup`. Emitted even when the whole pass is skipped (`trim_enabled` is
     /// a test seam, `suppressed` gates the deletes), because "this phase did nothing and why" is exactly
     /// what a reader of a round that reclaimed nothing needs to see.

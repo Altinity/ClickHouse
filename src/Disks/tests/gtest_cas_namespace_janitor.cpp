@@ -218,19 +218,83 @@ TEST(CasNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
+TEST(CasNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
+{
+    CountingBackend backend;
+    const Layout layout("p");
+    const CatalogEntry creating{
+        .ns = RootNamespace{"catalog-first"},
+        .state = NsState::Creating,
+        .incarnation = UInt128{54},
+        .creator = CreatorFence{.server_root_id = "srv", .writer_epoch = 2, .fence_generation = 3}};
+    seedCatalog(backend, layout, RefCatalog{.entries = {creating}});
+
+    /// The production creation order is the point: the catalog row is durable before either object.
+    const NamespaceLifeId creating_life
+        = NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation);
+    const String ckpt = layout.refCkptKey(creating_life);
+    const String file = layout.namespaceFilesPrefix(creating_life) + "data";
+    ASSERT_EQ(backend.putIfAbsent(ckpt, "checkpoint").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(file, "file").outcome, PutOutcome::Done);
+    backend.resetCounts();
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; });
+
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_EQ(backend.deleteTotal(), 0u);
+    EXPECT_EQ(backend.getCount(layout.refCatalogKey()), 1u);
+    EXPECT_TRUE(backend.get(ckpt));
+    EXPECT_TRUE(backend.get(file));
+}
+
+TEST(CasNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLifecycle)
+{
+    CountingBackend backend;
+    const Layout layout("p");
+    const CatalogEntry creating{
+        .ns = RootNamespace{"cancelled"},
+        .state = NsState::Creating,
+        .incarnation = UInt128{55},
+        .creator = CreatorFence{.server_root_id = "dead-srv", .writer_epoch = 4, .fence_generation = 5}};
+    seedCatalog(backend, layout, RefCatalog{.entries = {creating}});
+    const String ckpt = layout.refCkptKey(
+        NamespaceLifeId::fromCatalogEntry(creating.ns, creating.incarnation));
+    ASSERT_EQ(backend.putIfAbsent(ckpt, "cancelled-checkpoint").outcome, PutOutcome::Done);
+
+    ASSERT_EQ(CasRefCatalog::cancelStalledCreating(
+        backend, layout, creating, [](const CreatorFence &) { return true; },
+        /*admitted_generation=*/7, [](uint64_t) {}),
+        CasRefCatalog::StalledCreatingCancelOutcome::Cancelled);
+    EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; });
+    EXPECT_EQ(result.deleted, 1u);
+    EXPECT_FALSE(backend.get(ckpt));
+}
+
 TEST(CasNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
 {
     CountingBackend backend;
     const Layout layout("p");
     seedCatalog(backend, layout);
-    const auto dead = life("dead", 61);
-    const String key = layout.refCkptKey(dead);
-    ASSERT_EQ(backend.putIfAbsent(key, "bytes").outcome, PutOutcome::Done);
+    const String first = layout.refCkptKey(life("dead-a", 61));
+    const String second = layout.refCkptKey(life("dead-b", 62));
+    ASSERT_EQ(backend.putIfAbsent(first, "first").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(second, "second").outcome, PutOutcome::Done);
 
-    NamespaceJanitor janitor(backend, layout, 100);
+    NamespaceJanitor janitor(backend, layout, 1);
     EXPECT_EQ(janitor.runOnePage(true, [] { return true; }).deleted, 0u);
+    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent)
+        << "a globally suppressed page is undecided and must not mint cleanup progress";
+    EXPECT_EQ(backend.putCount(layout.gcMaintenanceStateKey()), 0u);
+    EXPECT_EQ(backend.casPutCount(layout.gcMaintenanceStateKey()), 0u);
     EXPECT_EQ(janitor.runOnePage(false, [] { return false; }).deleted, 0u);
-    EXPECT_TRUE(backend.get(key));
+    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent)
+        << "fence loss must not mint progress past a page whose deletion was not authorized";
+    EXPECT_TRUE(backend.get(first));
+    EXPECT_TRUE(backend.get(second));
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
@@ -243,13 +307,14 @@ TEST(CasNamespaceJanitor, CursorResumesThenResetsAtEnd)
     ASSERT_EQ(backend.putIfAbsent(layout.namespaceFilesPrefix(dead) + "a", "a").outcome, PutOutcome::Done);
     ASSERT_EQ(backend.putIfAbsent(layout.namespaceFilesPrefix(dead) + "b", "b").outcome, PutOutcome::Done);
 
-    NamespaceJanitor janitor(backend, layout, 1);
-    EXPECT_EQ(janitor.runOnePage(false, [] { return true; }).deleted, 1u);
+    NamespaceJanitor first_process(backend, layout, 1);
+    EXPECT_EQ(first_process.runOnePage(false, [] { return true; }).deleted, 1u);
     const auto mid = readGcMaintenanceState(backend, layout);
     ASSERT_EQ(mid.status, GcMaintenanceReadStatus::Valid);
     ASSERT_TRUE(mid.state);
     EXPECT_FALSE(mid.state->janitor_cursor.empty());
-    EXPECT_EQ(janitor.runOnePage(false, [] { return true; }).deleted, 1u);
+    NamespaceJanitor restarted_process(backend, layout, 1);
+    EXPECT_EQ(restarted_process.runOnePage(false, [] { return true; }).deleted, 1u);
     EXPECT_TRUE(readGcMaintenanceState(backend, layout).state->janitor_cursor.empty());
 }
 
@@ -288,29 +353,33 @@ TEST(CasNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
         CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128{91}},
         CatalogEntry{.ns = RootNamespace{"b"}, .state = NsState::Live, .incarnation = UInt128{91}}};
     seedCatalog(backend, layout, catalog);
-    const String dead = layout.refCkptKey(life("dead", 92));
-    ASSERT_EQ(backend.putIfAbsent(dead, "bytes").outcome, PutOutcome::Done);
-    const auto result = NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; });
+    const String dead_a = layout.refCkptKey(life("dead-a", 92));
+    const String dead_b = layout.refCkptKey(life("dead-b", 93));
+    ASSERT_EQ(backend.putIfAbsent(dead_a, "a").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(dead_b, "b").outcome, PutOutcome::Done);
+    const auto result = NamespaceJanitor(backend, layout, 1).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(backend.deleteTotal(), 0u);
-    EXPECT_TRUE(backend.get(dead));
+    EXPECT_TRUE(backend.get(dead_a));
+    EXPECT_TRUE(backend.get(dead_b));
+    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent)
+        << "an ambiguous catalog cut leaves the selected page undecided for an authoritative retry";
 }
 
-TEST(CasNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndOmittedCycleRetries)
+TEST(CasNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmittedCycleRetries)
 {
     OmitFirstNamespacePageBackend backend;
     const Layout layout("p");
     seedCatalog(backend, layout);
-    const String dead = layout.refCkptKey(life("dead", 101));
+    const String dead = layout.namespaceFilesPrefix(life("dead", 101)) + "only-residue";
     ASSERT_EQ(backend.putIfAbsent(dead, "bytes").outcome, PutOutcome::Done);
     ASSERT_EQ(backend.putIfAbsent(layout.gcMaintenanceStateKey(), "corrupt").outcome, PutOutcome::Done);
-    NamespaceJanitor janitor(backend, layout, 100);
-    EXPECT_EQ(janitor.runOnePage(false, [] { return true; }).deleted, 0u);
+    EXPECT_EQ(NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; }).deleted, 0u);
     EXPECT_TRUE(backend.get(dead));
     EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Valid);
-    EXPECT_EQ(janitor.runOnePage(false, [] { return true; }).deleted, 0u);
+    EXPECT_EQ(NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; }).deleted, 0u);
     EXPECT_TRUE(backend.get(dead));
-    EXPECT_EQ(janitor.runOnePage(false, [] { return true; }).deleted, 1u);
+    EXPECT_EQ(NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; }).deleted, 1u);
     EXPECT_FALSE(backend.get(dead));
 }
 

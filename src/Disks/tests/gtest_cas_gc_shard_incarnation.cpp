@@ -63,7 +63,7 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
         casAdmitEntry(*backend, layout, ns_live_empty);
 
         /// (b) A genuinely Creating entry, admitted directly (step 1 alone -- never completed to Live).
-        CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
+        CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns_creating, .state = NsState::Creating,
             .incarnation = UInt128(1), .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
 
         /// (c) Ref objects present, but the catalog was never told (or has since forgotten): write
@@ -144,7 +144,7 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblIncarnationSwap"};
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});   // Live forbids a creator fence
     appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11
     const NamespaceLifeId dead_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(11));
@@ -178,7 +178,7 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/tblOrdinaryRebirth"};
 
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = ns, .state = NsState::Live,
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});
 
     CatalogEntry after_rebirth{.ns = ns, .state = NsState::Live, .incarnation = UInt128(22), .creator = std::nullopt};
@@ -202,6 +202,8 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     backend->hide(layout.refCkptKey(current_life));
     backend->resetCounts();
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
     EXPECT_FALSE(report.deferred) << "the forced catalog-only fold must reach checkpoint intake";
@@ -209,8 +211,20 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
         << "the catalog-derived current life must drive an exact checkpoint GET";
     EXPECT_GT(backend->listCount(layout.namespaceStreamRootPrefix()), 0u);
     EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u)
-        << "checkpoint state must never be discovered by LIST";
-    EXPECT_EQ(backend->holesServed(), 0u) << "the hot LIST must stay scoped to the stream tree";
+        << "checkpoint state must never receive its own hot LIST";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the only broader LIST is the separately paced janitor page";
+    EXPECT_EQ(backend->holesServed(), 1u)
+        << "the hidden checkpoint is omitted only from the janitor's broad page, never from the hot stream LIST";
+    EXPECT_TRUE(backend->head(layout.refCkptKey(current_life)).exists)
+        << "the post-page catalog cut retains the current life even when LIST omitted its checkpoint";
+    const auto cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(cleanup, phases.end());
+    EXPECT_EQ(cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_EQ(cleanup->metrics.at("janitor_deleted"), 0u);
     bool saw_anomaly_for_ns = false;
     for (const RoundAnomaly & a : report.anomalies)
         if (a.ns.string() == ns.string())
@@ -259,7 +273,7 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     const RootNamespace unrelated_gone_ns{"srv1/tblGenuinelyGone"};
 
     /// Step 1 of createNamespace: insert the Creating entry with a live creator fence.
-    CasRefCatalog::casAdmitEntry(*backend, layout, CatalogEntry{.ns = creating_ns, .state = NsState::Creating,
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = creating_ns, .state = NsState::Creating,
         .incarnation = UInt128(33),
         .creator = CreatorFence{.server_root_id = "test", .writer_epoch = 1, .fence_generation = 1}});
     /// Step 2, without step 3: publish the genesis `_ckpt` directly, at the SAME incarnation the
@@ -276,8 +290,19 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
-    /// Add ordinary stream traffic so the round performs a fold rather than stopping at an empty walk.
-    appendRefLogSeed(*backend, layout, RootNamespace{"srv1/tblOrdinaryTraffic"}, {});
+    /// Add one fully current stream so the round performs a fold rather than stopping at an empty
+    /// walk. Catalog and checkpoint admission keep this traffic out of the janitor's dead-life set,
+    /// isolating the one deliberately unowned checkpoint below.
+    const RootNamespace ordinary_ns{"srv1/tblOrdinaryTraffic"};
+    casAdmitEntry(*backend, layout, ordinary_ns);
+    const NamespaceLifeId ordinary_life = NamespaceLifeId::stageATransition(ordinary_ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(ordinary_life),
+        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
+                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    appendRefLogSeed(*backend, layout, ordinary_ns, {});
+
+    std::vector<GcPhaseRecord> phases;
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
 
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
     bool saw_stalled_birth_anomaly = false;
@@ -292,7 +317,16 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     EXPECT_FALSE(saw_stalled_birth_anomaly);
     EXPECT_FALSE(saw_genuinely_gone_anomaly);
     EXPECT_TRUE(backend->head(layout.refCkptKey(creating_life)).exists);
-    EXPECT_TRUE(backend->head(layout.refCkptKey(gone_life)).exists);
+    EXPECT_TRUE(backend->head(layout.refCkptKey(ordinary_life)).exists);
+    EXPECT_FALSE(backend->head(layout.refCkptKey(gone_life)).exists)
+        << "catalog absence is inert to the hot walk but authorizes the later janitor exact-token delete";
+    const auto cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(cleanup, phases.end());
+    EXPECT_EQ(cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_EQ(cleanup->metrics.at("janitor_deleted"), 1u);
 }
 
 /// `listNamespaces` projects the authoritative catalog; physical streams never contribute names.

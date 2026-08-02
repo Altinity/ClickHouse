@@ -505,6 +505,13 @@ private:
     /// It performs no physical LIST or delete.
     CatalogLifecycleReconcileResult drainCompletedRemoving(const GcState & leased_state);
 
+    /// Run exactly one independently paced physical namespace-maintenance page. The caller supplies
+    /// the one round-wide destructive verdict when it exists; DEFER passes suppression because it has
+    /// no folded frontier verdict. This helper owns only janitor I/O and phase metrics, never lifecycle
+    /// transitions or the hot stream walk plan.
+    void runNamespaceJanitorPage(
+        const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
+
     /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),
     /// `root_shards` the discovered universe, `mf_cleanup` the part-manifest cleanup work keyed by

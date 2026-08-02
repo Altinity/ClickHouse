@@ -6,6 +6,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasNamespaceJanitor.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
@@ -302,8 +304,12 @@ TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
         = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
     ASSERT_FALSE(gc.runRegularRound().deferred);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - fold_builds_before, 1u);
-    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u)
-        << "generation zero has no drain read: the sole catalog GET must be the post-LIST cut";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
+        << "the hot walk must enumerate the stream tree exactly once";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the bounded janitor page is a distinct ownership-tree enumeration";
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2u)
+        << "generation zero has no drain read: one cut builds the hot walk plan and one follows the janitor page";
     const auto fold_decision = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
         return phase.phase == "defer_decision";
@@ -311,6 +317,12 @@ TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
     ASSERT_NE(fold_decision, phases.end());
     EXPECT_EQ(fold_decision->metrics.at("walk_plan_builds"), 1u);
     EXPECT_EQ(fold_decision->metrics.at("walk_plan_rows"), 1u);
+    const auto fold_cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(fold_cleanup, phases.end());
+    EXPECT_EQ(fold_cleanup->metrics.at("janitor_pages"), 1u);
 
     phases.clear();
     backend->resetCounts();
@@ -318,8 +330,12 @@ TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
         = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
     ASSERT_TRUE(gc.runRegularRound().deferred);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - defer_builds_before, 1u);
-    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2u)
-        << "the adopted-parent drain and the post-LIST cut are the deferred round's only catalog GETs";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
+        << "a deferred round still builds exactly one complete hot walk plan";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the janitor remains one separately paced ownership-tree page";
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 3u)
+        << "one adopted-parent drain cut, one post-hot-LIST cut, and one post-janitor-page cut";
     const auto defer_decision = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
         return phase.phase == "defer_decision";
@@ -330,6 +346,120 @@ TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
     EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_parent_rows"), 0u);
     EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_listed_lives"), 0u);
     EXPECT_EQ(defer_decision->metrics.at("walk_plan_dropped_tails"), 0u);
+    const auto defer_cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(defer_cleanup, phases.end());
+    EXPECT_EQ(defer_cleanup->metrics.at("janitor_pages"), 1u);
+}
+
+/// A maintenance cursor can be left between pages while the correctness state is already quiescent.
+/// The next acquired round may DEFER its fold, but it has no authoritative destructive verdict. It
+/// must therefore inspect exactly one janitor page without deleting OR advancing past it; the bounded
+/// forced fold then retries the same page under its computed global gate and reclaims the debris.
+TEST(CasGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutPublishingSuccessor)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/1);
+    const Layout & layout = store->layout();
+    const NamespaceLifeId dead_a
+        = NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/a"}, UInt128{0xDA});
+    const NamespaceLifeId dead_b
+        = NamespaceLifeId::fromCatalogEntry(RootNamespace{"dead/b"}, UInt128{0xDB});
+    const String key_a = layout.refCkptKey(dead_a);
+    const String key_b = layout.refCkptKey(dead_b);
+    ASSERT_EQ(backend->putIfAbsent(key_a, "dead-a").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(key_b, "dead-b").outcome, PutOutcome::Done);
+
+    /// Establish real opaque backend progress rather than fabricating a cursor value. One key remains
+    /// after this page and the durable cursor must be non-empty.
+    const NamespaceJanitorResult first_page
+        = NamespaceJanitor(*backend, layout, 1).runOnePage(false, [] { return true; });
+    ASSERT_EQ(first_page.pages, 1u);
+    ASSERT_EQ(first_page.deleted, 1u);
+    const GcMaintenanceReadResult partial = readGcMaintenanceState(*backend, layout);
+    ASSERT_EQ(partial.status, GcMaintenanceReadStatus::Valid);
+    ASSERT_TRUE(partial.state);
+    ASSERT_FALSE(partial.state->janitor_cursor.empty());
+    ASSERT_EQ(static_cast<uint64_t>(backend->head(key_a).exists) + static_cast<uint64_t>(backend->head(key_b).exists), 1u);
+
+    /// Give the forced fold a nonempty, fully proved authoritative universe. The R11 floor correctly
+    /// refuses to open the destructive gate for an empty 0-of-0 universe even in the test-only policy.
+    const RootNamespace live_namespace{"live/frontier@cas@"};
+    casAdmitEntry(*backend, layout, live_namespace);
+    ASSERT_EQ(backend->putIfAbsent(
+        layout.refCkptKey(NamespaceLifeId::stageATransition(live_namespace)),
+        encodeRefCkpt(RefCkpt{
+            .life_epoch = std::optional<uint64_t>{1},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt})).outcome,
+        PutOutcome::Done);
+
+    backend->resetCounts();
+    std::vector<GcPhaseRecord> phases;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
+    const uint64_t plans_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+
+    const RoundReport report = gc.runRegularRound();
+
+    ASSERT_TRUE(report.acquired_lease);
+    ASSERT_TRUE(report.deferred);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 1u)
+        << "DEFER still constructs its one immutable hot walk plan, never a second janitor-derived plan";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the deferred round must inspect exactly one separately paced janitor page";
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2u)
+        << "generation zero pays one hot walk-plan cut and one post-janitor-page cut";
+    const auto cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(cleanup, phases.end());
+    EXPECT_EQ(cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_GE(cleanup->metrics.at("janitor_keys"), 1u);
+    EXPECT_EQ(cleanup->metrics.at("janitor_deleted"), 0u);
+
+    const GcMaintenanceReadResult deferred_progress = readGcMaintenanceState(*backend, layout);
+    ASSERT_EQ(deferred_progress.status, GcMaintenanceReadStatus::Valid);
+    ASSERT_TRUE(deferred_progress.state);
+    EXPECT_EQ(deferred_progress.state->janitor_cursor, partial.state->janitor_cursor)
+        << "a suppressed DEFER page is undecided and must remain selected for the authoritative fold";
+    EXPECT_EQ(static_cast<uint64_t>(backend->head(key_a).exists) + static_cast<uint64_t>(backend->head(key_b).exists), 1u);
+
+    const auto gc_state = backend->get(layout.gcStateKey());
+    ASSERT_TRUE(gc_state);
+    const GcState state = decodeGcState(gc_state->bytes);
+    EXPECT_EQ(state.snap_generation, 0u);
+    EXPECT_EQ(state.snap_attempt, 0u);
+    EXPECT_FALSE(backend->head(layout.foldSealKey(1, 1)).exists)
+        << "maintenance on DEFER must not publish a fold successor";
+
+    backend->resetCounts();
+    phases.clear();
+    const RoundReport folded = gc.runRegularRound({}, true, UniversePolicy::AuthoritativeForTest);
+    ASSERT_TRUE(folded.acquired_lease);
+    ASSERT_FALSE(folded.deferred)
+        << "gc_fold_max_defer_rounds=1 forces the round immediately following one DEFER to fold";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the authoritative fold must run the janitor exactly once, not once per call site";
+    const auto folded_cleanup = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
+    {
+        return phase.phase == "namespace_cleanup";
+    });
+    ASSERT_NE(folded_cleanup, phases.end());
+    EXPECT_EQ(folded_cleanup->metrics.at("janitor_pages"), 1u);
+    EXPECT_GE(folded_cleanup->metrics.at("janitor_keys"), 1u);
+    EXPECT_EQ(folded_cleanup->metrics.at("janitor_deleted"), 1u);
+    EXPECT_EQ(static_cast<uint64_t>(backend->head(key_a).exists) + static_cast<uint64_t>(backend->head(key_b).exists), 0u)
+        << "the fold must retry and delete the exact page that DEFER left undecided";
+    const GcMaintenanceReadResult completed = readGcMaintenanceState(*backend, layout);
+    ASSERT_EQ(completed.status, GcMaintenanceReadStatus::Valid);
+    ASSERT_TRUE(completed.state);
+    EXPECT_TRUE(completed.state->janitor_cursor.empty());
 }
 
 /// The same idle-defer property under a sharded blob-target GC (gc_shards=2): graduationDue's loop

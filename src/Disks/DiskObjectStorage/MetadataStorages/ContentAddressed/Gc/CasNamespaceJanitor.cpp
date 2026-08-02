@@ -43,6 +43,13 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         result.anomalies.push_back(e.message());
         ambiguous = true;
     }
+    /// A valid page is complete only when the round had deletion authority for every dead-life
+    /// candidate on it. Advancing while the global gate is closed can phase-lock a dead page onto
+    /// every suppressed round and a different page onto every bounded forced fold. Ambiguous cuts and
+    /// observed fence loss have the same shape: retain the old cursor so an authoritative round
+    /// retries the exact page. Malformed keys, absent objects and token mismatches are final per-key
+    /// outcomes and therefore do not by themselves prevent progress.
+    bool page_decided = !ambiguous && !suppress_deletes;
 
     for (const ListedKey & listed : page.keys)
     {
@@ -87,19 +94,25 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
             token = current.token;
         }
         if (!fence_held())
+        {
+            page_decided = false;
             break;
+        }
         if (backend.deleteExact(listed.key, token).kind == DeleteOutcome::Kind::Deleted)
             ++result.deleted;
     }
 
-    const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
-    try
+    if (page_decided)
     {
-        (void)casGcMaintenanceState(backend, layout, progress.token, next);
-    }
-    catch (const std::exception & e)
-    {
-        result.anomalies.push_back("cursor publication failed: " + String(e.what()));
+        const GcMaintenanceState next{.janitor_cursor = page.next_cursor};
+        try
+        {
+            (void)casGcMaintenanceState(backend, layout, progress.token, next);
+        }
+        catch (const std::exception & e)
+        {
+            result.anomalies.push_back("cursor publication failed: " + String(e.what()));
+        }
     }
     return result;
 }
