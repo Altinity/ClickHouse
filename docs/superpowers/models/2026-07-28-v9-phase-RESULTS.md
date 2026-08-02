@@ -506,6 +506,26 @@ TLC's nonzero exit and had no assertion that the counterexample was specifically
 new runner exits zero only for the exact expected violation plus the green fixed model; a different
 invariant, TLC error, timeout, or missing config fails the suite.
 
+#### Ack-floor zombie whole-suite conversion {#ack-floor-zombie-whole-suite}
+
+`run_ackfloor_zombie.sh` now owns all four configs, including the empty-blob boundary added after the
+original 123-config inventory. Its prior no-argument invocation stopped at the usage check without
+starting TLC; the asserted runner instead executes the complete sabotage-first table. With the official
+pinned TLC jar and `TLC_WORKERS=auto`, the focused family gate produced:
+
+```text
+CONFIG             EXPECT      RESULT                           SECONDS  VERDICT
+sab_eagerdelete    violation   violation:INV_NO_DANGLE          3        PASS
+stage1             green       green                            148      PASS
+empty_blobs        green       green                            0        PASS
+witness_delete     violation   violation:W_DeleteHappens        1        PASS
+
+ALL EXPECTATIONS MET
+```
+
+The witness row is deliberately an exact expected violation: accepting any nonzero TLC exit would not
+prove that the honest delete path is reachable.
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
