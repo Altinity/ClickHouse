@@ -41,6 +41,7 @@ namespace ProfileEvents
     extern const Event CasGcMetaOps;
     extern const Event CasGcEnumerationPages;
     extern const Event CasGcRefWalkPlansBuilt;
+    extern const Event CasGcUnmatchedAdoptedParentLives;
     extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
@@ -222,6 +223,10 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         const auto it = plan.rows.find(life_id);
         if (it == plan.rows.end())
         {
+            ProfileEvents::increment(ProfileEvents::CasGcUnmatchedAdoptedParentLives);
+            LOG_WARNING(getLogger("CasGc"),
+                "CAS GC dropped adopted-parent ref-life row absent from the current catalog cut: life_id={}",
+                u128ToHex(life_id));
             ++plan.dropped_parent_rows;
             continue;
         }

@@ -2,15 +2,26 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+#include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 /// Explicit rather than relying on a transitive path: `DEBUG_OR_SANITIZER_BUILD` (used below to gate
 /// the `*DeathTest` split) must resolve in THIS translation unit.
 #include <base/defines.h>
+#include <Poco/AutoPtr.h>
+#include <Poco/StreamChannel.h>
 #include <fmt/format.h>
+#include <algorithm>
 #include <limits>
+#include <sstream>
 #include <type_traits>
 #include <utility>
 
 using namespace DB::Cas;
+
+namespace ProfileEvents
+{
+    extern const Event CasGcUnmatchedAdoptedParentLives;
+}
 
 namespace DB::Cas::tests
 {
@@ -135,6 +146,35 @@ private:
     std::optional<CatalogEntry> replacement;
     bool armed = false;
     bool fence_moved = false;
+};
+
+class ScopedCasGcLogCapture
+{
+public:
+    ScopedCasGcLogCapture()
+        : logger(getLogger("CasGc"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedCasGcLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
 };
 
 }
@@ -1270,6 +1310,39 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
     EXPECT_FALSE(rebuild.contains(UInt128{1}));
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
+}
+
+TEST(CasGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)
+{
+    const NamespaceLifePhysicalId current_life{2};
+    const NamespaceLifePhysicalId unmatched_life =
+        hexToU128("fedcba98765432100123456789abcdef");
+    RefCatalog catalog{.entries = {liveEntry("live", 2)}};
+    const CasRefCatalog::Snapshot cut{
+        .catalog = catalog, .token = std::nullopt, .life_index = CatalogLifeIndex(catalog)};
+    RefScanSummary scan;
+    scan.parent_ref_lives.emplace(current_life, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{2, 3}}});
+    scan.parent_ref_lives.emplace(unmatched_life, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+
+    const uint64_t events_before =
+        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load();
+    ScopedCasGcLogCapture log_capture;
+    const RefPlan plan = tests::buildRefWalkPlanForTest(scan, cut);
+
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load() - events_before,
+        1u);
+    EXPECT_EQ(plan.droppedParentRows(), 1u);
+    EXPECT_EQ(plan.size(), 1u);
+    EXPECT_TRUE(plan.contains(current_life));
+    EXPECT_FALSE(plan.contains(unmatched_life));
+    EXPECT_FALSE(plan.parentFoldStates().contains(unmatched_life));
+    EXPECT_FALSE(plan.successorFoldStates().contains(unmatched_life));
+    const String captured = log_capture.captured();
+    EXPECT_NE(captured.find("fedcba98765432100123456789abcdef"), String::npos);
+    EXPECT_EQ(std::count(captured.begin(), captured.end(), '\n'), 1u);
 }
 
 TEST(CasGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
