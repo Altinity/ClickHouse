@@ -16,7 +16,7 @@ TEST(CasFormatBattery, BlobMeta)
         .id = FormatId::BlobMeta,
         .encode = [&] { return sealObject(FormatId::BlobMeta, encodeBlobMeta(m)); },
         .decode = [](std::string_view s) { decodeBlobMeta(std::string(openObject(FormatId::BlobMeta, s))); },
-        .golden = "{\"type\":\"cas_blob_meta\",\"v\":7}\n"
+        .golden = "{\"type\":\"cas_blob_meta\",\"v\":8}\n"
                   "{\"st\":\"clean\",\"cr\":\"0\",\"sz\":\"12345\"}\n"});
 }
 

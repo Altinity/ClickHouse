@@ -188,12 +188,12 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     CasJsonWriter out;
     writeHeaderLine(out, FormatId::PoolMeta);
     const String rendered = std::move(out).take();
-    EXPECT_EQ(rendered, "{\"type\":\"cas_pool_meta\",\"v\":7}\n");
+    EXPECT_EQ(rendered, "{\"type\":\"cas_pool_meta\",\"v\":8}\n");
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     const TextHeader h = expectHeaderLine(in, FormatId::PoolMeta);
     EXPECT_EQ(h.type, "cas_pool_meta");
-    EXPECT_EQ(h.v, 7u);
+    EXPECT_EQ(h.v, 8u);
     EXPECT_TRUE(in.eof());
 
     const auto sniffed = sniffHeaderLine(rendered);

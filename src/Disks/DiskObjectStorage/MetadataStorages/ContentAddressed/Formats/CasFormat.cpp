@@ -54,6 +54,10 @@ constexpr FormatChangePoint REF_CKPT[] = {
 /// itself, for the same reason `REF_CKPT` originally did), so it carries no second change point here.
 constexpr FormatChangePoint REF_CATALOG[] = {{kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration}};
 constexpr FormatChangePoint GC_MAINTENANCE_STATE[] = {{kUnifiedRefLifeFoldGeneration, kUnifiedRefLifeFoldGeneration}};
+constexpr FormatChangePoint POOL_META[] = {
+    {1, 1},
+    {kPoolGcShardsGeneration, kPoolGcShardsGeneration},
+};
 
 }
 
@@ -70,9 +74,10 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
             return REF_CATALOG;
         case FormatId::GcMaintenanceState:
             return GC_MAINTENANCE_STATE;
+        case FormatId::PoolMeta:
+            return POOL_META;
         case FormatId::Blob:
         case FormatId::GcState:
-        case FormatId::PoolMeta:
         case FormatId::Roster:
         case FormatId::GcOutcomes:
         case FormatId::PartManifest:

@@ -1,5 +1,6 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <limits>
 #include <algorithm>
 
@@ -19,6 +20,13 @@ CasFoldSeal sampleFoldSeal()
     seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xABCDEF)});
     return seal;
 }
+
+void eraseRequiredField(String & encoded, std::string_view field)
+{
+    const size_t pos = encoded.find(field);
+    ASSERT_NE(pos, String::npos);
+    encoded.erase(pos, field.size());
+}
 }
 
 TEST(CasFormatBattery, FoldSeal)
@@ -33,7 +41,7 @@ TEST(CasFormatBattery, FoldSeal)
     runFormatBattery({FormatId::FoldSeal,
         [&] { return sealObject(FormatId::FoldSeal, encodeFoldSeal(seal)); },
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
+        "{\"type\":\"cas_fold_seal\",\"v\":8}\n"
         "{\"g\":\"5\",\"pg\":\"4\"}\n"
         "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n"
         "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"
@@ -55,6 +63,117 @@ TEST(CasFoldSealFormat, RoundTripsAllFields)
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
     EXPECT_EQ(out.blob_target_runs[0].checksum, UInt128(0xABCDEF));
     EXPECT_EQ(out, in);
+}
+
+TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.generation = 7;
+    seal.parent_generation = 6;
+    seal.blob_target_runs = {
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7},
+    };
+    seal.condemned_summary[0] = CondemnedSummary{};
+
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, /*gc_shards=*/1); },
+        "duplicate blob-target shard");
+}
+
+TEST(CasFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryField)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.generation = 7;
+    seal.parent_generation = 6;
+    seal.blob_target_runs.push_back(RunRef{
+        .key = layout.blobTargetRunKey(7, 1, 0, 0),
+        .checksum = UInt128{1},
+        .shard = 0,
+        .generation = 7});
+    seal.condemned_summary[0] = CondemnedSummary{};
+    const String valid = encodeFoldSeal(seal);
+
+    for (const std::string_view field : {
+        ",\"key\":\"p/gc/gen/7/attempt/1/blob_target/0/0\"",
+        ",\"ck\":\"00000000000000000000000000000001\"",
+        ",\"gen\":\"7\"",
+        ",\"ct\":0",
+        ",\"pt\":0",
+        ",\"ocr\":\"18446744073709551615\""})
+    {
+        String malformed = valid;
+        eraseRequiredField(malformed, field);
+        cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+            [&] { decodeFoldSeal(malformed, layout, 1); }, "missing");
+    }
+
+    /// `shard` occurs once on each row; remove each occurrence independently.
+    String missing_btr_shard = valid;
+    eraseRequiredField(missing_btr_shard, ",\"shard\":0");
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(missing_btr_shard, layout, 1); }, "missing");
+
+    String missing_cnd_shard = valid;
+    const size_t first_shard = missing_cnd_shard.find(",\"shard\":0");
+    ASSERT_NE(first_shard, String::npos);
+    const size_t second_shard = missing_cnd_shard.find(",\"shard\":0", first_shard + 1);
+    ASSERT_NE(second_shard, String::npos);
+    missing_cnd_shard.erase(second_shard, std::string_view(",\"shard\":0").size());
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(missing_cnd_shard, layout, 1); }, "missing");
+}
+
+TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteSummaryDomain)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.generation = 7;
+    seal.parent_generation = 6;
+    seal.blob_target_runs.push_back(RunRef{
+        .key = layout.blobTargetRunKey(7, 1, 1, 0),
+        .checksum = UInt128{1},
+        .shard = 1,
+        .generation = 7});
+    seal.condemned_summary[0] = CondemnedSummary{};
+
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "outside");
+
+    seal.blob_target_runs[0].shard = 0;
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "not canonical");
+
+    seal.blob_target_runs.clear();
+    seal.condemned_summary.clear();
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "exactly 1");
+
+    seal.condemned_summary[0] = CondemnedSummary{};
+    seal.condemned_summary[1] = CondemnedSummary{};
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "exactly 1");
+}
+
+TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsContradictorySummaryCounts)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.condemned_summary[0] = CondemnedSummary{
+        .condemned_total = 1,
+        .pending_total = 2,
+        .oldest_nonpending_condemn_round = 3};
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "greater than");
+
+    seal.condemned_summary[0] = CondemnedSummary{
+        .condemned_total = 2,
+        .pending_total = 1,
+        .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()};
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "real oldest");
 }
 
 TEST(CasFoldSealFormat, RejectsUnexpectedGeneration)
@@ -147,7 +266,7 @@ TEST(CasFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{9, 10}}});
 
     const String expected =
-        "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
+        "{\"type\":\"cas_fold_seal\",\"v\":8}\n"
         "{\"g\":\"8\",\"pg\":\"7\"}\n"
         "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
         "\"lfe\":\"3\",\"lfs\":\"4\",\"hr\":\"manifest_body_missing\",\"hpe\":\"5\","

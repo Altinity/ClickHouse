@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasByteBudget.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -93,6 +94,62 @@ void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
     writeKey(out, "shard", first); writeIntText(r.shard, out);
     writeKey(out, "gen", first);   writeU64StringValue(out, r.generation);
     closeObject(out, first);
+}
+
+void validateFoldSealStructure(
+    const CasFoldSeal & seal, const Layout & layout, uint64_t gc_shards,
+    int error_code, std::string_view source)
+{
+    if (gc_shards == 0)
+        throw Exception(error_code, "CAS fold seal {}: gc_shards must be nonzero", source);
+
+    std::vector<bool> run_seen(gc_shards, false);
+    for (const RunRef & run : seal.blob_target_runs)
+    {
+        if (run.key.empty() || run.generation == 0)
+            throw Exception(error_code,
+                "CAS fold seal {}: blob-target run requires a nonempty key and nonzero physical generation",
+                source);
+        if (run.shard >= gc_shards)
+            throw Exception(error_code,
+                "CAS fold seal {}: blob-target shard {} is outside [0, {})",
+                source, run.shard, gc_shards);
+        if (run_seen[run.shard])
+            throw Exception(error_code,
+                "CAS fold seal {}: duplicate blob-target shard {} -- at most one run per shard is allowed",
+                source, run.shard);
+        run_seen[run.shard] = true;
+
+        const auto parsed = layout.parseBlobTargetRunKey(run.key);
+        if (!parsed || parsed->generation != run.generation || parsed->shard != run.shard || parsed->seq != 0)
+            throw Exception(error_code,
+                "CAS fold seal {}: blob-target run key '{}' is not canonical for generation {}, shard {}, sequence 0",
+                source, run.key, run.generation, run.shard);
+    }
+
+    if (seal.condemned_summary.size() != gc_shards)
+        throw Exception(error_code,
+            "CAS fold seal {}: condemned summary has {} rows, but exactly {} shards are required",
+            source, seal.condemned_summary.size(), gc_shards);
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        const auto it = seal.condemned_summary.find(shard);
+        if (it == seal.condemned_summary.end())
+            throw Exception(error_code,
+                "CAS fold seal {}: condemned summary is missing shard {} from [0, {})",
+                source, shard, gc_shards);
+        const CondemnedSummary & summary = it->second;
+        if (summary.pending_total > summary.condemned_total)
+            throw Exception(error_code,
+                "CAS fold seal {}: shard {} has pending_total {} greater than condemned_total {}",
+                source, shard, summary.pending_total, summary.condemned_total);
+        const bool has_nonpending = summary.pending_total < summary.condemned_total;
+        const bool has_real_oldest = summary.oldest_nonpending_condemn_round != UINT64_MAX;
+        if (has_nonpending != has_real_oldest)
+            throw Exception(error_code,
+                "CAS fold seal {}: shard {} must carry a real oldest non-pending condemn round exactly when non-pending rows exist",
+                source, shard);
+    }
 }
 
 }
@@ -423,30 +480,45 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
         }
         else if (kind == "btr")
         {
-            RunRef run;
+            std::optional<String> run_key;
+            std::optional<UInt128> checksum;
+            std::optional<uint64_t> shard;
+            std::optional<uint64_t> generation;
             while (r.nextKey(key))
             {
-                if (key == "key") run.key = r.readString();
-                else if (key == "ck") run.checksum = r.readHex128();
-                else if (key == "shard") run.shard = r.readU64Number();
-                else if (key == "gen") run.generation = r.readU64String();
+                if (key == "key") run_key = r.readString();
+                else if (key == "ck") checksum = r.readHex128();
+                else if (key == "shard") shard = r.readU64Number();
+                else if (key == "gen") generation = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown run key '{}'", key);
             }
-            seal.blob_target_runs.push_back(run);
+            if (!run_key || !checksum || !shard || !generation)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: btr requires key, ck, shard, and gen");
+            seal.blob_target_runs.push_back(RunRef{
+                .key = std::move(*run_key), .checksum = *checksum, .shard = *shard, .generation = *generation});
         }
         else if (kind == "cnd")
         {
-            uint64_t shard = 0;
-            CondemnedSummary s;
+            std::optional<uint64_t> shard;
+            std::optional<uint64_t> condemned_total;
+            std::optional<uint64_t> pending_total;
+            std::optional<uint64_t> oldest_nonpending_condemn_round;
             while (r.nextKey(key))
             {
                 if (key == "shard") shard = r.readU64Number();
-                else if (key == "ct") s.condemned_total = r.readU64Number();
-                else if (key == "pt") s.pending_total = r.readU64Number();
-                else if (key == "ocr") s.oldest_nonpending_condemn_round = r.readU64String();
+                else if (key == "ct") condemned_total = r.readU64Number();
+                else if (key == "pt") pending_total = r.readU64Number();
+                else if (key == "ocr") oldest_nonpending_condemn_round = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown cnd key '{}'", key);
             }
-            insertRecordOnce(seal.condemned_summary, shard, s, "condemned-summary");
+            if (!shard || !condemned_total || !pending_total || !oldest_nonpending_condemn_round)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: cnd requires shard, ct, pt, and ocr");
+            insertRecordOnce(seal.condemned_summary, *shard, CondemnedSummary{
+                .condemned_total = *condemned_total,
+                .pending_total = *pending_total,
+                .oldest_nonpending_condemn_round = *oldest_nonpending_condemn_round}, "condemned-summary");
         }
         else
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown record kind '{}'", kind);
@@ -455,6 +527,20 @@ CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expect
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: junk after record");
         ++seen;
     }
+}
+
+CasFoldSeal decodeFoldSeal(
+    std::string_view data, const Layout & layout, uint64_t gc_shards,
+    std::optional<uint64_t> expected_generation)
+{
+    CasFoldSeal seal = decodeFoldSeal(data, expected_generation);
+    validateFoldSealStructure(seal, layout, gc_shards, ErrorCodes::CORRUPTED_DATA, "adoption");
+    return seal;
+}
+
+void validateFoldSealForWrite(const CasFoldSeal & seal, const Layout & layout, uint64_t gc_shards)
+{
+    validateFoldSealStructure(seal, layout, gc_shards, ErrorCodes::LOGICAL_ERROR, "producer");
 }
 
 }

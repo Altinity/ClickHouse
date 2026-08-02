@@ -72,7 +72,9 @@ String joinAlgoNames(const std::vector<uint8_t> & algos_used)
 /// `G_BUILD` and is correctly refused by the startup gate once a future generation bump lands here).
 /// On a CAS conflict, re-read and retry the whole decision (a concurrent admitter may have unioned a
 /// DIFFERENT algo, or the very one we wanted, in the meantime).
-PoolMeta admitOrValidate(Backend & backend, const String & key, PoolMeta pm, Token token, BlobHashAlgo config_algo, bool allow_new)
+PoolMeta admitOrValidate(
+    Backend & backend, const String & key, PoolMeta pm, Token token,
+    BlobHashAlgo config_algo, bool allow_new)
 {
     for (;;)
     {
@@ -104,11 +106,13 @@ PoolMeta admitOrValidate(Backend & backend, const String & key, PoolMeta pm, Tok
 }
 
 PoolMeta PoolMeta::createOrValidate(
-    Backend & backend, const Layout & layout, uint64_t blob_header_len,
+    Backend & backend, const Layout & layout, uint64_t blob_header_len, uint64_t gc_shards,
     BlobHashAlgo blob_hash_algo, bool allow_new, bool allow_mint)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
     validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
+    if (gc_shards == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS pool meta: gc_shards must be >= 1");
     /// Defense against a garbage `static_cast` past the caller's own boundary: `blobHashAlgoName`
     /// throws BAD_ARGUMENTS for anything `BlobHashAlgo` does not actually admit.
     blobHashAlgoName(blob_hash_algo);
@@ -144,6 +148,7 @@ PoolMeta PoolMeta::createOrValidate(
     PoolMeta pm;
     pm.pool_id = mintPoolId();
     pm.blob_header_len = blob_header_len;
+    pm.gc_shards = gc_shards;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(blob_hash_algo)};
 

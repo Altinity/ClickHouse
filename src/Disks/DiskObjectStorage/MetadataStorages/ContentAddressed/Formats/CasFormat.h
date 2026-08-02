@@ -50,7 +50,11 @@ namespace DB::Cas
 /// Generation 7 replaces the fold seal's independent namespace-keyed coverage and cleanup
 /// collections with one opaque-life-keyed row and removes the retired terminal-marker object class. A generation-6
 /// pool must be recreated; there is no dual reader for the split grammar.
-constexpr uint32_t G_BUILD = 7;
+///
+/// Generation 8 persists the creation-time `gc_shards` authority in `_pool_meta`. Generation-7 pools
+/// must be recreated because namespace admission can precede creation of `gc/state`; accepting a
+/// metadata object without this field would leave different openers charging different seal bounds.
+constexpr uint32_t G_BUILD = 8;
 
 /// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
 /// below this value cannot be opened, because its ref streams carry holes this build reports as
@@ -76,6 +80,9 @@ constexpr uint32_t kOpaqueNamespaceLifeLayoutGeneration = 6;
 /// The recreate-only generation at which one unified ref-life row replaced the split coverage and
 /// namespace-cleanup grammar.
 constexpr uint32_t kUnifiedRefLifeFoldGeneration = 7;
+
+/// The recreate-only generation at which `_pool_meta` became the authority for `gc_shards`.
+constexpr uint32_t kPoolGcShardsGeneration = 8;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:

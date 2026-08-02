@@ -25,6 +25,7 @@ struct PoolMeta
 {
     UInt128 pool_id{};
     uint64_t blob_header_len = 0;
+    uint64_t gc_shards = 1;
     uint64_t min_reader_generation = 0;
     /// Every hash algorithm ever admitted, encoded as `static_cast<uint8_t>(BlobHashAlgo)`, in strictly
     /// increasing order. Admission only appends a new algorithm to this durable set.
@@ -48,9 +49,20 @@ struct PoolMeta
     /// pool-lifecycle entry point cannot silently re-arm the observe-mint footgun by omission. The two
     /// production callers pass it explicitly; only test minting sites opt in with `allow_mint=true`.
     static PoolMeta createOrValidate(
-        Backend &, const Layout &, uint64_t blob_header_len,
+        Backend &, const Layout &, uint64_t blob_header_len, uint64_t gc_shards,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
         bool allow_mint = false);
+
+    /// Convenience for single-shard callers. Production pool opening passes the configured value to
+    /// the explicit overload above; this preserves compact single-shard codec/unit fixtures.
+    static PoolMeta createOrValidate(
+        Backend & backend, const Layout & layout, uint64_t blob_header_len,
+        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false,
+        bool allow_mint = false)
+    {
+        return createOrValidate(
+            backend, layout, blob_header_len, /*gc_shards=*/1, blob_hash_algo, allow_new, allow_mint);
+    }
 };
 
 /// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the

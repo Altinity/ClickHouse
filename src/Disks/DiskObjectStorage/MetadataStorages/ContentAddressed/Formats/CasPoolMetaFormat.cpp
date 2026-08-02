@@ -77,6 +77,8 @@ String encodePoolMeta(const PoolMeta & pm)
     writeHex128Value(out, pm.pool_id);
     writeKey(out, "hln", first);
     writeIntText(pm.blob_header_len, out);
+    writeKey(out, "gcs", first);
+    writeIntText(pm.gc_shards, out);
     writeKey(out, "mrg", first);
     writeIntText(pm.min_reader_generation, out);
     writeKey(out, "alg", first);
@@ -105,13 +107,13 @@ PoolMeta decodePoolMeta(std::string_view data)
     /// An older pool predates a breaking ref-layer change this build cannot reconcile, so
     /// reject it before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    /// Generation 7 is the latest recreate-only grammar floor and subsumes the earlier stream floors.
-    if (header.v < kUnifiedRefLifeFoldGeneration)
+    /// Generation 8 is the latest recreate-only authority floor and subsumes the earlier stream floors.
+    if (header.v < kPoolGcShardsGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates generation-7 unified ref-life fold state; recreate the pool. "
-            "This build reads one opaque-life-keyed fold row and no separate terminal-marker object "
+            "CAS pool format {} predates generation-8 pool-authoritative gc_shards; recreate the pool. "
+            "This build requires the namespace-admission shard bound in _pool_meta "
             "(generation {}+), and CAS is pre-release: there is no in-place migration.",
-            header.v, kUnifiedRefLifeFoldGeneration);
+            header.v, kPoolGcShardsGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());
@@ -119,6 +121,7 @@ PoolMeta decodePoolMeta(std::string_view data)
 
     PoolMeta pm;
     bool saw_pid = false;
+    bool saw_gc_shards = false;
     String key;
     while (r.nextKey(key))
     {
@@ -129,6 +132,11 @@ PoolMeta decodePoolMeta(std::string_view data)
         }
         else if (key == "hln")
             pm.blob_header_len = r.readU64Number();
+        else if (key == "gcs")
+        {
+            pm.gc_shards = r.readU64Number();
+            saw_gc_shards = true;
+        }
         else if (key == "mrg")
             pm.min_reader_generation = r.readU64Number();
         else if (key == "alg")
@@ -152,6 +160,8 @@ PoolMeta decodePoolMeta(std::string_view data)
     }
     if (!saw_pid)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing pid");
+    if (!saw_gc_shards || pm.gc_shards == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: missing or zero gcs");
     if (!body_in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: junk after body object");
     if (!in.eof())

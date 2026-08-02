@@ -320,7 +320,7 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-7 unified ref-life fold state",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-8 pool-authoritative gc_shards",
                                                kContiguousRefStreamsGeneration - 1)), String::npos)
             << "the message must name the migration: " << e.message();
     }
@@ -359,7 +359,7 @@ TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-7 unified ref-life fold state",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-8 pool-authoritative gc_shards",
                                                kNamespaceLifeKeyedGeneration)), String::npos)
             << "the message must name the migration: " << e.message();
     }
@@ -392,9 +392,25 @@ TEST(CasRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreat
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find("CAS pool format 6 predates generation-7 unified ref-life fold state"), String::npos)
+        EXPECT_NE(e.message().find("CAS pool format 6 predates generation-8 pool-authoritative gc_shards"), String::npos)
             << "the message must name the recreate-only grammar cut: " << e.message();
     }
+}
+
+TEST(CasPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
+{
+    InMemoryBackend backend;
+    const Layout layout("p");
+    const PoolMeta created = PoolMeta::createOrValidate(
+        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/4,
+        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/true);
+    EXPECT_EQ(created.gc_shards, 4u);
+
+    const PoolMeta reopened = PoolMeta::createOrValidate(
+        backend, layout, /*blob_header_len=*/256, /*gc_shards=*/1,
+        BlobHashAlgo::CityHash128, /*allow_new=*/false, /*allow_mint=*/false);
+    EXPECT_EQ(reopened.gc_shards, 4u);
+    EXPECT_EQ(decodePoolMeta(backend.get(layout.poolMetaKey())->bytes).gc_shards, 4u);
 }
 
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the

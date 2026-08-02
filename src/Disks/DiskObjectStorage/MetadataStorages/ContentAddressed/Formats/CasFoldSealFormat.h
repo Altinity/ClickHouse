@@ -12,6 +12,8 @@
 namespace DB::Cas
 {
 
+class Layout;
+
 /// A reference to one write-once run object and its whole-object checksum. A retry can compare the
 /// checksum with the bytes already sealed before it adopts or consumes the run.
 ///
@@ -208,5 +210,16 @@ String encodeFoldSeal(const CasFoldSeal & seal);
 /// Invalid persisted data raises `CORRUPTED_DATA` — including every shape the encoder refuses, since
 /// these bytes may have been written by anything at all.
 CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expected_generation = std::nullopt);
+
+/// Decodes a seal at an adoption boundary and validates the shard-indexed structure against the
+/// pool-authoritative nonzero `gc_shards`: canonical blob-target keys, at most one run per shard,
+/// and an exactly total, semantically consistent condemned summary.
+CasFoldSeal decodeFoldSeal(
+    std::string_view data, const Layout & layout, uint64_t gc_shards,
+    std::optional<uint64_t> expected_generation = std::nullopt);
+
+/// Applies the same shard-indexed structural checks to an in-memory producer immediately before its
+/// seal PUT. Invalid producer state is a `LOGICAL_ERROR`; no bytes are written.
+void validateFoldSealForWrite(const CasFoldSeal & seal, const Layout & layout, uint64_t gc_shards);
 
 }

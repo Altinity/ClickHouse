@@ -492,8 +492,9 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// writable object storage and only sets `read_only`), so it must NEVER mint: an absent meta fails
     /// closed instead (spec §2 [C4][D2]).
     PoolMeta meta = PoolMeta::createOrValidate(
-        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
+        *backend, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/!config.read_only);
+    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
@@ -836,8 +837,9 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// (a partially-erased pool whose owner anchor survives) fails closed with INVALID_STATE rather than
     /// minting a fresh identity here (spec §2 [C4][D2]).
     PoolMeta meta = PoolMeta::createOrValidate(
-        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new,
+        *backend, layout, config.blob_header_len, config.gc_shards, config.blob_hash_algo, config.blob_hash_allow_new,
         /*allow_mint=*/false);
+    config.gc_shards = meta.gc_shards;
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
