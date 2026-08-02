@@ -617,6 +617,32 @@ witness_spare             violation   violation:W_SpareHappens         0        
 ALL EXPECTATIONS MET
 ```
 
+#### Relink-confirm whole-suite conversion {#relink-confirm-whole-suite}
+
+`run_relinkconfirm.sh` now gates all 13 configs, including the historical holey-LIST finding and the
+empty-receiver boundary. The pre-change no-argument probe was only an interface red: it stopped at the
+single-config usage check. With the official pinned jar and `TLC_WORKERS=auto`, the asserted family gate
+produced:
+
+```text
+CONFIG                   EXPECT      RESULT                               SECONDS  VERDICT
+sab_holeylist            violation   violation:ConfirmedRelinkNeverDangles 1        PASS
+sab_nofence              violation   violation:ConfirmedRelinkNeverDangles 1        PASS
+sab_nogate1              violation   violation:ConfirmedRelinkNeverDangles 1        PASS
+sab_nopoison             violation   violation:ConfirmedRelinkNeverDangles 0        PASS
+sab_publishafterconfirm  violation   violation:PromotedNeverDangles       1        PASS
+sab_stalecache           violation   violation:ConfirmedRelinkNeverDangles 1        PASS
+main                     green       green                                1        PASS
+main2r                   green       green                                10       PASS
+empty_receivers          green       green                                0        PASS
+witness_confirmno        violation   violation:W_ConfirmNo                0        PASS
+witness_confirmunknown   violation   violation:W_ConfirmUnknown           1        PASS
+witness_confirmyes       violation   violation:W_ConfirmYesPromoted       0        PASS
+witness_delete           violation   violation:W_BlobDeleted              1        PASS
+
+ALL EXPECTATIONS MET
+```
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
