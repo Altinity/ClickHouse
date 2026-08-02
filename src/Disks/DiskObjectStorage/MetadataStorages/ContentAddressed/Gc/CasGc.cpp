@@ -3420,9 +3420,10 @@ void Gc::cleanupRefObjects(
             continue;
         const RefTxnId checkpoint_snapshot_id = *checkpoint->checkpoint_snapshot_id;
 
+        std::optional<RefTxnId> retained_log_proof;
         try
         {
-            (void)readCheckpointSnapshotBase(backend, layout, life, *checkpoint);
+            retained_log_proof = readCheckpointSnapshotBase(backend, layout, life, *checkpoint).predecessor_seal_id;
         }
         catch (const Exception & e)
         {
@@ -3432,7 +3433,8 @@ void Gc::cleanupRefObjects(
             continue;
         }
 
-        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint_snapshot_id);
+        const RefCleanupPlan plan = planRefCleanup(
+            listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
         for (const RefTxnId & log_id : plan.deletable_logs)
             if (!deleteRefObject(layout.refLogKey(life, log_id)))
                 return;

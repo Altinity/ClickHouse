@@ -675,6 +675,29 @@ TEST(CasRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink
 
     expect_rejected(RootNamespace{"srv1/base_missing_backlink"}, std::nullopt);
     expect_rejected(RootNamespace{"srv1/base_wrong_backlink"}, RefTxnId{1, 99});
+
+    const auto expect_predecessor_rejected = [&](const RootNamespace & ns, bool write_ordinary_predecessor)
+    {
+        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+        if (write_ordinary_predecessor)
+            writeRefLogTxnRaw(*backend, layout, txn(ns, seal_id, {}));
+        writeRefLogTxnRaw(*backend, layout, txn(ns, base_id, {}, seal_id));
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
+
+        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = base_id,
+            .checkpoint_snapshot_id = base_id,
+            .last_epoch_seal = seal_id})).outcome, PutOutcome::Done);
+
+        expectCode(
+            [&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); },
+            DB::ErrorCodes::CORRUPTED_DATA);
+    };
+
+    expect_predecessor_rejected(RootNamespace{"srv1/base_predecessor_absent"}, false);
+    expect_predecessor_rejected(RootNamespace{"srv1/base_predecessor_not_seal"}, true);
 }
 
 }

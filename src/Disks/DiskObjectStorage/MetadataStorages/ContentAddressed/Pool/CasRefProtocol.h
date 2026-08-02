@@ -658,7 +658,9 @@ std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
 /// The exact ref objects one round may delete for one namespace life.
 /// Pure; acts only on keys THIS round's scan returned, but the scan is never cleanup authority. The
 /// caller may supply `checkpoint` only after exact validation of the `_ckpt`-named recovery triple:
-/// `_ckpt` plus its same-id non-seal `_log` and `_snap`. Without that validated base the plan is empty.
+/// `_ckpt` plus its same-id non-seal `_log` and `_snap`. A later-epoch base also returns the exact
+/// predecessor seal that proved its transition; `retained_log_proof` keeps that log outside the delete
+/// plan while the checkpoint remains authoritative. Without a validated base the plan is empty.
 /// With it, a log `L` is deletable only when `L < checkpoint` and `L <= durable_cursor`; a listed
 /// snapshot is deletable only when its id is `< checkpoint`. The base's same-id `_log` and `_snap`,
 /// and every newer stream object, are retained.
@@ -670,7 +672,8 @@ struct RefCleanupPlan
     bool operator==(const RefCleanupPlan &) const = default;
 };
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              std::optional<RefTxnId> checkpoint = std::nullopt);
+                              std::optional<RefTxnId> checkpoint = std::nullopt,
+                              std::optional<RefTxnId> retained_log_proof = std::nullopt);
 
 /// Why an epoch crossing failed, or that it was PROVED. See `crossEpochFromSeal`.
 enum class EpochCrossOutcome : uint8_t
@@ -756,13 +759,17 @@ struct RecoveredRefTable
 /// Exact-read and decode the checkpoint-named recovery base. The anchor is the bounded triple
 /// `_ckpt` + same-id non-seal `_log` + same-id `_snap`: read and decode the log first, reject an
 /// `EpochSeal`, validate its contextual epoch backlink against `_ckpt.life_epoch` and the exact
-/// `_ckpt.last_epoch_seal` when that field describes the base's preceding epoch, then read the snapshot.
-/// This order prevents a forged snapshot at any historical seal or contextually invalid epoch start
-/// from becoming state. Cleanup retains the matching log while the checkpoint names this base.
+/// `_ckpt.last_epoch_seal` when that field describes the base's preceding epoch, exact-read and require
+/// the named predecessor to be an `EpochSeal`, then read the snapshot. This order prevents a forged
+/// snapshot at any historical seal or contextually invalid epoch start from becoming state. Cleanup
+/// retains both the matching log and returned predecessor proof while the checkpoint names this base.
 struct CheckpointSnapshotBase
 {
     RefTableSnapshot snapshot;
     uint64_t bytes = 0;
+    /// The exact `EpochSeal` named by a non-genesis sequence-1 base. Recovery needs that object as
+    /// durable transition proof, so cleanup must retain it together with the checkpoint base.
+    std::optional<RefTxnId> predecessor_seal_id;
 };
 
 CheckpointSnapshotBase readCheckpointSnapshotBase(

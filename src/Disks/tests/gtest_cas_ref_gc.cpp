@@ -432,6 +432,65 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the checkpoint-named snapshot must be retained";
 }
 
+TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/cross-epoch-cleanup@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const RefTxnId birth_id{1, 1};
+    const RefTxnId seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    const RefLogTxn birth{
+        .ns = ns.string(),
+        .txn_id = birth_id,
+        .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt};
+    RefOp seal_op;
+    seal_op.kind = RefOpKind::EpochSeal;
+    const RefLogTxn seal{
+        .ns = ns.string(),
+        .txn_id = seal_id,
+        .ops = {std::move(seal_op)},
+        .prev_epoch_seal = std::nullopt};
+    const RefLogTxn base{
+        .ns = ns.string(),
+        .txn_id = base_id,
+        .ops = {},
+        .prev_epoch_seal = seal_id};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    writeRefLogTxnRaw(*backend, layout, seal);
+    writeRefLogTxnRaw(*backend, layout, base);
+
+    RefTableState state;
+    applyRefLogTxn(state, birth);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    applyRefLogTxn(state, seal);
+    applyRefLogTxn(state, base);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = base_id,
+        .checkpoint_snapshot_id = base_id,
+        .last_epoch_seal = seal_id});
+
+    Gc gc(store, kGc);
+    runToFixpoint(store, gc);
+
+    EXPECT_TRUE(backend->head(layout.refLogKey(life, seal_id)).exists)
+        << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*backend, layout);
+    const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
+        [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
+    ASSERT_NE(entry, cut.catalog.entries.end());
+    const std::optional<CkptSample> checkpoint = readCkpt(*backend, layout, life);
+    ASSERT_TRUE(checkpoint);
+    EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(*backend, layout, *entry, checkpoint->ckpt));
+}
+
 TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();

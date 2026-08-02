@@ -822,7 +822,8 @@ std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
 }
 
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              std::optional<RefTxnId> checkpoint)
+                              std::optional<RefTxnId> checkpoint,
+                              std::optional<RefTxnId> retained_log_proof)
 {
     RefCleanupPlan plan;
 
@@ -838,6 +839,8 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
         if (durable_cursor < log_id)       /// L > cursor: its edge delta is not yet durable
             continue;
         if (*checkpoint <= log_id)         /// the exact witness and its successors remain
+            continue;
+        if (retained_log_proof == log_id)  /// a later-epoch base still needs its predecessor seal
             continue;
         plan.deletable_logs.push_back(log_id);
     }
@@ -997,6 +1000,31 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
             checkpoint.last_epoch_seal->writer_epoch, checkpoint.last_epoch_seal->ref_sequence);
     }
 
+    std::optional<RefTxnId> predecessor_seal_id;
+    if (base_txn.prev_epoch_seal)
+    {
+        predecessor_seal_id = *base_txn.prev_epoch_seal;
+        const auto predecessor = backend.get(layout.refLogKey(life, *predecessor_seal_id));
+        if (!predecessor)
+        {
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} refers to absent "
+                "previous epoch seal {}-{}",
+                ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
+                predecessor_seal_id->writer_epoch, predecessor_seal_id->ref_sequence);
+        }
+        const RefLogTxn predecessor_txn = decodeRefLogTxn(
+            openObject(FormatId::RefLog, predecessor->bytes), ns.string(), *predecessor_seal_id);
+        if (!refLogTxnIsEpochSeal(predecessor_txn))
+        {
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} refers to non-seal "
+                "transaction {}-{}",
+                ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
+                predecessor_seal_id->writer_epoch, predecessor_seal_id->ref_sequence);
+        }
+    }
+
     const auto snapshot = backend.get(layout.refSnapshotKey(life, snapshot_id));
     if (!snapshot)
     {
@@ -1007,7 +1035,8 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
     }
     return CheckpointSnapshotBase{
         .snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, snapshot->bytes), ns.string(), snapshot_id),
-        .bytes = snapshot->bytes.size()};
+        .bytes = snapshot->bytes.size(),
+        .predecessor_seal_id = predecessor_seal_id};
 }
 
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
