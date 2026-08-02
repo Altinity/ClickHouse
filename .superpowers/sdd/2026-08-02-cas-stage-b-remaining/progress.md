@@ -50,7 +50,17 @@ per commit; full CA gate at lane closures.
   MAIN worktree preflight: pinned TLC jar installed at `tmp/tla2tools.jar`
   (digest `cc4803dc…e516b3` verified; source: lane-g's `tmp/tla2tools-official.jar`). Preflight is
   per-worktree state — repeat in any new model-lane session.
-- T1 (Task 6 remainder): NOT STARTED. MAIN — next up.
+- T1 (Task 6 remainder): IN PROGRESS on MAIN.
+  - T1a: **COMPLETE** (2026-08-03). Classification verdict: ALL TEN `CasRefCatalog::read` sites
+    KEEP (no class-4/5) — zero production edits; slice = three coverage pins in new
+    `gtest_cas_ref_read_contract.cpp` (rebirth-alias via held runtime; zero-catalog/zero-backend
+    warm reads; stale `dropNamespace(life1)` refusal at the one held-writer seam, `NETWORK_ERROR`
+    retry-later). Stale-ref-writer requirement recorded as satisfied at that seam and vacuous
+    elsewhere. Commits: `ed76b256a50` (tests + classification + report), `ec0cfbc1007` (review
+    APPROVE-WITH-NONBLOCKING; prose → D39). Sensitivity checks preserved in
+    `build/t1a_sensitivity_test{1,2,3}.log`; reviewer re-verification 15/15 + 4/4.
+  - T1b: IN PROGRESS (list-arm zero-catalog pin + Task 9 claim re-check).
+  - T1c: NOT STARTED (fixture seam → migration → sentinel retirement; full CA gate at lane close).
 - T2 (Task 6b remainder): NOT STARTED. LANE-G after T1 integration.
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
 - T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
