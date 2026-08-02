@@ -381,6 +381,18 @@ optimization lands.
 
 ## 6. Dependencies {#dependencies}
 
+**Scheduling restatement (accepted at plan review):** the frontier-attribution prerequisite is
+extracted from T6 into an early independent risk spike (plan task T6a, dependent on T0 only) — it
+is the one potentially unbounded unknown, and answering it needs neither T1 nor T5. T6 then
+depends on T1 + T5 + T6a's verdict. Gate cadence: targeted tests on every commit; the full CA
+gate at lane closures only. Execution runs on two worktrees — MAIN
+(`…/ClickHouse/master`, the single production writer and sole committer to `cas-gc-rebuild`:
+publication, T0, T1, T5, T4's production steps, T6, T8, T9) and LANE-G
+(`…/ClickHouse/lane-g`, temporary `laneg/<task>` branches handed back for integration: T6a, T3,
+T7, T2 after T1, T4's test-only steps, T8's early pieces) — with full-CA-gate/build serialization
+via `flock` and a single praktika-or-soak slot on the box. The plan's
+`{#two-worktrees}` section is the normative map.
+
 ```
 publication commit ─→ T0 ─→ (all tasks)
 
