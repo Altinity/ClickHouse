@@ -66,7 +66,7 @@ inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
 
 /// Encode to the canonical text (not sealed): the caller compresses via
 /// `sealObject(FormatId::RefSnapshot, …)` on the persist path (Always/`.zst`), and the in-memory
-/// validation / `admits` size-estimate / `fsck` oracle callers use the uncompressed text. Throws
+/// validation and `admits` size-estimate callers use the uncompressed text. Throws
 /// CORRUPTED_DATA on: a zero `snapshot_id`; a non-canonical `ref_name`; an
 /// out-of-range `manifest_ref`; non-strictly-ascending
 /// `committed` / `precommits`; a `precommits` entry not `Precommit`; or an over-budget object.

@@ -699,7 +699,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # exists. Such a blob's in-degree is pinned above zero forever, so the incremental GC will never
     # reclaim it -- and until the class existed it was reported as an `AwaitingGc` "expected, no action
     # needed" backlog, which is what hid it. `ca-fsck` does NOT exit nonzero on it -- `CommandFsck.cpp`
-    # throws on `dangling`, `chain_broken`, `snapshot_oracle_mismatches`, `corrupted_runs` and
+    # throws on `dangling`, `chain_broken`, `corrupted_runs` and
     # `lifeless_keys`, and `stale_edge` is the ONE `clean()` term deliberately left out (it is
     # detail-mode-only) -- so the `exit_code` gate above does not cover this and THIS assert is the
     # compensating half that licenses the exclusion.

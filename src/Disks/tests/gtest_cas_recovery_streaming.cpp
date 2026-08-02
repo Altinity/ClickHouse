@@ -443,34 +443,27 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
         << "the leader and parked waiter must both recover without stream enumeration";
 }
 
-/// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailedFromAuthority`) and fsck's
-/// snapshot oracle (reached through `runFsck`) stream through the SAME builder and hold under the SAME
-/// per-transaction bound the primary recovery does.
+/// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailedFromAuthority`)
+/// and fsck's exact-authority recovery stream through the SAME builder and hold under the SAME
+/// per-transaction bound as primary recovery.
 TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     seedPoolMetaForRestart(*backend);
     const Layout layout("p");
     const RootNamespace ns_sweep{"00/sweep@cas@"};
-    const RootNamespace ns_oracle{"00/oracle@cas@"};
+    const RootNamespace ns_fsck{"00/fsck@cas@"};
 
     constexpr size_t kTxns = 16;
     constexpr size_t kOpsPerTxn = 250;
     uint64_t manifest_seq = 1;
     const SeededTail sweep_tail = seedBigTail(*backend, layout, ns_sweep, kTxns, kOpsPerTxn, manifest_seq);
-    const SeededTail oracle_tail = seedBigTail(*backend, layout, ns_oracle, kTxns, kOpsPerTxn, manifest_seq);
+    const SeededTail fsck_tail = seedBigTail(*backend, layout, ns_fsck, kTxns, kOpsPerTxn, manifest_seq);
 
-    /// Publish the byte-correct snapshot AT the oracle table's greatest log id: no snapshot below it,
-    /// so fsck's oracle rebuilds the state at X from the whole surviving log tail.
-    const CasRefCatalog::Snapshot oracle_catalog_cut = CasRefCatalog::read(*backend, layout);
-    const RefTableState oracle_state =
-        recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, oracle_catalog_cut, ns_oracle).state;
-    writeRefSnapshotRaw(*backend, layout, snapshotOf(oracle_state, ns_oracle.string()));
-
-    const uint64_t max_single = std::max(sweep_tail.max_single_footprint, oracle_tail.max_single_footprint);
+    const uint64_t max_single = std::max(sweep_tail.max_single_footprint, fsck_tail.max_single_footprint);
     const uint64_t bound = 2 * max_single;
     ASSERT_GT(sweep_tail.total_footprint, bound);
-    ASSERT_GT(oracle_tail.total_footprint, bound);
+    ASSERT_GT(fsck_tail.total_footprint, bound);
 
     auto store = openPoolForTest(backend);
 
@@ -495,12 +488,12 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
         setRecoveryReplayMemoryProbeForTest(tracker.probe());
         SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
         const FsckReport report = runFsck(*store, /*detail=*/true);
-        EXPECT_GE(report.snapshot_oracle_checked, 1u) << "the oracle must actually replay the oracle table's tail";
+        EXPECT_TRUE(report.clean());
         EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
-            << "fsck recovery/oracle must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
-        EXPECT_GE(tracker.peak(), static_cast<int64_t>(oracle_tail.max_single_footprint))
-            << "the oracle probe must observe at least one decoded oracle transaction (peak " << tracker.peak()
-            << " B) -- a zero peak means the fsck-oracle report call was silently removed";
+            << "fsck exact-authority recovery must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
+        EXPECT_GE(tracker.peak(), static_cast<int64_t>(fsck_tail.max_single_footprint))
+            << "the probe must observe at least one decoded fsck-recovery transaction (peak " << tracker.peak()
+            << " B) -- a zero peak means fsck stopped recovering catalog-authoritative namespaces";
         EXPECT_EQ(tracker.alive(), 0);
     }
 }

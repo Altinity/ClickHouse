@@ -42,8 +42,6 @@ enum class FsckClass : uint8_t
                    /// in-degree can never reach zero and the incremental GC can never reclaim it. Only a
                    /// full rebuild of the in-degree state can. ERROR — never an `AwaitingGc` "expected"
                    /// backlog, which is exactly the label that used to hide it.
-    SnapshotOracleMismatch,  /// a published table snapshot's bytes diverge from an independent replay of
-                             /// its logs — cache/codec corruption, ERROR
     CorruptedRun,  /// a GC source-edge run's whole-file seal checksum (`RunRef::checksum`) disagrees with
                    /// the stored bytes — cataloged so the read-only audit enumerates every finding in one
                    /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
@@ -55,7 +53,7 @@ enum class FsckClass : uint8_t
                    /// triple is corrupt, or a ref-log id is absent below its confirmed frontier. Ids are
                    /// dense `1..T` within `(namespace, epoch)` (INV-1), so neither is a stream end. ERROR
     Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
-                   /// crossing, an undecodable body, an oracle that could not replay). Not a finding and
+                   /// crossing, an undecodable body, or unstable authority/transport). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
                    /// silence as a proof.
     LifelessKey,   /// an opaque id under `cas/ns/stream/` or `cas/ns/state/` that the catalog does not name
@@ -110,14 +108,6 @@ struct FsckReport
     uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or interrupted-birth
                                        /// artifact; benign, NOT a dangle
 
-    /// Snapshot integrity oracle: for each table with a published snapshot
-    /// whose covered logs still survive, fsck independently replays those logs and re-encodes the
-    /// snapshot; a byte divergence from the published object means the writer cache or a codec is
-    /// corrupt and is a hard ERROR. `snapshot_oracle_checked` counts tables the oracle could actually
-    /// verify (logs present); tables whose covered logs were already cleaned are skipped, not counted.
-    uint64_t snapshot_oracle_mismatches = 0;
-    uint64_t snapshot_oracle_checked = 0;
-
     /// GC source-edge runs whose whole-file seal checksum did not match the stored bytes. Cataloged
     /// with the run key in `objects`; the audit CONTINUES — a read-only auditor
     /// enumerates all problems in one pass rather than aborting on the first corrupt run.
@@ -129,7 +119,7 @@ struct FsckReport
     ///
     /// `chain_broken` counts namespaces with a proven hole (see `FsckClass::ChainBroken`) and is a HARD
     /// ERROR: part of `clean`, and the command exits nonzero on it. `unchecked` counts namespaces the
-    /// walk (or the snapshot oracle) could not prove either way; it is COVERAGE, not a finding, so it
+    /// walk could not prove either way; it is COVERAGE, not a finding, so it
     /// is reported and printed but does not make a report unclean — exactly like `partial`. A pool with
     /// nothing wrong reads `chain_broken=0 unchecked=0`, so `unchecked` is never a resting state.
     ///
@@ -195,7 +185,6 @@ struct FsckHardFinding
 /// and the assert is what speaks.
 inline constexpr std::array kFsckHardFindings{
     FsckHardFinding{"dangling", &FsckReport::dangling},
-    FsckHardFinding{"snapshot_oracle_mismatches", &FsckReport::snapshot_oracle_mismatches},
     FsckHardFinding{"corrupted_runs", &FsckReport::corrupted_runs},
     FsckHardFinding{"stale_edge", &FsckReport::stale_edge},
     FsckHardFinding{"chain_broken", &FsckReport::chain_broken},
@@ -233,7 +222,7 @@ inline constexpr std::array kFsckHardFindings{
 /// than once, about the exit set -- and nothing here can break a build over them. (No count is given,
 /// for the same reason the paragraph above gives none: nobody keeping a tally of restatements can
 /// promise its own count will not go stale next.) They are a fourth surface, unfenced by construction.
-static_assert(kFsckHardFindings.size() == 6,
+static_assert(kFsckHardFindings.size() == 5,
     "A hard finding was added to or removed from `kFsckHardFindings`, which is `FsckReport::clean`. "
     "Before updating this count, render it in ALL THREE code surfaces: `formatFsckSummary`'s line, "
     "`CommandFsck::executeImpl`'s nonzero-exit set, and `contentAddressedFsckColumns` + "

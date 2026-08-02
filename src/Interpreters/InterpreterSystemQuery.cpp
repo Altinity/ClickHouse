@@ -2440,8 +2440,8 @@ ColumnsDescription contentAddressedFsckColumns()
         /// EVERY TERM OF `FsckReport::clean` APPEARS HERE. This row is the only view of a report a SQL
         /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
         /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
-        /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs`/`snapshot_oracle_mismatches` were
-        /// invisible from SQL while `clickhouse-disks ca-fsck` exited nonzero on all three; then
+        /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs` were invisible from SQL while
+        /// `clickhouse-disks ca-fsck` surfaced them; then
         /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too. Every time, the rule
         /// was written in prose, and every time the prose did not hold.
         ///
@@ -2457,14 +2457,12 @@ ColumnsDescription contentAddressedFsckColumns()
         /// and a column that appears the day the scan gains detail is a schema change nobody asked for.
         {"stale_edge", std::make_shared<DataTypeUInt64>()},
         {"corrupted_runs", std::make_shared<DataTypeUInt64>()},
-        {"snapshot_oracle_mismatches", std::make_shared<DataTypeUInt64>()},
-        {"snapshot_oracle_checked", std::make_shared<DataTypeUInt64>()},
         /// The ref-stream verdicts (spec §7). `chain_broken` is a HARD finding — it belongs on the row
         /// for the same reason `dangling` does. `unchecked` is its honest companion: namespaces the audit
         /// could not prove either way, so a zero here is what makes the other zeros mean something.
         {"chain_broken", std::make_shared<DataTypeUInt64>()},
         {"unchecked", std::make_shared<DataTypeUInt64>()},
-        /// A key naming no namespace LIFE — corruption behind the Stage B format bump, and the sixth
+        /// A key naming no namespace LIFE — corruption behind the Stage B format bump, and a
         /// term of `clean`.
         {"lifeless_keys", std::make_shared<DataTypeUInt64>()},
         {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
@@ -2487,8 +2485,6 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.unaccounted);
     res_columns[i++]->insert(rep.stale_edge);
     res_columns[i++]->insert(rep.corrupted_runs);
-    res_columns[i++]->insert(rep.snapshot_oracle_mismatches);
-    res_columns[i++]->insert(rep.snapshot_oracle_checked);
     res_columns[i++]->insert(rep.chain_broken);
     res_columns[i++]->insert(rep.unchecked);
     res_columns[i++]->insert(rep.lifeless_keys);

@@ -248,35 +248,6 @@ bool manifestStillReferenced(Backend & backend, const Layout & layout, const Roo
     }
 }
 
-/// One namespace's ref-object ids from a SINGLE `LIST` of its prefix, ascending.
-///
-/// A HINT, and nothing more. The arithmetic walk reads every id it cares about by exact key, so an
-/// omission changes no stream verdict; this supplies only the diagnostic oracle's snapshot candidates.
-/// The stream walk gets its complete finite range from the frozen catalog row and exact `_ckpt`.
-struct NsRefListing
-{
-    std::vector<RefTxnId> logs;
-    std::vector<RefTxnId> snapshots;
-};
-
-NsRefListing listNsRefObjects(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
-{
-    NsRefListing out;
-    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & lk)
-    {
-        const auto parsed = layout.parseRefObjectKey(lk.key);
-        if (!parsed || parsed->life_id != life.incarnation)
-            return;
-        if (parsed->kind == RefObjectKind::Snap)
-            out.snapshots.push_back(parsed->txn_id);
-        else if (parsed->kind == RefObjectKind::Log)
-            out.logs.push_back(parsed->txn_id);
-    });
-    std::sort(out.logs.begin(), out.logs.end());
-    std::sort(out.snapshots.begin(), out.snapshots.end());
-    return out;
-}
-
 String renderId(const RefTxnId & id)
 {
     return std::to_string(id.writer_epoch) + "-" + std::to_string(id.ref_sequence);
@@ -445,103 +416,6 @@ void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLif
     }
 }
 
-/// For the newest published snapshot `X` of `ns`, independently reconstruct the table state AT `X` from
-/// an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
-/// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
-/// `X` object. Byte-determinism of the codec (canonical sort, verified in the codec's own gtests) makes
-/// the comparison exact.
-///
-/// The check runs ONLY when every log needed for the independent reconstruction still survives. `X` reuses
-/// its last covered log's id, so `X` itself is a log id; once `GC` folds and covers those logs it deletes
-/// them, after which there is nothing independent left to replay from -- such a table is SKIPPED, never
-/// failed. A selected object that vanishes mid-check (a concurrent `GC` cleanup published a covering newer
-/// snapshot) is likewise a skip, exactly like recovery's restart-on-vanish -- never corruption. This
-/// oracle therefore validates freshly-published snapshots and any table whose `GC` cleanup is still
-/// behind; it uses only the shared `replay`/`snapshotOf` state machine, never a second copy.
-void checkSnapshotOracle(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                         const NsRefListing & listing, bool detail, const Deadline & deadline, FsckReport & report)
-{
-    checkDeadline(deadline, "snapshot oracle");
-    const RootNamespace & ns = life.ns;
-
-    const std::vector<RefTxnId> & snap_ids = listing.snapshots;
-    const std::vector<RefTxnId> & log_ids = listing.logs;
-    if (snap_ids.empty())
-        return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
-
-    const RefTxnId snapshot_x = snap_ids.back();
-    const auto got_x = backend.get(layout.refSnapshotKey(life, snapshot_x));
-    if (!got_x)
-        return;   /// vanished (a covering newer snapshot superseded it): restart-on-vanish -> skip
-
-    /// X reuses its last covered log's id, so X is itself a log id. Once GC covers and cleans that log
-    /// (the steady state on a caught-up pool), the state AT X cannot be independently reconstructed from
-    /// logs -- skip, never fail. This also guards against replaying an empty tail into a {0,0} state.
-    if (!std::binary_search(log_ids.begin(), log_ids.end(), snapshot_x))
-        return;
-
-    /// Independent base: the greatest snapshot strictly below X we can still fetch, else the empty state.
-    std::optional<RefTableSnapshot> base;
-    RefTxnId base_id{};   /// {0,0} = empty base
-    for (auto it = snap_ids.rbegin(); it != snap_ids.rend(); ++it)
-    {
-        if (!(*it < snapshot_x))
-            continue;   /// X itself or anything not strictly below it
-        const auto got_base = backend.get(layout.refSnapshotKey(life, *it));
-        if (!got_base)
-            continue;   /// vanished; try the next older snapshot
-        base = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got_base->bytes), ns.string(), *it);
-        base_id = *it;
-        break;
-    }
-
-    /// Logs in (base_id, X]. X reuses its last log's id, so X itself is a log id here: if its log -- or any
-    /// covered log above the base -- was already cleaned, the independent reconstruction is unavailable.
-    /// Reconstruct the state AT X by streaming those logs through one builder -- GET -> decode -> applyOne
-    /// -> discard, one at a time -- so a long log tail never materializes as a whole-tail vector (spec §5).
-    /// The builder revalidates the base snapshot in full (`stateFromSnapshot`) and applies the tail through
-    /// the SAME state machine the writer used; the last applied id is X, so `snapshotOf` below yields a
-    /// snapshot with id X whose bytes must equal the published object.
-    RefReplayBuilder builder(std::move(base));
-    for (const RefTxnId & id : log_ids)
-    {
-        if (!(base_id < id))
-            continue;   /// <= base: already folded into the base snapshot
-        if (snapshot_x < id)
-            continue;   /// > X: not part of the state AT X
-        checkDeadline(deadline, "snapshot oracle");
-        const auto got_log = backend.get(layout.refLogKey(life, id));
-        if (!got_log)
-            return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
-        RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id);
-        /// Account the decoded transaction's resident footprint to the memory probe for exactly this
-        /// iteration (see `reportReplayMemoryDelta`): the oracle streams one transaction at a time.
-        const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
-        reportReplayMemoryDelta(footprint);
-        SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
-        builder.applyOne(std::move(txn), got_log->bytes.size());
-    }
-
-    const RefTableState reconstructed = std::move(builder).finish().state;
-    /// `recomputed` is canonical TEXT; the stored object is Always/`.zst`, so compare against the
-    /// DECOMPRESSED stored bytes (zstd byte-determinism is not relied on here -- the canonical text is).
-    const String recomputed = encodeRefTableSnapshot(snapshotOf(reconstructed, ns.string()));
-    ++report.snapshot_oracle_checked;
-    if (recomputed != openObject(FormatId::RefSnapshot, got_x->bytes))
-    {
-        ++report.snapshot_oracle_mismatches;
-        FsckObject o;
-        o.key = layout.refSnapshotKey(life, snapshot_x);
-        o.kind = ObjectKind::Blob;   /// snapshots have no ObjectKind; reuse Blob as the generic kind
-        o.size = got_x->bytes.size();
-        o.cls = FsckClass::SnapshotOracleMismatch;
-        if (detail)
-            o.reachable_from = {"published snapshot bytes diverge from an independent replay of its logs "
-                                "(writer cache or codec corruption)"};
-        report.objects.push_back(std::move(o));
-    }
-}
-
 /// Perform the scan and accumulate into `report`. This helper owns the read-only traversal: it first
 /// recovers authoritative refs, then checks physical objects and GC labels, while preserving the
 /// distinction between a missing live object and expected in-flight cleanup. Deadline exceptions are
@@ -704,24 +578,16 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     .life = life, .catalog_entry = walk_life.catalog_entry, .checkpoint = checkpoint});
             chassert(inserted);
 
-            /// One listing of the life's stream prefix, shared by the stream walk and the oracle.
-            const NsRefListing listing = listNsRefObjects(backend, layout, life);
-
             /// The arithmetic stream audit runs FIRST, so a holed stream gets the verdict that EXPLAINS
             /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
             /// raise about the same hole.
             checkRefStream(
                 backend, layout, life, walk_life.catalog_entry, checkpoint_sample, deadline, report, verdicts);
 
-            /// LIST can only nominate a performance base. This recovery's finite range comes from the
-            /// original catalog row and exact `_ckpt`, never from a self-resolved name or an F+1 probe.
+            /// This recovery's finite range comes from the original catalog row and exact `_ckpt`, never
+            /// from a stream listing, a self-resolved name, or an F+1 probe.
             const RefTableState table = recoverRefTableDetailedFromAuthority(
                 backend, layout, authority_it->second.catalog_entry, authority_it->second.checkpoint).state;
-            /// Snapshot integrity oracle: verify this table's newest published
-            /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
-            /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
-            /// covered logs were already cleaned or an object vanished mid-check.
-            checkSnapshotOracle(backend, layout, life, listing, detail, deadline, report);
             for (const auto [ref_name, row] : table.getCommitted())
             {
                 const ManifestId id{ns, row.manifest_ref};
@@ -1253,8 +1119,6 @@ String formatFsckSummary(const FsckReport & report)
         << " lifeless_keys=" << report.lifeless_keys
         << " unchecked=" << report.unchecked
         << " ref_records_walked=" << report.ref_records_walked
-        << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
-        << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
         << " physical_bytes=" << report.physical_bytes
         << " referenced_logical_bytes=" << report.referenced_logical_bytes
         << " distinct_blobs=" << report.distinct_blobs

@@ -275,6 +275,86 @@ void expectListingIndependentFsck(const FsckReport & report)
     EXPECT_EQ(report.ref_records_walked, 2u);
     EXPECT_EQ(report.reachable, 1u);
 }
+
+struct FsckAuthorityVerdict
+{
+    bool clean = false;
+    uint64_t hard_findings = 0;
+    uint64_t chain_broken = 0;
+    uint64_t unchecked = 0;
+    uint64_t ref_records_walked = 0;
+    uint64_t reachable = 0;
+    uint64_t dangling = 0;
+
+    bool operator==(const FsckAuthorityVerdict &) const = default;
+};
+
+FsckAuthorityVerdict authorityVerdict(const FsckReport & report)
+{
+    uint64_t hard_findings = 0;
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        hard_findings += report.*(finding.value);
+    return FsckAuthorityVerdict{
+        .clean = report.clean(),
+        .hard_findings = hard_findings,
+        .chain_broken = report.chain_broken,
+        .unchecked = report.unchecked,
+        .ref_records_walked = report.ref_records_walked,
+        .reachable = report.reachable,
+        .dangling = report.dangling,
+    };
+}
+
+FsckReport runCheckpointBaseFsckWithListingMode(
+    FsckListingMode mode, std::string_view suffix, bool corrupt_exact_base)
+{
+    auto backend = std::make_shared<FsckListingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/listing_base_" + String(suffix) + "@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const RefLogTxn birth{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    RefTableState base_state;
+    applyRefLogTxn(base_state, birth);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(base_state, ns.string()));
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    if (corrupt_exact_base)
+    {
+        const String base_snapshot_key = layout.refSnapshotKey(life, base);
+        const HeadResult head = backend->head(base_snapshot_key);
+        EXPECT_TRUE(head.exists);
+        if (head.exists)
+            EXPECT_EQ(backend->deleteExact(base_snapshot_key, head.token).kind, DeleteOutcome::Kind::Deleted);
+    }
+    else
+    {
+        /// This newer pair is deliberately outside `_ckpt.committed_through`. It is inert garbage:
+        /// changing whether LIST happens to reveal it must not add or remove an fsck finding.
+        const RefTxnId unadopted{1, 2};
+        const RefOwnerBinding listed_binding{RefOwnerKind::Precommit, "listed", ref(9, 0xE9)};
+        const RefLogTxn listed_log{
+            .ns = ns.string(),
+            .txn_id = unadopted,
+            .ops = {ownerTransitionOp(std::nullopt, listed_binding)},
+            .prev_epoch_seal = std::nullopt};
+        writeRefLogTxnRaw(*backend, layout, listed_log);
+        RefTableState listed_state = base_state;
+        applyRefLogTxn(listed_state, listed_log);
+        RefTableSnapshot unadopted_snapshot = snapshotOf(listed_state, ns.string());
+        unadopted_snapshot.precommits.push_back(
+            RefOwnerBinding{RefOwnerKind::Precommit, "unlisted", ref(10, 0xEA)});
+        writeRefSnapshotRaw(*backend, layout, unadopted_snapshot);
+    }
+
+    backend->distort(layout.namespaceStreamPrefix(life), mode);
+    return runFsck(*store, /*detail=*/true);
+}
 }
 
 /// A committed ref whose manifest body is present and whose blobs exist => clean.
@@ -461,6 +541,44 @@ TEST(CasFsckAuthority, PartialListingDoesNotDefineStreamGeometry)
 TEST(CasFsckAuthority, ReorderedListingDoesNotDefineStreamGeometry)
 {
     expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Reordered, "reordered"));
+}
+
+/// Stream LIST is not fsck authority. The same exact catalog + `_ckpt` + checkpoint-base triple must
+/// yield the same result when LIST is complete, empty, partial, or reordered. A newer unadopted log and
+/// snapshot are inert garbage, while damage to the exact checkpoint base remains a hard finding under
+/// every listing. Mutation caught: the old LIST-derived snapshot oracle makes only listings that reveal
+/// the unadopted pair non-clean.
+TEST(CasFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
+{
+    const std::array modes{
+        FsckListingMode::Full,
+        FsckListingMode::Empty,
+        FsckListingMode::Partial,
+        FsckListingMode::Reordered,
+    };
+
+    std::optional<FsckAuthorityVerdict> clean_reference;
+    std::optional<FsckAuthorityVerdict> corrupt_reference;
+    for (size_t i = 0; i < modes.size(); ++i)
+    {
+        const FsckAuthorityVerdict clean = authorityVerdict(runCheckpointBaseFsckWithListingMode(
+            modes[i], "clean_" + std::to_string(i), /*corrupt_exact_base=*/false));
+        if (!clean_reference)
+            clean_reference = clean;
+        EXPECT_EQ(clean, *clean_reference);
+        EXPECT_TRUE(clean.clean);
+        EXPECT_EQ(clean.hard_findings, 0u);
+
+        const FsckAuthorityVerdict corrupt = authorityVerdict(runCheckpointBaseFsckWithListingMode(
+            modes[i], "corrupt_" + std::to_string(i), /*corrupt_exact_base=*/true));
+        if (!corrupt_reference)
+            corrupt_reference = corrupt;
+        EXPECT_EQ(corrupt, *corrupt_reference);
+        EXPECT_FALSE(corrupt.clean);
+        EXPECT_EQ(corrupt.chain_broken, 1u);
+        EXPECT_EQ(corrupt.unchecked, 0u);
+        EXPECT_EQ(corrupt.hard_findings, 1u);
+    }
 }
 
 /// A durable but unfrontiered F+1 is not part of this fsck cut. Mutation caught: probing one position
@@ -970,100 +1088,6 @@ TEST(CasFsck, BodyWithoutMetaIsBenign)
     EXPECT_GE(rep.body_without_meta, 1u);
     EXPECT_EQ(rep.dangling, 0u);
     EXPECT_EQ(rep.meta_without_body, 0u);
-    EXPECT_TRUE(rep.clean());
-}
-
-/// Snapshot integrity oracle (spec §Snapshot Publication): a published snapshot whose bytes equal an
-/// independent replay of its own surviving logs is clean, and the oracle actually RAN (logs present).
-TEST(CasFsckSnapshotOracle, PublishedSnapshotMatchingReplayIsClean)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
-
-    /// Publish the CORRECT snapshot: exactly the deterministic replay of the logs, at the greatest log id.
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, store->layout());
-    const RefTableState st = recoverRefTableDetailedAtCatalogCutForTest(*backend, store->layout(), catalog_cut, ns).state;
-    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
-    EXPECT_GE(rep.snapshot_oracle_checked, 1u) << "the oracle must actually run when the logs survive";
-}
-
-/// A published snapshot whose bytes are a VALID snapshot object but DIVERGE from the replay of its logs
-/// (here: it carries an extra precommit the logs never added) is a hard ERROR -- caught even though
-/// reachability is unaffected (precommits are not walked), so it surfaces ONLY through the oracle.
-TEST(CasFsckSnapshotOracle, ForgedSnapshotDivergingFromReplayIsError)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
-
-    /// Forge a snapshot at the greatest log id: the correct replay plus one phantom precommit binding.
-    /// It is internally valid (decodes fine), so only the byte-compare against the log replay catches it.
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, store->layout());
-    const RefTableState st = recoverRefTableDetailedAtCatalogCutForTest(*backend, store->layout(), catalog_cut, ns).state;
-    RefTableSnapshot forged = snapshotOf(st, ns.string());
-    forged.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "ghost", ref(2, 0xBB)});
-    writeRefSnapshotRaw(*backend, store->layout(), forged);
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 1u);
-    EXPECT_EQ(rep.dangling, 0u) << "the divergence is a snapshot-oracle error, not a reachability dangle";
-    EXPECT_FALSE(rep.clean());
-    bool saw = false;
-    for (const FsckObject & o : rep.objects)
-        if (o.cls == FsckClass::SnapshotOracleMismatch)
-            saw = true;
-    EXPECT_TRUE(saw);
-}
-
-/// Once a table's covered logs are cleaned (the steady state on a GC-caught-up pool), the oracle has no
-/// independent history to replay from and SKIPS the table -- it must never false-positive on a snapshot
-/// whose logs are legitimately gone.
-TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t seq = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, seq});
-
-    /// Publish the correct snapshot, then delete the log it covers (as GC cleanup would once covered).
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, store->layout());
-    const RefTableState st = recoverRefTableDetailedAtCatalogCutForTest(*backend, store->layout(), catalog_cut, ns).state;
-    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
-    const String ckpt_key = store->layout().refCkptKey(life);
-    const HeadResult ckpt_head = backend->head(ckpt_key);
-    ASSERT_TRUE(ckpt_head.exists);
-    ASSERT_EQ(backend->putOverwrite(ckpt_key,
-        encodeRefCkpt(RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, seq},
-                               .checkpoint_snapshot_id = RefTxnId{1, seq},
-                               .last_epoch_seal = std::nullopt}), ckpt_head.token).outcome, PutOutcome::Done);
-    const String log_key = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq});
-    const HeadResult h = backend->head(log_key);
-    ASSERT_TRUE(h.exists);
-    backend->deleteExact(log_key, h.token);
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
-    EXPECT_EQ(rep.snapshot_oracle_checked, 0u) << "no surviving logs -> the oracle skips, not fails";
     EXPECT_TRUE(rep.clean());
 }
 

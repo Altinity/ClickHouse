@@ -440,7 +440,7 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// (`CasRefLedger::ensureRefTableRecovered`) fills the admission budgets,
 /// `needs_stale_precommit_sweep` and `last_epoch_seal`, before installing the whole struct under
 /// `state_mutex` with `recovered` set last. The read-only consumers
-/// (`recoverRefTableDetailedFromAuthority` for the orphan sweep and fsck's snapshot oracle) read only
+/// (`recoverRefTableDetailedFromAuthority` for the orphan sweep and fsck) read only
 /// `state` (plus `newest_snapshot_id` for the sweep) and leave the rest at default.
 struct RecoveryResult
 {
@@ -476,7 +476,7 @@ struct RecoveryResult
 /// the growing candidate once per transaction and reintroduce the O(K*N) cost `replay` was written to
 /// avoid. The candidate never touches any live runtime state; a throw destroys it during unwinding, so no
 /// consumer ever observes a poisoned candidate. All three full-tail materialisers stream through this:
-/// the writer's recovery, `recoverRefTableDetailedFromAuthority` (orphan sweep), and fsck's snapshot oracle.
+/// the writer's recovery, `recoverRefTableDetailedFromAuthority` (orphan sweep and fsck).
 class RefReplayBuilder
 {
 public:

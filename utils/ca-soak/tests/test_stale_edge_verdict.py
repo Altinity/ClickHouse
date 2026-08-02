@@ -10,7 +10,7 @@ from soak.fsck import parse_fsck_summary, stale_edge_verdict
 
 SUMMARY_LINE = (
     "reachable=120 dangling=0 unreachable=7 pending_gc=3 awaiting_gc=4 unaccounted=0 "
-    "stale_edge=0 snapshot_oracle_mismatches=0 snapshot_oracle_checked=2 physical_bytes=4096 "
+    "stale_edge=0 physical_bytes=4096 "
     "referenced_logical_bytes=8192 distinct_blobs=120 total_blob_refs=456 dedup_ratio=3.8"
 )
 

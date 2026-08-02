@@ -101,8 +101,8 @@ ones. So one namespace's failure becomes that namespace's verdict and the sweep 
 is the exception: the deadline is a property of the whole scan and still aborts it, or yields
 `partial=1` under `--partial`.)
 
-**Exit code** is nonzero when `dangling`, `chain_broken`, `snapshot_oracle_mismatches`,
-`corrupted_runs` or `lifeless_keys` is nonzero. That is every term of the report's `clean()` **except
+**Exit code** is nonzero when `dangling`, `chain_broken`, `corrupted_runs` or `lifeless_keys` is
+nonzero. That is every term of the report's `clean()` **except
 one**: `stale_edge` is a `clean()` term that `CommandFsck::executeImpl` never exits nonzero on, in
 EITHER mode — it is only ever COUNTED under `--detail`, so a summary run's `stale_edge=0` is structural
 rather than a finding, but a `--detail` run that counts `stale_edge=5` still exits 0. The soak harness

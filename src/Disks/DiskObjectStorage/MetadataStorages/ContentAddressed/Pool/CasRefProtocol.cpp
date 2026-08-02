@@ -690,7 +690,7 @@ RecoveryResult RefReplayBuilder::finish() &&
 {
     /// Matches `replay`: the candidate is returned WITHOUT `materializeCommitted` -- the writer's
     /// recovery folds the COW overlays once on the result before installing it; the read-only consumers
-    /// (orphan sweep, fsck oracle) do not need the fold at all.
+    /// (orphan sweep and fsck) do not need the fold at all.
     result.state = std::move(candidate);
     return std::move(result);
 }

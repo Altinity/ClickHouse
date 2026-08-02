@@ -151,8 +151,8 @@ void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace 
     writeRecoverableCkptForRawFixture(backend, layout, ns, ckpt);
 }
 
-/// The table state after applying exactly `ids`, through the same builder the writer and the oracle
-/// use — so a snapshot built from it is what the codec itself would have published.
+/// The table state after applying exactly `ids`, through the same builder as recovery — so a snapshot
+/// built from it is what the codec itself would have published.
 RefTableState stateAfter(Backend & backend, const Layout & layout, const RootNamespace & ns,
                          const std::vector<RefTxnId> & ids)
 {
@@ -170,8 +170,7 @@ RefTableState stateAfter(Backend & backend, const Layout & layout, const RootNam
 }
 
 /// Two writer epochs joined by a real seal: `{1,1} {1,2}` then the `{1,3}` seal, then `{2,1}` naming it
-/// as its `prev_epoch_seal` and `{2,2}` after it. The shape both the walk's crossing and the oracle's
-/// replay have to handle.
+/// as its `prev_epoch_seal` and `{2,2}` after it. The exact-authority walk must handle this crossing.
 void seedSealedTwoEpochStream(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     publishAt(backend, layout, ns, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
@@ -518,7 +517,7 @@ TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 4}, "ref_d", 4, DB::UInt128(4));
 
     /// A published snapshot at {1,2}, named by the checkpoint. Its bytes are the codec's own view of
-    /// the state at {1,2}, so the snapshot oracle validates rather than trips over it.
+    /// the state at {1,2}, so exact checkpoint-base validation accepts it.
     writeRefSnapshotRaw(*backend, layout,
                         snapshotOf(stateAfter(*backend, layout, kNsA, {RefTxnId{1, 1}, RefTxnId{1, 2}}), kNsA.string()));
     writeCkptRaw(*backend, layout, kNsA,
@@ -558,35 +557,6 @@ TEST(CasRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
     EXPECT_EQ(rep.chain_broken, 0u);
     EXPECT_EQ(rep.unchecked, 0u) << "a PROVED crossing is not an unproven one";
     EXPECT_EQ(rep.ref_records_walked, 3u) << "the seal plus both records of the epoch it opened";
-}
-
-/// The snapshot oracle over the same sealed stream. It replays the tail through the shared state
-/// machine, and that tail CONTAINS a seal and an epoch crossing — the case that only started applying
-/// in T6. A published snapshot above the boundary must reproduce byte-for-byte from below it.
-TEST(CasRebuildCondemnNothingFsck, SnapshotOracleReplaysASealedStream)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
-    const Layout & layout = store->layout();
-
-    seedSealedTwoEpochStream(*backend, layout, kNsA);
-    /// Two snapshots: the oracle checks the newest (`{2,2}`, above the boundary) by replaying from the
-    /// older one (`{1,2}`, below it) — so the seal and the crossing are inside the replayed span.
-    writeRefSnapshotRaw(*backend, layout,
-                        snapshotOf(stateAfter(*backend, layout, kNsA, {RefTxnId{1, 1}, RefTxnId{1, 2}}), kNsA.string()));
-    writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{2, 2},
-                         .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = RefTxnId{1, 3}});
-    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
-    writeRefSnapshotRaw(*backend, layout,
-                        snapshotOf(recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, kNsA).state,
-                                   kNsA.string()));
-
-    const FsckReport rep = runFsck(*store, /*detail=*/true);
-    EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
-    EXPECT_EQ(rep.snapshot_oracle_checked, 1u) << "the oracle must have been able to replay this table";
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
-    EXPECT_EQ(rep.unchecked, 0u) << "an oracle that could not replay the seal would report `unchecked` here";
 }
 
 /// An exact `_ckpt` frontier turns an impossible epoch crossing into a hard chain break. Here `ns_a`'s

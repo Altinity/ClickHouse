@@ -24,22 +24,15 @@ Legs (leg B is deliberately ABSENT — see below):
   fault CLASS with a different blast radius: they reach thread-CREATING paths (the background
   snapshot dispatcher, pools), and cannot reach the ref append lane at all. Mixing them into this
   card destroys attribution when something breaks. Do not add them back here.
-- **Leg C — disarm, quiesce, GC to fixpoint, fsck, restart, compare.** The restart oracle alone is
-  NOT sufficient: a snapshot published from a poisoned cache makes the pre- and post-restart views
-  identically wrong. So leg C also runs the fsck **snapshot integrity oracle**, which independently
-  replays each table's surviving covered ref logs, re-encodes the snapshot, and compares it byte-wise
-  with the published object (`FsckReport::snapshot_oracle_{mismatches,checked}`) — that is the
-  "replay from the last snapshot plus the raw tail logs and compare against what the cache published"
-  half of the oracle. It is read at QUIESCENCE, before the forced GC: the oracle needs the logs a
-  snapshot covers, and GC's ref cleanup deletes exactly those, after which every table is skipped
-  (`snapshot_oracle_checked == 0`) and the oracle is structurally vacuous. A zero check count is
-  reported `inconclusive`, never as a pass.
+- **Leg C — disarm, quiesce, GC to fixpoint, fsck, restart, compare.** The durable journal rebuild must
+  reproduce the pre-restart view. Fsck derives its ref view only from catalog + exact `_ckpt` authority;
+  unadopted snapshots visible to LIST are inert garbage, never an integrity oracle.
 
 **What green means (2026-07-25 decision).** Green is A CONSISTENT STATE ON DISK AND IN MEMORY, not
 proof that a fault landed in the post-durable install window. The verdict rests on the consistency
 oracle: the post-restart (journal-rebuilt) view identical to the pre-restart view, every acked
 block present, replicas agreeing, fsck `dangling`/`unaccounted`/`stale_edge` clean pre- and
-post-restart, the snapshot integrity oracle clean, zero `LOGICAL_ERROR`, no wedged ref lane, GC
+post-restart, zero `LOGICAL_ERROR`, no wedged ref lane, GC
 rounds succeeding after disarm.
 
 **Anti-vacuity, which survives.** A run in which no allocation fault occurred at all still cannot
@@ -57,8 +50,8 @@ verdict is a real `check` and the run fails — that half is unchanged.
 
 **Oracle (queries ARE allowed to fail; invariants are not):** zero `LOGICAL_ERROR`/abort; every ACKED
 insert's rows present (S40-shaped, block-granular); replicas agree; fsck `dangling=0`,
-`unaccounted=0`, `stale_edge=0` (detail mode only — the counter is not computed by a summary scan),
-snapshot oracle clean; GC rounds succeed again after disarm; no permanently wedged ref lane; no query
+`unaccounted=0`, `stale_edge=0` (detail mode only — the counter is not computed by a summary scan);
+GC rounds succeed again after disarm; no permanently wedged ref lane; no query
 hung past a bound.
 
 **Reported, never gating:** `CasGcUnmatchedRemoveDeltas` (removal deltas reaching the in-degree
@@ -373,19 +366,6 @@ class S42(Scenario):
         ctx.log("S42 leg C: quiescing")
         lifecycle.quiesce_cluster(cl, [_TABLE], log_fn=ctx.log)
 
-        # The snapshot integrity oracle is read HERE, before the forced GC — not from the later
-        # scans. The oracle can only reconstruct the state at a published snapshot X while the logs
-        # X covers still exist, and GC's ref cleanup (`CasRefCleanupObjectsDeleted`) deletes exactly
-        # those once coverage is confirmed; `runFsck` then SKIPS the table (`snapshot_oracle_checked`
-        # stays 0) rather than failing. Measured: after the end-checkpoint's GC-to-fixpoint the count
-        # is 0 for every table (2026-07-25 smoke), i.e. reading the oracle post-GC is structurally
-        # vacuous.
-        fsck_quiesced = lifecycle.fsck_detail()
-        result.observations["fsck_quiesced_pre_gc"] = {
-            k: fsck_quiesced.get(k) for k in
-            ("reachable", "dangling", "unreachable", "snapshot_oracle_mismatches",
-             "snapshot_oracle_checked", "partial")}
-
         ctx.log("S42 leg C: driving GC to fixpoint")
         residual, gc_history = gc_mod.forced_gc_to_fixpoint(
             cl, lifecycle.unreachable_probe(), log_fn=ctx.log)
@@ -398,7 +378,7 @@ class S42(Scenario):
         result.observations["fsck_pre_restart"] = {
             k: fsck_pre.get(k) for k in
             ("reachable", "dangling", "unreachable", "pending_gc", "awaiting_gc", "unaccounted",
-             "stale_edge", "snapshot_oracle_mismatches", "snapshot_oracle_checked", "partial")}
+             "stale_edge", "partial")}
 
         view_pre = {n.container: _view(n, rows_per_insert) for n in cl.nodes()}
 
@@ -452,7 +432,7 @@ class S42(Scenario):
         result.observations["fsck_post_restart"] = {
             k: fsck_post.get(k) for k in
             ("reachable", "dangling", "unreachable", "pending_gc", "awaiting_gc", "unaccounted",
-             "stale_edge", "snapshot_oracle_mismatches", "snapshot_oracle_checked", "partial")}
+             "stale_edge", "partial")}
 
         for label, rep in (("pre-restart", fsck_pre), ("post-restart", fsck_post)):
             if "stale_edge" not in rep:
@@ -473,29 +453,7 @@ class S42(Scenario):
                 f"dangling={rep.get('dangling')} unaccounted={rep.get('unaccounted')}",
                 int(rep.get("dangling", -1)) == 0 and int(rep.get("unaccounted", -1)) == 0))
 
-        # The replay half of leg C's oracle: fsck independently replays each table's surviving
-        # covered ref logs, re-encodes the snapshot and compares it byte-wise with the published
-        # object. A cache that published a snapshot omitting a durable transaction diverges here even
-        # when the pre- and post-restart views agree (both being rebuilt from the same wrong snapshot).
-        checked = int(fsck_quiesced.get("snapshot_oracle_checked", 0) or 0)
-        mismatches = int(fsck_quiesced.get("snapshot_oracle_mismatches", 0) or 0)
-        if checked == 0:
-            result.add(Verdict.inconclusive(
-                "snapshot integrity oracle (replay of covered logs == published snapshot)",
-                "> 0 tables checked, 0 mismatches",
-                "0 tables could be verified even at quiescence, before the forced GC — every "
-                "published snapshot's covered logs had already been cleaned, so the replay oracle "
-                "proved nothing this run"))
-        else:
-            result.add(Verdict.check(
-                "snapshot integrity oracle (replay of covered logs == published snapshot)",
-                "0 mismatches over > 0 checked tables",
-                f"checked={checked} mismatches={mismatches}", mismatches == 0,
-                "" if mismatches == 0 else
-                "a published snapshot does not match an independent replay of its own covered logs — "
-                "a poisoned/diverged writer cache published it"))
-
-        # ---- Poison: the targeted signal, and the oracle it feeds --------------------------------
+        # ---- Poison: the targeted signal ----------------------------------------------------------
         ev_post = _cluster_events(cl)
         result.observations["events_after_restart_absolute"] = ev_post
         # `system.events` is per-process, so the restart resets it: the armed-window delta and the
@@ -514,25 +472,6 @@ class S42(Scenario):
             "" if poison_total == 0 else
             "an install failed although its ref-log object may already be durable — §A1's "
             "allocation-free install regions did not hold"))
-
-        if poison_total == 0:
-            result.add(Verdict.reported(
-                "no snapshot advanced across a poisoned transaction",
-                "vacuous while poison_total == 0",
-                "not exercised",
-                "no transaction was poisoned this run, so nothing could advance across one. The "
-                "snapshot integrity oracle above is the unconditional half of this check and DID "
-                "run. Reported rather than skipped: `skipped` outranks `pass` in the harness, so a "
-                "structurally-vacuous branch would otherwise cap every healthy run."))
-        else:
-            result.add(Verdict.check(
-                "no snapshot advanced across a poisoned transaction",
-                "snapshot oracle clean over > 0 checked tables while poison was set",
-                f"poison={poison_total} checked={checked} mismatches={mismatches}",
-                checked > 0 and mismatches == 0,
-                "there is NO in-product snapshot fence on poison (§A2 kept the marker as an assert "
-                "layer once §A1 landed; only confirmExactRef reads it), so this is the only oracle "
-                "that can catch a snapshot published past a missing transaction"))
 
         # ---- Soundness guard (step 5) -------------------------------------------------------------
         generic = int(injected_client_failures[0]) + int(armed_delta.get("QueryMemoryLimitExceeded", 0))

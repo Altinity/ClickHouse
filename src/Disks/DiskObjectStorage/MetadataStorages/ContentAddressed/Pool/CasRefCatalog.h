@@ -43,7 +43,7 @@ public:
     /// Stage B (Task 4-C): the REAL catalog life for `ns` if a `Live`/`Removing` entry names it, else
     /// the deterministic Stage-A fixture identity (`NamespaceLifeId::stageATransition`). For
     /// non-production discovery-path
-    /// readers -- `recoverRefTableDetailed`, fsck's stream/oracle walk, `CasOrphanManifestSweep`'s
+    /// readers -- `recoverRefTableDetailed`, fsck's exact stream walk, `CasOrphanManifestSweep`'s
     /// active-key set -- which must find whatever a mounted writer actually wrote (a catalog-minted
     /// incarnation, since Task 4-C's production birth wiring) while staying correct for raw fixtures
     /// that explicitly seed an empty catalog and then admit a deterministic transition life. For
