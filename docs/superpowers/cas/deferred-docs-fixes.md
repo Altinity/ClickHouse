@@ -582,3 +582,21 @@ The scratch report cites `StaleReaderAfterSameNameRebirthNeverSeesSuccessorBytes
 test is `HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes` (renamed during landing). The R1
 closure note inherited the stale name — fixed at batch time; the scratch report itself stays as-is
 (scratch artifacts are not maintained).
+
+### D39 — T1a slice-record prose (from the T1a review) {#d39-t1a-slice-record-prose}
+
+Three findings from `t1a-review.md`, all in slice documents under
+`.superpowers/sdd/2026-08-02-cas-stage-b-remaining/` (F3's source-comment half was fixed directly):
+
+- F1 (FALSE): `t1a-classification.md` claims `readable_catalog_after_observation_hook_for_test`
+  has zero test users; three `RefWriterRuntimeIdentity` tests in `gtest_cas_ref_writer.cpp` use it
+  and pin exactly the between-observations race. Site-2 disposition unaffected.
+- F2 (IMPRECISE): "a live table reader … issues zero catalog GETs today" is unqualified — an armed
+  `needs_stale_precommit_sweep` piggybacks a mutation (`commitRefChunk`, class-2 read) onto a read
+  entry point; and the test comment's "no backend request whatsoever" holds under the test's
+  disarmed-maintenance setup, over `CountingBackend`'s counted ops.
+- F4 (record): the mandatory mutation-demonstration sentence is absent from `t1a-report.md`
+  (substance present); the commit body does not name the report.
+
+**Fix:** slice records are historical once the lane closes — carry the F2 qualification into any
+future prose that quotes the zero-GET claim; no retro-editing round.

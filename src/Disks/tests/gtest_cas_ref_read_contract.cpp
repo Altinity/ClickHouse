@@ -11,7 +11,7 @@
 #include <memory>
 #include <optional>
 
-/// T1a of the ref-side read contract (the ten `CasRefCatalog::read` sites in `CasRefLedger.cpp` were
+/// The ref-side read contract (the ten `CasRefCatalog::read` sites in `CasRefLedger.cpp` were
 /// classified elsewhere: every site is a mutation/admission authority or a per-key destructive
 /// revalidation, and every live table reader reaches `acquireReadableRefTableRuntime`, whose warm path
 /// returns the resident runtime before any catalog read). These are COVERAGE PINS for a contract the
