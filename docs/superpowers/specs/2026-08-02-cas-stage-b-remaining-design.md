@@ -161,8 +161,12 @@ classification of each of the ten `CasRefCatalog::read` sites in `CasRefLedger.c
 
 Only classes 4 and 5 are removal candidates. "Hot paths off the ten sites" as a blanket goal is
 explicitly rejected — it invites deleting an authority check. The classification lands in the task
-report before the first production edit. Then: introduce `NamespaceLifeId::fromLiveHandle`, plumb
-held handles through the ref reader/table-cache paths, and add the two missing ref tests in new
+report before the first production edit. Then plumb held lives through the ref reader/table-cache
+paths. **Admissible authority source:** a held life originates only from a catalog snapshot
+resolution; nothing may mint a `NamespaceLifeId` from a `RootNamespace`, a LIST key, or a path.
+If the held capability at each site is already a `NamespaceLifeId`, pass it directly — the
+`fromLiveHandle` factory the old comment in `CasNamespaceLifeId.h` promises is added only if a
+site genuinely needs it, and under the same source restriction. Add the two missing ref tests in new
 `gtest_cas_ref_read_contract.cpp`: a reader holding inc1 across drop+rebirth reads
 stale-or-`NotFound`, never inc2; a hot ref read performs zero catalog requests (op-journal
 assertion). Stale-writer contract: writes through an old handle land under the old incarnation or
@@ -229,8 +233,10 @@ Gate: full CA. Own commit and review; T2 does not block T6.
 
 **Q-1 decision — debris ownership, adopted:**
 
-- provably `Rejected` (absence of durable publication proven) → the writer cleanup duty is
-  removed and the writer path cleans up;
+- the writer cleanup duty **owns** provably `Rejected` debris (absence of durable publication
+  proven) and is retired only **after** the exact deletion succeeds or absence is confirmed;
+  a cleanup failure retains the duty for retry — the duty is never removed first, so no stop
+  between the two actions can leave debris ownerless;
 - `Uncertain` or potentially `Durable` bodies are **never** deleted by the writer path;
 - such bodies are nominated and deleted by the orphan sweep after its own reachability and
   authority checks.
@@ -246,9 +252,11 @@ outcome and global reachability. Acceptance conditions, each a test or measureme
 Also in T4: tighten the two `EXPECT_THROW(…, DB::Exception)` fences to
 `expectThrowsCode(ErrorCodes::CORRUPTED_DATA, …)` (T-1); add the reject-arm C++ test (T-2, also
 acceptance 1); add the B2-ordinal/unmatched-remove accounting assertions to the real-round
-nomination test (T-3, also acceptance 4); disposition the `sweepManifestCursorPage` footgun (C-1:
-either fold into the test translation units or make its comment state it deletes without retiring
-and is not a production path). Load-bearing mutation demonstrations use the T3 wording verbatim.
+nomination test (T-3, also acceptance 4); remove the `sweepManifestCursorPage` footgun from the
+production surface (C-1: delete it from the production translation unit/header or move it into a
+test-only translation unit — a comment-only disposition is excluded, because a production-looking
+API that must not be called is the footgun). Load-bearing mutation demonstrations use the T3
+wording verbatim.
 Gates: full CA + the S3 evidence the task always owed. Closure commit.
 
 ### T5 — Task 7a: delete probe A {#t5}
@@ -317,8 +325,15 @@ post-flip posture, and that T6's per-term assertions are where that term gets it
 ### T8 — Stage B gates (Task 11) {#t8}
 
 The requirement body is carried into the new plan from the old Task 11, shortened and corrected:
-AMD tidy lane in its own `build_tidy`; executable-prose sweep; the residual-cleanup gate row
-(Task-1 minors 1–7, MINOR-B + NITs C–F) **extended with this audit's accepted leftovers**; full CA
+AMD tidy lane in its own `build_tidy`; executable-prose sweep; the residual-cleanup gate row —
+which the new plan **enumerates explicitly, item by item with a disposition column** (the audit
+stays evidence/provenance, never a requirement source an executor must load). The row's content,
+fixed here: the Task-1 review minors 1–7 and the re-review's MINOR-B plus NITs C–F (copied
+verbatim into the new plan at plan-writing time); Task 5's deferred symmetric regression test for
+the exact-delete exception branch; the two comment-policy citations audit-t8 named (the
+`writeFile` directive reference; the `stageATransition` comment, which T1(c) deletes anyway); the
+Q-2 ABA-edge sequencing observation; and the 10b sharding-arm `KNOWN` model debt (named in T7's
+RESULTS, re-checked here). Then: full CA
 gtest gate against the post-T5 baseline (per the T5 delta rule); all CA integration lanes; the four
 soaks (churn, rebirth with namespace-file readers/writers, decommission, and the separate
 90-minute general soak carrying the sequential-baseline destructive workload); the six result
@@ -333,9 +348,18 @@ estimated, honest before/after only where a before exists (probe A yes, destruct
 falsifiable opportunities, evidence index, figures re-read at write time, BACKLOG entries. No
 optimization lands.
 
+### Stage-B completion semantics {#completion-semantics}
+
+- T8 issues the **technical verdict** (`STAGE B: PASS`/`FAIL`).
+- T9 is the **mandatory closeout**: the ledger does not record Stage B as COMPLETE until T9's
+  report is committed.
+- T9 does not change T8's verdict — unless its analysis of the specimen discovers that a T8
+  measurement was wrong, in which case the verdict is corrected on that evidence and the
+  correction is recorded in both documents.
+
 ### Follow-ups (in the document, outside the Stage-B verdict) {#follow-ups}
 
-**Stage B ends with T8's verdict and T9's report. The follow-ups do not gate `STAGE B: PASS`.**
+**The follow-ups do not gate `STAGE B: PASS` and run after the T9 closeout.**
 
 - **F1 (old Task 13) — post-baseline mechanical split:** request-count/order goldens first, then
   split `CasGc.cpp` and `CasRefLedger.cpp` along existing seams, then the unchanged goldens rerun.
