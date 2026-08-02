@@ -546,6 +546,26 @@ ALL EXPECTATIONS MET
 Although all four sabotages target `INV_NO_DANGLE`, each remains a separate row because each removes a
 different load-bearing order or adoption guard.
 
+#### Retired-in-run whole-suite conversion {#retired-in-run-whole-suite}
+
+`run_retiredinrun.sh` now selects exactly the five `CaRetiredInRun` configs without accidentally
+including the similarly prefixed fold-abort family. Its first asserted run also caught an expectation
+error: `sab_attempt_reuse` reaches the smaller empty-journal duplicate-attempt trace first, so the exact
+reported invariant is `INV_ONE_PASS`, not `INV_COVERAGE`. The config promises a red attempt-reuse
+sabotage, not a coverage-first traversal. After correcting that expectation, the official pinned jar
+with `TLC_WORKERS=auto` produced:
+
+```text
+CONFIG             EXPECT      RESULT                           SECONDS  VERDICT
+sab_attempt_reuse  violation   violation:INV_ONE_PASS           1        PASS
+sab_inmem_token    violation   violation:INV_NO_RETURN          1        PASS
+sab_no_pacing      violation   violation:INV_NO_LOSS            0        PASS
+base               green       green                            1        PASS
+empty_blobs        green       green                            1        PASS
+
+ALL EXPECTATIONS MET
+```
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
