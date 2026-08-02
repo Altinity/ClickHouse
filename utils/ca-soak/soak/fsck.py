@@ -237,14 +237,13 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
         # added to surface. That is how `awaiting-gc` objects sat mislabelled as B140 M-F debris for
         # months. Whenever `FsckClass` gains a member, extend this tuple in the same change — and note
         # the parser below now warns rather than discarding an unknown class outright.
-        # `snapshot-oracle-mismatch` and `corrupted-run` were added to `FsckClass` without this tuple
-        # being extended, so every such row was being dropped here — the exact hazard the paragraph
-        # above describes, happening to the two remaining ERROR classes. Added 2026-07-26. Note that a
-        # dropped row is not merely unreported: `run.py`'s dryrun-subset check reads a dryrun key it
+        # `corrupted-run` was added to `FsckClass` without this tuple being extended, so every such row
+        # was being dropped here — the exact hazard the paragraph above describes. Added 2026-07-26.
+        # A dropped row is not merely unreported: `run.py`'s dryrun-subset check reads a dryrun key it
         # cannot find in `detail` as "already deleted, tolerated".
         known_classes = (
             "reachable", "dangling", "unreachable", "pending-gc", "awaiting-gc", "unaccounted",
-            "stale-edge", "snapshot-oracle-mismatch", "corrupted-run",
+            "stale-edge", "corrupted-run",
         )
         detail_rows: list[dict] = []
         unknown_classes: set[str] = set()
