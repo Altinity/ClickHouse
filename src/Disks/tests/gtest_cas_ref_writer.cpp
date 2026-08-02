@@ -2847,9 +2847,10 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     const Layout layout("p");
     const RootNamespace ns{"srv1/precommit_sweep_retry"};
 
-    /// One shared injected clock for BOTH incarnations, so the successor's backoff deadline is driven
-    /// deterministically (never a raw sleep).
+    /// One shared injected clock for both incarnations. The successor's wait hook below advances this
+    /// same clock, so both mount observation and the later sweep-backoff deadline are deterministic.
     uint64_t fake_now = 1'000'000;
+    size_t mount_wait_calls = 0;
     const auto fake_clock = [&fake_now] { return fake_now; };
 
     {
@@ -2858,14 +2859,16 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
         pred_config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
         pred_config.boot_ms_fn = fake_clock;
         auto predecessor = openPoolWithConfig(backend, pred_config);
+        std::vector<PartWriteTxnPtr> predecessor_builds;
         for (const String & name : {"stale_a", "stale_b", "stale_c"})
         {
             auto build = startBuildFor(predecessor, ns, name);
             const ManifestId id = build->stageManifest({});
             build->precommitAdd(ns, name, id);
             /// no promote -- left dangling, as a crashed build would leave it
+            predecessor_builds.push_back(std::move(build));
         }
-    }   /// predecessor destroyed: its mount lease is released
+    }   /// all three cleanup duties remain pending; predecessor publishes no clean farewell
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
     /// transparently retries away (mirrors the wedge-semantics tests in this file exactly).
@@ -2878,8 +2881,15 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = fake_clock;
+    config.wait_sleep_fn = [&fake_now, &mount_wait_calls](uint64_t ms)
+    {
+        ++mount_wait_calls;
+        fake_now += ms;
+    };
     SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPoolWithConfig(backend, config);
+    EXPECT_GT(mount_wait_calls, 0u)
+        << "the unclean predecessor must exercise the injected mount-observation wait";
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
