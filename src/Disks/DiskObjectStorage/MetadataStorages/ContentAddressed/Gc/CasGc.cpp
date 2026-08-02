@@ -2883,12 +2883,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Same reuse for the checkpoints: the intake walk already paid for them as its second witness, and
     /// the cleanup ranges below are the other consumer of the same fact.
     ///
-    /// An UNDECODABLE `_ckpt` contributes no entry here, which reads as "no checkpoint" and WIDENS this
-    /// namespace's delete boundaries. That is safe for exactly one reason, stated here because it is not
-    /// local: the walk above held (or recorded an anomaly for) every such namespace, so the round's
-    /// destructive gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future
-    /// change that narrows the gate from round-wide to per-namespace must carry this set with it.
-    result.checkpoints = checkpoint_witness;
+    /// An UNDECODABLE `_ckpt` contributes no entry here and therefore grants no cleanup authority. The
+    /// walk above also held (or recorded an anomaly for) every such namespace, so the round's destructive
+    /// gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future change that
+    /// narrows the gate from round-wide to per-namespace must carry this set with it.
+    result.checkpoints = checkpoints.recovery_checkpoints;
 
     /// Folding the terminal record earns positive cleanup evidence directly on the catalog-admitted
     /// life row. It does not claim that any physical debris was removed: `_ckpt`, stream and `_files`
@@ -3414,11 +3413,12 @@ void Gc::cleanupRefObjects(
         /// before its publisher's checkpoint CAS, so it must never be promoted into cleanup authority.
         /// Validate the exact same-id non-seal `_log` and `_snap` through recovery's one shared helper;
         /// failure is confined to this namespace and leaks its listed objects for a later round.
-        std::optional<RefTxnId> checkpoint;
+        std::optional<RefCkpt> checkpoint;
         if (const auto ckit = folded.checkpoints.find(ns_str); ckit != folded.checkpoints.end())
             checkpoint = ckit->second;
-        if (!checkpoint)
+        if (!checkpoint || !checkpoint->checkpoint_snapshot_id)
             continue;
+        const RefTxnId checkpoint_snapshot_id = *checkpoint->checkpoint_snapshot_id;
 
         try
         {
@@ -3428,11 +3428,11 @@ void Gc::cleanupRefObjects(
         {
             LOG_WARNING(logger,
                 "CAS GC ref cleanup retained namespace '{}': checkpoint base {} is not a valid recovery triple: {}",
-                ns_str, renderRefTxnId(*checkpoint), e.message());
+                ns_str, renderRefTxnId(checkpoint_snapshot_id), e.message());
             continue;
         }
 
-        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint);
+        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint_snapshot_id);
         for (const RefTxnId & log_id : plan.deletable_logs)
             if (!deleteRefObject(layout.refLogKey(life, log_id)))
                 return;
@@ -3441,7 +3441,7 @@ void Gc::cleanupRefObjects(
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
-            chassert(!checkpoint || snap_id < *checkpoint);
+            chassert(snap_id < checkpoint_snapshot_id);
             if (!deleteRefObject(layout.refSnapshotKey(life, snap_id)))
                 return;
         }

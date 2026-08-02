@@ -349,7 +349,7 @@ void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLif
         {
             /// Even when the base IS the frontier and there is no replay tail, a checkpoint may not
             /// turn an `EpochSeal` into a state snapshot by naming a same-id `_snap`.
-            (void)readCheckpointSnapshotBase(backend, layout, life, *grounding.base);
+            (void)readCheckpointSnapshotBase(backend, layout, life, *checkpoint);
         }
         catch (const Exception & e)
         {

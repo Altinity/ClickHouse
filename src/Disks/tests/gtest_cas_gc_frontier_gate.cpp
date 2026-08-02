@@ -1922,6 +1922,11 @@ TEST(CasGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnap
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout{"p"};
     const RefTxnId base{1, 1};
+    const RefCkpt checkpoint{
+        .life_epoch = 1,
+        .committed_through = base,
+        .checkpoint_snapshot_id = base,
+        .last_epoch_seal = std::nullopt};
     CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
 
     {
@@ -1929,22 +1934,67 @@ TEST(CasGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnap
         casAdmitEntry(*backend, layout, ns);
         const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
-        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, base), DB::Exception);
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
     {
         const RootNamespace ns{"00/cleanup-missing-base-snapshot@cas@"};
         writeRefLogTxnRaw(*backend, layout, RefLogTxn{
             .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
         const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
-        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, base), DB::Exception);
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
     {
         const RootNamespace ns{"00/cleanup-seal-is-not-base@cas@"};
         writeSealAt(*backend, layout, ns, base);
         const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
-        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, base), DB::Exception);
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
     }
+}
+
+TEST(CasGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCannotLicenseDeletion)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout{"p"};
+    CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+    const RefTxnId seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    const auto expect_no_deletion_authority = [&](const RootNamespace & ns, std::optional<RefTxnId> backlink)
+    {
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+            .prev_epoch_seal = std::nullopt});
+        writeSealAt(*backend, layout, ns, seal_id);
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = base_id, .ops = {}, .prev_epoch_seal = backlink});
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+
+        std::optional<RefTxnId> validated_base;
+        try
+        {
+            (void)readCheckpointSnapshotBase(*backend, layout, life, RefCkpt{
+                .life_epoch = 1,
+                .committed_through = base_id,
+                .checkpoint_snapshot_id = base_id,
+                .last_epoch_seal = seal_id});
+            validated_base = base_id;
+        }
+        catch (const DB::Exception &)
+        {
+        }
+
+        RefTableListing listing;
+        listing.logs = {{1, 1}, seal_id, base_id};
+        listing.snapshots = {{1, 1}, base_id};
+        const RefCleanupPlan plan = planRefCleanup(listing, base_id, validated_base);
+        EXPECT_TRUE(plan.deletable_logs.empty());
+        EXPECT_TRUE(plan.deletable_snapshots.empty());
+    };
+
+    expect_no_deletion_authority(RootNamespace{"00/cleanup-base-missing-backlink@cas@"}, std::nullopt);
+    expect_no_deletion_authority(RootNamespace{"00/cleanup-base-wrong-backlink@cas@"}, RefTxnId{1, 99});
 }
 
 /// Folding a namespace terminal records evidence but performs no lifecycle-specific physical cleanup.

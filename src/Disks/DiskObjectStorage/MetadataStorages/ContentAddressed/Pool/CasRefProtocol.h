@@ -755,9 +755,10 @@ struct RecoveredRefTable
 
 /// Exact-read and decode the checkpoint-named recovery base. The anchor is the bounded triple
 /// `_ckpt` + same-id non-seal `_log` + same-id `_snap`: read and decode the log first, reject an
-/// `EpochSeal`, then read the snapshot. This order prevents a forged snapshot at any historical seal
-/// from becoming state, including when that seal is older than `_ckpt.last_epoch_seal`. Cleanup retains
-/// the matching log while the checkpoint names this base.
+/// `EpochSeal`, validate its contextual epoch backlink against `_ckpt.life_epoch` and the exact
+/// `_ckpt.last_epoch_seal` when that field describes the base's preceding epoch, then read the snapshot.
+/// This order prevents a forged snapshot at any historical seal or contextually invalid epoch start
+/// from becoming state. Cleanup retains the matching log while the checkpoint names this base.
 struct CheckpointSnapshotBase
 {
     RefTableSnapshot snapshot;
@@ -765,7 +766,7 @@ struct CheckpointSnapshotBase
 };
 
 CheckpointSnapshotBase readCheckpointSnapshotBase(
-    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & snapshot_id);
+    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint);
 
 /// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
 /// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is

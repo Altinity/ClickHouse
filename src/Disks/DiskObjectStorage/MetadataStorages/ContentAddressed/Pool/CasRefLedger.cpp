@@ -768,7 +768,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     {
         try
         {
-            CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, *base_id);
+            CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, sampled_ckpt->ckpt);
             base_snapshot = std::move(base.snapshot);
             base_snapshot_bytes = base.bytes;
         }

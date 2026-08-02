@@ -645,4 +645,36 @@ TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
+TEST(CasRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink)
+{
+    auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
+    const Layout layout("p");
+    const RefTxnId seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    const auto expect_rejected = [&](const RootNamespace & ns, std::optional<RefTxnId> backlink)
+    {
+        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+        RefOp seal;
+        seal.kind = RefOpKind::EpochSeal;
+        writeRefLogTxnRaw(*backend, layout, txn(ns, seal_id, {std::move(seal)}));
+        writeRefLogTxnRaw(*backend, layout, txn(ns, base_id, {}, backlink));
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
+
+        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = base_id,
+            .checkpoint_snapshot_id = base_id,
+            .last_epoch_seal = seal_id})).outcome, PutOutcome::Done);
+
+        expectCode(
+            [&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); },
+            DB::ErrorCodes::CORRUPTED_DATA);
+    };
+
+    expect_rejected(RootNamespace{"srv1/base_missing_backlink"}, std::nullopt);
+    expect_rejected(RootNamespace{"srv1/base_wrong_backlink"}, RefTxnId{1, 99});
+}
+
 }

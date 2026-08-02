@@ -949,9 +949,22 @@ std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
 }
 
 CheckpointSnapshotBase readCheckpointSnapshotBase(
-    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & snapshot_id)
+    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefCkpt & checkpoint)
 {
     const RootNamespace & ns = life.ns;
+    if (!checkpoint.checkpoint_snapshot_id)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint has no snapshot base",
+            ns.string());
+    }
+    if (!checkpoint.life_epoch)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint-named snapshot base has no life_epoch context",
+            ns.string());
+    }
+    const RefTxnId snapshot_id = *checkpoint.checkpoint_snapshot_id;
     const auto log = backend.get(layout.refLogKey(life, snapshot_id));
     if (!log)
     {
@@ -969,6 +982,19 @@ CheckpointSnapshotBase readCheckpointSnapshotBase(
             "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} names an EpochSeal, "
             "not a snapshot base",
             ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence);
+    }
+    validateEpochSealGrammarContextual(base_txn, *checkpoint.life_epoch);
+    if (base_txn.prev_epoch_seal && checkpoint.last_epoch_seal && checkpoint.committed_through
+        && checkpoint.committed_through->writer_epoch == snapshot_id.writer_epoch
+        && checkpoint.last_epoch_seal->writer_epoch + 1 == snapshot_id.writer_epoch
+        && *base_txn.prev_epoch_seal != *checkpoint.last_epoch_seal)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} refers to previous "
+            "epoch seal {}-{}, but checkpoint authority names {}-{}",
+            ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence,
+            base_txn.prev_epoch_seal->writer_epoch, base_txn.prev_epoch_seal->ref_sequence,
+            checkpoint.last_epoch_seal->writer_epoch, checkpoint.last_epoch_seal->ref_sequence);
     }
 
     const auto snapshot = backend.get(layout.refSnapshotKey(life, snapshot_id));
@@ -1004,7 +1030,7 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
     uint64_t base_snapshot_bytes = 0;
     if (base_id)
     {
-        CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, *base_id);
+        CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, *ckpt);
         base_snapshot = std::move(base.snapshot);
         base_snapshot_bytes = base.bytes;
     }

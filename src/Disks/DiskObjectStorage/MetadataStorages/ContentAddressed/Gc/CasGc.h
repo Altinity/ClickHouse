@@ -553,13 +553,14 @@ private:
         /// never assume the Stage-A sentinel applies.
         std::optional<CasRefCatalog::Snapshot> catalog_cut;
 
-        /// The round's per-namespace `_ckpt.checkpoint`, read ONCE by the intake walk (its second,
+        /// The round's per-namespace decoded `_ckpt`, read ONCE by the intake walk (its second,
         /// hint-independent witness) and reused post-CAS by `cleanupRefObjects` for its delete ranges --
         /// the same DRY reason `ref_tables` is carried here rather than re-listed. A namespace whose
         /// `_ckpt` is present but UNDECODABLE has no entry, and the walk either HELD it or -- when it
         /// offered no position to walk from -- RECORDED AN ANOMALY for it. Either way an absent entry
-        /// widens the delete boundaries, so only the shut destructive gate makes that absence safe.
-        std::map<String, RefTxnId> checkpoints;
+        /// grants no cleanup authority; the shut destructive gate additionally prevents every other
+        /// namespace from deleting against the incomplete round.
+        std::map<String, RefCkpt> checkpoints;
         /// THE DESTRUCTIVE GATE for this round, computed ONCE in `fold()` and threaded everywhere so no
         /// two destructive sites can disagree about it:
         ///
