@@ -52,8 +52,8 @@ set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
-source "$(dirname "$0")/tlc_temporal_gate.sh"
-check_tlc_temporal_gate "$JAR" || exit 4
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
 MODULE=CaBuildRootPrecommit
 
 # name  expectation(green|violation|temporal)  expected-invariant/property(asserted, not just logged)
@@ -67,6 +67,7 @@ CONFIGS=(
   "inlineclosure_b2  green      -"
   "b2_witness        violation  W_SharedSparedUniqueReclaimed"
 )
+check_tlc_temporal_expectations "$JAR" "${CONFIGS[@]}" || exit 4
 
 # The PROPERTY/PROPERTIES names a cfg declares, one per line (used by the `temporal` assertion).
 declared_properties() {

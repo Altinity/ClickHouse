@@ -33,12 +33,24 @@ behind each is told in prose below.
   produce a counterexample; an unexpected pass means the model lost its teeth.
 - `_witness_*` — negated reachability: TLC reporting a "violation" means the state IS reachable
   (non-vacuity check).
-- `run_*.sh` — TLC/Apalache runners; TLC jar expected at `../../../tmp/tla2tools.jar`
-  (v2.19), Apalache at `../../../tmp/apalache/bin/apalache-mc` (0.58.0+). Two shapes exist: a
+- `run_*.sh` — TLC/Apalache runners. The single pinned TLC jar for both safety and temporal checking
+  is expected at `../../../tmp/tla2tools.jar`: official `tla2tools` `2026.07.18.145032`, revision
+  `30cc360`, SHA-256
+  `cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`. The former TLC 2.19 jar
+  (revision `5a47802`) is rejected because it reports a violation for the tautology `<> TRUE`; do not
+  split safety and temporal work across two jars. Apalache is expected at
+  `../../../tmp/apalache/bin/apalache-mc` (0.58.0+). Two runner shapes exist: a
   **suite runner** owns its model's whole config list and asserts each expected outcome *by the name
   of the invariant or property it must break* (`run_mount.sh` is the reference), while the rest are
   single-config drivers taking a cfg as `$1` and asserting nothing. Prefer the first shape: a colour
   nothing checks is a colour that rots.
+- A suite runner that contains a `temporal` expectation must call
+  `check_tlc_temporal_expectations` from `tlc_temporal_gate.sh`. It runs `TlcTemporalSmoke` against
+  that runner's own jar before any verdict is trusted. Safety-only expectation tables skip the
+  redundant smoke, but the shared table scan makes adding a future `temporal` row activate it
+  automatically. The five audited Task 10g runners also call `check_tlc_pin` before any row, so a
+  safety-only table cannot keep using the former jar. `test_tlc_temporal_gate.sh` pins the digest and
+  both smoke-selection branches.
 - `states/`, `tmp/`, `_apalache-out/` — tool scratch output, gitignored / untracked.
 - `*_RESULTS.md` — supplementary raw TLC run evidence (state counts, counterexample traces) for
   the matching model. `<date>-*-RESULTS.md` — a whole-phase gate across several models

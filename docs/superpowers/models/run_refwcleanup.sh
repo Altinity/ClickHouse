@@ -49,6 +49,8 @@ set -uo pipefail
 cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
 MODULE=CaRefWriterCleanupCore
 
 # name  expectation(green|violation)  expected-invariant(asserted, not just logged)
@@ -58,6 +60,7 @@ CONFIGS=(
   "sab_cancelbeforedurable    violation  INV_NAMESPACE_REMOVAL_COMPLETE"
   "safe                       green      -"
 )
+check_tlc_temporal_expectations "$JAR" "${CONFIGS[@]}" || exit 4
 
 # The PROPERTY/PROPERTIES names a cfg declares, one per line. No expectation in the table above is
 # `temporal` -- only `_safe` declares a property and it must hold -- so this only ever labels an

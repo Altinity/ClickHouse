@@ -18,10 +18,12 @@ current GC leader fence, before the current round derives its physical gate.
 
 ## Checker identity and temporal smoke {#checker-identity-and-temporal-smoke}
 
-The recorded run used the already-pinned official jar at
-`tmp/tla2tools-official.jar`, overlaid at the runner's required
-`tmp/tla2tools.jar` path inside an isolated mount namespace. The worktree's
-existing TLC 2.19 symlink was not modified.
+The recorded run used the official jar at `tmp/tla2tools-official.jar`,
+overlaid at the runner's required `tmp/tla2tools.jar` path inside an isolated
+mount namespace. The worktree's then-existing TLC 2.19 symlink was not
+modified. Task 10g subsequently adopted these same official bytes as the one
+ordinary pin for both safety and temporal checking; future runs need no
+dual-jar overlay.
 
 - TLC: `2026.07.18.145032`, revision `30cc360`.
 - SHA-256: `cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`.
@@ -29,9 +31,9 @@ existing TLC 2.19 symlink was not modified.
   2 generated / 1 distinct state, depth 1, in `00s`.
 - Workers: 1, deterministic breadth-first search.
 
-The ordinary pinned path currently resolves to TLC 2.19, whose known temporal
-checker defect makes the shared smoke gate fail. `run_destructive_gate.sh`
-correctly exits 4 before trusting any row under that jar.
+The former ordinary pin, TLC 2.19 revision `5a47802`, has a known temporal
+checker defect and makes the shared smoke gate fail. It is no longer an
+accepted checker for either safety or temporal runs.
 
 ## Exact runner tail {#exact-runner-tail}
 

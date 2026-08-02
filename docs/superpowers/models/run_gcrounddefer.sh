@@ -7,8 +7,8 @@ cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 MODULE=CaGcRoundDeferCore
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
-source "$(dirname "$0")/tlc_temporal_gate.sh"
-check_tlc_temporal_gate "$JAR" || exit 4
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
 
 # `sab_unbounded_defer` is liveness: TLC does not name the violated temporal property.
 # name                     expectation  expected-invariant-or-property
@@ -18,6 +18,7 @@ CONFIGS=(
   "stage1                  green        -"
   "witness_deferthenfold   violation    W_DeferThenFold"
 )
+check_tlc_temporal_expectations "$JAR" "${CONFIGS[@]}" || exit 4
 
 overall=0
 printf '%-28s %-11s %-40s %-8s %s\n' "CONFIG" "EXPECT" "RESULT" "SECONDS" "VERDICT"

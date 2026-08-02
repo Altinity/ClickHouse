@@ -184,9 +184,37 @@ violates temporal properties incorrectly. `TlcTemporalSmoke.tla` and the
 shared `tlc_temporal_gate.sh` make that fact a runner gate: each of these
 runners now refuses temporal verdicts when its selected jar violates `<> TRUE`.
 
-Recommendation: retain the pinned TLC 2.19 jar for now, because changing it
-wholesale is outside this audit. The official jar passes the smoke test and is
-the candidate replacement, but first re-run every configuration that declares
-`PROPERTY` or `PROPERTIES` (43 configurations in this survey's inventory),
-including their safety and temporal outcomes, then review and deliberately
-accept any changed result before changing the runner jar.
+### Final checker policy and focused revalidation — 2026-08-02 {#final-checker-policy-and-focused-revalidation-2026-08-02}
+
+The checker decision is now one jar, not a safety/temporal split. Both kinds of
+run use official `tla2tools` `2026.07.18.145032`, revision `30cc360`, SHA-256
+`cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`, at the
+ordinary pinned path `tmp/tla2tools.jar`. A single checker identity is simpler
+to reproduce and prevents a safety-only invocation from silently remaining on
+the defective TLC 2.19 build.
+
+The five runners named by Task 10g were audited. The three that currently
+carry a `temporal` expectation (`run_buildrootprecommit.sh`,
+`run_disklifecycle.sh`, `run_gcrounddefer.sh`) run the smoke gate. The other two
+(`run_refwcleanup.sh`, `run_foldclamp.sh`) currently have no temporal
+expectation and do not pay a redundant TLC run; they call the same table-aware
+helper, so adding a future temporal row activates the gate without another
+runner edit. All five verify the official digest before any model row, including
+safety-only rows. `test_tlc_temporal_gate.sh` verifies the digest and both
+smoke-selection branches.
+
+The official jar was invoked directly from `tmp/tla2tools-official.jar` for
+this focused revalidation, leaving the user's existing `tmp/tla2tools.jar`
+symlink unchanged. Every invocation used one worker and its own metadir under
+`tmp/t10g/`. Only the smoke and the three temporal-expectation rows were run:
+
+| Run | Expected and observed result | Generated / distinct / queue | Depth | TLC time | Exit |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `TlcTemporalSmoke` | green; `No error has been found` | 2 / 1 / 0 | 1 | `00s` | 0 |
+| `CaBuildRootPrecommit_lazyleak.cfg` | temporal property `INV_NO_LEAK` violated | 145193 / 23429 / 7657 | 11 | `03s` | 13 |
+| `CaDiskLifecycle_sab_nogcselfexit.cfg` | temporal property `GcExitsAfterVanished` violated | 863 / 268 / 0 | 21 | `00s` | 13 |
+| `CaGcRoundDeferCore_sab_unbounded_defer.cfg` | temporal property `EventuallyFolded` violated | 402 / 102 / 0 | 11 | `00s` | 13 |
+
+The non-empty queue on `lazyleak` is expected: TLC stopped when it found the
+counterexample. These named violations reconfirm that all three negative
+controls are genuine under the smoke-capable checker.
