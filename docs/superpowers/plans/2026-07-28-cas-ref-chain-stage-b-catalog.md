@@ -1717,6 +1717,13 @@ behavior-preserving mechanical split of the large translation units after the pe
   normally scheduled round begin at the start.
   Keep the work in `namespace_cleanup`; publish `janitor_pages`, `janitor_keys` and
   `janitor_deleted` for Task 11's inventory.
+- [ ] **A suppressed DEFER page retains its cursor.** A DEFER invocation lacks the fold's destructive
+  proof, but still runs one bounded `namespace_cleanup` page with deletion suppressed and its metrics
+  published. A valid suppressed page publishes **no cursor advance**, so the next authorized fold retries
+  it. Advancing would phase-lock alternating `DEFER`/fold rounds (`A` dead page: `DEFER A→B`, fold
+  `B→A`) and leak A forever. Corrupt/backend-rejected progress keeps the existing fail-closed exact-reset
+  rule. Gate this with `CaNamespaceJanitorCursorCore`: the honest model proves `<> ~deadA`; the isolated
+  `AdvanceSuppressed` sabotage produces the fair `A-defer → B-fold → A` liveness counterexample.
 - [ ] **One physical classifier, joined to the catalog authority.** Parse the fixed family and
   `life_id`; do not reconstruct a `RootNamespace` from the key and do not consult `_path`. The immutable
   post-page cut's reverse index classifies an id currently named by any `Creating`, `Live` or `Removing`
