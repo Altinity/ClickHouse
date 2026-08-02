@@ -608,6 +608,11 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
 
 RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)
 {
+    if (state.getLifecycle() != RefLifecycle::Live)
+        throw Exception(
+            ErrorCodes::CORRUPTED_DATA,
+            "snapshotOf: terminal namespace state is not snapshot-serializable");
+
     RefTableSnapshot snapshot;
     snapshot.ns = ns;
     snapshot.snapshot_id = state.getGreatestApplied();
