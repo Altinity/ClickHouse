@@ -643,6 +643,66 @@ witness_delete           violation   violation:W_BlobDeleted              1     
 ALL EXPECTATIONS MET
 ```
 
+#### Incarnation-core whole-suite conversion {#incarnation-core-whole-suite}
+
+`run_tlc.sh` now owns all 27 `CaIncarnationCore` configs and distinguishes five outcome kinds:
+proof-green, exact named safety violation, exact named temporal violation, finite random-simulation
+probe, and bounded incomplete BFS. The pre-change no-argument probe was only an interface red. The
+first classifier smoke then found two real harness mismatches: official TLC names a liveness failure
+as `Temporal property NoLeakForever was violated`, and successful simulation prints simulation markers
+rather than BFS's `No error has been found`. Both are now matched exactly; simulation is labelled
+`PROBE`, never `PASS`.
+
+The default battery, with the official pinned jar, `TLC_WORKERS=auto` and 1,000 requested simulation
+batches, produced:
+
+```text
+CONFIG                 EXPECT       RESULT                               SECONDS  VERDICT
+sab_cascade            violation    violation:INV_NO_LOSS                 174      PASS
+sab_cutoverclaim       violation    violation:INV_NO_DANGLE               4        PASS
+sab_foldtimeuniverse   violation    violation:INV_NO_DANGLE               1        PASS
+sab_noevreobserve      violation    violation:INV_NO_LOSS                 3        PASS
+sab_nofence            violation    violation:INV_NO_DANGLE               1        PASS
+sab_norecheckfold      violation    violation:INV_NO_DANGLE               2        PASS
+sab_noregistry         violation    violation:INV_NO_DANGLE               1        PASS
+sab_noreobserve        violation    violation:INV_NO_DANGLE               1        PASS
+sab_noretireview       violation    violation:INV_NO_DANGLE               2        PASS
+sab_reusedtag          violation    violation:INV_NO_RETURN               0        PASS
+sab_unconddelete       violation    violation:INV_NO_DANGLE               2        PASS
+stage1                 green        green                                 143      PASS
+stage2                 green        green                                 2        PASS
+reval_stage2           green        green                                 2        PASS
+stage3                 green        green                                 323      PASS
+stage4_journaltree     green        green                                 145      PASS
+stage4_small           green        green                                 55       PASS
+stage5_small           green        green                                 253      PASS
+stage6_cross_smoke     green        green                                 3        PASS
+stage6_evstale         green        green                                 46       PASS
+stage6_registry        green        green                                 15       PASS
+empty_hashes           green        green                                 1        PASS
+stage2_live            temporal     temporal:NoLeakForever                4        PASS
+hunt_sim               simulation   simulation                            4        PROBE
+
+ALL EXPECTATIONS MET
+```
+
+The remaining three rows are deliberately behind `SLOW=1`. A 60-second bounded run of each showed
+continued BFS progress, no counterexample, and no queue exhaustion; therefore the result is
+`KNOWN incomplete`, not a proof:
+
+```text
+CONFIG                 EXPECT       RESULT                               SECONDS  VERDICT
+hunt_cross             incomplete   incomplete                            60       KNOWN
+stage4                 incomplete   incomplete                            60       KNOWN
+stage5                 incomplete   incomplete                            61       KNOWN
+
+ALL EXPECTATIONS MET
+```
+
+The bounded prefixes generated respectively 6,529,439, 5,514,071 and 5,102,770 states. A future
+queue-exhausted green is accepted loudly as `green (tighten expectation)` so improvement cannot look
+like a regression, while any named violation remains a failure.
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
