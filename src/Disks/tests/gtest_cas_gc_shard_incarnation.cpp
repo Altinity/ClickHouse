@@ -220,7 +220,7 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
 }
 
 /// A stream life absent from the immutable catalog cut cannot be attributed to any logical namespace.
-/// It defers the fold conservatively but remains inert debris rather than producing a made-up name.
+/// It remains inert debris rather than producing a made-up name or a round anomaly.
 TEST(CasGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace)
 {
     std::shared_ptr<InMemoryBackend> backend;
@@ -436,8 +436,8 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
 /// `ReviveRacesReclaimAborts`) were removed with the snapshot+log ref model. They asserted GC reclaims /
 /// token-guards a MUTABLE per-namespace ref-shard object at `rootShardKey(ns, shard)`. There is no such
 /// mutable object anymore: a namespace's ref state is its immutable `_log`/`_snap` objects, physical
-/// reclamation is the namespace-cleanup item (`remove_namespace` -> Pending -> Completed), and ABA safety
-/// is structural -- a recreated namespace uses a strictly-greater `RefTxnId`. The still-meaningful ABA
-/// case (`remove_namespace` then a later `namespace_birth` with a greater id folds normally, no
-/// stale-cursor double-count) is covered by `gtest_cas_ref_gc.cpp`; the namespace-cleanup reclaim path is
-/// covered there and in `gtest_cas_gc_round.cpp`.
+/// reclamation belongs to the perpetual namespace janitor, and ABA safety is structural -- a recreated
+/// namespace uses a different opaque life id. The still-meaningful reincarnation case (a terminal old
+/// life followed by a new life folds without inheriting the old cursor) is covered by
+/// `gtest_cas_ref_gc.cpp`; lifecycle completion itself requires only folded terminal evidence and the
+/// exact catalog-row mutation.

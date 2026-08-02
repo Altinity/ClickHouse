@@ -375,39 +375,39 @@ and no future-object gate.
   convert it to protobuf with `CasHeader`.
 - Do not add more fixed unversioned control records.
 
-## Fold Seal `CAFS` {#fold-seal-cafs}
+## Fold Seal `cas_fold_seal` {#fold-seal-cafs}
 
 **Storage path:** `<prefix>/gc/gen/<gen>/attempt/<attempt>/fold_seal`, produced by
 `Layout::foldSealKey`.
 
-**Body:** `FoldSealProto` protobuf with `CasHeader` magic `CAFS`. It stores:
+**Body:** strict raw text control object. After the versioned `cas_fold_seal` header and the
+generation/parent-generation meta line, records appear in fixed tagged order:
 
-- `generation`.
-- `parent_generation`.
-- `per_ns_shard`: sorted coverage map encoded as repeated entries.
-- `blob_target_runs`: sorted `RunRefProto` list.
-- `part_manifest_cleanup`: sorted `RunRefProto` list.
+- `rfl`: one opaque-life-keyed `RefLifeFoldState` for every catalog-admitted `Live` or `Removing`
+  life, containing coverage, an optional hold, and optional terminal cleanup evidence.
+- `btr`: sorted blob-target `RunRef` records with checksum, shard, and physical generation.
+- `cnd`: shard-sorted condemned-row summaries used by graduation and pure carry.
 
-Coverage entries store a namespace/shard key, classification, folded token type/value, folded cursor,
-and shard incarnation.
+The object ends with a record-count trailer. There is no name-keyed ref-shard row and no persisted
+`part_manifest_cleanup` run: manifest cleanup executes from the round's in-memory cleanup map.
 
 **Producer:** GC fold creates it through `encodeFoldSeal` and stores it with
 `putDeterministicArtifact`, so replay of the same attempt must reproduce identical bytes.
 
-**Consumers:** later GC rounds, rebuild baseline, orphan manifest sweep, and `fsck` use the coverage
-and `blob_target_runs` parts. No current runtime consumer was found for `part_manifest_cleanup` refs.
+**Consumers:** later GC rounds, rebuild baseline, orphan manifest sweep, and `fsck` use the ref-life,
+blob-target-run, and condemned-summary records.
 
 **Purpose:** write-once coverage record for a generation. It is the durable link from a generation to
-the run files that contain blob-target and cleanup data.
+its catalog-admitted ref-life state and blob-target runs.
 
-**Versioning and integrity:** protobuf with `CasHeader`; deterministic ordering is part of the
-contract.
+**Versioning and integrity:** strict tagged text with a generation-gated format header, line and object
+byte caps, deterministic ordering, duplicate-key rejection, and pinned raw storage.
 
 **Notes:**
 
-- `FoldShardCoverageProto.classification` should be validated as an enum domain during decode (the text
-  codec does: the set `{0, 1, 2, 4}` is closed and checked before the value is narrowed to its byte).
-- The `RunRefProto` checksum comments and writer behavior disagree; see `RunRef` below.
+- The coverage classification set `{0, 1, 2, 4}` is closed and validated before narrowing to its byte.
+- A classification-4 `rfl` record requires a canonical hold; other classifications forbid one.
+- The `RunRef` checksum comments and writer behavior disagree; see `RunRef` below.
 
 ## Run Reference Subformat {#run-reference-subformat}
 

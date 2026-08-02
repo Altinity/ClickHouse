@@ -652,25 +652,16 @@ struct RefTableListing
 std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
     const Layout & layout, const std::vector<String> & listed_keys);
 
-/// The exact ref objects one round may delete for one table.
+/// The exact ref objects one round may delete for one namespace life.
 /// Pure; acts only on keys THIS round's scan returned, so a covering snapshot is always
 /// durable before any deletion it authorizes. A log `L` is deletable iff:
 ///   1. the newest observed snapshot `X` covers it (`L <= X`);
 ///   2. the durable `last_folded_ref_id` covers it (`L <= durable_cursor`);
-///   3. it is not in `removal_logs_blocked` (a `remove_namespace` log whose namespace-cleanup item has
-///      not durably reached `Completed`).
+///   3. the optional durable checkpoint covers it (`L <= checkpoint`).
 /// Snapshots with id `< X` are deletable. With no observed snapshot, `X` is undefined and no log is
 /// coverage-deletable (an empty plan). The newest snapshot `X` itself is retained.
 ///
-/// `completed_removal_snapshot` (optional) is the identifier of a `Removed` snapshot that the caller has
-/// already made durable THIS round via `putIfAbsent` for a namespace-cleanup item that reached
-/// `Completed`. It participates in `X` as a covering
-/// snapshot exactly as if the round's scan had returned it -- the caller guarantees it is durable before
-/// any delete this plan authorizes, preserving the "covering snapshot durable before deletion" invariant.
-/// It is never itself scheduled for deletion (it is not in `listing.snapshots` on the round it is first
-/// published; on a later round it appears in `listing.snapshots` as the newest and is retained there).
-///
-/// `checkpoint` (optional) is the namespace's own durable `_ckpt.checkpoint`. It only ever TIGHTENS the
+/// `checkpoint` (optional) is the namespace's own durable `_ckpt.checkpoint_snapshot_id`. It only ever TIGHTENS the
 /// two boundaries -- a log must additionally satisfy `L <= checkpoint`, and a snapshot must be STRICTLY
 /// BELOW it, so the snapshot the checkpoint itself names always survives. It can never widen either:
 /// a checkpoint AHEAD of what this round observed names durable objects the scan did not return, and

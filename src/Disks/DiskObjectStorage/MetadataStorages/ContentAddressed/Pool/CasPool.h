@@ -494,10 +494,10 @@ public:
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RefPublishedAtUpdate &)> mutator);   /// one set_published_at txn
-    /// one ref-log transaction naming every owner's exact removal
-    /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
-    /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
-    /// GC's namespace-cleanup item.
+    /// One ref-log transaction naming every owner's exact removal followed by `remove_namespace`, then
+    /// the catalog transition to `Removing`. Performs no physical deletion: GC records folded terminal
+    /// evidence and later removes the exact catalog row, while the perpetual janitor reclaims dead-life
+    /// stream, checkpoint, and namespace-file bytes independently.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
     /// Decommission-only exact-life overload; never re-resolves by namespace name.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);

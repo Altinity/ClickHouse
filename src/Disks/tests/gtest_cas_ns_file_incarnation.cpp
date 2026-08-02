@@ -31,11 +31,10 @@ namespace DB::ErrorCodes
 /// rebirth or deletion safety". `OldFileHiddenByListIsInvisibleAfterRebirth` asserts exactly that split
 /// by leaving the old object physically present and byte-intact.
 ///
-/// WHAT REBIRTH NO LONGER WAITS FOR. The `Pending -> Completed` gate used to LIST-probe the files
-/// prefix, i.e. it required a PHYSICAL-EMPTY PROOF for files before a name could be reused. That probe
-/// is deleted, not weakened: `PhysicalEmptyProofIgnoresFiles` pins the predicate answering "empty" with
-/// files still on the store, and `RebirthDoesNotWaitForFilesToBeEmpty` pins the stronger operational
-/// form -- creation does not merely tolerate the debris, it never looks at it.
+/// WHAT REBIRTH NO LONGER WAITS FOR. Catalog removal depends on folded terminal evidence for the old
+/// opaque life, not on a physical-empty proof. `RebirthDoesNotWaitForFilesToBeEmpty` keeps old `_files`
+/// bytes present while that evidence is adopted; their later reclamation belongs to the perpetual
+/// janitor and is not a precondition for same-name reuse.
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -197,14 +196,9 @@ TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
     EXPECT_EQ(backend->casPutTotal(), 0u);
 }
 
-/// Rebirth does not wait for the previous life's files to be physically gone. Driven through the thing
-/// that actually made it wait -- the `Pending -> Completed` promotion in a real GC round, which is the
-/// precondition a name's reuse is gated on -- with `_files` debris present throughout.
-///
-/// WHY THIS DRIVER AND NOT A BARE RE-RESOLUTION: a test that only resolved a fresh life with debris
-/// present would pass on the PRE-re-key tree too, because the resolution path never probed files; only
-/// the completion gate did. Asserting the property at the resolution would therefore assert nothing
-/// about this change. The gate is where the wait lived, so the gate is where its absence must be shown.
+/// A real GC fold records terminal evidence for the previous life while its namespace-file debris
+/// remains physically present. Lifecycle completion is therefore independent of `_files` enumeration;
+/// the perpetual janitor may reclaim the bytes later without participating in the removal proof.
 TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
 {
     auto backend = std::make_shared<CountingBackend>();
