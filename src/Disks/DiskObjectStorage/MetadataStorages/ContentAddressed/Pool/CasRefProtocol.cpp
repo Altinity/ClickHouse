@@ -74,8 +74,10 @@ namespace
 
 /// Txn-wide structural check, NOT a per-op precondition: if `ops` contains a
 /// `RemoveNamespace`, it must be the last element, and every earlier op must be an exact
-/// owner-removal `owner_transition` (`old_binding` set, `new_binding` empty). `CasRefLogCodec`
-/// deliberately does not check this shape -- this is the one place that does.
+/// owner-removal `owner_transition` (`old_binding` set, `new_binding` empty). The sole other legal
+/// form is `[NamespaceBirth, RemoveNamespace]`: a cataloged life may own `_ckpt`/`_files` without ever
+/// having emitted a ref transaction, and its empty birth+terminal must be one durable removal record.
+/// `CasRefLogCodec` deliberately does not check this shape -- this is the one place that does.
 void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
 {
     const bool has_remove = std::any_of(ops.begin(), ops.end(),
@@ -86,6 +88,9 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
     if (ops.empty() || ops.back().kind != RefOpKind::RemoveNamespace)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableState: remove_namespace must be the final operation of its transaction");
+
+    if (ops.size() == 2 && ops.front().kind == RefOpKind::NamespaceBirth)
+        return;
 
     for (size_t i = 0; i + 1 < ops.size(); ++i)
     {
@@ -428,8 +433,10 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
     const RefTableSnapshot validated = decodeRefTableSnapshot(bytes, snapshot.ns, snapshot.snapshot_id);
 
     RefTableState state;
-    state.lifecycle = validated.lifecycle;
-    state.remove_txn_id = validated.remove_txn_id;
+    /// A persisted snapshot is a materialization of a live stream only. `RefTableState` defaults to
+    /// `Removed`, so this assignment is deliberately explicit rather than relying on construction
+    /// defaults that have the opposite meaning.
+    state.lifecycle = RefLifecycle::Live;
     state.greatest_applied = validated.snapshot_id;
     /// The codec validated sortedness and no-duplicate ref_name/(ref_name, manifest_ref), but NEVER
     /// cross-owner `manifest_ref` uniqueness -- a snapshot naming one manifest under two owners
@@ -604,8 +611,6 @@ RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)
     RefTableSnapshot snapshot;
     snapshot.ns = ns;
     snapshot.snapshot_id = state.getGreatestApplied();
-    snapshot.lifecycle = state.getLifecycle();
-    snapshot.remove_txn_id = state.getRemoveTxnId();
 
     snapshot.committed.reserve(state.getCommitted().size());
     for (const auto [name, row] : state.getCommitted())
@@ -686,11 +691,11 @@ RecoveryResult RefReplayBuilder::finish() &&
 
 uint64_t encodedSnapshotBudgetSize(const RefTableState & state)
 {
-    /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, and the state's own
-    /// lifecycle/remove_txn_id -- match that framing exactly, then add the running body sum.
+    /// `snapshotOf` uses `snapshot_id = state.greatest_applied` and an empty namespace here. Snapshot
+    /// lifecycle is fixed to live on the wire, so the framing depends only on those fields and the row
+    /// count.
     const uint64_t rows = state.getCommitted().size() + state.getPrecommits().size();
-    return snapshotFramingSize("", state.getGreatestApplied(), state.getLifecycle(),
-                               state.getRemoveTxnId(), rows)
+    return snapshotFramingSize("", state.getGreatestApplied(), rows)
         + state.getSnapshotBodyBytes();
 }
 

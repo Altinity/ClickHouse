@@ -555,9 +555,19 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireRefTableRunt
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefTableRuntime(
     const RootNamespace & ns)
 {
+    /// A resident runtime is the process's already-held immutable life handle. Hot readers deliberately
+    /// pay no catalog request here: after rebirth the handle may return predecessor bytes or NotFound,
+    /// but its exact physical id can never alias successor bytes. A genuinely fresh logical-name
+    /// admission is the cold path below and resolves the current catalog life before publishing a
+    /// runtime.
     if (const auto current = lookupRefTableRuntime(ns))
     {
         check_fence_or_throw(current->admitted_fence_generation);
+        {
+            std::lock_guard queue_lock(ref_queue_mutex);
+            if (current->removal_admission_closed)
+                return nullptr;
+        }
         if (current->catalog_life_invalidated.load(std::memory_order_acquire)
             || current->superseded_by_remount.load(std::memory_order_acquire))
             throwCasWriteRetryLater(fmt::format(
@@ -584,7 +594,8 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     /// every actor that shares this pool. Validate both the token and the decoded canonical value:
     /// neither a token-reuse defect nor an unrelated catalog write may let a life derived from the
     /// first cut become the first resident runtime. This second GET is deliberately immediately before
-    /// the queue-locked fence/slot recheck in `acquireRefTableRuntime`; the warm path above pays none.
+    /// the queue-locked fence/slot recheck in `acquireRefTableRuntime`; the held-handle warm path above
+    /// pays none.
     const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(backend, layout);
     check_fence_or_throw(admitted_generation);
     const bool catalog_changed
@@ -1820,23 +1831,30 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
+    if (kind == RootMutationKind::DropNamespace)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS namespace '{}': the generic append surface cannot acquire removal ownership; "
+            "use the exact `dropNamespace` lifecycle operation",
+            ns.string());
     const auto rt = acquireMutableRefTableRuntime(ns);
     if (append_after_runtime_capture_hook_for_test)
         append_after_runtime_capture_hook_for_test();
     return appendRefOpsOnRuntime(
-        ns, rt, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
+        ns, rt, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep,
+        /*terminal_removal_authorized=*/false);
 }
 
 
 RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
     std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
-    RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep)
+    RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep,
+    bool terminal_removal_authorized)
 {
     const auto refuse_if_removing = [&]
     {
         std::lock_guard<std::mutex> lock(ref_queue_mutex);
-        if (rt->removal_admission_closed && kind != RootMutationKind::DropNamespace)
+        if (rt->removal_admission_closed && !terminal_removal_authorized)
             throwCasWriteRetryLater(fmt::format(
                 "CAS namespace '{}' is Removing: positive ref mutation admission is closed while "
                 "its terminal fold and catalog removal complete; retry later", ns.string()));
@@ -1859,6 +1877,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     item->build_ops = std::move(build_ops);
     item->origin = origin;
     item->kind = kind;
+    item->terminal_removal_authorized = terminal_removal_authorized;
 
     const auto enqueued_at = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lk(ref_queue_mutex);
@@ -1869,7 +1888,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
         throwCasWriteRetryLater(fmt::format(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id));
-    if (rt->removal_admission_closed && kind != RootMutationKind::DropNamespace)
+    if (rt->removal_admission_closed && !terminal_removal_authorized)
         throwCasWriteRetryLater(fmt::format(
             "CAS namespace '{}' is Removing: positive ref mutation admission is closed while its "
             "terminal fold and catalog removal complete; retry later", ns.string()));
@@ -2826,6 +2845,11 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_id, item_ops,
                                                       chainLinkFor(shape_id, preview_epoch_seal)});
             }
+            if (removal_class && !it->terminal_removal_authorized)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "ref mutation on namespace '{}' attempted `RemoveNamespace` through the generic append "
+                    "surface; only exact catalog removal ownership may append the terminal transaction",
+                    ns.string());
 
             for (const RefOp & op : item_ops)
             {
@@ -3004,6 +3028,51 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
         return (op.kind == RefOpKind::OwnerTransition && op.new_binding.has_value())
             || op.kind == RefOpKind::SetPublishedAt;
     });
+    const bool removal_append = refLogTxnIsRemovalClass(chunk_ops);
+
+    /// The local capability prevents callers from reaching this point through the generic API; the
+    /// durable row is the independent final authority. Re-read it immediately before id allocation so
+    /// a stale exact runtime cannot append a terminal after the catalog life changed, and require the
+    /// positive lane to still be closed under the same queue lock that guards admission.
+    if (removal_append)
+    {
+        try
+        {
+            if (!std::all_of(chunk_survivors.begin(), chunk_survivors.end(),
+                    [](const auto & item) { return item->terminal_removal_authorized; }))
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS namespace removal '{}': terminal chunk lacks exact removal ownership",
+                    ns.string());
+
+            {
+                std::lock_guard queue_lock(ref_queue_mutex);
+                if (!rt->removal_admission_closed)
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS namespace removal '{}': terminal append reached an open positive lane",
+                        ns.string());
+            }
+
+            const uint64_t admitted_generation = rt->admitted_fence_generation;
+            const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);
+            check_fence_or_throw(admitted_generation);
+            catalog.life_index.throwIfAmbiguous("CAS terminal removal append");
+            const auto entry_it = std::find_if(
+                catalog.catalog.entries.begin(), catalog.catalog.entries.end(),
+                [&](const CatalogEntry & entry)
+                {
+                    return entry.ns == ns && entry.incarnation == rt->life.incarnation;
+                });
+            if (entry_it == catalog.catalog.entries.end() || entry_it->state != NsState::Removing)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS namespace removal '{}': terminal append requires its exact catalog life to be Removing",
+                    ns.string());
+        }
+        catch (...)
+        {
+            complete_error(chunk_survivors, std::current_exception());
+            return false;
+        }
+    }
 
     /// The pre-carve seam is above this call, so this is the final catalog admission observation before
     /// id allocation. It closes the cached-runtime window in which another actor publishes `Removing`
@@ -4508,13 +4577,12 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     const auto rt = acquireRefTableRuntime(observed_life, runtime_generation);
     ensureRefTableRecovered(ns, *rt);
     {
-        /// "Repeated API removal observes the cached Removed state and returns success without
-        /// appending a second transaction." A namespace that exists in the catalog but whose ref state
-        /// has no `Live` lifecycle -- nothing was ever committed into it -- takes the same exit: both are
-        /// `Removed` in the representation (see the note on `RefTableState`), and both have nothing to
-        /// remove.
+        /// A real terminal transaction is idempotent. The representation also calls an empty, never-born
+        /// stream `Removed`, but its absent `remove_txn_id` distinguishes that state: a cataloged life may
+        /// already own `_ckpt` or `_files`, so it still needs durable birth+terminal evidence before GC
+        /// may delete its catalog row.
         std::lock_guard lock(rt->state_mutex);
-        if (rt->state.getLifecycle() != RefLifecycle::Live)
+        if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
             return {};
     }
 
@@ -4533,6 +4601,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
 
     const uint64_t admitted_generation = fence_generation_fn();
     std::optional<CatalogEntry> observed_live;
+    if (initial_it->state == NsState::Live)
+        observed_live = *initial_it;
     bool removing_durable = false;
     try
     {
@@ -4631,10 +4701,16 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     appendRefOpsOnRuntime(ns, rt, MutationScope::wholeShard(),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            if (state.getLifecycle() != RefLifecycle::Live)
+            if (state.getLifecycle() != RefLifecycle::Live && state.getRemoveTxnId().has_value())
                 return {};   /// raced: another caller already removed it since our check above
 
             std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+            {
+                RefOp birth;
+                birth.kind = RefOpKind::NamespaceBirth;
+                ops.push_back(std::move(birth));
+            }
             for (const auto [ref_name, row] : state.getCommitted())
             {
                 RefOp op;
@@ -4663,7 +4739,8 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
         /// for THIS call -- and, left enabled, a race: the hoisted sweep runs first and would reclaim an
         /// epoch-stale binding in its OWN transaction, so `state.getPrecommits()` above would already be
         /// missing it and undercount `stats.precommits`. See `appendRefOps`'s doc comment.
-        /*skip_stale_precommit_sweep=*/true);
+        /*skip_stale_precommit_sweep=*/true,
+        /*terminal_removal_authorized=*/true);
 
     /// "After the transaction is durable, it applies the same
     /// operations to memory, cancels local builds, and rejects further ordinary mutations." Reaching here

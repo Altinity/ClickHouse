@@ -1,5 +1,6 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,19 @@ namespace
 PoolPtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 {
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
+}
+
+void drainCompletedNamespaceRemovals(const std::shared_ptr<InMemoryBackend> & backend)
+{
+    PoolConfig config{
+        .pool_prefix = "p",
+        .server_root_id = "gc",
+        .gc_fold_threshold = 1,
+        .gc_fold_max_defer_rounds = 0};
+    auto store = Pool::open(backend, config);
+    Gc gc(store, UInt128{991});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
 }
 
 /// Fails `deleteExact` for one or two designated keys -- either by throwing (a transient backend
@@ -713,13 +727,16 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
     EXPECT_EQ(report.precommits_removed, 1u);
     EXPECT_EQ(report.edge_deltas_emitted, 4u);
 
-    /// Task 4: a clean drain (nothing under staging/roots/manifest-debris here, so `warnings` stays
-    /// empty) removes the pool slot -- a fresh `Pool::openForDecommission` for "victim" is no longer
-    /// possible (`RemovesSlotAndMakesRerunUnknown` proves the BAD_ARGUMENTS shape directly), so a
-    /// "still durably Removed" check can no longer go through a re-opened admin store the way it did
-    /// before Task 4 landed.
-    EXPECT_TRUE(report.warnings.empty());
-    EXPECT_TRUE(report.slot_removed);
+    /// Terminal publication is writer work; exact catalog-row deletion remains GC work. The first
+    /// command therefore keeps the slot as an ownership anchor, and a retry may retire it only after
+    /// GC's next invocation drains the completed `Removing` rows.
+    EXPECT_FALSE(report.warnings.empty());
+    EXPECT_FALSE(report.slot_removed);
+    drainCompletedNamespaceRemovals(backend);
+    const auto retired = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
+    EXPECT_TRUE(retired.warnings.empty());
+    EXPECT_TRUE(retired.slot_removed);
 }
 
 /// Task 2 review finding 1: `makeTableWithRefs`'s precommit seed uses an artificially high
@@ -955,8 +972,8 @@ TEST(CasDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
         << "the failing object is left behind (untouched) so a re-run can retry it";
 }
 
-/// A clean drain removes the mutable slot objects and tombstones the owner anchor. A re-run of the
-/// same `srid` then fails closed instead of silently resuming the explicitly retired identity.
+/// GC owns the completed catalog-row deletion. Once it drains the row, a clean decommission retry
+/// removes the mutable slot objects and tombstones the owner anchor.
 TEST(CasDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -964,8 +981,13 @@ TEST(CasDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
         auto victim = openVictim(backend);
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
     }
-    const auto report = decommissionPoolMember(
+    const auto pending = decommissionPoolMember(
         backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    EXPECT_FALSE(pending.slot_removed);
+    EXPECT_FALSE(pending.warnings.empty());
+    drainCompletedNamespaceRemovals(backend);
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     EXPECT_TRUE(report.slot_removed);
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
@@ -1216,10 +1238,16 @@ TEST(CasDecommission, FailedDrainKeepsSlotThenResumes)
     failing->disarm();
     const auto second = decommissionPoolMember(
         failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
-    EXPECT_TRUE(second.warnings.empty());
-    EXPECT_TRUE(second.slot_removed);
+    EXPECT_FALSE(second.warnings.empty());
+    EXPECT_FALSE(second.slot_removed);
     EXPECT_EQ(second.namespaces_already_removed, 1u);
     EXPECT_EQ(second.mountpoint_objects_removed, 1u);
+
+    drainCompletedNamespaceRemovals(inner);
+    const auto third = decommissionPoolMember(
+        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a3"}, "victim");
+    EXPECT_TRUE(third.warnings.empty());
+    EXPECT_TRUE(third.slot_removed);
 }
 
 /// Task 4 fail-close, manifest-debris variant (review follow-up: the plan's own example only exercises

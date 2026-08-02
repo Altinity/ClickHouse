@@ -5,7 +5,6 @@
 #include <base/types.h>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -27,8 +26,8 @@ namespace DB::Cas
 /// published through the ordinary single-owner `putIfAbsentControlled` path, not a
 /// `putDeterministicArtifact` byte-adoption gate.
 
-/// In-memory ref-table lifecycle. Only `Live` is serializable as a generation-7 snapshot; terminal
-/// state lives in the removal log and fold evidence.
+/// In-memory ref-table lifecycle. Only `Live` is serializable as a generation-8 snapshot; terminal
+/// state lives in the removal log and fold evidence and has no snapshot DTO representation.
 enum class RefLifecycle : uint8_t
 {
     Live = 1,
@@ -48,15 +47,13 @@ struct RefCommittedRow
 
 /// The complete state of one namespace's ref table in one canonical snapshot object. `precommits`
 /// reuses `RefOwnerBinding` from `CasRefWireVocab.h`; every entry's `kind` must be `Precommit`.
-/// Generation 7 serializes only `Live` snapshots and forbids `remove_txn_id`. Both row vectors must
-/// already be strictly sorted by their documented keys, because the codec
+/// Generation 8 serializes only `Live` snapshots. Both row vectors must already be strictly sorted by
+/// their documented keys, because the codec
 /// validates and emits the caller-provided order rather than sorting it.
 struct RefTableSnapshot
 {
     String ns;
     RefTxnId snapshot_id;
-    RefLifecycle lifecycle = RefLifecycle::Live;
-    std::optional<RefTxnId> remove_txn_id;      /// in-memory terminal state only; forbidden on wire
     std::vector<RefCommittedRow> committed;     /// sorted by canonical bytewise ref_name, no duplicates
     std::vector<RefOwnerBinding> precommits;    /// sorted by (ref_name, manifest_ref), no duplicates
 
@@ -70,8 +67,7 @@ inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
 /// Encode to the canonical text (not sealed): the caller compresses via
 /// `sealObject(FormatId::RefSnapshot, …)` on the persist path (Always/`.zst`), and the in-memory
 /// validation / `admits` size-estimate / `fsck` oracle callers use the uncompressed text. Throws
-/// CORRUPTED_DATA on: a zero `snapshot_id`; a non-`Live` lifecycle or `remove_txn_id`; a
-/// non-canonical `ref_name`; an
+/// CORRUPTED_DATA on: a zero `snapshot_id`; a non-canonical `ref_name`; an
 /// out-of-range `manifest_ref`; non-strictly-ascending
 /// `committed` / `precommits`; a `precommits` entry not `Precommit`; or an over-budget object.
 String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
@@ -79,7 +75,8 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
 /// Decode the canonical text (the caller `openObject`s the stored `.zst` first). `expected_ns` /
 /// `expected_snapshot_id` are recovered from the object key; the decoded body must equal them (the
 /// key↔body binding). Throws UNKNOWN_FORMAT_VERSION for a header `v` above this build, CORRUPTED_DATA
-/// for truncation, an unknown lifecycle/owner kind, or any validation failure listed above.
+/// for truncation, a missing/non-`live` lifecycle word, either retired `rte`/`rts` field, an unknown
+/// owner kind, or any validation failure listed above.
 RefTableSnapshot decodeRefTableSnapshot(
     std::string_view data, const String & expected_ns, const RefTxnId & expected_snapshot_id);
 
@@ -93,7 +90,6 @@ size_t precommitRowEncodedSize(const RefOwnerBinding & binding);
 /// Encoded byte size of a snapshot's framing (header + meta line + trailer) for the given metadata and
 /// row count, excluding all row lines. `snapshotFramingSize(...) + Σ committedRowEncodedSize +
 /// Σ precommitRowEncodedSize` equals `encodeRefTableSnapshot(...).size()` exactly.
-size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
-                           const std::optional<RefTxnId> & remove_txn_id, uint64_t row_count);
+size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, uint64_t row_count);
 
 }

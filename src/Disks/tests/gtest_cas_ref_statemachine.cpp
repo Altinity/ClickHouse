@@ -519,6 +519,17 @@ TEST(CasRefStateMachine, RemoveNamespaceAloneOnEmptyTableAccepted)
     EXPECT_EQ(*state.getRemoveTxnId(), (RefTxnId{1, 2}));
 }
 
+TEST(CasRefStateMachine, CatalogedNeverBornLifeAcceptsAtomicEmptyBirthAndRemoval)
+{
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), removeNamespaceOp()}));
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Removed);
+    ASSERT_TRUE(state.getRemoveTxnId().has_value());
+    EXPECT_EQ(*state.getRemoveTxnId(), (RefTxnId{1, 1}));
+    EXPECT_TRUE(state.getCommitted().empty());
+    EXPECT_TRUE(state.getPrecommits().empty());
+}
+
 TEST(CasRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
 {
     RefTableState state;
@@ -652,7 +663,7 @@ TEST(CasRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
 }
 
 /// ===================================================================================
-/// snapshotOf: canonical sort + Removed shape
+/// snapshotOf: canonical sort + terminal-state refusal
 /// ===================================================================================
 
 TEST(CasRefStateMachine, SnapshotOfSortsCommittedAndPrecommits)
@@ -677,18 +688,16 @@ TEST(CasRefStateMachine, SnapshotOfSortsCommittedAndPrecommits)
     EXPECT_EQ(decoded, snap);
 }
 
-TEST(CasRefStateMachine, SnapshotOfRemovedIsEmptyWithRemoveTxnId)
+TEST(CasRefStateMachine, SnapshotOfRefusesTerminalState)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removeNamespaceOp()}));
 
-    const RefTableSnapshot snap = snapshotOf(state, kNs);
-    EXPECT_EQ(snap.lifecycle, RefLifecycle::Removed);
-    ASSERT_TRUE(snap.remove_txn_id.has_value());
-    EXPECT_EQ(*snap.remove_txn_id, (RefTxnId{1, 2}));
-    EXPECT_TRUE(snap.committed.empty());
-    EXPECT_TRUE(snap.precommits.empty());
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Removed);
+    ASSERT_TRUE(state.getRemoveTxnId().has_value());
+    EXPECT_EQ(*state.getRemoveTxnId(), (RefTxnId{1, 2}));
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { snapshotOf(state, kNs); });
 }
 
 /// ===================================================================================
@@ -719,6 +728,17 @@ TEST(CasRefStateMachine, ReplayFromSnapshotPlusTail)
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 }
 
+TEST(CasRefStateMachine, StateFromSnapshotConstructsLiveState)
+{
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+
+    const RefTableState state = stateFromSnapshot(snap);
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_FALSE(state.getRemoveTxnId().has_value());
+}
+
 TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAgainstSnapshot)
 {
     RefTableState built;
@@ -747,7 +767,6 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithDuplicateCommittedNam
     RefTableSnapshot snap;
     snap.ns = kNs;
     snap.snapshot_id = RefTxnId{1, 1};
-    snap.lifecycle = RefLifecycle::Live;
     RefCommittedRow row1;
     row1.ref_name = "a";
     row1.manifest_ref = manifestRef(1, 1, 1);
@@ -765,7 +784,6 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
     RefTableSnapshot snap;
     snap.ns = kNs;
     snap.snapshot_id = RefTxnId{1, 1};
-    snap.lifecycle = RefLifecycle::Live;
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "b", manifestRef(1, 1, 1)});
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "a", manifestRef(1, 2, 1)});
 
@@ -912,7 +930,6 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoCommittedRowsNamingOneManif
     RefTableSnapshot snap;
     snap.ns = kNs;
     snap.snapshot_id = RefTxnId{1, 1};
-    snap.lifecycle = RefLifecycle::Live;
     RefCommittedRow row1;
     row1.ref_name = "a";
     row1.manifest_ref = manifestRef(1, 1, 1);
@@ -933,7 +950,6 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithCommittedAndPrecommitSharingMa
     RefTableSnapshot snap;
     snap.ns = kNs;
     snap.snapshot_id = RefTxnId{1, 1};
-    snap.lifecycle = RefLifecycle::Live;
     RefCommittedRow row;
     row.ref_name = "a";
     row.manifest_ref = manifestRef(1, 1, 1);
@@ -950,7 +966,6 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoPrecommitsSharingManifest)
     RefTableSnapshot snap;
     snap.ns = kNs;
     snap.snapshot_id = RefTxnId{1, 1};
-    snap.lifecycle = RefLifecycle::Live;
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "a", manifestRef(1, 1, 1)});
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "b", manifestRef(1, 1, 1)});
 
@@ -1304,9 +1319,7 @@ TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
     const RefTableSnapshot snap = snapshotOf(state, "");
     const size_t full = encodeRefTableSnapshot(snap).size();
 
-    size_t rebuilt = snapshotFramingSize("", snap.snapshot_id, snap.lifecycle,
-                                         snap.remove_txn_id,
-                                         snap.committed.size() + snap.precommits.size());
+    size_t rebuilt = snapshotFramingSize("", snap.snapshot_id, snap.committed.size() + snap.precommits.size());
     for (const RefCommittedRow & row : snap.committed)
         rebuilt += committedRowEncodedSize(row);
     for (const RefOwnerBinding & pc : snap.precommits)

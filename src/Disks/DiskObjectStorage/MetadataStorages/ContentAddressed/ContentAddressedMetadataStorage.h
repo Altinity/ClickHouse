@@ -191,6 +191,10 @@ public:
     /// by read-only mode or configuration.
     Cas::RoundReport runGarbageCollectionRoundNow();
 
+    /// Coalesce an administrative liveness hint into the existing periodic GC worker. If this disk has
+    /// no running scheduler, the normal operator-visible retry path remains unchanged.
+    void requestGcRoundSoon();
+
     /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
     /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
     /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.

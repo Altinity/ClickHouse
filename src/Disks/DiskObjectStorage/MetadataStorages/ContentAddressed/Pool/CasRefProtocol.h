@@ -314,8 +314,9 @@ private:
 /// `RefTableSnapshot` that never passed through `decodeRefTableSnapshot`, so this round-trips it
 /// through the codec's own `encodeRefTableSnapshot`/`decodeRefTableSnapshot` rather than
 /// re-implementing a second, independently-maintained copy of its validation (sortedness, no
-/// duplicates, canonical names, nonzero ids, `manifest_ref` field validity, lifecycle/remove_txn_id
-/// coupling) that could silently miss a case. Concretely: a hand-built snapshot with two committed
+/// duplicates, canonical names, nonzero ids, and `manifest_ref` field validity) that could silently
+/// miss a case. A decoded snapshot always constructs a `Live` runtime state; terminal lifecycle and
+/// its removal evidence exist only in replayed log state. Concretely: a hand-built snapshot with two committed
 /// rows sharing one `ref_name` would otherwise DROP the second row via `RefCowMap::emplace` below
 /// (same no-overwrite-on-existing-key semantics as `std::map::emplace`) -- the same phantom-alive
 /// class of bug as a promote's silent displacement (see `applyOwnerTransition` above), just reached
@@ -408,17 +409,17 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
 /// and `precommits` sorted by `(ref_name, manifest_ref)` (guaranteed by
 /// `std::set<std::pair<String, ManifestRef>>`'s iteration order, since `ManifestRef::operator<`
 /// matches the tuple order `CasRefSnapshotCodec` itself sorts by). `snapshot_id` is
-/// `state.greatest_applied`; a `Removed` state produces zero rows plus `remove_txn_id`, per spec.
-/// Does not itself enforce that the result is encodable (a never-born state's `snapshot_id` is
-/// `{0, 0}`, which `encodeRefTableSnapshot` already rejects) -- that check already lives in the
-/// codec and need not be duplicated here.
+/// `state.greatest_applied`. A non-`Live` state is terminal replay evidence rather than snapshot
+/// state and is rejected with `CORRUPTED_DATA`. This does not otherwise enforce that the result is
+/// encodable (a never-born state's `snapshot_id` is `{0, 0}`, which `encodeRefTableSnapshot`
+/// already rejects) -- that check already lives in the codec and need not be duplicated here.
 RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 
 /// `TableState = Replay(S_X.state, tail(X))` in one call: starts from `snapshot`
 /// (or the empty/never-born state when absent) and applies every transaction in `tail`, in order, via
 /// `applyRefLogTxn`. A given `snapshot` is revalidated in full -- sortedness, no duplicates, canonical
-/// names, nonzero ids, `manifest_ref` field validity, and lifecycle/remove_txn_id/row-emptiness
-/// coupling, i.e. everything `CasRefSnapshotCodec` already enforces -- because `replay` may be handed
+/// names, nonzero ids, and `manifest_ref` field validity, i.e. everything
+/// `CasRefSnapshotCodec` already enforces -- because `replay` may be handed
 /// a hand-built `RefTableSnapshot` that never passed through `decodeRefTableSnapshot` (`fsck`, most
 /// notably). Every entry of `tail` must also share one `ns` -- with `snapshot`'s `ns` when a snapshot
 /// is given, otherwise with each other. A mismatch (of either kind) throws `CORRUPTED_DATA`: silently

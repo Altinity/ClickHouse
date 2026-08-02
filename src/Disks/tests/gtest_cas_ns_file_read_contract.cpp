@@ -71,9 +71,9 @@ void writeVerbatimThroughDisk(
     buffer->finalize();
 }
 
-/// Replace the current catalog life through the production exact-removal authority. The original
-/// storage deliberately keeps its already-admitted runtime, making subsequent reads stale by design.
-NamespaceLifeId replaceCatalogLife(
+/// Delete the current catalog life through the production exact-removal authority while retaining all
+/// old physical bytes and the original process's already-resident runtime.
+void deleteCatalogLife(
     DB::ContentAddressedMetadataStorage & storage, const NamespaceLifeId & life1)
 {
     Backend & backend = storage.store()->backend();
@@ -113,12 +113,25 @@ NamespaceLifeId replaceCatalogLife(
         throw DB::Exception(
             DB::ErrorCodes::LOGICAL_ERROR, "Failed to delete fixture catalog life '{}'", life1.ns.string());
 
+}
+
+NamespaceLifeId admitReplacementLife(
+    DB::ContentAddressedMetadataStorage & storage, const NamespaceLifeId & life1)
+{
     if (life1.incarnation == kLife2Id)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Fixture life ids unexpectedly collide");
     const NamespaceLifeId life2 = NamespaceLifeId::fromCatalogEntry(life1.ns, kLife2Id);
-    CasRefCatalog::casAdmitEntry(backend, layout, storage.store()->poolConfig().gc_shards, CatalogEntry{
+    CasRefCatalog::casAdmitEntry(
+        storage.store()->backend(), storage.store()->layout(), storage.store()->poolConfig().gc_shards, CatalogEntry{
         .ns = life2.ns, .state = NsState::Live, .incarnation = life2.incarnation});
     return life2;
+}
+
+NamespaceLifeId replaceCatalogLife(
+    DB::ContentAddressedMetadataStorage & storage, const NamespaceLifeId & life1)
+{
+    deleteCatalogLife(storage, life1);
+    return admitReplacementLife(storage, life1);
 }
 
 NamespaceLifeId currentLife(DB::ContentAddressedMetadataStorage & storage)
@@ -132,9 +145,10 @@ NamespaceLifeId currentLife(DB::ContentAddressedMetadataStorage & storage)
 
 }
 
-/// Mutation caught: resolving the namespace name again on each read would return life 2 and expose its
-/// bytes through a reader that was already bound to life 1.
-TEST(CasNamespaceFileReadContract, StaleReaderAfterSameNameRebirthNeverSeesSuccessorBytes)
+/// This storage already holds life 1. Reusing its warm runtime after same-name rebirth is a retained
+/// life-handle operation, not a fresh logical-name admission: it may still see predecessor bytes (or
+/// answer absent), but the opaque physical life id makes successor bytes structurally unreachable.
+TEST(CasNamespaceFileReadContract, HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes)
 {
     DiskFixture fixture = openDiskFixture();
     writeVerbatimThroughDisk(*fixture.storage, kFilePath, "life-1\n");
@@ -142,16 +156,10 @@ TEST(CasNamespaceFileReadContract, StaleReaderAfterSameNameRebirthNeverSeesSucce
     const NamespaceLifeId life2 = replaceCatalogLife(*fixture.storage, life1);
     fixture.storage->store()->putNamespaceFile(life2, kFile, "life-2\n");
 
-    const String life2_key = fixture.storage->store()->layout().namespaceFileKey(life2, kFile);
-    ASSERT_TRUE(std::filesystem::exists(nativeKeyUnder(fixture.object_storage, life2_key)));
-    const auto life2_object = fixture.storage->store()->backend().get(life2_key);
-    ASSERT_TRUE(life2_object.has_value());
-    ASSERT_EQ(life2_object->bytes, "life-2\n");
-
-    const std::optional<String> stale_read = fixture.storage->tryGetInManifestBytes(kFilePath);
-    EXPECT_NE(stale_read, std::optional<String>("life-2\n"));
-    EXPECT_TRUE(!stale_read || *stale_read == "life-1\n")
-        << "a stale reader may retain life 1 or answer absent, but must never cross into life 2";
+    const std::optional<String> held_read = fixture.storage->tryGetInManifestBytes(kFilePath);
+    EXPECT_NE(held_read, std::optional<String>{"life-2\n"});
+    EXPECT_TRUE(!held_read || held_read == std::optional<String>{"life-1\n"});
+    EXPECT_EQ(fixture.storage->store()->getNamespaceFile(life1, kFile), std::optional<String>{"life-1\n"});
 }
 
 /// Mutation caught: capturing only the namespace name and resolving it when the buffer finalizes would

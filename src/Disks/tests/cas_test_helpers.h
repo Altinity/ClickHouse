@@ -1080,7 +1080,6 @@ inline DB::Cas::RefTableSnapshot minimalLiveSnapshot(
     DB::Cas::RefTableSnapshot s;
     s.ns = ns;
     s.snapshot_id = snapshot_id;
-    s.lifecycle = DB::Cas::RefLifecycle::Live;
     s.committed = std::move(committed);
     return s;
 }

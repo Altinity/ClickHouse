@@ -400,6 +400,17 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     snapshot->runOneRoundNow();
 }
 
+void ContentAddressedMetadataStorage::requestGcRoundSoon()
+{
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
+    {
+        std::lock_guard lock(pointer_mutex);
+        snapshot = gc_scheduler;
+    }
+    if (snapshot)
+        snapshot->requestRoundSoon();
+}
+
 std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
 {
     /// A brief pointer_mutex snapshot only -- this must NEVER wait behind gc_scheduler_mutex (an

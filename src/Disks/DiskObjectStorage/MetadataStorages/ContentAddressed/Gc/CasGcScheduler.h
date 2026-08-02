@@ -108,6 +108,11 @@ public:
     /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CONTENT ADDRESSED GC STOP`).
     void stop();
 
+    /// Wake the periodic worker so it starts the next ordinary round promptly. This does not create a
+    /// second execution path: the same worker, lease protocol, and `gc_round_mutex` remain the sole
+    /// scheduled-round authority. Requests coalesce into one boolean while a round is pending.
+    void requestRoundSoon();
+
     /// Test/diagnostics hook: run ONE round synchronously on the caller's thread. Returns the round
     /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
     Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
@@ -191,6 +196,7 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     bool stopping = false;
+    bool round_requested = false;   /// guarded by `mutex`; coalesced external wake request
     ThreadFromGlobalPool thread;
     /// Set by the round worker and read by the heartbeat worker. It is only an in-process hint: the
     /// durable lease remains the authority, and a failed round clears the hint before retrying.

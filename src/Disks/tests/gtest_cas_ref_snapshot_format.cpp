@@ -28,7 +28,6 @@ RefTableSnapshot makeLiveSnapshot()
     RefTableSnapshot s;
     s.ns = "srv1/db/table@cas@";
     s.snapshot_id = RefTxnId{5, 200};
-    s.lifecycle = RefLifecycle::Live;
 
     RefCommittedRow c1;
     c1.ref_name = "all_1_1_0";
@@ -62,6 +61,71 @@ TEST(CasRefSnapshotCodec, RoundTripLive)
     EXPECT_EQ(decoded, s);
 }
 
+TEST(CasRefSnapshotCodec, DecodeRequiresLifecycleField)
+{
+    const RefTableSnapshot s = makeLiveSnapshot();
+    String bytes = encodeRefTableSnapshot(s);
+    const String field = ",\"lc\":\"live\"";
+    const size_t at = bytes.find(field);
+    ASSERT_NE(at, String::npos);
+    bytes.erase(at, field.size());
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
+TEST(CasRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
+{
+    const RefTableSnapshot s = makeLiveSnapshot();
+    String bytes = encodeRefTableSnapshot(s);
+    const String live = "\"lc\":\"live\"";
+    const size_t at = bytes.find(live);
+    ASSERT_NE(at, String::npos);
+    bytes.replace(at, live.size(), "\"lc\":\"removed\"");
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
+TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
+{
+    const RefTableSnapshot s = makeLiveSnapshot();
+    String bytes = encodeRefTableSnapshot(s);
+    const String live = "\"lc\":\"live\"";
+    const size_t at = bytes.find(live);
+    ASSERT_NE(at, String::npos);
+    bytes.replace(at, live.size(), live + ",\"rte\":\"7\"");
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
+TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
+{
+    const RefTableSnapshot s = makeLiveSnapshot();
+    String bytes = encodeRefTableSnapshot(s);
+    const String live = "\"lc\":\"live\"";
+    const size_t at = bytes.find(live);
+    ASSERT_NE(at, String::npos);
+    bytes.replace(at, live.size(), live + ",\"rts\":\"9\"");
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
+TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
+{
+    const RefTableSnapshot s = makeLiveSnapshot();
+    String bytes = encodeRefTableSnapshot(s);
+    const String live = "\"lc\":\"live\"";
+    const size_t at = bytes.find(live);
+    ASSERT_NE(at, String::npos);
+    bytes.replace(at, live.size(), live + ",\"rte\":\"7\",\"rts\":\"9\"");
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
 /// No-tolerance decode pin (codex round-2, finding 3): the `"pl"` (payload) field was removed from the
 /// committed-row wire in stage-1 T12. It is NOT a genuinely-unknown future field the tolerant reader may
 /// skip -- silently discarding a persisted payload would lose data -- so decoding a committed row that
@@ -71,7 +135,6 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
     RefTableSnapshot s;
     s.ns = "ns";
     s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Live;
     RefCommittedRow c;
     c.ref_name = "all_1_1_0";
     c.manifest_ref = manifestRef(5, 10, 1);
@@ -94,25 +157,12 @@ TEST(CasRefSnapshotCodec, RoundTripLiveEmpty)
     RefTableSnapshot s;
     s.ns = "ns";
     s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Live;
 
     const String bytes = encodeRefTableSnapshot(s);
     const RefTableSnapshot decoded = decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id);
     EXPECT_EQ(decoded, s);
     EXPECT_TRUE(decoded.committed.empty());
     EXPECT_TRUE(decoded.precommits.empty());
-    EXPECT_FALSE(decoded.remove_txn_id.has_value());
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsTerminalLifecycle)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{7, 500};
-    s.lifecycle = RefLifecycle::Removed;
-    s.remove_txn_id = RefTxnId{7, 500};
-
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
 TEST(CasRefSnapshotCodec, ByteIdenticalReencode)
@@ -153,7 +203,6 @@ TEST(CasRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
     RefTableSnapshot m;
     m.ns = "ns";
     m.snapshot_id = RefTxnId{5, std::numeric_limits<uint64_t>::max()};
-    m.lifecycle = RefLifecycle::Live;
 
     const String text = encodeRefTableSnapshot(m);
     const RefTableSnapshot back = decodeRefTableSnapshot(text, m.ns, m.snapshot_id);
@@ -170,60 +219,6 @@ TEST(CasRefSnapshotCodec, EncodeRejectsZeroSnapshotId)
     RefTableSnapshot s;
     s.ns = "ns";
     s.snapshot_id = RefTxnId{0, 1};
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsRemovedWithoutRemoveTxnId)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Removed;
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsRemovedWithZeroRemoveTxnId)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Removed;
-    s.remove_txn_id = RefTxnId{0, 0};
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsRemovedWithNonEmptyCommitted)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Removed;
-    s.remove_txn_id = RefTxnId{1, 1};
-    RefCommittedRow row;
-    row.ref_name = "r";
-    row.manifest_ref = manifestRef(1, 1, 1);
-    s.committed.push_back(row);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsRemovedWithNonEmptyPrecommits)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Removed;
-    s.remove_txn_id = RefTxnId{1, 1};
-    s.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 1, 1)});
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
-}
-
-TEST(CasRefSnapshotCodec, EncodeRejectsLiveWithRemoveTxnIdSet)
-{
-    RefTableSnapshot s;
-    s.ns = "ns";
-    s.snapshot_id = RefTxnId{1, 1};
-    s.lifecycle = RefLifecycle::Live;
-    s.remove_txn_id = RefTxnId{1, 1};
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 

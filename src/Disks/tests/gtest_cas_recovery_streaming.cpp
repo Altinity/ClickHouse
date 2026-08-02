@@ -553,7 +553,6 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     RefTableSnapshot base;
     base.ns = ns.string();
     base.snapshot_id = RefTxnId{1, 5};
-    base.lifecycle = RefLifecycle::Live;
     base.committed = {committedRow("c_one", mref(11)), committedRow("c_two", mref(12))};
     base.precommits = {RefOwnerBinding{RefOwnerKind::Precommit, "p_stale", mref(13)}};
     writeRefSnapshotRaw(*backend, layout, base);

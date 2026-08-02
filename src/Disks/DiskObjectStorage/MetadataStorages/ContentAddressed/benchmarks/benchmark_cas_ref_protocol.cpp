@@ -125,7 +125,6 @@ RefTableSnapshot makeSyntheticSnapshot(size_t n)
     RefTableSnapshot snapshot;
     snapshot.ns = "roots/bench";
     snapshot.snapshot_id = RefTxnId{1, 1};
-    snapshot.lifecycle = RefLifecycle::Live;
     for (size_t i = 0; i < n; ++i)
     {
         RefCommittedRow row;

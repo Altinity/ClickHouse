@@ -20,24 +20,6 @@ namespace DB::Cas
 namespace
 {
 
-std::string_view lifecycleToWord(RefLifecycle l)
-{
-    switch (l)
-    {
-        case RefLifecycle::Live:    return "live";
-        case RefLifecycle::Removed:
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "RefTableSnapshot: terminal lifecycle is not serializable in generation 7");
-    }
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown lifecycle {}", static_cast<int>(l));
-}
-
-RefLifecycle lifecycleFromWord(std::string_view w)
-{
-    if (w == "live")    return RefLifecycle::Live;
-    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown lifecycle '{}'", w);
-}
-
 void checkCommittedSorted(const std::vector<RefCommittedRow> & rows)
 {
     for (size_t i = 1; i < rows.size(); ++i)
@@ -60,19 +42,13 @@ void checkPrecommitsSorted(const std::vector<RefOwnerBinding> & rows)
     }
 }
 
-/// Whole-object validation: transaction IDs must be nonzero, only `Live` is serializable, and both row
-/// vectors must be strictly sorted. Applying the same
+/// Whole-object validation: transaction IDs must be nonzero and both row vectors must be strictly
+/// sorted. Applying the same
 /// checks before encoding and after decoding keeps malformed caller state and malformed stored data
 /// subject to the same contract.
 void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
 {
     checkRefTxnIdNonzero(snapshot.snapshot_id, "RefTableSnapshot", "snapshot_id");
-
-    if (snapshot.lifecycle != RefLifecycle::Live)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableSnapshot: terminal lifecycle is not serializable in generation 7");
-    if (snapshot.remove_txn_id)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
 
     checkCommittedSorted(snapshot.committed);
     checkPrecommitsSorted(snapshot.precommits);
@@ -112,7 +88,8 @@ void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
     writeChar('\n', out);
 }
 
-/// The snapshot's header-object meta line (`ns`, `snapshot_id`, and lifecycle). Shared by
+/// The snapshot's header-object meta line (`ns`, `snapshot_id`, and the required generation-8
+/// `lc:"live"` constant). Shared by
 /// `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
 /// byte. Assumes the caller has already validated the snapshot (or is measuring framing only).
 void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
@@ -122,7 +99,7 @@ void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
     writeStringValue(out, snapshot.ns);
     writeRefTxnIdFields(out, first, "we", "rs", snapshot.snapshot_id);
     writeKey(out, "lc", first);
-    writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
+    writeStringValue(out, "live");
     closeObject(out, first);
     writeChar('\n', out);
 }
@@ -186,27 +163,27 @@ RefTableSnapshot decodeRefTableSnapshot(
         bool saw_we = false;
         bool saw_rs = false;
         bool saw_lc = false;
-        std::optional<uint64_t> rte;
-        std::optional<uint64_t> rts;
         String key;
         while (r.nextKey(key))
         {
             if (key == "ns") { snapshot.ns = r.readString(); saw_ns = true; }
             else if (key == "we") { snapshot.snapshot_id.writer_epoch = r.readU64String(); saw_we = true; }
             else if (key == "rs") { snapshot.snapshot_id.ref_sequence = r.readU64String(); saw_rs = true; }
-            else if (key == "lc") { snapshot.lifecycle = lifecycleFromWord(r.readString()); saw_lc = true; }
-            else if (key == "rte") rte = r.readU64String();
-            else if (key == "rts") rts = r.readU64String();
+            else if (key == "lc")
+            {
+                const String lifecycle = r.readString();
+                if (lifecycle != "live")
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "RefTableSnapshot: lifecycle must be exactly 'live', got '{}'", lifecycle);
+                saw_lc = true;
+            }
+            else if (key == "rte" || key == "rts")
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableSnapshot: meta carries retired terminal field '{}'", key);
             else r.skipUnknown(key);
         }
         if (!saw_ns || !saw_we || !saw_rs || !saw_lc)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: meta line missing ns/we/rs/lc");
-        if (rte || rts)
-        {
-            if (!rte || !rts)
-                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: remove_txn_id needs both rte and rts");
-            snapshot.remove_txn_id = RefTxnId{*rte, *rts};
-        }
         if (!meta_buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after meta line");
     }
@@ -312,14 +289,11 @@ size_t precommitRowEncodedSize(const RefOwnerBinding & binding)
     return out.size();
 }
 
-size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
-                           const std::optional<RefTxnId> & remove_txn_id, uint64_t row_count)
+size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, uint64_t row_count)
 {
     RefTableSnapshot meta_only;
     meta_only.ns = ns;
     meta_only.snapshot_id = snapshot_id;
-    meta_only.lifecycle = lifecycle;
-    meta_only.remove_txn_id = remove_txn_id;
 
     CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefSnapshot);

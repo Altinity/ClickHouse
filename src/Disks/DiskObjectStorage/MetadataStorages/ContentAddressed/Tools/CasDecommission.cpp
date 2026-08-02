@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <base/scope_guard.h>
 #include <algorithm>
 #include <chrono>
 #include <limits>
@@ -107,10 +108,19 @@ bool deleteSlotObject(Backend & backend, const String & key, const Token & token
 }
 
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
-                                          const String & victim_srid, const CasEventSink & sink)
+                                          const String & victim_srid, const CasEventSink & sink,
+                                          const std::function<void()> & request_gc_round)
 {
     DecommissionReport report;
     report.srid = victim_srid;
+    bool gc_round_needed = false;
+    /// A namespace may have reached `Removing` before a later namespace fails closed. Preserve the
+    /// already-earned liveness signal on every exit: the callback only wakes the existing serialized
+    /// GC worker and cannot perform catalog work itself.
+    SCOPE_EXIT({
+        if (gc_round_needed && request_gc_round)
+            request_gc_round();
+    });
 
     /// Validate one required immutable ownership cut before impersonating the victim. The admin open
     /// performs its own fresh catalog observation for mount safety, but namespace selection below
@@ -166,7 +176,18 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
         if (selected_entry.state == NsState::Removing)
         {
+            if (!admin->backend().head(admin->layout().refCkptKey(life)).exists)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "ca-decommission: namespace '{}' is Removing but its exact checkpoint is absent; "
+                    "the catalog row remains owned and the victim slot cannot be retired",
+                    ns_str);
+
+            /// `dropNamespace` is the sole terminal writer. On an already-complete removal this is an
+            /// idempotent observation; on a pre-terminal `Removing` life it resumes the exact terminal
+            /// append under the administrative writer fence. Catalog deletion remains GC's job.
+            (void)admin->dropNamespace(life);
             ++report.namespaces_already_removed;
+            gc_round_needed = true;
             continue;
         }
 
@@ -175,6 +196,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         report.committed_refs_removed += stats.committed_refs;
         report.precommits_removed += stats.precommits;
         report.edge_deltas_emitted += stats.committed_refs + stats.precommits;
+        if (selected_entry.state != NsState::Creating)
+            gc_round_needed = true;
 
         EventEmitter{*admin}.emit([&](CasEvent & e)
         {
@@ -218,11 +241,45 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     report.mountpoint_objects_removed += deleteListedPrefix(
         admin->backend(), admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
 
+    /// The catalog, not physical debris, owns the slot-retirement decision. A terminal append only
+    /// moves a row to `Removing`; GC must fold/prune/delete it before the member's ownership anchor can
+    /// disappear. Capture one exact whole-catalog cut after every drain, then revalidate its token and
+    /// canonical value immediately before entering the retirement tail. The administrative claim fences
+    /// the victim writer between those observations.
+    std::optional<CasRefCatalog::Snapshot> retirement_catalog_cut;
+    if (report.warnings.empty())
+    {
+        retirement_catalog_cut = CasRefCatalog::read(admin->backend(), admin->layout());
+        const bool victim_still_owned = std::any_of(
+            retirement_catalog_cut->catalog.entries.begin(), retirement_catalog_cut->catalog.entries.end(),
+            [&](const CatalogEntry & entry)
+            {
+                return entry.ns.string() == victim_srid
+                    || entry.ns.string().starts_with(victim_namespace_prefix);
+            });
+        if (victim_still_owned)
+            report.warnings.push_back(
+                "catalog still owns victim namespaces in Removing/Creating state; GC completion is required "
+                "before slot retirement");
+    }
+
     /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
     /// before `admin.reset()`: graceful close destroys the `Pool`, while the backend must remain alive to
     /// retire the slot objects afterwards.
     const Layout layout = admin->layout();
     const BackendPtr pool_backend = admin->poolBackendPtr();
+    if (report.warnings.empty())
+    {
+        const CasRefCatalog::Snapshot fresh_retirement_catalog
+            = CasRefCatalog::read(admin->backend(), admin->layout());
+        if (!retirement_catalog_cut
+            || fresh_retirement_catalog.token != retirement_catalog_cut->token
+            || fresh_retirement_catalog.catalog != retirement_catalog_cut->catalog)
+        {
+            report.warnings.push_back(
+                "catalog changed after the victim ownership check; refusing slot retirement against a stale cut");
+        }
+    }
     if (report.warnings.empty())
     {
         const String mount_key = layout.mountKey(victim_srid);

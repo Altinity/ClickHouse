@@ -92,6 +92,17 @@ void CasGcScheduler::stop()
     i_am_leader.store(false, std::memory_order_relaxed);
 }
 
+void CasGcScheduler::requestRoundSoon()
+{
+    {
+        std::lock_guard lock(mutex);
+        if (stopping || !thread.joinable())
+            return;
+        round_requested = true;
+    }
+    wake.notify_all();
+}
+
 void CasGcScheduler::onLeaseAcquired()
 {
     i_am_leader.store(true, std::memory_order_relaxed);
@@ -248,8 +259,10 @@ void CasGcScheduler::loop()
     {
         {
             std::unique_lock lock(mutex);
-            if (wake.wait_for(lock, interval, [this] { return stopping; }))
+            wake.wait_for(lock, interval, [this] { return stopping || round_requested; });
+            if (stopping)
                 return;
+            round_requested = false;
         }
         /// rev.7 §3 [C1] + rev.8 §9 item 8: self-exit the pacing loop the moment the pool reaches — or is
         /// being driven toward — ANY terminal state. A NATURAL terminal transition (`VanishedReplaced` after

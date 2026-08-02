@@ -154,16 +154,6 @@ String renderRefCommittedRow(const RefCommittedRow & r)
         .str();
 }
 
-String refLifecycleName(RefLifecycle l)
-{
-    switch (l)
-    {
-        case RefLifecycle::Live: return "Live";
-        case RefLifecycle::Removed: return "Removed";
-    }
-    return "Unknown";
-}
-
 String renderRefTableSnapshot(const RefTableSnapshot & s)
 {
     std::vector<String> committed;
@@ -180,8 +170,7 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("object", jsonEscape("ref_snapshot"))
         .add("ns", jsonEscape(s.ns))
         .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
-        .add("lifecycle", jsonEscape(refLifecycleName(s.lifecycle)))
-        .add("remove_txn_id", s.remove_txn_id ? renderRefTxnIdObj(*s.remove_txn_id) : "null")
+        .add("lifecycle", jsonEscape("Live"))
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
         .str();

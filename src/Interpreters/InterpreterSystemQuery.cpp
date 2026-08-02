@@ -1072,7 +1072,9 @@ BlockIO InterpreterSystemQuery::execute()
             ca->checkNotReadOnly("SYSTEM CONTENT ADDRESSED DROP POOL MEMBER");
 
             const auto & host_store = ca->store();
-            const auto report = Cas::decommissionPoolMember(host_store->poolBackendPtr(), host_store->poolConfig(), query.replica);
+            const auto report = Cas::decommissionPoolMember(
+                host_store->poolBackendPtr(), host_store->poolConfig(), query.replica, {},
+                [ca] { ca->requestGcRoundSoon(); });
 
             /// One-row summary result set (precedent: SYNC_FILESYSTEM_CACHE's MutableColumns/
             /// SourceFromSingleChunk construction above).

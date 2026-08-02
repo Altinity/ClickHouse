@@ -642,6 +642,10 @@ private:
         std::function<std::vector<RefOp>(const RefTableState &)> build_ops;
         RootMutationOrigin origin = RootMutationOrigin::Writer;
         RootMutationKind kind = RootMutationKind::Publish;
+        /// Capability carried only by `dropNamespaceImpl` after it closed the exact runtime's positive
+        /// lane. `RootMutationKind::DropNamespace` is descriptive metadata, not removal authority: the
+        /// public generic append surface accepts that enum and must not thereby gain terminal rights.
+        bool terminal_removal_authorized = false;
         bool done = false;                       /// guarded by ref_queue_mutex
         std::exception_ptr error;                /// guarded by ref_queue_mutex
         RefTxnId committed_id{};                  /// written by the leader before done = true
@@ -806,7 +810,8 @@ private:
     RefTxnId appendRefOpsOnRuntime(
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, MutationScope scope,
         std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
-        RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep);
+        RootMutationOrigin origin, RootMutationKind kind, bool skip_stale_precommit_sweep,
+        bool terminal_removal_authorized);
 
     /// Publishes only from the exact runtime captured by the caller. Background dispatch carries this
     /// pointer across the thread hand-off; it must never resolve the logical name again and accidentally

@@ -376,6 +376,10 @@ public:
     String catalog_replacement_bytes;
     int catalog_resolution_get_fault_count = 0;
     bool catalog_cas_fault_fired = false;
+    /// Fail one selected catalog GET after allowing an exact number of earlier catalog GETs through.
+    /// This reaches the removal lane's post-close observation without faulting its initial discovery.
+    int catalog_gets_before_fault = -1;
+    int catalog_get_fault_count = 0;
 
     String fault_key_substr;
     int fault_count = 0;
@@ -415,6 +419,15 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
+        if (key == catalog_fault_key && catalog_get_fault_count > 0 && catalog_gets_before_fault >= 0)
+        {
+            if (catalog_gets_before_fault == 0)
+            {
+                --catalog_get_fault_count;
+                throw std::runtime_error("RefWriterTestBackend: simulated catalog admission read failure");
+            }
+            --catalog_gets_before_fault;
+        }
         if (catalog_cas_fault_fired && key == catalog_fault_key && catalog_resolution_get_fault_count > 0)
         {
             --catalog_resolution_get_fault_count;
@@ -1008,7 +1021,6 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     DB::Cas::RefTableSnapshot foreign;
     foreign.ns = other_ns.string();
     foreign.snapshot_id = snap_x;
-    foreign.lifecycle = RefLifecycle::Live;
     backend->putIfAbsent(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x),
                          DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign)));
 
@@ -3476,11 +3488,159 @@ TEST(RefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejecte
                 remove_ns_2.kind = RefOpKind::RemoveNamespace;
                 return {remove_ns_1, remove_ns_2};   /// remove_namespace NOT the final op -- malformed
             },
-            RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+            /// Deliberately mislabel the malformed terminal as an ordinary mutation: this bypasses
+            /// the public removal-capability preflight and proves the txn-wide shape check itself
+            /// rejects the object before the later capability check or any backend mutation.
+            RootMutationOrigin::Writer, RootMutationKind::Publish);
     });
 
     EXPECT_EQ(backend->putTotal(), put_before) << "the malformed shape must be rejected before any object is created";
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value()) << "the malformed attempt left no trace on the table";
+}
+
+/// A caller cannot turn the generic append surface into a second namespace-removal capability, even
+/// when it disguises terminal operations as an ordinary mutation kind. Only `dropNamespace` may carry
+/// the exact runtime ownership established by the durable `Live -> Removing` transition.
+TEST(RefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogIsLive)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/unauthorized_terminal"};
+    publishEmptyPart(store, ns, "owned");
+    const CatalogEntry live = catalogEntryOrThrow(*backend, layout, ns);
+    ASSERT_EQ(live.state, NsState::Live);
+    const auto greatest_before = listGreatestLogIdForLifeForTest(
+        *backend, layout, NamespaceLifeId::fromCatalogEntry(ns, live.incarnation));
+    ASSERT_TRUE(greatest_before);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        store->appendRefOps(ns, MutationScope::wholeShard(),
+            [](const RefTableState & state) -> std::vector<RefOp>
+            {
+                std::vector<RefOp> ops;
+                for (const auto [ref_name, row] : state.getCommitted())
+                {
+                    RefOp remove_owner;
+                    remove_owner.kind = RefOpKind::OwnerTransition;
+                    remove_owner.old_binding = RefOwnerBinding{
+                        RefOwnerKind::Committed, ref_name, row.manifest_ref};
+                    ops.push_back(std::move(remove_owner));
+                }
+                RefOp terminal;
+                terminal.kind = RefOpKind::RemoveNamespace;
+                ops.push_back(terminal);
+                return ops;
+            },
+            RootMutationOrigin::Writer, RootMutationKind::Publish,
+            /*skip_stale_precommit_sweep=*/true);
+    });
+
+    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns), live);
+    EXPECT_EQ(listGreatestLogIdForLifeForTest(
+        *backend, layout, NamespaceLifeId::fromCatalogEntry(ns, live.incarnation)), greatest_before)
+        << "an unauthorized terminal must allocate no id and create no ref-log object";
+    EXPECT_TRUE(store->resolveRef(ns, "owned"));
+}
+
+/// The public generic surface must reject the terminal-capable operation kind before resolving or
+/// creating a life. Otherwise an absent name can acquire a catalog row and checkpoint before the
+/// internal terminal capability check rejects the actual operations.
+TEST(RefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurableMutation)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/absent_unauthorized_terminal"};
+    const CasRefCatalog::Snapshot catalog_before = CasRefCatalog::read(*backend, store->layout());
+
+    backend->resetCounts();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        store->appendRefOps(ns, MutationScope::wholeShard(),
+            [](const RefTableState &) -> std::vector<RefOp>
+            {
+                RefOp terminal;
+                terminal.kind = RefOpKind::RemoveNamespace;
+                return {terminal};
+            },
+            RootMutationOrigin::Writer, RootMutationKind::DropNamespace,
+            /*skip_stale_precommit_sweep=*/true);
+    });
+
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+    EXPECT_EQ(backend->deleteTotal(), 0u);
+    const CasRefCatalog::Snapshot catalog_after = CasRefCatalog::read(*backend, store->layout());
+    EXPECT_EQ(catalog_after.token, catalog_before.token);
+    EXPECT_EQ(catalog_after.catalog, catalog_before.catalog);
+    EXPECT_FALSE(store->refTableLifeForTest(ns));
+}
+
+/// A namespace file births a catalog life and checkpoint without necessarily creating a ref stream.
+/// Removing that table must still publish terminal evidence and let GC retire the catalog row.
+TEST(RefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemoval)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.gc_fold_max_defer_rounds = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/files_only"};
+    const NamespaceLifeId life = store->namespaceLife(ns);
+    store->putNamespaceFile(life, "format_version.txt", "1\n");
+    ASSERT_TRUE(backend->list(layout.namespaceStreamPrefix(life), "", 100).keys.empty());
+    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Live);
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+
+    const ListPage terminal_page = backend->list(layout.namespaceStreamPrefix(life), "", 100);
+    ASSERT_EQ(terminal_page.keys.size(), 1u);
+    const auto parsed = layout.parseRefObjectKey(terminal_page.keys.front().key);
+    ASSERT_TRUE(parsed);
+    const auto terminal_body = backend->get(terminal_page.keys.front().key);
+    ASSERT_TRUE(terminal_body);
+    const RefLogTxn terminal = decodeRefLogTxn(
+        openObject(FormatId::RefLog, terminal_body->bytes), ns.string(), parsed->txn_id);
+    ASSERT_EQ(terminal.ops.size(), 2u);
+    EXPECT_EQ(terminal.ops[0].kind, RefOpKind::NamespaceBirth);
+    EXPECT_EQ(terminal.ops[1].kind, RefOpKind::RemoveNamespace);
+
+    Gc gc(store, UInt128{181});
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred);
+    (void)runRegularRoundReclaiming(gc);
+    const RefCatalog after = CasRefCatalog::read(*backend, layout).catalog;
+    EXPECT_TRUE(std::none_of(after.entries.begin(), after.entries.end(), [&](const CatalogEntry & entry)
+    {
+        return entry.ns == ns;
+    }));
+}
+
+/// If the first catalog read after closing the positive lane fails, the catch-side authoritative read
+/// is still allowed to prove the exact original `Live` row and reopen admission.
+TEST(RefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveLane)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/predurable_read_failure"};
+    publishEmptyPart(store, ns, "owned");
+    const CatalogEntry live = catalogEntryOrThrow(*backend, layout, ns);
+
+    backend->catalog_fault_key = layout.refCatalogKey();
+    backend->catalog_gets_before_fault = 1;   /// initial discovery succeeds; post-close observation fails
+    backend->catalog_get_fault_count = 1;
+    EXPECT_THROW(store->dropNamespace(ns), std::runtime_error);
+    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns), live);
+
+    EXPECT_NO_THROW(store->updateRefPublishedAt(ns, "owned", [](RefPublishedAtUpdate & update)
+    {
+        update.published_at_ms = 17;
+    })) << "a fresh exact Live observation must reopen the lane after a pre-durable failure";
+    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Live);
 }
 
 /// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same
@@ -3517,10 +3677,9 @@ TEST(RefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows
     EXPECT_FALSE(store->resolveRef(ns, "committed").has_value()) << "the whole namespace was removed";
 }
 
-/// spec §Namespace Removal (line 667-668): "If the append fails, the namespace remains Live and the
-/// exception propagates." Cancellation must NOT fire on a failed removal append -- the build stays alive
-/// and usable. (Fault the removal transaction's own `_log` PUT so the append wedges and throws.)
-TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespaceLive)
+/// The catalog transition precedes the terminal append. If that append is unresolved, the namespace
+/// remains `Removing`, positive ownership is refused, and a retry of the same removal resolves the wedge.
+TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCompletes)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -3544,11 +3703,19 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
 
-    /// The removal did not apply: the namespace stays Live and its committed ref still resolves.
-    ASSERT_TRUE(store->resolveRef(ns, "committed").has_value()) << "a failed removal leaves the namespace Live";
+    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+    EXPECT_FALSE(store->resolveRef(ns, "committed"))
+        << "a fresh name lookup must not expose a catalog-Removing life";
     /// The build was NOT cancelled: a non-append operation (`stageManifest` -- it never touches the now
     /// wedged ref-append lane) still succeeds; it would throw ABORTED had the build been cancelled.
     EXPECT_NO_THROW(build->stageManifest({}));
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->promote(ns, "inflight", build->buildId(), id);
+    });
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->stageManifest({}); });
 }
 
 /// Cancellation is namespace-scoped: dropping namespace N must not cancel an in-flight build targeting a

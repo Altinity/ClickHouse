@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -16,14 +17,14 @@ namespace DB::Cas
 /// ref edges makes them eligible for ordinary GC, but this operation does not synchronously reclaim
 /// shared content.
 ///
-/// A decommission is resumable. A previous run may already have marked namespaces `Removed`, and a
+/// A decommission is resumable. A previous run may already have moved namespaces to `Removing`, and a
 /// warning means that the corresponding drain was not confirmed. In either case the report lets the
 /// caller distinguish work done by this invocation from work observed from an earlier invocation.
 struct DecommissionReport
 {
     String srid;                                  /// The decommissioned member's `server_root_id`.
     uint64_t namespaces_removed = 0;              /// Namespaces erased by this invocation.
-    uint64_t namespaces_already_removed = 0;      /// Namespaces already marked `Removed` on entry.
+    uint64_t namespaces_already_removed = 0;      /// Namespaces already `Removing` on entry.
     uint64_t committed_refs_removed = 0;          /// Committed ref records removed by namespace drops.
     uint64_t precommits_removed = 0;              /// Precommit records removed by namespace drops.
     uint64_t edge_deltas_emitted = 0;             /// The sum of `committed_refs_removed` and `precommits_removed`.
@@ -38,8 +39,9 @@ struct DecommissionReport
 /// slot as an administrative writer; a live lease is refused, and the claim fences the dead member from
 /// writing while cleanup runs. It then drops each table namespace through `Pool::dropNamespace`, drains
 /// eligible manifest debris, staging objects, and mountpoint objects, and retires the slot only after all
-/// drains are confirmed. Namespace drops are idempotent, so a rerun skips namespaces already marked
-/// `Removed`.
+/// drains are confirmed. Namespace drops are idempotent: a rerun resumes any missing terminal append
+/// and leaves exact catalog-row deletion to GC. The member slot remains while any catalog entry still
+/// belongs to the victim.
 ///
 /// This is a writer operation, not GC: it emits the normal ref-edge deltas and does not invent ref
 /// transitions. Per-object drain failures are recorded in `DecommissionReport::warnings` and leave the
@@ -47,6 +49,7 @@ struct DecommissionReport
 /// as exceptions. When set, `sink` receives `MemberDecommission` audit events for the run's begin,
 /// per-namespace, and end milestones.
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
-                                          const String & victim_srid, const CasEventSink & sink = {});
+                                          const String & victim_srid, const CasEventSink & sink = {},
+                                          const std::function<void()> & request_gc_round = {});
 
 }
