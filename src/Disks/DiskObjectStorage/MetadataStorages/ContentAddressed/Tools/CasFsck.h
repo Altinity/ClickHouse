@@ -49,10 +49,11 @@ enum class FsckClass : uint8_t
                    /// pass; deletion-deriving consumers (`fold`, `zeroInDegree`, `previewDeletes`) still
                    /// fail closed on the same mismatch. ERROR
     /// The two verdicts of the arithmetic ref-stream walk (spec §7). They are about a NAMESPACE, not an
-    /// object, and the `key` of such a row is the ref-log key the walk stopped on.
-    ChainBroken,   /// a ref-log id is absent BELOW a confirmed durable same-epoch id. Ids are dense
-                   /// `1..T` within `(namespace, epoch)` (INV-1), so this is not the end of a stream —
-                   /// a durable record is missing and every transaction above it is unreachable. ERROR
+    /// object; the row's `key` identifies the exact log where the walk stopped or the checkpoint-named
+    /// snapshot base whose required triple could not be validated.
+    ChainBroken,   /// the exact checkpoint authority is durably inconsistent: its required snapshot-base
+                   /// triple is corrupt, or a ref-log id is absent below its confirmed frontier. Ids are
+                   /// dense `1..T` within `(namespace, epoch)` (INV-1), so neither is a stream end. ERROR
     Unchecked,     /// the walk could not prove this namespace's stream EITHER WAY (an unprovable epoch
                    /// crossing, an undecodable body, an oracle that could not replay). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a

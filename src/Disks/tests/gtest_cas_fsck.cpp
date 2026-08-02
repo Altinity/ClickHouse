@@ -150,6 +150,27 @@ private:
     FsckListingMode mode = FsckListingMode::Full;
 };
 
+/// Fail one exact GET without disturbing LIST or any other object read. This keeps the checkpoint
+/// authority stable while proving that fsck distinguishes a transport failure from durable corruption.
+class FailExactGetBackend : public InMemoryBackend
+{
+public:
+    void fail(String key_)
+    {
+        key = std::move(key_);
+    }
+
+    std::optional<GetResult> get(const String & requested_key, Range range) override
+    {
+        if (requested_key == key)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected exact GET failure");
+        return InMemoryBackend::get(requested_key, range);
+    }
+
+private:
+    String key;
+};
+
 /// Publish the exact `_ckpt` authority an ordinary Live test life would have after its first committed
 /// record. Raw ref-log helpers deliberately do not do this: several protocol tests need malformed or
 /// pre-creation states. Fsck tests that exercise a recoverable Live life must make the durable authority
@@ -172,6 +193,38 @@ void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNam
         ? backend.putOverwrite(key, body, current.token)
         : backend.putIfAbsent(key, body);
     ASSERT_EQ(put.outcome, PutOutcome::Done);
+}
+
+void writeFsckCheckpointWithBase(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId base,
+    std::optional<RefTxnId> last_epoch_seal = std::nullopt)
+{
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    ASSERT_EQ(backend.putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = base,
+        .checkpoint_snapshot_id = base,
+        .last_epoch_seal = last_epoch_seal})).outcome, PutOutcome::Done);
+}
+
+void expectCheckpointBaseVerdict(
+    const FsckReport & report, const String & exact_base_key, FsckClass expected_class,
+    std::string_view expected_reason)
+{
+    EXPECT_EQ(report.chain_broken, expected_class == FsckClass::ChainBroken ? 1u : 0u);
+    EXPECT_EQ(report.unchecked, expected_class == FsckClass::Unchecked ? 1u : 0u);
+    EXPECT_EQ(report.clean(), expected_class != FsckClass::ChainBroken);
+
+    size_t matching = 0;
+    for (const FsckObject & object : report.objects)
+    {
+        if (object.cls != expected_class || object.key != exact_base_key)
+            continue;
+        ++matching;
+        ASSERT_EQ(object.reachable_from.size(), 1u);
+        EXPECT_NE(object.reachable_from.front().find(expected_reason), String::npos);
+    }
+    EXPECT_EQ(matching, 1u) << "the checkpoint-base verdict must identify its exact named base and cause";
 }
 
 /// Test-only external catalog writer. It changes the namespace's current logical life after fsck took
@@ -490,11 +543,55 @@ TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
     EXPECT_EQ(report.ref_records_walked, 2u);
 }
 
+/// The checkpoint base is the inclusive frontier, so there is no replay tail in which another hole
+/// could satisfy this test. The missing same-id log itself makes the stable exact authority corrupt.
+/// Mutation caught: mapping every `readCheckpointSnapshotBase` failure to `Unchecked` leaves `clean` true.
+TEST(CasFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing_checkpoint_base_log@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::ChainBroken, "has no matching log");
+}
+
+/// A present, valid non-seal base log rules out a stream hole; only its checkpoint-named same-id
+/// snapshot is absent. Stable exact absence is damage, not lost diagnostic coverage.
+TEST(CasFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing_checkpoint_base_snapshot@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::ChainBroken,
+        "is absent under the supplied immutable lifecycle authority");
+}
+
 /// `_ckpt.checkpoint_snapshot_id` names a state snapshot, never an `EpochSeal`. The forged base is an
 /// OLDER seal, deliberately different from `last_epoch_seal`, so comparing checkpoint metadata cannot
 /// expose it: the stream audit must exact-read the base log and reject it before recovery can bless the
 /// same-id snapshot.
-TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsUnchecked)
+TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -531,10 +628,72 @@ TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsUnchecked)
         .last_epoch_seal = RefTxnId{2, 1}})).outcome, PutOutcome::Done);
 
     const FsckReport report = runFsck(*store, /*detail=*/true);
-    EXPECT_EQ(report.chain_broken, 0u);
-    EXPECT_EQ(report.unchecked, 1u);
     EXPECT_EQ(report.ref_records_walked, 0u)
         << "the seal is rejected as the checkpoint base, not walked as a normal replay record";
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, RefTxnId{1, 2}), FsckClass::ChainBroken,
+        "names an EpochSeal, not a snapshot base");
+}
+
+/// An unstable transport failure while exact-reading the same valid checkpoint base proves neither
+/// presence nor absence. It remains the honest third answer and must not become a hard finding.
+TEST(CasFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
+{
+    auto backend = std::make_shared<FailExactGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint_base_transport@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    RefTableState state;
+    applyRefLogTxn(state, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+    backend->fail(layout.refLogKey(life, base));
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected exact GET failure");
+}
+
+/// The sampled checkpoint is immutable input, but cleanup may advance `_ckpt` after that sample and
+/// retire its old base before fsck exact-reads it. The miss is then authority instability, not evidence
+/// that either durable checkpoint incarnation was internally corrupt.
+/// Mutation caught: classifying `CORRUPTED_DATA` without rechecking the sampled checkpoint token.
+TEST(CasFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint_base_advanced@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId old_base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeFsckCheckpointWithBase(*backend, layout, ns, old_base);
+    backend->armOnFirstGet(layout.refLogKey(life, old_base), [&]
+    {
+        const String ckpt_key = layout.refCkptKey(life);
+        const HeadResult head = backend->head(ckpt_key);
+        ASSERT_TRUE(head.exists);
+        ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = std::nullopt,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt}), head.token).outcome, PutOutcome::Done);
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, old_base), FsckClass::Unchecked,
+        "checkpoint authority changed while validating its snapshot base");
 }
 
 /// A Live catalog row without `_ckpt` is not a recoverable table, even when a listing happens to show a

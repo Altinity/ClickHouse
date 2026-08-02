@@ -27,6 +27,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int TIMEOUT_EXCEEDED;
 }
 }
@@ -337,11 +338,13 @@ struct NsVerdicts
 /// no above-hole listing witness is needed. An epoch seal advances directly to the next epoch's first id,
 /// exactly as authoritative read-only recovery does.
 void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                    const CatalogEntry & catalog_entry, const std::optional<RefCkpt> & checkpoint,
+                    const CatalogEntry & catalog_entry, const std::optional<CkptSample> & checkpoint_sample,
                     const Deadline & deadline, FsckReport & report, NsVerdicts & verdicts)
 {
     checkDeadline(deadline, "ref stream");
     const RootNamespace & ns = life.ns;
+    const std::optional<RefCkpt> checkpoint
+        = checkpoint_sample ? std::optional<RefCkpt>{checkpoint_sample->ckpt} : std::nullopt;
     const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, checkpoint);
     if (grounding.base)
     {
@@ -353,9 +356,44 @@ void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLif
         }
         catch (const Exception & e)
         {
-            verdicts.recordUnchecked(report, ns, layout.refSnapshotKey(life, *grounding.base),
-                "ref stream: checkpoint snapshot base " + renderId(*grounding.base)
-                + " is invalid: " + e.message());
+            const String key = layout.refSnapshotKey(life, *grounding.base);
+            const String note = "ref stream: checkpoint snapshot base " + renderId(*grounding.base)
+                + " is invalid: " + e.message();
+            if (e.code() != ErrorCodes::CORRUPTED_DATA)
+            {
+                verdicts.recordUnchecked(report, ns, key, note);
+                return;
+            }
+
+            /// A concurrent checkpoint advance may retire the sampled base between these exact reads.
+            /// Only the SAME checkpoint incarnation turns a missing/invalid member of its required
+            /// triple into durable corruption. A changed, absent, or unreadable authority proves no
+            /// such thing and remains the honest `Unchecked` answer.
+            checkDeadline(deadline, "checkpoint-base authority revalidation");
+            try
+            {
+                const std::optional<CkptSample> current = readCkpt(backend, layout, life);
+                if (!current || !checkpoint_sample || current->token != checkpoint_sample->token)
+                {
+                    verdicts.recordUnchecked(report, ns, key,
+                        note + "; checkpoint authority changed while validating its snapshot base");
+                    return;
+                }
+            }
+            catch (const Exception & revalidation_error)
+            {
+                verdicts.recordUnchecked(report, ns, key,
+                    note + "; checkpoint authority could not be revalidated: " + revalidation_error.message());
+                return;
+            }
+            catch (...)
+            {
+                verdicts.recordUnchecked(report, ns, key,
+                    note + "; checkpoint authority could not be revalidated");
+                return;
+            }
+
+            verdicts.recordChainBroken(report, ns, key, note);
             return;
         }
     }
@@ -658,9 +696,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             /// One materialized `_ckpt` body is part of this namespace's frozen audit authority. The
             /// recovery API receives exactly these bytes; `checkRefStream` receives the same decoded
             /// value, so the two legs cannot quietly choose different frontiers after a concurrent CAS.
-            std::optional<RefCkpt> checkpoint;
-            if (const std::optional<CkptSample> sampled = readCkpt(backend, layout, life))
-                checkpoint = sampled->ckpt;
+            const std::optional<CkptSample> checkpoint_sample = readCkpt(backend, layout, life);
+            const std::optional<RefCkpt> checkpoint
+                = checkpoint_sample ? std::optional<RefCkpt>{checkpoint_sample->ckpt} : std::nullopt;
             const auto [authority_it, inserted] = recovery_authorities.emplace(
                 ns.string(), FsckRecoveryAuthority{
                     .life = life, .catalog_entry = walk_life.catalog_entry, .checkpoint = checkpoint});
@@ -673,7 +711,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
             /// raise about the same hole.
             checkRefStream(
-                backend, layout, life, walk_life.catalog_entry, checkpoint, deadline, report, verdicts);
+                backend, layout, life, walk_life.catalog_entry, checkpoint_sample, deadline, report, verdicts);
 
             /// LIST can only nominate a performance base. This recovery's finite range comes from the
             /// original catalog row and exact `_ckpt`, never from a self-resolved name or an F+1 probe.
