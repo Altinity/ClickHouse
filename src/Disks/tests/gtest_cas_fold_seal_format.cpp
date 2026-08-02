@@ -6,7 +6,7 @@
 
 using namespace DB::Cas;
 
-namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int LOGICAL_ERROR; }
 
 namespace
 {
@@ -81,6 +81,31 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
         [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, /*gc_shards=*/1); },
         "duplicate blob-target shard");
 }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.blob_target_runs = {
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7}};
+    seal.condemned_summary[0] = CondemnedSummary{};
+    EXPECT_DEATH({ validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
+}
+#else
+TEST(CasFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)
+{
+    const Layout layout("p");
+    CasFoldSeal seal;
+    seal.blob_target_runs = {
+        RunRef{.key = layout.blobTargetRunKey(7, 1, 0, 0), .checksum = UInt128{1}, .shard = 0, .generation = 7},
+        RunRef{.key = layout.blobTargetRunKey(7, 2, 0, 0), .checksum = UInt128{2}, .shard = 0, .generation = 7}};
+    seal.condemned_summary[0] = CondemnedSummary{};
+    cas_battery_detail::expectCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
+}
+#endif
 
 TEST(CasFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryField)
 {

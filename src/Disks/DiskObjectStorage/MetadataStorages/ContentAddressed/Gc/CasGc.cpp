@@ -3106,6 +3106,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// PHASE 11/19 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).
     {
         GcPhaseTimer t(phase_sink, "fold_seal_write");
+        validateFoldSealForWrite(result.fold_seal, layout, store->poolConfig().gc_shards);
         const String seal_body = encodeFoldSeal(result.fold_seal);
         t.metric("seal_bytes", seal_body.size());
         t.metric("seal_runs", result.fold_seal.blob_target_runs.size());
@@ -3390,7 +3391,8 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
     if (const auto got = store->backend().get(store->layout().foldSealKey(generation, attempt)))
-        return decodeFoldSeal(got->bytes, generation);
+        return decodeFoldSeal(
+            got->bytes, store->layout(), store->poolConfig().gc_shards, generation);
     return std::nullopt;
 }
 
@@ -4233,6 +4235,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     uint64_t seal_attempt = 1;
     for (uint64_t a : attempt_of)
         seal_attempt = std::max(seal_attempt, a);
+    validateFoldSealForWrite(seal, layout, gc_shards);
     putDeterministicArtifact(backend, layout.foldSealKey(generation, seal_attempt), encodeFoldSeal(seal));
 
     GcState next = state;
@@ -4407,6 +4410,10 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
         }
 
         GcState current = decodeGcState(got->bytes);
+        if (current.gc_shards != store->poolConfig().gc_shards)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS gc/state gc_shards {} disagrees with the pool-authoritative _pool_meta value {}",
+                current.gc_shards, store->poolConfig().gc_shards);
 
         if (current.lease.owner == gc_id)
         {
