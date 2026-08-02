@@ -860,6 +860,29 @@ inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     return inDegreeInRuns(backend, runsForShard(backend, layout, /*shard*/0), legacyMetaTestRef(hash));
 }
 
+/// The single named entry point for the nonproduction CA shapes this test tree constructs directly,
+/// rather than through the production birth/write paths. Every raw fixture below is one of three
+/// deliberate divergences from what production can ever produce, gathered here under one name so a
+/// future change to any of them has exactly one place to change, not every call site that needs it:
+///   1. `fixtureLife` returns a DETERMINISTIC namespace-derived life identity, never a fresh random
+///      mint the way a real birth (`CasRefCatalog::createNamespace`) would -- opaque and catalog-born
+///      in production, but every raw fixture below needs to derive the SAME identity a namespace's
+///      catalog entry will carry before that entry exists, so its writes and a later read agree on
+///      where to look.
+///   2. `admitLive` reaches `Live` with NO `_ckpt` at all. Production only ever reaches `Live` through
+///      `completeCreation`, which publishes `_ckpt` FIRST; this shape is kept deliberately, because
+///      recovery and failure tests need to exercise a `Live` or `Removing` row missing that authority.
+///   3. `writeRefLogRaw` writes ref-log bytes directly at the resolved fixture identity, bypassing the
+///      writer's own birth/append lane entirely -- exercising the on-storage object shape a real writer
+///      would emit without driving a real writer to produce it.
+namespace fixture
+{
+    inline DB::Cas::NamespaceLifeId fixtureLife(const DB::Cas::RootNamespace & ns)
+    {
+        return DB::Cas::NamespaceLifeId::stageATransition(ns);
+    }
+}
+
 /// Resolve the opaque life id that keys this namespace's single fold-coverage row.
 inline UInt128 catalogLifeIdForTest(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
@@ -895,7 +918,7 @@ inline void seedFoldCursorForTest(
     DB::Cas::RefTxnId cursor, std::optional<DB::Cas::RefHold> hold = std::nullopt,
     uint64_t generation = 1, uint64_t attempt = 1)
 {
-    DB::Cas::NamespaceLifeId life = DB::Cas::NamespaceLifeId::stageATransition(ns);
+    DB::Cas::NamespaceLifeId life = fixture::fixtureLife(ns);
     const DB::Cas::CasRefCatalog::Snapshot catalog_cut = DB::Cas::CasRefCatalog::read(backend, layout);
     const auto catalog_it = std::find_if(
         catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
@@ -905,7 +928,7 @@ inline void seedFoldCursorForTest(
         DB::Cas::CatalogEntry entry;
         entry.ns = ns;
         entry.state = DB::Cas::NsState::Live;
-        entry.incarnation = DB::Cas::NamespaceLifeId::stageATransition(ns).incarnation;
+        entry.incarnation = fixture::fixtureLife(ns).incarnation;
         DB::Cas::CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
         life = DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, entry.incarnation);
     }
@@ -1057,8 +1080,17 @@ inline void casAdmitEntry(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     CatalogEntry entry;
     entry.ns = ns;
     entry.state = NsState::Live;
-    entry.incarnation = NamespaceLifeId::stageATransition(ns).incarnation;
+    entry.incarnation = fixture::fixtureLife(ns).incarnation;
     CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
+}
+
+namespace fixture
+{
+    /// The admit-Live-without-`_ckpt` pattern (divergence 2 above), reachable through the seam.
+    inline void admitLive(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
+    {
+        casAdmitEntry(backend, layout, ns);
+    }
 }
 
 /// Write the checkpoint frontier that makes a raw `Live` fixture a normal recoverable life. Raw logs
@@ -1253,6 +1285,15 @@ inline void writeRefLogTxnRaw(
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
     const String key = layout.refLogKey(life, txn.txn_id);
     backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)));
+}
+
+namespace fixture
+{
+    /// The raw ref-log write pattern (divergence 3 above), reachable through the seam.
+    inline void writeRefLogRaw(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn)
+    {
+        writeRefLogTxnRaw(backend, layout, txn);
+    }
 }
 
 /// A `Live` snapshot naming exactly `committed` (already-sorted-by-ref_name input expected) with no

@@ -225,7 +225,7 @@ TEST(CasNamespaceFileReadContract, ListThroughHeldLifeIssuesZeroCatalogRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr store = openPoolForTest(backend);
-    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"00/ns_file_list_contract@cas@"});
+    const NamespaceLifeId life = fixture::fixtureLife(RootNamespace{"00/ns_file_list_contract@cas@"});
     const String prefix = store->layout().namespaceFilesPrefix(life);
 
     store->putNamespaceFile(life, "a.txt", "a\n");
