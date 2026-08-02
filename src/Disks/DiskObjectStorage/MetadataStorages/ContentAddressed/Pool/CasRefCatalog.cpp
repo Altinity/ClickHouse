@@ -454,6 +454,7 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::completeCreation(
     /// will ever know its genesis epoch -- see `Pool/CasRefCkpt.h`'s `publishCkpt` doc for the merge
     /// discipline this rides on unchanged. `FencedOut` here ends the attempt: nothing durable changed.
     const RefCkpt contribution{.life_epoch = std::optional<uint64_t>{observed.creator->writer_epoch},
+                                .committed_through = std::nullopt,
                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     if (publishCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(observed.ns, observed.incarnation),
                      contribution, admitted_generation, check_fence_or_throw,

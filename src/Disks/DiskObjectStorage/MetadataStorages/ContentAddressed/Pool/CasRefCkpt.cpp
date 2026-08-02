@@ -2,12 +2,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Common/Exception.h>
 #include <algorithm>
+#include <limits>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int INVALID_STATE;
 }
 }
 
@@ -32,6 +34,19 @@ std::optional<T> maxKnown(const std::optional<T> & a, const std::optional<T> & b
         return b;
     if (!b)
         return a;
+    return std::max(*a, *b);
+}
+
+std::optional<RefTxnId> mergeCommittedThrough(const std::optional<RefTxnId> & a, const std::optional<RefTxnId> & b)
+{
+    if (!a)
+        return b;
+    if (!b)
+        return a;
+    if (a->writer_epoch != b->writer_epoch)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS _ckpt: cannot merge committed_through across writer epochs {} and {} without a validated epoch seal",
+            a->writer_epoch, b->writer_epoch);
     return std::max(*a, *b);
 }
 
@@ -107,9 +122,57 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     /// the values it legitimately takes only ever RISE, which is what makes the max right here and what
     /// lets `publishCkpt` refuse the fall separately.)
     merged.life_epoch = maxKnown(a.life_epoch, b.life_epoch);
+    merged.committed_through = mergeCommittedThrough(a.committed_through, b.committed_through);
     merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
     merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
     return merged;
+}
+
+RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
+                                          const std::optional<RefCkpt> & ckpt,
+                                          const std::optional<RefTxnId> & greatest_hinted_snapshot)
+{
+    if (!catalog_state || catalog_state->state == NsState::Creating)
+        throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace is absent or Creating");
+    if (catalog_state->state != NsState::Live && catalog_state->state != NsState::Removing)
+        throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace has an unsupported lifecycle state");
+    if (!ckpt || !ckpt->life_epoch)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery grounding: a Live or Removing namespace requires a readable _ckpt with life_epoch");
+
+    checkRefCkptInvariants(*ckpt, "recovery grounding");
+    RecoveryGrounding result;
+    result.committed_through = ckpt->committed_through;
+    if (!result.committed_through)
+    {
+        if (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery grounding: a checkpoint without committed_through cannot name a snapshot or epoch seal");
+        result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
+        return result;
+    }
+
+    if (ckpt->checkpoint_snapshot_id)
+        result.base = ckpt->checkpoint_snapshot_id;
+    if (greatest_hinted_snapshot)
+    {
+        if (*result.committed_through < *greatest_hinted_snapshot)
+            result.ignored_hinted_snapshot_above_frontier = true;
+        else if (!result.base || *result.base < *greatest_hinted_snapshot)
+            result.base = greatest_hinted_snapshot;
+    }
+    if (result.base)
+    {
+        if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery grounding: checkpoint base has no representable successor");
+        result.walk_from = RefTxnId{result.base->writer_epoch, result.base->ref_sequence + 1};
+    }
+    else
+    {
+        result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
+    }
+    return result;
 }
 
 std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life)

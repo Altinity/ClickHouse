@@ -77,6 +77,10 @@ struct RefCkpt
     /// lower a wrong one: a guess here is permanent. A consumer that NEEDS the genesis epoch (Stage B's
     /// cross-epoch GC fold) must fail closed on `nullopt`, never substitute a floor.
     std::optional<uint64_t> life_epoch;
+    /// The greatest transaction admitted to durable logical history. Absent means this life has no
+    /// committed transaction; a snapshot or epoch seal is then invalid because neither can describe
+    /// history that was never committed.
+    std::optional<RefTxnId> committed_through = std::nullopt;
     /// The snapshot recovery point-reads as its base, and the floor cleanup deletes strictly below.
     /// `nullopt` until this namespace's first snapshot publication commits.
     std::optional<RefTxnId> checkpoint_snapshot_id;
@@ -109,7 +113,8 @@ String encodeRefCkpt(const RefCkpt & ckpt);
 RefCkpt decodeRefCkpt(std::string_view data);
 
 /// The shared field-level validity rule, applied on both encode and decode: every PRESENT field is a
-/// real value -- a set `life_epoch` is nonzero, and a present id has both components nonzero. `what`
+/// real value -- a set `life_epoch` is nonzero, and a present id has both components nonzero. When a
+/// frontier is present, a snapshot or seal may not exceed it. `what`
 /// identifies the direction in the exception message. Exposed so a caller that assembles a `RefCkpt`
 /// from several sources can fail closed before it reaches the wire.
 void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what);

@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCatalogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <cstdint>
 #include <functional>
@@ -10,6 +11,23 @@
 
 namespace DB::Cas
 {
+
+/// The pure, catalog-authoritative input to both recovery entry points. A stream LIST may offer only
+/// `greatest_hinted_snapshot`; it cannot supply a life epoch, frontier, or stopping condition.
+struct RecoveryGrounding
+{
+    std::optional<RefTxnId> base;
+    RefTxnId walk_from;
+    std::optional<RefTxnId> committed_through;
+    bool ignored_hinted_snapshot_above_frontier = false;
+};
+
+/// Choose recovery's finite exact range from catalog lifecycle authority and `_ckpt`. Throws
+/// `INVALID_STATE` for absent/Creating names and `CORRUPTED_DATA` when a Live/Removing life lacks
+/// the checkpoint or genesis fact it must have. This helper performs no I/O and never trusts LIST.
+RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
+                                          const std::optional<RefCkpt> & ckpt,
+                                          const std::optional<RefTxnId> & greatest_hinted_snapshot);
 
 /// THE update and read algorithms for one namespace's `_ckpt` object (spec INV-4). The object itself
 /// and its codec live in `Formats/CasRefCkptFormat.h`; this header is what WRITES it and what a reader

@@ -30,22 +30,33 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
 /// A class BORN after generation 1 begins its history at its birth generation, not at 1. `RefCkpt`
 /// (spec INV-4) was introduced at generation 4: there is no such thing as a generation-1 `_ckpt`, and a
 /// `{1, 1}` baseline would assert that a generation-1 reader could read one. Its history then gained a
-/// two later breaking entries: generation 5 re-keyed it under `<ns>/<incarnation>/`, and generation 6
-/// moved it to opaque life-owned state. Neither change touches the gen-1 baseline. Pinned because the decision is
+/// three later breaking entries: generation 5 re-keyed it under `<ns>/<incarnation>/`, generation 6
+/// moved it to opaque life-owned state, and generation 9 added the exact committed frontier. Neither
+/// change touches the gen-1 baseline. Pinned because the decision is
 /// invisible otherwise — nothing consults `changePoints` at decode time yet, so a wrong entry here
 /// would sit unnoticed until the day a per-class reader floor is wired and starts admitting objects it
 /// should refuse.
 TEST(CasFormat, ChangePointsOfAClassBornAfterGenerationOneStartAtItsBirth)
 {
     const auto cps = changePoints(FormatId::RefCkpt);
-    ASSERT_EQ(cps.size(), 3u);
+    ASSERT_EQ(cps.size(), 4u);
     EXPECT_EQ(cps.front().generation, kContiguousRefStreamsGeneration);
     EXPECT_EQ(cps.front().min_reader, kContiguousRefStreamsGeneration);
     EXPECT_GT(cps.front().generation, 1u) << "the point of this test is that it is NOT the gen-1 baseline";
     EXPECT_EQ(cps[1].generation, kNamespaceLifeKeyedGeneration);
     EXPECT_EQ(cps[1].min_reader, kNamespaceLifeKeyedGeneration);
-    EXPECT_EQ(cps.back().generation, kOpaqueNamespaceLifeLayoutGeneration);
-    EXPECT_EQ(cps.back().min_reader, kOpaqueNamespaceLifeLayoutGeneration);
+    EXPECT_EQ(cps[2].generation, kOpaqueNamespaceLifeLayoutGeneration);
+    EXPECT_EQ(cps[2].min_reader, kOpaqueNamespaceLifeLayoutGeneration);
+    EXPECT_EQ(cps.back().generation, kCommittedRefFrontierGeneration);
+    EXPECT_EQ(cps.back().min_reader, kCommittedRefFrontierGeneration);
+}
+
+TEST(CasFormat, PoolMetaTracksTheRecreateOnlyRecoveryFrontierGeneration)
+{
+    const auto cps = changePoints(FormatId::PoolMeta);
+    ASSERT_EQ(cps.size(), 3u);
+    EXPECT_EQ(cps.back().generation, kCommittedRefFrontierGeneration);
+    EXPECT_EQ(cps.back().min_reader, kCommittedRefFrontierGeneration);
 }
 
 TEST(CasFormat, CurrentVersionsAreGBuild)

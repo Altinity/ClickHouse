@@ -171,7 +171,7 @@ private:
 /// The codec
 /// ---------------------------------------------------------------------------------------------
 
-/// Every combination of the two optionals survives a round trip. Both-absent is the shape a namespace
+/// Every combination of the frontier and existing optionals survives a round trip. Both-absent is the shape a namespace
 /// carries from creation until its first snapshot, so it is a real state and not a degenerate one.
 TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
 {
@@ -180,9 +180,24 @@ TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = std::nullopt},
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
     };
     for (const RefCkpt & ckpt : cases)
         EXPECT_EQ(decodeRefCkpt(encodeRefCkpt(ckpt)), ckpt);
+}
+
+TEST(CasRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
+{
+    const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
+                       .committed_through = RefTxnId{9, 11},
+                       .checkpoint_snapshot_id = RefTxnId{9, 10},
+                       .last_epoch_seal = RefTxnId{8, 12}};
+    const String expected = R"({"type":"cas_ref_ckpt","v":9}
+{"le":"7","cte":"9","cts":"11","cse":"9","css":"10","lse":"8","lss":"12"}
+)";
+
+    EXPECT_EQ(encodeRefCkpt(ckpt), expected);
+    EXPECT_EQ(decodeRefCkpt(expected), ckpt);
 }
 
 /// STRICT means an unknown key is corruption, not something to skip. A `_ckpt` decides deletions, so a
@@ -238,6 +253,9 @@ TEST(CasRefCkpt, RejectsTruncation)
 
     const String other_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","lss":"2"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(other_half); });
+
+    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cte":"1"})" + "\n";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(frontier_half); });
 }
 
 TEST(CasRefCkpt, RejectsTrailingBytes)
@@ -881,7 +899,7 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
     EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "e86dddfa09c364152fb893d776cd6863")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "784e7fd1ae0010f9cffdac1796730070")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }

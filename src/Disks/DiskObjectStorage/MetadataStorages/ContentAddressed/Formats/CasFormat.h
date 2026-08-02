@@ -54,7 +54,10 @@ namespace DB::Cas
 /// Generation 8 persists the creation-time `gc_shards` authority in `_pool_meta`. Generation-7 pools
 /// must be recreated because namespace admission can precede creation of `gc/state`; accepting a
 /// metadata object without this field would leave different openers charging different seal bounds.
-constexpr uint32_t G_BUILD = 8;
+/// Generation 9 adds `_ckpt.committed_through`, the exact recovery frontier. Generation-8 pools
+/// must be recreated: the absence of this field has the incompatible meaning that no transaction has
+/// entered durable logical history.
+constexpr uint32_t G_BUILD = 9;
 
 /// The pool-format generation at which ref-log ids became per-namespace and contiguous. Pool metadata
 /// below this value cannot be opened, because its ref streams carry holes this build reports as
@@ -83,6 +86,9 @@ constexpr uint32_t kUnifiedRefLifeFoldGeneration = 7;
 
 /// The recreate-only generation at which `_pool_meta` became the authority for `gc_shards`.
 constexpr uint32_t kPoolGcShardsGeneration = 8;
+
+/// The recreate-only generation at which `_ckpt` gained its exact committed-transaction frontier.
+constexpr uint32_t kCommittedRefFrontierGeneration = 9;
 
 /// Stable identifiers for every self-describing persisted object class. The text registry uses the
 /// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
