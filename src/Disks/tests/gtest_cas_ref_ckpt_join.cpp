@@ -248,9 +248,19 @@ TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAndPreservesMatchingSeal)
     EXPECT_EQ(mergeCkpt(older, transitioned).committed_through, transitioned.committed_through);
     EXPECT_EQ(mergeCkpt(transitioned, older).committed_through, transitioned.committed_through);
 
+    const RefCkpt advanced{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
+                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 1}};
+    EXPECT_EQ(mergeCkpt(advanced, older).committed_through, advanced.committed_through);
+
     const RefCkpt unsealed{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},
                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     EXPECT_THROW(mergeCkpt(older, unsealed), DB::Exception);
+    const RefCkpt wrong_epoch_seal{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
+                                   .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_THROW(mergeCkpt(older, wrong_epoch_seal), DB::Exception);
+    const RefCkpt seal_above_frontier{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
+                                      .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 6}};
+    EXPECT_THROW(mergeCkpt(older, seal_above_frontier), DB::Exception);
 }
 
 /// THE FIRST OF THE TWO SEQUENCES THAT RAISE `life_epoch` HONESTLY, end to end through the production

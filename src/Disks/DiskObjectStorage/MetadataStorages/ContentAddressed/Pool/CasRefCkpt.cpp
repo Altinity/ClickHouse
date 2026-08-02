@@ -47,9 +47,11 @@ std::optional<RefTxnId> mergeCommittedThrough(const RefCkpt & a, const RefCkpt &
         return std::max(*a.committed_through, *b.committed_through);
 
     const RefCkpt & higher = *a.committed_through < *b.committed_through ? b : a;
-    if (!higher.last_epoch_seal || *higher.last_epoch_seal != *higher.committed_through)
+    if (!higher.last_epoch_seal
+        || higher.last_epoch_seal->writer_epoch != higher.committed_through->writer_epoch
+        || *higher.committed_through < *higher.last_epoch_seal)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS _ckpt: cross-epoch committed_through requires the higher input to seal that exact frontier");
+            "CAS _ckpt: cross-epoch committed_through requires a same-epoch seal at or below the higher frontier");
     return higher.committed_through;
 }
 
