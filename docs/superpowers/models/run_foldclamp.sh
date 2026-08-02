@@ -2,7 +2,8 @@
 # Run every CaRefFoldClampRecoveryCore config and print a one-line PASS/FAIL verdict per config.
 # Model: fold-clamp recoverability (spec 2026-07-11-cas-ref-table-snapshot-log-design.md
 # SS gc-step-produce-manifest-edge-delta transaction atomicity / SS gc-retire) -- per-log staging
-# means a clamp is always recoverable and the post-CAS delete never reclaims an unfolded log's body.
+# means a clamp is always recoverable and the post-CAS delete never reclaims an unfolded log's body;
+# the same round CAS adopts neutral orphan-manifest nominations before exact-token deletion.
 #
 # 2026-07-28: expectations upgraded from bare colours to NAME assertions during the v9 ref-chain TLA
 # phase audit. The old classifier accepted `is violated|Error:` as "violation", so a parse error, a
@@ -14,7 +15,12 @@
 #                                                pre-fix bug) instead of on full log fold: the
 #                                                post-CAS delete reclaims A's body while its log is
 #                                                clamped, and every re-fold clamps forever
-#   safe                -> GREEN                 per-log staging: NoDeleteBehindClamp + EventuallyFolded
+#   sab_deletebeforeadoption -> NominationAdoptedBeforeManifestDelete
+#                                               exact-delete a candidate before gc/state adopts it
+#   sab_nominationcontaminates -> NeutralNominationPreservesRefAccounting
+#                                               send neutral input through B2/unmatched-remove
+#   witness_*           -> WITNESS_*             honest adoption and post-adoption delete are reached
+#   safe                -> GREEN                 per-log staging plus neutral nomination ordering
 #
 # The sabotage breaks BOTH declared properties -- the safety invariant `NoDeleteBehindClamp` and the
 # liveness `EventuallyFolded` (a permanent freeze) -- and the expectation names the invariant because
@@ -35,7 +41,7 @@
 # want a verdict and not the numbers.
 set -uo pipefail
 cd "$(dirname "$0")"
-JAR=../../../tmp/tla2tools.jar
+JAR="${TLC_JAR:-../../../tmp/tla2tools.jar}"
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
 source ./tlc_temporal_gate.sh
 check_tlc_pin "$JAR" || exit 3
@@ -44,6 +50,10 @@ MODULE=CaRefFoldClampRecoveryCore
 # name  expectation(green|violation|temporal)  expected-invariant/property(asserted, not just logged)
 CONFIGS=(
   "sab_edgegranularity  violation  NoDeleteBehindClamp"
+  "sab_deletebeforeadoption violation NominationAdoptedBeforeManifestDelete"
+  "sab_nominationcontaminates violation NeutralNominationPreservesRefAccounting"
+  "witness_nomination_adopted violation WITNESS_NEUTRAL_NOMINATION_ADOPTED"
+  "witness_manifest_deleted violation WITNESS_MANIFEST_DELETE_AFTER_ADOPTION"
   "safe                 green      -"
 )
 check_tlc_temporal_expectations "$JAR" "${CONFIGS[@]}" || exit 4

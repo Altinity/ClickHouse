@@ -10,16 +10,17 @@
    durable log).
 
    MODELED LIFECYCLE:
-     - StartBuild: a build is born Active in the current epoch and durably owns a precommit for
-       its own manifest (Add Precommit, spec: exact binding, build tuple = locally active build).
+     - StartBuild: a build is born Active in the current epoch and attempts a precommit for its own
+       manifest. The every-attempt wedge may report Adopted or remain Unresolved; unresolved means
+       the conditional PUT may already be durable, so the possible owner is modeled explicitly.
      - PromoteBuild: one atomic transaction removes the precommit and installs the committed
        owner (spec Promote: "There is no moment at which the manifest has no owner"). Guarded on
        build.epoch == current_epoch (an old-epoch build can never promote after a Fence).
-     - FailBuild / RemoveFailedPrecommit / RetireFailedBuild: the current writer's own failure path
-       (spec Failed Precommit Cleanup) — "keeps the build active, appends the exact precommit
-       removal, and retires the build only after the log object is durable." Split into two
-       actions on purpose so the wrong order (retire before the removal is durable) is a reachable,
-       toggle-able behavior, not something TLA+ atomicity hides.
+     - FailBuild / ResolveGrant* / RemoveFailedPrecommit / RetireFailedBuild: failure deposits an
+       in-memory cleanup duty while the mount lives. The duty first resolves an uncertain grant;
+       Adopted owes an exact owner removal, Rejected proves none exists, and neither arm may retire
+       while the outcome is uncertain. The steps are split so both wrong retirement orders are
+       reachable, toggle-able behaviors rather than something TLA+ atomicity hides.
      - Fence: a successor mints a new epoch; PromoteBuild's guard freezes every older-epoch build
        in place (no further Fail/Retire either — that machinery belongs to the dead predecessor
        process; only SuccessorCleanupStep may still touch its precommit).
@@ -46,7 +47,9 @@
        owner AFTER namespace removal is the expected teardown, not ownerlessness).
      INV_RETIRE_AFTER_REMOVAL  (I3) — a build is Retired only once its exact precommit removal is
        durable.
-     INV_NAMESPACE_REMOVAL_COMPLETE (I4) — namespaceState = "Removed" implies no owner binding
+     INV_NO_RETIRE_UNCERTAIN_GRANT (I4) — a build is never Retired while its owner-grant outcome
+       remains unresolved.
+     INV_NAMESPACE_REMOVAL_COMPLETE (I5) — namespaceState = "Removed" implies no owner binding
        (precommit or committed) survives, for every build. RemoveNamespace requires zero owners
        durably; CancelBuild running before durability lets a build's binding escape the removal
        transaction's enumeration.
@@ -66,6 +69,8 @@
        cancelled before the removal transaction is durable is excluded from that transaction's
        owner enumeration, so the namespace-removal marks itself Removed while the build's
        precommit remains a durable, never-cleaned owner).
+     SabotageRetireUncertain              (S4) -> INV_NO_RETIRE_UNCERTAIN_GRANT violated (a failed
+       build drops its cleanup duty while the attempted owner PUT may already be durable).
 
    Self-loop NoOp so a fully quiescent terminal state (namespace Removed, no builds left to touch)
    is not a spurious TLC deadlock (house pattern, see CaGcAckFloorCore.tla). *)
@@ -74,29 +79,40 @@ EXTENDS Integers
 CONSTANTS
     Builds, MaxEpoch,
     SabotageRetireBeforeRemoval,           \* S1: retire a Failed build before its removal is durable
+    SabotageRetireUncertain,               \* S4: retire while the owner-grant outcome is unresolved
     SabotageSuccessorRemovesCurrentEpoch,  \* S2: successor cleanup also reclaims epoch == current
     SabotageCancelBeforeRemovalDurable     \* S3: cancel a local build before namespace removal lands
 
 Epochs == 1..MaxEpoch
 BuildStates == {"Unborn", "Active", "Failed", "Retired", "Promoted", "Cancelled"}
+GrantOutcomes == {"None", "Unresolved", "Adopted", "Rejected"}
+GrantRealities == {"None", "Adopted", "Rejected"}
 
 VARIABLES
     currentEpoch,     \* the current writer's fence epoch (Fence only ever increases it)
     namespaceState,    \* "Live" | "Removed" (no recreation in this small model — out of scope here)
     buildEpoch,        \* [Builds -> 0..MaxEpoch]; 0 = not yet started ("Unborn")
     buildState,        \* [Builds -> BuildStates]
+    grantOutcome,      \* [Builds -> GrantOutcomes]; outcome observable by the caller
+    grantReality,      \* [Builds -> GrantRealities]; actual durable result hidden by Unresolved
+    dutyQueued,        \* [Builds -> BOOLEAN]; live-mount cleanup duty awaiting settlement/retirement
+    sawUnresolvedDuty, \* reachability ghost: a failed build was queued while its grant was unresolved
     hasPrecommit,      \* [Builds -> BOOLEAN] durable precommit ownership of this build's manifest
     hasCommitted,      \* [Builds -> BOOLEAN] durable committed ownership, installed only by Promote
     wrongfulReclaim    \* ghost: SuccessorCleanupStep ever reclaimed a still-promotable precommit
 
-vars == << currentEpoch, namespaceState, buildEpoch, buildState, hasPrecommit, hasCommitted,
-           wrongfulReclaim >>
+vars == << currentEpoch, namespaceState, buildEpoch, buildState, grantOutcome, grantReality, dutyQueued,
+           sawUnresolvedDuty, hasPrecommit, hasCommitted, wrongfulReclaim >>
 
 Init ==
     /\ currentEpoch = 1
     /\ namespaceState = "Live"
     /\ buildEpoch = [b \in Builds |-> 0]
     /\ buildState = [b \in Builds |-> "Unborn"]
+    /\ grantOutcome = [b \in Builds |-> "None"]
+    /\ grantReality = [b \in Builds |-> "None"]
+    /\ dutyQueued = [b \in Builds |-> FALSE]
+    /\ sawUnresolvedDuty = [b \in Builds |-> FALSE]
     /\ hasPrecommit = [b \in Builds |-> FALSE]
     /\ hasCommitted = [b \in Builds |-> FALSE]
     /\ wrongfulReclaim = FALSE
@@ -109,8 +125,18 @@ StartBuild(b) ==
     /\ buildState[b] = "Unborn"
     /\ buildEpoch' = [buildEpoch EXCEPT ![b] = currentEpoch]
     /\ buildState' = [buildState EXCEPT ![b] = "Active"]
-    /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = TRUE]
-    /\ UNCHANGED << currentEpoch, namespaceState, hasCommitted, wrongfulReclaim >>
+    /\ \/ /\ grantOutcome' = [grantOutcome EXCEPT ![b] = "Adopted"]
+           /\ grantReality' = [grantReality EXCEPT ![b] = "Adopted"]
+           /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = TRUE]
+       \/ /\ grantOutcome' = [grantOutcome EXCEPT ![b] = "Unresolved"]
+           /\ grantReality' = [grantReality EXCEPT ![b] = "Adopted"]
+           \* An unresolved conditional PUT may already be durable: the dangerous world.
+           /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = TRUE]
+       \/ /\ grantOutcome' = [grantOutcome EXCEPT ![b] = "Unresolved"]
+           /\ grantReality' = [grantReality EXCEPT ![b] = "Rejected"]
+           /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = FALSE]
+    /\ UNCHANGED << currentEpoch, namespaceState, dutyQueued, sawUnresolvedDuty,
+                    hasCommitted, wrongfulReclaim >>
 
 \* Promote: one atomic transaction removes the exact precommit and installs the committed owner —
 \* never a moment with zero owners. Guarded on build.epoch == current_epoch (spec: "promote guarded
@@ -119,11 +145,13 @@ StartBuild(b) ==
 PromoteBuild(b) ==
     /\ buildState[b] = "Active"
     /\ buildEpoch[b] = currentEpoch
+    /\ grantOutcome[b] = "Adopted"
     /\ hasPrecommit[b]
     /\ buildState' = [buildState EXCEPT ![b] = "Promoted"]
     /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = FALSE]
     /\ hasCommitted' = [hasCommitted EXCEPT ![b] = TRUE]
-    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, wrongfulReclaim >>
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, grantOutcome, grantReality, dutyQueued,
+                    sawUnresolvedDuty, wrongfulReclaim >>
 
 \* The current writer observes a failed build: it keeps the build Active (bookkeeping-wise still
 \* holding its precommit) until the removal below is durable.
@@ -131,28 +159,62 @@ FailBuild(b) ==
     /\ buildState[b] = "Active"
     /\ buildEpoch[b] = currentEpoch
     /\ buildState' = [buildState EXCEPT ![b] = "Failed"]
-    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, hasPrecommit, hasCommitted,
-                    wrongfulReclaim >>
+    /\ dutyQueued' = [dutyQueued EXCEPT ![b] = TRUE]
+    /\ sawUnresolvedDuty' = [sawUnresolvedDuty EXCEPT ![b] =
+                                @ \/ grantOutcome[b] = "Unresolved"]
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, grantOutcome, grantReality,
+                    hasPrecommit, hasCommitted, wrongfulReclaim >>
+
+\* The duty queue is the next live-mount caller of the every-attempt wedge. An adopted outcome may
+\* owe an exact owner removal; a rejected outcome proves that no owner survived.
+ResolveGrantAdopted(b) ==
+    /\ buildState[b] = "Failed"
+    /\ buildEpoch[b] = currentEpoch
+    /\ dutyQueued[b]
+    /\ grantOutcome[b] = "Unresolved"
+    /\ grantReality[b] = "Adopted"
+    /\ grantOutcome' = [grantOutcome EXCEPT ![b] = "Adopted"]
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, grantReality, dutyQueued,
+                    sawUnresolvedDuty, hasPrecommit, hasCommitted, wrongfulReclaim >>
+
+ResolveGrantRejected(b) ==
+    /\ buildState[b] = "Failed"
+    /\ buildEpoch[b] = currentEpoch
+    /\ dutyQueued[b]
+    /\ grantOutcome[b] = "Unresolved"
+    /\ grantReality[b] = "Rejected"
+    /\ grantOutcome' = [grantOutcome EXCEPT ![b] = "Rejected"]
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, grantReality, dutyQueued,
+                    sawUnresolvedDuty, hasPrecommit, hasCommitted, wrongfulReclaim >>
 
 \* Durable exact precommit removal for a current-epoch failed build.
 RemoveFailedPrecommit(b) ==
     /\ buildState[b] = "Failed"
     /\ buildEpoch[b] = currentEpoch
+    /\ dutyQueued[b]
+    /\ grantOutcome[b] = "Adopted"
     /\ hasPrecommit[b]
     /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = FALSE]
-    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, hasCommitted,
-                    wrongfulReclaim >>
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, grantOutcome, grantReality,
+                    dutyQueued, sawUnresolvedDuty, hasCommitted, wrongfulReclaim >>
 
 \* Retire only after the removal above is durable (SabotageRetireBeforeRemoval drops that gate: S1).
 RetireFailedBuild(b) ==
     /\ buildState[b] = "Failed"
     /\ buildEpoch[b] = currentEpoch
-    /\ (SabotageRetireBeforeRemoval \/ ~hasPrecommit[b])
+    /\ dutyQueued[b]
+    /\ (SabotageRetireBeforeRemoval \/ ~hasPrecommit[b]
+        \/ (SabotageRetireUncertain /\ grantOutcome[b] = "Unresolved"
+            /\ grantReality[b] = "Adopted"))
+    /\ (SabotageRetireUncertain \/ grantOutcome[b] # "Unresolved")
     /\ buildState' = [buildState EXCEPT ![b] = "Retired"]
-    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, hasPrecommit, hasCommitted,
-                    wrongfulReclaim >>
+    /\ dutyQueued' = [dutyQueued EXCEPT ![b] = FALSE]
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, grantOutcome, grantReality, sawUnresolvedDuty,
+                    hasPrecommit, hasCommitted, wrongfulReclaim >>
 
-CleanupFailedProgress == \E b \in Builds : RemoveFailedPrecommit(b) \/ RetireFailedBuild(b)
+CleanupFailedProgress ==
+    \E b \in Builds : ResolveGrantAdopted(b) \/ ResolveGrantRejected(b)
+                   \/ RemoveFailedPrecommit(b) \/ RetireFailedBuild(b)
 
 (* ---- epoch fencing and successor maintenance ---- *)
 
@@ -163,8 +225,8 @@ CleanupFailedProgress == \E b \in Builds : RemoveFailedPrecommit(b) \/ RetireFai
 Fence ==
     /\ currentEpoch < MaxEpoch
     /\ currentEpoch' = currentEpoch + 1
-    /\ UNCHANGED << namespaceState, buildEpoch, buildState, hasPrecommit, hasCommitted,
-                    wrongfulReclaim >>
+    /\ UNCHANGED << namespaceState, buildEpoch, buildState, grantOutcome, grantReality, dutyQueued,
+                    sawUnresolvedDuty, hasPrecommit, hasCommitted, wrongfulReclaim >>
 
 \* Clean Up Old Precommits: bounded (one binding per step) exact removal of stale bindings.
 \* Honest guard: buildEpoch[b] < currentEpoch (strictly older than the fence). Sabotage widens it
@@ -177,7 +239,8 @@ SuccessorCleanupStep ==
            ELSE buildEpoch[b] < currentEpoch
         /\ hasPrecommit' = [hasPrecommit EXCEPT ![b] = FALSE]
         /\ wrongfulReclaim' = (wrongfulReclaim \/ (buildState[b] = "Active" /\ buildEpoch[b] = currentEpoch))
-        /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, hasCommitted >>
+        /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, buildState, grantOutcome, grantReality,
+                        dutyQueued, sawUnresolvedDuty, hasCommitted >>
 
 (* ---- namespace removal ---- *)
 
@@ -193,7 +256,8 @@ RemoveNamespace ==
        IN /\ hasPrecommit' = [b \in Builds |-> IF b \in toClear THEN FALSE ELSE hasPrecommit[b]]
           /\ hasCommitted' = [b \in Builds |-> IF b \in toClear THEN FALSE ELSE hasCommitted[b]]
     /\ namespaceState' = "Removed"
-    /\ UNCHANGED << currentEpoch, buildEpoch, buildState, wrongfulReclaim >>
+    /\ UNCHANGED << currentEpoch, buildEpoch, buildState, grantOutcome, grantReality, dutyQueued,
+                    sawUnresolvedDuty, wrongfulReclaim >>
 
 \* Local builds cancelled only AFTER the removal transaction above is durable (SabotageCancel
 \* BeforeRemovalDurable drops that gate: S3).
@@ -202,8 +266,8 @@ CancelBuild(b) ==
     /\ buildEpoch[b] = currentEpoch
     /\ (SabotageCancelBeforeRemovalDurable \/ namespaceState = "Removed")
     /\ buildState' = [buildState EXCEPT ![b] = "Cancelled"]
-    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, hasPrecommit, hasCommitted,
-                    wrongfulReclaim >>
+    /\ UNCHANGED << currentEpoch, namespaceState, buildEpoch, grantOutcome, grantReality, dutyQueued,
+                    sawUnresolvedDuty, hasPrecommit, hasCommitted, wrongfulReclaim >>
 
 NoOp == UNCHANGED vars
 
@@ -232,6 +296,14 @@ TypeOK ==
     /\ namespaceState \in {"Live", "Removed"}
     /\ buildEpoch \in [Builds -> 0..MaxEpoch]
     /\ buildState \in [Builds -> BuildStates]
+    /\ grantOutcome \in [Builds -> GrantOutcomes]
+    /\ grantReality \in [Builds -> GrantRealities]
+    /\ \A b \in Builds :
+          /\ grantOutcome[b] = "Adopted" => grantReality[b] = "Adopted"
+          /\ grantOutcome[b] = "Rejected" => grantReality[b] = "Rejected"
+          /\ hasPrecommit[b] => grantReality[b] = "Adopted"
+    /\ dutyQueued \in [Builds -> BOOLEAN]
+    /\ sawUnresolvedDuty \in [Builds -> BOOLEAN]
     /\ hasPrecommit \in [Builds -> BOOLEAN]
     /\ hasCommitted \in [Builds -> BOOLEAN]
     /\ wrongfulReclaim \in BOOLEAN
@@ -249,6 +321,11 @@ INV_PROMOTE_NEVER_OWNERLESS ==
 \* (I3) A build is Retired only once its exact precommit removal is durable.
 INV_RETIRE_AFTER_REMOVAL == \A b \in Builds : buildState[b] = "Retired" => ~hasPrecommit[b]
 
+\* An unresolved grant is a possible durable owner. Retirement is forbidden until the every-attempt
+\* wedge resolves it; the live duty remains queued in the meantime.
+INV_NO_RETIRE_UNCERTAIN_GRANT ==
+    \A b \in Builds : buildState[b] = "Retired" => grantOutcome[b] # "Unresolved"
+
 \* (I4) RemoveNamespace requires zero owners durably: once Removed, no binding survives.
 INV_NAMESPACE_REMOVAL_COMPLETE ==
     namespaceState = "Removed" => \A b \in Builds : ~hasPrecommit[b] /\ ~hasCommitted[b]
@@ -260,5 +337,17 @@ StaleExists == \E b \in Builds : hasPrecommit[b] /\ buildEpoch[b] < currentEpoch
 NoStale == \A b \in Builds : ~(hasPrecommit[b] /\ buildEpoch[b] < currentEpoch)
 
 StalePrecommitEventuallyGone == StaleExists ~> NoStale
+
+(* ---- negated reachability witnesses for both duty-queue resolution arms ---- *)
+
+DutyAdoptDrained ==
+    \E b \in Builds : sawUnresolvedDuty[b] /\ grantOutcome[b] = "Adopted"
+                   /\ buildState[b] = "Retired" /\ ~dutyQueued[b] /\ ~hasPrecommit[b]
+DutyRejectDrained ==
+    \E b \in Builds : sawUnresolvedDuty[b] /\ grantOutcome[b] = "Rejected"
+                   /\ buildState[b] = "Retired" /\ ~dutyQueued[b] /\ ~hasPrecommit[b]
+
+WITNESS_DUTY_ADOPT_DRAIN == ~DutyAdoptDrained
+WITNESS_DUTY_REJECT_DRAIN == ~DutyRejectDrained
 
 =============================================================================

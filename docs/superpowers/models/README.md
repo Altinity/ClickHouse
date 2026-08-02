@@ -117,10 +117,10 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRefCatalogCore.tla` | local namespace lifecycle: create/reconcile safety, fresh opaque life ids, bounded catalog churn, and evidence + no-hold + exact-row authorization for `Removing -> absent` | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_refcatalog.sh` |
 | `CaRefLaneCore.tla` | append-lane ownership plus a bounded two-runtime name-cache composition: real attempt/resolver runtime capture, per-runtime cache/durable projections, immutable `(life_id, admitted_fence_generation)` identity, exact invalidation, accepted post-arm publication, and allocation-free missing-name confirmation | CURRENT (review-hardened 2026-08-01; gates checkpoint 7.5c runtime identity) | `run_reflane.sh` |
 | `CaRefPreFoldDrainCore.tla` | two-GC-actor ordering plus its two-row serial-rescan companion: opaque life id separate from lifecycle state, adopted-parent proof, conclusive identity-exact catalog drain, completed hot LIST, ONE fresh authoritative cut, life-id ref-plan intake, then fold/`REBUILD`/`DEFER`; red-controls consequential stale-cut omission, absent-listed debris deferral, predecessor-proof deletion of successor `Removing`, stale row and stale token independently; witness adopts successor `Removing` while an old request conflicts and predecessor bytes remain LIST-visible; damaged-state `REBUILD` restores authority without deleting catalog rows | CURRENT (amended 2026-08-01; sole owner of cross-object removal order, post-LIST cut provenance, identity-exact admission/deletion and inert-debris classification) | `run_prefold_drain.sh` |
-| `CaRefFoldClampRecoveryCore.tla` | fold clamp always recoverable: per-log cleanup staging | CURRENT | `run_foldclamp.sh` |
+| `CaRefFoldClampRecoveryCore.tla` | recoverable fold clamp plus neutral orphan nomination adopted before exact delete | CURRENT (Task 8A extension 2026-08-02) | `run_foldclamp.sh` |
 | `CaRefNsCleanupStaleLeaderCore.tla` | perpetual janitor: a LIST page captures an exact physical life id, and a delayed delete never re-derives its target from a reborn logical name | CURRENT (re-scoped 2026-08-01; gates the ref-chain implementation) | `run_nscleanup_staleleader.sh` |
 | `CaNamespaceJanitorCursorCore.tla` | perpetual janitor cursor liveness: a suppressed DEFER page retains its cursor, so alternating DEFER/fold rounds cannot phase-lock a dead page out of authorized cleanup | CURRENT (Step 8 scheduling gate) | `run_namespace_janitor_cursor.sh` |
-| `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
+| `CaRefWriterCleanupCore.tla` | writer ownership lifecycle plus unresolved-grant duty queue and retirement guard | CURRENT (Task 8A extension 2026-08-02) | `run_refwcleanup.sh` |
 | `CaRelinkConfirmCore.tla` | publish-then-confirm relink: gate 1 (exact-`ManifestRef` equality, lane quiescence, poison, mount fence) and the publish-before-confirm order, each proven load-bearing — **plus the finding that the theorem is violable independently of the protocol under an honest fold cursor** | CURRENT (gates unlanded Part B; `_main` is CONDITIONAL on `LIST` completeness) | `run_relinkconfirm.sh` |
 | `CaErasureProof.tla` | rev.7 natural `Vanished(erased)` proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found — evidence in the decision to excise the natural-erasure stack from v1 | HISTORICAL (design excised before activation) | `run_erasureproof.sh` |
 | `CaDiskLifecycle.tla` | rev.8 FORGET-only v1 lifecycle: one-way-ness, the as-built `FORGET` protocol (trip#2 sufficiency, earned farewell, first-terminal-wins), the [C1] GC self-exit-on-Vanished, the [M1] intent-bail; Task-15 gate | CURRENT | `run_disklifecycle.sh` |
@@ -314,7 +314,11 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   must stay recoverable: body tokens named by a log's removal records may join the round's cleanup
   set only once the WHOLE log folds, and a clamp discards the log's staged tokens. Committing at
   edge granularity instead deletes a body the clamped log still needs, and every later re-fold
-  then clamps on the missing body — a permanent, pool-wide destructive freeze.
+  then clamps on the missing body — a permanent, pool-wide destructive freeze. Task 8A also uses
+  this model's existing round-CAS boundary for neutral orphan-manifest nomination: exact GET/decode
+  neither consumes a B2 ordinal nor enters unmatched-remove accounting, `CommitRound` adopts the
+  nomination, and exact-token deletion follows adoption. Results:
+  `2026-08-02-stage-b-task8a-RESULTS.md`.
 - **`CaRefNsCleanupStaleLeaderCore.tla`** — the perpetual `cas/ns/` janitor's delayed-delete proof.
   A LIST page captures the physical life id from a returned key, and a later catalog cut nominates
   that id as foreign. The deletion may resume after same-name rebirth, but it still targets the
@@ -325,9 +329,11 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
 - **`CaRefWriterCleanupCore.tla`** — the writer-side ownership lifecycle for one table: a build
   precommits (owns its precommit record), promote atomically removes the precommit and installs
   the committed owner, gated on the current epoch; failed builds are cleaned in the order
-  remove-then-retire; a successor fences a new epoch and removes stale precommits by exact
-  identity, bounded. Invariants: no wrongful reclaim of a live build's objects, promote never
-  leaves a ref ownerless, retire only after removal, namespace removal complete.
+  resolve-grant-then-remove-then-retire; an unresolved every-attempt grant remains an in-memory duty
+  while the mount lives and cannot be retired. A successor fences a new epoch and removes stale
+  precommits by exact identity, bounded. Invariants: no wrongful reclaim of a live build's objects,
+  promote never leaves a ref ownerless, retire only after removal and a certain grant outcome,
+  namespace removal complete. Results: `2026-08-02-stage-b-task8a-RESULTS.md`.
 
 ### Fetch handoff: publish-then-confirm relink {#group-relink-confirm}
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run every CaRefWriterCleanupCore config and print a one-line PASS/FAIL verdict per config.
-# Model: ref-writer cleanup -- failed-precommit removal ordering, successor-epoch reclamation and
-# namespace-removal completeness, with liveness (`StalePrecommitEventuallyGone`) under weak fairness
-# of `SuccessorCleanupStep` and `CleanupFailedProgress` (both are inside `Spec` itself).
+# Model: ref-writer cleanup -- unresolved owner-grant duties, failed-precommit removal ordering,
+# successor-epoch reclamation and namespace-removal completeness, with liveness
+# (`StalePrecommitEventuallyGone`) under weak fairness of `SuccessorCleanupStep` and
+# `CleanupFailedProgress` (both are inside `Spec` itself).
 #
 # 2026-07-28: expectations upgraded from bare colours to NAME assertions during the v9 ref-chain TLA
 # phase audit. The old classifier derived the expectation from the config NAME (`*_sab_*` => expect
@@ -31,7 +32,12 @@
 #                                                                  enumeration, so the namespace
 #                                                                  reaches "Removed" with a durable
 #                                                                  never-cleaned owner behind it
-#   safe                       -> GREEN                            all four safety invariants plus the
+#   sab_retireuncertain        -> INV_NO_RETIRE_UNCERTAIN_GRANT    S4: retire and drop the duty while
+#                                                                  the owner-grant PUT may already
+#                                                                  be durable
+#   witness_duty_adopt/reject  -> WITNESS_*                        both resolution arms reach drained,
+#                                                                  retired duties
+#   safe                       -> GREEN                            all five safety invariants plus the
 #                                                                  liveness property
 #
 # Exits nonzero if any expectation is unmet.
@@ -47,7 +53,7 @@
 # want a verdict and not the numbers.
 set -uo pipefail
 cd "$(dirname "$0")"
-JAR=../../../tmp/tla2tools.jar
+JAR="${TLC_JAR:-../../../tmp/tla2tools.jar}"
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
 source ./tlc_temporal_gate.sh
 check_tlc_pin "$JAR" || exit 3
@@ -56,8 +62,11 @@ MODULE=CaRefWriterCleanupCore
 # name  expectation(green|violation)  expected-invariant(asserted, not just logged)
 CONFIGS=(
   "sab_retirebeforeremoval    violation  INV_RETIRE_AFTER_REMOVAL"
+  "sab_retireuncertain        violation  INV_NO_RETIRE_UNCERTAIN_GRANT"
   "sab_successorcurrentepoch  violation  INV_NO_WRONGFUL_RECLAIM"
   "sab_cancelbeforedurable    violation  INV_NAMESPACE_REMOVAL_COMPLETE"
+  "witness_duty_adopt         violation  WITNESS_DUTY_ADOPT_DRAIN"
+  "witness_duty_reject        violation  WITNESS_DUTY_REJECT_DRAIN"
   "safe                       green      -"
 )
 check_tlc_temporal_expectations "$JAR" "${CONFIGS[@]}" || exit 4
