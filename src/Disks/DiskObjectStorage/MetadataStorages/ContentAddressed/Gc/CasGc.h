@@ -532,6 +532,9 @@ private:
         CasFoldSeal fold_seal;
         std::vector<std::pair<RootNamespace, uint64_t>> root_shards;
         std::map<ManifestId, Token> mf_cleanup;
+        /// Bounded orphan candidates exact-read before reduce. Their source retirements ride this
+        /// fold's runs; their manifest tokens become deletable only after the round CAS adopts them.
+        ManifestSweepResult orphan_sweep;
         /// Ack-floor one-pass round: the retired-cursor outcome per gc-shard (settled entries, new
         /// condemnations, floor-passed pendings, and the prior pendings to delete pre-CAS).
         std::vector<RetiredMergeResult> retired_merge;
@@ -737,12 +740,6 @@ private:
     /// carried a `checkpoint_snapshot_id`) degrades to the cursor/snapshot boundaries alone.
     void cleanupRefObjects(
         const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive);
-
-    /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
-    /// discards cursor progress and must not fail the already-completed GC round. Returns the page's
-    /// counters so the `orphan_sweep` phase row can report what the pass actually did — including the
-    /// §6 premise's per-reason retention classes, which on this path are the only report there is.
-    ManifestSweepResult runManifestSweepCursorPass(GcState & state, Token & state_token);
 
     /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
     /// the pass itself so the phase row and the log line read the SAME counters rather than two

@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <base/types.h>
@@ -123,6 +124,17 @@ struct ManifestSweepResult
     uint64_t retained_unconsumed_seal = 0;
     uint64_t retained_tail_removal = 0;
 
+    /// Exact-GET/decode candidates. The reducer must adopt every `source_retirements` entry before the
+    /// caller may exact-token-delete `key` with `token`.
+    struct Nomination
+    {
+        ManifestId id;
+        String key;
+        Token token;
+        std::vector<BlobSourceRetirement> source_retirements;
+    };
+    std::vector<Nomination> nominations;
+
     /// The reason class that retained the most manifests on this page and how many — the rollup that
     /// answers "why is manifest debris not shrinking?". `{None, 0}` means the premise retained nothing.
     /// Ties resolve to the first class in enum order, which is stable across passes so an unchanged
@@ -173,5 +185,16 @@ ManifestSweepResult sweepManifestCursorPage(
     const String & cursor,
     uint64_t list_budget,
     uint64_t delete_budget);
+
+/// Plan one cursor page without deleting. Every candidate is exact-GET, decoded and identity-validated;
+/// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
+/// Catalog-named namespaces are retain-only unless the caller explicitly supplies a closed recovery
+/// authority (the production recovery path is still LIST-dependent at this stage).
+ManifestSweepResult planManifestCursorPage(
+    Pool & store,
+    const String & cursor,
+    uint64_t list_budget,
+    uint64_t nomination_budget,
+    bool catalog_recovery_authoritative);
 
 }

@@ -163,6 +163,15 @@ static constexpr size_t kBlobDeltaSize = 64;
 static_assert(sizeof(BlobDelta) == kBlobDeltaSize,
               "BlobDelta is the fold's hot per-edge row; growing it is a hot-path change");
 
+/// One orphan-manifest source edge to retire without pretending it came from a ref transaction.
+/// The reducer applies this as an idempotent exact-key removal, but it deliberately consumes no B2
+/// transaction ordinal and an already-absent edge is not an unmatched-remove correctness signal.
+struct BlobSourceRetirement
+{
+    BlobRef ref{};
+    UInt128 source_id{};
+};
+
 /// A blob whose active source-edge set became empty this generation — a retire candidate.
 struct BlobCandidate
 {
@@ -297,7 +306,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               /// that can reach millions of rows, and a `std::function` call there is
                               /// not free. Never read by the merge; write-only. The caller must size it
                               /// to cover every `txn_ordinal` present in `scattered`.
-                              std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr);
+                              std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr,
+                              std::vector<BlobSourceRetirement> source_retirements = {});
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

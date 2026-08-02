@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Common/Exception.h>
@@ -67,6 +68,7 @@ struct ListedManifestObject
 {
     RootNamespace ns;
     BuildPrefix prefix;
+    ManifestRef ref;
     String key;
 };
 
@@ -82,6 +84,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
     return ListedManifestObject{
         .ns = parsed->root_namespace,
         .prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
+        .ref = parsed->ref,
         .key = key};
 }
 
@@ -435,11 +438,12 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     return deleted;
 }
 
-ManifestSweepResult sweepManifestCursorPage(
+ManifestSweepResult planManifestCursorPage(
     Pool & store,
     const String & cursor,
     uint64_t list_budget,
-    uint64_t delete_budget)
+    uint64_t nomination_budget,
+    bool catalog_recovery_authoritative)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -481,7 +485,7 @@ ManifestSweepResult sweepManifestCursorPage(
         /// A budget of ZERO is not exhaustion but a list-only pass: nothing is ever deletable, so
         /// freezing the cursor on it would make the sweep spin on one page forever. That pass keeps
         /// its pre-existing behaviour and advances.
-        if (budget_exhausted || (delete_budget > 0 && result.deleted >= delete_budget))
+        if (budget_exhausted || (nomination_budget > 0 && result.nominations.size() >= nomination_budget))
         {
             budget_exhausted = true;
             ++result.skipped;
@@ -496,7 +500,7 @@ ManifestSweepResult sweepManifestCursorPage(
             continue;
         }
 
-        if (delete_budget == 0)
+        if (nomination_budget == 0)
         {
             /// The list-only pass: examined, not deletable, cursor advances (see the budget rule above).
             ++result.skipped;
@@ -522,6 +526,20 @@ ManifestSweepResult sweepManifestCursorPage(
         if (inserted)
         {
             view_it->second.coverage = coverageOf(adopted_seal, catalog_cut, parsed->ns);
+            const bool catalog_named = std::any_of(
+                catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+                [&](const CatalogEntry & entry) { return entry.ns == parsed->ns; });
+            if (catalog_named && !catalog_recovery_authoritative)
+            {
+                LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                    "CAS orphan sweep: retaining {} -- catalog-named namespace recovery is still "
+                    "LIST-dependent; exact committed frontier is unavailable", parsed->key);
+                errored_namespaces.insert(parsed->ns.string());
+                ++result.retained_no_coverage;
+                ++result.skipped;
+                decided_through = listed.key;
+                continue;
+            }
             /// A corrupt snapshot or invalid transaction means the protection view is unavailable. Skip
             /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try
@@ -578,43 +596,34 @@ ManifestSweepResult sweepManifestCursorPage(
             continue;
         }
 
-        Token token;
-        if (listed.token)
-            token = *listed.token;
-        else
+        /// Exact GET is load-bearing: the token and the bytes used to derive source identities must be
+        /// one observation. A LIST token plus a later GET could mix manifest incarnations.
+        const auto got = backend.get(parsed->key);
+        if (!got)
         {
-            const HeadResult head = backend.head(parsed->key);
-            if (!head.exists)
-            {
-                ++result.skipped;
-                decided_through = listed.key;
-                continue;
-            }
-            token = head.token;
-        }
-
-        const DeleteOutcome outcome = backend.deleteExact(parsed->key, token);
-        const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
-        if (outcome_class == DeleteClass::Deleted)
-            ++result.deleted;
-        else
             ++result.skipped;
-        decided_through = listed.key;
+            decided_through = listed.key;
+            continue;
+        }
+        const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
+        const ManifestId id{parsed->ns, parsed->ref};
+        if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS orphan sweep: manifest identity mismatch at {} while deriving exact source edges",
+                parsed->key);
 
-        /// Every manifest-body deletion emits an audit row. The full raw key is used as `object_hash`, so
-        /// namespace-qualified keys cannot collide when different namespaces use the same manifest-ref
-        /// string.
-        EventEmitter{store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::ManifestDelete;
-            e.namespace_ = parsed->ns.string();
-            e.object_kind = CasEventObjectKind::Manifest;
-            e.object_hash = parsed->key;
-            e.outcome = String{deleteClassName(outcome_class)};
-            e.reason = "orphan-manifest sweep: exact-token delete of an eligible+unowned build-prefix body";
-            e.detail = {{"writer_epoch", std::to_string(parsed->prefix.writer_epoch)},
-                        {"build_sequence", std::to_string(parsed->prefix.build_sequence)}};
-        });
+        ManifestSweepResult::Nomination nomination{
+            .id = id,
+            .key = parsed->key,
+            .token = got->token,
+            .source_retirements = {}};
+        for (const ManifestEntry & entry : body.entries)
+            if (entry.placement == EntryPlacement::Blob)
+                nomination.source_retirements.push_back(BlobSourceRetirement{
+                    .ref = entry.ref,
+                    .source_id = sourceEdgeId(id, entry.path)});
+        result.nominations.push_back(std::move(nomination));
+        decided_through = listed.key;
     }
 
     if (budget_exhausted)
@@ -630,6 +639,25 @@ ManifestSweepResult sweepManifestCursorPage(
 
     result.next_cursor = page.next_cursor;
     result.wrapped = page.next_cursor.empty();
+    return result;
+}
+
+ManifestSweepResult sweepManifestCursorPage(
+    Pool & store,
+    const String & cursor,
+    uint64_t list_budget,
+    uint64_t delete_budget)
+{
+    ManifestSweepResult result = planManifestCursorPage(
+        store, cursor, list_budget, delete_budget, /*catalog_recovery_authoritative=*/true);
+    for (const ManifestSweepResult::Nomination & nomination : result.nominations)
+    {
+        const DeleteOutcome outcome = store.backend().deleteExact(nomination.key, nomination.token);
+        if (classifyDeleteOutcome(outcome) == DeleteClass::Deleted)
+            ++result.deleted;
+        else
+            ++result.skipped;
+    }
     return result;
 }
 

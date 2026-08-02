@@ -1015,8 +1015,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// separates the two costs inside the row.
     std::optional<GcPhaseTimer> round_commit_timer;
     round_commit_timer.emplace(phase_sink, "round_commit");
+    const String manifest_sweep_cursor_before = state.manifest_sweep_cursor;
     GcState next = state;
     next.round = new_round;
+    if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
+        next.manifest_sweep_cursor = folded.orphan_sweep.next_cursor;
     /// The generations the adopted seal's runs physically live in (reference-parent carry can point a
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
@@ -1180,27 +1183,40 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("namespaces_planned", folded.ref_tables.size());
     }
 
-    /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
+    /// Bounded orphan-manifest backstop. The fold already exact-read each candidate, retired its exact
+    /// source edges into the adopted runs and placed cursor progress in the SAME `gc/state` CAS above.
+    /// Only this post-CAS tail may delete candidate bodies.
     /// PHASE 19/19 `orphan_sweep`.
     {
         GcPhaseTimer t(phase_sink, "orphan_sweep");
-        const String sweep_cursor_before = state.manifest_sweep_cursor;
-        /// GATED, and the cursor stays put with it. The sweep decides a body is an orphan from the
-        /// SAME durable watermark/ownership view the fold just failed to prove complete, so an
-        /// unprovable round is exactly the round whose orphan verdicts cannot be trusted. Advancing the
-        /// cursor without sweeping would be worse than not running at all -- the skipped range is never
-        /// revisited -- so the whole pass is skipped, cursor included.
-        ManifestSweepResult sweep;
-        try
+        ManifestSweepResult & sweep = folded.orphan_sweep;
+        for (const ManifestSweepResult::Nomination & nomination : sweep.nominations)
         {
-            if (!suppress_destructive)
-                sweep = runManifestSweepCursorPass(state, state_token);
+            const DeleteOutcome outcome = backend.deleteExact(nomination.key, nomination.token);
+            const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::ManifestDelete;
+                e.namespace_ = nomination.id.root_namespace.string();
+                e.object_kind = CasEventObjectKind::Manifest;
+                e.object_hash = nomination.key;
+                e.token = nomination.token.value;
+                e.round = new_round;
+                e.gen = generation;
+                e.outcome = String{deleteClassName(outcome_class)};
+                e.reason = "orphan-manifest sweep: source edges retired and adopted before exact-token delete";
+            });
+            if (outcome.kind == DeleteOutcome::Kind::TokenMismatch)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS orphan sweep: manifest key {} changed token after exact GET; immutable manifest "
+                    "identity suffered illegal ABA, retained replacement", nomination.key);
+            if (outcome_class == DeleteClass::Deleted)
+                ++sweep.deleted;
+            else
+                ++sweep.skipped;
         }
-        catch (const Exception & e)
-        {
-            LOG_WARNING(logger, "CAS gc orphan sweep skipped this round: {}", e.message());
-        }
-        t.metric("cursor_advanced", state.manifest_sweep_cursor != sweep_cursor_before ? 1 : 0);
+        reportSweepRetention(sweep);
+        t.metric("cursor_advanced", state.manifest_sweep_cursor != manifest_sweep_cursor_before ? 1 : 0);
         t.metric("list_budget_keys", store->poolConfig().manifest_sweep_list_budget_keys);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("listed", sweep.listed);
@@ -2982,11 +2998,27 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 result.frontier_proven, result.frontier_namespaces, universe_note);
     }
 
+    std::vector<BlobSourceRetirement> orphan_source_retirements;
+    if (!suppress_destructive && store->poolConfig().manifest_sweep_list_budget_keys > 0)
+    {
+        result.orphan_sweep = planManifestCursorPage(
+            *store,
+            state.manifest_sweep_cursor,
+            store->poolConfig().manifest_sweep_list_budget_keys,
+            store->poolConfig().manifest_sweep_delete_budget_keys,
+            policy == UniversePolicy::AuthoritativeForTest);
+        for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
+            orphan_source_retirements.insert(
+                orphan_source_retirements.end(),
+                nomination.source_retirements.begin(),
+                nomination.source_retirements.end());
+    }
+
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
         /// folds into one `blobTargetRunKey(new_generation, 0, 0)` run.
-        if (!folded_any && summaryOfParent(0).condemned_total == 0)
+        if (!folded_any && orphan_source_retirements.empty() && summaryOfParent(0).condemned_total == 0)
         {
             /// Pure ref-carry: nothing changed and no condemned entries to settle => zero run I/O. Carry the
             /// parent shard-0 refs + summary into the seal so coverage/resume/graduation stay durable.
@@ -3003,7 +3035,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      current_round, condemn_round, head_blob, peek_head,
                                      confirm_condemned_marker,
                                      result.retired_merge.data(), suppress_destructive,
-                                     &ledger.applied);
+                                     &ledger.applied, std::move(orphan_source_retirements));
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -3021,10 +3053,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         std::vector<std::vector<BlobDelta>> buckets(state.gc_shards);
         for (BlobDelta & d : deltas)
             buckets[blobShard(d.ref, state.gc_shards)].push_back(std::move(d));
+        std::vector<std::vector<BlobSourceRetirement>> retirement_buckets(state.gc_shards);
+        for (BlobSourceRetirement & retirement : orphan_source_retirements)
+            retirement_buckets[blobShard(retirement.ref, state.gc_shards)].push_back(std::move(retirement));
 
         for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         {
-            if (buckets[shard].empty() && summaryOfParent(shard).condemned_total == 0)
+            if (buckets[shard].empty() && retirement_buckets[shard].empty()
+                && summaryOfParent(shard).condemned_total == 0)
             {
                 /// Pure ref-carry for this shard: empty delta + no condemned entries => zero run I/O.
                 carryParentRefs(shard);
@@ -3033,15 +3069,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             }
             /// A reducer owns exactly one disjoint shard. Two replicas may run reducers for DIFFERENT
             /// shards concurrently (CasGcScheduler ownership); their run-key namespaces never collide.
-            ShardReducer reducer{shard, state.gc_shards};
-            std::vector<RunRef> shard_runs =
-                reducer.reduce(backend, layout, priorRunsFor(shard),
-                               new_generation, attempt,
-                               std::move(buckets[shard]),
-                               current_round, condemn_round, head_blob, peek_head,
-                               confirm_condemned_marker,
-                               &result.retired_merge[shard], suppress_destructive,
-                               &ledger.applied);
+            std::vector<RunRef> shard_runs;
+            foldDeltasIntoGeneration(
+                backend, layout, priorRunsFor(shard), new_generation, attempt, shard,
+                std::move(buckets[shard]), shard_runs,
+                current_round, condemn_round, head_blob, peek_head,
+                confirm_condemned_marker,
+                &result.retired_merge[shard], suppress_destructive,
+                &ledger.applied, std::move(retirement_buckets[shard]));
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
@@ -3168,40 +3203,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// evaporates at that one CAS; its attempt-scoped artifacts are never adopted.
     state.snap_generation = new_generation;
     state.snap_attempt = attempt;
-    return result;
-}
-
-ManifestSweepResult Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
-{
-    const uint64_t list_budget = store->poolConfig().manifest_sweep_list_budget_keys;
-    if (list_budget == 0)
-        return {};
-
-    const uint64_t delete_budget = store->poolConfig().manifest_sweep_delete_budget_keys;
-    const ManifestSweepResult result = sweepManifestCursorPage(
-        *store, state.manifest_sweep_cursor, list_budget, delete_budget);
-
-    /// THE RETENTION ROLLUP, before any cursor bookkeeping, because it must be reported whether or not
-    /// the cursor moved: a pass that retains everything it examined legitimately leaves the cursor
-    /// where it was, and that is exactly the pass an operator most needs to hear about.
-    reportSweepRetention(result);
-
-    if (result.next_cursor == state.manifest_sweep_cursor)
-        return result;
-
-    GcState next = state;
-    next.manifest_sweep_cursor = result.next_cursor;
-    const CasResult res = store->backend().casPut(store->layout().gcStateKey(), encodeGcState(next), state_token);
-    if (res.outcome == CasOutcome::Committed)
-    {
-        state = std::move(next);
-        state_token = res.token;
-        return result;
-    }
-
-    LOG_DEBUG(logger,
-        "CAS gc orphan sweep cursor progress discarded because gc/state moved (listed {}, deleted {}, skipped {})",
-        result.listed, result.deleted, result.skipped);
     return result;
 }
 

@@ -362,7 +362,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive,
-                              std::vector<uint8_t> * out_applied_by_txn_ordinal)
+                              std::vector<uint8_t> * out_applied_by_txn_ordinal,
+                              std::vector<BlobSourceRetirement> source_retirements)
 {
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
@@ -380,6 +381,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             if (a.ref != b.ref) return a.ref < b.ref;
             return a.source_id < b.source_id;
         });
+    std::sort(source_retirements.begin(), source_retirements.end(),
+        [](const BlobSourceRetirement & a, const BlobSourceRetirement & b)
+        {
+            if (a.ref != b.ref) return a.ref < b.ref;
+            return a.source_id < b.source_id;
+        });
 
     PriorEdgeCursor cursor(backend, prior_runs);
 
@@ -393,6 +400,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     // absent), settle each blob's carried retired row against its post-merge in-degree at close-out, and
     // re-emit the surviving retired rows / zero-transition markers. O(block) IO + O(1) per current blob.
     size_t di = 0;
+    size_t ri = 0;
     BlobRef cur_blob{};
     bool have_blob = false;
     uint64_t cur_edges = 0;              // surviving edges of cur_blob so far
@@ -572,7 +580,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
     };
 
-    while (cursor.valid() || di < scattered.size())
+    while (cursor.valid() || di < scattered.size() || ri < source_retirements.size())
     {
         // Pick the smallest row key across the prior-run cursor and this round's deltas.
         String key;
@@ -582,6 +590,11 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         {
             const String dk = SourceEdgeKeyCodec::key(scattered[di].ref, scattered[di].source_id);
             if (!from_prior || dk < key) { key = dk; from_prior = false; }
+        }
+        if (ri < source_retirements.size())
+        {
+            const String rk = SourceEdgeKeyCodec::key(source_retirements[ri].ref, source_retirements[ri].source_id);
+            if ((!from_prior && key.empty()) || rk < key) { key = rk; from_prior = false; }
         }
 
         BlobRef blob_ref;
@@ -626,6 +639,17 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
             ++di;
+        }
+
+        /// Orphan nomination retires this exact manifest-source identity after ordinary ref deltas at
+        /// the same key. It is accounting-neutral: absence is an idempotent no-op, not an unmatched
+        /// ref removal, and there is no transaction ordinal to mark in B2's apply ledger.
+        while (ri < source_retirements.size()
+               && source_retirements[ri].ref == blob_ref && source_retirements[ri].source_id == source_id)
+        {
+            present = false;
+            cur_touched = true;
+            ++ri;
         }
 
         if (present)
