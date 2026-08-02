@@ -1419,8 +1419,9 @@ barrier. `2a5bb563b26`, `8fb37da10b0`, `95ae0d54a54` and `54aa4812450` then sepa
 reconciliation, immutable round plans and life runtimes, and leak-only maintenance state before
 `111bb12a407` added the perpetual janitor. The lifecycle-cleanup chain through `224aacd8eb9` retired
 the special removal machinery, and `765c50b7cb93` closed the final stale-prose and post-fold
-unreadable-terminal observability residuals. The focused residual gate passes 21/21; the previously
-final full CA gate passes 1929/1929 and the two object-storage selectors pass 3/3. The Task 5 audit
+unreadable-terminal observability residuals. The focused residual gate passes 21/21; the Task 5 branch
+gate passed 1929/1929, and merge commit `78cf06456d3` records the post-merge 1930/1930 gate; the
+two object-storage selectors pass 3/3. The Task 5 audit
 found no remaining implementation or model obligation. A symmetric direct regression for the
 exact-delete exception branch remains a minor test-strengthening follow-up; the implementation is
 already symmetric and nonblocking, so it does not reopen Task 5.
@@ -1868,6 +1869,12 @@ behavior-preserving mechanical split of the large translation units after the pe
 
 ### Task 5b: `chooseRecoveryGrounding` — recovery becomes LIST-independent {#task-5b}
 
+**Execution status, 2026-08-02: COMPLETE.** The model checkpoint is `c863cdd7fa60`, the production
+baseline is `357cf7b963f4`, and the review-closing chain ends at `613faf8166e`; `ee9e84d855e` records
+the closure. The branch gate passed 1929/1929 with two disabled tests, both required S3 selectors
+passed 3/3, and merge commit `78cf06456d3` records the post-merge 1930/1930 gate. No Task 5b debt
+remains open.
+
 [Directive design change 3 + implementation improvement 2 = amendment commit 6. **This is the task
 that kills `[RECOVER-REF-TABLE-LIST-RESIDUAL]`** — the BACKLOG residual Task 0 Step 3 registered as a
 Task 7b PRECONDITION, guarded by two capstone sentinels deliberately written to go RED when it dies.
@@ -2207,6 +2214,13 @@ change with a hard ordering obligation attached.]
   `ca: ref — tryPublishSnapshotAndAdvanceCheckpointOnce: the name states both durable effects`.
 
 ### Task 7: R5 — decommission duties {#task-7}
+
+**Execution status, 2026-08-02: IMPLEMENTATION PRESENT, CLOSURE NOT YET EVIDENCED.**
+`224aacd8eb9` implements catalog-exact decommission and its focused tests, but the plan-required
+red-first record and a post-`224aacd8eb9`, Task-7-specific
+`test_content_addressed_drop_pool_member` lane result are not recorded. The older Stage-A 2/2 result
+predates this implementation and is not closure evidence.
+The steps below therefore remain unchecked; resume at evidence/gate closure, not by reimplementing R5.
 
 **Carried code residues from the Task 1c review** (prose findings from that review went to
 `docs/superpowers/cas/deferred-docs-fixes.md` instead; these three are executing defects, so they
@@ -2548,6 +2562,12 @@ in scope precisely because leaving it invites a revert.
 
 ### Task 8: R2+R3 — writer duty queue + orphan nomination, one coherent change {#task-8}
 
+**Execution status, 2026-08-02: MODEL GATE COMPLETE; PRODUCTION IMPLEMENTATION PRESENT; TASK NOT
+CLOSED.** The model phase is `d34aa06d89f`. Production slices exist as `c3cc24c8152` and
+`8f14bc119fe`, with direct tests, but the required Task-8 red-first record, full CA/S3 lane evidence
+and one reviewed closure commit are not recorded. Do not repeat the implementation; close and review
+the existing slices before marking Steps 2–5 complete.
+
 **Files:**
 - Modify: `.../Pool/CasPartWriteTxn.cpp` (`~PartWriteTxn` unconditional retirement `:119`;
   staged-body cleanup `:1438`), `.../Gc/CasOrphanManifestSweep.cpp` (the nomination path),
@@ -2586,7 +2606,7 @@ in scope precisely because leaving it invites a revert.
   test reproducing the recorded S42 shape
   (`reports/2026-07-26-s42-stale-edge-repro/`).
 
-- [ ] **Step 1: TLA first** (phase conventions): extend `CaRefWriterCleanupCore` with the duty
+- [x] **Step 1: TLA first** (phase conventions): extend `CaRefWriterCleanupCore` with the duty
   queue + uncertain-grant retirement guard; new sabotage `_sab_retireuncertain` (retire while
   wedged-Unresolved) must go RED on the ownership invariant; runner updated, sabotages first,
   exact-name assertion. Commit the model change separately BEFORE the C++.
@@ -2601,6 +2621,10 @@ in scope precisely because leaving it invites a revert.
   `ca: writer/gc — duty queue, uncertain-grant retirement guard, neutral orphan nomination (R2+R3)`.
 
 ### Task 9: R1 closure note — verbatim-file rebirth aliasing {#task-9}
+
+**Execution status, 2026-08-02: COMPLETE (`ca07cbf87fd`).** The closure note records every R1
+sub-hazard and its test/commit evidence, and the loose-mountpoint audit found no remaining
+rebirth-aliasing hazard.
 
 **RE-SCOPED 2026-07-29 by the amendment, from "write the R1 design spec" to "record where R1
 went".** The reason, stated for the reviewer: R1's direction offered two alternatives — qualify the
@@ -2620,7 +2644,7 @@ the note records what landed and not what was intended.
 - Modify: `docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md` — R1's entry gets its
   disposition; `docs/superpowers/cas/BACKLOG.md` if any residue survives
 
-- [ ] **Step 1:** Per R1 sub-hazard, record WHERE it went, with the commit and the test that
+- [x] **Step 1:** Per R1 sub-hazard, record WHERE it went, with the commit and the test that
   proves it — no prose-only claims:
   (a) unqualified file keys aliasing a reborn namespace → closed first by Task 4b's re-key and finally
   by Task 4d's opaque-id state prefix (name both tests);
@@ -2636,19 +2660,31 @@ the note records what landed and not what was intended.
   owns orphan-manifest bytes; LIST omission remains leak-only;
   (d) migration → Task 4d's generation-6 layout cut followed by Task 5's generation-7 wire cut,
   both recreate-only, Constraint 14.
-- [ ] **Step 2 (the one open question):** Determine whether LOOSE MOUNTPOINT OBJECTS carry a
+- [x] **Step 2 (the one open question):** Determine whether LOOSE MOUNTPOINT OBJECTS carry a
   rebirth-aliasing hazard of their own. They are outside namespace ownership and the directive
   keeps them unqualified, so the answer is expected to be no — but ANSWER it from the code, do not
   assume: if a mountpoint object's identity can be re-resolved by a same-name reborn namespace,
   that is a surviving hazard, it is OUT of this amendment's scope, and it gets a new register item
   + a `BACKLOG.md` entry naming the exposure (and only then a small spec, as its own unit of work).
-- [ ] **Step 3:** Commit `ca: docs — R1 verbatim-file aliasing closed by the namespace-life re-key`.
+- [x] **Step 3:** Commit `ca: docs — R1 verbatim-file aliasing closed by the namespace-life re-key`.
 
 ### Task 10: TLA debt from the phase — seven review units {#task-10}
 
 [Codex finding 17: the original single-unit framing could hide an evidence-sensitive model
 retirement inside a mechanically enormous diff. Each sub-task below is dispatched, reviewed and
 committed INDEPENDENTLY, with its own before/after results artifact.]
+
+**Execution status, 2026-08-02:**
+
+| Unit | Status | Evidence / remaining work |
+|---|---|---|
+| 10a | **OPEN** | `CaGcRootLocalPartManifestCore` still carries the unaudited `listedTok` premise. |
+| 10b | **PARTIAL — 8/9 families committed** | `ba8fdc6ba45`, `71ab79daa4b`, `e4b34c3d6fb`, `3d982731a8f`, `5696c2d1135`, `43f0b878fbd`, `e354def4eb0`, `f2c1a861027`; `run_gc_partmanifest.sh` is an uncommitted ninth family and still needs its battery and RESULTS record. |
+| 10c | **PARTIAL** | `5cbd1b7c4c8` added all four runners, merged by `5a5e32618af`, but the required before/after results artifact is absent and the old phase results still say these models have no runners. |
+| 10d | **COMPLETE** | `0382d5737b0`, merged by `5a5e32618af`; all affected runners use the digit-capable classifier and were re-run. |
+| 10e | **COMPLETE** | `0665d3fd6fb` corrects the claim and `76ba4adb5a9` adds the durable-adoption witness, both merged by `5a5e32618af`. |
+| 10f | **COMPLETE** | `fd4959e29b8` models the destructive gate; `fef19e98723` closes correspondence; the empty-set survey and official checker are committed. |
+| 10g | **COMPLETE** | `6fccf5a4db2` adds the temporal smoke gate and `4e1ae9b64de` pins the official checker and records the revalidation. |
 
 **Task 10a — `listedTok` semantic audit (after Task 5b).** Audit `CaGcRootLocalPartManifestCore`'s `listedTok`
 (`:79`) + the skip gate (`:866`) against v9: does the model's "discovery observes from LIST"
@@ -2680,17 +2716,17 @@ line, and the green-expecting ones PASS — which they could not if the false vi
 defect needs a reachable stuttering-only suffix, i.e. a state with no enabled action, which is exactly what an
 empty entity set produces. What is genuinely at risk is the other direction:
 
-- [ ] **Re-validate the three `temporal` expectation rows under a jar that passes the `<> TRUE` smoke test**
+- [x] **Re-validate the three `temporal` expectation rows under a jar that passes the `<> TRUE` smoke test**
   (in `run_refwcleanup.sh`, `run_buildrootprecommit.sh`, `run_disklifecycle.sh`, `run_gcrounddefer.sh`,
   `run_foldclamp.sh`). **A row that EXPECTS a violation passes under a checker that violates everything** —
   so each of those three is a candidate for having been green for the wrong reason since it was written.
-- [ ] **Adopt the smoke test as a gate on the checker, not just as a note.** Before trusting any temporal
+- [x] **Adopt the smoke test as a gate on the checker, not just as a note.** Before trusting any temporal
   result, run `<> TRUE`; if it violates, the checker is lying and no temporal verdict from it means anything.
   Two lines, and it would have replaced this entire investigation.
-- [ ] **Do NOT add `ASSUME Builds # {}` to hide the empty-set result** — that converts a checker defect into
+- [x] **Do NOT add `ASSUME Builds # {}` to hide the empty-set result** — that converts a checker defect into
   a model restriction, and the empty set is semantically valid for that model and that property.
   `CaBuildRootPrecommit`'s `ASSUME` is right only where the model genuinely requires a non-empty domain.
-- [ ] Decide whether to upgrade the pinned jar or keep the old one for safety checking and the new one for
+- [x] Decide whether to upgrade the pinned jar or keep the old one for safety checking and the new one for
   temporal work; either way the choice must be recorded where the runners can see it.
 
 **Task 10f — the empty-set blind spot, and the unmodelled destructive gate (after Task 5; before
