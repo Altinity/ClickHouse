@@ -37,6 +37,9 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
     check_id(ckpt.checkpoint_snapshot_id, "checkpoint_snapshot_id");
     check_id(ckpt.last_epoch_seal, "last_epoch_seal");
     check_id(ckpt.committed_through, "committed_through");
+    if (!ckpt.committed_through && (ckpt.checkpoint_snapshot_id || ckpt.last_epoch_seal))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: checkpoint_snapshot_id and last_epoch_seal require committed_through", what);
     if (ckpt.committed_through)
     {
         if (ckpt.checkpoint_snapshot_id && *ckpt.committed_through < *ckpt.checkpoint_snapshot_id)

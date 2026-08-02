@@ -177,9 +177,9 @@ TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
 {
     const std::vector<RefCkpt> cases = {
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
     };
     for (const RefCkpt & ckpt : cases)
@@ -205,7 +205,7 @@ TEST(CasRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
 /// partly read.
 TEST(CasRefCkpt, RejectsAnUnknownKey)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_1,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
                                               .last_epoch_seal = std::nullopt});
     String with_unknown = good;
     with_unknown.replace(with_unknown.rfind('}'), 1, R"(,"zz":"1"})");
@@ -233,7 +233,7 @@ TEST(CasRefCkpt, RejectsADuplicateKey)
 /// "recovery has no base" and would be trusted.
 TEST(CasRefCkpt, RejectsTruncation)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2,
                                               .last_epoch_seal = std::nullopt});
 
     const String header_only = good.substr(0, good.find('\n') + 1);
@@ -279,6 +279,8 @@ TEST(CasRefCkpt, RejectsInvalidFieldsOnEncodeAndOnDecode)
         [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = RefTxnId{1, 0}, .last_epoch_seal = std::nullopt}); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{0, 1}}); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt}); });
 
     const String header = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                                 .last_epoch_seal = std::nullopt});
@@ -437,7 +439,7 @@ TEST(CasRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_partial_create"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
-    const RefCkpt publisher{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt publisher{.life_epoch = std::nullopt, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, publisher, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -478,13 +480,13 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
         if (interfered)
             return;
         interfered = true;
-        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
         const HeadResult h = backend->head(key);
         ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(mergeCkpt(base, sealer)), h.token).outcome,
                   PutOutcome::Done);
     };
 
-    const RefCkpt publisher{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt publisher{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, publisher, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
 
@@ -508,7 +510,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     const RootNamespace ns{"srv1/ckpt_noop"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt full{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
+    const RefCkpt full{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -518,7 +520,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     /// The same contribution again, and a strictly OLDER one: neither adds anything.
     EXPECT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
-    const RefCkpt older{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt older{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, older, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
 
@@ -536,7 +538,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     const RootNamespace ns{"srv1/ckpt_fenced"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, base, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
     const Token token_before = backend->head(key).token;
@@ -551,7 +553,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
             "fence generation moved since admission ({})", admitted);
     };
 
-    const RefCkpt advance{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, advance, 1, moved_fence, generousDeadline()),
               CkptPublishOutcome::FencedOut);
     EXPECT_EQ(backend->casPutCount(key), writes_before) << "the check precedes the CAS, so nothing is sent";
@@ -568,7 +570,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
     const RootNamespace ns{"srv1/ckpt_exhausted"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
@@ -586,7 +588,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
             backend->putOverwrite(key, encodeRefCkpt(base), h.token);
     };
 
-    const RefCkpt advance{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { publishCkpt(*backend, layout, life, advance, 1, ALWAYS_ADMITTED, CkptDeadline{[&] { return now; }, 5}); });
     EXPECT_EQ(readCkptOrFail(*backend, layout, life), base) << "no partial state: every attempt either "
@@ -604,7 +606,7 @@ TEST(CasRefCkpt, ACorruptCheckpointIsNeverOverwritten)
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
     ASSERT_EQ(publishCkpt(*backend, layout, life,
-                          RefCkpt{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+                          RefCkpt{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
                           1, ALWAYS_ADMITTED, generousDeadline()), CkptPublishOutcome::Published);
 
     const String garbage = "not a cas object\n";

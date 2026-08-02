@@ -37,17 +37,20 @@ std::optional<T> maxKnown(const std::optional<T> & a, const std::optional<T> & b
     return std::max(*a, *b);
 }
 
-std::optional<RefTxnId> mergeCommittedThrough(const std::optional<RefTxnId> & a, const std::optional<RefTxnId> & b)
+std::optional<RefTxnId> mergeCommittedThrough(const RefCkpt & a, const RefCkpt & b)
 {
-    if (!a)
-        return b;
-    if (!b)
-        return a;
-    if (a->writer_epoch != b->writer_epoch)
+    if (!a.committed_through)
+        return b.committed_through;
+    if (!b.committed_through)
+        return a.committed_through;
+    if (a.committed_through->writer_epoch == b.committed_through->writer_epoch)
+        return std::max(*a.committed_through, *b.committed_through);
+
+    const RefCkpt & higher = *a.committed_through < *b.committed_through ? b : a;
+    if (!higher.last_epoch_seal || *higher.last_epoch_seal != *higher.committed_through)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS _ckpt: cannot merge committed_through across writer epochs {} and {} without a validated epoch seal",
-            a->writer_epoch, b->writer_epoch);
-    return std::max(*a, *b);
+            "CAS _ckpt: cross-epoch committed_through requires the higher input to seal that exact frontier");
+    return higher.committed_through;
 }
 
 /// `life_epoch` MAY NOT DECREASE, and this is the whole of that rule. It lives HERE, at the publish
@@ -122,7 +125,7 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     /// the values it legitimately takes only ever RISE, which is what makes the max right here and what
     /// lets `publishCkpt` refuse the fall separately.)
     merged.life_epoch = maxKnown(a.life_epoch, b.life_epoch);
-    merged.committed_through = mergeCommittedThrough(a.committed_through, b.committed_through);
+    merged.committed_through = mergeCommittedThrough(a, b);
     merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
     merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
     return merged;
@@ -145,10 +148,10 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
     result.committed_through = ckpt->committed_through;
     if (!result.committed_through)
     {
+        result.ignored_hinted_snapshot_above_frontier = greatest_hinted_snapshot.has_value();
         if (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS recovery grounding: a checkpoint without committed_through cannot name a snapshot or epoch seal");
-        result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
         return result;
     }
 
@@ -161,14 +164,14 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
         else if (!result.base || *result.base < *greatest_hinted_snapshot)
             result.base = greatest_hinted_snapshot;
     }
-    if (result.base)
+    if (result.base && *result.base < *result.committed_through)
     {
         if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS recovery grounding: checkpoint base has no representable successor");
         result.walk_from = RefTxnId{result.base->writer_epoch, result.base->ref_sequence + 1};
     }
-    else
+    else if (!result.base)
     {
         result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
     }

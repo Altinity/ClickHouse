@@ -17,7 +17,7 @@ namespace DB::Cas
 struct RecoveryGrounding
 {
     std::optional<RefTxnId> base;
-    RefTxnId walk_from;
+    std::optional<RefTxnId> walk_from;
     std::optional<RefTxnId> committed_through;
     bool ignored_hinted_snapshot_above_frontier = false;
 };

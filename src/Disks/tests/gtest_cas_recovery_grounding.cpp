@@ -67,6 +67,7 @@ TEST(CasRecoveryGrounding, MissingFrontierMeansNoCommittedTransaction)
     const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, std::nullopt), RefTxnId{7, 2});
     EXPECT_FALSE(grounding.base);
     EXPECT_FALSE(grounding.committed_through);
+    EXPECT_TRUE(grounding.ignored_hinted_snapshot_above_frontier);
 }
 
 TEST(CasRecoveryGrounding, ChoosesGreatestEligibleBaseAndArithmeticWalkStart)
@@ -97,8 +98,7 @@ TEST(CasRecoveryGrounding, RejectsBaseWithoutARepresentableSuccessor)
     expectCode([&]
     {
         chooseRecoveryGrounding(catalog(NsState::Live),
-            ckpt(7, RefTxnId{7, std::numeric_limits<uint64_t>::max()},
-                 RefTxnId{7, std::numeric_limits<uint64_t>::max()}),
+            ckpt(7, RefTxnId{8, 1}, RefTxnId{7, std::numeric_limits<uint64_t>::max()}, RefTxnId{8, 1}),
             std::nullopt);
     }, DB::ErrorCodes::CORRUPTED_DATA);
 }

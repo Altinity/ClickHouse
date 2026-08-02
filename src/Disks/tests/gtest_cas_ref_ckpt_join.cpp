@@ -239,6 +239,20 @@ TEST(CasRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
         << "an equal life_epoch must not disturb the other fields' own join";
 }
 
+TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAndPreservesMatchingSeal)
+{
+    const RefCkpt older{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt transitioned{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},
+                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 1}};
+    EXPECT_EQ(mergeCkpt(older, transitioned).committed_through, transitioned.committed_through);
+    EXPECT_EQ(mergeCkpt(transitioned, older).committed_through, transitioned.committed_through);
+
+    const RefCkpt unsealed{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},
+                           .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_THROW(mergeCkpt(older, unsealed), DB::Exception);
+}
+
 /// THE FIRST OF THE TWO SEQUENCES THAT RAISE `life_epoch` HONESTLY, end to end through the production
 /// primitives rather than at the merge: a creator publishes `_ckpt` at E1 (`completeCreation` step 2)
 /// and dies before its `Creating -> Live` CAS (step 3), and a later actor reconciles the stalled entry
@@ -489,9 +503,9 @@ TEST(CasRefCkptJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsAndEpoc
 
     /// The growth term is the decimal width, and it is bounded by that ceiling rather than proportional
     /// to the number of transactions: four orders of magnitude of `ref_sequence` cost four bytes.
-    const RefCkpt at_sequence_1{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = RefTxnId{1, 1}};
-    const RefCkpt at_sequence_10k{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 10000}, .last_epoch_seal = RefTxnId{1, 10000}};
-    EXPECT_EQ(encodeRefCkpt(at_sequence_10k).size(), encodeRefCkpt(at_sequence_1).size() + 8);
+    const RefCkpt at_sequence_1{.life_epoch = 1, .committed_through = RefTxnId{1, 1}, .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = RefTxnId{1, 1}};
+    const RefCkpt at_sequence_10k{.life_epoch = 1, .committed_through = RefTxnId{1, 10000}, .checkpoint_snapshot_id = RefTxnId{1, 10000}, .last_epoch_seal = RefTxnId{1, 10000}};
+    EXPECT_EQ(encodeRefCkpt(at_sequence_10k).size(), encodeRefCkpt(at_sequence_1).size() + 12);
     EXPECT_LE(encodeRefCkpt(at_sequence_10k).size(), worst_bytes);
     EXPECT_LE(encodeRefCkpt(at_sequence_1).size(), worst_bytes);
 

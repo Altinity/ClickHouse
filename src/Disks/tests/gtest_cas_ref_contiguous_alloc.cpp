@@ -320,7 +320,7 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-8 pool-authoritative gc_shards",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-9 exact _ckpt committed_through recovery frontier",
                                                kContiguousRefStreamsGeneration - 1)), String::npos)
             << "the message must name the migration: " << e.message();
     }
@@ -359,7 +359,7 @@ TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-8 pool-authoritative gc_shards",
+        EXPECT_NE(e.message().find(fmt::format("CAS pool format {} predates generation-9 exact _ckpt committed_through recovery frontier",
                                                kNamespaceLifeKeyedGeneration)), String::npos)
             << "the message must name the migration: " << e.message();
     }
@@ -392,7 +392,7 @@ TEST(CasRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreat
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
-        EXPECT_NE(e.message().find("CAS pool format 6 predates generation-8 pool-authoritative gc_shards"), String::npos)
+        EXPECT_NE(e.message().find("CAS pool format 6 predates generation-9 exact _ckpt committed_through recovery frontier"), String::npos)
             << "the message must name the recreate-only grammar cut: " << e.message();
     }
 }

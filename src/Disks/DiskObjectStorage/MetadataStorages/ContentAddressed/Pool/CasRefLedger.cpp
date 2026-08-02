@@ -1102,7 +1102,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     {
         checkRecoveryStillAdmitted(ns, rt, cancelled);
         const RefCkpt contribution{.life_epoch = std::nullopt,
-                                   .committed_through = std::nullopt,
+                                   .committed_through = last_epoch_seal,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
         const auto check_recovery_write_admitted = [this, &rt](uint64_t expected_generation)
@@ -4131,7 +4131,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
     try
     {
         ckpt_advanced = publishCkptContribution(rt->life, RefCkpt{.life_epoch = std::nullopt,
-                                                            .committed_through = std::nullopt,
+                                                            .committed_through = candidate_x,
                                                             .checkpoint_snapshot_id = candidate_x,
                                                             .last_epoch_seal = std::nullopt},
                                                 admitted_generation,
