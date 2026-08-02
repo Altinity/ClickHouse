@@ -92,11 +92,20 @@ TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
     String wrong_type = head;
     wrong_type.replace(wrong_type.find("cas_blob"), 8, "cas_xxxx");
     EXPECT_THROW(decodeEnvelopeHeader(wrong_type, wrong_type.size(), ObjectKind::Blob), DB::Exception);
+
+    const String current_version = "\"v\":" + std::to_string(G_BUILD);
+    const String future_version = "\"v\":" + std::to_string(G_BUILD + 1);
     String future = head;
-    future.replace(future.find("\"v\":7"), 5, "\"v\":8");
-    EXPECT_THROW(decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob), DB::Exception);
+    const size_t future_version_at = future.find(current_version);
+    ASSERT_NE(future_version_at, String::npos);
+    future.replace(future_version_at, current_version.size(), future_version);
+    cas_battery_detail::expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [&] { decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob); }, "future blob-envelope version");
+
     String out_of_range = head;
-    out_of_range.replace(out_of_range.find("\"v\":7"), 5, "\"v\":4294967299");
+    const size_t out_of_range_version_at = out_of_range.find(current_version);
+    ASSERT_NE(out_of_range_version_at, String::npos);
+    out_of_range.replace(out_of_range_version_at, current_version.size(), "\"v\":4294967299");
     try
     {
         decodeEnvelopeHeader(out_of_range, out_of_range.size(), ObjectKind::Blob);

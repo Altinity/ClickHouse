@@ -267,9 +267,11 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
     const String json = caInspectToJson(
         layout, key, encodeRefTableSnapshot(snap), NamespaceLifeId::stageATransition(ns));
     EXPECT_NE(json.find("ref_snapshot"), String::npos);
-    EXPECT_NE(json.find("\"lifecycle\""), String::npos);
-    EXPECT_NE(json.find("Live"), String::npos);
+    EXPECT_NE(json.find("\"snapshot_id\""), String::npos);
+    EXPECT_NE(json.find("\"ref_sequence\":7"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
+    EXPECT_EQ(json.find("\"lifecycle\""), String::npos)
+        << "generation-8 snapshot inspection must not recreate lifecycle state retired from the snapshot DTO";
 }
 
 /// ...and a `_log/<txn-id>` renders as a ref-transaction log.

@@ -272,7 +272,7 @@ TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
 }
 
 /// Mutation caught: restoring separate `cov` and `nsc` rows, dropping the cleanup evidence, or
-/// serializing the row under a logical namespace changes these literal generation-7 bytes.
+/// serializing the row under a logical namespace changes these literal generation-8 bytes.
 TEST(CasFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidence)
 {
     CasFoldSeal seal;

@@ -48,7 +48,7 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     txn.ops.push_back(removal);
 
     const String expected =
-        "{\"type\":\"cas_ref_log\",\"v\":7}\n"
+        "{\"type\":\"cas_ref_log\",\"v\":8}\n"
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\"}\n"
         "{\"op\":\"namespace_birth\"}\n"
         "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"20260101_0_1_1_1\","
@@ -101,7 +101,7 @@ TEST(CasEncodingPins, SourceEdgeRunLines)
     /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
     /// that Task 8's line-scratch rewrite must reproduce it byte-for-byte.
     const String text = out.str();
-    const String header = "{\"type\":\"cas_run\",\"v\":7,\"kind\":\"source_edge\"}\n";
+    const String header = "{\"type\":\"cas_run\",\"v\":8,\"kind\":\"source_edge\"}\n";
     const String expected_record =
         "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
     const String trailer = "{\"n\":1}\n";

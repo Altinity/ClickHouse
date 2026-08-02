@@ -31,7 +31,7 @@ TEST(CasBlobMetaFormat, CondemnedRoundTripAllFields)
     EXPECT_EQ(back.condemn_round, 7u);
     EXPECT_EQ(back.size, 4096u);
     EXPECT_EQ(encodeBlobMeta(m),
-        "{\"type\":\"cas_blob_meta\",\"v\":7}\n{\"st\":\"condemned\",\"cr\":\"7\",\"sz\":\"4096\"}\n");
+        "{\"type\":\"cas_blob_meta\",\"v\":8}\n{\"st\":\"condemned\",\"cr\":\"7\",\"sz\":\"4096\"}\n");
 }
 
 TEST(CasBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)

@@ -47,7 +47,7 @@ TEST(CasGcMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
 
     const GcMaintenanceState empty;
     EXPECT_EQ(encodeGcMaintenanceState(empty),
-        "{\"type\":\"cas_gc_maintenance_state\",\"v\":7}\n{\"cur\":\"\"}\n");
+        "{\"type\":\"cas_gc_maintenance_state\",\"v\":8}\n{\"cur\":\"\"}\n");
     const GcMaintenanceState state{.janitor_cursor = R"(cas/ns/a/"quoted"\\next)"};
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(state)), state);
 }
@@ -170,8 +170,9 @@ TEST(CasGcMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    ASSERT_EQ(backend.putIfAbsent(key,
-        "{\"type\":\"cas_gc_maintenance_state\",\"v\":8}\n{\"cur\":\"\"}\n").outcome, PutOutcome::Done);
+    const String future =
+        "{\"type\":\"cas_gc_maintenance_state\",\"v\":" + std::to_string(G_BUILD + 1) + "}\n{\"cur\":\"\"}\n";
+    ASSERT_EQ(backend.putIfAbsent(key, future).outcome, PutOutcome::Done);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { (void)readGcMaintenanceState(backend, layout); });
     EXPECT_EQ(backend.casPutCount(key), 0u);
