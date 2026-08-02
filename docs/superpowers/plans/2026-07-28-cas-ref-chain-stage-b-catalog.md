@@ -2014,12 +2014,17 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
   first; append/frontier ordering and ambiguous recovery second; both recovery entry points plus
   fold/REBUILD/orphan consumers third; then deleted the LIST-derived fallbacks. No slice enables
   deletion for catalog-named lives until the exact frontier is consumed.
-- [x] **Step 5:** Full CA gate and both CA-s3 lanes are green. Fresh validation: 1924/1924 pass,
+- [x] **Step 5:** Full CA gate and both CA-s3 lanes are green. Final validation: 1929/1929 pass,
   2 disabled; the two required S3 integration selectors passed 3/3 in one Praktika run with structured
   result `OK`. The prerequisite model checkpoint is committed as `c863cdd7fa60` and precedes the
   production change.
-- [ ] **Step 6: Commit**
-  `ca: ref — LIST-independent recovery: exact checkpoint frontier, no hint-derived history`.
+- [x] **Step 6: Commit.** The model checkpoint is `c863cdd7fa60` (writer 5/5, delta intake 15/15),
+  followed by production baseline `357cf7b963f4`. Its four review debts are closed by follow-ups:
+  contextual checkpoint-base validation and proof retention (`3747975bbbf`, `8183a1af1800`), the
+  mounted-writer terminal-gap fix (`e48b476d90f`), hard failure for an invalid fsck checkpoint base
+  (`4ab9b452e660`), and removal of the fsck LIST oracle (`60cbec2bd274`, with soak-residue correction
+  `7ac127b650a`). The orphan-sweep fixture correction is `613faf8166e`. Every closing review passed;
+  Task 5b has no open implementation or review debt.
 
 ### Task 6: Read-side contract — refs AND namespace files {#task-6}
 
