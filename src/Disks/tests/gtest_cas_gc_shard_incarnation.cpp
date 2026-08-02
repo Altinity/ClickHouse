@@ -209,7 +209,8 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
     EXPECT_FALSE(report.deferred) << "the forced catalog-only fold must reach checkpoint intake";
     EXPECT_GT(backend->getCount(layout.refCkptKey(current_life)), 0u)
         << "the catalog-derived current life must drive an exact checkpoint GET";
-    EXPECT_GT(backend->listCount(layout.namespaceStreamRootPrefix()), 0u);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
+        << "the round must build exactly one hot stream plan";
     EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u)
         << "checkpoint state must never receive its own hot LIST";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -265,8 +266,9 @@ TEST(CasGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
 /// checkpoint are both outside the hot stream scan and cannot manufacture logical namespace anomalies.
 TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
 {
-    std::shared_ptr<InMemoryBackend> backend;
-    auto store = makePoolWithShards(backend, /*gc_shards=*/1);
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
     const Layout & layout = store->layout();
     const RootNamespace creating_ns{"srv1/tblStalledBirth"};
@@ -301,6 +303,7 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
                               .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     appendRefLogSeed(*backend, layout, ordinary_ns, {});
 
+    backend->resetCounts();
     std::vector<GcPhaseRecord> phases;
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
 
@@ -316,6 +319,18 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     }
     EXPECT_FALSE(saw_stalled_birth_anomaly);
     EXPECT_FALSE(saw_genuinely_gone_anomaly);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
+        << "all hot intake must consume one immutable stream listing";
+    EXPECT_EQ(backend->listCount(layout.namespaceStateRootPrefix()), 0u)
+        << "state checkpoints are never a hot discovery source";
+    EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
+        << "the only ownership-tree listing belongs to the independently paced janitor";
+    EXPECT_GT(backend->getCount(layout.refCkptKey(ordinary_life)), 0u)
+        << "the cataloged Live life is read by its exact checkpoint key";
+    EXPECT_EQ(backend->getCount(layout.refCkptKey(creating_life)), 0u)
+        << "Creating is retained by the janitor cut but excluded from hot checkpoint intake";
+    EXPECT_EQ(backend->getCount(layout.refCkptKey(gone_life)), 0u)
+        << "uncataloged state debris is classified by the janitor page, never exact-read by the hot walk";
     EXPECT_TRUE(backend->head(layout.refCkptKey(creating_life)).exists);
     EXPECT_TRUE(backend->head(layout.refCkptKey(ordinary_life)).exists);
     EXPECT_FALSE(backend->head(layout.refCkptKey(gone_life)).exists)

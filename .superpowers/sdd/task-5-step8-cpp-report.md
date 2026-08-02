@@ -22,10 +22,17 @@ The original integration returned from `DEFER` before `namespace_cleanup`. Addin
 
 - RED: `build/task5_step8_suppressed_cursor_red_tests.log` — the old `DEFER` early return omitted the namespace page/cut/phase, and suppressed standalone janitor minted successor progress.
 - Clean production/object compilation before final link: `build/task5_step8_defer_helper_green_build.log`, `build/task5_step8_owned_objects_build.log`, and `build/task5_step8_ambiguous_cursor_object_build.log`.
-- Final linked build: `build/task5_step8_final_with_foreign_compat_build.log` — `unit_tests_dbms` linked successfully.
-- Final focused gate: `build/task5_step8_final_focused_21_tests.log` — 21/21 passed, zero failed/skipped/disabled.
-- Final wider gate: `build/task5_step8_final_wider_tests.log` — 65/65 passed, zero failed/skipped/disabled.
+- Baseline linked build: `build/task5_step8_final_with_foreign_compat_build.log` — `unit_tests_dbms` linked successfully.
+- Baseline focused gate: `build/task5_step8_final_focused_21_tests.log` — 21/21 passed, zero failed/skipped/disabled.
+- Baseline wider gate: `build/task5_step8_final_wider_tests.log` — 65/65 passed, zero failed/skipped/disabled.
 - Mutation controls: removing the DEFER helper made both DEFER integration pins fail; restoring the old suppressed-cursor advance made both the standalone and integrated phase-lock pins fail. Production was restored before the final gates.
+- Final-fence mutation: with the post-loop fence recheck removed under a stable source hash, both
+  retained-only and loss-after-last-delete pins failed, while malformed-key and exact-token-mismatch
+  progress pins remained green. After restoration, the focused gate passed 24/24. The contemporaneous
+  wider gate passed 67/68; its sole failure was a foreign two-shard fold-seal fixture opened as a
+  one-shard pool after runtime seal validation landed. The fixture correction is outside this commit,
+  and the full shared gate remains an explicit pre-approval rerun once the concurrent Task 6/8 wave
+  stabilizes.
 
 ## Additional Step 8 pins
 
@@ -33,7 +40,9 @@ The original integration returned from `DEFER` before `namespace_cleanup`. Addin
 - `_files`-only debris omitted for a whole page/cycle is retried and reclaimed.
 - Literal catalog-first `Creating` objects are retained, in addition to the existing post-LIST concurrent-creation race.
 - A `_ckpt` left by public `cancelStalledCreating` is reclaimed after the row is gone.
-- Suppression, catalog ambiguity, and fence loss each retain the selected page; fence loss stops subsequent deletes and does not roll back earlier exact deletes.
+- Suppression, catalog ambiguity, and fence loss each retain the selected page; fence loss stops
+  subsequent deletes and does not roll back earlier exact deletes. A final fence recheck also prevents
+  progress after a retained-only page or after authority is lost following the last completed delete.
 
 ## Ownership exclusions
 
@@ -41,6 +50,8 @@ This slice does not own or stage the TLA/plan files, the protected aggregate Tas
 
 The concurrent `gc_shards` migration changed the catalog-admission signature during this slice. Eight
 call sites in the two already-owned Step 8 test files were mechanically migrated using each fixture's
-actual `store->poolConfig().gc_shards`, including the multi-shard fixture. One additional compatibility
-edit in `gtest_cas_ns_file_read_contract.cpp` was required to unblock the shared final link; it remains
-foreign, unstaged and uncommitted.
+actual `store->poolConfig().gc_shards`, including the multi-shard fixture. A shared-index race then
+included the new Task 6 `gtest_cas_ns_file_read_contract.cpp` in the first Step 8 commit after the exact
+eight-file inventory had been verified. Task 6 immediately took ownership in follow-up commit
+`3b952c6cbde`; no history rewrite was attempted because this branch forbids amend/rebase. That file and
+its report are not Step 8 verification evidence.
