@@ -102,6 +102,12 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
             ++result.deleted;
     }
 
+    /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST
+    /// or after the last exact delete must not publish progress. Loss after this check may still race
+    /// with the leak-only maintenance CAS; already completed exact deletes remain safe to repeat.
+    if (page_decided && !fence_held())
+        page_decided = false;
+
     if (page_decided)
     {
         const GcMaintenanceState next{.janitor_cursor = page.next_cursor};

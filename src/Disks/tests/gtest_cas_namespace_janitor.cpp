@@ -298,6 +298,52 @@ TEST(CasNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
+TEST(CasNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
+{
+    CountingBackend backend;
+    const Layout layout("p");
+    const CatalogEntry current{
+        .ns = RootNamespace{"current"}, .state = NsState::Live, .incarnation = UInt128{63}};
+    seedCatalog(backend, layout, RefCatalog{.entries = {current}});
+    const NamespaceLifeId current_life
+        = NamespaceLifeId::fromCatalogEntry(current.ns, current.incarnation);
+    const String ckpt = layout.refCkptKey(current_life);
+    const String file = layout.namespaceFilesPrefix(current_life) + "data";
+    ASSERT_EQ(backend.putIfAbsent(ckpt, "checkpoint").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(file, "file").outcome, PutOutcome::Done);
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(backend, layout, 1).runOnePage(false, [] { return false; });
+
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_EQ(backend.deleteTotal(), 0u);
+    EXPECT_TRUE(backend.get(ckpt));
+    EXPECT_TRUE(backend.get(file));
+    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent)
+        << "a tenure that observes fence loss cannot publish progress even when every object was retained";
+}
+
+TEST(CasNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBackDelete)
+{
+    CountingBackend backend;
+    const Layout layout("p");
+    seedCatalog(backend, layout);
+    const String dead = layout.refCkptKey(life("dead-after-delete", 64));
+    ASSERT_EQ(backend.putIfAbsent(dead, "dead").outcome, PutOutcome::Done);
+    uint64_t fence_checks = 0;
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(backend, layout, 1).runOnePage(false, [&] { return fence_checks++ == 0; });
+
+    EXPECT_EQ(result.deleted, 1u);
+    EXPECT_FALSE(backend.get(dead))
+        << "the exact delete completed under the fence and is never rolled back";
+    EXPECT_EQ(fence_checks, 2u)
+        << "the fence must be checked before deletion and again immediately before cursor publication";
+    EXPECT_EQ(readGcMaintenanceState(backend, layout).status, GcMaintenanceReadStatus::Absent)
+        << "losing the fence after the delete keeps this page selected for an idempotent retry";
+}
+
 TEST(CasNamespaceJanitor, CursorResumesThenResetsAtEnd)
 {
     CountingBackend backend;
@@ -344,6 +390,30 @@ TEST(CasNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalforme
     EXPECT_EQ(backend.getCount(layout.refCatalogKey()), 1u);
 }
 
+TEST(CasNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
+{
+    CountingBackend backend;
+    const Layout layout("p");
+    seedCatalog(backend, layout);
+    const String first = layout.namespaceStreamRootPrefix() + "bad-a/_log/1-1.zst";
+    const String second = layout.namespaceStreamRootPrefix() + "bad-b/_log/1-1.zst";
+    ASSERT_EQ(backend.putIfAbsent(first, "first").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(second, "second").outcome, PutOutcome::Done);
+
+    const NamespaceJanitorResult result
+        = NamespaceJanitor(backend, layout, 1).runOnePage(false, [] { return true; });
+
+    EXPECT_EQ(result.deleted, 0u);
+    EXPECT_FALSE(result.anomalies.empty());
+    EXPECT_TRUE(backend.get(first));
+    EXPECT_TRUE(backend.get(second));
+    const GcMaintenanceReadResult progress = readGcMaintenanceState(backend, layout);
+    ASSERT_EQ(progress.status, GcMaintenanceReadStatus::Valid);
+    ASSERT_TRUE(progress.state);
+    EXPECT_FALSE(progress.state->janitor_cursor.empty())
+        << "malformed keys are surfaced and skipped, but do not pin the cleanup cycle";
+}
+
 TEST(CasNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
 {
     CountingBackend backend;
@@ -388,12 +458,20 @@ TEST(CasNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
     ReplaceBeforeJanitorDeleteBackend backend;
     const Layout layout("p");
     seedCatalog(backend, layout);
-    const String dead = layout.refCkptKey(life("dead", 111));
+    const String dead = layout.refCkptKey(life("dead-a", 111));
+    const String later = layout.refCkptKey(life("dead-b", 112));
     ASSERT_EQ(backend.putIfAbsent(dead, "old").outcome, PutOutcome::Done);
-    const auto result = NamespaceJanitor(backend, layout, 100).runOnePage(false, [] { return true; });
+    ASSERT_EQ(backend.putIfAbsent(later, "later").outcome, PutOutcome::Done);
+    const auto result = NamespaceJanitor(backend, layout, 1).runOnePage(false, [] { return true; });
     EXPECT_EQ(result.deleted, 0u);
     ASSERT_TRUE(backend.get(dead));
     EXPECT_EQ(backend.get(dead)->bytes, "winner");
+    EXPECT_TRUE(backend.get(later));
+    const GcMaintenanceReadResult progress = readGcMaintenanceState(backend, layout);
+    ASSERT_EQ(progress.status, GcMaintenanceReadStatus::Valid);
+    ASSERT_TRUE(progress.state);
+    EXPECT_FALSE(progress.state->janitor_cursor.empty())
+        << "an exact-token mismatch retains the rewrite but completes this page's decision";
 }
 
 TEST(CasNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement)
