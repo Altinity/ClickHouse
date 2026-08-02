@@ -16,6 +16,7 @@
 #include <Common/scope_guard_safe.h>
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -97,17 +98,64 @@ bool parseBuildPrefix(const Layout & layout, const String & key, BuildPrefix & o
 /// blob, makes the stale walk look like a genuine dangle (a "phantom dangling") — this made the fsck
 /// oracle dishonest and falsely report a dangle during long-running validation.
 ///
-/// Before counting a HEAD-absent blob as `Dangling`, re-resolve every `"ns/ref"` label that named it
-/// freshly (`resolveRef` with `allow_stale=false`, never the walk's cached/stale view) and check whether
-/// the CURRENT manifest still lists this blob as a `Blob` entry. `label` is split on the LAST '/' —
+/// Before counting a HEAD-absent blob as `Dangling`, re-resolve every `"ns/ref"` label under the same
+/// immutable catalog row, using a fresh exact `_ckpt` from that original physical life. This admits a
+/// same-life repoint/drop while refusing a competing rebirth. `label` is split on the LAST '/' —
 /// mirroring exactly how the walk built it (`ns_str + "/" + ref_name`): `ref_name` never contains '/',
 /// but `ns_str` may, so the join separator is always the rightmost one.
 ///
-/// Fails CLOSED on any ambiguity (a malformed label, a dropped-then-recreated ref that throws, a
-/// corrupt current manifest): treated as "still referenced", i.e. the original conservative verdict.
+/// Fails CLOSED on any ambiguity (a malformed label, a recovery error, a corrupt manifest): treated as
+/// "still referenced", i.e. the original conservative verdict.
 /// The fix can only SHRINK false positives — it must never hide a real one.
+struct FsckRecoveryAuthority
+{
+    NamespaceLifeId life;
+    CatalogEntry catalog_entry;
+    std::optional<RefCkpt> checkpoint;
+};
+
+using FsckRecoveryAuthorities = std::unordered_map<String, FsckRecoveryAuthority>;
+using RecordRecoveryUnchecked = std::function<void(const RootNamespace &, const String &, const String &)>;
+
+/// Recheck one ref table against a newer `_ckpt` from the SAME physical life selected by fsck's
+/// original catalog cut. The catalog row and life id never move; only the monotone checkpoint may
+/// advance, which is how a same-life drop/repoint that completed during a long scan becomes visible
+/// without admitting a competing rebirth. A missing or unreadable checkpoint cannot prove that an
+/// old owner went away, so the caller records lost coverage and keeps the conservative verdict.
+std::optional<RefTableState> recoverLateRefTable(
+    Backend & backend, const Layout & layout, const FsckRecoveryAuthority & authority,
+    const RecordRecoveryUnchecked & record_unchecked)
+{
+    try
+    {
+        const std::optional<CkptSample> sampled = readCkpt(backend, layout, authority.life);
+        if (!sampled)
+        {
+            record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
+                "late ref recheck: the original life checkpoint is absent");
+            return std::nullopt;
+        }
+        return recoverRefTableDetailedFromAuthority(
+            backend, layout, authority.catalog_entry, sampled->ckpt).state;
+    }
+    catch (const Exception & e)
+    {
+        record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
+            "late ref recheck: the original life checkpoint or replay is unreadable: " + e.message());
+        return std::nullopt;
+    }
+    catch (...)
+    {
+        record_unchecked(authority.life.ns, layout.refCkptKey(authority.life),
+            "late ref recheck: the original life checkpoint or replay could not be read");
+        return std::nullopt;
+    }
+}
+
 bool blobStillReferenced(Pool & store, const Layout & layout,
-                          const String & bkey, const std::vector<String> & labels, const Deadline & deadline)
+                          const FsckRecoveryAuthorities & authorities, const String & bkey,
+                          const std::vector<String> & labels, const Deadline & deadline,
+                          const RecordRecoveryUnchecked & record_unchecked)
 {
     if (labels.empty())
         return true;
@@ -121,13 +169,22 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
         const String ref_name = label.substr(slash + 1);
         try
         {
-            /// Read freshly via `recoverRefTable` (a full LIST + replay), not `store.resolveRef`: the
-            /// mounted Pool caches its `RefTableState` and never re-recovers it, so a concurrent external
-            /// ref write is invisible to the cache. The recovery equation sees every log.
+            /// Never read a second catalog cut here. A later rebirth may name the same logical namespace
+            /// but it is not the life whose original row made this blob reachable in this fsck pass.
+            const auto authority_it = authorities.find(ns_part);
+            if (authority_it == authorities.end())
+            {
+                record_unchecked(RootNamespace{ns_part}, layout.refCatalogKey(),
+                    "late blob recheck: no original Live/Removing authority was retained");
+                return true;   /// no original Live/Removing authority -- fail closed
+            }
             const RootNamespace rns{ns_part};
-            const RefTableState table = recoverRefTable(store.backend(), layout, rns);
-            const auto rit = table.getCommitted().find(ref_name);
-            if (rit == table.getCommitted().end())
+            const std::optional<RefTableState> table = recoverLateRefTable(
+                store.backend(), layout, authority_it->second, record_unchecked);
+            if (!table)
+                return true;
+            const auto rit = table->getCommitted().find(ref_name);
+            if (rit == table->getCommitted().end())
                 continue;   /// the ref was DROPPED since the walk — this label no longer applies
             const PartManifest body = store.readManifest(ManifestId{rns, rit->second.manifest_ref});
             for (const ManifestEntry & e : body.entries)
@@ -135,7 +192,7 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
                 if (e.placement != EntryPlacement::Blob)
                     continue;
                 if (layout.blobKey(e.ref) == bkey)
-                    return true;   /// a CURRENT ref still names this exact blob — a real dangle
+                    return true;   /// an original-life ref still names this exact blob — a real dangle
             }
         }
         catch (...)
@@ -143,7 +200,7 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
             return true;   /// cannot confirm the ref moved away — keep the conservative verdict
         }
     }
-    return false;   /// every label re-resolved away (re-published or dropped) — a stale-walk artifact
+    return false;   /// no original-life label names this blob — the stale-walk artifact is gone
 }
 
 /// The manifest sibling of the `blobStillReferenced` recheck above. The ref-walk captures each committed
@@ -153,21 +210,33 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
 /// manifest body, makes the stale captured row look like a committed ref over a missing manifest (a
 /// "phantom dangling manifest"), the same dishonest-oracle failure `blobStillReferenced` kills for blobs.
 ///
-/// Before counting a missing manifest body as `Dangling`, re-resolve the EXACT ref from a FRESH
-/// authoritative recovery (`recoverRefTable`, never the walk's captured row) and check whether the CURRENT
-/// committed row still names THIS exact manifest key. Only a current ref over the SAME still-missing
-/// manifest is a real dangle. Fails CLOSED on any ambiguity (a throw, a corrupt table): treated as "still
-/// referenced", the original conservative verdict — the fix can only SHRINK false positives, never hide a
-/// real loss.
+/// Before counting a missing manifest body as `Dangling`, re-resolve the EXACT ref from the SAME frozen
+/// catalog row with a fresh exact `_ckpt` from that original physical life, then check whether the
+/// committed row still names THIS exact manifest key. A later catalog cut must not replace that row,
+/// but a same-life checkpoint advance must be visible. Fails CLOSED on any ambiguity (a throw, a corrupt
+/// table): treated as "still referenced", the original conservative verdict — the fix can only SHRINK
+/// false positives, never hide a real loss.
 bool manifestStillReferenced(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                             const String & ref_name, const String & mkey, const Deadline & deadline)
+                             const FsckRecoveryAuthorities & authorities, const String & ref_name,
+                             const String & mkey, const Deadline & deadline,
+                             const RecordRecoveryUnchecked & record_unchecked)
 {
     checkDeadline(deadline, "re-resolving ref at missing-manifest");
     try
     {
-        const RefTableState table = recoverRefTable(backend, layout, ns);
-        const auto rit = table.getCommitted().find(ref_name);
-        if (rit == table.getCommitted().end())
+        const auto authority_it = authorities.find(ns.string());
+        if (authority_it == authorities.end())
+        {
+            record_unchecked(ns, layout.refCatalogKey(),
+                "late manifest recheck: no original Live/Removing authority was retained");
+            return true;   /// no original Live/Removing authority -- fail closed
+        }
+        const std::optional<RefTableState> table = recoverLateRefTable(
+            backend, layout, authority_it->second, record_unchecked);
+        if (!table)
+            return true;
+        const auto rit = table->getCommitted().find(ref_name);
+        if (rit == table->getCommitted().end())
             return false;   /// the ref was DROPPED since the walk — no longer a committed owner
         /// A republish moved the ref to a different manifest key: this old key is no longer owned.
         return layout.manifestKey(ManifestId{ns, rit->second.manifest_ref}) == mkey;
@@ -178,13 +247,11 @@ bool manifestStillReferenced(Backend & backend, const Layout & layout, const Roo
     }
 }
 
-/// For the newest published snapshot `X` of `ns`, independently reconstruct
 /// One namespace's ref-object ids from a SINGLE `LIST` of its prefix, ascending.
 ///
 /// A HINT, and nothing more. The arithmetic walk reads every id it cares about by exact key, so an
-/// omission costs one `GET` and changes no verdict; this supplies the walk's witness set and the
-/// oracle's snapshot candidates. Both consumers share one listing rather than each taking their own,
-/// which is also what keeps a namespace's audit at one enumeration.
+/// omission changes no stream verdict; this supplies only the diagnostic oracle's snapshot candidates.
+/// The stream walk gets its complete finite range from the frozen catalog row and exact `_ckpt`.
 struct NsRefListing
 {
     std::vector<RefTxnId> logs;
@@ -263,169 +330,85 @@ struct NsVerdicts
 
 /// THE ARITHMETIC STREAM WALK (spec §7). Read-only, one namespace.
 ///
-/// fsck may not rest a verdict on an enumeration any more than the fold may. Ids are dense `1..T`
-/// within `(namespace, writer_epoch)` (INV-1), so the next id is COMPUTABLE and every position is read
-/// by exact key from `_ckpt.checkpoint`'s successor upward. An absent expected-next is the decision
-/// point, and there are exactly three answers:
-///
-///   * nothing above it            => the namespace's FRONTIER. Proven, silent, the healthy case.
-///   * a CONFIRMED durable id in the SAME epoch above it => `chain-broken`. Under contiguity this
-///     cannot be the end of anything: a durable record is missing and every transaction above it is
-///     unreachable. The witness is confirmed by its own exact `GET` before it may convict — a listing
-///     that can omit a key can equally well name one that is gone, and this verdict costs an exit code.
-///   * only LATER-epoch ids above it => attempt the crossing, which is PROVED through the next epoch's
-///     `prev_epoch_seal` back-chain (`crossEpochFromSeal`, shared with the fold) or else reported
-///     `unchecked`.
-///
-/// It writes nothing and mints nothing. The writer's recovery closes a dead epoch by putting a seal in
-/// the slot it walked to; an auditor has no business doing that, so a stream whose epoch was never
-/// closed reads as unprovable rather than being repaired into provable.
+/// The frozen catalog row and exact `_ckpt` define the complete finite walk. LIST supplies no genesis,
+/// witness, frontier or stop condition, and the walker never probes the position after
+/// `_ckpt.committed_through`. Every required id is point-read from the checkpoint base's successor (or
+/// `{life_epoch, 1}`) through that inclusive frontier. A missing required id is therefore a proven hole;
+/// no above-hole listing witness is needed. An epoch seal advances directly to the next epoch's first id,
+/// exactly as authoritative read-only recovery does.
 void checkRefStream(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                    const NsRefListing & listing, const Deadline & deadline,
-                    FsckReport & report, NsVerdicts & verdicts)
+                    const CatalogEntry & catalog_entry, const std::optional<RefCkpt> & checkpoint,
+                    const Deadline & deadline, FsckReport & report, NsVerdicts & verdicts)
 {
     checkDeadline(deadline, "ref stream");
     const RootNamespace & ns = life.ns;
-    const std::optional<CkptSample> sampled_ckpt = readCkpt(backend, layout, life);
-
-    /// The base: the greater of what the listing offered and what the checkpoint NAMES. The checkpoint
-    /// is what makes this robust against a cleaned prefix — INV-4 forbids deleting the snapshot it
-    /// names, so that one is fetchable even when no listing mentions it.
-    std::optional<RefTxnId> base_id;
-    if (!listing.snapshots.empty())
-        base_id = listing.snapshots.back();
-    if (sampled_ckpt && sampled_ckpt->ckpt.checkpoint_snapshot_id
-        && (!base_id || *base_id < *sampled_ckpt->ckpt.checkpoint_snapshot_id))
-        base_id = sampled_ckpt->ckpt.checkpoint_snapshot_id;
-
-    /// Where the tail starts, by the same grounding rule recovery uses (spec §4) minus its writes: the
-    /// base's successor, else the namespace's birth epoch, else the listing's floor. A namespace with
-    /// none of the three was never born, and the empty stream IS its proof — not an `unchecked`.
-    std::optional<RefTxnId> expected;
-    if (base_id)
-        expected = RefTxnId{base_id->writer_epoch, base_id->ref_sequence + 1};
-    else if (sampled_ckpt && sampled_ckpt->ckpt.life_epoch)
-        expected = RefTxnId{*sampled_ckpt->ckpt.life_epoch, 1};
-    else if (!listing.logs.empty())
-        expected = RefTxnId{listing.logs.front().writer_epoch, 1};
-    if (!expected)
+    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, checkpoint);
+    if (grounding.base)
+    {
+        try
+        {
+            /// Even when the base IS the frontier and there is no replay tail, a checkpoint may not
+            /// turn an `EpochSeal` into a state snapshot by naming a same-id `_snap`.
+            (void)readCheckpointSnapshotBase(backend, layout, life, *grounding.base);
+        }
+        catch (const Exception & e)
+        {
+            verdicts.recordUnchecked(report, ns, layout.refSnapshotKey(life, *grounding.base),
+                "ref stream: checkpoint snapshot base " + renderId(*grounding.base)
+                + " is invalid: " + e.message());
+            return;
+        }
+    }
+    if (!grounding.walk_from || !grounding.committed_through)
         return;
 
-    /// The GREATEST candidate in `epoch` strictly above `above_sequence` — the one most likely to still
-    /// be durable, so a hole is caught with a single confirming read. `_ckpt.last_epoch_seal` joins the
-    /// listing as a second, listing-INDEPENDENT witness: a checkpoint that records a seal at `{E, S}`
-    /// had a durable object there, whatever any enumeration says.
-    const auto greatestSameEpochAbove = [&](uint64_t epoch, uint64_t above_sequence) -> std::optional<RefTxnId>
-    {
-        std::optional<RefTxnId> best;
-        const auto consider = [&](const RefTxnId & w)
-        {
-            if (w.writer_epoch == epoch && w.ref_sequence > above_sequence && (!best || *best < w))
-                best = w;
-        };
-        for (const RefTxnId & id : listing.logs)
-            consider(id);
-        if (sampled_ckpt && sampled_ckpt->ckpt.last_epoch_seal)
-            consider(*sampled_ckpt->ckpt.last_epoch_seal);
-        return best;
-    };
-
-    /// The NEAREST candidate in a LATER epoch — the epoch a crossing would aim at. Nearest rather than
-    /// greatest: the crossing proves its way back down the chain, so aiming at the closest epoch that
-    /// something claims exists is both sufficient and cheapest.
-    const auto nearestLaterEpochAbove = [&](const RefTxnId & id) -> std::optional<RefTxnId>
-    {
-        std::optional<RefTxnId> best;
-        const auto consider = [&](const RefTxnId & w)
-        {
-            if (w.writer_epoch > id.writer_epoch && (!best || w < *best))
-                best = w;
-        };
-        for (const RefTxnId & l : listing.logs)
-            consider(l);
-        if (sampled_ckpt && sampled_ckpt->ckpt.last_epoch_seal)
-            consider(*sampled_ckpt->ckpt.last_epoch_seal);
-        return best;
-    };
-
-    RefTxnId resolved_through{};
-    std::optional<bool> last_applied_is_seal;
-
-    for (;;)
+    RefTxnId expected = *grounding.walk_from;
+    while (expected <= *grounding.committed_through)
     {
         checkDeadline(deadline, "ref stream");
-        const auto got = backend.get(layout.refLogKey(life, *expected));
-        if (got)
+        const auto got = backend.get(layout.refLogKey(life, expected));
+        if (!got)
         {
-            bool is_seal = false;
-            try
-            {
-                is_seal = refLogTxnIsEpochSeal(
-                    decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *expected));
-            }
-            catch (const Exception & e)
-            {
-                verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
-                    "ref stream: the record at " + renderId(*expected) + " could not be decoded, so nothing "
-                    "above it can be proved either: " + e.message());
-                return;
-            }
-            ++report.ref_records_walked;
-            resolved_through = *expected;
-            last_applied_is_seal = is_seal;
-            /// A seal gets NO special case: it advances the position like any other record, the walk
-            /// then finds nothing at the position after it, and the crossing below is what proves where
-            /// the stream continues. Jumping to `{epoch + 1, 1}` here would be a guess.
-            expected = RefTxnId{expected->writer_epoch, expected->ref_sequence + 1};
-            continue;
-        }
-
-        /// ---- Absent: hole, frontier, or an epoch boundary ----
-        if (const auto witness = greatestSameEpochAbove(expected->writer_epoch, expected->ref_sequence))
-        {
-            if (backend.get(layout.refLogKey(life, *witness)))
-            {
-                verdicts.recordChainBroken(report, ns, layout.refLogKey(life, *expected),
-                    "ref stream: id " + renderId(*expected) + " is absent while " + renderId(*witness)
-                    + " in the same epoch is durable — the stream is dense by construction (INV-1), so this "
-                      "is a HOLE, not the end of the stream, and every record above it is unreachable");
-                return;
-            }
-            /// The listing named a key that is not there. That convicts nobody; fall through and let a
-            /// later-epoch witness (if any) decide whether there is a crossing to attempt.
-        }
-
-        const auto later = nearestLaterEpochAbove(*expected);
-        if (!later)
-            return;   /// frontier: nothing above claims to exist, and the walk proved everything below it
-
-        const EpochCrossResult crossing =
-            crossEpochFromSeal(backend, layout, ns, resolved_through, last_applied_is_seal, *later, life);
-        if (!crossing.proved())
-        {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
-                "ref stream: records of a later epoch are reachable but this epoch's closing seal was "
-                "never consumed (or the position they chain from is not one), so the crossing at "
-                + renderId(*expected) + " has no proof"
-                + (crossing.detail.empty() ? "" : ": " + crossing.detail));
+            verdicts.recordChainBroken(report, ns, layout.refLogKey(life, expected),
+                "ref stream: checkpoint requires id " + renderId(expected) + " at or below inclusive frontier "
+                + renderId(*grounding.committed_through) + ", but its exact key is absent");
             return;
         }
-        /// Every iteration must move strictly forward. A crossing that lands back on the position just
-        /// read as absent means the epoch-start record answered the crossing's `GET` and then stopped
-        /// answering ours — an above-cursor object vanishing under the walk, which nothing may
-        /// legitimately do. Unprovable, and reported as such rather than spun on.
-        if (!(*expected < crossing.start))
+
+        bool is_seal = false;
+        try
         {
-            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, *expected),
-                "ref stream: the epoch crossing resolved back to " + renderId(crossing.start)
-                + ", the position that just read absent — the epoch-start record is not stably readable");
+            is_seal = refLogTxnIsEpochSeal(
+                decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), expected));
+        }
+        catch (const Exception & e)
+        {
+            verdicts.recordUnchecked(report, ns, layout.refLogKey(life, expected),
+                "ref stream: the checkpoint-required record at " + renderId(expected)
+                + " could not be decoded: " + e.message());
             return;
         }
-        expected = crossing.start;
+        ++report.ref_records_walked;
+
+        try
+        {
+            if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
+                    expected, is_seal, *grounding.committed_through))
+                expected = *next;
+            else
+                break;
+        }
+        catch (const Exception & e)
+        {
+            verdicts.recordChainBroken(report, ns, layout.refLogKey(life, expected),
+                "ref stream: " + e.message());
+            return;
+        }
     }
 }
 
-/// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
+/// For the newest published snapshot `X` of `ns`, independently reconstruct the table state AT `X` from
+/// an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
 /// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
 /// `X` object. Byte-determinism of the codec (canonical sort, verified in the codec's own gtests) makes
 /// the comparison exact.
@@ -549,6 +532,11 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     uint64_t refs_walked = 0;
     NsVerdicts verdicts;
     SCOPE_EXIT({ verdicts.publish(report); });
+    const RecordRecoveryUnchecked record_recovery_unchecked =
+        [&](const RootNamespace & ns, const String & key, const String & detail_text)
+        {
+            verdicts.recordUnchecked(report, ns, key, detail_text);
+        };
 
     /// RECORD AND CONTINUE for a key that belongs to no namespace at all. fsck is the forensic tool an
     /// operator reaches for once something is already wrong, so a key it cannot attribute must become a
@@ -575,20 +563,28 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     };
 
-    /// One immutable cut owns every physical-id join in this walk. All catalog states participate:
-    /// `Creating` can already have its genesis checkpoint, while duplicate ids make both rows
-    /// unresolvable. A diagnostic records that corruption and keeps walking unrelated unique lives.
+    /// One immutable cut owns every physical-id join in this walk. `Creating` participates in that
+    /// attribution (its physical keys may exist) but is never recovered: only Live/Removing rows have a
+    /// durable publication frontier. A diagnostic records duplicate ids and keeps walking unrelated
+    /// unique lives.
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
-    std::vector<NamespaceLifeId> walk_lives;
+    struct FsckWalkLife
+    {
+        NamespaceLifeId life;
+        CatalogEntry catalog_entry;
+    };
+    std::vector<FsckWalkLife> walk_lives;
     walk_lives.reserve(catalog_cut.catalog.entries.size());
     for (const CatalogEntry & entry : catalog_cut.catalog.entries)
     {
         if (!entry.ns.string().starts_with(namespace_prefix))
             continue;
+        if (entry.state == NsState::Creating)
+            continue;
         try
         {
             if (const auto life = catalog_cut.life_index.resolve(entry.incarnation))
-                walk_lives.push_back(*life);
+                walk_lives.push_back(FsckWalkLife{.life = *life, .catalog_entry = entry});
         }
         catch (const Exception & e)
         {
@@ -637,8 +633,15 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         });
     }
 
-    for (const NamespaceLifeId & life : walk_lives)
+    /// Every replay and late recheck below reuses the same exact catalog row and physical life. The
+    /// primary walk also retains its checkpoint sample; a late recheck exact-reads `_ckpt` again at that
+    /// SAME life so a concurrent same-life drop/repoint is visible without ever accepting a rebirth.
+    FsckRecoveryAuthorities recovery_authorities;
+    recovery_authorities.reserve(walk_lives.size());
+
+    for (const FsckWalkLife & walk_life : walk_lives)
     {
+        const NamespaceLifeId & life = walk_life.life;
         const RootNamespace & ns = life.ns;
         const String & ns_str = ns.string();
         /// RECORD AND CONTINUE, NEVER WEDGE. Everything below is per-namespace, and every one of these
@@ -652,17 +655,30 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// and `runFsck`'s `partial` handling owns it.
         try
         {
+            /// One materialized `_ckpt` body is part of this namespace's frozen audit authority. The
+            /// recovery API receives exactly these bytes; `checkRefStream` receives the same decoded
+            /// value, so the two legs cannot quietly choose different frontiers after a concurrent CAS.
+            std::optional<RefCkpt> checkpoint;
+            if (const std::optional<CkptSample> sampled = readCkpt(backend, layout, life))
+                checkpoint = sampled->ckpt;
+            const auto [authority_it, inserted] = recovery_authorities.emplace(
+                ns.string(), FsckRecoveryAuthority{
+                    .life = life, .catalog_entry = walk_life.catalog_entry, .checkpoint = checkpoint});
+            chassert(inserted);
+
             /// One listing of the life's stream prefix, shared by the stream walk and the oracle.
             const NsRefListing listing = listNsRefObjects(backend, layout, life);
 
             /// The arithmetic stream audit runs FIRST, so a holed stream gets the verdict that EXPLAINS
             /// it (`chain-broken`) rather than the downstream `CORRUPTED_DATA` the replay below would
             /// raise about the same hole.
-            checkRefStream(backend, layout, life, listing, deadline, report, verdicts);
+            checkRefStream(
+                backend, layout, life, walk_life.catalog_entry, checkpoint, deadline, report, verdicts);
 
-            /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
-            /// audit that must see the authoritative durable ref state, including any external write.
-            const RefTableState table = recoverRefTable(backend, layout, life);
+            /// LIST can only nominate a performance base. This recovery's finite range comes from the
+            /// original catalog row and exact `_ckpt`, never from a self-resolved name or an F+1 probe.
+            const RefTableState table = recoverRefTableDetailedFromAuthority(
+                backend, layout, authority_it->second.catalog_entry, authority_it->second.checkpoint).state;
             /// Snapshot integrity oracle: verify this table's newest published
             /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
             /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
@@ -682,11 +698,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     /// but the per-ref GET runs later than the namespace's ref recovery, so a stale captured
                     /// row plus a legitimate GC delete of a since-superseded manifest can masquerade as one,
                     /// and a bare GET can lag a present object. Revalidate exactly like the blob `Dangling`
-                    /// recheck below: HEAD the exact object AND re-resolve the exact ref freshly. Count the
-                    /// dangle ONLY when the exact object is HEAD-absent AND a CURRENT ref still names THIS
-                    /// exact manifest — otherwise it is LIST/GET lag or a phantom stale-row, never a loss.
+                    /// recheck below: HEAD the exact object AND re-resolve under the original catalog row
+                    /// plus a fresh checkpoint from its physical life. Count the dangle ONLY when the exact
+                    /// object is HEAD-absent AND that life still names THIS exact manifest — otherwise it is
+                    /// LIST/GET lag or a phantom stale-row, never a loss.
                     if (!backend.head(mkey).exists
-                        && manifestStillReferenced(backend, layout, ns, ref_name, mkey, deadline))
+                        && manifestStillReferenced(backend, layout, ns, recovery_authorities, ref_name, mkey,
+                            deadline, record_recovery_unchecked))
                     {
                         ++report.dangling;
                         FsckObject o;
@@ -697,8 +715,8 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         o.reachable_from = {label};
                         report.objects.push_back(std::move(o));
                     }
-                    /// A present object (GET lag) or a ref that moved away (stale-walk artifact) is not a
-                    /// dangle; the manifest's blobs are re-walked under the ref's CURRENT manifest elsewhere.
+                    /// A present object is GET lag. A row not named by the original-life authority is a
+                    /// stale-walk artifact, not a dangle; its original owner cannot contribute blobs.
                     ++refs_walked;
                     continue;
                 }
@@ -796,11 +814,12 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         const auto lit = blob_labels.find(bkey);
         if (!exists)
         {
-            /// Before declaring a loss, re-resolve the referencing refs freshly — a ref
-            /// re-published or dropped between the walk and this HEAD-confirm, combined with a
-            /// legitimate GC delete of the OLD blob, must NOT surface as a phantom dangle.
-            const bool still_referenced = blobStillReferenced(store, layout, bkey,
-                lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
+            /// Before declaring a loss, re-resolve the referencing refs from the original audit
+            /// authority. A later rebirth must not replace the old owner while this verdict is being
+            /// decided.
+            const bool still_referenced = blobStillReferenced(store, layout, recovery_authorities, bkey,
+                lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline,
+                record_recovery_unchecked);
             if (!still_referenced)
                 continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
         }
@@ -1091,8 +1110,9 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             if (!exists)
             {
                 /// Use the same HEAD-absent re-resolve as the global-mode loop above.
-                const bool still_referenced = blobStillReferenced(store, layout, bkey,
-                    lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
+                const bool still_referenced = blobStillReferenced(store, layout, recovery_authorities, bkey,
+                    lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline,
+                    record_recovery_unchecked);
                 if (!still_referenced)
                     continue;   /// stale-walk artifact — neither reachable nor dangling
             }

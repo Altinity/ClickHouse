@@ -408,18 +408,28 @@ void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed,
         CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
     }
 
+    uint64_t last_ref_sequence = 0;
     for (uint64_t i = 0; i < committed; ++i)
     {
         const ManifestRef ref{.writer_epoch = 1, .build_sequence = i + 1, .manifest_ordinal = 1};
         writeManifestRaw(backend, layout, ns, ref, {});
-        publishCommittedTransition(backend, layout, ns, "committed_" + std::to_string(i), std::nullopt, ref);
+        last_ref_sequence = publishCommittedTransition(backend, layout, ns, "committed_" + std::to_string(i), std::nullopt, ref);
     }
     for (uint64_t i = 0; i < precommits; ++i)
     {
         const ManifestRef ref{.writer_epoch = 999999, .build_sequence = i + 1, .manifest_ordinal = 1};
         writeManifestRaw(backend, layout, ns, ref, {});
-        addPrecommitTransition(backend, layout, ns, UInt128(1), "precommit_" + std::to_string(i), std::nullopt, ref);
+        last_ref_sequence = addPrecommitTransition(backend, layout, ns, UInt128(1), "precommit_" + std::to_string(i), std::nullopt, ref);
     }
+
+    /// Semantic transition helpers already publish `_ckpt`; replace their final checkpoint through
+    /// the exact token-CAS fixture helper to make this fixture's complete intended state explicit.
+    replaceRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = last_ref_sequence ? std::optional<RefTxnId>{RefTxnId{1, last_ref_sequence}} : std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     /// Self-checking: `listRefs` must observe exactly `committed` committed refs before returning.
     ASSERT_EQ(victim.listRefs(ns).size(), committed);

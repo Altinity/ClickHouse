@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <set>
 
@@ -188,12 +189,12 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     CasJsonWriter out;
     writeHeaderLine(out, FormatId::PoolMeta);
     const String rendered = std::move(out).take();
-    EXPECT_EQ(rendered, "{\"type\":\"cas_pool_meta\",\"v\":8}\n");
+    EXPECT_EQ(rendered, fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", currentCompatibilityVersion()));
 
     DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     const TextHeader h = expectHeaderLine(in, FormatId::PoolMeta);
     EXPECT_EQ(h.type, "cas_pool_meta");
-    EXPECT_EQ(h.v, 8u);
+    EXPECT_EQ(h.v, currentCompatibilityVersion());
     EXPECT_TRUE(in.eof());
 
     const auto sniffed = sniffHeaderLine(rendered);
@@ -207,7 +208,7 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     const String wrong = "{\"type\":\"cas_owner\",\"v\":3}\n";
     DB::ReadBufferFromMemory in2(wrong.data(), wrong.size());
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in2, FormatId::PoolMeta); });
-    const String future = "{\"type\":\"cas_pool_meta\",\"v\":8}\n";
+    const String future = fmt::format("{{\"type\":\"cas_pool_meta\",\"v\":{}}}\n", currentCompatibilityVersion() + 1);
     DB::ReadBufferFromMemory in3(future.data(), future.size());
     expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { expectHeaderLine(in3, FormatId::PoolMeta); });
 

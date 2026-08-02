@@ -15,8 +15,8 @@ TEST(CasFormatBattery, Owner)
 {
     OwnerObject o;
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
-    const String golden =
-        "{\"type\":\"cas_owner\",\"v\":8}\n{\"su\":\"0123456789abcdeffedcba9876543210\"}\n";
+    const String golden = currentFormatHeader("cas_owner") +
+        "{\"su\":\"0123456789abcdeffedcba9876543210\"}\n";
     EXPECT_EQ(encodeOwner(o), golden);
     EXPECT_FALSE(decodeOwner(golden).retired_at_ms.has_value());
     runFormatBattery({FormatId::Owner,
@@ -43,7 +43,7 @@ TEST(CasFormatBattery, ServerEpoch)
     runFormatBattery({FormatId::ServerEpoch,
         [&] { return sealObject(FormatId::ServerEpoch, encodeServerEpoch(e)); },
         [](std::string_view s) { decodeServerEpoch(std::string(openObject(FormatId::ServerEpoch, s))); },
-        "{\"type\":\"cas_epoch\",\"v\":8}\n{\"nwe\":\"7\"}\n"});
+        currentFormatHeader("cas_epoch") + "{\"nwe\":\"7\"}\n"});
 }
 
 TEST(CasFormatBattery, MountLease)
@@ -53,7 +53,7 @@ TEST(CasFormatBattery, MountLease)
     runFormatBattery({FormatId::MountLease,
         [&] { return sealObject(FormatId::MountLease, encodeMountLease(m)); },
         [](std::string_view s) { decodeMountLease(std::string(openObject(FormatId::MountLease, s))); },
-        "{\"type\":\"cas_mount_lease\",\"v\":8}\n"
+        currentFormatHeader("cas_mount_lease") +
         "{\"su\":\"0123456789abcdeffedcba9876543210\",\"we\":\"7\",\"hn\":\"host-1\",\"pid\":4242,"
         "\"sat\":1752537600000,\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false}\n"});
 }

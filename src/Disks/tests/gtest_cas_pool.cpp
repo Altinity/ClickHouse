@@ -660,6 +660,12 @@ TEST(CasPool, ReadManifestValidatesBodyAndFailsClosed)
         DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
             {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[0],
              DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[1]}, std::nullopt});
+        DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 1},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt,
+        });
 
         auto r = s->resolveRef(ns, "part_dangle");
         ASSERT_TRUE(r.has_value());
@@ -792,6 +798,12 @@ TEST(CasPool, ManifestDecodeCacheIsByteBounded)
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
         DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops, std::nullopt});
     }
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 8},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.manifest_decode_cache_bytes = 2ULL << 20;
@@ -871,6 +883,12 @@ TEST(CasPool, ListRefsMergesAllShards)
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
     DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     auto refs = s->listRefs(ns);
     ASSERT_EQ(refs.size(), 8u);
@@ -883,19 +901,18 @@ TEST(CasPool, ListRefsMergesAllShards)
     }
 }
 
-/// Task A (2026-07-03 CREATE/load HEAD storm): an empty namespace must cost exactly one LIST of the
-/// namespace's ref-shard prefix and ZERO HEADs — not one HEAD per root shard (32 by default). Measure
-/// deltas around the listRefs call: Pool::open itself may LIST (probe/pool-meta), so the pre-call
-/// counts are the baseline.
-TEST(CasPool, ListRefsEmptyNamespaceCostsOneListZeroHeads)
+/// An empty namespace recovers from its exact `_ckpt` authority and exact successor GET. It performs
+/// ZERO LISTs and ZERO HEADs: recovery no longer enumerates the stream, and it never probes a shard
+/// fan-out. Measure deltas around `listRefs`; `Pool::open` and fixture admission have their own metadata
+/// traffic.
+TEST(CasPool, ListRefsEmptyNamespaceCostsZeroListsAndHeads)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
-    /// EMPTY, but EXISTING -- otherwise this measures the wrong thing entirely: a namespace the catalog
-    /// does not name is answered from the catalog and never recovers, so it never reaches the LIST whose
-    /// absence of a HEAD fan-out is the point here. That shape is measured by the case below.
-    DB::Cas::tests::casAdmitEntry(*b, Layout("p"), ns);
+    /// EMPTY, but EXISTING and recoverable. A namespace the catalog does not name is answered from the
+    /// catalog and never reaches recovery; that separate shape is measured by the case below.
+    DB::Cas::tests::casAdmitRecoverableEntry(*b, Layout("p"), ns);
 
     const uint64_t heads_before = b->headTotal();
     const uint64_t lists_before = b->listTotal();
@@ -904,9 +921,9 @@ TEST(CasPool, ListRefsEmptyNamespaceCostsOneListZeroHeads)
 
     EXPECT_TRUE(refs.empty());
     EXPECT_EQ(b->headTotal() - heads_before, 0u)
-        << "empty-namespace listRefs must not HEAD any shard (the CREATE/load storm)";
-    EXPECT_EQ(b->listTotal() - lists_before, 1u)
-        << "empty-namespace listRefs must cost exactly one LIST of the namespace's ref-shard prefix";
+        << "empty-namespace listRefs must not HEAD any shard";
+    EXPECT_EQ(b->listTotal() - lists_before, 0u)
+        << "checkpoint-grounded recovery reads exact keys and must not LIST the ref stream";
 }
 
 /// The other shape: a namespace that was never born. A read must not be what brings one into existence,
@@ -939,8 +956,8 @@ TEST(CasPool, ListRefsOnANeverBornNamespaceCostsNoListAndNoHead)
 TEST(CasPool, ListRefsReturnsSameContentAsBefore)
 {
     /// Task 10: there is no more per-shard HEAD fan-out to bound (a warm listRefs costs ZERO requests;
-    /// a cold one costs exactly the one recovery LIST, already covered by
-    /// ListRefsEmptyNamespaceCostsOneListZeroHeads) -- this now just proves the returned content is
+    /// a cold empty one costs zero LISTs and HEADs, already covered by
+    /// `ListRefsEmptyNamespaceCostsZeroListsAndHeads`) -- this now just proves the returned content is
     /// correct for a multi-ref table built from a single raw ref-log fixture.
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -954,6 +971,12 @@ TEST(CasPool, ListRefsReturnsSameContentAsBefore)
         ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
     DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops, std::nullopt});
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     auto refs = s->listRefs(ns);
 
@@ -981,6 +1004,12 @@ TEST(CasPool, ListRefsSkipsForeignKeys)
     DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps(ref, mref)[0],
          DB::Cas::tests::publishCommittedOps(ref, mref)[1]}, std::nullopt});
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*b, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     /// A stray key directly under the namespace's ref-object prefix that is not `_log`/
     /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
@@ -1586,7 +1615,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so the fault
     /// injected below (computed from that same sentinel) lands on the key production actually writes
     /// to -- otherwise the real append mints an unrelated random incarnation and the fault misses.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
     publishPart(store, ns.string(), "x", "payload");
 
     /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
@@ -1881,7 +1910,7 @@ TEST(CasRemountWaits, UnresolvedWedgeRemountPaysNoWaitEither)
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/remount_wedge"};
     /// Stage B (Task 4-C): see `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`'s identical comment.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
     publishPart(store, ns.string(), "x", "payload");
 
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
@@ -1944,8 +1973,8 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     /// Stage B (Task 4-C): `ns1` is pinned because the fault below targets its key by exact sentinel
     /// match. `ns2` must ALSO be pinned: the epoch-close assertions further down read its ref-log keys
     /// directly at `NamespaceLifeId::stageATransition(ns2)`.
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns1);
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns2);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns1, store->liveWriterEpoch());
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns2, store->liveWriterEpoch());
     publishPart(store, ns1.string(), "x", "payload-a");
     /// ns2's epoch-1 data: never touched again by this incarnation until the final check below, well
     /// after both remounts -- the "table recovered for the first time, late" the fix must not over-seal.
@@ -2004,6 +2033,12 @@ TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
          DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}, std::nullopt});
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});

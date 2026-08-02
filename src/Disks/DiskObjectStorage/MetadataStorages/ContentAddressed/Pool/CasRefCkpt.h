@@ -12,22 +12,20 @@
 namespace DB::Cas
 {
 
-/// The pure, catalog-authoritative input to both recovery entry points. A stream LIST may offer only
-/// `greatest_hinted_snapshot`; it cannot supply a life epoch, frontier, or stopping condition.
+/// The pure, catalog-authoritative input to both recovery entry points. The checkpoint supplies every
+/// recovery boundary; `LIST` cannot supply a base, life epoch, frontier, or stopping condition.
 struct RecoveryGrounding
 {
     std::optional<RefTxnId> base;
     std::optional<RefTxnId> walk_from;
     std::optional<RefTxnId> committed_through;
-    bool ignored_hinted_snapshot_above_frontier = false;
 };
 
 /// Choose recovery's finite exact range from catalog lifecycle authority and `_ckpt`. Throws
 /// `INVALID_STATE` for absent/Creating names and `CORRUPTED_DATA` when a Live/Removing life lacks
 /// the checkpoint or genesis fact it must have. This helper performs no I/O and never trusts LIST.
 RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
-                                          const std::optional<RefCkpt> & ckpt,
-                                          const std::optional<RefTxnId> & greatest_hinted_snapshot);
+                                          const std::optional<RefCkpt> & ckpt);
 
 /// THE update and read algorithms for one namespace's `_ckpt` object (spec INV-4). The object itself
 /// and its codec live in `Formats/CasRefCkptFormat.h`; this header is what WRITES it and what a reader
@@ -45,8 +43,11 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
 /// where a sealer writing its sampled body back verbatim drops a concurrently published base and the
 /// next recovery loses an ACKED transaction.
 ///
-/// The merge is commutative and associative (it is a per-field max), which is why the two writers need
-/// no ordering between them -- only the token-CAS, which makes each read-modify-write atomic.
+/// Compatible contributions still merge commutatively, but the committed frontier is deliberately not
+/// an unconstrained CRDT maximum: a cross-epoch pair must be numerically adjacent and carry its seal
+/// evidence. That makes arbitrary regrouping of a corrupt historical set invalid, while the actual
+/// publish protocol remains simple: each token-CAS merges one contribution with the one durable body it
+/// just read.
 ///
 /// It is therefore NOT where `life_epoch`'s may-not-decrease rule lives, and that is a placement
 /// decision rather than an omission: a commutative function does not know which of its arguments is the
@@ -140,15 +141,17 @@ enum class MissingBaseVerdict : uint8_t
     Corrupted,        /// the base is gone under a checkpoint that still names it -- fail closed
 };
 
-/// Adjudicate a sampled base that turned out to be MISSING (its exact-key GET returned 404), by
-/// comparing the `_ckpt` token this recovery sampled against the token a fresh re-read observes.
+/// Adjudicate a sampled recovery anchor that turned out to be unavailable, by comparing the `_ckpt`
+/// token this recovery sampled against the token a fresh re-read observes. The anchor is the
+/// checkpoint-named snapshot and its retained same-id non-seal log witness; the caller supplies this
+/// verdict after either exact GET is absent.
 ///
 ///   - token ADVANCED  -> `RestartRecovery`. Cleanup legitimately advanced the checkpoint and deleted
-///     a snapshot strictly below the new base while we were reading. Nothing is wrong; restart from
-///     the newer base (bounded by the caller's own restart budget).
-///   - token UNCHANGED -> `Corrupted`. The checkpoint still names the object that is not there, and
-///     the deletion gate makes that unreachable in an honest run: snapshots are deletable only
-///     STRICTLY BELOW the checkpoint. Something deleted a live base.
+///     the previous anchor while we were reading. Nothing is wrong; restart from the newer base
+///     (bounded by the caller's own restart budget).
+///   - token UNCHANGED -> `Corrupted`. The checkpoint still names an object that is not there, and
+///     the deletion gate makes that unreachable in an honest run: the named snapshot and matching log
+///     are both retained. Something deleted a live anchor.
 ///   - `_ckpt` itself ABSENT on the re-read -> `Corrupted` for the same reason, and more bluntly: the
 ///     namespace has a base we sampled and no checkpoint at all. `_ckpt` is deleted only as part of
 ///     namespace removal, which cannot be racing a live recovery of that same namespace.

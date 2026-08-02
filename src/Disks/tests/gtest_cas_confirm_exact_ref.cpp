@@ -59,11 +59,12 @@ using DB::Cas::tests::CountingBackend;
 namespace
 {
 
-/// A `CountingBackend` with two recovery-side seams: a one-shot NON-transient LIST failure (which
+/// A `CountingBackend` with two recovery-side seams: a one-shot NON-transient exact GET failure (which
 /// leaves the namespace runtime resident but UNRECOVERED, because recovery fails closed), and a
-/// blocking LIST (which parks a caller inside `ensureRefTableRecovered` with `recovery_in_progress`
-/// set). The failure is deliberately `CORRUPTED_DATA`: `isTransientRecoveryError` does not list it, so
-/// recovery fails fast instead of burning its retry budget.
+/// blocking exact GET (which parks a caller inside `ensureRefTableRecovered` with
+/// `recovery_in_progress` set). The failure is deliberately `CORRUPTED_DATA`:
+/// `isTransientRecoveryError` does not list it, so recovery fails fast instead of burning its retry
+/// budget.
 class RecoveryLatchBackend : public CountingBackend
 {
 public:
@@ -74,47 +75,47 @@ public:
     using CountingBackend::putOverwrite;
     using CountingBackend::casPut;
 
-    /// Set before the driving call; consumed by the first matching LIST.
-    String fail_list_once_prefix;
+    /// Set before the driving call; consumed by the first matching recovery GET.
+    String fail_get_once_key;
 
-    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
-        if (!fail_list_once_prefix.empty() && prefix == fail_list_once_prefix)
+        if (!fail_get_once_key.empty() && key == fail_get_once_key)
         {
-            fail_list_once_prefix.clear();
+            fail_get_once_key.clear();
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "RecoveryLatchBackend: simulated non-transient LIST failure");
+                "RecoveryLatchBackend: simulated non-transient exact GET failure");
         }
         {
             std::unique_lock lk(m);
-            if (!block_prefix.empty() && prefix == block_prefix)
+            if (!block_key.empty() && key == block_key)
             {
                 entered = true;
                 cv.notify_all();
                 /// Bounded (20s) so a wiring bug bounds the wait instead of hanging the suite.
-                cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_prefix.empty(); });
+                cv.wait_for(lk, std::chrono::seconds(20), [&] { return block_key.empty(); });
             }
         }
-        return CountingBackend::list(prefix, cursor, limit);
+        return CountingBackend::get(key, range);
     }
 
-    void armBlockedList(const String & prefix)
+    void armBlockedGet(const String & key)
     {
         std::lock_guard lk(m);
-        block_prefix = prefix;
+        block_key = key;
         entered = false;
     }
-    void awaitBlockedList()
+    void awaitBlockedGet()
     {
         std::unique_lock lk(m);
         cv.wait_for(lk, std::chrono::seconds(20), [&] { return entered; });
-        ASSERT_TRUE(entered) << "the recovery LIST never parked -- the in-progress window was not exercised";
+        ASSERT_TRUE(entered) << "the recovery GET never parked -- the in-progress window was not exercised";
     }
-    void releaseBlockedList()
+    void releaseBlockedGet()
     {
         {
             std::lock_guard lk(m);
-            block_prefix.clear();
+            block_key.clear();
         }
         cv.notify_all();
     }
@@ -122,7 +123,7 @@ public:
 private:
     std::mutex m;
     std::condition_variable cv;
-    String block_prefix;
+    String block_key;
     bool entered = false;
 };
 
@@ -383,10 +384,10 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_unrecovered"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
 
     const size_t cached_before = store->refTablesCachedCountForTest();
-    backend->fail_list_once_prefix = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
+    backend->fail_get_once_key = store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns));
     EXPECT_THROW(store->resolveRef(ns, "x"), DB::Exception);
 
     ASSERT_EQ(store->refTablesCachedCountForTest(), cached_before + 1u)
@@ -403,21 +404,32 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
 
 
 /// Rule 2, the recovering case: another caller is INSIDE `ensureRefTableRecovered`, parked on its
-/// LIST. The runtime is resident, `recovery_in_progress` is set, and the state is still empty. Waiting
-/// for that recovery would be exactly the "recover from storage to answer" this primitive refuses.
+/// exact `_ckpt` GET. The runtime is resident, `recovery_in_progress` is set, and the state is still
+/// empty. Waiting for that recovery would be exactly the "recover from storage to answer" this
+/// primitive refuses.
 TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_recovering"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
-
-    backend->armBlockedList(store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
-    std::thread recoverer([&] { store->resolveRef(ns, "x"); });
-    backend->awaitBlockedList();
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
+    backend->armBlockedGet(store->layout().refCkptKey(NamespaceLifeId::stageATransition(ns)));
+    std::exception_ptr recovery_error;
+    std::thread recoverer([&]
+    {
+        try
+        {
+            store->resolveRef(ns, "x");
+        }
+        catch (...)
+        {
+            recovery_error = std::current_exception();
+        }
+    });
+    backend->awaitBlockedGet();
 
     backend->resetCounts();
-    /// The parked LIST holds `state_mutex` for its whole duration (up to the 20s block bound), so this
+    /// The parked exact GET is outside `state_mutex` (up to the 20s block bound), so this
     /// call must NOT be a blocking acquire of that mutex: waiting would make the confirm pay for
     /// somebody else's recovery while holding pool-wide append admission. The elapsed bound is what
     /// pins that -- it is an order of magnitude below the park, so it cannot pass by luck.
@@ -426,8 +438,24 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
     const auto elapsed = std::chrono::steady_clock::now() - started;
     const uint64_t requests = backendRequests(*backend);
 
-    backend->releaseBlockedList();
+    backend->releaseBlockedGet();
     recoverer.join();
+
+    if (recovery_error)
+    {
+        try
+        {
+            std::rethrow_exception(recovery_error);
+        }
+        catch (const std::exception & e)
+        {
+            FAIL() << "the driving recovery unexpectedly failed: " << e.what();
+        }
+        catch (...)
+        {
+            FAIL() << "the driving recovery unexpectedly failed with a non-standard exception";
+        }
+    }
 
     EXPECT_EQ(answer, ConfirmAnswer::Unknown);
     EXPECT_EQ(requests, 0u)
@@ -564,7 +592,7 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/confirm_wedge"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns);
 
     const ManifestId id = publishEmptyPart(store, ns, "x");
     ASSERT_EQ(store->confirmExactRef(ns, "x", id.ref), ConfirmAnswer::Yes);

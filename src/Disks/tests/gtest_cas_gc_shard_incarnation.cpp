@@ -134,8 +134,9 @@ TEST(CasGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
 }
 
 /// A physical life id carries no reversible logical namespace component. Once the catalog moves a
-/// logical name to a new life, the former stream is opaque debris: it cannot redirect GC to that name,
-/// cannot suppress the round, and is left intact for a separately-authorized cleanup path.
+/// logical name to a new life, the former stream is opaque debris: it cannot redirect GC to that name
+/// or contribute an edge to the current-life fold. The separately paced janitor may reclaim its
+/// unowned physical objects after that fold.
 TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 {
     std::shared_ptr<InMemoryBackend> backend;
@@ -146,7 +147,13 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 
     CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards, CatalogEntry{.ns = ns, .state = NsState::Live,
         .incarnation = UInt128(11), .creator = std::nullopt});   // Live forbids a creator fence
-    appendRefLogSeed(*backend, layout, ns, {});   // one real record, keyed at incarnation 11
+    const ManifestRef dead_ref = testRef(1);
+    writeBlobBody(*backend, layout, UInt128(11));
+    writeManifestRaw(*backend, layout, ns, dead_ref, {blobEntryFor("dead", UInt128(11))});
+    std::vector<RefOp> dead_ops{namespaceBirthOp()};
+    const auto dead_committed_ops = publishCommittedOps("part_dead", dead_ref);
+    dead_ops.insert(dead_ops.end(), dead_committed_ops.begin(), dead_committed_ops.end());
+    appendRefLogSeed(*backend, layout, ns, std::move(dead_ops));   // real but unacknowledged record at incarnation 11
     const NamespaceLifeId dead_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(11));
 
     {
@@ -161,9 +168,31 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
                    PutOutcome::Done);
     }
 
+    const NamespaceLifeId current_life = NamespaceLifeId::fromCatalogEntry(ns, UInt128(22));
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(current_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = std::optional<uint64_t>{1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    const ManifestRef current_ref = testRef(2);
+    writeBlobBody(*backend, layout, UInt128(22));
+    writeManifestRaw(*backend, layout, ns, current_ref, {blobEntryFor("current", UInt128(22))});
+    std::vector<RefOp> current_ops{namespaceBirthOp()};
+    const auto committed_ops = publishCommittedOps("part_current", current_ref);
+    current_ops.insert(current_ops.end(), committed_ops.begin(), committed_ops.end());
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(current_ops), .prev_epoch_seal = std::nullopt});
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = std::optional<uint64_t>{1},
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt});
+
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
     EXPECT_TRUE(report.anomalies.empty());
-    EXPECT_FALSE(backend->list(layout.namespaceStreamPrefix(dead_life), "", 100).keys.empty());
+    EXPECT_FALSE(report.deferred);
+    EXPECT_EQ(inDegreeOf(*backend, layout, UInt128(22)), 1);
+    EXPECT_EQ(inDegreeOf(*backend, layout, UInt128(11)), 0)
+        << "the unmatched old life must not contribute its unacknowledged edge to the current-life fold";
 }
 
 /// Checkpoints live in the state tree and are read by exact key from the catalog cut. They are never

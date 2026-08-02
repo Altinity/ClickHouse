@@ -258,14 +258,18 @@ void validateEpochSealGrammarStructural(const RefLogTxn & txn)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal is only allowed at sequence 1, got txn_id {}-{}",
                 txn.txn_id.writer_epoch, txn.txn_id.ref_sequence);
-        /// Chain-direction (review finding I3): a seal closing epoch E has id {E, T+1}, and the
-        /// transaction chaining to it lives at {E', 1} with E' > E -- so prev_epoch_seal's writer_epoch
-        /// must be strictly less than this transaction's own. A self- or forward-pointer is precisely
-        /// the corrupted shape a chain walk (Tasks 2/6) must not have to defend against itself; this is
-        /// a context-free property of a single transaction, so it belongs here, not in the walker.
+        /// INV-2 materializes every global writer epoch for an existing life. A sequence-1 transaction
+        /// in E therefore chains to the closing seal of exactly E-1, not merely an arbitrary earlier
+        /// epoch. A skip would make a missing intermediate seal look like a proved boundary and let a
+        /// fold or destructive tail walk bypass it. This is a context-free property of one body, so
+        /// reject it in the codec before any walker can interpret the link as evidence.
         if (txn.prev_epoch_seal->writer_epoch >= txn.txn_id.writer_epoch)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefLogTxn: prev_epoch_seal writer_epoch {} must be strictly less than this "
+                "transaction's writer_epoch {}", txn.prev_epoch_seal->writer_epoch, txn.txn_id.writer_epoch);
+        if (txn.prev_epoch_seal->writer_epoch + 1 != txn.txn_id.writer_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefLogTxn: prev_epoch_seal writer_epoch {} must immediately precede this "
                 "transaction's writer_epoch {}", txn.prev_epoch_seal->writer_epoch, txn.txn_id.writer_epoch);
     }
 }

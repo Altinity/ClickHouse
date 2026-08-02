@@ -287,7 +287,7 @@ public:
     /// unresolved-`PUT` state; cleanup methods expose sweep eligibility; publication methods expose
     /// settling, snapshot identity, and tail accounting. Every observer below is resident-only: it
     /// performs no catalog/backend I/O and never materializes or recovers a runtime.
-    /// Returns the number of LIST/GET recovery restarts recorded for `ns`.
+    /// Returns the number of exact-read recovery restarts recorded for `ns`.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
@@ -747,7 +747,7 @@ private:
         /// moment the live epoch advances past the seal's. Nothing else writes it: a seal is durable
         /// evidence, never a local guess.
         std::optional<RefTxnId> last_epoch_seal;
-        uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
+        uint64_t recovery_restarts = 0;           /// diagnostic: exact-GET restarts forced by a vanished object
         /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
         /// overhead and the fixed safety margin, computed once at recovery.
         uint64_t snapshot_budget = 0;

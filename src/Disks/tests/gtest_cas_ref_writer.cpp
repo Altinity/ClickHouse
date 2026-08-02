@@ -68,6 +68,7 @@ using DB::Cas::tests::publishCommittedOps;
 using DB::Cas::tests::runRegularRoundReclaiming;
 using DB::Cas::tests::writeRefLogTxnRaw;
 using DB::Cas::tests::writeRefSnapshotRaw;
+using DB::Cas::tests::writeSealAt;
 
 namespace
 {
@@ -154,7 +155,7 @@ PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 /// production birth mints a random incarnation and those computed keys land nowhere real.
 PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(s->backend(), s->layout(), ns, s->liveWriterEpoch());
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
@@ -341,7 +342,7 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
 }
 
 /// A backend that can (a) force one `get()` on a chosen exact key to return absent exactly once
-/// (simulating an object vanishing between a recovery LIST and its GET, with an optional side effect
+/// (simulating an object vanishing after recovery sampled its exact checkpoint, with an optional side effect
 /// fired at that exact moment -- e.g. publishing a covering newer snapshot, mirroring a concurrent GC
 /// cleanup+republish race), and (b) force `putIfAbsent` on keys matching a chosen substring to throw an
 /// ambiguous (Unresolved-classified) exception a bounded number of times, optionally still capturing
@@ -425,9 +426,8 @@ public:
     String ckpt_get_hook_key;
     std::function<void()> ckpt_get_hook;
 
-    /// Force the recovery namespace LIST to throw a transient object-store error (S3_ERROR) a bounded
-    /// number of times -- exercises Layer 1's transient-retry over the LIST leg of recovery (not just
-    /// the seal PUT). Mirrors what a real object-storage backend surfaces for a network/throttle blip.
+    /// Force a stream `LIST` to throw a transient object-store error (S3_ERROR) a bounded number of
+    /// times. Recovery must not consume this injection; callers that intentionally enumerate still do.
     int list_fault_count = 0;
 
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
@@ -713,7 +713,7 @@ private:
 }
 
 /// ===================================================================================
-/// Recovery (spec §Startup And Recovery / §Why One LIST Is Sufficient)
+/// Recovery (spec §Recovery / exact checkpoint grounding)
 /// ===================================================================================
 
 TEST(RefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
@@ -755,7 +755,7 @@ TEST(RefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInv
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/cold-read-catalog-aba"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
     const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
@@ -819,7 +819,7 @@ TEST(RefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
     auto external_store = Pool::open(backend, std::move(external_config));
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/external-catalog-runtime-publication"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
     const CatalogEntry predecessor = catalogEntryOrThrow(*backend, layout, ns);
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
@@ -856,7 +856,7 @@ TEST(RefWriterRuntimeIdentity, ColdReadRejectsUnrelatedCatalogMutationBetweenObs
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/unrelated-catalog-runtime-publication"};
     const RootNamespace unrelated{"srv1/unrelated-catalog-row"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     store->setReadableCatalogAfterObservationHookForTest([&]
@@ -877,7 +877,7 @@ TEST(RefWriterRuntimeIdentity, WarmReadableRuntimeDoesNotReadCatalog)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/warm-runtime-zero-catalog-get"};
-    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, layout, ns, store->liveWriterEpoch());
 
     EXPECT_NO_THROW((void)store->listRefs(ns));
     ASSERT_NE(store->refTableRuntimeIdentityForTest(ns), 0u);
@@ -1000,6 +1000,11 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
     /// (the snapshot already contains it) and throw -- proving it must be ignored, not merely benign.
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 3},
         {namespaceBirthOp(), publishCommittedOps("a", ma)[0], publishCommittedOps("a", ma)[1]}, std::nullopt});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = RefTxnId{1, 5},
+        .ops = publishCommittedOps("a", ma),
+        .prev_epoch_seal = std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{1, 5}, {committedRow("a", ma)}));
 
     std::vector<RefOp> tail_ops;
@@ -1015,18 +1020,22 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
         .checkpoint_snapshot_id = RefTxnId{1, 5},
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
+    backend->resetCounts();
     auto store = openPool(backend);
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
     const auto b = store->resolveRef(ns, "b");
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(b->manifest_id.ref, mb);
     EXPECT_EQ(store->listRefs(ns).size(), 1u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 5})), 1u)
+        << "recovery must validate the selected base's retained ordinary log";
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, RefTxnId{1, 5})), 1u)
+        << "the fixture must reach and decode the selected base snapshot";
 }
 
-/// Restart-on-vanish (spec §Startup And Recovery): the selected snapshot vanishes between the LIST and
-/// its GET (here: a concurrent GC cleanup+republish race is simulated by publishing a NEWER, covering
-/// snapshot exactly when the vanish fires). Recovery must restart with a fresh LIST and converge on the
-/// newer snapshot, not treat the vanish as corruption.
+/// Restart-on-vanish (spec §Recovery): the checkpoint-named snapshot vanishes during its exact GET
+/// while concurrent cleanup publishes a newer checkpoint base. Recovery must restart from the newer
+/// exact checkpoint, not treat the vanish as corruption.
 TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1042,6 +1051,11 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = snap_x,
+        .ops = publishCommittedOps("a", ma),
+        .prev_epoch_seal = std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
@@ -1049,9 +1063,16 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
         .checkpoint_snapshot_id = snap_x,
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     backend->vanish_once_keys.insert(layout.refSnapshotKey(life, snap_x));
+    bool vanish_fired = false;
     backend->on_vanish_fire = [&]
     {
+        vanish_fired = true;
         const RefTxnId snap_y{1, 20};
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(),
+            .txn_id = snap_y,
+            .ops = publishCommittedOps("b", mb),
+            .prev_epoch_seal = std::nullopt});
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_y, {committedRow("b", mb)}));
         const auto before = backend->get(layout.refCkptKey(life));
         ASSERT_TRUE(before);
@@ -1062,12 +1083,17 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
             .last_epoch_seal = std::nullopt}), before->token).outcome, CasOutcome::Committed);
     };
 
+    backend->resetCounts();
     auto store = openPool(backend);
     const auto b = store->resolveRef(ns, "b");
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(b->manifest_id.ref, mb);
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value()) << "must converge on snapshot Y, not a mix of X and Y";
     EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 1u);
+    EXPECT_TRUE(vanish_fired) << "the fixture must reach the old snapshot GET and fire the replacement hook";
+    EXPECT_FALSE(backend->vanish_once_keys.contains(layout.refSnapshotKey(life, snap_x)));
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, snap_x)), 1u);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 20})), 1u);
 }
 
 /// A DIFFERENT valid object at the exact snapshot key (not merely absent) is corruption, never a
@@ -1088,6 +1114,11 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RootNamespace other_ns{"srv1/other"};
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = snap_x,
+        .ops = publishCommittedOps("anchor", manifestRef(1, 10, 1)),
+        .prev_epoch_seal = std::nullopt});
     DB::Cas::RefTableSnapshot foreign;
     foreign.ns = other_ns.string();
     foreign.snapshot_id = snap_x;
@@ -1104,6 +1135,8 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     auto store = openPool(backend);
     backend->resetCounts();
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "anything"); });
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, snap_x)), 1u)
+        << "the matching ordinary log must be validated before the selected snapshot";
     EXPECT_EQ(backend->getCount(snapshot_key), 1u)
         << "the corruption must come from decoding the required checkpoint snapshot";
 }
@@ -2423,9 +2456,11 @@ TEST(RefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 }
 
 /// A fresh mount that recovers a large PRE-EXISTING tail (left by a predecessor whose own thresholds
-/// never fired) must trigger its own publish from a plain READ (resolveRef/listRefs), not only from a
-/// write -- the mount-time trigger (spec: "or right after recovery replays a tail already above one").
-TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLargeTail)
+/// never fired) retains that tail as trigger debt. Recovery ends at a terminal epoch seal, which is not
+/// snapshot-serializable; one ordinary successor makes the inherited over-threshold tail publishable.
+/// The single successor alone is below the threshold, so the dispatch still proves the mount-time tail
+/// was retained rather than forgotten during recovery.
+TEST(RefWriterSnapshotPublish, MountTimeRecoveredLargeTailPublishesAfterOrdinarySuccessor)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2444,13 +2479,23 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     auto successor = openPoolWithConfig(backend, config);
 
-    /// A mere READ triggers recovery; recovery alone must dispatch the mount-time publish (the table is
-    /// never otherwise mutated by this mount).
+    /// A mere read triggers recovery. The recovered tail is already above threshold, but its greatest
+    /// applied record is the terminal seal, so there is deliberately no snapshot candidate yet.
     EXPECT_EQ(successor->listRefs(ns).size(), 3u);
+    successor->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_GT(successor->tailSinceSnapshotCountForTest(ns), config.snapshot_log_count_threshold)
+        << "the mount must retain the predecessor's large uncovered tail";
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
+        << "a terminal recovery seal is not snapshot-serializable";
+
+    /// One ordinary transaction above the seal reopens the candidate. It cannot cross the threshold
+    /// by itself; publication therefore depends on the recovered mount-time tail asserted above.
+    successor->dropRef(ns, "c");
     successor->waitForSnapshotPublishSettleForTest(ns);
 
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
-    ASSERT_TRUE(snap_id.has_value()) << "the mount-time trigger must have published a snapshot";
+    ASSERT_TRUE(snap_id.has_value())
+        << "the ordinary successor must make the inherited mount-time tail publishable";
     EXPECT_EQ(successor->tailSinceSnapshotCountForTest(ns), 0u);
 
     const auto got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), *snap_id));
@@ -2826,11 +2871,17 @@ TEST(RefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntil
         publishEmptyPart(predecessor, ns, "before_seal");
         const auto before = backend->get(predecessor->layout().refCkptKey(life));
         ASSERT_TRUE(before);
-        ASSERT_EQ(backend->casPut(predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
-            .life_epoch = predecessor->liveWriterEpoch(),
-            .committed_through = RefTxnId{predecessor->liveWriterEpoch(), 2},
-            .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt}), before->token).outcome, CasOutcome::Committed);
+        const RefCkpt before_seal = decodeRefCkpt(before->bytes);
+        ASSERT_TRUE(before_seal.committed_through);
+        const RefTxnId seal_id{before_seal.committed_through->writer_epoch,
+                               before_seal.committed_through->ref_sequence + 1};
+        writeSealAt(*backend, predecessor->layout(), ns, seal_id);
+
+        RefCkpt recovered_seal = before_seal;
+        recovered_seal.committed_through = seal_id;
+        recovered_seal.last_epoch_seal = seal_id;
+        ASSERT_EQ(backend->casPut(predecessor->layout().refCkptKey(life), encodeRefCkpt(recovered_seal), before->token).outcome,
+                  CasOutcome::Committed);
     }
 
     PoolConfig successor_config;
@@ -2847,7 +2898,9 @@ TEST(RefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntil
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_at_seal)
         << "a recovered seal must not dispatch or re-dispatch an unpublishable snapshot candidate";
 
-    publishEmptyPart(successor, ns, "after_seal");
+    /// One ordinary append transaction above the recovered seal must reopen the scheduler. `dropRef`
+    /// is exactly one ordinary ref-log append, unlike `publishEmptyPart`'s two-phase part publication.
+    successor->dropRef(ns, "before_seal");
     successor->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_at_seal + 1)
         << "an ordinary successor above the seal must make the threshold candidate publishable again";
@@ -3072,6 +3125,12 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         }
         writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2, std::nullopt});
     }
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = e1,
+        .committed_through = RefTxnId{e1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
     /// transparently retries away. This test is where `kSingleAttemptDeadlineMs` was first needed and
@@ -3169,9 +3228,10 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     const Layout layout("p");
     const RootNamespace ns{"srv1/precommit_sweep_retry"};
 
-    /// One shared injected clock for BOTH incarnations, so the successor's backoff deadline is driven
-    /// deterministically (never a raw sleep).
+    /// One shared injected clock for both incarnations. The successor's wait hook below advances this
+    /// same clock, so both mount observation and the later sweep-backoff deadline are deterministic.
     uint64_t fake_now = 1'000'000;
+    size_t mount_wait_calls = 0;
     const auto fake_clock = [&fake_now] { return fake_now; };
 
     {
@@ -3180,14 +3240,16 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
         pred_config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
         pred_config.boot_ms_fn = fake_clock;
         auto predecessor = openPoolWithConfig(backend, pred_config);
+        std::vector<PartWriteTxnPtr> predecessor_builds;
         for (const String & name : {"stale_a", "stale_b", "stale_c"})
         {
             auto build = startBuildFor(predecessor, ns, name);
             const ManifestId id = build->stageManifest({});
             build->precommitAdd(ns, name, id);
             /// no promote -- left dangling, as a crashed build would leave it
+            predecessor_builds.push_back(std::move(build));
         }
-    }   /// predecessor destroyed: its mount lease is released
+    }   /// all three cleanup duties remain pending; predecessor publishes no clean farewell
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
     /// transparently retries away (mirrors the wedge-semantics tests in this file exactly).
@@ -3200,8 +3262,15 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = fake_clock;
+    config.wait_sleep_fn = [&fake_now, &mount_wait_calls](uint64_t ms)
+    {
+        ++mount_wait_calls;
+        fake_now += ms;
+    };
     SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPoolWithConfig(backend, config);
+    EXPECT_GT(mount_wait_calls, 0u)
+        << "the unclean predecessor must exercise the injected mount-observation wait";
 
     successor->setEventSink([&](const CasEvent & e) { seen.add(e); });
 
@@ -4359,6 +4428,12 @@ TEST(RefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation
     const RootNamespace ns{"srv1/existing-live-assignment"};
     CasRefCatalog::casAdmitEntry(*backend, store->layout(), 1, CatalogEntry{
         .ns = ns, .state = NsState::Live, .incarnation = UInt128{41}});
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefCkpt{
+        .life_epoch = store->liveWriterEpoch(),
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     backend->resetCounts();
     const NamespaceLifeId life = store->namespaceLife(ns);
@@ -4482,6 +4557,14 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
     mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
                publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
     writeRefLogTxnRaw(backend, layout, mut);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        /// The namespace was born in epoch 1 and only `{1,1}` is fronted initially. Recovery must mint
+        /// the missing required seal `{1,2}` before it may adopt the already durable `{2,1}` successor.
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 }
 
 /// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
@@ -4583,12 +4666,10 @@ TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2);
 }
 
-TEST(RefWriterRecoveryRetry, TransientListFailureIsRetriedThenSucceeds)
+TEST(RefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
 {
-    /// The recovery namespace LIST (not just the seal PUT) fails transiently. LIST/GET call the backend
-    /// directly and surface a raw S3_ERROR, NOT the NETWORK_ERROR the seal controller mints -- this test
-    /// guards that Layer 1's transient classifier covers the LIST leg (the path the motivating stuck-load
-    /// incident actually hit), not only the seal PUT.
+    /// A recovery stream LIST used to be a transient failure leg. The checkpoint now names both the
+    /// base and frontier, so the same injected failures must remain untouched while recovery seals.
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/retry_list"};
@@ -4611,17 +4692,20 @@ TEST(RefWriterRecoveryRetry, TransientListFailureIsRetriedThenSucceeds)
 
     store->setCasRetrySleepForTest([](uint64_t) {});
 
-    /// Fail the recovery LIST twice with a transient S3_ERROR; the third attempt lists cleanly and seals.
+    /// If recovery ever reintroduces a stream LIST, this injection turns the attempt into a retry and
+    /// consumes the counter. `namespaceFilesLifeIfReadable` reaches writer recovery without performing
+    /// the unrelated user-facing `listRefs` enumeration.
     backend->list_fault_count = 2;
 
     using ProfileEvents::global_counters;
     const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
     const auto sealed_before = global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load();
 
-    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must retry past the transient LIST failures";
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before + 2);
+    ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
+    EXPECT_EQ(backend->list_fault_count, 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2)
-        << "two dead epochs (1 and 2) are closed once the listing succeeds";
+        << "two dead epochs (1 and 2) are closed without enumerating their stream";
 }
 
 TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
@@ -4686,6 +4770,8 @@ TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     backend->corrupt_count = 1;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
+    EXPECT_EQ(backend->corrupt_count, 0)
+        << "the test must reach the injected foreign seal conflict, not fail on fixture validation";
     EXPECT_EQ(sleep_calls, 0u) << "a non-transient error must fail fast with zero backoff sleeps";
 }
 
@@ -4701,36 +4787,39 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     /// this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
+    std::vector<RefOp> base_ops{namespaceBirthOp()};
+    const auto publish_a = publishCommittedOps("a", ma);
+    base_ops.insert(base_ops.end(), publish_a.begin(), publish_a.end());
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), snap_x, std::move(base_ops), std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = snap_x,
+        .checkpoint_snapshot_id = snap_x,
+        .last_epoch_seal = std::nullopt,
+    });
 
     auto store = openPool(backend);
 
     size_t sleep_calls = 0;
     store->setCasRetrySleepForTest([&sleep_calls](uint64_t) { ++sleep_calls; });
 
-    /// Re-arm the vanish so the SAME selected snapshot key keeps disappearing between LIST and GET,
-    /// past the kRefRecoveryMaxRestarts (3) inner brake.
+    /// A checkpoint-named snapshot belongs to the caller's immutable authority cut. If that exact
+    /// object is absent, recovery must report corruption immediately; it must neither reinterpret a
+    /// transient disappearance as a new authority cut nor enter the outer transient-retry loop.
     const String vkey = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x);
-    int fires = 0;
-    std::function<void()> rearm = [&]()
-    {
-        if (++fires < 5)
-        {
-            backend->vanish_once_keys.insert(vkey);
-            backend->on_vanish_fire = rearm;
-        }
-    };
     backend->vanish_once_keys.insert(vkey);
-    backend->on_vanish_fire = rearm;
 
     using ProfileEvents::global_counters;
     const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
 
+    EXPECT_FALSE(backend->vanish_once_keys.contains(vkey))
+        << "the test must reach the checkpoint-named snapshot GET, not fail on earlier fixture validation";
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before)
-        << "the vanish-race brake is terminal; the outer transient-retry loop must NOT re-drive it";
-    EXPECT_EQ(sleep_calls, 0u) << "no backoff sleep for the terminal vanish brake";
+        << "missing immutable checkpoint authority is terminal; the outer transient-retry loop must NOT re-drive it";
+    EXPECT_EQ(sleep_calls, 0u) << "no backoff sleep for missing immutable checkpoint authority";
 }
 
 TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)

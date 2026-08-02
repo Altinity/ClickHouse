@@ -113,7 +113,10 @@ TEST(CasGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
     ///   v3: DUPLICATE DROP r1 {old=committed(r1), new=none}
     /// The second removal of r1's edges is a no-op under the idempotent set model.
     appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
-    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
+    const uint64_t duplicate_removal_sequence
+        = appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
+    advanceRecoverableCkptForRawFixture(
+        *backend, store->layout(), ns, RefTxnId{1, duplicate_removal_sequence});
 
     /// Drive GC to fixpoint (advancing the mount ack each round so the ack floor graduates the condemned
     /// blobs): must complete without throwing and collect both blobs.

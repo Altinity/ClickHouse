@@ -66,7 +66,7 @@ PoolPtr openPool(const BackendPtr & backend)
 /// injection/verification that separately computes a key via `NamespaceLifeId::stageATransition(ns)`.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(s->backend(), s->layout(), ns, s->liveWriterEpoch());
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;

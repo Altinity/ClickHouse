@@ -1,9 +1,11 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <iostream>
@@ -123,6 +125,22 @@ ManifestId publishOneBlobPart(
     return id;
 }
 
+/// The semantic `publishCommittedTransition` wrapper advances its same-life checkpoint. Keep this
+/// assertion explicit so this leak fixture cannot silently depend on a historical checkpoint lag.
+void assertSemanticTransitionCheckpoint(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & committed_through)
+{
+    const auto life = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    ASSERT_TRUE(life);
+    const String key = layout.refCkptKey(*life);
+    const auto before = backend.get(key);
+    ASSERT_TRUE(before);
+
+    RefCkpt ckpt = decodeRefCkpt(before->bytes);
+    ASSERT_TRUE(ckpt.committed_through);
+    EXPECT_EQ(*ckpt.committed_through, committed_through);
+}
+
 /// Whether a blob's body object is present in the backend (HEADs blobKey directly — the GC retire path
 /// HEADs the object key, never the Pool's manifest decode cache).
 bool blobPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & layout, const String & payload)
@@ -176,7 +194,8 @@ FsckReport displaceAndGc(
         << "partA manifest body must still be present so GC can read its -1 edges at removal-fold";
 
     /// REPOINT: old={Committed,ref,partA} / new={Committed,ref,partB} in the single ordered journal.
-    publishCommittedTransition(*b, s->layout(), ns, ref, part_a.ref, part_b.ref);
+    const uint64_t repoint_sequence = publishCommittedTransition(*b, s->layout(), ns, ref, part_a.ref, part_b.ref);
+    assertSemanticTransitionCheckpoint(*b, s->layout(), ns, RefTxnId{1, repoint_sequence});
 
     /// The repoint dropped partA's owner; advance the watermark floor so partA's now-orphaned blobs are
     /// not spared as in-flight, then run GC to a fixpoint.

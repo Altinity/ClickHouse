@@ -34,12 +34,12 @@
 /// Stage A task 6: recovery is `_ckpt` + an ARITHMETIC tail + a seal CAS-walk, and it installs nothing
 /// without presenting the fence generation it was admitted under.
 ///
-/// The one sentence this suite exists to defend: **a LIST is a hint, never a census.** Everything the
+/// The one sentence this suite exists to defend: **recovery performs no stream `LIST`.** Everything the
 /// old recovery knew about a table's durable stream came from one `LIST`, so a listing that silently
-/// omitted a key produced a table that was missing an ACKED transaction and looked perfectly healthy --
-/// the blocker observed live on 2026-07-26. Completeness is now decided by arithmetic (INV-1: ids are
-/// dense `1..T` within `(namespace, epoch)`), so a hint omission costs one exact-key `GET` and changes
-/// no outcome, while a genuine hole is a `CORRUPTED_DATA` nobody can mistake for an empty tail.
+/// omitted a key produced a table missing an ACKED transaction and looked perfectly healthy. The
+/// checkpoint now supplies the only base and finite frontier; arithmetic exact GETs decide recovery.
+/// These list-liar fixtures are retained as sentinels: hiding or fabricating a listed key cannot affect
+/// recovery because recovery sends zero stream LIST requests.
 ///
 /// The other half is INV-2: a dead epoch is closed IN-BAND, by a seal transaction the store's own
 /// conditional create places at exactly `{E, T+1}` -- the key a dying predecessor's in-flight PUT would
@@ -97,9 +97,9 @@ void fenceOutMountForRemount(Backend & backend, const String & mount_key)
         PutOutcome::Done);
 }
 
-/// A backend whose LIST can be made to LIE by omission -- the whole point of this suite. `hidden_keys`
-/// are still readable by exact key (that is what a real listing inconsistency looks like: the object is
-/// there, the enumeration simply did not mention it), and `list` filters them out of every page.
+/// A backend whose `LIST` can lie by omission. `hidden_keys` remain readable by exact key, so these
+/// fixtures prove the stronger modern rule: recovery sends no stream `LIST` at all and therefore cannot
+/// be affected by an enumeration inconsistency.
 ///
 /// Deliberately NOT a "delete the object" fixture: an object that is genuinely gone is a different
 /// (and already covered) case. The blocker is an object that EXISTS and is invisible to enumeration.
@@ -495,15 +495,12 @@ CatalogEntry replaceCatalogLifeForTest(
 }
 
 /// ---------------------------------------------------------------------------------------------
-/// The arithmetic tail: a hint is a hint
+/// The checkpoint-bounded arithmetic tail: no recovery LIST
 /// ---------------------------------------------------------------------------------------------
 
-/// THE blocker's recovery face. The namespace's durable stream is `{1,1} {1,2} {1,3}`; the listing
-/// omits the MIDDLE one. Under LIST-reconciliation recovery replayed `{1,1}` then met `{1,3}`, which is
-/// not the contiguous successor -- so before INV-1 it silently produced a table missing an acked
-/// transaction, and after INV-1 it would fail the whole table. Arithmetic fetches the omitted id by
-/// exact key and the recovered table is IDENTICAL to the one a complete hint produces.
-TEST(CasRefRecoveryCasWalk, HintOmittingAMiddleLogIdChangesNothing)
+/// The durable stream is `{1,1} {1,2} {1,3}` while the backend hides the middle key from LIST.
+/// Recovery must make zero stream LIST requests and recover the same exact checkpoint range.
+TEST(CasRefRecoveryCasWalk, HiddenMiddleLogDoesNotAffectCheckpointRecovery)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -517,18 +514,19 @@ TEST(CasRefRecoveryCasWalk, HintOmittingAMiddleLogIdChangesNothing)
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
+    backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
-    EXPECT_EQ(refs.size(), 3u) << "the hint omitted {1,2}; the arithmetic walk must fetch it by exact key";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(refs.size(), 3u) << "the arithmetic walk must fetch {1,2} by exact key";
     EXPECT_TRUE(refs.contains("a"));
     EXPECT_TRUE(refs.contains("b")) << "'b' is the ref the omitted transaction published";
     EXPECT_TRUE(refs.contains("c"));
 }
 
-/// The same omission at the TAIL. This is the more dangerous shape: a lost middle id at least makes the
-/// replay non-contiguous, whereas a lost tail id looks exactly like "the stream ends here" -- there is
-/// nothing above it to disagree with. Only an exact-key probe of `last + 1` can tell them apart.
-TEST(CasRefRecoveryCasWalk, HintOmittingTheTailLogIdChangesNothing)
+/// The same sentinel at the tail. A hidden tail key is still found by the bounded exact walk, not by a
+/// stream enumeration.
+TEST(CasRefRecoveryCasWalk, HiddenTailLogDoesNotAffectCheckpointRecovery)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -541,27 +539,28 @@ TEST(CasRefRecoveryCasWalk, HintOmittingTheTailLogIdChangesNothing)
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
+    backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
     EXPECT_EQ(refs.size(), 2u) << "an omitted TAIL id is indistinguishable from the end of the stream to a "
-                                  "listing; the arithmetic probe of last+1 is what finds it";
+                                  "listing; recovery never enumerates it and exact-reads the checkpoint range";
     EXPECT_TRUE(refs.contains("b"));
 }
 
-/// A hint that omits the base SNAPSHOT is harmless for the same reason, but by a different route: the
-/// base is chosen as the greatest of (hint, `_ckpt.checkpoint`) and fetched by EXACT KEY, so the
-/// checkpoint alone is enough to find it. Without this, a cleaned prefix whose listing lost the newest
-/// snapshot would replay from an older base -- or from nothing at all.
-TEST(CasRefRecoveryCasWalk, CkptNamesTheBaseSnapshotTheHintLost)
+/// Hiding the checkpoint base snapshot from LIST cannot matter: the checkpoint names it, recovery
+/// exact-reads its matching non-seal log first, then exact-reads the snapshot.
+TEST(CasRefRecoveryCasWalk, CkptNamedBaseIsRecoveredWithoutStreamList)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/hint_snap"};
 
-    const RefTxnId base{1, 2};
+    const RefTxnId base{1, 1};
+    seedTxn(*backend, layout, ns, base, "a", /*birth=*/true);
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), base, {committedRow("a", manifestRef(1, 1, 1))}));
-    seedTxn(*backend, layout, ns, RefTxnId{1, 3}, "c", /*birth=*/false);
+    seedTxn(*backend, layout, ns, RefTxnId{1, 2}, "c", /*birth=*/false);
     seedCkpt(*backend, layout, ns, RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                                            .committed_through = base,
                                            .checkpoint_snapshot_id = base,
@@ -570,10 +569,12 @@ TEST(CasRefRecoveryCasWalk, CkptNamesTheBaseSnapshotTheHintLost)
 
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
+    backend->resetCounts();
 
     const auto refs = store->listRefs(ns);
-    EXPECT_EQ(refs.size(), 2u) << "the checkpoint names the base; the hint's omission of it is irrelevant";
-    EXPECT_TRUE(refs.contains("a")) << "'a' exists only inside the snapshot the hint lost";
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
+    EXPECT_EQ(refs.size(), 2u) << "the checkpoint names the base; the listing's omission is irrelevant";
+    EXPECT_TRUE(refs.contains("a")) << "'a' exists inside the checkpoint-named snapshot";
     EXPECT_TRUE(refs.contains("c"));
 }
 
@@ -604,7 +605,7 @@ TEST(CasRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
         << "an unchanged checkpoint makes the missing committed id corruption, not a shorter stream";
 }
 
-TEST(CasRefRecoveryCasWalk, HintedSnapshotAboveCommittedFrontierIsIgnored)
+TEST(CasRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -625,14 +626,16 @@ TEST(CasRefRecoveryCasWalk, HintedSnapshotAboveCommittedFrontierIsIgnored)
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     auto store = openWalkPool(backend);
+    backend->resetCounts();
     const auto refs = store->listRefs(ns);
 
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(life)), 0u);
     EXPECT_TRUE(refs.contains("committed"));
     EXPECT_FALSE(refs.contains("laundered"))
-        << "LIST may offer a snapshot, but it cannot raise the recovered cut above committed_through";
+        << "a physical snapshot not named by `_ckpt` cannot raise the recovered cut";
 }
 
-TEST(CasRefRecoveryCasWalk, FullAndEmptyListRecoverTheSameCommittedCut)
+TEST(CasRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/list_equivalence"};
@@ -641,6 +644,7 @@ TEST(CasRefRecoveryCasWalk, FullAndEmptyListRecoverTheSameCommittedCut)
     auto seed = std::make_shared<HidingListBackend>();
 
     DB::Cas::tests::casAdmitEntry(*seed, layout, ns);
+    seedTxn(*seed, layout, ns, base, "a", /*birth=*/true);
     writeRefSnapshotRaw(*seed, layout,
         minimalLiveSnapshot(ns.string(), base, {committedRow("a", manifestRef(1, 1, 1))}));
     seedTxn(*seed, layout, ns, frontier, "b", /*birth=*/false);
@@ -680,7 +684,11 @@ TEST(CasRefRecoveryCasWalk, FullAndEmptyListRecoverTheSameCommittedCut)
     };
     const auto recover = [&](const std::shared_ptr<HidingListBackend> & backend)
     {
-        return openWalkPool(backend)->listRefs(ns);
+        auto store = openWalkPool(backend);
+        backend->resetCounts();
+        const auto refs = store->listRefs(ns);
+        EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(life)), 0u);
+        return refs;
     };
 
     const auto full = recover(clone_seed());
@@ -700,7 +708,7 @@ TEST(CasRefRecoveryCasWalk, FullAndEmptyListRecoverTheSameCommittedCut)
     EXPECT_TRUE(empty.contains("b"));
 }
 
-TEST(CasRefRecoveryCasWalk, MissingHintOnlySnapshotFallsBackToCheckpointBaseInSameAttempt)
+TEST(CasRefRecoveryCasWalk, PhantomListedSnapshotIsUnobserved)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -708,6 +716,7 @@ TEST(CasRefRecoveryCasWalk, MissingHintOnlySnapshotFallsBackToCheckpointBaseInSa
     const RefTxnId checkpoint_base{1, 1};
     const RefTxnId frontier{1, 2};
 
+    seedTxn(*backend, layout, ns, checkpoint_base, "a", /*birth=*/true);
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), checkpoint_base, {committedRow("a", manifestRef(1, 1, 1))}));
     seedTxn(*backend, layout, ns, frontier, "b", /*birth=*/false);
@@ -720,8 +729,10 @@ TEST(CasRefRecoveryCasWalk, MissingHintOnlySnapshotFallsBackToCheckpointBaseInSa
     backend->phantom_list_keys.insert(layout.refSnapshotKey(life, frontier));
 
     auto store = openWalkPool(backend);
+    backend->resetCounts();
     const auto refs = store->listRefs(ns);
 
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(life)), 0u);
     EXPECT_TRUE(refs.contains("a"));
     EXPECT_TRUE(refs.contains("b"));
 }
@@ -738,8 +749,10 @@ TEST(CasRefRecoveryCasWalk, ListedFPlusTwoWithoutFPlusOneIsInertUncommittedDebri
     seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, frontier));
 
     auto store = openWalkPool(backend);
+    backend->resetCounts();
     const auto refs = store->listRefs(ns);
 
+    EXPECT_EQ(backend->listCount(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns))), 0u);
     EXPECT_TRUE(refs.contains("a"));
     EXPECT_FALSE(refs.contains("debris"));
 }
@@ -1927,23 +1940,21 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
     EXPECT_TRUE(refLogTxnIsEpochSeal(*seal));
 }
 
-/// A REMOVED namespace's dead epoch is NOT sealed, and the walk keeps going past it.
+/// Checkpoint-grounded recovery starts at the recreated life's own genesis and does not replay or
+/// extend the predecessor life's stream.
 ///
-/// Found by the gate, not by design: the first cut sealed every dead epoch unconditionally and then
-/// refused to APPLY its own seal, because a seal is a statement about a live stream and `applyOp`
-/// rejects one over a Removed table. That combination is the worst of both -- the object was already
-/// durable when the apply threw, so the namespace was permanently unrecoverable. The two sides of the
-/// rule now agree, and this pins both halves plus the reason skipping the write must not mean skipping
-/// the walk: a namespace removed in one epoch and RECREATED in a later one still has durable
-/// transactions above the dead life, and stopping at the removal would silently truncate them.
-TEST(CasRefRecoveryCasWalk, ARemovedNamespaceIsNotSealedAndTheWalkContinuesToItsRecreation)
+/// The old same-stream fixture claimed that recovery walked through the epoch-1 removal into epoch 2.
+/// With authoritative `_ckpt.life_epoch=2`, epoch 2 is instead the current life's genesis and the walk
+/// begins at `{2,1}`. Epoch-1 objects are inert predecessor-life debris: they neither supply state nor
+/// receive a recovery seal.
+TEST(CasRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredecessorStreamUntouched)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/removed_then_reborn"};
 
     burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/3);
-    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, RefTxnId{2, 1}));
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(2, RefTxnId{2, 1}));
     seedTxn(*backend, layout, ns, RefTxnId{1, 1}, "a", /*birth=*/true);
 
     /// Epoch 1 ends with the terminal record: the ref is removed, then the namespace.
@@ -1955,8 +1966,8 @@ TEST(CasRefRecoveryCasWalk, ARemovedNamespaceIsNotSealedAndTheWalkContinuesToIts
                    removeNamespaceOp()};
     writeRefLogTxnRaw(*backend, layout, removal);
 
-    /// A RECREATION in epoch 2 -- above the dead life, and the reason the walk must not stop at the
-    /// removal. Its birth is sequence 1 of its own genesis epoch, so it carries no chain link.
+    /// The current life starts in epoch 2. Its birth is sequence 1 of its own genesis epoch, so it
+    /// carries no chain link to the predecessor life.
     seedTxn(*backend, layout, ns, RefTxnId{2, 1}, "reborn", /*birth=*/true);
 
     auto store = openWalkPool(backend);
@@ -1965,10 +1976,10 @@ TEST(CasRefRecoveryCasWalk, ARemovedNamespaceIsNotSealedAndTheWalkContinuesToIts
 
     const auto refs = store->listRefs(ns);
     EXPECT_EQ(refs.size(), 1u);
-    EXPECT_TRUE(refs.contains("reborn")) << "the walk must reach the recreated life above the removal";
+    EXPECT_TRUE(refs.contains("reborn")) << "recovery must begin at the recreated life's genesis";
 
     EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{1, 3}).has_value())
-        << "epoch 1 died Removed: no seal, because a seal closes the epoch of a LIVE stream";
+        << "recovery of life epoch 2 must not extend the predecessor-life stream";
     const auto seal2 = readLogTxn(*backend, layout, ns, RefTxnId{2, 2});
     ASSERT_TRUE(seal2.has_value()) << "epoch 2 IS live again by the time it dies, so it closes normally";
     EXPECT_TRUE(refLogTxnIsEpochSeal(*seal2));

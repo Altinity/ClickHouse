@@ -114,7 +114,9 @@ RefCkpt decodeRefCkpt(std::string_view data);
 
 /// The shared field-level validity rule, applied on both encode and decode: every PRESENT field is a
 /// real value -- a set `life_epoch` is nonzero, and a present id has both components nonzero. When a
-/// frontier is present, a snapshot or seal may not exceed it. `what`
+/// frontier is present, its writer epoch may not precede `life_epoch`, and a snapshot may not exceed
+/// it. Its `last_epoch_seal` is either that exact frontier or closes the immediately preceding numeric
+/// writer epoch; without a seal, a known `life_epoch` permits only that genesis epoch. `what`
 /// identifies the direction in the exception message. Exposed so a caller that assembles a `RefCkpt`
 /// from several sources can fail closed before it reaches the wire.
 void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what);

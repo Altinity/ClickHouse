@@ -80,15 +80,20 @@ After the catalog lifecycle lands:
 - after GC deletes a proved complete `Removing` row, recovery has no namespace to resume and the janitor owns any surviving `_ckpt`;
 - missing required `_ckpt` is corruption.
 
-LIST may still:
+Recovery performs no stream `LIST`. `_ckpt.checkpoint_snapshot_id` is the sole recovery-snapshot
+authority: a well-formed listed snapshot can still encode an uncommitted state, so it cannot be used
+even as a performance base. `LIST` remains only for GC/janitor garbage nomination.
 
-- offer a newer snapshot candidate;
-- provide additional diagnostic witnesses;
-- nominate garbage for cleanup.
+Before trusting a nonempty checkpoint base, recovery exact-reads and decodes the matching `_log` and
+rejects an `EpochSeal` before it reads the same-id `_snap`. This is not delegated solely to the
+publisher: the check also runs when the base equals `committed_through`, where an empty replay tail
+would otherwise hide the malformed durable authority. Fsck applies the same exact-base check. Cleanup
+therefore retains the checkpoint base's matching non-seal `_log`; older covered logs remain deletable.
 
-LIST must not determine genesis or committed history. Remove the fallback that starts from `hint_log_ids.front()`. Never fabricate `life_epoch` with `value_or`.
+Remove the fallback that starts from `hint_log_ids.front()`. Never fabricate `life_epoch` with `value_or`.
 
-For the same exact objects, full, empty, partial and reordered LIST results must reconstruct the same logical state. Only request count, diagnostics and discovered garbage may differ.
+For the same exact objects, full, empty, partial and reordered backend listings must reconstruct the
+same logical state with zero recovery `LIST` requests; forged listed snapshots are not observed.
 
 **Lifecycle correction, 2026-07-31.** The later opaque-id, single-plan invariant in
 `2026-07-27-cas-ref-chain-complete-cut-design.md` supersedes the short-lived `RemovalReady` amendment.
@@ -144,17 +149,20 @@ Do not broadly rewrite settlement in the same change.
 
 Introduce a pure helper such as:
 
-`chooseRecoveryGrounding(catalog_state, ckpt, greatest_hinted_snapshot)`
+`chooseRecoveryGrounding(catalog_state, ckpt)`
 
 Rules:
 
-- choose the greater checkpoint/hinted snapshot as the base;
+- use only `checkpoint_snapshot_id` as the base;
+- exact-read and decode the base's matching `_log` before reading `_snap`; reject `EpochSeal`;
+- retain that matching `_log` while `_ckpt` names the base; it is one bounded recovery witness per life;
 - with a base, walk from its successor;
 - without a base, walk from `{life_epoch, 1}`;
 - never derive genesis from log LIST results;
 - fail closed when the lifecycle requires information that is absent.
 
-Audit every remaining use of recovery LIST data. If any LIST result still affects correctness rather than performance, diagnostics or leak-only cleanup, stop and document the unresolved dependency instead of preserving a fallback.
+Audit every remaining recovery `LIST` call. No stream enumeration may remain in recovery; `LIST` is
+reserved for GC/janitor leak-only cleanup discovery.
 
 #### 3. Clarify snapshot publication {#clarify-snapshot-publication}
 
@@ -206,7 +214,7 @@ Add targeted tests for:
 - stale cleanup resuming after a new incarnation exists;
 - zero catalog requests on namespace-file hot paths;
 - unchanged request counts for rewrite, append, remove and dedup-log rotation;
-- equal logical recovery under full, empty and partial LIST results;
+- equal logical recovery under full, empty and partial backend listings, with zero recovery `LIST` calls;
 - missing `_ckpt` for `Live`;
 - conflicting `_ckpt.life_epoch`;
 - rejection of legacy unqualified ref and `_files` keys;

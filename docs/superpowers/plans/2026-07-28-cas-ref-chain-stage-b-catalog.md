@@ -132,7 +132,7 @@ task here. Additional Stage-B constraints:
 
 Measured 2026-07-30, after `bb4dd513118` landed, by checking every symbol these tasks name against
 the tree rather than assuming: **no later task is stale in its target.** `trySnapshotPublishOnce`,
-`runRecoveryWalkOnce`, `recoverRefTable`, `recoverRefTableDetailed`, `hint_log_ids`,
+`runRecoveryWalkOnce`, `recoverRefTable`, `recoverRefTableDetailed`,
 `publishCkptContribution`, `observedNamespaceCleanupMarker`, `sweepStalePrecommitsNow` and
 `resolveWedgeOnce` all still exist, and all four models Task 10's TLA debt names still exist (that
 debt is about the GC models, not the lane). The restatement rewrote the machinery INSIDE
@@ -1883,14 +1883,12 @@ cursor, cleanup path or mutable authority. The rejected segment+head design expr
 with more objects; the zero-metadata design makes ordinary crash recovery unavailable.
 
 **Files — THERE ARE TWO RECOVERY ENTRY POINTS AND THE DIRECTIVE BINDS BOTH.** They have confusingly
-similar names, they are not related by code, and only one of them is where the `hint_log_ids`
-discussion applies. An implementer who touches one and reports "done" has done half the task:
+similar names and are not related by code. An implementer who touches one and reports "done" has done
+half the task:
 - Modify: `.../Pool/CasRefLedger.cpp` — `runRecoveryWalkOnce` (`:532`), the LIVE WRITER MOUNT's
-  spec-§4 walk: `hint_log_ids` declared `:554`, filled `:579`, sorted `:591`; **the genesis fallback
-  `else if (!hint_log_ids.empty()) walk_from = RefTxnId{hint_log_ids.front().writer_epoch, 1};`
-  (`:653-654`) is DELETED**; the `_ckpt.life_epoch` grounding (`:651-652`) becomes the ONLY genesis
-  source; the hint's remaining role (`:669`) is exact-key fetch plus diagnostics; the seal-grammar
-  contextual check (`:788-794`) already refuses to fabricate `life_epoch` and stays;
+  spec-§4 walk: delete every `hint_log_ids` producer, genesis fallback and sampled snapshot candidate;
+  `_ckpt.life_epoch` is the ONLY genesis source and `checkpoint_snapshot_id` is the ONLY recovery
+  base. The seal-grammar contextual check already refuses to fabricate `life_epoch` and stays;
   `ensureRefTableRecovered` (`CasRefLedger.h:700`, def `:921`) and `installRecoveryResult` (`:1150`)
   carry the lifecycle gates
 - Modify: `.../Pool/CasRefProtocol.cpp` — `recoverRefTable` (`:976`, declared
@@ -1900,8 +1898,8 @@ discussion applies. An implementer who touches one and reports "done" has done h
   `hint_log_ids`, no `_ckpt`, no `life_epoch`, no catalog.** Making it LIST-independent is the
   substantial half of this task: it must take the grounding from `chooseRecoveryGrounding` like the
   writer path does, which means it needs the catalog entry and `_ckpt` passed in (the callers have
-  both after Task 4). Its "one LIST" survives only as a snapshot-candidate offer and a diagnostic
-  witness source
+  both after Task 4). It performs **no recovery stream `LIST`**: the checkpoint is the sole snapshot
+  base authority, and GC/janitor discovery is the only remaining `LIST` consumer
 - Modify: `.../Formats/CasRefCkptFormat.*`, `.../Pool/CasRefCkpt.*`, append/recovery state in
   `CasRefLedger.*`, and the format registry/goldens — add and validate `committed_through`, publish it
   before ack/next-id allocation, and make generation 9 the strict recreate-only cut
@@ -1909,6 +1907,12 @@ discussion applies. An implementer who touches one and reports "done" has done h
   bound is `committed_through`; until it is available, a catalog-named namespace is retain-only
 - Modify: the ref-lane/checkpoint TLA model — `LogDurable → FrontierDurable → Installed/Acknowledged`
   with stale-writer and lost-response controls; model commits precede the C++ behavior commit
+- Modify: `CaRefDeltaIntakeCore` plus every matching cfg, runner, RESULTS and model README reference.
+  This is the model-side death gate for the expected-next 404 path: compose the catalog-built target
+  set with exact same-round `_ckpt.committed_through`, require every target to resolve before
+  `ScanComplete`, and exact-retry every carried hold even under total hint omission. The old
+  `_fix_ckptwitness`, `_witness_corruptgap` and `_sab_skipquietprobe` configs are retired only with
+  red replacements for skipped catalog targeting and skipped held retry.
 - Modify: `docs/superpowers/cas/BACKLOG.md` — `[RECOVER-REF-TABLE-LIST-RESIDUAL]` → CLOSED, naming
   this commit
 - Modify: `src/Disks/tests/gtest_cas_list_liar_end_to_end.cpp` — the two capstone sentinels
@@ -1918,8 +1922,7 @@ discussion applies. An implementer who touches one and reports "done" has done h
 
 **Interfaces:**
 ```cpp
-/// Pure: no backend, no LIST, no clock. `greatest_hinted_snapshot` is a HINT-derived candidate —
-/// it may only RAISE the base; it may never supply genesis.
+/// Pure: no backend, no LIST, no clock. The checkpoint is the only snapshot-base authority.
 struct RecoveryGrounding
 {
     std::optional<RefTxnId> base;   /// none => this life has no committed base yet
@@ -1928,17 +1931,16 @@ struct RecoveryGrounding
 };
 
 RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
-                                          const std::optional<RefCkpt> & ckpt,
-                                          const std::optional<RefTxnId> & greatest_hinted_snapshot);
+                                          const std::optional<RefCkpt> & ckpt);
 ```
-- Grounding rules: choose the greater checkpoint/hinted snapshot as the base only when the candidate
-  is at or below `committed_through`; a hint above the frontier, or a hint-only candidate above the
-  checkpoint base whose exact snapshot/log validation is absent, corrupt or an `EpochSeal`, is ignored
-  and diagnosed. A checkpoint-named base is not backwalked or matched against a log: it relies on the
-  producer invariant and the uniform arithmetic successor `{E, S + 1}`. A persisted checkpoint snapshot
-  may never name any `EpochSeal`; the publisher enforces its local candidate-equals-`last_epoch_seal`
-  guard. A resulting missing required replay key at or below the frontier is corruption. With a
-  base,
+- Grounding rules: choose only `checkpoint_snapshot_id` as the base. Before reading its same-id
+  snapshot, exact-read and decode the matching log; reject an `EpochSeal` even when the base is the
+  frontier and the replay tail is empty. The shared exact-base helper is also required by fsck's stream
+  audit. A persisted checkpoint snapshot may never name any `EpochSeal`; the publisher's local
+  candidate-equals-`last_epoch_seal` guard is necessary but not sufficient for recovery. A resulting
+  missing required base or replay key at or below the frontier is corruption. Cleanup retains that one
+  non-seal matching log while the checkpoint names the base; older covered logs remain reclaimable.
+  With a base,
   walk from its successor through the inclusive frontier; without a base and with a frontier, walk
   from `{life_epoch, 1}` through it. A readable checkpoint with no frontier represents a life with no
   committed transaction and requires no replay. Never derive genesis, the frontier or a stop from log
@@ -1946,10 +1948,8 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
 - Lifecycle rules, verbatim: "`Creating` namespaces are never recovered or published; `Live` and
   `Removing` namespaces require a readable `_ckpt` with `life_epoch`; a missing required `_ckpt` in
   either state is corruption. An id absent from the catalog is not recovered."
-- What LIST may STILL do, verbatim: "offer a newer snapshot candidate; provide additional diagnostic
-  witnesses; nominate garbage for cleanup." The hot hint is Task 4d's one
-  `LIST(cas/ns/stream/)`, which deliberately includes immutable `_log` and `_snap` but excludes
-  `_ckpt` and `_files`. What it may not: "determine genesis or committed history."
+- What LIST may STILL do, verbatim: "nominate garbage for cleanup." GC/janitor discovery may enumerate
+  `cas/ns/stream/`; neither read-only nor writer recovery may enumerate its own stream.
 - Ordinary append: a transaction is not acknowledged and the next id is not allocatable until the
   same-fence `_ckpt.committed_through` contribution is proved durable. An unresolved log/frontier
   window remains the existing `NeedsRecovery` state. Writer recovery may resolve exactly one
@@ -1965,35 +1965,28 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
   needed. It is NOT satisfied on the `recoverRefTableDetailed` path, which has no `life_epoch`
   concept at all — there the requirement is new construction, not a fence.
 
-- [ ] **Step 1: the LIST audit, BEFORE any code change** (directive: "Audit every remaining use of
-  recovery LIST data"). Produce a table in the task report covering BOTH entry points: every
-  recovery-path use of LIST-derived data — the `hint_log_ids` producers (`CasRefLedger.cpp:554-591`),
-  the genesis fallback (`:653-654`), the exact-key fetch loop (`:669`), the sampled snapshot
-  candidate, `recoverRefTableDetailed`'s entire LIST-driven shape (`CasRefProtocol.cpp:889-974`) and
-  each of its callers' expectations, plus anything else the audit finds — each classified as
-  CORRECTNESS / performance / diagnostics / leak-only-cleanup. **Stop-and-document rule, verbatim:
-  "If any LIST result still affects correctness rather than performance, diagnostics or leak-only
-  cleanup, stop and document the unresolved dependency instead of preserving a fallback."** A
-  surviving correctness use means this task STOPS, writes the dependency into the report and
-  `BACKLOG.md`, and the controller rules — it does not get papered over with a fallback.
-- [ ] **Step 2: Failing tests** in `gtest_cas_recovery_grounding.cpp` (pure ones need no backend):
+- [x] **Step 1: the LIST audit, BEFORE any code change** (directive: "Audit every remaining use of
+  recovery LIST data"). Cover BOTH entry points: the `hint_log_ids` producers, the old genesis
+  fallback, exact-key hint fetches, sampled snapshot candidates, `recoverRefTableDetailed`'s former
+  LIST-driven shape and every caller expectation. Delete every recovery stream LIST rather than
+  preserving a diagnostic or performance fallback. Any remaining recovery enumeration is a blocker
+  recorded in the report and `BACKLOG.md`.
+- [x] **Step 2: Failing tests** in `gtest_cas_recovery_grounding.cpp` (pure ones need no backend):
   `RecoveryIsEquivalentUnderFullEmptyPartialAndReorderedList` — the directive's recovery-equivalence
-  test: for the SAME exact objects, four LIST behaviours (complete / empty / partial / reordered)
-  reconstruct an identical logical state — assert the installed table state, `last_epoch_seal` and
-  next id are equal across all four; only request counts, diagnostics and discovered garbage may
-  differ (assert THOSE are allowed to differ, so the test cannot be satisfied by making LIST
-  irrelevant to performance too);
+  test: for the SAME exact objects, four backend listing behaviours (complete / empty / partial /
+  reordered) reconstruct an identical logical state with **zero recovery LIST requests** — assert the
+  installed table state, `last_epoch_seal` and next id are equal across all four; a well-formed forged
+  snapshot that describes an uncommitted transaction is not fetched or applied;
   `LiveWithoutReadableCkptIsCorruption` (the directive's "missing `_ckpt` for `Live`" test);
   `LiveWithCkptLackingLifeEpochIsCorruption`;
   `RemovingWithoutCkptIsCorruption`;
   `AbsentLifeIsNotRecoveredEvenWhenCkptSurvives` (Task 5's direct deletion leaves checkpoint cleanup to
   the janitor);
   `CreatingIsNeverRecoveredOrPublished`;
-  `GenesisNeverComesFromHintedLogIds` — the deleted fallback, stated as a behaviour: hint offers
-  `{E,1}` while `_ckpt` has no `life_epoch` → corruption, NOT a walk from the hint;
-  `HintedSnapshotMayOnlyRaiseTheBaseWithinTheFrontier` — a hint below the selected base is ignored, a
-  newer hint at/below `committed_through` may be adopted, and a hint above the frontier is ignored and
-  diagnosed;
+  `GenesisComesOnlyFromLifeEpoch` — `_ckpt` with no `life_epoch` is corruption, not a walk from
+  enumerated objects;
+  `CheckpointSnapshotIsTheOnlyRecoveryBase` — a forged well-formed snapshot above or below the exact
+  checkpoint base is neither listed nor fetched;
   `LifeEpochIsNeverFabricated` — the `value_or` fence described above;
   `AppendDoesNotAckOrAllocateNextBeforeFrontier` — op journal and waiter state pin log PUT → `_ckpt`
   frontier → install/ack/next allocation;
@@ -2003,24 +1996,29 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
   corruption controls; read-only recovery excludes the same successor;
   `SnapshotAndSealCannotExceedCommittedThrough`, including the combined seal contribution;
   `CommittedChunkAddsOneCheckpointGetAndCas` — request-count pin for the accepted hot-path cost.
-- [ ] **Step 2a: TLA gate before C++.** Extend the existing ref-lane/checkpoint model with distinct
+- [x] **Step 2a: TLA gate before C++.** Extend the existing ref-lane/checkpoint model with distinct
   `LogDurable`, `FrontierDurable` and `Installed/Acknowledged` states. Sabotages: ack or next-id
   allocation before frontier, recovery install above frontier, stale writer advancing a frontier
   without the exact next valid log/seal link, and snapshot/seal fields above frontier. Green controls:
   every crash window, lost frontier-CAS response, one exact successor adoption, old-writer log losing
   to a successor seal, and an already-issued valid frontier CAS linearizing. Commit model + results
   before production code.
-- [ ] **Step 2b: the capstone sentinels and the residual.** Run
+- [x] **Step 2b: the capstone sentinels and the residual.** Run
   `gtest_cas_list_liar_end_to_end.cpp` — the two sentinels (`:511`, `:561`) MUST now be red; that is
   the designed signal, not a regression. Adapt them per the fix instruction in their own failure
   messages, flip `[RECOVER-REF-TABLE-LIST-RESIDUAL]` to CLOSED in `BACKLOG.md`, and record in the
   report that Task 7b's precondition is discharged (Task 0 Step 3 was written to refuse until
   exactly this).
-- [ ] **Step 3:** → FAIL. **Step 4:** Implement in reviewable slices: generation-9 checkpoint codec and
-  pure grounding first; append/frontier ordering and ambiguous recovery second; both recovery entry
-  points plus fold/REBUILD/orphan consumers third; then delete the LIST-derived fallbacks. No slice
-  enables deletion for catalog-named lives until the exact frontier is consumed. **Step 5:** Full CA gate
-  + both CA-s3 lanes green. **Step 6: Commit**
+- [x] **Step 3:** Failing tests ran before implementation.
+- [x] **Step 4:** Implemented in reviewable slices: generation-9 checkpoint codec and pure grounding
+  first; append/frontier ordering and ambiguous recovery second; both recovery entry points plus
+  fold/REBUILD/orphan consumers third; then deleted the LIST-derived fallbacks. No slice enables
+  deletion for catalog-named lives until the exact frontier is consumed.
+- [x] **Step 5:** Full CA gate and both CA-s3 lanes are green. Fresh validation: 1924/1924 pass,
+  2 disabled; the two required S3 integration selectors passed 3/3 in one Praktika run with structured
+  result `OK`. The prerequisite model checkpoint is committed as `c863cdd7fa60` and precedes the
+  production change.
+- [ ] **Step 6: Commit**
   `ca: ref — LIST-independent recovery: exact checkpoint frontier, no hint-derived history`.
 
 ### Task 6: Read-side contract — refs AND namespace files {#task-6}

@@ -48,12 +48,13 @@ std::optional<RefTxnId> mergeCommittedThrough(const RefCkpt & a, const RefCkpt &
 
     const RefCkpt & higher = *a.committed_through < *b.committed_through ? b : a;
     const RefCkpt & lower = *a.committed_through < *b.committed_through ? a : b;
-    if (!higher.last_epoch_seal
+    if (lower.committed_through->writer_epoch + 1 != higher.committed_through->writer_epoch
+        || !higher.last_epoch_seal
         || *higher.last_epoch_seal < *lower.committed_through
         || *higher.committed_through < *higher.last_epoch_seal)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS _ckpt: cross-epoch committed_through requires a seal covering the lower frontier and "
-            "not exceeding the higher frontier");
+            "CAS _ckpt: cross-epoch committed_through requires the immediately next writer epoch and "
+            "a seal covering the lower frontier without exceeding the higher frontier");
     return higher.committed_through;
 }
 
@@ -132,12 +133,16 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     merged.committed_through = mergeCommittedThrough(a, b);
     merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
     merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
+    /// Contributions may omit independent facts, but the resulting durable shape may not. In
+    /// particular, if one writer supplies `life_epoch` and another supplies a later frontier, their
+    /// merge must carry the chain evidence before `publishCkpt` can encode it.
+    if (merged.committed_through)
+        checkRefCkptInvariants(merged, "_ckpt merge");
     return merged;
 }
 
 RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
-                                          const std::optional<RefCkpt> & ckpt,
-                                          const std::optional<RefTxnId> & greatest_hinted_snapshot)
+                                          const std::optional<RefCkpt> & ckpt)
 {
     if (!catalog_state || catalog_state->state == NsState::Creating)
         throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace is absent or Creating");
@@ -152,22 +157,19 @@ RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & ca
     result.committed_through = ckpt->committed_through;
     if (!result.committed_through)
     {
-        result.ignored_hinted_snapshot_above_frontier = greatest_hinted_snapshot.has_value();
         if (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS recovery grounding: a checkpoint without committed_through cannot name a snapshot or epoch seal");
         return result;
     }
 
+    if (ckpt->checkpoint_snapshot_id && ckpt->last_epoch_seal
+        && *ckpt->checkpoint_snapshot_id == *ckpt->last_epoch_seal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery grounding: checkpoint_snapshot_id must not name last_epoch_seal");
+
     if (ckpt->checkpoint_snapshot_id)
         result.base = ckpt->checkpoint_snapshot_id;
-    if (greatest_hinted_snapshot)
-    {
-        if (*result.committed_through < *greatest_hinted_snapshot)
-            result.ignored_hinted_snapshot_above_frontier = true;
-        else if (!result.base || *result.base < *greatest_hinted_snapshot)
-            result.base = greatest_hinted_snapshot;
-    }
     if (result.base)
     {
         if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())

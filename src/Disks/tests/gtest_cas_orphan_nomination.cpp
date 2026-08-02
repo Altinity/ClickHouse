@@ -135,6 +135,15 @@ ReadyFixture makeReadyFixture()
     writeSealAt(*f.backend, f.store->layout(), f.ns, RefTxnId{1, 2});
     publishAt(*f.backend, f.store->layout(), f.ns, RefTxnId{2, 1}, "live-b", /*build_sequence=*/7,
               UInt128(0x7002), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    /// Raw log helpers intentionally do not manufacture lifecycle authority. This fixture's durable
+    /// frontier includes the predecessor seal and the epoch-2 start, so nomination is exercised rather
+    /// than being (correctly) skipped for a missing `_ckpt`.
+    writeRecoverableCkptForRawFixture(*f.backend, f.store->layout(), f.ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
     EXPECT_TRUE(runRegularRoundReclaiming(*f.gc).acquired_lease);
     setWatermarkMinActive(*f.backend, f.store->layout(), "test", kCandidateEpoch, /*min_active=*/6);
 

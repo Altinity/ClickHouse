@@ -111,6 +111,12 @@ SeededTail seedBigTail(
         seeded.total_footprint += footprint;
         writeRefLogTxnRaw(backend, layout, txn);
     }
+    /// This helper always builds a recoverable `Live` life. Tests that need the distinct missing-
+    /// checkpoint corruption shape use the lower-level raw writers directly instead.
+    writeRecoverableCkptForRawFixture(
+        backend, layout, ns,
+        RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, static_cast<uint64_t>(num_txns)},
+                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     return seeded;
 }
 
@@ -133,7 +139,7 @@ bool pollUntil(Pred pred)
 
 /// Backend that drops one selected `_log/` object on its FIRST GET (a concurrent-cleanup vanish),
 /// then serves it normally, and counts fresh (cursor-empty) LISTs of the ref prefix so a test can
-/// assert recovery re-LISTed a bounded number of times.
+/// prove a stable checkpoint verdict did not spin on the advisory listing.
 class VanishMidTailOnceBackend : public InMemoryBackend
 {
 public:
@@ -190,25 +196,32 @@ public:
     }
 };
 
-/// Backend that throws ONE transient LIST failure for the ref prefix, forcing recovery into its
-/// (unlocked) retry-backoff window; a concurrent second caller can then reach `recovery_cv`. Counts
-/// fresh LISTs so a test can assert the parked caller did not race its own independent recovery.
-class TransientListOnceBackend : public InMemoryBackend
+/// Backend that blocks the first exact log GET while recovery holds no state lock. A concurrent second
+/// caller can then reach `recovery_cv`, while the LIST counter proves neither caller enumerates the
+/// recovery stream.
+class BlockingFirstLogGetBackend : public InMemoryBackend
 {
 public:
+    using InMemoryBackend::get;
+
     String refs_prefix;
+    String target_log_key;
     std::atomic<bool> armed{false};
-    std::atomic<bool> threw_once{false};
-    std::atomic<int> fresh_list_count{0};
+    std::atomic<bool> blocked{false};
+    std::atomic<int> list_calls{0};
+    std::function<void()> on_first_target_get;
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (armed.load() && key == target_log_key && !blocked.exchange(true))
+            on_first_target_get();
+        return InMemoryBackend::get(key, range);
+    }
 
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {
         if (armed.load() && prefix == refs_prefix && cursor.empty())
-        {
-            fresh_list_count.fetch_add(1, std::memory_order_relaxed);
-            if (!threw_once.exchange(true))
-                throw DB::Exception(DB::ErrorCodes::S3_ERROR, "injected transient list failure (test)");
-        }
+            list_calls.fetch_add(1, std::memory_order_relaxed);
         return InMemoryBackend::list(prefix, cursor, limit);
     }
 };
@@ -242,7 +255,8 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
     setRecoveryReplayMemoryProbeForTest(tracker.probe());
     SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
 
-    const RefTableState state = recoverRefTable(*backend, layout, ns);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    const RefTableState state = recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, ns).state;
     EXPECT_EQ(state.getPrecommits().size(), kTxns * kOpsPerTxn) << "the whole tail must have replayed";
     EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
         << "streaming recovery must hold at most ~one decoded transaction (peak " << tracker.peak()
@@ -316,10 +330,11 @@ TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
     EXPECT_EQ(tracker.alive(), 0);
 }
 
-/// Test 14 (vanished-selected-object leg): a mid-tail `_log/` object that disappears between the LIST
-/// and its GET is a concurrent-cleanup race, not corruption -- recovery discards the candidate and
-/// re-LISTs, bounded. Asserts exactly one restart (bounded) and a successful, complete recovery.
-TEST(CasRecoveryStreaming, MidTailVanishedObjectReLists)
+/// Test 14 (vanished-selected-object leg): once the exact `_ckpt` commits a finite frontier, a missing
+/// record inside it is not something a fresh LIST may reinterpret as a shorter stream. With the same
+/// checkpoint token still durable, recovery fails closed immediately instead of accepting incomplete
+/// state or spinning on an advisory enumeration.
+TEST(CasRecoveryStreaming, MidTailVanishedObjectFailsClosedAgainstStableAuthority)
 {
     auto backend = std::make_shared<VanishMidTailOnceBackend>();
     seedPoolMetaForRestart(*backend);
@@ -331,19 +346,17 @@ TEST(CasRecoveryStreaming, MidTailVanishedObjectReLists)
     const uint64_t seq3 = publishCommittedTransition(*backend, layout, ns, "c", std::nullopt, mref(3));
     ASSERT_LT(seq1, seq2);
     ASSERT_LT(seq2, seq3);
+    /// Semantic publication already durably advances the exact checkpoint frontier to `seq3`.
 
     auto store = openPoolForTest(backend);
     backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
     backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq2});   /// vanish a mid-tail object
     backend->armed = true;
 
-    const auto refs = store->listRefs(ns);
-    EXPECT_EQ(refs.size(), 3u) << "recovery must complete with the full ref set after the re-LIST";
-    EXPECT_TRUE(store->resolveRef(ns, "a").has_value());
-    EXPECT_TRUE(store->resolveRef(ns, "b").has_value());
-    EXPECT_TRUE(store->resolveRef(ns, "c").has_value());
-    EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 1u) << "exactly one bounded restart on the vanish";
-    EXPECT_EQ(backend->fresh_list_count.load(), 2) << "one initial LIST plus one re-LIST, no more";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
+    EXPECT_TRUE(backend->vanished.load()) << "the selected committed object must actually have vanished";
+    EXPECT_EQ(backend->fresh_list_count.load(), 0)
+        << "the exact checkpoint frontier makes recovery stream enumeration unnecessary";
 }
 
 /// Test 14 (durable-corruption leg): a `_log/` object whose body decodes to a foreign namespace is
@@ -359,6 +372,7 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
     publishCommittedTransition(*backend, layout, ns, "a", std::nullopt, mref(1));
     const uint64_t seq2 = publishCommittedTransition(*backend, layout, ns, "b", std::nullopt, mref(2));
     publishCommittedTransition(*backend, layout, ns, "c", std::nullopt, mref(3));
+    /// Semantic publication already durably advances the exact checkpoint frontier.
 
     /// A structurally valid ref-log object for a DIFFERENT namespace: it decompresses and parses, but
     /// its body namespace does not match the key, which `decodeRefLogTxn` rejects as CORRUPTED_DATA.
@@ -374,45 +388,44 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
     backend->armed = true;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "a"); });
-    /// A single LIST proves recovery did not re-LIST: it discarded the candidate and propagated the
-    /// decode error fast, unlike the vanish path which restarts on a fresh listing. (The recovery-restart
-    /// counter is not read here: its accessor re-drives recovery, which would re-throw against the still-
-    /// armed corrupt object.)
-    EXPECT_EQ(backend->refs_list_count.load(), 1) << "no re-LIST loop on durable corruption -- one LIST";
+    /// The exact checkpoint frontier determines this GET. A corrupt committed object fails fast without
+    /// asking a stream enumeration to reinterpret the durable recovery boundary.
+    EXPECT_EQ(backend->refs_list_count.load(), 0) << "durable corruption must not trigger recovery LIST";
 }
 
-/// Test 14 (concurrent-waiter leg): while one caller is inside recovery's unlocked retry-backoff
-/// window, a second caller for the same table parks on `recovery_cv` and is woken exactly once when
-/// recovery completes -- it never races its own independent LIST+replay. Asserts a single parked
-/// waiter, both callers converging on the recovered state, and no phantom waiter left behind.
+/// Test 14 (concurrent-waiter leg): while one caller is blocked in recovery's unlocked exact-log GET,
+/// a second caller for the same table parks on `recovery_cv` and is woken exactly once when recovery
+/// completes. Neither caller may race an independent stream LIST.
 TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
 {
-    auto backend = std::make_shared<TransientListOnceBackend>();
+    auto backend = std::make_shared<BlockingFirstLogGetBackend>();
     seedPoolMetaForRestart(*backend);
     const Layout layout("p");
     const RootNamespace ns{"00/aa@cas@"};
 
     publishCommittedTransition(*backend, layout, ns, "x", std::nullopt, mref(1));
     publishCommittedTransition(*backend, layout, ns, "y", std::nullopt, mref(2));
+    /// Semantic publication already durably advances the exact checkpoint frontier.
 
     auto store = openPoolForTest(backend);
     backend->refs_prefix = layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns));
 
-    /// Gate the retry-backoff sleep: the first recovering caller parks HERE (state_mutex released),
-    /// which is the only window in which a second caller can reach `recovery_cv`.
-    std::atomic<bool> sleep_entered{false};
+    /// Gate the first exact replay GET. The leader reaches it with `state_mutex` released, which is
+    /// the window in which a second caller must be able to park on `recovery_cv`.
+    std::atomic<bool> get_entered{false};
     std::promise<void> entered_promise;
     std::promise<void> release_promise;
     std::shared_future<void> release_future = release_promise.get_future().share();
-    store->setCasRetrySleepForTest([&](uint64_t)
+    backend->target_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 1});
+    backend->on_first_target_get = [&]
     {
-        if (!sleep_entered.exchange(true))
+        if (!get_entered.exchange(true))
             entered_promise.set_value();
         release_future.wait();
-    });
+    };
     backend->armed = true;
 
-    std::thread t1([&] { store->listRefs(ns); });   /// transient LIST failure -> parks in the gated sleep
+    std::thread t1([&] { store->listRefs(ns); });   /// exact GET blocks with recovery unlocked
     entered_promise.get_future().wait();
 
     std::thread t2([&] { store->listRefs(ns); });    /// second caller must park on recovery_cv
@@ -426,11 +439,11 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
     EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u) << "no phantom waiter after recovery completes";
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value());
     EXPECT_TRUE(store->resolveRef(ns, "y").has_value());
-    EXPECT_EQ(backend->fresh_list_count.load(), 2)
-        << "one failed LIST plus one successful LIST by the leader; the parked caller ran no LIST of its own";
+    EXPECT_EQ(backend->list_calls.load(), 0)
+        << "the leader and parked waiter must both recover without stream enumeration";
 }
 
-/// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailed`) and fsck's
+/// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailedFromAuthority`) and fsck's
 /// snapshot oracle (reached through `runFsck`) stream through the SAME builder and hold under the SAME
 /// per-transaction bound the primary recovery does.
 TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
@@ -449,7 +462,9 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
 
     /// Publish the byte-correct snapshot AT the oracle table's greatest log id: no snapshot below it,
     /// so fsck's oracle rebuilds the state at X from the whole surviving log tail.
-    const RefTableState oracle_state = recoverRefTable(*backend, layout, ns_oracle);
+    const CasRefCatalog::Snapshot oracle_catalog_cut = CasRefCatalog::read(*backend, layout);
+    const RefTableState oracle_state =
+        recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, oracle_catalog_cut, ns_oracle).state;
     writeRefSnapshotRaw(*backend, layout, snapshotOf(oracle_state, ns_oracle.string()));
 
     const uint64_t max_single = std::max(sweep_tail.max_single_footprint, oracle_tail.max_single_footprint);
@@ -463,7 +478,9 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
         PeakTracker tracker;
         setRecoveryReplayMemoryProbeForTest(tracker.probe());
         SCOPE_EXIT({ setRecoveryReplayMemoryProbeForTest({}); });
-        const RecoveredRefTable recovered = recoverRefTableDetailed(*backend, layout, ns_sweep);
+        const CasRefCatalog::Snapshot sweep_catalog_cut = CasRefCatalog::read(*backend, layout);
+        const RecoveredRefTable recovered =
+            recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, sweep_catalog_cut, ns_sweep);
         EXPECT_EQ(recovered.state.getPrecommits().size(), kTxns * kOpsPerTxn);
         EXPECT_LE(tracker.peak(), static_cast<int64_t>(bound))
             << "orphan-sweep recovery must stream: peak " << tracker.peak() << " B, bound " << bound << " B";
@@ -491,7 +508,7 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
 /// Test 14 (writer-ledger leg -- the production recovery path): the writer ledger's OWN recovery loop
 /// (`CasRefLedger::ensureRefTableRecovered`, reached through any Pool touch) must stream the tail under
 /// the SAME per-transaction bound the free recovery does. This is the exact production path the original
-/// memory finding named; `LongTailReplaysUnderMemoryBound` above exercises the free `recoverRefTable`,
+/// memory finding named; `LongTailReplaysUnderMemoryBound` above exercises the free authoritative recovery,
 /// NOT the ledger loop, so the ledger could regress to whole-tail materialisation while every other
 /// bound stayed green. Recovery is driven through the production non-minting namespace-file read path,
 /// which does NOT dispatch the stale-precommit sweep `listRefs` would (that sweep
@@ -544,7 +561,7 @@ TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
 /// regression guard: streaming recovery must install exactly what the whole-tail recovery installed.
 TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<CountingBackend>();
     seedPoolMetaForRestart(*backend);
     const Layout layout("p");
     const RootNamespace ns{"00/inv@cas@"};
@@ -555,6 +572,11 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     base.snapshot_id = RefTxnId{1, 5};
     base.committed = {committedRow("c_one", mref(11)), committedRow("c_two", mref(12))};
     base.precommits = {RefOwnerBinding{RefOwnerKind::Precommit, "p_stale", mref(13)}};
+    RefLogTxn base_txn;
+    base_txn.ns = ns.string();
+    base_txn.txn_id = base.snapshot_id;
+    base_txn.ops = publishCommittedOps("c_two", mref(12));
+    writeRefLogTxnRaw(*backend, layout, base_txn);
     writeRefSnapshotRaw(*backend, layout, base);
     const auto base_got = backend->get(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), base.snapshot_id));
     ASSERT_TRUE(base_got.has_value());
@@ -572,9 +594,15 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     t7.ops = publishCommittedOps("c_four", mref(22));
     writeRefLogTxnRaw(*backend, layout, t7);
 
+    writeRecoverableCkptForRawFixture(
+        *backend, layout, ns, RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 7},
+                                       .checkpoint_snapshot_id = RefTxnId{1, 5},
+                                       .last_epoch_seal = std::nullopt});
+
     const uint64_t tail6 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 6}))->bytes.size();
     const uint64_t tail7 = backend->get(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 7}))->bytes.size();
 
+    backend->resetCounts();
     auto store = openPoolForTest(backend);
 
     /// Drive recovery via the production namespace-file reader WITHOUT the stale-precommit sweep that
@@ -584,6 +612,11 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     /// left for LAST (after `needs_stale_precommit_sweep` has been observed).
 
     ASSERT_TRUE(store->namespaceFilesLifeIfReadable(ns));
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, base.snapshot_id)), 1u)
+        << "recovery must validate the selected base's matching ordinary log";
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, base.snapshot_id)), 1u)
+        << "the inventory must come from the selected snapshot, not a pre-snapshot failure";
 
     /// newest snapshot identity: the recovered base id, no seal on this clean mount.
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::optional<RefTxnId>(base.snapshot_id));

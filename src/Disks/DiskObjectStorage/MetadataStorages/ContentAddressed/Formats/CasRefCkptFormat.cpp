@@ -42,12 +42,37 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
             "CAS {}: checkpoint_snapshot_id and last_epoch_seal require committed_through", what);
     if (ckpt.committed_through)
     {
+        if (ckpt.life_epoch && ckpt.committed_through->writer_epoch < *ckpt.life_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: committed_through must not precede life_epoch", what);
         if (ckpt.checkpoint_snapshot_id && *ckpt.committed_through < *ckpt.checkpoint_snapshot_id)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS {}: checkpoint_snapshot_id must not exceed committed_through", what);
         if (ckpt.last_epoch_seal && *ckpt.committed_through < *ckpt.last_epoch_seal)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS {}: last_epoch_seal must not exceed committed_through", what);
+
+        /// The checkpoint carries the same finite proof as the ref-log chain. A current epoch is either
+        /// closed at the frontier itself, or its frontier follows the seal of exactly the preceding
+        /// numeric epoch. A seal from the same epoch below the frontier would claim that an epoch kept
+        /// accepting transactions after it was closed; a larger gap would let a missing epoch masquerade
+        /// as a proved boundary.
+        if (ckpt.last_epoch_seal)
+        {
+            if (*ckpt.last_epoch_seal != *ckpt.committed_through
+                && ckpt.last_epoch_seal->writer_epoch + 1 != ckpt.committed_through->writer_epoch)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS {}: last_epoch_seal must equal committed_through or close its immediately preceding writer epoch",
+                    what);
+        }
+        else if (ckpt.life_epoch && ckpt.committed_through->writer_epoch > *ckpt.life_epoch)
+        {
+            /// With a known genesis epoch, an unsealed later epoch has no chain evidence. Leave the
+            /// unknown-genesis contribution representable: another checkpoint writer may still merge
+            /// the genesis fact before this partial contribution is encoded as durable authority.
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: committed_through after life_epoch requires last_epoch_seal", what);
+        }
     }
 }
 

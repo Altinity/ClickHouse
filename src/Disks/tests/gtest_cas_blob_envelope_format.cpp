@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 
+#include <stdexcept>
+
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int UNKNOWN_FORMAT_VERSION; }
@@ -19,6 +21,28 @@ EnvelopeHeader sampleHeader(const String & ref)
     return h;
 }
 constexpr uint32_t L = 256;
+
+/// The envelope has a fixed physical length. At generation 9 there is no unsupported one-digit
+/// version, so replacing `9` with `10` must consume one byte from the space pad rather than silently
+/// turning the 256-byte fixture into a different wire shape.
+String blobEnvelopeWithFutureVersion(std::string_view text)
+{
+    const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
+    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
+    String future(text);
+    const size_t version_pos = future.find(v_now);
+    if (version_pos == String::npos || v_next.size() < v_now.size())
+        throw std::logic_error("blob-envelope future-version fixture cannot locate the current version");
+
+    future.replace(version_pos, v_now.size(), v_next);
+    const size_t growth = v_next.size() - v_now.size();
+    const size_t newline_pos = future.find('\n');
+    if (newline_pos == String::npos || newline_pos < growth
+        || future.substr(newline_pos - growth, growth) != String(growth, ' '))
+        throw std::logic_error("blob-envelope future-version fixture has insufficient padding");
+    future.erase(newline_pos - growth, growth);
+    return future;
+}
 }
 
 TEST(CasBlobEnvelopeFormat, FixedLengthAndPadZone)
@@ -27,7 +51,8 @@ TEST(CasBlobEnvelopeFormat, FixedLengthAndPadZone)
     const String head = encodeEnvelopeHeader(h, L);
     ASSERT_EQ(head.size(), L);                       /// exactly blob_header_len
     EXPECT_EQ(head[L - 1], '\n');                     /// terminator at byte 255
-    const String json = "{\"type\":\"cas_blob\",\"v\":8,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
+    const String json = fmt::format("{{\"type\":\"cas_blob\",\"v\":{},", currentCompatibilityVersion()) +
+                        "\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
                         "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
                         "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
                         "\"ref\":\"t-abc/all_1_2_0\"}";
@@ -92,11 +117,23 @@ TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
     String wrong_type = head;
     wrong_type.replace(wrong_type.find("cas_blob"), 8, "cas_xxxx");
     EXPECT_THROW(decodeEnvelopeHeader(wrong_type, wrong_type.size(), ObjectKind::Blob), DB::Exception);
+    const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
+    const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
     String future = head;
-    future.replace(future.find("\"v\":7"), 5, "\"v\":8");
-    EXPECT_THROW(decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob), DB::Exception);
+    const size_t version_pos = future.find(v_now);
+    ASSERT_NE(version_pos, String::npos);
+    future.replace(version_pos, v_now.size(), v_next);
+    try
+    {
+        decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob);
+        FAIL() << "expected UNKNOWN_FORMAT_VERSION";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
+    }
     String out_of_range = head;
-    out_of_range.replace(out_of_range.find("\"v\":7"), 5, "\"v\":4294967299");
+    out_of_range.replace(out_of_range.find(v_now), v_now.size(), "\"v\":4294967299");
     try
     {
         decodeEnvelopeHeader(out_of_range, out_of_range.size(), ObjectKind::Blob);
@@ -130,7 +167,8 @@ TEST(CasFormatBattery, BlobEnvelope)
     /// The golden is CONSTRUCTED from the hand-pinned json literal (same one FixedLengthAndPadZone
     /// asserts) + the derived pad — NOT self-computed via encodeEnvelopeHeader, which would compare
     /// the encoder to itself and pin nothing.
-    const String json = "{\"type\":\"cas_blob\",\"v\":8,\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
+    const String json = fmt::format("{{\"type\":\"cas_blob\",\"v\":{},", currentCompatibilityVersion()) +
+                        "\"tag\":\"0102030405060708090a0b0c0d0e0f10\","
                         "\"bld\":\"1112131415161718191a1b1c1d1e1f20\",\"ts\":1752537600123,"
                         "\"by\":\"2122232425262728292a2b2c2d2e2f30\",\"op\":\"merge\",\"ch\":26006001,"
                         "\"ref\":\"t-abc/all_1_2_0\"}";
@@ -139,5 +177,6 @@ TEST(CasFormatBattery, BlobEnvelope)
         .id = FormatId::Blob,
         .encode = [&] { EnvelopeHeader e = sampleHeader("t-abc/all_1_2_0"); return sealObject(FormatId::Blob, encodeEnvelopeHeader(e, L)); },
         .decode = [](std::string_view s) { decodeEnvelopeHeader(String(openObject(FormatId::Blob, s)), s.size(), ObjectKind::Blob); },
-        .golden = golden});
+        .golden = golden,
+        .make_future_version = blobEnvelopeWithFutureVersion});
 }

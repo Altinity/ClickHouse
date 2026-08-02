@@ -258,8 +258,15 @@ TEST(CasRetirementSweep, ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway)
     const RootNamespace ns{"srv/tbl"};
     const String payload = "retirement-payload";
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
-    /// lists at that exact prefix.
+    /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
+    /// as a completed production birth before `publishOneBlobPart` invokes recovery.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     std::vector<Rec> rows;
     DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca",
@@ -345,8 +352,15 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
     const RootNamespace ns{"srv/tbl"};
     const String payload = "reclaimed-payload";
     /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
-    /// lists at that exact prefix.
+    /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
+    /// as a completed production birth before `publishOneBlobPart` invokes recovery.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     publishOneBlobPart(store, ns, "part_a", payload);
     Gc gc(store, hexToU128("00000000000000000000000000000012"));
@@ -488,7 +502,15 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
     ASSERT_TRUE(store);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/straggler"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);   /// Stage B (Task 4-C): pin to the sentinel before the first real touch
+    /// Pin to the transition life before the first real touch, and give that raw `Live` row the exact
+    /// empty checkpoint authority that production birth would have published before recovery.
+    DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     publishOneBlobPart(store, ns, "x", "straggler-payload");
     ASSERT_EQ(store->liveWriterEpoch(), 1u);

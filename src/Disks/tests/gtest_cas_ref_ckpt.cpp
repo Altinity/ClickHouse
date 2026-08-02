@@ -257,10 +257,10 @@ TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
 {
     const std::vector<RefCkpt> cases = {
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
     };
     for (const RefCkpt & ckpt : cases)
         EXPECT_EQ(decodeRefCkpt(encodeRefCkpt(ckpt)), ckpt);
@@ -280,12 +280,42 @@ TEST(CasRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
     EXPECT_EQ(decodeRefCkpt(expected), ckpt);
 }
 
+/// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier
+/// itself when that frontier is the terminal seal, or closes the immediately preceding numeric epoch.
+/// Accepting a gap or a later same-epoch frontier would manufacture a boundary that INV-2 never proved.
+TEST(CasRefCkpt, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
+{
+    const RefCkpt valid{.life_epoch = 7, .committed_through = RefTxnId{8, 5},
+                        .checkpoint_snapshot_id = RefTxnId{7, 4}, .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_NO_THROW(encodeRefCkpt(valid));
+
+    const RefCkpt skipped_epoch{.life_epoch = 7, .committed_through = RefTxnId{10, 1},
+                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(skipped_epoch); });
+
+    const RefCkpt frontier_after_same_epoch_seal{.life_epoch = 7, .committed_through = RefTxnId{8, 5},
+                                                 .checkpoint_snapshot_id = std::nullopt,
+                                                 .last_epoch_seal = RefTxnId{8, 1}};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { encodeRefCkpt(frontier_after_same_epoch_seal); });
+
+    const RefCkpt unsealed_non_genesis{.life_epoch = 7, .committed_through = RefTxnId{8, 1},
+                                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(unsealed_non_genesis); });
+
+    String malformed = encodeRefCkpt(valid);
+    const size_t cte = malformed.find("\"cte\":\"8\"");
+    ASSERT_NE(cte, String::npos);
+    malformed.replace(cte, String{"\"cte\":\"8\""}.size(), "\"cte\":\"10\"");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
+}
+
 /// STRICT means an unknown key is corruption, not something to skip. A `_ckpt` decides deletions, so a
 /// reader that ignored a field it did not understand would be authorizing them from a body it only
 /// partly read.
 TEST(CasRefCkpt, RejectsAnUnknownKey)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
                                               .last_epoch_seal = std::nullopt});
     String with_unknown = good;
     with_unknown.replace(with_unknown.rfind('}'), 1, R"(,"zz":"1"})");
@@ -313,7 +343,7 @@ TEST(CasRefCkpt, RejectsADuplicateKey)
 /// "recovery has no base" and would be trusted.
 TEST(CasRefCkpt, RejectsTruncation)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2,
                                               .last_epoch_seal = std::nullopt});
 
     const String header_only = good.substr(0, good.find('\n') + 1);
@@ -528,13 +558,13 @@ TEST(CasRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
     EXPECT_EQ(created->ckpt.checkpoint_snapshot_id, ID_1_1);
     EXPECT_FALSE(created->ckpt.life_epoch.has_value()) << "the publisher must not invent a genesis epoch";
 
-    const RefCkpt birth{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt,
+    const RefCkpt birth{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                         .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, birth, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
     const auto completed = readCkpt(*backend, layout, life);
     ASSERT_TRUE(completed.has_value());
-    EXPECT_EQ(completed->ckpt.life_epoch, 5u);
+    EXPECT_EQ(completed->ckpt.life_epoch, 1u);
     EXPECT_EQ(completed->ckpt.checkpoint_snapshot_id, ID_1_1) << "and must not lose the checkpoint on the way in";
 }
 
@@ -547,7 +577,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
     const RootNamespace ns{"srv1/ckpt_conflict"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
@@ -560,7 +590,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
         if (interfered)
             return;
         interfered = true;
-        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
         const HeadResult h = backend->head(key);
         ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(mergeCkpt(base, sealer)), h.token).outcome,
                   PutOutcome::Done);
@@ -576,7 +606,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
     EXPECT_EQ(sample->ckpt.last_epoch_seal, ID_2_1)
         << "the concurrent writer's seal must survive our retry -- a retry that reused the body read "
            "before the conflict would silently drop it (TLC `_sab_sealclobbersbase`)";
-    EXPECT_EQ(sample->ckpt.life_epoch, 5u);
+    EXPECT_EQ(sample->ckpt.life_epoch, 1u);
     EXPECT_GE(backend->casPutCount(key), 2u) << "the first CAS must have been rejected, not skipped";
 }
 
@@ -590,7 +620,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     const RootNamespace ns{"srv1/ckpt_noop"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt full{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
+    const RefCkpt full{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -600,7 +630,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     /// The same contribution again, and a strictly OLDER one: neither adds anything.
     EXPECT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
-    const RefCkpt older{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt older{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, older, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
 
@@ -618,7 +648,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     const RootNamespace ns{"srv1/ckpt_fenced"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, base, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
     const Token token_before = backend->head(key).token;
@@ -650,7 +680,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
     const RootNamespace ns{"srv1/ckpt_exhausted"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
@@ -681,7 +711,7 @@ TEST(CasRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
     const Layout layout{"p"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_committed"});
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -700,7 +730,7 @@ TEST(CasRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
     const Layout layout{"p"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_retry"});
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -719,11 +749,11 @@ TEST(CasRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
     const Layout layout{"p"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_dominating"});
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
-    const RefCkpt dominating{.life_epoch = 5, .committed_through = ID_2_1,
+    const RefCkpt dominating{.life_epoch = 1, .committed_through = ID_2_1,
                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
     backend->dominating_bytes = encodeRefCkpt(dominating);
@@ -741,7 +771,7 @@ TEST(CasRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
     const Layout layout{"p"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_read_failed"});
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
     backend->fail_resolution_get = true;
@@ -766,7 +796,7 @@ TEST(CasRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
         const NamespaceLifeId life = NamespaceLifeId::stageATransition(
             RootNamespace{move_before_read ? "srv1/ckpt_fence_before_resolution" : "srv1/ckpt_fence_after_resolution"});
         const String key = layout.refCkptKey(life);
-        const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+        const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
         ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
         bool admitted = true;
@@ -796,7 +826,7 @@ TEST(CasRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCa
     const Layout layout{"p"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguity_deadline"});
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = 5, .committed_through = ID_1_1,
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
     uint64_t now = 0;
@@ -826,7 +856,7 @@ TEST(CasRefCkpt, ACorruptCheckpointIsNeverOverwritten)
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
     ASSERT_EQ(publishCkpt(*backend, layout, life,
-                          RefCkpt{.life_epoch = std::optional<uint64_t>{5}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+                          RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
                           1, ALWAYS_ADMITTED, generousDeadline()), CkptPublishOutcome::Published);
 
     const String garbage = "not a cas object\n";

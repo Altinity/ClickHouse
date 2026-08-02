@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/WriteBufferFromString.h>
+#include <fmt/format.h>
 
 using namespace DB;
 using namespace DB::Cas;
@@ -47,8 +48,7 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     removal.kind = RefOpKind::RemoveNamespace;
     txn.ops.push_back(removal);
 
-    const String expected =
-        "{\"type\":\"cas_ref_log\",\"v\":7}\n"
+    const String expected = fmt::format("{{\"type\":\"cas_ref_log\",\"v\":{}}}\n", currentCompatibilityVersion()) +
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\"}\n"
         "{\"op\":\"namespace_birth\"}\n"
         "{\"op\":\"owner_transition\",\"obk\":\"precommit\",\"orn\":\"20260101_0_1_1_1\","
@@ -75,8 +75,7 @@ TEST(CasEncodingPins, RefSnapshotLive)
 
     snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "20260102_0_2_2_2", ManifestRef{4, 5, 6}});
 
-    const String expected =
-        "{\"type\":\"cas_ref_snap\",\"v\":8}\n"
+    const String expected = fmt::format("{{\"type\":\"cas_ref_snap\",\"v\":{}}}\n", currentCompatibilityVersion()) +
         "{\"ns\":\"roots/pin\",\"we\":\"7\",\"rs\":\"9\",\"lc\":\"live\"}\n"
         "{\"k\":\"c\",\"rn\":\"20260101_0_1_1_1\",\"me\":\"1\",\"mb\":\"2\",\"mo\":3,\"ts\":5}\n"
         "{\"k\":\"p\",\"rn\":\"20260102_0_2_2_2\",\"me\":\"4\",\"mb\":\"5\",\"mo\":6}\n"
@@ -101,7 +100,7 @@ TEST(CasEncodingPins, SourceEdgeRunLines)
     /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
     /// that Task 8's line-scratch rewrite must reproduce it byte-for-byte.
     const String text = out.str();
-    const String header = "{\"type\":\"cas_run\",\"v\":7,\"kind\":\"source_edge\"}\n";
+    const String header = fmt::format("{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n", currentCompatibilityVersion());
     const String expected_record =
         "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
     const String trailer = "{\"n\":1}\n";

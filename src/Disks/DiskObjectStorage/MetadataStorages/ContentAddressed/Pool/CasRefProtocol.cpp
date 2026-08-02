@@ -4,6 +4,7 @@
 #include <Common/Exception.h>
 #include <Common/scope_guard_safe.h>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <type_traits>
 #include <utility>
@@ -825,35 +826,26 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 {
     RefCleanupPlan plan;
 
-    /// The coverage boundary `X` is the newest snapshot known to be durable: the newest observed in this
-    /// round's scan. With none there is no boundary, so no log is coverage-deletable and no older
-    /// snapshot exists to delete.
-    std::optional<RefTxnId> newest_snapshot;
-    if (!listing.snapshots.empty())
-        newest_snapshot = listing.snapshots.back();
-    if (!newest_snapshot)
+    /// A physical `_snap` listed after its PUT but before the `_ckpt` CAS is not a recovery base.
+    /// The caller supplies `checkpoint` only after `readCheckpointSnapshotBase` has exact-read the
+    /// same-id non-seal `_log` and `_snap`. With no such validated triple cleanup has no coverage
+    /// authority and deliberately leaks every listed object.
+    if (!checkpoint)
         return plan;
-
-    /// The SNAPSHOT boundary, `min(X, checkpoint)`. A snapshot is deletable only STRICTLY BELOW it, so
-    /// the snapshot at the boundary -- the newest covering one, or the one the checkpoint names when the
-    /// checkpoint is the tighter of the two -- always survives.
-    const RefTxnId snapshot_boundary =
-        checkpoint && *checkpoint < *newest_snapshot ? *checkpoint : *newest_snapshot;
 
     for (const RefTxnId & log_id : listing.logs)
     {
-        if (*newest_snapshot < log_id)     /// L > X: not covered by any durable snapshot
-            continue;
         if (durable_cursor < log_id)       /// L > cursor: its edge delta is not yet durable
             continue;
-        if (checkpoint && *checkpoint < log_id)   /// L > checkpoint: above the namespace's own durable tail
+        if (*checkpoint <= log_id)         /// the exact witness and its successors remain
             continue;
         plan.deletable_logs.push_back(log_id);
     }
 
-    /// Only snapshots the scan actually returned are deletion candidates.
+    /// The checkpoint's same-id snapshot is the recovery base, so only strictly older listed snapshots
+    /// are deletion candidates.
     for (const RefTxnId & snapshot_id : listing.snapshots)
-        if (snapshot_id < snapshot_boundary)
+        if (snapshot_id < *checkpoint)
             plan.deletable_snapshots.push_back(snapshot_id);
 
     return plan;
@@ -923,17 +915,83 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
     return result;
 }
 
+std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
+    const RefTxnId & current, bool is_epoch_seal, const RefTxnId & committed_through)
+{
+    if (committed_through < current)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS checkpoint-bounded ref walk: current id {}-{} lies above committed_through {}-{}",
+            current.writer_epoch, current.ref_sequence,
+            committed_through.writer_epoch, committed_through.ref_sequence);
+    if (current == committed_through)
+        return std::nullopt;
+
+    if (is_epoch_seal)
+    {
+        if (committed_through.writer_epoch == current.writer_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS checkpoint-bounded ref walk: committed_through {}-{} lies after EpochSeal {}-{} in "
+                "the same numeric epoch",
+                committed_through.writer_epoch, committed_through.ref_sequence,
+                current.writer_epoch, current.ref_sequence);
+        if (current.writer_epoch == std::numeric_limits<uint64_t>::max())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS checkpoint-bounded ref walk: EpochSeal {}-{} has no representable successor",
+                current.writer_epoch, current.ref_sequence);
+        return RefTxnId{current.writer_epoch + 1, 1};
+    }
+
+    if (current.ref_sequence == std::numeric_limits<uint64_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS checkpoint-bounded ref walk: log id {}-{} has no representable successor",
+            current.writer_epoch, current.ref_sequence);
+    return RefTxnId{current.writer_epoch, current.ref_sequence + 1};
+}
+
+CheckpointSnapshotBase readCheckpointSnapshotBase(
+    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & snapshot_id)
+{
+    const RootNamespace & ns = life.ns;
+    const auto log = backend.get(layout.refLogKey(life, snapshot_id));
+    if (!log)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} has no matching log under "
+            "the supplied immutable lifecycle authority",
+            ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence);
+    }
+
+    const RefLogTxn base_txn = decodeRefLogTxn(
+        openObject(FormatId::RefLog, log->bytes), ns.string(), snapshot_id);
+    if (refLogTxnIsEpochSeal(base_txn))
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} names an EpochSeal, "
+            "not a snapshot base",
+            ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence);
+    }
+
+    const auto snapshot = backend.get(layout.refSnapshotKey(life, snapshot_id));
+    if (!snapshot)
+    {
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery for namespace '{}': checkpoint-named base snapshot {}-{} is absent under the supplied "
+            "immutable lifecycle authority",
+            ns.string(), snapshot_id.writer_epoch, snapshot_id.ref_sequence);
+    }
+    return CheckpointSnapshotBase{
+        .snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, snapshot->bytes), ns.string(), snapshot_id),
+        .bytes = snapshot->bytes.size()};
+}
+
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, const std::function<void()> & on_page_fetched)
+    const std::optional<RefCkpt> & ckpt)
 {
-    /// LIST only nominates a potentially useful base snapshot. The frozen catalog row and `_ckpt`
-    /// supplied by the caller determine every semantic boundary; this function must not re-read either
-    /// mutable object, because that would splice two catalog cuts into one recovery result.
-    /// Reject nonrecoverable lifecycle authority BEFORE an optional physical hint. Aside from avoiding
-    /// pointless I/O, this makes the promised lifecycle error deterministic rather than allowing a
-    /// transient LIST failure to hide it.
-    RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+    /// The frozen catalog row and `_ckpt` supplied by the caller determine every recovery boundary;
+    /// this function must not re-read either mutable object, or enumerate the stream, because that
+    /// would splice unrelated physical observations into the caller's one authority cut.
+    RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, ckpt);
     /// `chooseRecoveryGrounding` has just established that this is a Live/Removing row. Constructing
     /// the life from that SAME value, rather than resolving the name again, preserves the caller's
     /// catalog-cut join.
@@ -941,113 +999,17 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
         catalog_entry->ns, catalog_entry->incarnation);
     const RootNamespace & ns = life.ns;
 
-    std::optional<RefTxnId> greatest_hinted_snapshot;
-    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & listed)
-    {
-        std::optional<ParsedRefObjectKey> parsed;
-        try
-        {
-            parsed = layout.parseRefObjectKey(listed.key);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() != ErrorCodes::CORRUPTED_DATA)
-                throw;
-        }
-        if (parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Snap
-            && (!greatest_hinted_snapshot || *greatest_hinted_snapshot < parsed->txn_id))
-            greatest_hinted_snapshot = parsed->txn_id;
-    }, 1000, on_page_fetched);
-    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, greatest_hinted_snapshot);
-
     std::optional<RefTxnId> base_id = grounding.base;
-    bool base_is_hint_only = greatest_hinted_snapshot && base_id == greatest_hinted_snapshot
-        && (!ckpt->checkpoint_snapshot_id || *ckpt->checkpoint_snapshot_id < *greatest_hinted_snapshot);
-    bool discarded_hinted_snapshot = false;
     std::optional<RefTableSnapshot> base_snapshot;
     uint64_t base_snapshot_bytes = 0;
-    std::optional<RefReplayBuilder> builder;
-    while (base_id)
+    if (base_id)
     {
-        const auto got = backend.get(layout.refSnapshotKey(life, *base_id));
-        if (!got)
-        {
-            /// A nominated LIST snapshot may disappear or have been stale. It has no authority, so
-            /// retry from the checkpoint's exact base without treating its absence as stream damage.
-            if (base_is_hint_only)
-            {
-                discarded_hinted_snapshot = true;
-                grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
-                base_id = grounding.base;
-                base_is_hint_only = false;
-                continue;
-            }
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS read-only recovery for namespace '{}': checkpoint-named base snapshot {}-{} is absent "
-                "under the supplied immutable lifecycle authority",
-                ns.string(), base_id->writer_epoch, base_id->ref_sequence);
-        }
-
-        if (base_is_hint_only)
-        {
-            try
-            {
-                /// A snapshot is only a performance hint until its matching transaction proves it is a
-                /// real state-bearing cut. A seal cannot be such a cut: selecting it would make LIST
-                /// decide epoch geometry, so fall back to the immutable checkpoint grounding instead.
-                const auto matching_log = backend.get(layout.refLogKey(life, *base_id));
-                if (!matching_log)
-                {
-                    discarded_hinted_snapshot = true;
-                    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
-                    base_id = grounding.base;
-                    base_is_hint_only = false;
-                    continue;
-                }
-                const RefLogTxn matching_txn = decodeRefLogTxn(
-                    openObject(FormatId::RefLog, matching_log->bytes), ns.string(), *base_id);
-                if (refLogTxnIsEpochSeal(matching_txn))
-                {
-                    discarded_hinted_snapshot = true;
-                    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
-                    base_id = grounding.base;
-                    base_is_hint_only = false;
-                    continue;
-                }
-                base_snapshot = decodeRefTableSnapshot(
-                    openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
-                /// `decodeRefTableSnapshot` validates the wire form, but snapshots also carry table
-                /// invariants such as cross-owner manifest uniqueness. Validate those semantics before
-                /// allowing a LIST-only candidate to become the replay base: unlike an immutable
-                /// checkpoint base, a bad hint is discarded and recovery returns to its exact grounding.
-                /// Construct the real replay builder here, so a valid hint is semantically validated
-                /// exactly once and the tail reuses that already-validated state.
-                builder.emplace(std::move(base_snapshot), got->bytes.size());
-            }
-            catch (const Exception & e)
-            {
-                if (e.code() != ErrorCodes::CORRUPTED_DATA)
-                    throw;
-                discarded_hinted_snapshot = true;
-                /// `emplace` receives ownership of the decoded snapshot. If semantic construction
-                /// throws, the moved-from optional must not become the fallback's accidental base.
-                base_snapshot.reset();
-                grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
-                base_id = grounding.base;
-                base_is_hint_only = false;
-                continue;
-            }
-        }
-        else
-        {
-            base_snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
-            base_snapshot_bytes = got->bytes.size();
-        }
-        break;
+        CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, *base_id);
+        base_snapshot = std::move(base.snapshot);
+        base_snapshot_bytes = base.bytes;
     }
 
-    if (!builder)
-        builder.emplace(std::move(base_snapshot), base_snapshot_bytes);
+    RefReplayBuilder builder(std::move(base_snapshot), base_snapshot_bytes);
     if (grounding.walk_from && grounding.committed_through)
     {
         RefTxnId id = *grounding.walk_from;
@@ -1071,182 +1033,21 @@ RecoveredRefTable recoverRefTableDetailedFromAuthority(
             const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
             reportReplayMemoryDelta(footprint);
             SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
-            builder->applyOne(std::move(txn), got->bytes.size());
+            builder.applyOne(std::move(txn), got->bytes.size());
 
-            if (is_seal)
-            {
-                if (id.writer_epoch == std::numeric_limits<uint64_t>::max())
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS read-only recovery for namespace '{}': epoch seal {}-{} has no representable successor",
-                        ns.string(), id.writer_epoch, id.ref_sequence);
-                ++id.writer_epoch;
-                id.ref_sequence = 1;
-            }
+            if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
+                    id, is_seal, *grounding.committed_through))
+                id = *next;
             else
-            {
-                if (id.ref_sequence == std::numeric_limits<uint64_t>::max())
-                    throw Exception(ErrorCodes::CORRUPTED_DATA,
-                        "CAS read-only recovery for namespace '{}': log id {}-{} has no representable successor",
-                        ns.string(), id.writer_epoch, id.ref_sequence);
-                ++id.ref_sequence;
-            }
+                break;
         }
     }
 
-    RecoveryResult result = std::move(*builder).finish();
+    RecoveryResult result = std::move(builder).finish();
     return RecoveredRefTable{
         .state = std::move(result.state),
         .newest_snapshot_id = result.newest_snapshot_id,
-        .last_epoch_seal = ckpt->last_epoch_seal,
-        .ignored_hinted_snapshot_above_frontier = grounding.ignored_hinted_snapshot_above_frontier,
-        .discarded_hinted_snapshot = discarded_hinted_snapshot};
-}
-
-RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                                          const std::function<void()> & on_page_fetched, unsigned max_restarts)
-{
-    /// Stage B (spec INV-3): resolve `ns`'s REAL catalog life ONCE, before the walk. This function is
-    /// the SHARED non-production discovery-path recovery -- fsck, `Gc::rebuildBaseline`'s
-    /// disaster-recovery scan, and `CasOrphanManifestSweep`'s active-manifest-key set all ride it -- and
-    /// every one of them must see what the mounted writer actually wrote, which since Task 4-C's
-    /// production birth wiring is a real, catalog-minted incarnation, never the Stage-A sentinel. The
-    /// mandatory catalog may legitimately carry no ENTRY for a namespace that was never born; the
-    /// sentinel is that namespace's read-only, never-born identity, not a substitute for an absent
-    /// catalog. Raw recovery fixtures that need visible content explicitly admit this sentinel life.
-    /// `Creating` is excluded exactly as `Gc::discoverUniverse` excludes it: no publication can exist
-    /// yet under that entry, so a life-less fallback is the correct answer for it too.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
-    return recoverRefTableDetailed(backend, layout, life, on_page_fetched, max_restarts);
-}
-
-RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                                          const std::function<void()> & on_page_fetched, unsigned max_restarts)
-{
-    const RootNamespace & ns = life.ns;
-
-    for (unsigned attempt = 0;; ++attempt)
-    {
-        /// One LIST of the table prefix; classify keys into logs and snapshots.
-        std::vector<RefTxnId> logs;
-        std::vector<RefTxnId> snapshots;
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = backend.list(layout.namespaceStreamPrefix(life), cursor, 1000);
-            if (on_page_fetched)
-                on_page_fetched();
-            for (const ListedKey & lk : page.keys)
-            {
-                /// This listing is a HINT (the arithmetic walk below is the authority), and the very next
-                /// line discards any key that does not name THIS namespace. A key that names no LIFE
-                /// cannot name this namespace, so absorbing the parser's refusal here gives it exactly
-                /// the treatment the `id.ns == ns` test already gives it. Letting the refusal escape
-                /// instead would abort this recovery.
-                ///
-                /// WHY SKIPPING IS SAFE EVEN FOR A CALLER THAT DELETES ON THIS LISTING
-                /// (`CasOrphanManifestSweep`'s `activeManifestKeys` calls this function directly and
-                /// builds its protection set from the result, so a log omitted here would leave that log's
-                /// manifests unprotected):
-                /// The LIST base is this life's own stream prefix, so every canonical key begins at
-                /// `<life_id>/`. A parser refusal therefore requires an extra or malformed segment
-                /// between the life prefix and the kind directory.
-                /// Such a key is not `refLogKey(life, id)` for any id, so it is not a log of this life at
-                /// all, and skipping it removes nothing from the protection set.
-                std::optional<ParsedRefObjectKey> parsed;
-                try
-                {
-                    parsed = layout.parseRefObjectKey(lk.key);
-                }
-                catch (const Exception & e)
-                {
-                    if (e.code() != ErrorCodes::CORRUPTED_DATA)
-                        throw;   /// not a key refusal: a real failure of the listing itself
-                }
-                if (parsed && parsed->life_id == life.incarnation)
-                {
-                    if (parsed->kind == RefObjectKind::Log)
-                        logs.push_back(parsed->txn_id);
-                    else if (parsed->kind == RefObjectKind::Snap)
-                        snapshots.push_back(parsed->txn_id);
-                }
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
-        std::sort(logs.begin(), logs.end());
-        std::sort(snapshots.begin(), snapshots.end());
-
-        bool vanished = false;
-
-        /// Newest snapshot, if any.
-        std::optional<RefTableSnapshot> snapshot;
-        std::optional<RefTxnId> snapshot_id;
-        if (!snapshots.empty())
-        {
-            snapshot_id = snapshots.back();
-            const auto got = backend.get(layout.refSnapshotKey(life, *snapshot_id));
-            if (!got)
-                vanished = true;
-            else
-                snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snapshot_id);
-        }
-
-        /// Stream every log with id greater than the selected snapshot, in id order, through one
-        /// builder: GET -> decode -> applyOne -> discard, holding at most a single decoded transaction
-        /// resident (unlike the retired whole-tail vector, which held every decoded transaction at once).
-        RefReplayBuilder builder(std::move(snapshot));
-        if (!vanished)
-            for (const RefTxnId & id : logs)
-            {
-                if (snapshot_id && !(*snapshot_id < id))
-                    continue;   /// id <= snapshot: already included in the snapshot
-                const auto got = backend.get(layout.refLogKey(life, id));
-                if (!got)
-                {
-                    vanished = true;
-                    break;
-                }
-                RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
-                /// Account this decoded transaction's resident footprint to the memory probe for exactly
-                /// the span it is held -- this iteration. The streaming loop holds one at a time, so the
-                /// probe's peak stays within a single transaction (a whole-tail materialiser would hold
-                /// the entire tail, and the probe would see it). No-op in production.
-                const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
-                reportReplayMemoryDelta(footprint);
-                SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
-                builder.applyOne(std::move(txn), got->bytes.size());
-            }
-
-        if (vanished)
-        {
-            if (attempt < max_restarts)
-                continue;   /// a selected object vanished; restart with a fresh LIST (the builder's candidate is discarded)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "recoverRefTable: table {} kept losing a selected snapshot/tail object across {} restarts",
-                ns.string(), max_restarts);
-        }
-
-        RecoveryResult result = std::move(builder).finish();
-        return RecoveredRefTable{
-            .state = std::move(result.state),
-            .newest_snapshot_id = result.newest_snapshot_id,
-            .last_epoch_seal = std::nullopt,
-            .ignored_hinted_snapshot_above_frontier = false,
-            .discarded_hinted_snapshot = false};
-    }
-}
-
-RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
-{
-    return recoverRefTableDetailed(backend, layout, ns, on_page_fetched, max_restarts).state;
-}
-
-RefTableState recoverRefTable(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
-{
-    return recoverRefTableDetailed(backend, layout, life, on_page_fetched, max_restarts).state;
+        .last_epoch_seal = ckpt->last_epoch_seal};
 }
 
 }

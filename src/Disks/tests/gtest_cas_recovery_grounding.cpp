@@ -40,7 +40,6 @@ enum class ListingMode : uint8_t
     Empty,
     Partial,
     Reordered,
-    HintAboveFrontier,
 };
 
 class RecoveryListingBackend : public CountingBackend
@@ -65,10 +64,6 @@ public:
         }
         else if (mode == ListingMode::Reordered)
             std::reverse(page.keys.begin(), page.keys.end());
-        else if (mode == ListingMode::HintAboveFrontier)
-            page.keys.push_back(ListedKey{
-                .key = prefix + "_snap/" + renderRefTxnId({9, 1}) + String(storedSuffix(FormatId::RefSnapshot)),
-                .token = std::nullopt});
         return page;
     }
 
@@ -184,34 +179,33 @@ void expectCode(const std::function<void()> & f, int code)
 
 TEST(CasRecoveryGrounding, CreatingAndAbsentCatalogEntriesAreNotRecovered)
 {
-    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Creating), ckpt(7, RefTxnId{7, 3}), std::nullopt); },
+    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Creating), ckpt(7, RefTxnId{7, 3})); },
                DB::ErrorCodes::INVALID_STATE);
-    expectCode([&] { chooseRecoveryGrounding(std::nullopt, ckpt(7, RefTxnId{7, 3}), std::nullopt); },
+    expectCode([&] { chooseRecoveryGrounding(std::nullopt, ckpt(7, RefTxnId{7, 3})); },
                DB::ErrorCodes::INVALID_STATE);
 }
 
 TEST(CasRecoveryGrounding, LiveAndRemovingRequireCheckpointAndLifeEpoch)
 {
-    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Live), std::nullopt, std::nullopt); },
+    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Live), std::nullopt); },
                DB::ErrorCodes::CORRUPTED_DATA);
-    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Removing), RefCkpt{}, std::nullopt); },
+    expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Removing), RefCkpt{}); },
                DB::ErrorCodes::CORRUPTED_DATA);
 }
 
 TEST(CasRecoveryGrounding, MissingFrontierMeansNoCommittedTransaction)
 {
-    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, std::nullopt), RefTxnId{7, 2});
+    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, std::nullopt));
     EXPECT_FALSE(grounding.base);
     EXPECT_FALSE(grounding.committed_through);
-    EXPECT_TRUE(grounding.ignored_hinted_snapshot_above_frontier);
 }
 
-TEST(CasRecoveryGrounding, ChoosesGreatestEligibleBaseAndArithmeticWalkStart)
+TEST(CasRecoveryGrounding, ChoosesCheckpointBaseAndArithmeticWalkStart)
 {
     const RecoveryGrounding grounding = chooseRecoveryGrounding(
-        catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 4}), RefTxnId{7, 6});
-    EXPECT_EQ(grounding.base, (RefTxnId{7, 6}));
-    EXPECT_EQ(grounding.walk_from, (RefTxnId{7, 7}));
+        catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 4}));
+    EXPECT_EQ(grounding.base, (RefTxnId{7, 4}));
+    EXPECT_EQ(grounding.walk_from, (RefTxnId{7, 5}));
     EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
 }
 
@@ -220,24 +214,16 @@ TEST(CasRecoveryGrounding, BaseAtFrontierStillStartsAtItsExactSuccessor)
     /// A writer recovery probes exactly this slot for its sole possible unfrontiered successor. The
     /// grounding contract must supply the arithmetic start even when the committed replay tail is empty.
     const RecoveryGrounding grounding = chooseRecoveryGrounding(
-        catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 8}), std::nullopt);
+        catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 8}));
 
     EXPECT_EQ(grounding.base, (RefTxnId{7, 8}));
     EXPECT_EQ(grounding.walk_from, (RefTxnId{7, 9}));
     EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
 }
 
-TEST(CasRecoveryGrounding, IgnoresHintAboveFrontierAndRecordsDiagnostic)
+TEST(CasRecoveryGrounding, WalksFromLifeEpochWithoutCheckpointBase)
 {
-    const RecoveryGrounding grounding = chooseRecoveryGrounding(
-        catalog(NsState::Live), ckpt(7, RefTxnId{7, 5}, RefTxnId{7, 3}), RefTxnId{7, 6});
-    EXPECT_EQ(grounding.base, (RefTxnId{7, 3}));
-    EXPECT_TRUE(grounding.ignored_hinted_snapshot_above_frontier);
-}
-
-TEST(CasRecoveryGrounding, WalksFromLifeEpochWithoutBaseAndNeverFromHintedLog)
-{
-    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Removing), ckpt(9, RefTxnId{9, 3}), std::nullopt);
+    const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Removing), ckpt(9, RefTxnId{9, 3}));
     EXPECT_EQ(grounding.walk_from, (RefTxnId{9, 1}));
 }
 
@@ -246,8 +232,7 @@ TEST(CasRecoveryGrounding, RejectsBaseWithoutARepresentableSuccessor)
     expectCode([&]
     {
         chooseRecoveryGrounding(catalog(NsState::Live),
-            ckpt(7, RefTxnId{8, 1}, RefTxnId{7, std::numeric_limits<uint64_t>::max()}, RefTxnId{8, 1}),
-            std::nullopt);
+            ckpt(7, RefTxnId{8, 1}, RefTxnId{7, std::numeric_limits<uint64_t>::max()}, RefTxnId{8, 1}));
     }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
@@ -255,12 +240,44 @@ TEST(CasRecoveryGrounding, RejectsCheckpointFieldsAboveCommittedFrontier)
 {
     expectCode([&]
     {
-        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{7, 3}, RefTxnId{7, 4}), std::nullopt);
+        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{7, 3}, RefTxnId{7, 4}));
     }, DB::ErrorCodes::CORRUPTED_DATA);
     expectCode([&]
     {
-        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{7, 3}, std::nullopt, RefTxnId{7, 4}), std::nullopt);
+        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{7, 3}, std::nullopt, RefTxnId{7, 4}));
     }, DB::ErrorCodes::CORRUPTED_DATA);
+}
+
+TEST(CasRecoveryGrounding, RejectsIncoherentEpochBoundaryInCheckpointAuthority)
+{
+    expectCode([&]
+    {
+        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{10, 1}, std::nullopt, RefTxnId{7, 9}));
+    }, DB::ErrorCodes::CORRUPTED_DATA);
+    expectCode([&]
+    {
+        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{8, 5}, std::nullopt, RefTxnId{8, 1}));
+    }, DB::ErrorCodes::CORRUPTED_DATA);
+    expectCode([&]
+    {
+        chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, RefTxnId{8, 1}));
+    }, DB::ErrorCodes::CORRUPTED_DATA);
+}
+
+/// A life starts in its own writer epoch. Letting it start after the checkpoint's writer epoch makes
+/// `walk_from > committed_through`, so recovery silently returns an empty table instead of refusing the
+/// impossible authority. The codec and pure grounding entry point must reject the same sabotage.
+TEST(CasRecoveryGrounding, RejectsLifeEpochAboveCommittedFrontierOnDecodeAndGrounding)
+{
+    const RefCkpt invalid = ckpt(2, RefTxnId{1, 5});
+    String encoded = encodeRefCkpt(ckpt(1, RefTxnId{1, 5}));
+    const size_t life_epoch = encoded.find("\"le\":\"1\"");
+    ASSERT_NE(life_epoch, String::npos);
+    encoded.replace(life_epoch, String{"\"le\":\"1\""}.size(), "\"le\":\"2\"");
+
+    expectCode([&] { (void)decodeRefCkpt(encoded); }, DB::ErrorCodes::CORRUPTED_DATA);
+    expectCode([&] { (void)chooseRecoveryGrounding(catalog(NsState::Live), invalid); },
+               DB::ErrorCodes::CORRUPTED_DATA);
 }
 
 TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReorderedList)
@@ -273,6 +290,7 @@ TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
         RefTxnId next_id;
         uint64_t log_gets = 0;
         uint64_t snapshot_gets = 0;
+        uint64_t list_calls = 0;
     };
 
     std::vector<Observation> observations;
@@ -285,6 +303,7 @@ TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
         seedAuthoritativeStream(*backend, layout, ns, frontier);
         const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
         backend->resetCounts();
+        backend->list_calls = 0;
 
         const RecoveredRefTable recovered = recoverFromCurrentCatalogCut(*backend, layout, ns);
         const uint64_t log_gets = backend->getCount(layout.refLogKey(life, {1, 1}))
@@ -297,7 +316,8 @@ TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
             .last_epoch_seal = recovered.last_epoch_seal,
             .next_id = recovered.state.nextTxnId(/*live_epoch=*/3),
             .log_gets = log_gets,
-            .snapshot_gets = snapshot_gets});
+            .snapshot_gets = snapshot_gets,
+            .list_calls = backend->list_calls});
     }
 
     ASSERT_EQ(observations.size(), 4u);
@@ -310,9 +330,13 @@ TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
     }
     for (const Observation & observation : observations)
         EXPECT_EQ(observation.log_gets, 3u)
-            << "a selected hint validates its matching log, while an unhinted replay reads the same exact frontier";
-    EXPECT_NE(observations[0].snapshot_gets, observations[1].snapshot_gets)
-        << "LIST must remain a useful snapshot-performance hint";
+            << "recovery must fetch every exact log in the checkpoint-bounded frontier";
+    for (const Observation & observation : observations)
+        EXPECT_EQ(observation.snapshot_gets, 0u)
+            << "a snapshot not named by `_ckpt` is not a recovery base";
+    for (const Observation & observation : observations)
+        EXPECT_EQ(observation.list_calls, 0u)
+            << "recovery must not enumerate a stream whose exact checkpoint already supplies its base and frontier";
 }
 
 TEST(CasRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyRecovery)
@@ -414,119 +438,38 @@ TEST(CasRecoveryGrounding, ReadOnlyRecoveryNeverAdoptsFPlusOne)
     EXPECT_FALSE(recovered.state.getCommitted().contains("uncommitted"));
 }
 
-TEST(CasRecoveryGrounding, ReportsListedSnapshotAboveExactFrontierWithoutUsingIt)
+/// A well-formed snapshot can describe a real but uncommitted transaction. If recovery merely treated
+/// `LIST` as a performance hint, it could still select this false base and skip the exact first log.
+/// The checkpoint names no snapshot, so every listing behaviour must leave the forged object unread.
+TEST(CasRecoveryGrounding, ForgedWellFormedListedSnapshotIsUnobservedAndRecoveryDoesNotList)
 {
-    auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::HintAboveFrontier);
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/hint_above_frontier"};
-    seedAuthoritativeStream(*backend, layout, ns, RefTxnId{1, 1});
-
-    const RecoveredRefTable recovered = recoverFromCurrentCatalogCut(*backend, layout, ns);
-    EXPECT_TRUE(recovered.ignored_hinted_snapshot_above_frontier);
-    EXPECT_EQ(recovered.state.getGreatestApplied(), (RefTxnId{1, 1}));
-    EXPECT_TRUE(recovered.state.getCommitted().contains("a"));
-}
-
-/// A snapshot listed at an epoch seal is not a usable recovery cut. `LIST` is only a performance
-/// hint, so the full listing must converge with an empty listing after exact reads prove that the
-/// nominated snapshot's matching log is a seal.
-TEST(CasRecoveryGrounding, ListedSnapshotAtEpochSealIsDiscardedAndDoesNotChangeRecovery)
-{
-    struct Observation
-    {
-        std::map<String, ManifestRef> committed;
-        RefTxnId greatest_applied;
-        std::optional<RefTxnId> last_epoch_seal;
-        bool discarded_hinted_snapshot;
-    };
-
-    std::vector<Observation> observations;
-    for (const ListingMode mode : {ListingMode::Full, ListingMode::Empty})
+    for (const ListingMode mode : {ListingMode::Full, ListingMode::Empty, ListingMode::Partial, ListingMode::Reordered})
     {
         auto backend = std::make_shared<RecoveryListingBackend>(mode);
         const Layout layout("p");
-        const RootNamespace ns{"srv1/hinted_snapshot_at_seal"};
-        seedAuthoritativeStream(*backend, layout, ns, RefTxnId{2, 1});
+        const RootNamespace ns{"srv1/forged_listed_snapshot"};
+        seedAuthoritativeStream(*backend, layout, ns, RefTxnId{1, 1}, /*include_f_plus_one=*/true);
+        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
 
-        RefTableState state_through_seal;
+        RefTableState forged_state;
         std::vector<RefOp> birth{namespaceBirthOp()};
         const auto first_publish = publishCommittedOps("a", ManifestRef{1, 1, 1});
         birth.insert(birth.end(), first_publish.begin(), first_publish.end());
-        applyRefLogTxn(state_through_seal, txn(ns, {1, 1}, std::move(birth)));
-        RefOp seal;
-        seal.kind = RefOpKind::EpochSeal;
-        applyRefLogTxn(state_through_seal, txn(ns, {1, 2}, {std::move(seal)}));
-        writeRefSnapshotRaw(*backend, layout, snapshotOf(state_through_seal, ns.string()));
+        applyRefLogTxn(forged_state, txn(ns, {1, 1}, std::move(birth)));
+        applyRefLogTxn(forged_state, txn(ns, {1, 2}, publishCommittedOps("uncommitted", ManifestRef{1, 2, 1})));
+        writeRefSnapshotRaw(*backend, layout, snapshotOf(forged_state, ns.string()));
+        const String forged_key = layout.refSnapshotKey(life, {1, 2});
 
+        backend->resetCounts();
+        backend->list_calls = 0;
         const RecoveredRefTable recovered = recoverFromCurrentCatalogCut(*backend, layout, ns);
-        observations.push_back(Observation{
-            .committed = committedOf(recovered.state),
-            .greatest_applied = recovered.state.getGreatestApplied(),
-            .last_epoch_seal = recovered.last_epoch_seal,
-            .discarded_hinted_snapshot = recovered.discarded_hinted_snapshot});
+
+        EXPECT_EQ(backend->list_calls, 0u);
+        EXPECT_EQ(backend->getCount(forged_key), 0u);
+        EXPECT_EQ(recovered.state.getGreatestApplied(), (RefTxnId{1, 1}));
+        EXPECT_TRUE(recovered.state.getCommitted().contains("a"));
+        EXPECT_FALSE(recovered.state.getCommitted().contains("uncommitted"));
     }
-
-    ASSERT_EQ(observations.size(), 2u);
-    EXPECT_EQ(observations[0].committed, observations[1].committed);
-    EXPECT_EQ(observations[0].greatest_applied, (RefTxnId{2, 1}));
-    EXPECT_EQ(observations[1].greatest_applied, (RefTxnId{2, 1}));
-    EXPECT_EQ(observations[0].last_epoch_seal, (RefTxnId{1, 2}));
-    EXPECT_EQ(observations[1].last_epoch_seal, (RefTxnId{1, 2}));
-    EXPECT_TRUE(observations[0].discarded_hinted_snapshot);
-    EXPECT_FALSE(observations[1].discarded_hinted_snapshot);
-}
-
-/// `decodeRefTableSnapshot` accepts this wire-valid row set, but a single manifest under a committed
-/// and a precommit owner violates the table's semantic ownership invariant in `stateFromSnapshot`.
-/// A LIST-only snapshot is merely a performance candidate, so full and empty listings must converge
-/// after that validation rejects the candidate.
-TEST(CasRecoveryGrounding, SemanticallyMalformedHintedSnapshotIsDiscardedAndDoesNotChangeRecovery)
-{
-    struct Observation
-    {
-        std::map<String, ManifestRef> committed;
-        RefTxnId greatest_applied;
-        bool discarded_hinted_snapshot;
-    };
-
-    std::vector<Observation> observations;
-    for (const ListingMode mode : {ListingMode::Full, ListingMode::Empty})
-    {
-        auto backend = std::make_shared<RecoveryListingBackend>(mode);
-        const Layout layout("p");
-        const RootNamespace ns{"srv1/semantically_malformed_hint"};
-        const ManifestRef manifest{1, 1, 1};
-        std::vector<RefOp> ops{namespaceBirthOp()};
-        const auto publish = publishCommittedOps("committed", manifest);
-        ops.insert(ops.end(), publish.begin(), publish.end());
-        writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, std::move(ops)));
-
-        RefTableSnapshot malformed = minimalLiveSnapshot(
-            ns.string(), {1, 1}, {DB::Cas::tests::committedRow("committed", manifest)});
-        malformed.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "precommit", manifest});
-        writeRefSnapshotRaw(*backend, layout, malformed);
-
-        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
-        ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
-            .life_epoch = 1,
-            .committed_through = RefTxnId{1, 1},
-            .checkpoint_snapshot_id = std::nullopt,
-            .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
-
-        const RecoveredRefTable recovered = recoverFromCurrentCatalogCut(*backend, layout, ns);
-        observations.push_back(Observation{
-            .committed = committedOf(recovered.state),
-            .greatest_applied = recovered.state.getGreatestApplied(),
-            .discarded_hinted_snapshot = recovered.discarded_hinted_snapshot});
-    }
-
-    ASSERT_EQ(observations.size(), 2u);
-    EXPECT_EQ(observations[0].committed, observations[1].committed);
-    EXPECT_EQ(observations[0].greatest_applied, observations[1].greatest_applied);
-    EXPECT_EQ(observations[0].committed, (std::map<String, ManifestRef>{{"committed", {1, 1, 1}}}));
-    EXPECT_EQ(observations[0].greatest_applied, (RefTxnId{1, 1}));
-    EXPECT_TRUE(observations[0].discarded_hinted_snapshot);
-    EXPECT_FALSE(observations[1].discarded_hinted_snapshot);
 }
 
 /// A checkpoint-named snapshot is immutable lifecycle authority, not a list candidate. Its exact GET
@@ -570,12 +513,13 @@ TEST(CasRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAf
         << "the corruption must come from the checkpoint snapshot's exact decode";
 }
 
-TEST(CasRecoveryGrounding, CheckpointSnapshotAtEpochSealIsCorruption)
+TEST(CasRecoveryGrounding, CheckpointSnapshotEqualToLastEpochSealIsRejectedBeforeReadingItsLog)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
     const RootNamespace ns{"srv1/checkpoint_base_seal"};
-    seedAuthoritativeStream(*backend, layout, ns, RefTxnId{2, 1});
+    /// The checkpoint directly contradicts itself: its sole snapshot base names its terminal seal.
+    seedAuthoritativeStream(*backend, layout, ns, RefTxnId{1, 2});
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
 
     RefTableState through_seal;
@@ -591,11 +535,45 @@ TEST(CasRecoveryGrounding, CheckpointSnapshotAtEpochSealIsCorruption)
     const CkptSample before = *readCkpt(*backend, layout, life);
     const RefCkpt with_sealed_base{
         .life_epoch = 1,
-        .committed_through = RefTxnId{2, 1},
+        .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = RefTxnId{1, 2},
         .last_epoch_seal = RefTxnId{1, 2}};
     ASSERT_EQ(backend->casPut(layout.refCkptKey(life), encodeRefCkpt(with_sealed_base), before.token).outcome,
               CasOutcome::Committed);
+
+    backend->resetCounts();
+    expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, {1, 2})), 0u)
+        << "the contradictory checkpoint metadata is rejected before any matching-log read";
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, {1, 2})), 0u)
+        << "the seal-kind witness must be checked before reading the forged same-id snapshot";
+}
+
+/// An `EpochSeal` terminates its numeric epoch.  A checkpoint frontier one sequence later in that
+/// same epoch is not an empty tail: no record can occupy that slot.  Recovery must diagnose the
+/// malformed authority instead of advancing to `{E+1,1}` and terminating because that id sorts above
+/// the bogus same-epoch frontier.
+TEST(CasRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
+{
+    auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/frontier_after_seal"};
+
+    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 1}, {namespaceBirthOp()}));
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    writeRefLogTxnRaw(*backend, layout, txn(ns, {1, 2}, {std::move(seal)}));
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    String malformed_ckpt = encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2}});
+    const size_t frontier_sequence = malformed_ckpt.find("\"cts\":\"2\"");
+    ASSERT_NE(frontier_sequence, String::npos);
+    malformed_ckpt.replace(frontier_sequence, String{"\"cts\":\"2\""}.size(), "\"cts\":\"3\"");
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
@@ -633,7 +611,12 @@ TEST(CasRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
     ASSERT_EQ(backend->casPut(layout.refCkptKey(life), encodeRefCkpt(with_old_sealed_base), before.token).outcome,
               CasOutcome::Committed);
 
+    backend->resetCounts();
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, {1, 2})), 1u)
+        << "the old seal differs from `last_epoch_seal`, so only the matching-log proof can reject it";
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, {1, 2})), 0u)
+        << "the old seal must be rejected before the forged same-id snapshot is read";
 }
 
 TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
@@ -649,11 +632,15 @@ TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
     writeRefLogTxnRaw(*backend, layout, txn(ns, {2, 1}, {namespaceBirthOp()}));
 
     const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+    String malformed_ckpt = encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
-        .committed_through = RefTxnId{2, 1},
+        .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        .last_epoch_seal = std::nullopt});
+    const size_t frontier_epoch = malformed_ckpt.find("\"cte\":\"1\"");
+    ASSERT_NE(frontier_epoch, String::npos);
+    malformed_ckpt.replace(frontier_epoch, String{"\"cte\":\"1\""}.size(), "\"cte\":\"2\"");
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }

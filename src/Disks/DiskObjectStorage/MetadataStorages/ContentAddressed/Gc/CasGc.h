@@ -673,6 +673,11 @@ private:
         /// correctly unproven -- fail-closed on a genuinely unknown genesis, never a guessed one.
         std::map<String, uint64_t> life_epochs;
 
+        /// The complete decoded checkpoint for each catalog-admitted Live/Removing life. `REBUILD`
+        /// passes this exact sample together with the same immutable catalog row to read-only recovery;
+        /// it must not re-read either authority object after its plan has been frozen.
+        std::map<String, RefCkpt> recovery_checkpoints;
+
         /// namespace -> the decode failure's message, for the namespaces whose `_ckpt` is PRESENT and
         /// UNREADABLE. Separate from an absent entry because the two mean opposite things: an absent
         /// entry says "this namespace published no checkpoint", which the walk may treat as no witness,
@@ -729,15 +734,14 @@ private:
 
 
     /// Ref-object cleanup: delete each table's ref logs covered by BOTH the durable fold cursor and a
-    /// durable snapshot, and snapshots older than the newest observed one, in batches of <=1000 exact
-    /// keys. A folded terminal's cleanup evidence carries its tail-covering snapshot id directly on the
-    /// same ref-life row. Runs post-CAS and only on a clamp-free round.
+    /// checkpoint-named validated recovery triple, and listed snapshots strictly older than that base,
+    /// in batches of <=1000 exact keys. A folded terminal's cleanup evidence carries its tail-covering
+    /// snapshot id directly on the same ref-life row. Runs post-CAS and only on a clamp-free round.
     ///
-    /// The round's `folded.checkpoints` TIGHTENS both boundaries and can never widen either: a log is
-    /// deletable only at or below `min(newest covering snapshot, checkpoint, cursor)`, and a snapshot
-    /// only STRICTLY BELOW `min(newest covering snapshot, checkpoint)` -- so the snapshot the checkpoint
-    /// itself names always survives. A namespace with no entry (no `_ckpt` yet, or one that has never
-    /// carried a `checkpoint_snapshot_id`) degrades to the cursor/snapshot boundaries alone.
+    /// A listed `_snap` never licenses cleanup on its own: only `folded.checkpoints` whose exact
+    /// same-id `_log` and `_snap` validate through `readCheckpointSnapshotBase` do. Logs and snapshots
+    /// are then deletable only strictly BELOW that checkpoint (and logs also at or below the durable
+    /// cursor). A namespace with no checkpoint base, or an invalid triple, is leak-only this pass.
     void cleanupRefObjects(
         const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive);
 

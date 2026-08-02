@@ -89,8 +89,8 @@ private:
 /// (`CasGcRound.TrimDropsFoldedOwnerEvents` was removed with the snapshot+log ref model: it asserted GC
 /// trims folded owner events out of a MUTABLE shard journal in place. Immutable `_log` objects are never
 /// trimmed in place; the new-model equivalent -- ref-object cleanup deletes a covered `_log`/`_snap` key
-/// once BOTH the durable cursor AND an observed snapshot cover it -- is exercised in `gtest_cas_ref_gc.cpp`
-/// (RefObjectCleanupHonorsAllThreeConditions).)
+/// once BOTH the durable cursor AND a checkpoint-named validated recovery triple cover it -- is exercised in
+/// `gtest_cas_ref_gc.cpp` (`RefObjectCleanupRetainsCheckpointNamedTriple`).)
 
 /// A crashed round leaves only never-adopted attempt-scoped debris (there is no resume machinery in the
 /// one-pass round). A fresh Gc simply re-runs the round under a fresh attempt and the deletion pipeline

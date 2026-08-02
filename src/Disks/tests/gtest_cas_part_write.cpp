@@ -1802,7 +1802,7 @@ TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
     /// append, so the corruption injected below (at a key computed from that sentinel) actually lands
     /// on the path production writes to -- otherwise `precommitAdd` mints an unrelated random
     /// incarnation and the corruption below misses it entirely.
-    DB::Cas::tests::casAdmitEntry(*b, s->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*b, s->layout(), ns, s->liveWriterEpoch());
     auto build = startBuildFor(s, ns, "part_1");
 
     build->putBlob(idOf("kept"), BlobSource::fromString("kept"));

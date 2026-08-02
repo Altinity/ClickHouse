@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include "cas_test_helpers.h"
 
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -142,12 +143,12 @@ String publishAtReturningManifestKey(
                                                          .manifest_ordinal = 1}});
 }
 
-/// Write `ns`'s `_ckpt` directly. The real writers go through `publishCkpt`, which merges by semantic
-/// maximum and additionally refuses a `life_epoch` below the durable one; a fixture that owns the whole
-/// namespace states the checkpoint outright.
+/// Publish the exact `_ckpt` that makes a raw fixture recoverable. The real writers go through
+/// `publishCkpt`, which merges by semantic maximum and additionally refuses a `life_epoch` below the
+/// durable one; this helper instead makes the fixture's one admissible recovery frontier explicit.
 void writeCkptRaw(Backend & backend, const Layout & layout, const RootNamespace & ns, const RefCkpt & ckpt)
 {
-    backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)), encodeRefCkpt(ckpt));
+    writeRecoverableCkptForRawFixture(backend, layout, ns, ckpt);
 }
 
 /// The table state after applying exactly `ids`, through the same builder the writer and the oracle
@@ -181,13 +182,13 @@ void seedSealedTwoEpochStream(Backend & backend, const Layout & layout, const Ro
     publishAt(backend, layout, ns, RefTxnId{2, 2}, "ref_d", 2, DB::UInt128(4));
 }
 
-/// The number of `Unchecked` rows whose note mentions `needle`, over the whole report.
-size_t uncheckedRowsMentioning(const FsckReport & rep, const String & needle)
+/// The number of rows in `cls` whose note mentions `needle`, over the whole report.
+size_t rowsMentioning(const FsckReport & rep, FsckClass cls, const String & needle)
 {
     size_t n = 0;
     for (const FsckObject & o : rep.objects)
     {
-        if (o.cls != FsckClass::Unchecked)
+        if (o.cls != cls)
             continue;
         for (const String & note : o.reachable_from)
             if (note.find(needle) != String::npos)
@@ -202,11 +203,9 @@ size_t uncheckedRowsMentioning(const FsckReport & rep, const String & needle)
 
 /// THE REGRESSION TEST FOR r5-finding-4. A blob pinned by a COMMITTED ref, whose ref-log record and
 /// whose manifest body the store both omit from every LIST while serving them perfectly by exact key.
-/// REBUILD's traversal is listing-driven on both legs — the owner replay reads the ref prefix, the
-/// trimmed-but-live pass reads the manifest prefix — so it reaches neither, and the blob ends the
-/// rebuild with zero edges. It used to be condemned right there, from the `blobs/` LIST: acked data,
-/// scheduled for deletion, because one enumeration lied. Now nothing is condemned at all, so a hidden
-/// owner costs retention and never data.
+/// The catalog row plus `_ckpt` frontier make the ref-log record authoritative, so REBUILD must recover
+/// both owners despite the lying hint. The hidden manifest LIST still cannot justify condemnation: an
+/// omitted object costs retention and never data.
 TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
 {
     auto backend = std::make_shared<HintHoleBackend>();
@@ -218,6 +217,9 @@ TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
     /// HIDDEN owner: ref_b pins blob 2, and neither its record nor its manifest is ever listed.
     const String hidden_manifest =
         publishAtReturningManifestKey(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", /*build_sequence=*/2, DB::UInt128(2));
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 2},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2}));
     backend->hide(hidden_manifest);
 
@@ -229,7 +231,8 @@ TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
     const RebuildReport rep = gc.rebuildBaseline(/*force=*/true);
     ASSERT_TRUE(rep.performed) << rep.refusal;
     ASSERT_GT(backend->holesServed(), 0u) << "the hidden keys were never actually omitted from a LIST";
-    EXPECT_EQ(rep.committed_refs, 1u) << "precondition: the rebuild must NOT have seen the hidden owner";
+    EXPECT_EQ(rep.committed_refs, 2u)
+        << "the immutable checkpoint frontier, not the lying LIST, defines both committed owners";
 
     EXPECT_FALSE(condemnedInSealedRuns(*backend, layout, DB::UInt128(2)))
         << "the hidden owner's blob was condemned — that is acked data scheduled for deletion";
@@ -258,6 +261,9 @@ TEST(CasRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     writeBlobBody(*backend, layout, DB::UInt128(2));   /// orphan: present, named by nothing
 
     Gc gc(store, kGc);
@@ -290,6 +296,9 @@ TEST(CasRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     /// Hand-built: no helper can mint this shape any more.
     const String noncanonical_life =
@@ -323,6 +332,9 @@ TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -359,6 +371,9 @@ TEST(CasRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1,
               DB::UInt128(1), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     /// A decoded generation-0 state exercises the health check's namespace walk before the rebuild
     /// universe is consumed. The backend would erase the authority set on a second catalog GET.
@@ -392,6 +407,9 @@ TEST(CasRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
     const Layout & layout = store->layout();
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", /*build_sequence=*/1, DB::UInt128(1), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     writeBlobBody(*backend, layout, DB::UInt128(2));   /// an orphan alongside the held namespace
 
     /// One real round first: it establishes the pool's `gc/state` and takes the lease under THIS
@@ -435,6 +453,9 @@ TEST(CasRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", 2, DB::UInt128(2));
     publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     const FsckReport rep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
@@ -457,6 +478,9 @@ TEST(CasRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", 2, DB::UInt128(2));
     publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     /// Punch the hole: {1,2} is gone while {1,3} stays durable and listed.
     const String holed = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2});
@@ -498,7 +522,8 @@ TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
     writeRefSnapshotRaw(*backend, layout,
                         snapshotOf(stateAfter(*backend, layout, kNsA, {RefTxnId{1, 1}, RefTxnId{1, 2}}), kNsA.string()));
     writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = std::nullopt});
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 4},
+                         .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = std::nullopt});
 
     /// The store stops listing the tail. It stays perfectly readable by exact key.
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 3}));
@@ -525,7 +550,8 @@ TEST(CasRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
     writeRefSnapshotRaw(*backend, layout,
                         snapshotOf(stateAfter(*backend, layout, kNsA, {RefTxnId{1, 1}, RefTxnId{1, 2}}), kNsA.string()));
     writeCkptRaw(*backend, layout, kNsA,
-                 RefCkpt{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = RefTxnId{1, 3}});
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{2, 2},
+                         .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = RefTxnId{1, 3}});
 
     const FsckReport rep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
@@ -548,7 +574,13 @@ TEST(CasRebuildCondemnNothingFsck, SnapshotOracleReplaysASealedStream)
     /// older one (`{1,2}`, below it) — so the seal and the crossing are inside the replayed span.
     writeRefSnapshotRaw(*backend, layout,
                         snapshotOf(stateAfter(*backend, layout, kNsA, {RefTxnId{1, 1}, RefTxnId{1, 2}}), kNsA.string()));
-    writeRefSnapshotRaw(*backend, layout, snapshotOf(recoverRefTable(*backend, layout, kNsA), kNsA.string()));
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{2, 2},
+                         .checkpoint_snapshot_id = RefTxnId{1, 2}, .last_epoch_seal = RefTxnId{1, 3}});
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    writeRefSnapshotRaw(*backend, layout,
+                        snapshotOf(recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, kNsA).state,
+                                   kNsA.string()));
 
     const FsckReport rep = runFsck(*store, /*detail=*/true);
     EXPECT_TRUE(rep.clean()) << formatFsckSummary(rep);
@@ -557,11 +589,12 @@ TEST(CasRebuildCondemnNothingFsck, SnapshotOracleReplaysASealedStream)
     EXPECT_EQ(rep.unchecked, 0u) << "an oracle that could not replay the seal would report `unchecked` here";
 }
 
-/// `unchecked` is the honest third answer, and it is reserved for exactly that. Here `ns_a`'s epoch 1
-/// is never sealed while a record of epoch 2 exists that chains from nothing: the crossing has no
-/// proof, so fsck says so instead of either blessing the namespace or condemning it. The healthy
-/// `ns_b` in the same pool is unaffected — one namespace's unprovable stream never spreads.
-TEST(CasRebuildCondemnNothingFsck, UncheckedOnlyForTheGenuinelyUnprovable)
+/// An exact `_ckpt` frontier turns an impossible epoch crossing into a hard chain break. Here `ns_a`'s
+/// epoch 1 ends at the PRESENT ordinary record `{1,3}`, while both `_ckpt` and `{2,1}` falsely claim
+/// that position as the closing seal. The finite range is complete and proves the contradiction: this
+/// is NOT `unchecked`, and there is no earlier missing record that could make the test pass instead.
+/// The healthy `ns_b` in the same pool is unaffected — one broken namespace never spreads.
+TEST(CasRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -569,20 +602,33 @@ TEST(CasRebuildCondemnNothingFsck, UncheckedOnlyForTheGenuinelyUnprovable)
 
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", 2, DB::UInt128(2));
-    /// A record of epoch 2 that chains from `{1, 5}` — a position epoch 1 never reached and certainly
-    /// never sealed. The walk stops at the frontier of epoch 1 having applied an ORDINARY record, so the
-    /// crossing's first gate (the record we stopped on must be a seal) fails and no back-chain can
-    /// rescue it. Unprovable, which is different from broken: nothing here says a record was LOST.
-    publishAt(*backend, layout, kNsA, RefTxnId{2, 1}, "ref_c", 1, DB::UInt128(3), /*birth=*/false,
-              /*prev_epoch_seal=*/RefTxnId{1, 5});
+    publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
+    /// `{1,3}` exists but is an ordinary owner transaction, not an `EpochSeal`. Claiming it as the
+    /// predecessor must not authorize the transition to epoch 2.
+    publishAt(*backend, layout, kNsA, RefTxnId{2, 1}, "ref_d", 1, DB::UInt128(4), /*birth=*/false,
+              /*prev_epoch_seal=*/RefTxnId{1, 3});
 
     publishAt(*backend, layout, kNsB, RefTxnId{1, 1}, "ref_z", 1, DB::UInt128(9), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{2, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{1, 3}});
+    writeCkptRaw(*backend, layout, kNsB,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     FsckReport rep;
     ASSERT_NO_THROW(rep = runFsck(*store, /*detail=*/true));
-    EXPECT_EQ(rep.unchecked, 1u) << "exactly the namespace that cannot be proved — never the healthy one";
-    EXPECT_EQ(rep.chain_broken, 0u) << "an unprovable crossing is not a proven hole";
-    EXPECT_GE(uncheckedRowsMentioning(rep, "crossing"), 1u) << "the verdict must say what could not be proved";
+    EXPECT_EQ(rep.unchecked, 0u) << "the exact frontier proves this crossing inconsistent";
+    EXPECT_EQ(rep.chain_broken, 1u) << "exactly the malformed namespace must be reported";
+    const String missing_key = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 4});
+    EXPECT_EQ(std::count_if(rep.objects.begin(), rep.objects.end(), [&](const FsckObject & object)
+    {
+        return object.cls == FsckClass::ChainBroken && object.key == missing_key;
+    }), 1u) << "the present ordinary 1-3 cannot close epoch 1, so arithmetic continuation requires 1-4";
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "checkpoint requires id 1-4"), 1u)
+        << "the verdict must expose that the claimed ordinary predecessor did not authorize a crossing";
+    EXPECT_GE(rowsMentioning(rep, FsckClass::ChainBroken, "inclusive frontier 2-1"), 1u)
+        << "the verdict must name the authority that made the absence a proven chain break";
 }
 
 /// W2 (Task-3 review): a holed namespace used to make the WHOLE scan throw — `applyOne` raises
@@ -599,12 +645,18 @@ TEST(CasRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
     publishAt(*backend, layout, kNsA, RefTxnId{1, 1}, "ref_a", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, kNsA, RefTxnId{1, 2}, "ref_b", 2, DB::UInt128(2));
     publishAt(*backend, layout, kNsA, RefTxnId{1, 3}, "ref_c", 3, DB::UInt128(3));
+    writeCkptRaw(*backend, layout, kNsA,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 3},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     const String holed = layout.refLogKey(NamespaceLifeId::stageATransition(kNsA), RefTxnId{1, 2});
     const HeadResult h = backend->head(holed);
     ASSERT_TRUE(h.exists);
     backend->deleteExact(holed, h.token);
 
     publishAt(*backend, layout, kNsB, RefTxnId{1, 1}, "ref_z", 1, DB::UInt128(9), /*birth=*/true);
+    writeCkptRaw(*backend, layout, kNsB,
+                 RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     FsckReport rep;
     ASSERT_NO_THROW(rep = runFsck(*store, /*detail=*/true));

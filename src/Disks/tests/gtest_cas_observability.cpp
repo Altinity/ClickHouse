@@ -266,10 +266,11 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
     const String key = layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_id);
     const String json = caInspectToJson(
         layout, key, encodeRefTableSnapshot(snap), NamespaceLifeId::stageATransition(ns));
-    EXPECT_NE(json.find("ref_snapshot"), String::npos);
-    EXPECT_NE(json.find("\"lifecycle\""), String::npos);
-    EXPECT_NE(json.find("Live"), String::npos);
-    EXPECT_NE(json.find("all_0_0_0"), String::npos);
+    EXPECT_NE(json.find(R"("object":"ref_snapshot")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("ns":"srv/tbl@cas@")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("snapshot_id":{"writer_epoch":1,"ref_sequence":7})"), String::npos) << json;
+    EXPECT_NE(json.find(R"("ref_name":"all_0_0_0")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("precommits":[])"), String::npos) << json;
 }
 
 /// ...and a `_log/<txn-id>` renders as a ref-transaction log.

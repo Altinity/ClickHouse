@@ -80,14 +80,14 @@ namespace DB::Cas
 
 namespace
 {
-/// Classifies whether an exception thrown out of a ref-table recovery attempt (namespace LIST,
-/// snapshot/log GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
+/// Classifies whether an exception thrown out of a ref-table recovery attempt (checkpoint/snapshot/log
+/// GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
 /// vs. a terminal condition (corruption, decode failure, logic error, resource limit) that must fail
 /// fast. The recovery reads call the backend directly (not through `ref_request_controller`), so a
 /// transient blip surfaces as the object storage's native code -- `S3_ERROR` for the S3 backend, or a
 /// socket/timeout/Poco transport code -- NOT the `NETWORK_ERROR` that only the seal PUT's controller
 /// re-mints. Retrying only `NETWORK_ERROR` would leave the LIST/GET legs unprotected, which is exactly
-/// the path the motivating stuck-load incident hit.
+/// the exact-read path the recovery retry boundary protects.
 bool isTransientRecoveryError(int code)
 {
     return code == ErrorCodes::NETWORK_ERROR
@@ -122,7 +122,8 @@ enum class Occupant : uint8_t
 /// propagates, leaving the caller's lane exactly as it was.
 std::optional<RefTxnId> chainLinkFor(const RefTxnId & id, const std::optional<RefTxnId> & last_epoch_seal)
 {
-    return id.ref_sequence == 1 && last_epoch_seal && last_epoch_seal->writer_epoch < id.writer_epoch
+    return id.ref_sequence == 1 && last_epoch_seal
+        && last_epoch_seal->writer_epoch + 1 == id.writer_epoch
         ? last_epoch_seal : std::nullopt;
 }
 
@@ -144,8 +145,8 @@ RefLogTxn makeEpochSealTxn(const RootNamespace & ns, const RefTxnId & id, const 
     /// rule whose four-site drift is what let the writer preview a transaction it would never send. The
     /// two conditions happen to coincide for every id the walk can reach here -- its first dead epoch
     /// always already holds the birth transaction, so that seal sits at sequence >= 2, and every later
-    /// dead epoch's seal is at sequence 1 with a strictly-lower held seal -- but "happen to coincide" is
-    /// exactly the property that rots silently. One rule, one caller shape.
+    /// dead epoch's seal is at sequence 1 with the immediately preceding epoch's held seal -- but
+    /// "happen to coincide" is exactly the property that rots silently. One rule, one caller shape.
     seal.prev_epoch_seal = chainLinkFor(id, prev_epoch_seal);
     return seal;
 }
@@ -347,8 +348,8 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
 std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
 {
     /// The whole ref set is a map iteration over this namespace's recovered-and-cached `RefTableState`:
-    /// an empty but existing namespace still costs exactly one `LIST` (recovery) and zero further
-    /// requests; a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
+    /// an empty but existing namespace still pays one exact recovery pass and zero further requests;
+    /// a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
     /// dance, since there is no longer a shard fan-out to rediscover on every call). A namespace that was
     /// never born costs one catalog GET and stops there.
     const auto rt = acquireReadableRefTableRuntime(ns);
@@ -442,7 +443,7 @@ ConfirmAnswer CasRefLedger::confirmExactRef(const RootNamespace & ns, const Stri
     RefTableRuntime & rt = *it->second.current;
 
     /// `try_to_lock`, not a blocking acquire: `ensureRefTableRecovered` holds `state_mutex` across its
-    /// whole LIST + replay, so blocking here would make a confirm WAIT on someone else's recovery --
+    /// whole exact replay, so blocking here would make a confirm WAIT on someone else's recovery --
     /// up to the full retry envelope -- while holding `ref_queue_mutex`, which is pool-wide append
     /// admission. That is the zero-I/O contract broken by proxy: the query would not issue a request,
     /// it would merely be paid for by one, and it would stall every table's lane meanwhile. Failing to
@@ -753,96 +754,47 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
     std::optional<CkptSample> accepted_ckpt_sample = sampled_ckpt;
     checkRecoveryStillAdmitted(ns, rt, cancelled);
 
-    /// ---- Step 3: ONE hint LIST ----
-    /// A HINT, and nothing more. It may offer a base-snapshot candidate. Log names are deliberately not
-    /// retained: neither an omission nor a stale `F+2` name may change a checkpoint-bounded decision.
-    std::optional<RefTxnId> greatest_listed_snapshot;
-    {
-        const String prefix = layout.namespaceStreamPrefix(life);
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-            for (const ListedKey & lk : page.keys)
-            {
-                const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (!parsed)
-                    continue;   /// not a ref-object key (the namespace's own `_ckpt`, for one)
-                /// The scoped LIST names one physical life. A returned key is accepted only when its
-                /// parsed id is exactly that captured life; logical authority remains the catalog row.
-                if (parsed->life_id != life.incarnation)
-                    continue;
-                switch (parsed->kind)
-                {
-                    case RefObjectKind::Log:
-                        break;
-                    case RefObjectKind::Snap:
-                        if (!greatest_listed_snapshot || *greatest_listed_snapshot < parsed->txn_id)
-                            greatest_listed_snapshot = parsed->txn_id;
-                        break;
-                }
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
-    }
-    checkRecoveryStillAdmitted(ns, rt, cancelled);
-
-    /// ---- Step 4: the finite grounding and exact base ----
-    /// `chooseRecoveryGrounding` is the single policy boundary: LIST may offer a snapshot only at or
-    /// below the exact committed frontier. It may neither provide genesis nor extend durable history.
+    /// ---- Step 3: the finite grounding and exact base ----
+    /// `chooseRecoveryGrounding` is the single policy boundary. The immutable checkpoint alone names
+    /// the base and inclusive frontier; recovery does not enumerate its own stream.
     RecoveryGrounding grounding = chooseRecoveryGrounding(
         catalog_entry,
-        sampled_ckpt ? std::optional<RefCkpt>{sampled_ckpt->ckpt} : std::nullopt,
-        greatest_listed_snapshot);
+        sampled_ckpt ? std::optional<RefCkpt>{sampled_ckpt->ckpt} : std::nullopt);
     std::optional<RefTxnId> base_id = grounding.base;
-    bool base_is_hint_only = greatest_listed_snapshot && base_id == greatest_listed_snapshot
-        && (!sampled_ckpt->ckpt.checkpoint_snapshot_id
-            || *sampled_ckpt->ckpt.checkpoint_snapshot_id < *greatest_listed_snapshot);
 
     std::optional<RefTableSnapshot> base_snapshot;
     uint64_t base_snapshot_bytes = 0;
-    while (base_id)
+    if (base_id)
     {
-        const auto got = backend.get(layout.refSnapshotKey(life, *base_id));
-        if (!got)
+        try
         {
-            if (base_is_hint_only)
-            {
-                grounding = chooseRecoveryGrounding(
-                    catalog_entry, std::optional<RefCkpt>{sampled_ckpt->ckpt}, std::nullopt);
-                base_id = grounding.base;
-                base_is_hint_only = false;
-                continue;
-            }
-            /// INV-4's three-way revalidation, consumed from `CasRefCkpt` rather than re-derived: the
-            /// same rule at every call site is the point of the helper existing.
-            if (!sampled_ckpt)
-                return std::nullopt;   /// no checkpoint to adjudicate against: the plain vanish restart
+            CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, *base_id);
+            base_snapshot = std::move(base.snapshot);
+            base_snapshot_bytes = base.bytes;
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::CORRUPTED_DATA || !sampled_ckpt)
+                throw;
 
+            /// A newer checkpoint may have atomically re-anchored recovery while cleanup retired this
+            /// old anchor's snapshot or witness log. Restart from that newer immutable sample; an
+            /// unchanged checkpoint turns every helper failure (missing, malformed, or seal) into the
+            /// fail-closed corruption it describes.
             const std::optional<CkptSample> current = readCkpt(backend, layout, life);
             if (classifyMissingSampledBase(sampled_ckpt->token,
                                            current ? std::optional<Token>(current->token) : std::nullopt)
                 == MissingBaseVerdict::RestartRecovery)
-                return std::nullopt;   /// the checkpoint advanced under us; restart from the newer base
-
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS ref-table recovery for namespace '{}': the base snapshot {}-{} is absent while the "
-                "checkpoint that names it is unchanged. A snapshot is deletable only STRICTLY BELOW the "
-                "checkpoint, so this one could not have been cleaned — a live base was deleted",
-                ns.string(), base_id->writer_epoch, base_id->ref_sequence);
+                return std::nullopt;
+            throw;
         }
-        base_snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
-        base_snapshot_bytes = got->bytes.size();
-        break;
     }
     checkRecoveryStillAdmitted(ns, rt, cancelled);
 
     /// The committed replay range comes only from the grounding. Writer recovery additionally probes
     /// the single arithmetic successor: it is the durable-but-not-yet-frontiered transaction left by
     /// a lost checkpoint response. With no committed transaction that successor is genesis itself.
-    /// Deliberately no hint-log fallback exists here.
+    /// Deliberately no enumerated-log fallback exists here.
     std::optional<RefTxnId> walk_from = grounding.walk_from;
     if (!walk_from && !grounding.committed_through)
         walk_from = RefTxnId{*sampled_ckpt->ckpt.life_epoch, 1};
@@ -1518,7 +1470,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
         }
         catch (...)
         {
-            /// `catch (...)`, not `catch (const Exception &)`: recovery LIST/GET failures can surface as
+            /// `catch (...)`, not `catch (const Exception &)`: recovery exact-GET failures can surface as
             /// a raw object-storage transport exception (even a non-`DB::Exception` Poco timeout), which
             /// a `catch (const Exception &)` would not even see. `getCurrentExceptionCode()` normalises
             /// every exception (DB, Poco, std) to a code so the transient classifier can decide.
@@ -1581,7 +1533,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 || rt.superseded_by_remount.load(std::memory_order_acquire)
                 || fence_generation_fn() != admitted_generation)
                 throw;
-            /// loop: re-run recovery from a fresh checkpoint read, listing, replay and walk
+            /// loop: re-run recovery from a fresh checkpoint read, exact replay and walk
         }
     }
     }

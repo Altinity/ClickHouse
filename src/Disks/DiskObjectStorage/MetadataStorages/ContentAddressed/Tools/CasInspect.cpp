@@ -177,9 +177,10 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
 
 /// The namespace's checkpoint (spec INV-4). Every field is optional and each absence means something
 /// different an operator needs to see: no `life_epoch` means no writer that knew this namespace's
-/// genesis epoch has written here yet, no `checkpoint_snapshot_id` means recovery has no base and
-/// NOTHING is deletable, and no `last_epoch_seal` means no epoch of this namespace has been closed.
-/// They are rendered as explicit `null`s rather than omitted keys so the three cases are visible.
+/// genesis epoch has written here yet, no `committed_through` means the life has no committed
+/// transaction, no `checkpoint_snapshot_id` means recovery has no snapshot base, and no
+/// `last_epoch_seal` means no epoch of this namespace has been closed. They are rendered as explicit
+/// `null`s rather than omitted keys so all four cases are visible.
 /// `ns` comes from the KEY -- unlike the log and snapshot objects, a `_ckpt` body does not name its
 /// namespace, so there is no key-to-body binding to cross-check here.
 String renderRefCkpt(const RootNamespace & ns, const RefCkpt & c)
@@ -188,6 +189,7 @@ String renderRefCkpt(const RootNamespace & ns, const RefCkpt & c)
         .add("object", jsonEscape("ref_ckpt"))
         .add("ns", jsonEscape(ns.string()))
         .add("life_epoch", c.life_epoch ? jsonUInt(*c.life_epoch) : "null")
+        .add("committed_through", c.committed_through ? renderRefTxnIdObj(*c.committed_through) : "null")
         .add("checkpoint_snapshot_id",
              c.checkpoint_snapshot_id ? renderRefTxnIdObj(*c.checkpoint_snapshot_id) : "null")
         .add("last_epoch_seal", c.last_epoch_seal ? renderRefTxnIdObj(*c.last_epoch_seal) : "null")

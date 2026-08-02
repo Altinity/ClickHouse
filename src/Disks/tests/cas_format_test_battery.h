@@ -22,7 +22,19 @@ struct FormatBatteryCase
     std::function<String()> encode;
     std::function<void(std::string_view)> decode;
     String golden;
+    /// Optional format-specific construction for the unsupported-version sample. Fixed-size formats
+    /// use this to preserve their physical envelope while growing a version field across a digit
+    /// boundary; ordinary line-oriented formats use the default textual replacement below.
+    std::function<String(std::string_view)> make_future_version = {};
 };
+
+/// Canonical object headers track the current compatibility generation. The type remains an
+/// explicit test literal at every call site, so a registry/type mismatch cannot be hidden by a
+/// self-derived expectation.
+inline String currentFormatHeader(std::string_view type)
+{
+    return fmt::format("{{\"type\":\"{}\",\"v\":{}}}\n", type, DB::Cas::currentCompatibilityVersion());
+}
 
 namespace cas_battery_detail
 {
@@ -75,8 +87,14 @@ inline void runFormatBattery(const FormatBatteryCase & c)
     /// v+1 gate.
     const String v_now = fmt::format("\"v\":{}", currentCompatibilityVersion());
     const String v_next = fmt::format("\"v\":{}", currentCompatibilityVersion() + 1);
-    String future = text;
-    future.replace(future.find(v_now), v_now.size(), v_next);
+    String future;
+    if (c.make_future_version)
+        future = c.make_future_version(text);
+    else
+    {
+        future = text;
+        future.replace(future.find(v_now), v_now.size(), v_next);
+    }
     cas_battery_detail::expectCode(ec::UNKNOWN_FORMAT_VERSION, [&] { c.decode(future); },
         fmt::format("{}: v+1", t.type));
 

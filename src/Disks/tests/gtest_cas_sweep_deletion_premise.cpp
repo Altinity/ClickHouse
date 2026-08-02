@@ -53,7 +53,10 @@ struct OrphanFixture
     OrphanFixture()
     {
         store = openPoolForTest(backend);
-        registerNamespaceRaw(*backend, store->layout(), ns);
+        /// This fixture has no ref transaction, but it is a normal empty catalog life rather than the
+        /// deliberate missing-checkpoint corruption shape. State that empty recovery frontier before
+        /// exercising the independent sweep-deletion premise.
+        casAdmitRecoverableEntry(*backend, store->layout(), ns);
         writeManifestRaw(*backend, store->layout(), ns, orphan, {blobEntryFor("a", DB::UInt128(1))});
         /// min_active 6 > build_sequence 5: the durable watermark fact makes the prefix ELIGIBLE, which
         /// is the half the premise sits on top of.
@@ -228,6 +231,7 @@ TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     /// Namespace A: a cursor still INSIDE the build's epoch -> rule (1), `unconsumed_seal`.
     const RootNamespace ns_a{"00/aa@cas@"};
     const ManifestRef ref_a = ref(5, 0xA1);
+    casAdmitRecoverableEntry(*backend, layout, ns_a);
     writeManifestRaw(*backend, layout, ns_a, ref_a, {blobEntryFor("a", DB::UInt128(1))});
     seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch, 3});
 
@@ -235,6 +239,7 @@ TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     /// and the hold is demonstrably what retained it.
     const RootNamespace ns_b{"00/bb@cas@"};
     const ManifestRef ref_b = ref(5, 0xB1);
+    casAdmitRecoverableEntry(*backend, layout, ns_b);
     writeManifestRaw(*backend, layout, ns_b, ref_b, {blobEntryFor("b", DB::UInt128(2))});
     const RefHold hold{.reason = HoldReason::BodyUndecodable,
                        .offending_position = RefTxnId{kBuildEpoch + 1, 9},

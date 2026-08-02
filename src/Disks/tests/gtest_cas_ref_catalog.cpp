@@ -193,7 +193,7 @@ TEST(CasFormatBattery, RefCatalog)
     runFormatBattery({FormatId::RefCatalog,
         [&] { return sealObject(FormatId::RefCatalog, encodeRefCatalog(c)); },
         [](std::string_view s) { decodeRefCatalog(std::string(openObject(FormatId::RefCatalog, s))); },
-        "{\"type\":\"cas_ref_catalog\",\"v\":8}\n"
+        currentFormatHeader("cas_ref_catalog") +
         "{\"k\":\"ent\",\"ns\":\"a\",\"st\":\"creating\",\"inc\":\"00000000000000000000000000000001\","
         "\"csr\":\"srv1\",\"cwe\":\"5\",\"cfg\":\"2\"}\n"
         "{\"k\":\"ent\",\"ns\":\"b\",\"st\":\"live\",\"inc\":\"00000000000000000000000000000002\"}\n"

@@ -239,7 +239,7 @@ TEST(CasRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
         << "an equal life_epoch must not disturb the other fields' own join";
 }
 
-TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAndPreservesASealAtOrBelowIt)
+TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
 {
     const RefCkpt older{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -248,18 +248,17 @@ TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAndPreservesASealAtOrBelowIt)
     EXPECT_EQ(mergeCkpt(older, transitioned).committed_through, transitioned.committed_through);
     EXPECT_EQ(mergeCkpt(transitioned, older).committed_through, transitioned.committed_through);
 
-    /// The first ordinary transaction of a later epoch carries the seal that closed its PREVIOUS
-    /// epoch. Writer epochs are pool-wide and may skip, so numeric adjacency is neither required nor
-    /// useful; the log grammar validates the exact `prev_epoch_seal` link before this contribution is
-    /// built.
-    const RefCkpt linked_from_prior{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
+    /// Every committed epoch is materialized. A later frontier may advance only to the immediately
+    /// following numeric writer epoch, otherwise a missing epoch would be mistaken for a proved
+    /// boundary. The log grammar rejects this same skip at the record boundary; `_ckpt` must not
+    /// reintroduce it through its semantic merge.
+    const RefCkpt skipped_epoch{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
                                     .checkpoint_snapshot_id = std::nullopt,
                                     .last_epoch_seal = RefTxnId{7, 9}};
-    EXPECT_EQ(mergeCkpt(older, linked_from_prior).committed_through, linked_from_prior.committed_through);
-    EXPECT_EQ(mergeCkpt(older, linked_from_prior).last_epoch_seal, linked_from_prior.last_epoch_seal);
+    EXPECT_THROW(mergeCkpt(older, skipped_epoch), DB::Exception);
 
     const RefCkpt advanced{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
-                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 1}};
+                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
     EXPECT_EQ(mergeCkpt(advanced, older).committed_through, advanced.committed_through);
 
     const RefCkpt unsealed{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},

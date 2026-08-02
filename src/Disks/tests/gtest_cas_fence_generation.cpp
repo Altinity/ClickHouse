@@ -182,7 +182,7 @@ TEST(CasFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openTestPool(backend);
     const RootNamespace ns{"srv1/rearm-publication-order"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
     ASSERT_EQ(store->refTableRuntimeIdentityForTest(ns), 0u);
 
     store->tripMountLost();

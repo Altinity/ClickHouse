@@ -439,9 +439,9 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// remaining fields are recovery-context the streaming builder cannot know -- the writer's own recovery
 /// (`CasRefLedger::ensureRefTableRecovered`) fills the admission budgets,
 /// `needs_stale_precommit_sweep` and `last_epoch_seal`, before installing the whole struct under
-/// `state_mutex` with `recovered` set last. The read-only consumers (`recoverRefTableDetailed` for the
-/// orphan sweep, fsck's snapshot oracle) read only `state` (plus `newest_snapshot_id` for the sweep) and
-/// leave the rest at default.
+/// `state_mutex` with `recovered` set last. The read-only consumers
+/// (`recoverRefTableDetailedFromAuthority` for the orphan sweep and fsck's snapshot oracle) read only
+/// `state` (plus `newest_snapshot_id` for the sweep) and leave the rest at default.
 struct RecoveryResult
 {
     RefTableState state;
@@ -476,7 +476,7 @@ struct RecoveryResult
 /// the growing candidate once per transaction and reintroduce the O(K*N) cost `replay` was written to
 /// avoid. The candidate never touches any live runtime state; a throw destroys it during unwinding, so no
 /// consumer ever observes a poisoned candidate. All three full-tail materialisers stream through this:
-/// the writer's recovery, `recoverRefTableDetailed` (orphan sweep), and fsck's snapshot oracle.
+/// the writer's recovery, `recoverRefTableDetailedFromAuthority` (orphan sweep), and fsck's snapshot oracle.
 class RefReplayBuilder
 {
 public:
@@ -656,21 +656,12 @@ std::map<NamespaceLifePhysicalId, RefTableListing> groupRefKeys(
     const Layout & layout, const std::vector<String> & listed_keys);
 
 /// The exact ref objects one round may delete for one namespace life.
-/// Pure; acts only on keys THIS round's scan returned, so a covering snapshot is always
-/// durable before any deletion it authorizes. A log `L` is deletable iff:
-///   1. the newest observed snapshot `X` covers it (`L <= X`);
-///   2. the durable `last_folded_ref_id` covers it (`L <= durable_cursor`);
-///   3. the optional durable checkpoint covers it (`L <= checkpoint`).
-/// Snapshots with id `< X` are deletable. With no observed snapshot, `X` is undefined and no log is
-/// coverage-deletable (an empty plan). The newest snapshot `X` itself is retained.
-///
-/// `checkpoint` (optional) is the namespace's own durable `_ckpt.checkpoint_snapshot_id`. It only ever TIGHTENS the
-/// two boundaries -- a log must additionally satisfy `L <= checkpoint`, and a snapshot must be STRICTLY
-/// BELOW it, so the snapshot the checkpoint itself names always survives. It can never widen either:
-/// a checkpoint AHEAD of what this round observed names durable objects the scan did not return, and
-/// this plan acts only on keys the scan DID return. Absent -- a namespace whose `_ckpt` does not exist
-/// yet, or exists without a `checkpoint_snapshot_id` because only its other fields have ever been
-/// published -- leaves both boundaries at the cursor and the newest covering snapshot alone.
+/// Pure; acts only on keys THIS round's scan returned, but the scan is never cleanup authority. The
+/// caller may supply `checkpoint` only after exact validation of the `_ckpt`-named recovery triple:
+/// `_ckpt` plus its same-id non-seal `_log` and `_snap`. Without that validated base the plan is empty.
+/// With it, a log `L` is deletable only when `L < checkpoint` and `L <= durable_cursor`; a listed
+/// snapshot is deletable only when its id is `< checkpoint`. The base's same-id `_log` and `_snap`,
+/// and every newer stream object, are retained.
 struct RefCleanupPlan
 {
     std::vector<RefTxnId> deletable_logs;
@@ -723,9 +714,9 @@ struct EpochCrossResult
 /// is an inherited cursor whose record may since have been cleaned, so its kind is unknowable by any
 /// amount of reading here and the crossing rests on chain-trust.
 ///
-/// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch <
-/// txn_id.writer_epoch`, so the target epoch strictly decreases and the loop is bounded below by
-/// `from_seal`'s own epoch. The record it proves is read once more by the caller's own walk: one
+/// Terminates: `validateEpochSealGrammarStructural` guarantees `prev_epoch_seal->writer_epoch + 1 ==
+/// txn_id.writer_epoch`, so the target epoch decreases one numeric epoch per link and is bounded below
+/// by `from_seal`'s own epoch. The record it proves is read once more by the caller's own walk: one
 /// redundant `GET` per epoch crossed, and crossings happen once per writer-epoch change.
 ///
 /// READ-ONLY, and shared deliberately: the GC fold's intake and fsck's audit must not be able to
@@ -742,22 +733,39 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
                                     const RefTxnId & from_seal, std::optional<bool> seal_proven,
                                     const RefTxnId & witness, const NamespaceLifeId & life);
 
-/// The result of `recoverRefTableDetailed`: the replayed table state plus the identity of the snapshot
-/// recovery actually selected as its base (`nullopt` when it found no snapshot at all).
+/// Return the one exact successor an immutable `_ckpt.committed_through` range permits after the
+/// decoded record at `current`, or `nullopt` when `current` is the inclusive frontier itself. An
+/// `EpochSeal` ends its numeric epoch, so a strictly-later frontier in that SAME epoch is corrupt:
+/// advancing to `{E+1,1}` and letting ordinary ordering terminate would silently discard the invalid
+/// part of the claimed range. Shared by every checkpoint-bounded reader so recovery, fsck, and the
+/// orphan protection walk cannot disagree about that malformed authority.
+std::optional<RefTxnId> nextRefLogIdWithinCommittedFrontier(
+    const RefTxnId & current, bool is_epoch_seal, const RefTxnId & committed_through);
+
+/// The result of `recoverRefTableDetailedFromAuthority`: the replayed table state plus the identity of
+/// the snapshot recovery actually selected as its base (`nullopt` when it found no snapshot at all).
 struct RecoveredRefTable
 {
     RefTableState state;
     std::optional<RefTxnId> newest_snapshot_id;
     /// The exact lifecycle authority's last sealed epoch. The authoritative read-only entry point
-    /// copies this from its immutable `_ckpt` input; it is deliberately not inferred from LIST.
+    /// copies this from its immutable `_ckpt` input.
     std::optional<RefTxnId> last_epoch_seal;
-    /// A listed snapshot named an id above the exact checkpoint frontier and was ignored. This is
-    /// diagnostic evidence of stale enumeration, never an authority input.
-    bool ignored_hinted_snapshot_above_frontier = false;
-    /// A listed snapshot at or below the exact frontier was rejected after exact reads. This is
-    /// diagnostic evidence only: a `LIST` result never changes the immutable recovery authority.
-    bool discarded_hinted_snapshot = false;
 };
+
+/// Exact-read and decode the checkpoint-named recovery base. The anchor is the bounded triple
+/// `_ckpt` + same-id non-seal `_log` + same-id `_snap`: read and decode the log first, reject an
+/// `EpochSeal`, then read the snapshot. This order prevents a forged snapshot at any historical seal
+/// from becoming state, including when that seal is older than `_ckpt.last_epoch_seal`. Cleanup retains
+/// the matching log while the checkpoint names this base.
+struct CheckpointSnapshotBase
+{
+    RefTableSnapshot snapshot;
+    uint64_t bytes = 0;
+};
+
+CheckpointSnapshotBase readCheckpointSnapshotBase(
+    Backend & backend, const Layout & layout, const NamespaceLifeId & life, const RefTxnId & snapshot_id);
 
 /// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
 /// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is
@@ -766,47 +774,13 @@ struct RecoveredRefTable
 /// with the caller's other decisions. `chooseRecoveryGrounding` makes absent/Creating names non-recoverable
 /// and requires a readable `_ckpt` with `life_epoch` for Live/Removing.
 ///
-/// A stream LIST is only a snapshot-performance hint. The replay is exact point GETs from the selected
-/// base through inclusive `committed_through`; a missing checkpoint-named base or committed log is
-/// corruption under this immutable authority. In particular, this read-only API never probes or adopts
-/// `F+1`. Callers that still rely on the legacy LIST-only entry points must migrate explicitly; those
-/// compatibility shims are deleted once all consumers pass their frozen `RefPlan::catalogCut` rows.
+/// Recovery performs no stream `LIST`: its replay is exact point GETs from the checkpoint-named base
+/// through inclusive `committed_through`; a missing checkpoint-named base or committed log is corruption
+/// under this immutable authority. In particular, this read-only API never probes or adopts `F+1`. There
+/// is deliberately no self-resolving compatibility overload: every consumer must pass the row from its
+/// frozen catalog cut explicitly.
 RecoveredRefTable recoverRefTableDetailedFromAuthority(
     Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
-    const std::optional<RefCkpt> & ckpt, const std::function<void()> & on_page_fetched = {});
-
-/// Recover one table's state via the shared recovery equation:
-/// one `LIST` of the table prefix, the newest valid snapshot, and replay of the later log tail through the
-/// same state machine the writer uses. This is the read-only recovery `fsck`, offline repair, and GC's
-/// disaster-recovery rebuild all consume, so every consumer agrees on what a table's ref state is.
-/// Restart-on-vanish: a selected snapshot or tail body deleted between the `LIST` and its `GET` (a
-/// concurrent GC cleanup published a covering newer snapshot) is not corruption -- recovery restarts with a
-/// fresh `LIST`, bounded by `max_restarts`, after which the vanish becomes a `CORRUPTED_DATA` throw. A
-/// never-touched namespace yields the empty (never-born) state. Different bytes under a deterministic key,
-/// or an invalid body, are corruption and throw immediately.
-///
-/// `on_page_fetched`, if set, fires once per physical `backend.list` page across every restart attempt --
-/// a GC-owned caller's hook for a page-level ProfileEvents counter; fsck/offline-repair callers leave it
-/// unset.
-/// Temporary LIST-only migration shim. It is intentionally NOT an overload of the authoritative API above:
-/// callers must make their use of legacy self-resolution visible until the next migration deletes it.
-RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                                          const std::function<void()> & on_page_fetched = {},
-                                          unsigned max_restarts = 3);
-
-/// Same recovery walk with a life already resolved from the caller's immutable catalog cut. Recovery,
-/// REBUILD and listed-key tools use this overload to avoid a second catalog GET changing the join.
-RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                                          const std::function<void()> & on_page_fetched = {},
-                                          unsigned max_restarts = 3);
-
-/// Thin wrapper over `recoverRefTableDetailed` for the consumers that only need the replayed state
-/// (fsck, offline repair, the writer's own recovery-on-open, and the GC fold's owner-set builder).
-RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                              const std::function<void()> & on_page_fetched = {},
-                              unsigned max_restarts = 3);
-RefTableState recoverRefTable(Backend & backend, const Layout & layout, const NamespaceLifeId & life,
-                              const std::function<void()> & on_page_fetched = {},
-                              unsigned max_restarts = 3);
+    const std::optional<RefCkpt> & ckpt);
 
 }

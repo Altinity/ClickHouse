@@ -41,7 +41,7 @@ TEST(CasFormatBattery, FoldSeal)
     runFormatBattery({FormatId::FoldSeal,
         [&] { return sealObject(FormatId::FoldSeal, encodeFoldSeal(seal)); },
         [](std::string_view s) { decodeFoldSeal(std::string(openObject(FormatId::FoldSeal, s))); },
-        "{\"type\":\"cas_fold_seal\",\"v\":8}\n"
+        currentFormatHeader("cas_fold_seal") +
         "{\"g\":\"5\",\"pg\":\"4\"}\n"
         "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000000001\",\"cls\":2,\"lfe\":\"7\",\"lfs\":\"11\"}\n"
         "{\"k\":\"btr\",\"key\":\"r0\",\"ck\":\"0000000000000000000000000000000f\",\"shard\":0,\"gen\":\"5\"}\n"
@@ -290,8 +290,7 @@ TEST(CasFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
                 .next_retry_round = 8}},
         .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{9, 10}}});
 
-    const String expected =
-        "{\"type\":\"cas_fold_seal\",\"v\":8}\n"
+    const String expected = currentFormatHeader("cas_fold_seal") +
         "{\"g\":\"8\",\"pg\":\"7\"}\n"
         "{\"k\":\"rfl\",\"life\":\"00000000000000000000000000001234\",\"cls\":4,"
         "\"lfe\":\"3\",\"lfs\":\"4\",\"hr\":\"manifest_body_missing\",\"hpe\":\"5\","
