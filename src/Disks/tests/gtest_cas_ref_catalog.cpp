@@ -1425,6 +1425,10 @@ TEST(CasGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
     ASSERT_TRUE(unreadable);
     EXPECT_NE(unreadable->find(layout.refLogKey(row.life, RefTxnId{5, 6})), String::npos);
     EXPECT_NE(unreadable->find("is unreadable"), String::npos);
+    EXPECT_NE(unreadable->find("restore the exact object"), String::npos);
+    EXPECT_NE(unreadable->find("recreate the pool"), String::npos);
+    EXPECT_EQ(unreadable->find("REBUILD"), String::npos)
+        << "the diagnostic must not promise a command that cannot recover this exact object";
 }
 
 TEST(CasGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)

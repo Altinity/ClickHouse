@@ -212,7 +212,8 @@ std::optional<String> stuckRemovalWarning(
     if (hold && hold->reason == HoldReason::BodyUndecodable)
         return fmt::format(
             "CAS GC namespace removal is stuck: namespace='{}', life_id={}, removal_started_round={}, "
-            "current_round={}, age_rounds={}; cleanup evidence is absent because ref-log body '{}' is unreadable",
+            "current_round={}, age_rounds={}; cleanup evidence is absent because ref-log body '{}' is unreadable; "
+            "restore the exact object or recreate the pool",
             row.life.ns.string(), u128ToHex(row.life.incarnation), started, current_round, age,
             layout.refLogKey(row.life, hold->offending_position));
 

@@ -56,6 +56,7 @@ using namespace DB::Cas::tests;
 namespace ProfileEvents
 {
 extern const Event CasGcRefWalkPlansBuilt;
+extern const Event CasGcUnmatchedAdoptedParentLives;
 }
 
 namespace
@@ -1367,6 +1368,54 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
     EXPECT_TRUE(backend->head(ckpt_key).exists);
     EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
+}
+
+TEST(CasGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDeletion)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/unmatched-parent@cas@"};
+    const DB::UInt128 blob(0xcafe);
+    const ManifestRef mref = publish(*backend, layout, ns, "victim", 1, blob);
+    const ManifestId manifest_id{ns, mref};
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_TRUE(backend->head(layout.manifestKey(manifest_id)).exists);
+
+    const GcState before = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const String parent_seal_key = layout.foldSealKey(before.snap_generation, before.snap_attempt);
+    const auto parent_object = backend->get(parent_seal_key);
+    ASSERT_TRUE(parent_object);
+    CasFoldSeal parent = decodeFoldSeal(parent_object->bytes, before.snap_generation);
+    const UInt128 unmatched_life = hexToU128("fedcba98765432100123456789abcdef");
+    ASSERT_FALSE(parent.ref_lives.contains(unmatched_life));
+    parent.ref_lives.emplace(unmatched_life, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
+    ASSERT_EQ(
+        backend->putOverwrite(parent_seal_key, encodeFoldSeal(parent), parent_object->token).outcome,
+        PutOutcome::Done);
+
+    dropRefTransition(*backend, layout, ns, "victim", mref);
+    const uint64_t events_before =
+        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load();
+    const RoundReport report = runRegularRoundReclaiming(gc);
+
+    ASSERT_TRUE(report.acquired_lease);
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load() - events_before,
+        1u);
+    EXPECT_EQ(report.manifests_deleted, 1u)
+        << "an unmatched adopted-parent row is observed and dropped, not promoted to pool-wide suppression";
+    EXPECT_FALSE(backend->head(layout.manifestKey(manifest_id)).exists)
+        << "the valid manifest candidate must be physically deleted by the same authoritative round";
+
+    const GcState after = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal successor = decodeFoldSeal(
+        backend->get(layout.foldSealKey(after.snap_generation, after.snap_attempt))->bytes,
+        after.snap_generation);
+    EXPECT_FALSE(successor.ref_lives.contains(unmatched_life));
 }
 
 TEST(CatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
