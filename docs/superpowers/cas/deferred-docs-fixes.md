@@ -500,3 +500,85 @@ fences.
 
 `CasRefCkptFormat.h`: the reflow leaves a short ragged line ("...Writing the whole body is what makes a /
 stale field dangerous, and") that does not match the file's wrapping.
+
+## 2026-08-03 Stage-B midpoint audit — batched prose findings {#midpoint-audit-batch}
+
+From `docs/superpowers/cas/2026-08-02-stage-b-midpoint-audit.md`. Findings against the OLD plan and
+the handoff are closed wholesale by the supersession note (`f8df7d9a5e8`) and are not re-listed
+here. Two findings were fixed directly at batch time (the R1 closure note's two test-name
+citations); items with a named executor say so and are NOT to be fixed out of band.
+
+### D30 — Task 5 Files list names a file that never existed {#d30-phantom-removal-lifecycle-file}
+
+Old plan, Task 5 Files: `Create: src/Disks/tests/gtest_cas_ns_removal_lifecycle.cpp` — never
+created on any branch; the removal-lifecycle tests live in `gtest_cas_ref_catalog.cpp`
+(`CasRefCatalogRemoval`) and `gtest_cas_gc_frontier_gate.cpp`.
+
+**Fix:** none needed in the superseded plan; recorded so an inventory reader does not hunt for it.
+
+### D31 — `resolveLifeOrSentinel` doc comment describes callers it no longer has {#d31-resolvelife-doc-stale}
+
+`Pool/CasRefCatalog.h`: the doc says it serves "non-production discovery-path readers —
+`recoverRefTableDetailed`, fsck's exact stream walk, `CasOrphanManifestSweep`'s active-key set";
+none of those call it any more (all 17 callers are tests).
+
+**Executor: plan task T1c deletes the function entirely** — do not patch the comment separately.
+
+### D32 — Task 9 closure note: `mountpointObjectKey` attribution {#d32-mountpoint-attribution}
+
+`2026-08-02-r1-verbatim-file-aliasing-closure.md` says `Layout::mountpointObjectKey` maps the loose
+branch to `roots/<server_root_id>/<path>`; the `<server_root_id>/` qualifier is prepended by the
+caller (`ContentAddressedTransaction::writeFile`), not the Layout. The conclusion stands; the
+safety property is attributed to the wrong layer.
+
+**Fix:** one sentence naming the caller as the qualifier's source.
+
+### D33 — Task 9 closure note: RED-evidence provenance {#d33-r1-red-provenance}
+
+The note's RED-evidence sentence is sourced to the scratch report
+`.superpowers/sdd/2026-07-28-cas-ref-chain-stage-b-catalog/task6-ns-file-contract-report.md`
+(now-tracked history records it; the underlying ASan logs under `build_asan/` are the primary
+evidence). The record is genuine; the citation should point at the durable logs or the audit.
+
+**Fix:** cite the audit's corroboration (`{#report-t6}`) or the log paths.
+
+### D34 — stale TLA runner prose in three places {#d34-tla-runner-prose}
+
+(1) `models/2026-07-28-v9-phase-RESULTS.md` `{#fix-runners}` closing paragraph still says four
+models "have no runner at all"; (2) `models/README.md` summary table still shows `(inline TLC)`
+for those four rows; (3) `cas/06-tla-models.md` `{#running-models}` still describes the jar as
+"(v2.19)" and `run_tlc.sh`/`run_ackfloor.sh` as assert-nothing drivers.
+
+**Executor: plan task T7 lane B owns (1) and (2) as 10c closure content.** (3) is batch material:
+rewrite the section around the pinned-jar gate and the asserted suite runners.
+
+### D35 — `CaGcDestructiveGateCore` RESULTS overstate term coverage {#d35-destructive-gate-results}
+
+The correspondence section maps the production `frontier_complete` formula without disclosing that
+`UniverseAuthoritative` is pinned `TRUE`, uncontrolled, and false in production pre-flip.
+
+**Executor: plan task T7 (the 10f disclosure step)** — one sentence in RESULTS + one comment at the
+constant.
+
+### D36 — `Gc/CasGc.cpp` comments citing internal documents {#d36-gc-comment-citations}
+
+`frontier_complete`'s comment cites `2026-07-28-ref-rework-adjacent-findings.md {#r11-…}` by path;
+`ContentAddressedTransaction::writeFile` ends with "(directive §namespace-file-requirements)";
+`CasNamespaceLifeId.h` says "`Task 6` DELETES it". Reasons are good, citations are forbidden.
+
+**Executor: T1c deletes the `CasNamespaceLifeId.h` one with the constant; the rest belong to F2's
+sweep (T8 residual row item 5 records them).**
+
+### D37 — old-ledger foundation anchor mislabels a Task-5 commit {#d37-ledger-foundation-anchor}
+
+The (now closed) old ledger says foundation Tasks 0–4d run "through `d278d130024`", whose subject
+is a Task 5 commit; the Task-4d boundary is `6a3dd6a9245`.
+
+**Fix:** none — ledger closed; recorded for historians.
+
+### D38 — scratch report task6-ns-file-contract-report names a renamed test {#d38-scratch-test-name}
+
+The scratch report cites `StaleReaderAfterSameNameRebirthNeverSeesSuccessorBytes`; the committed
+test is `HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes` (renamed during landing). The R1
+closure note inherited the stale name — fixed at batch time; the scratch report itself stays as-is
+(scratch artifacts are not maintained).

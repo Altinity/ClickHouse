@@ -27,7 +27,7 @@ alternatives that the namespace-life amendment already decided.
 Task 4b commit `827bc0a9189` changed namespace-file APIs and keys from name-only identity to an exact
 `NamespaceLifeId`. Its tests establish both sides of the new contract:
 
-- `CasNsFileIncarnation.OldFileHiddenByListIsInvisibleAfterRebirth` leaves life 1's object
+- `CasNsFileIncarnation.ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval` leaves life 1's object
   physically present and hidden from `LIST`, admits life 2 under the same namespace name, and proves
   the life-1 bytes remain unreachable from life 2.
 - `CasNsFileIncarnation.RebirthDoesNotWaitForFilesToBeEmpty` leaves `_files` debris present while
@@ -56,7 +56,7 @@ steady namespace-file operations add no hot-path catalog request.
 Commits `4048163f0dd` and `3b952c6cbde` add the real disk-path contract suite
 `CasNamespaceFileReadContract.*`:
 
-- `StaleReaderAfterSameNameRebirthNeverSeesSuccessorBytes` seeds different same-name bytes in two
+- `HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes` seeds different same-name bytes in two
   lives and proves a stale life-1 reader returns only life-1 bytes or absence, never life-2 bytes.
 - `DelayedInlineFinalizeCannotChangeSuccessorTokenOrBytes` opens a real `CaInlineWriteBuffer` under
   life 1, makes life 2 live, then proves delayed finalization cannot change life 2's token or bytes
