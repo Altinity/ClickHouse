@@ -41,8 +41,16 @@ per commit; full CA gate at lane closures.
 
 ## Task states {#tasks}
 
-- T0 (bootstrap): NOT STARTED.
-- T1 (Task 6 remainder): NOT STARTED. MAIN.
+- T0 (bootstrap): **COMPLETE** (2026-08-03). Prose batch D30–D38 + R1-note citation fixes in
+  `5fbc13c629c`. Gate tooling verified AND hardened post-publication in `5c42d88cddd` (TEST_P
+  suites claimed — 276 suites/0 unclaimed vs the 273 that silently missed
+  `CasBackendContract`/`CasGcCompletedRemovalFenceRace`; runner exits nonzero on FAIL/ABORT;
+  explicit compile-guarded death-test list; shared `git-common-dir` gate lock; plan branch-switch
+  constraint scoped to MAIN; `kDefault`-comment instruction aligned with comment policy).
+  MAIN worktree preflight: pinned TLC jar installed at `tmp/tla2tools.jar`
+  (digest `cc4803dc…e516b3` verified; source: lane-g's `tmp/tla2tools-official.jar`). Preflight is
+  per-worktree state — repeat in any new model-lane session.
+- T1 (Task 6 remainder): NOT STARTED. MAIN — next up.
 - T2 (Task 6b remainder): NOT STARTED. LANE-G after T1 integration.
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
 - T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
