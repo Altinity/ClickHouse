@@ -1,0 +1,60 @@
+# SDD ledger — plan: docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md
+
+Published 2026-08-03 in one atomic publication commit (plan + midpoint audit + supersession note
+in the old plan + old-ledger close + this ledger + `utils/cas-gate/` tooling). Execution inputs
+are exactly: the plan, the design spec
+(`docs/superpowers/specs/2026-08-02-cas-stage-b-remaining-design.md`), the midpoint audit
+(evidence/provenance only), and this ledger. The old plan and the session handoff are historical
+provenance and are not loaded during execution.
+
+Execution mode: two worktrees per the plan's `{#two-worktrees}` map. MAIN
+(`/home/mfilimonov/workspace/ClickHouse/master`, `cas-gc-rebuild`) is the single production
+writer and sole committer to the branch; LANE-G (`/home/mfilimonov/workspace/ClickHouse/lane-g`)
+works on `laneg/<task>` temp branches handed back for integration, preserving its ~224 untracked
+investigation artifacts. Full CA gates/builds serialized across worktrees via
+`flock tmp/unit_tests.lock`; at most one praktika-or-soak run on the box. SDD mandatory for
+T1–T7: implementor → specification review → code-quality review → ordinary commit. Targeted tests
+per commit; full CA gate at lane closures.
+
+## Seeded baseline states (tree-verified at `ce312f547c3`, per the midpoint audit) {#baseline}
+
+- Old-plan Tasks 0–5b, 9, 10d/e/f/g: COMPLETE and verified. Do not re-dispatch.
+- Task 6: namespace-file half LANDED (APIs life-keyed; `namespaceFilesReadable` deleted in
+  `827bc0a9189`; delayed-writer life capture fixed + tested; 2 of 3 required tests committed;
+  zero-catalog pinned except the `list` arm). Ref side NOT STARTED (no held-life ref reads, no
+  ref contract tests; `resolveLifeOrSentinel`/`stageATransition` present, test-only).
+- Task 6b: rename LANDED at `9d92c84ee37` (one retry unit, not split). All four
+  ordering/poison/backoff tests MISSING.
+- Task 7: implementation PRESENT (`224aacd8eb9`, six focused tests; the three old residues fixed
+  in code). Closure evidence OPEN; retirement-fence arm (b) UNTESTED.
+- Task 8: model gate COMPLETE (`d34aa06d89f`); production slices PRESENT (`c3cc24c8152`,
+  `8f14bc119fe`, 11 direct tests). Closure OPEN: T-1/T-2/T-3 test findings, C-1 footgun, Q-1
+  decision execution, C++ mutation demonstrations, task gates.
+- Tasks 7a, 7b: NOT IMPLEMENTED (probe A fully live; `kDefault = StageA_Suppressed`;
+  `PENDING` double-count already fixed in `8e9b06c2a81`).
+- Task 10: 10a OPEN (no RESULTS file exists); 10b 8/9 (ninth = unstaged
+  `run_gc_partmanifest.sh` rewrite); 10c runners present, results artifact absent, three runners
+  unpinned; 10f `UniverseAuthoritative` disclosure owed.
+- Model-tool preflight owed in every model-lane session: `tmp/tla2tools.jar` in this worktree is
+  the WRONG jar (1.7.4); the pin is SHA-256
+  `cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`.
+
+## Task states {#tasks}
+
+- T0 (bootstrap): NOT STARTED.
+- T1 (Task 6 remainder): NOT STARTED. MAIN.
+- T2 (Task 6b remainder): NOT STARTED. LANE-G after T1 integration.
+- T3 (Task 7 closure): NOT STARTED. LANE-G.
+- T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
+- T5 (probe A deletion): NOT STARTED. MAIN after T3 integration.
+- T6a (frontier-attribution spike): NOT STARTED. LANE-G, immediately after T0.
+- T6 (destruction enablement): BLOCKED on T1 + T5 + T6a verdict. MAIN.
+- T7 (model lane): NOT STARTED. LANE-G. Lane A (10a → 10b ninth) strictly sequential; lane B
+  (10c) independent.
+- T8 (Stage B gates): early pieces may start anytime; battery/soaks BLOCKED on T1–T7. MAIN.
+- T9 (perf research): BLOCKED on T8. Stage B is COMPLETE only when T9's commit lands; T8 issues
+  the technical verdict.
+- F1/F2: follow-ups after T9, outside the Stage-B verdict.
+
+Historical-unrecoverable items (Task-1 minors verbatim list; NITs C–F) are recorded once in the
+midpoint audit `{#historical-unrecoverable}`; T8 performs no archaeology.

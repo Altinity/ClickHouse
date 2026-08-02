@@ -1,8 +1,14 @@
 # CAS ref catalog + incarnations — Stage B Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
-> (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking.
+> **SUPERSEDED (2026-08-03). DO NOT EXECUTE FROM THIS DOCUMENT.** Execution authority for all
+> remaining Stage-B work moved to `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md`,
+> which is self-contained: it restates every requirement still applicable to the remaining work,
+> corrected against the midpoint audit
+> (`docs/superpowers/cas/2026-08-02-stage-b-midpoint-audit.md`). This plan and the session
+> handoff need not be loaded or interpreted during execution; no normative requirement is
+> incorporated from here by reference. The sections below are requirements history — several are
+> known-stale (the audit records where), and following them would redo landed work or
+> mis-sequence the destruction flip.
 
 **Goal:** Make the namespace universe authoritative and rebirth-proof: the `ref_catalog`
 (INV-3) with ref-layer-scoped incarnations, the namespace lifecycles (§3), universe-from-catalog
