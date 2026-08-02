@@ -21,6 +21,7 @@ using namespace DB::Cas;
 namespace ProfileEvents
 {
     extern const Event CasGcUnmatchedAdoptedParentLives;
+    extern const Event CasGcStuckRemovals;
 }
 
 namespace DB::Cas::tests
@@ -52,6 +53,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int LIMIT_EXCEEDED;
     extern const int NETWORK_ERROR;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace
@@ -1357,6 +1359,7 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     const std::optional<RefCleanupEvidence> cleanup_evidence{
         RefCleanupEvidence{.remove_txn_id = RefTxnId{3, 3}}};
     EXPECT_EQ(ordinary.row(UInt128{3}).fold_state.cleanup_evidence, cleanup_evidence);
+    EXPECT_EQ(ordinary.row(UInt128{3}).removal_started_round, 8u);
     EXPECT_FALSE(ordinary.contains(UInt128{1}));
     EXPECT_FALSE(ordinary.contains(UInt128{4}));
 
@@ -1366,6 +1369,156 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_EQ(rebuild.row(UInt128{3}).tail_observation, (RefTxnId{3, 12}));
     EXPECT_FALSE(rebuild.contains(UInt128{1}));
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
+}
+
+TEST(CasGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
+{
+    const Layout layout("p");
+    RefWalkPlanRow row{
+        .life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"removing"}, UInt128{7}),
+        .fold_state = {},
+        .removal_started_round = 10,
+        .has_parent_fold_state = false,
+        .listed_hint = false,
+        .checkpoint_observation = std::nullopt,
+        .tail_observation = std::nullopt};
+
+    EXPECT_FALSE(stuckRemovalWarning(row, /*current_round=*/12, /*threshold_rounds=*/3, layout));
+    const auto at_threshold = stuckRemovalWarning(row, /*current_round=*/13, /*threshold_rounds=*/3, layout);
+    const auto next_round = stuckRemovalWarning(row, /*current_round=*/14, /*threshold_rounds=*/3, layout);
+    ASSERT_TRUE(at_threshold);
+    ASSERT_TRUE(next_round);
+    EXPECT_NE(at_threshold->find("age_rounds=3"), String::npos);
+    EXPECT_NE(next_round->find("age_rounds=4"), String::npos);
+
+    /// A fresh process given the same durable catalog row and adopted round produces the same signal.
+    EXPECT_EQ(stuckRemovalWarning(row, 13, 3, layout), at_threshold);
+
+    row.fold_state.cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}};
+    EXPECT_FALSE(stuckRemovalWarning(row, 100, 3, layout));
+}
+
+TEST(CasGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
+{
+    const Layout layout("p");
+    RefWalkPlanRow row{
+        .life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"removing"}, UInt128{7}),
+        .fold_state = {},
+        .removal_started_round = std::numeric_limits<uint64_t>::max(),
+        .has_parent_fold_state = false,
+        .listed_hint = false,
+        .checkpoint_observation = std::nullopt,
+        .tail_observation = std::nullopt};
+    EXPECT_FALSE(stuckRemovalWarning(row, 0, 1, layout));
+
+    row.removal_started_round = 1;
+    const auto absent = stuckRemovalWarning(row, 2, 1, layout);
+    ASSERT_TRUE(absent);
+    EXPECT_NE(absent->find("terminal has not folded"), String::npos);
+    EXPECT_EQ(absent->find("/_log/"), String::npos) << "an absent terminal has no exact id to name";
+
+    row.fold_state.coverage.classification = 4;
+    row.fold_state.coverage.hold = RefHold{
+        .reason = HoldReason::BodyUndecodable,
+        .offending_position = RefTxnId{5, 6}};
+    const auto unreadable = stuckRemovalWarning(row, 2, 1, layout);
+    ASSERT_TRUE(unreadable);
+    EXPECT_NE(unreadable->find(layout.refLogKey(row.life, RefTxnId{5, 6})), String::npos);
+    EXPECT_NE(unreadable->find("is unreadable"), String::npos);
+}
+
+TEST(CasGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
+{
+    DB::Cas::tests::CountingBackend backend;
+    const Layout layout("p");
+    const RefWalkPlanRow row{
+        .life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"removing"}, UInt128{7}),
+        .fold_state = {},
+        .removal_started_round = 1,
+        .has_parent_fold_state = false,
+        .listed_hint = false,
+        .checkpoint_observation = std::nullopt,
+        .tail_observation = std::nullopt};
+    const uint64_t puts_before = backend.putTotal();
+    const uint64_t cas_before = backend.casPutTotal();
+    EXPECT_TRUE(stuckRemovalWarning(row, 11, 10, layout));
+    EXPECT_EQ(backend.putTotal(), puts_before);
+    EXPECT_EQ(backend.casPutTotal(), cas_before);
+    EXPECT_EQ(backend.deleteTotal(), 0u);
+}
+
+TEST(CasGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .gc_stuck_removal_rounds = 10});
+    const Layout & layout = store->layout();
+    const UInt128 gc_id{99};
+    const UInt128 life_id{7};
+
+    const CatalogEntry removing{
+        .ns = RootNamespace{"removing"},
+        .state = NsState::Removing,
+        .incarnation = life_id,
+        .removal_started_round = 1};
+    const auto catalog = backend->get(layout.refCatalogKey());
+    ASSERT_TRUE(catalog);
+    ASSERT_EQ(backend->casPut(
+        layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}}), catalog->token).outcome,
+        CasOutcome::Committed);
+
+    CasFoldSeal seal;
+    seal.generation = 1;
+    seal.ref_lives.emplace(life_id, RefLifeFoldState{
+        .coverage = RefCoverage{
+            .classification = 4,
+            .hold = RefHold{
+                .reason = HoldReason::BodyUndecodable,
+                .offending_position = RefTxnId{5, 6},
+                .retry_count = 0,
+                .next_retry_round = 12}}});
+    seal.condemned_summary[0] = CondemnedSummary{};
+    ASSERT_EQ(backend->putIfAbsent(layout.foldSealKey(1, 1), encodeFoldSeal(seal)).outcome, PutOutcome::Done);
+
+    GcState state;
+    state.lease = GcLease{.owner = gc_id, .seq = 1};
+    state.round = 11;
+    state.gc_shards = 1;
+    state.snap_generation = 1;
+    state.snap_attempt = 1;
+    ASSERT_EQ(backend->putIfAbsent(layout.gcStateKey(), encodeGcState(state)).outcome, PutOutcome::Done);
+
+    const uint64_t signals_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcStuckRemovals].load();
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(removing.ns, life_id);
+    const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
+    const uint64_t append_puts_before = backend->putCount(unreadable_ref_log_key);
+    ScopedCasGcLogCapture log_capture;
+    Gc first_process(store, gc_id);
+    EXPECT_TRUE(first_process.runRegularRound().acquired_lease);
+    Gc restarted_process(store, gc_id);
+    EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcStuckRemovals].load() - signals_before, 2u);
+    EXPECT_EQ(backend->putCount(unreadable_ref_log_key), append_puts_before)
+        << "the diagnostic cannot append the unreadable ref log";
+    const String captured = log_capture.captured();
+    EXPECT_EQ(std::count(captured.begin(), captured.end(), '\n'), 2u);
+    EXPECT_NE(captured.find(unreadable_ref_log_key), String::npos);
+    EXPECT_NE(captured.find("is unreadable"), String::npos);
+}
+
+TEST(CasGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_root_id = "test",
+        .gc_stuck_removal_rounds = 0});
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
+        [&] { Gc gc(store, UInt128{1}); });
 }
 
 TEST(CasGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)

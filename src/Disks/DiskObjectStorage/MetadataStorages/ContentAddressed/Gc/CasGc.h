@@ -270,11 +270,19 @@ struct RefWalkPlanRow
 {
     NamespaceLifeId life;
     RefLifeFoldState fold_state;
+    std::optional<uint64_t> removal_started_round;
     bool has_parent_fold_state = false;
     bool listed_hint = false;
     std::optional<RefTxnId> checkpoint_observation;
     std::optional<RefTxnId> tail_observation;
 };
+
+/// Diagnostic-only classification of a catalog `Removing` life against the adopted round. Returns
+/// no value before the threshold, when terminal cleanup evidence exists, or for a non-removing row.
+/// It performs no I/O and changes no round decision.
+std::optional<String> stuckRemovalWarning(
+    const RefWalkPlanRow & row, uint64_t current_round, uint64_t threshold_rounds,
+    const Layout & layout);
 
 /// A frozen catalog-built row set. Enrichment is exposed only through exact lookup; there is no
 /// `operator[]`, insertion method, or mutable row map through which a hint, parent, hold, or checkpoint
@@ -511,6 +519,8 @@ private:
     /// transitions or the hot stream walk plan.
     void runNamespaceJanitorPage(
         const GcState & leased_state, bool suppress_destructive, uint64_t cleanup_evidence_rows);
+
+    void reportStuckRemovals(const RefPlan & plan, uint64_t current_round);
 
     /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),

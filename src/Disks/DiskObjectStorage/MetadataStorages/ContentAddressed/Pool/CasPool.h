@@ -106,6 +106,9 @@ struct PoolConfig
     /// Liveness bound for batching: force a FOLD after this many consecutive DEFER rounds even below
     /// the threshold. Inert at gc_fold_threshold == 1 (an idle defer has nothing to fold). Default 8.
     uint64_t gc_fold_max_defer_rounds = 8;
+    /// Diagnostic-only threshold for a `Removing` catalog life whose terminal cleanup evidence has
+    /// not appeared. Test/config struct seam only; no user-facing setting is registered.
+    uint64_t gc_stuck_removal_rounds = 10;
     /// Deterministic sampling cadence of the ref-prefix store-quality detector ("probe A",
     /// `Gc::sampleRefListQuality`): a folding round samples when `round % gc_probe_a_period == 0`.
     /// 0 disables the detector entirely.

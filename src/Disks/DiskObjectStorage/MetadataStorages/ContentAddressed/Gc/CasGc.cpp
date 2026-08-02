@@ -42,6 +42,7 @@ namespace ProfileEvents
     extern const Event CasGcEnumerationPages;
     extern const Event CasGcRefWalkPlansBuilt;
     extern const Event CasGcUnmatchedAdoptedParentLives;
+    extern const Event CasGcStuckRemovals;
     extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
@@ -196,6 +197,31 @@ size_t RefPlan::changedRows() const
     });
 }
 
+std::optional<String> stuckRemovalWarning(
+    const RefWalkPlanRow & row, uint64_t current_round, uint64_t threshold_rounds,
+    const Layout & layout)
+{
+    if (!row.removal_started_round || row.fold_state.cleanup_evidence)
+        return std::nullopt;
+    const uint64_t started = *row.removal_started_round;
+    if (current_round < started || current_round - started < threshold_rounds)
+        return std::nullopt;
+
+    const uint64_t age = current_round - started;
+    const std::optional<RefHold> & hold = row.fold_state.coverage.hold;
+    if (hold && hold->reason == HoldReason::BodyUndecodable)
+        return fmt::format(
+            "CAS GC namespace removal is stuck: namespace='{}', life_id={}, removal_started_round={}, "
+            "current_round={}, age_rounds={}; cleanup evidence is absent because ref-log body '{}' is unreadable",
+            row.life.ns.string(), u128ToHex(row.life.incarnation), started, current_round, age,
+            layout.refLogKey(row.life, hold->offending_position));
+
+    return fmt::format(
+        "CAS GC namespace removal is stuck: namespace='{}', life_id={}, removal_started_round={}, "
+        "current_round={}, age_rounds={}; cleanup evidence is absent because terminal has not folded",
+        row.life.ns.string(), u128ToHex(row.life.incarnation), started, current_round, age);
+}
+
 RefPlan buildRefWalkPlan(RoundInput && round_input)
 {
     ProfileEvents::increment(ProfileEvents::CasGcRefWalkPlansBuilt);
@@ -212,6 +238,7 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         plan.rows.emplace(entry.incarnation, RefWalkPlanRow{
             .life = NamespaceLifeId::fromCatalogEntry(entry.ns, entry.incarnation),
             .fold_state = {},
+            .removal_started_round = entry.removal_started_round,
             .has_parent_fold_state = false,
             .listed_hint = false,
             .checkpoint_observation = std::nullopt,
@@ -322,6 +349,9 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cas::Gc: store must not be null");
     if (gc_id == UInt128(0))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cas::Gc: gc_id must not be 0 (reserved for 'lease never held')");
+    if (store->poolConfig().gc_stuck_removal_rounds == 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Cas::Gc: gc_stuck_removal_rounds must be nonzero");
     if (!now_ms_fn)
         now_ms_fn = []() -> uint64_t
         {
@@ -587,6 +617,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         GcPhaseTimer t(phase_sink, "defer_decision");
         const bool graduation_due = graduationDue(state, new_round);
         walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)));
+        reportStuckRemovals(*walk_plan, state.round);
         const RefScanSummary & ref_scan = walk_plan->refScan();
         const size_t changed = walk_plan->changedRows();
         defer_round = shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
@@ -1187,6 +1218,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     return report;
+}
+
+void Gc::reportStuckRemovals(const RefPlan & plan, uint64_t current_round)
+{
+    for (const UInt128 & life_id : plan.lifeIds())
+    {
+        const auto warning = stuckRemovalWarning(
+            plan.row(life_id), current_round, store->poolConfig().gc_stuck_removal_rounds,
+            store->layout());
+        if (!warning)
+            continue;
+        ProfileEvents::increment(ProfileEvents::CasGcStuckRemovals);
+        LOG_WARNING(logger, "{}", *warning);
+    }
 }
 
 bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelta> & deltas,
