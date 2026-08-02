@@ -583,7 +583,9 @@ TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
 
 /// Control for the cleaned-cursor path: the exact immediately-next epoch head exists and names the
 /// deleted seal, so the tail is readable. Its `-1` protects the removed body while an unrelated eligible
-/// body proves the namespace was scanned rather than retained wholesale.
+/// body proves the namespace was scanned rather than retained wholesale. The checkpoint base is the
+/// following same-epoch transaction: recovery therefore has a retained exact anchor without turning the
+/// deliberately cleaned predecessor seal into part of that anchor's proof.
 TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochHead)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -603,12 +605,15 @@ TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     const ManifestRef removed{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
     writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 1},
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "removed", removed}, std::nullopt)}, cursor);
+    const ManifestRef absent_anchor{.writer_epoch = 1, .build_sequence = 7, .manifest_ordinal = 1};
+    writeTxnAt(*backend, store->layout(), ns, RefTxnId{3, 2},
+        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "absent-anchor", absent_anchor}, std::nullopt)});
     writeRefSnapshotRaw(*backend, store->layout(), RefTableSnapshot{
-        .ns = ns.string(), .snapshot_id = RefTxnId{3, 1}, .committed = {}, .precommits = {}});
+        .ns = ns.string(), .snapshot_id = RefTxnId{3, 2}, .committed = {}, .precommits = {}});
     ASSERT_EQ(backend->putIfAbsent(store->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
         .life_epoch = 1,
-        .committed_through = RefTxnId{3, 1},
-        .checkpoint_snapshot_id = RefTxnId{3, 1},
+        .committed_through = RefTxnId{3, 2},
+        .checkpoint_snapshot_id = RefTxnId{3, 2},
         .last_epoch_seal = cursor})).outcome, PutOutcome::Done);
 
     const ManifestRef unowned{.writer_epoch = 1, .build_sequence = 6, .manifest_ordinal = 1};
