@@ -470,8 +470,9 @@ invariant or property whose name contains a digit — but it still represented f
 risk. The current phase runners use `[A-Za-z0-9_]+`; the amended catalog and stale-janitor batteries
 and the new pre-fold battery were run after that correction.
 
-**Not changed, and why.** Nine runners are single-config drivers (`./run_X.sh <cfg>`) that assert
-nothing by construction — `run_ackfloor`, `run_ackfloor_zombie`, `run_condemnmarker`, `run_ebo`,
+**Historical scope boundary, now being closed.** Nine runners were single-config drivers
+(`./run_X.sh <cfg>`) that asserted nothing by construction — `run_ackfloor`,
+`run_ackfloor_zombie`, `run_condemnmarker`, `run_ebo`,
 `run_gc_partmanifest`, `run_relinkconfirm`, `run_retiredinrun`, `run_tlc`,
 `run_foldabort_witness`. They have no expectation table to strengthen; turning each into an asserted
 suite means authoring expectations for 123 more configs across nine models (47 in
@@ -484,6 +485,26 @@ Three further models have no runner at all (`CaGcLeaseCore`, `CaGcRoundDeferCore
 `CaGcShardIncarnationCore`) plus `CaB140DangleMerge`, whose four configs use an `m_*.cfg` prefix
 instead of the usual `<Model>_*.cfg` one (so a conventional glob misses them). Recorded as the
 follow-up, not silently skipped.
+
+#### First whole-suite conversion: condemn-marker gate {#condemn-marker-whole-suite}
+
+`run_condemnmarker.sh` is the first of those nine drivers converted to an asserted whole-suite
+runner. It keeps optional config selection for focused development, but selection cannot weaken the
+selected row's exact expectation. The sabotage runs first, each config has a private TLC metadir and
+log, and an unknown selector fails closed. The official pinned TLC jar produced:
+
+```text
+CONFIG       EXPECT      RESULT                           SECONDS  VERDICT
+bug          violation   violation:NoDangle               0        PASS
+fix          green       green                            1        PASS
+
+ALL EXPECTATIONS MET
+```
+
+The TDD red was the old driver's behavior on `CaGcCondemnMarkerGate_bug.cfg`: it merely forwarded
+TLC's nonzero exit and had no assertion that the counterexample was specifically `NoDangle`. The
+new runner exits zero only for the exact expected violation plus the green fixed model; a different
+invariant, TLC error, timeout, or missing config fails the suite.
 
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
