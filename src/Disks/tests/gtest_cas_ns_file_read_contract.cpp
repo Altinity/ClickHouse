@@ -9,9 +9,11 @@
 #include <IO/WriteHelpers.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <unistd.h>
 
 namespace DB::ContentAddressedSetting
 {
