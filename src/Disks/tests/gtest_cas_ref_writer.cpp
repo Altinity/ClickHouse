@@ -244,14 +244,14 @@ std::optional<RefTxnId> listGreatestLogIdForLifeForTest(
     }
 }
 
-struct RemovalReadyFixture
+struct CompletedRemovingFixture
 {
     CatalogEntry predecessor;
     uint64_t writer_epoch = 0;
     uint64_t runtime_identity = 0;
 };
 
-RemovalReadyFixture prepareResidentRemovalForDrain(
+CompletedRemovingFixture prepareResidentRemovalForDrain(
     const PoolPtr & store, Backend & backend, const RootNamespace & ns, Gc & gc)
 {
     publishWithProductionBirth(store, ns, "predecessor");
@@ -3908,7 +3908,7 @@ TEST(RefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResidentRu
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-erase-lost-response"};
     Gc gc(store, UInt128{101});
-    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
@@ -3949,7 +3949,7 @@ TEST(RefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredecesso
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-other-winner-replacement"};
     Gc gc(store, UInt128{102});
-    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
 
     const CatalogEntry replacement{
         .ns = ns,
@@ -3983,7 +3983,7 @@ TEST(RefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolutionRea
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-resolution-read-failure-lookup"};
     Gc gc(store, UInt128{103});
-    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;
@@ -4010,7 +4010,7 @@ TEST(RefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvalidat
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/removal-resolution-read-failure-post-list"};
     Gc gc(store, UInt128{104});
-    const RemovalReadyFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
+    const CompletedRemovingFixture ready = prepareResidentRemovalForDrain(store, *backend, ns, gc);
 
     backend->catalog_fault_key = layout.refCatalogKey();
     backend->catalog_cas_fault = RefWriterTestBackend::CatalogCasFault::CommitThenThrow;

@@ -48,9 +48,9 @@ const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 /// stay readable by exact key. Permanent (not nth-call) omission keeps GC's probe A quiet by its own
 /// stated limitation, so these tests exercise the intake walk and not the probe.
 
-/// The `RefCoverage` the newest fold seal recorded for `ns` (shard 0), or nullopt when the seal has
-/// no entry for it. Scans downward from the adopted generation for the most recent fold seal, mirroring
-/// `foldCursorOf`'s reasoning (a completed round's gc/state points at the recheck generation).
+/// The `RefCoverage` the newest fold seal recorded for `ns`'s opaque catalog life, or nullopt when the
+/// seal has no entry for it. Scans downward from the adopted generation for the most recent fold seal,
+/// mirroring `foldCursorOf`'s reasoning (a completed round's `gc/state` points at the recheck generation).
 std::optional<RefCoverage> coverageOf(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     const uint64_t gen = currentGenerationOf(backend, layout);

@@ -3844,7 +3844,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// DRY: the engine is the round's own bricks — one catalog cut for the universe,
     /// foldManifestEdges(+1) for edge emission, foldDeltasIntoGeneration with EMPTY priors
     /// (attempt-iterated for O(budget) memory), computeHeartbeatFloor for the round mint.
-    /// Writes ONLY the gc plane; never touches ref shards, manifests, or blobs; never deletes.
+    /// Writes ONLY the GC plane; namespace streams/state, manifests, and blobs are read-only inputs;
+    /// the rebuild never deletes them.
     RebuildReport rep;
     Backend & backend = store->backend();
     const Layout & layout = store->layout();

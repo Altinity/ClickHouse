@@ -4,6 +4,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -329,14 +330,27 @@ TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
 TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    constexpr uint64_t gc_shards = 2;
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = gc_shards});
     const RootNamespace ns{"00/aa@cas@"};
-    for (uint64_t i = 1; i <= 6; ++i)
+    constexpr uint64_t edge_budget = 2;
+    constexpr uint64_t refs_per_shard = edge_budget + 1;
+    std::vector<UInt128> blobs;
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
     {
-        writeBlobBody(*backend, store->layout(), DB::UInt128(i));
-        const ManifestRef r = ref(i, 0xA0 + i);
-        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("f", DB::UInt128(i))});
-        publishCommittedTransition(*backend, store->layout(), ns, "tbl_" + std::to_string(i), std::nullopt, r);
+        for (uint64_t i = 0; i < refs_per_shard; ++i)
+        {
+            const uint64_t sequence = blobs.size() + 1;
+            const UInt128 blob = (UInt128{shard + gc_shards * i} << 64) | UInt128{sequence};
+            ASSERT_EQ(blobShard(legacyMetaTestRef(blob), gc_shards), shard);
+            blobs.push_back(blob);
+            writeBlobBody(*backend, store->layout(), blob);
+            const ManifestRef r = ref(sequence, 0xA0 + sequence);
+            writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("f", blob)});
+            publishCommittedTransition(
+                *backend, store->layout(), ns, "tbl_" + std::to_string(sequence), std::nullopt, r);
+        }
     }
     Gc gc(store, kGc);
     gc.runRegularRound();
@@ -345,19 +359,46 @@ TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
     backend->deleteExact(store->layout().gcStateKey(), st.token);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000006"));
-    gc2.setRebuildEdgeBudgetForTest(2);   /// forces multiple attempt-iterated batches
+    /// Every shard has `edge_budget + 1` live edges, so each independently crosses the flush budget;
+    /// a test with only a pool-wide excess would not prove multiple batches for every non-empty shard.
+    gc2.setRebuildEdgeBudgetForTest(edge_budget);
     const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_EQ(rep.committed_refs, 6u);
+    EXPECT_EQ(rep.committed_refs, blobs.size());
+
+    /// Multiple rebuild flushes still converge to one authoritative row domain: no more than one
+    /// canonical seq-0 `btr` per shard and exactly one `cnd` per shard. These are the cardinalities the
+    /// catalog admission reservation over-covers independently of catalog-entry count.
+    const GcState rebuilt_state = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    const CasFoldSeal rebuilt_seal = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(
+            rebuilt_state.snap_generation, rebuilt_state.snap_attempt))->bytes,
+        store->layout(), gc_shards);
+    ASSERT_EQ(rebuilt_seal.condemned_summary.size(), gc_shards);
+    bool run_seen[gc_shards] = {false, false};
+    ASSERT_EQ(rebuilt_seal.blob_target_runs.size(), gc_shards);
+    for (const RunRef & run : rebuilt_seal.blob_target_runs)
+    {
+        ASSERT_LT(run.shard, gc_shards);
+        EXPECT_FALSE(run_seen[run.shard]);
+        run_seen[run.shard] = true;
+        const auto parsed = store->layout().parseBlobTargetRunKey(run.key);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(parsed->shard, run.shard);
+        EXPECT_EQ(parsed->generation, run.generation);
+        EXPECT_EQ(parsed->seq, 0u);
+    }
+    EXPECT_TRUE(run_seen[0]);
+    EXPECT_TRUE(run_seen[1]);
 
     for (int i = 0; i < 5; ++i)
     {
         gc2.runRegularRound();
         store->renewWatermarkOnce();
     }
-    for (uint64_t i = 1; i <= 6; ++i)
-        EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(i))})).exists)
-            << "blob " << i;
+    for (const UInt128 blob : blobs)
+        EXPECT_TRUE(backend->head(store->layout().blobKey(legacyMetaTestRef(blob))).exists)
+            << "blob " << u128ToHex(blob);
 }
 
 /// Trimmed-but-live (design delta 2): the precommit's journal evidence is gone (trim), the build

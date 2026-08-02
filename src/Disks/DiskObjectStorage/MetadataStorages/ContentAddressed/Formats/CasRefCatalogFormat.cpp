@@ -368,6 +368,8 @@ void checkFoldSealReservation(
     /// wrap to a remainder far smaller than the true reservation, which would answer "fits" for an
     /// `entry_count` that plainly does not.
     const uint64_t ref_lives = mulByteBudget(entry_count, worstCaseEntryFoldReservationBytes());
+    /// `validateFoldSealStructure` permits at most one canonical seq-0 `btr` per shard, so charging
+    /// one widest row for every shard covers the full legal run domain without per-entry arithmetic.
     const uint64_t blob_target_runs = mulByteBudget(
         gc_shards, widestBlobTargetRunReservationBytes(layout, gc_shards));
     const uint64_t condemned_summaries = mulByteBudget(

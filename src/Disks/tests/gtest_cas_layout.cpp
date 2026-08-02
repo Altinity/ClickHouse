@@ -145,6 +145,7 @@ TEST(CasLayout, GenerationAndRootsKeys)
     /// rev. 16: every per-round artifact is attempt-scoped under gc/gen/<gen>/attempt/<attempt>/.
     EXPECT_EQ(l.foldSealKey(12, 0), "p/gc/gen/12/attempt/0/fold_seal");
     EXPECT_EQ(l.blobTargetRunKey(12, 0, 0, 0), "p/gc/gen/12/attempt/0/blob_target/0/0");
+    EXPECT_EQ(l.namespaceRootPrefix(), "p/cas/ns/");
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
 }
 

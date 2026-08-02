@@ -847,7 +847,7 @@ inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     return inDegreeInRuns(backend, runsForShard(backend, layout, /*shard*/0), legacyMetaTestRef(hash));
 }
 
-/// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.
+/// Resolve the opaque life id that keys this namespace's single fold-coverage row.
 inline UInt128 catalogLifeIdForTest(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
 {

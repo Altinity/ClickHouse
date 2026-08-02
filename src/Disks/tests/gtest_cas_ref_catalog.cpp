@@ -630,7 +630,7 @@ TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
     EXPECT_EQ(encoded, encodeRefCatalog(candidate));
 }
 
-TEST(CasRefCatalogAdmission, ReservationCoversActualWidestRowsAcrossDecimalTransitions)
+TEST(CasRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimalTransitions)
 {
     const Layout layout("p/quoted-\"prefix");
     constexpr uint64_t gc_shards = 100;
@@ -656,6 +656,9 @@ TEST(CasRefCatalogAdmission, ReservationCoversActualWidestRowsAcrossDecimalTrans
         }
         for (uint64_t shard = 0; shard < gc_shards; ++shard)
         {
+            /// Predicate 2 charges exactly `gc_shards` widest `btr` rows. This fixture is the maximum
+            /// legal cardinality, not an optimistic producer convention: authoritative fold-seal
+            /// grammar permits at most one run per shard and requires its canonical key to use seq 0.
             seal.blob_target_runs.push_back(RunRef{
                 .key = layout.blobTargetRunKey(max, max, shard, 0),
                 .checksum = std::numeric_limits<UInt128>::max(),
@@ -666,6 +669,9 @@ TEST(CasRefCatalogAdmission, ReservationCoversActualWidestRowsAcrossDecimalTrans
                 .pending_total = max,
                 .oldest_nonpending_condemn_round = max});
         }
+
+        ASSERT_EQ(seal.blob_target_runs.size(), gc_shards);
+        EXPECT_NO_THROW(validateFoldSealForWrite(seal, layout, gc_shards));
 
         const uint64_t bound = foldSealFixedBytes()
             + entry_count * worstCaseEntryFoldReservationBytes()

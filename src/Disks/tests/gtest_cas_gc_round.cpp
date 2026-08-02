@@ -627,38 +627,45 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the blob is redeleted";
 }
 
-/// retired-in-snapshot T4: a pure ref-carry shard copies its parent seal's condemned_summary entry
-/// VERBATIM (totality is preserved across a carry round). With gc_shards == 2 and activity in only one
-/// shard, the OTHER shard is pure-carried every fold — its summary entry in the new seal must be the
-/// parent's, byte-for-byte.
-TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
+/// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
+/// non-vacuous with one live blob in each of two shards; the forced no-delta successor must preserve
+/// both `btr` rows and the total `cnd` domain byte-for-byte.
+TEST(CasGcRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_shards = 2});
+                   .gc_shards = 2, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
 
     Gc gc(store, kGc);
 
-    const ManifestRef r1 = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    const UInt128 shard0_blob{1};
+    const UInt128 shard1_blob = (UInt128{1} << 64) | UInt128{1};
+    ASSERT_EQ(blobShard(legacyMetaTestRef(shard0_blob), 2), 0u);
+    ASSERT_EQ(blobShard(legacyMetaTestRef(shard1_blob), 2), 1u);
+
+    const ManifestRef r0 = ref(1, 0xAA);
+    const ManifestRef r1 = ref(2, 0xBB);
+    writeBlobBody(*backend, store->layout(), shard0_blob);
+    writeBlobBody(*backend, store->layout(), shard1_blob);
+    writeManifestRaw(*backend, store->layout(), ns, r0, {blobEntryFor("a", shard0_blob)});
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("b", shard1_blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl0", std::nullopt, r0);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl1", std::nullopt, r1);
     gc.runRegularRound();
     const GcState st1 = readState(*backend, *store);
     const CasFoldSeal seal1 = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes,
+        store->layout(), /*gc_shards=*/2);
 
-    /// A second ref keeps the pool folding so the inactive shard is pure-carried again in the next fold.
-    const ManifestRef r2 = ref(2, 0xBB);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
-    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+    /// No state changes after the parent. The zero defer bound forces an actual fold rather than DEFER,
+    /// so every shard takes the production pure-carry path.
     gc.runRegularRound();
     const GcState st2 = readState(*backend, *store);
     const CasFoldSeal seal2 = decodeFoldSeal(
-        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes);
+        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes,
+        store->layout(), /*gc_shards=*/2);
 
     /// TOTALITY: both seals carry a summary entry for every gc-shard.
     ASSERT_EQ(seal1.condemned_summary.size(), 2u);
@@ -666,8 +673,40 @@ TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
     EXPECT_TRUE(seal1.condemned_summary.contains(0) && seal1.condemned_summary.contains(1));
     EXPECT_TRUE(seal2.condemned_summary.contains(0) && seal2.condemned_summary.contains(1));
 
+    /// Capacity reserves one widest `btr` row per shard. Pin the production pure-carry seal to the
+    /// authoritative grammar that makes that bound sufficient: at most one in-range canonical seq-0
+    /// run per shard, beside exactly one `cnd` row for every shard.
+    bool run_seen[2] = {false, false};
+    ASSERT_EQ(seal1.blob_target_runs.size(), 2u);
+    ASSERT_EQ(seal2.blob_target_runs.size(), 2u);
+    for (const RunRef & run : seal2.blob_target_runs)
+    {
+        ASSERT_LT(run.shard, 2u);
+        EXPECT_FALSE(run_seen[run.shard]);
+        run_seen[run.shard] = true;
+        const auto parsed = store->layout().parseBlobTargetRunKey(run.key);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(parsed->shard, run.shard);
+        EXPECT_EQ(parsed->generation, run.generation);
+        EXPECT_EQ(parsed->seq, 0u);
+    }
+    EXPECT_TRUE(run_seen[0]);
+    EXPECT_TRUE(run_seen[1]);
+    for (uint64_t shard = 0; shard < 2; ++shard)
+    {
+        const auto parent_run = std::find_if(
+            seal1.blob_target_runs.begin(), seal1.blob_target_runs.end(),
+            [shard](const RunRef & run) { return run.shard == shard; });
+        const auto carried_run = std::find_if(
+            seal2.blob_target_runs.begin(), seal2.blob_target_runs.end(),
+            [shard](const RunRef & run) { return run.shard == shard; });
+        ASSERT_NE(parent_run, seal1.blob_target_runs.end());
+        ASSERT_NE(carried_run, seal2.blob_target_runs.end());
+        EXPECT_EQ(*carried_run, *parent_run);
+    }
+
     /// VERBATIM CARRY: nothing was ever condemned, so every shard's summary is the zero entry, carried
-    /// unchanged from parent to child across the fold.
+    /// unchanged from parent to child across the fully idle fold.
     for (uint64_t shard = 0; shard < 2; ++shard)
     {
         EXPECT_EQ(seal2.condemned_summary.at(shard), seal1.condemned_summary.at(shard))
