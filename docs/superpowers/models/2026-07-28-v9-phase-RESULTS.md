@@ -566,6 +566,26 @@ empty_blobs        green       green                            1        PASS
 ALL EXPECTATIONS MET
 ```
 
+#### Fold-abort witness whole-suite conversion {#fold-abort-witness-whole-suite}
+
+`run_foldabort_witness.sh` now owns all seven add-only freshness configs. The pre-change no-argument
+probe was an interface-level red only: the single-config driver printed usage and did not start TLC.
+The semantic red evidence comes from the new sabotage rows themselves, each asserted by exact invariant
+name. With the official pinned jar and `TLC_WORKERS=auto`, the family gate produced:
+
+```text
+CONFIG                      EXPECT      RESULT                           SECONDS  VERDICT
+sab_attempt_reuse           violation   violation:INV_ONE_PASS           0        PASS
+sab_gc_clear_on_spare       violation   violation:INV_NO_LOSS            10       PASS
+sab_inmem_token             violation   violation:INV_NO_RETURN          3        PASS
+sab_no_pacing               violation   violation:INV_NO_LOSS            3        PASS
+sab_post_adoption_clear     violation   violation:INV_NO_LOSS            9        PASS
+base                        green       green                            164      PASS
+empty_blobs                 green       green                            1        PASS
+
+ALL EXPECTATIONS MET
+```
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
