@@ -98,7 +98,7 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
 
     const String json = caInspectToJson(layout, key, bytes, NamespaceLifeId::stageATransition(ns));
     EXPECT_EQ(json.find("payload"), String::npos) << json;
-    EXPECT_NE(json.find(R"("lifecycle":"Live")"), String::npos) << json;
+    EXPECT_EQ(json.find("lifecycle"), String::npos) << json;
     EXPECT_EQ(json.find("remove_txn_id"), String::npos) << json;
     EXPECT_NE(json.find(R"("published_at_ms":42)"), String::npos) << json;
 }

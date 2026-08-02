@@ -170,7 +170,6 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("object", jsonEscape("ref_snapshot"))
         .add("ns", jsonEscape(s.ns))
         .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
-        .add("lifecycle", jsonEscape("Live"))
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
         .str();
