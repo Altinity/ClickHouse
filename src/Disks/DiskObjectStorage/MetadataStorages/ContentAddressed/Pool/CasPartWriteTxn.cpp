@@ -118,8 +118,20 @@ PartWriteTxn::PartWriteTxn(PoolPtr store_, UInt128 build_id_,
 
 PartWriteTxn::~PartWriteTxn()
 {
-    /// Crash semantics: the PartWriteTxn dtor retires the build_seq so the GC watermark floor (minActive) can
-    /// advance even if neither publish nor abandon ran (idempotent — safe if already retired).
+    /// An attempted precommit whose terminal operation did not settle may still be a durable owner.
+    /// Transfer that exact cleanup duty to the mount and KEEP the build active: the next mutation of
+    /// this namespace first resolves the every-attempt wedge, then removes the owner if it exists, and
+    /// retires the sequence only after that same state observation proves the duty discharged. If the
+    /// process ends first, no false clean farewell is written and successor recovery seals the old
+    /// epoch before sweeping its stale precommit.
+    if (precommit_state == PrecommitState::Uncertain || precommit_state == PrecommitState::Durable)
+    {
+        store->enqueueWriterCleanupDuty(
+            precommit_target_ns, precommit_final_ref, precommit_manifest, build_seq);
+        return;
+    }
+
+    /// No owner duty remains: promotion/abandon settled it, or no precommit append was attempted.
     store->retireBuildSeq(build_seq);
 }
 

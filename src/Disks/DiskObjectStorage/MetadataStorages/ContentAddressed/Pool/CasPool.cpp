@@ -877,8 +877,9 @@ Pool::~Pool()
     /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded. It
     /// stays on `Pool` (mediating the mount↔ledger coupling), sequenced between the two mount-runtime
     /// teardown steps exactly as before.
-    const bool drained = ref_ledger.drainRefLanesForShutdown(
+    const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
         config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+    const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();
 
     /// 3. Retire the merged heartbeat: `finishTeardown` runs the keeper's terminal op on a clean drain
     /// (stamping the lease already-expired + folding in the watermark farewell so a SAME-server reopen
@@ -939,8 +940,9 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
 
     /// (5b) Drain the ref lanes (bounded by one attempt's budget + safety margin) to learn whether a clean
     /// farewell is EARNED — exactly the `~Pool` rule.
-    const bool drained = ref_ledger.drainRefLanesForShutdown(
+    const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
         config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+    const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();
 
     /// (3+5c) Retire the merged heartbeat: a clean-release farewell ONLY if the lanes provably drained,
     /// otherwise stop background renewal with NO terminal marker so the lease expires by observation (never
@@ -1236,6 +1238,124 @@ void Pool::renewWatermarkOnce()
 void Pool::retireBuildSeq(uint64_t seq)
 {
     mount_runtime.retireBuildSeq(seq);
+}
+
+void Pool::enqueueWriterCleanupDuty(
+    const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest, uint64_t build_seq) noexcept
+{
+    try
+    {
+        auto duty = std::make_shared<WriterCleanupDuty>(WriterCleanupDuty{
+            .ref_name = ref_name,
+            .manifest = manifest,
+            .build_seq = build_seq,
+        });
+        std::lock_guard lock(writer_cleanup_mutex);
+        writer_cleanup_queues[ns].pending.push_back(std::move(duty));
+        writer_cleanup_cv.notify_all();
+    }
+    catch (...)
+    {
+        /// The build deliberately remains active. Advancing `min_active` after losing the only cleanup
+        /// duty would make an uncertain owner grant look dead; pinning the floor until process exit is
+        /// the safe failure direction, and successor recovery handles the durable remnant.
+        writer_cleanup_queue_failed.store(true, std::memory_order_release);
+        try
+        {
+            tryLogCurrentException(
+                getLogger("CasPool"),
+                "CAS writer cleanup duty could not be queued; retaining the build in the active watermark");
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+            /// `noexcept` destructor path: the sticky bit above is the safety mechanism.
+        }
+    }
+}
+
+bool Pool::writerCleanupDutiesPending() const
+{
+    if (writer_cleanup_queue_failed.load(std::memory_order_acquire))
+        return true;
+    std::lock_guard lock(writer_cleanup_mutex);
+    return std::any_of(
+        writer_cleanup_queues.begin(), writer_cleanup_queues.end(),
+        [](const auto & item) { return !item.second.pending.empty(); });
+}
+
+void Pool::drainWriterCleanupDuties(const RootNamespace & ns)
+{
+    {
+        std::unique_lock lock(writer_cleanup_mutex);
+        writer_cleanup_cv.wait(lock, [&]
+        {
+            const auto it = writer_cleanup_queues.find(ns);
+            return it == writer_cleanup_queues.end() || !it->second.draining;
+        });
+
+        const auto it = writer_cleanup_queues.find(ns);
+        if (it == writer_cleanup_queues.end() || it->second.pending.empty())
+            return;
+        it->second.draining = true;
+    }
+
+    try
+    {
+        while (true)
+        {
+            std::shared_ptr<const WriterCleanupDuty> duty;
+            {
+                std::lock_guard lock(writer_cleanup_mutex);
+                const auto it = writer_cleanup_queues.find(ns);
+                chassert(it != writer_cleanup_queues.end() && it->second.draining);
+                if (it->second.pending.empty())
+                {
+                    writer_cleanup_queues.erase(it);
+                    writer_cleanup_cv.notify_all();
+                    return;
+                }
+                duty = it->second.pending.front();
+            }
+
+            ref_ledger.appendRefOps(
+                ns,
+                MutationScope::ref(duty->ref_name),
+                [ref_name = duty->ref_name, manifest = duty->manifest]
+                (const RefTableState & state) -> std::vector<RefOp>
+                {
+                    /// Absence is a conclusive settlement, not an error: the original uncertain grant
+                    /// was rejected, a promote atomically consumed it, or another exact owner-removal
+                    /// path already discharged it. Presence owes one exact removal.
+                    if (!state.getPrecommits().contains({ref_name, manifest}))
+                        return {};
+                    RefOp op;
+                    op.kind = RefOpKind::OwnerTransition;
+                    op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest};
+                    return {op};
+                },
+                RootMutationOrigin::Writer,
+                RootMutationKind::Abandon);
+
+            /// Removal/absence is now durable in the same state observation. Only now may the active
+            /// build floor advance beyond the manifest's build sequence.
+            retireBuildSeq(duty->build_seq);
+
+            std::lock_guard lock(writer_cleanup_mutex);
+            const auto it = writer_cleanup_queues.find(ns);
+            chassert(it != writer_cleanup_queues.end() && it->second.draining);
+            chassert(!it->second.pending.empty() && it->second.pending.front() == duty);
+            it->second.pending.pop_front();
+        }
+    }
+    catch (...)
+    {
+        std::lock_guard lock(writer_cleanup_mutex);
+        const auto it = writer_cleanup_queues.find(ns);
+        if (it != writer_cleanup_queues.end())
+            it->second.draining = false;
+        writer_cleanup_cv.notify_all();
+        throw;
+    }
 }
 
 PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
@@ -1571,6 +1691,7 @@ RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
 {
+    drainWriterCleanupDuties(ns);
     return ref_ledger.appendRefOps(ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
 }
 

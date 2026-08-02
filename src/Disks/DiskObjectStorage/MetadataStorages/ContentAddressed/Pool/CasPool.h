@@ -18,6 +18,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/ProfileEvents.h>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -453,6 +454,14 @@ public:
     /// PartWriteTxn-facing surface: a `PartWriteTxn` retires its own seq on finalize/abandon/dtor (previously reached
     /// via `friend class PartWriteTxn`, removed when the ref-ledger became a member component.
     void retireBuildSeq(uint64_t seq);
+
+    /// Transfer a destroyed transaction's unresolved precommit-release duty to the mount. The build
+    /// sequence remains active until a later mutation resolves the namespace's every-attempt wedge and
+    /// proves the exact precommit absent or appends its exact removal. `noexcept`: a transaction
+    /// destructor must fail closed by retaining the active build, never terminate while trying to
+    /// allocate queue bookkeeping.
+    void enqueueWriterCleanupDuty(
+        const RootNamespace & ns, const String & ref_name, const ManifestRef & manifest, uint64_t build_seq) noexcept;
 
     /// ---- read side ----
     /// `audit` defaults to `Emit` so every existing caller keeps emitting `RefResolve` unchanged; see
@@ -965,9 +974,35 @@ public:
     uint64_t refBaseSnapshotBytesForTest(const RootNamespace & ns) { return ref_ledger.refBaseSnapshotBytesForTest(ns); }
     uint64_t refTailBytesSinceSnapshotForTest(const RootNamespace & ns) { return ref_ledger.refTailBytesSinceSnapshotForTest(ns); }
 private:
+    struct WriterCleanupDuty
+    {
+        String ref_name;
+        ManifestRef manifest;
+        uint64_t build_seq = 0;
+    };
+
+    struct WriterCleanupQueue
+    {
+        std::deque<std::shared_ptr<const WriterCleanupDuty>> pending;
+        bool draining = false;
+    };
+
+    /// Drain `ns` before admitting its next ordinary mutation. Only one caller drains a namespace at a
+    /// time; concurrent callers wait so none can overtake a cleanup whose build still holds the active
+    /// watermark floor. The drain calls `ref_ledger` directly to avoid re-entering this Pool wrapper.
+    void drainWriterCleanupDuties(const RootNamespace & ns);
+    bool writerCleanupDutiesPending() const;
+
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    mutable std::mutex writer_cleanup_mutex;
+    std::condition_variable writer_cleanup_cv;
+    std::map<RootNamespace, WriterCleanupQueue> writer_cleanup_queues;
+    /// Sticky fail-close bit for the destructor's allocation-failure path. If a duty could not enter
+    /// the queue, no mount teardown may claim a clean farewell even though the guarded map is empty.
+    std::atomic<bool> writer_cleanup_queue_failed{false};
 
     /// CAS mixed-algo pools: monotone in-memory cache of `algos_used`, seeded from
     /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,
