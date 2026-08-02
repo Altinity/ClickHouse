@@ -107,13 +107,14 @@ PoolMeta decodePoolMeta(std::string_view data)
     /// An older pool predates a breaking ref-layer change this build cannot reconcile, so
     /// reject it before reading the metadata body. Writers always emit the current generation, while
     /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
-    /// Generation 8 is the latest recreate-only authority floor and subsumes the earlier stream floors.
-    if (header.v < kPoolGcShardsGeneration)
+    /// Generation 9 is the latest recreate-only authority floor and subsumes the earlier stream floors.
+    if (header.v < kCommittedRefFrontierGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool format {} predates generation-8 pool-authoritative gc_shards; recreate the pool. "
-            "This build requires the namespace-admission shard bound in _pool_meta "
+            "CAS pool format {} predates generation-9 exact _ckpt committed_through recovery frontier; recreate the pool. "
+            "This build requires the namespace-admission shard bound and exact recovery frontier "
+            "in the generation-9 format "
             "(generation {}+), and CAS is pre-release: there is no in-place migration.",
-            header.v, kPoolGcShardsGeneration);
+            header.v, kCommittedRefFrontierGeneration);
 
     const String body = readLine(in, traitsFor(FormatId::PoolMeta).line_cap, "pool meta");
     ReadBufferFromMemory body_in(body.data(), body.size());

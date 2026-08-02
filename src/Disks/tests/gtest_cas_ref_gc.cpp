@@ -196,13 +196,22 @@ RefCleanupFixture seedTwoCoveredLogs(
     DB::Cas::tests::casAdmitEntry(backend, layout, ns);
     const ManifestRef r1 = mref(1);
     const ManifestRef r2 = mref(2);
+    const ManifestRef r3 = mref(3);
     writeManifestRaw(backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
     writeManifestRaw(backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    writeManifestRaw(backend, layout, ns, r3, {blobEntryFor("c", DB::UInt128(3))});
     const uint64_t v1 = publishCommittedTransition(backend, layout, ns, "t1", std::nullopt, r1);
     const uint64_t v2 = publishCommittedTransition(backend, layout, ns, "t2", std::nullopt, r2);
+    const uint64_t v3 = publishCommittedTransition(backend, layout, ns, "t3", std::nullopt, r3);
     writeRefSnapshotRaw(backend, layout,
-        minimalLiveSnapshot(ns.string(), RefTxnId{1, v2},
-            {committedRow("t1", r1), committedRow("t2", r2)}));
+        minimalLiveSnapshot(ns.string(), RefTxnId{1, v3},
+            {committedRow("t1", r1), committedRow("t2", r2), committedRow("t3", r3)}));
+    replaceRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, v3},
+        .checkpoint_snapshot_id = RefTxnId{1, v3},
+        .last_epoch_seal = std::nullopt,
+    });
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     return {
         .first_log_key = layout.refLogKey(life, RefTxnId{1, v1}),
@@ -226,6 +235,10 @@ TEST(CasRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
         writeManifestRaw(*backend, layout, ns, mr, {blobEntryFor("data", DB::UInt128(i))});
         seedCommittedAt(*backend, layout, ns, /*seq*/ i, "t" + std::to_string(i), mr, /*birth*/ i == 1);
     }
+    writeRecoverableCkptForRawFixture(
+        *backend, layout, ns,
+        RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, N},
+                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     Gc gc(store, kGc);
     ASSERT_NO_THROW(gc.runRegularRound());
@@ -364,9 +377,9 @@ TEST(CasRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
         << "a losing generation commit must never delete a blob against an unadopted fold";
 }
 
-/// (6) Ref-object cleanup honors all three conditions: a `_log` is deleted only when a covering snapshot
-/// AND the durable cursor both cover it; an older `_snap` is deleted while the newest is kept.
-TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
+/// (6) Ref-object cleanup trusts only a checkpoint-named recovery triple: an older `_log` and `_snap`
+/// are deleted after the durable cursor reaches them, while that triple remains intact.
+TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -390,6 +403,12 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
         {committedRow("t1", r1), committedRow("t2", r2)});
     writeRefSnapshotRaw(*backend, layout, old_snap);
     writeRefSnapshotRaw(*backend, layout, new_snap);
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, v2},
+        .checkpoint_snapshot_id = RefTxnId{1, v2},
+        .last_epoch_seal = std::nullopt,
+    });
 
     const String log_v1_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v1});
     const String log_v2_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, v2});
@@ -402,18 +421,74 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);   /// folds v1,v2 (cursor -> v2) then cleans covered ref objects post-CAS
 
-    /// log v1: snapshot-covered (X=v2 >= v1) AND cursor-covered (durable cursor v2 >= v1) => DELETED.
+    /// The old log lies below both the durable cursor and the validated checkpoint base => DELETED.
     EXPECT_FALSE(backend->head(log_v1_key).exists)
-        << "a log covered by BOTH the newest snapshot and the durable cursor must be deleted";
-    /// log v2 (the frontier log): the coverage/cursor boundary is `<=`, not `<`, so the log for the
-    /// newest committed transition is deletable too once its own snapshot is durable -- only the
-    /// SNAPSHOT boundary is strict `<` (checked below). Unlike the newest snapshot, the newest log is
-    /// NOT specially retained.
-    EXPECT_FALSE(backend->head(log_v2_key).exists)
-        << "the log for the newest committed transition must also be deleted once it is snapshot- and cursor-covered";
-    /// the older snapshot (< newest) is deleted; the newest is retained.
+        << "a log below the checkpoint-named snapshot base and durable cursor must be deleted";
+    /// The same-id ordinary log is part of recovery's triple and must survive.
+    EXPECT_TRUE(backend->head(log_v2_key).exists)
+        << "the checkpoint-named non-seal log must survive with its snapshot";
+    /// The older snapshot is deleted; the checkpoint-named snapshot is retained.
     EXPECT_FALSE(backend->head(old_snap_key).exists) << "an older snapshot must be deleted";
-    EXPECT_TRUE(backend->head(new_snap_key).exists) << "the newest snapshot must be retained";
+    EXPECT_TRUE(backend->head(new_snap_key).exists) << "the checkpoint-named snapshot must be retained";
+}
+
+TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/cross-epoch-cleanup@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    const RefTxnId birth_id{1, 1};
+    const RefTxnId seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    const RefLogTxn birth{
+        .ns = ns.string(),
+        .txn_id = birth_id,
+        .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt};
+    RefOp seal_op;
+    seal_op.kind = RefOpKind::EpochSeal;
+    const RefLogTxn seal{
+        .ns = ns.string(),
+        .txn_id = seal_id,
+        .ops = {std::move(seal_op)},
+        .prev_epoch_seal = std::nullopt};
+    const RefLogTxn base{
+        .ns = ns.string(),
+        .txn_id = base_id,
+        .ops = {},
+        .prev_epoch_seal = seal_id};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    writeRefLogTxnRaw(*backend, layout, seal);
+    writeRefLogTxnRaw(*backend, layout, base);
+
+    RefTableState state;
+    applyRefLogTxn(state, birth);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    applyRefLogTxn(state, seal);
+    applyRefLogTxn(state, base);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = base_id,
+        .checkpoint_snapshot_id = base_id,
+        .last_epoch_seal = seal_id});
+
+    Gc gc(store, kGc);
+    runToFixpoint(store, gc);
+
+    EXPECT_TRUE(backend->head(layout.refLogKey(life, seal_id)).exists)
+        << "cleanup must retain the predecessor seal that proves the checkpoint base's epoch transition";
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(*backend, layout);
+    const auto entry = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
+        [&](const CatalogEntry & candidate) { return candidate.ns == ns; });
+    ASSERT_NE(entry, cut.catalog.entries.end());
+    const std::optional<CkptSample> checkpoint = readCkpt(*backend, layout, life);
+    ASSERT_TRUE(checkpoint);
+    EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(*backend, layout, *entry, checkpoint->ckpt));
 }
 
 TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
@@ -515,9 +590,15 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
     const uint64_t v1 = publishCommittedTransition(*backend, layout, ns, "t1", std::nullopt, r1);
     const uint64_t v2 = publishCommittedTransition(*backend, layout, ns, "t2", std::nullopt, r2);
-    /// A newest snapshot covering v2 so cleanup can delete the covered logs once folded.
+    /// A checkpoint-named snapshot base makes older listed objects eligible for cleanup once folded.
     writeRefSnapshotRaw(*backend, layout,
         minimalLiveSnapshot(ns.string(), RefTxnId{1, v2}, {committedRow("t1", r1), committedRow("t2", r2)}));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, v2},
+        .checkpoint_snapshot_id = RefTxnId{1, v2},
+        .last_epoch_seal = std::nullopt,
+    });
     (void)v1;
 
     Gc gc(store, kGc);
@@ -559,11 +640,20 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
     const uint64_t va1 = publishCommittedTransition(*backend, layout, ns_a, "t", std::nullopt, a1);
     const uint64_t va2 = publishCommittedTransition(*backend, layout, ns_a, "t", a1, a2);   /// replace a1 -> a2
     publishCommittedTransition(*backend, layout, ns_b, "t", std::nullopt, b1);
+    /// The semantic transition helper has already published the exact CTE for each life.
 
     /// The writer's compaction: a snapshot of ns_a covering its greatest log (va2), the same
     /// deterministic bytes the oracle recomputes.
-    const RefTableState sa = recoverRefTable(*backend, layout, ns_a);
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(*backend, layout);
+    const RefTableState sa = recoverRefTableDetailedAtCatalogCutForTest(*backend, layout, catalog_cut, ns_a).state;
     writeRefSnapshotRaw(*backend, layout, snapshotOf(sa, ns_a.string()));
+    const NamespaceLifeId life_a = store->namespaceLife(ns_a);
+    const CkptSample before_snapshot_publish = *readCkpt(*backend, layout, life_a);
+    RefCkpt after_snapshot_publish = before_snapshot_publish.ckpt;
+    after_snapshot_publish.checkpoint_snapshot_id = RefTxnId{1, va2};
+    ASSERT_EQ(backend->casPut(
+        layout.refCkptKey(life_a), encodeRefCkpt(after_snapshot_publish), before_snapshot_publish.token).outcome,
+        CasOutcome::Committed);
 
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
@@ -577,17 +667,11 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
 
-    /// Read-only consumers agree: fsck clean (no dangle) and ca-gc-dryrun empty. The snapshot oracle takes
-    /// its SKIP path here -- va1, a log covered by the retained va2 snapshot, was cleaned in this same run,
-    /// so the oracle cannot reconstruct the state AT va2 and returns without comparing (spec: a cleaned
-    /// covered log makes the oracle unavailable, not an error; `snapshot_oracle_checked` stays 0). The
-    /// `snapshot_oracle_mismatches == 0` below therefore holds trivially, NOT via an active byte-compare;
-    /// the positive byte-compare path (covered logs still surviving) is exercised by
-    /// `CasFsckSnapshotOracle.PublishedSnapshotMatchingReplayIsClean`.
+    /// Read-only consumers agree: fsck recovers through the exact checkpoint base and reports no dangle,
+    /// while ca-gc-dryrun has no pending content deletes. Covered LIST debris is not diagnostic authority.
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
     EXPECT_TRUE(gc.previewDeletes().empty()) << "ca-gc-dryrun equivalent: no pending content deletes";
 }
 
@@ -603,6 +687,7 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
     const ManifestRef r = mref(1);
     writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    /// The semantic transition helper has already published the exact CTE.
 
     /// Plant a malformed ref key under the ref prefix (a `_log` with a non-canonical id render).
     const NamespaceLifeId life = store->namespaceLife(ns);
@@ -707,6 +792,9 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
     /// and `decodeRefLogTxn` throws.
     const String garbage_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, dropped + 1});
     backend->putIfAbsent(garbage_key, "garbage-not-a-valid-reflog-body");
+    /// The corruption claims the next committed position. Advance only the durable frontier, not the
+    /// log body, so recovery must exact-GET and hold this malformed object instead of ignoring F+1.
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, dropped + 1});
 
     /// Eight rounds under the hold. Each one catches the hold internally and survives.
     for (int i = 0; i < 8; ++i)
@@ -745,13 +833,13 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 
     /// REPAIR is the release: a DECODABLE record at the offending position. The fold reads it, folds
     /// through it, seals a cursor above it -- and only then does the namespace stop being held and
-    /// destruction resume. `publishCommittedTransition` allocates the freed id, which is exactly the
-    /// position the hold names.
+    /// destruction resumes. The CTE already claims this position, so this must replace the repaired
+    /// body at its exact id rather than use the semantic wrapper, which would attempt a non-monotone
+    /// checkpoint advance.
     const ManifestRef r2 = mref(2);
     writeBlobBody(*backend, layout, DB::UInt128(2));
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
-    ASSERT_EQ(publishCommittedTransition(*backend, layout, ns, "tbl2", std::nullopt, r2), dropped + 1)
-        << "the repair must land ON the held position, not above it";
+    writeTxnAt(*backend, layout, ns, RefTxnId{1, dropped + 1}, publishCommittedOps("tbl2", r2));
 
     ASSERT_TRUE(runToFixpoint(store, gc) < 64u) << "the released namespace must converge";
     EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), dropped + 1) << "the walk folded through the hold";

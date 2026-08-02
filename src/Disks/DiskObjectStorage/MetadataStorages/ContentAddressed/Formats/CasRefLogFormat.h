@@ -25,7 +25,7 @@ namespace DB::Cas
 /// CRITICAL -- an unrecognized `!`-key fails closed with `UNKNOWN_FORMAT_VERSION` rather than being
 /// silently skipped, since dropping it would lose INV-2's chain evidence while still passing the
 /// structural grammar) chains to the transaction id of the seal that closed the PRECEDING epoch, and
-/// its own `writer_epoch` is strictly below the referencing transaction's. `prev_epoch_seal` is
+/// its own `writer_epoch` is exactly one below the referencing transaction's. `prev_epoch_seal` is
 /// required on exactly sequence 1 of every epoch above the namespace's genesis (`life_epoch`, the
 /// writer epoch of its `NamespaceBirth`) and forbidden elsewhere -- see
 /// `validateEpochSealGrammarStructural` and `validateEpochSealGrammarContextual`.
@@ -154,10 +154,11 @@ bool refLogTxnIsEpochSeal(const RefLogTxn & txn);
 
 /// The context-free half of the INV-2 seal grammar: a transaction carrying an `EpochSeal` op contains
 /// EXACTLY that one op, and `prev_epoch_seal`, when present, is well-formed (both `RefTxnId`
-/// components nonzero), appears ONLY at `txn_id.ref_sequence == 1`, and names a STRICTLY earlier
-/// epoch (`prev_epoch_seal->writer_epoch < txn_id.writer_epoch`) -- a self- or forward-pointer is
-/// rejected even though it cannot arise from `writeLogMeta`'s own writer, because Tasks 2/6 walk this
-/// pointer backwards over untrusted decoded bodies. Called by both `encodeRefLogTxn` and
+/// components nonzero), appears ONLY at `txn_id.ref_sequence == 1`, and names the IMMEDIATELY
+/// preceding epoch (`prev_epoch_seal->writer_epoch + 1 == txn_id.writer_epoch`) -- a self, forward,
+/// or skipping pointer is rejected even though it cannot arise from `writeLogMeta`'s own writer,
+/// because Tasks 2/6 walk this pointer backwards over untrusted decoded bodies. Called by both
+/// `encodeRefLogTxn` and
 /// `decodeRefLogTxn`, so a caller-built transaction and a decoded one are held to the identical rule.
 /// Throws CORRUPTED_DATA on violation. Does NOT check the required-iff rule -- that needs
 /// `life_epoch`, which the codec never sees; see `validateEpochSealGrammarContextual`.

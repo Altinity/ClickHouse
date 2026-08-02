@@ -31,7 +31,7 @@
 ///
 /// So the properties these tests pin are:
 ///   * a round folds through its round-start tail and no further, whatever lands meanwhile;
-///   * a namespace whose tail did not move folds NOTHING and pays exactly one exact probe;
+///   * a namespace whose tail did not move folds NOTHING and a matching CTE proves its carried cursor;
 ///   * a round where no tail moved is skipped outright by the existing defer machinery;
 ///   * stopping at the tail is NOT a frontier proof, so such a round destroys nothing;
 ///   * a manifest edge fold costs one GET and never a HEAD;
@@ -212,6 +212,12 @@ TEST(CasGcBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
     const RootNamespace ns{"00/hot@cas@"};
 
     publishRange(*backend, layout, ns, 1, planted);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, planted},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     backend->arm(&layout, ns, planted, appended_mid_round);
 
     Gc gc(store, kGc);
@@ -233,18 +239,18 @@ TEST(CasGcBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
     backend->disarm();
     const uint64_t total = backend->publishedThrough();
     ASSERT_GT(total, planted);
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, total});
     const std::map<String, UInt64> second = runRoundCapturingIntake(gc);
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, total}))
         << "the records that landed mid-round are folded by the round that lists them";
     EXPECT_EQ(metric(second, "tails_advanced"), 1u);
 }
 
-/// ===================== (b) A NAMESPACE WHOSE TAIL DID NOT MOVE FOLDS NOTHING =====================
+/// ===================== (b) A CTE-AUTHORIZED UNCHANGED NAMESPACE FOLDS NOTHING =====================
 ///
-/// Two namespaces; only one gets a new record. The unchanged one must fold NOTHING and cost exactly one
-/// ref-log read -- the exact probe at `cursor + 1`, which is its frontier proof and the reason it is
-/// read at all. Anything more than that one read is the round doing work for a namespace that has none.
-TEST(CasGcBoundedWalk, AnUnchangedNamespaceFoldsNothingAndPaysExactlyOneProbe)
+/// Two namespaces; only one gets a new record. The unchanged one must fold NOTHING. Its CTE already
+/// authorizes the sealed cursor as a frontier, so an exact probe at `cursor + 1` would be redundant.
+TEST(CasGcBoundedWalk, ACTEAuthorizedUnchangedNamespaceFoldsNothingWithoutAProbe)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -254,6 +260,18 @@ TEST(CasGcBoundedWalk, AnUnchangedNamespaceFoldsNothingAndPaysExactlyOneProbe)
 
     publishRange(*backend, layout, moved, 1, 2);
     publishRange(*backend, layout, still, 1, 2);
+    writeRecoverableCkptForRawFixture(*backend, layout, moved, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    writeRecoverableCkptForRawFixture(*backend, layout, still, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     runRoundCapturingIntake(gc);
@@ -262,14 +280,15 @@ TEST(CasGcBoundedWalk, AnUnchangedNamespaceFoldsNothingAndPaysExactlyOneProbe)
 
     /// Only `moved` advances.
     publishAt(*backend, layout, moved, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0x33));
+    advanceRecoverableCkptForRawFixture(*backend, layout, moved, RefTxnId{1, 3});
 
     backend->resetCounts();
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
 
-    EXPECT_EQ(refLogGetsFor(*backend, layout, still, 1, 8), 1u)
-        << "an unchanged namespace costs its one frontier probe and nothing else";
-    EXPECT_EQ(backend->getCount(layout.refLogKey(NamespaceLifeId::stageATransition(still), RefTxnId{1, 3})), 1u)
-        << "and that one read is at the arithmetic successor of its sealed cursor";
+    EXPECT_EQ(refLogGetsFor(*backend, layout, still, 1, 8), 0u)
+        << "the CTE already proves the unchanged namespace's sealed frontier";
+    EXPECT_EQ(backend->getCount(layout.refLogKey(NamespaceLifeId::stageATransition(still), RefTxnId{1, 3})), 0u)
+        << "a valid CTE needs no successor probe";
     EXPECT_EQ(metric(intake, "tails_unchanged"), 1u);
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
     EXPECT_EQ(metric(intake, "logs_applied"), 1u) << "only the one new record was folded, pool-wide";
@@ -292,6 +311,18 @@ TEST(CasGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
 
     publishRange(*backend, layout, a, 1, 2);
     publishRange(*backend, layout, b, 1, 2);
+    writeRecoverableCkptForRawFixture(*backend, layout, a, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    writeRecoverableCkptForRawFixture(*backend, layout, b, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     ASSERT_FALSE(runRoundCapturingIntake(gc).empty()) << "the seeding round must actually fold";
@@ -306,6 +337,7 @@ TEST(CasGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
 
     /// One append, in `a` only.
     publishAt(*backend, layout, a, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0xaa3));
+    advanceRecoverableCkptForRawFixture(*backend, layout, a, RefTxnId{1, 3});
 
     backend->resetCounts();
     const std::map<String, UInt64> woken = runRoundCapturingIntake(gc);
@@ -313,8 +345,8 @@ TEST(CasGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
     EXPECT_EQ(metric(woken, "tails_advanced"), 1u) << "the appended-to namespace is walked again";
     EXPECT_EQ(metric(woken, "tails_unchanged"), 1u) << "and only that one";
     EXPECT_EQ(cursorOf(*backend, layout, a), (RefTxnId{1, 3}));
-    EXPECT_EQ(refLogGetsFor(*backend, layout, b, 1, 8), 1u)
-        << "the still-quiet namespace pays its one probe and folds nothing";
+    EXPECT_EQ(refLogGetsFor(*backend, layout, b, 1, 8), 0u)
+        << "the still-quiet namespace's CTE proves its carried frontier without a probe";
 }
 
 /// ===================== (d) STOPPING AT THE TAIL IS NOT A FRONTIER PROOF =====================
@@ -323,13 +355,11 @@ TEST(CasGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
 /// default suppresses destruction for a reason unrelated to this change, so the same test on the default
 /// would pass whatever the frozen tail did to the proofs.
 ///
-/// A namespace with a record ABOVE its frozen tail was not walked to the end of its stream -- the walk
-/// read that record and declined to fold it -- so nothing was ever observed absent and nothing is
-/// proven. The round must destroy nothing, even though the blob's folded in-degree reached zero. The
-/// control arm is the same pool once the writer stops: there the probe DOES come back absent, the
-/// frontier is proven, and the blob is reclaimed -- without which the first arm would pass merely
-/// because nothing was reclaimable.
-TEST(CasGcBoundedWalk, AStopAtTheFrozenTailProvesNoFrontierAndTheRoundDestroysNothing)
+/// The CTE fixes the namespace's committed frontier at `{1,3}`. A raw record ABOVE that frontier was
+/// never committed, so it is neither a reason to extend the fold nor a reason to suppress destruction:
+/// LIST may observe it, but it cannot manufacture a later authoritative frontier. The dropped blob is
+/// therefore reclaimable after the normal condemn/graduation pipeline.
+TEST(CasGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruction)
 {
     auto backend = std::make_shared<ChasingWriterBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -360,20 +390,18 @@ TEST(CasGcBoundedWalk, AStopAtTheFrozenTailProvesNoFrontierAndTheRoundDestroysNo
     ASSERT_EQ(backend->publishedThrough(), 4u) << "the mid-round appender never fired";
     ASSERT_EQ(metric(intake, "tails_advanced"), 1u) << "the namespace must have been walked";
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3})) << "and folded exactly its frozen tail";
-    EXPECT_EQ(metric(intake, "frontier_proven"), 0u)
-        << "the walk stopped on a PRESENT record above the tail, so it observed no end of stream";
+    EXPECT_EQ(metric(intake, "frontier_proven"), 1u)
+        << "the CTE, not the raw record beyond it, fixes the namespace frontier";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 1u) << "it is still in the round's universe";
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "an unproven frontier must suppress every destructive decision of the round. Deleted:"
+    EXPECT_EQ(backend->deleteTotal(), 1u)
+        << "the committed frontier permits the round's immediate manifest cleanup. Deleted:"
         << deletedKeysMessage(*backend);
     EXPECT_TRUE(backend->head(layout.blobKey(legacyMetaTestRef(blob))).exists);
 
-    /// CONTROL: the writer stops. The probe now comes back absent, the frontier is proven, and the
-    /// reclamation that was suppressed above happens -- otherwise "suppressed" would be
-    /// indistinguishable from "broken".
+    /// The raw F+1 record remains outside the CTE; it cannot defer the normal destructive pipeline.
     backend->disarm();
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob, /*max_rounds*/ 8))
-        << "once the tail stands still the namespace must prove its frontier and the blob must go";
+        << "the committed frontier must permit reclamation despite the raw record above it";
 }
 
 /// A store that hides a namespace's records from every LIST does not lose them: the namespace goes
@@ -388,6 +416,12 @@ TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
     const RootNamespace ns{"00/liar@cas@"};
 
     publishRange(*backend, layout, ns, 1, 2);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     Gc gc(store, kGc);
     runRoundCapturingIntake(gc);
     ASSERT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
@@ -395,6 +429,7 @@ TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
     /// A third record lands and the store stops listing the namespace at the same moment: its listed
     /// tail is now nothing at all, while `{1, 3}` is durable and readable by exact key.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_3", 3, DB::UInt128(0x1a3));
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 3});
     backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
 
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
@@ -418,6 +453,12 @@ TEST(CasGcBoundedWalk, ManifestEdgeFoldsPayAGetAndNeverAHead)
 
     const uint64_t records = 3;
     publishRange(*backend, layout, ns, 1, records);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, records},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     backend->resetCounts();
     Gc gc(store, kGc);
@@ -446,6 +487,12 @@ TEST(CasGcBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
     const RootNamespace ns{"00/aa@cas@"};
 
     publishRange(*backend, layout, ns, 1, 3);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     const ManifestId gone{ns, ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1}};
     deleteManifestBody(*backend, layout, gone);
 
@@ -482,6 +529,18 @@ TEST(CasGcBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
 
     publishRange(*backend, layout, quiet, 1, 3);
     publishRange(*backend, layout, moved, 1, 1);
+    writeRecoverableCkptForRawFixture(*backend, layout, quiet, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    writeRecoverableCkptForRawFixture(*backend, layout, moved, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     runRoundCapturingIntake(gc);
@@ -493,6 +552,7 @@ TEST(CasGcBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
     /// A second round in which `quiet` folds nothing and `moved` does, so the round really does write a
     /// new seal that could have dropped the row.
     publishAt(*backend, layout, moved, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(0x22));
+    advanceRecoverableCkptForRawFixture(*backend, layout, moved, RefTxnId{1, 2});
     const std::map<String, UInt64> intake = runRoundCapturingIntake(gc);
     ASSERT_EQ(metric(intake, "tails_unchanged"), 1u) << "the fixture must actually exercise the quiet case";
 

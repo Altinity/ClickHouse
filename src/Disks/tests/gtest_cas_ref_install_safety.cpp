@@ -249,7 +249,7 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     /// Scoped to THIS namespace's ref log, so nothing else the part publish writes (the manifest, the
     /// pool's own metadata) can consume the single fault.
@@ -358,7 +358,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -413,7 +413,7 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -501,7 +501,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -637,7 +637,7 @@ TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     backend->fault_substr = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
@@ -659,7 +659,7 @@ TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -690,7 +690,7 @@ TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     backend->fault_substr = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::ForeignConflict;
@@ -717,7 +717,7 @@ TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     backend->fault_substr = store->layout().namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)) + "_log/";
     backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Definite;
@@ -749,7 +749,7 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -810,7 +810,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
@@ -892,7 +892,7 @@ TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
     /// Stage B (Task 4-C): pin `ns` to the Stage-A sentinel BEFORE its first real touch, so
     /// the fault injected below (computed from that same sentinel) lands on the key production
     /// actually writes to.
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     PartWriteInfo info;
     info.intended_namespace = ns;

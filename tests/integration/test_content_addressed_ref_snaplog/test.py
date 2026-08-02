@@ -103,11 +103,9 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
         _content_objects() > content_baseline
     ), "expected content objects to rise above baseline after inserts"
 
-    # Read-only consumers agree while data is present: fsck finds no missing objects (dangling) and the
-    # snapshot integrity oracle finds no divergence between any published snapshot and its log replay.
+    # Read-only fsck agrees while data is present: no authoritative ref names a missing object.
     live_fsck = _disks(node, "ca-fsck")
     assert "dangling=0" in live_fsck, live_fsck
-    assert "snapshot_oracle_mismatches=0" in live_fsck, live_fsck
 
     # (3) Rename one table: data must survive (its ref namespace and its logs/snapshots are unaffected).
     node.query("RENAME TABLE ref_t1 TO ref_t1_renamed")
@@ -190,10 +188,9 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
 
     # (6) Read-only consumers on the RETAINED pool. The two invariants below hold whether or not
     #     reclamation is suppressed, and they are the ones that matter: unreferenced content that GC has
-    #     not removed is retention, never a dangle, and never an oracle divergence.
+    #     not removed is retention, never a dangle.
     final_fsck = _disks(node, "ca-fsck")
     assert "dangling=0" in final_fsck, final_fsck
-    assert "snapshot_oracle_mismatches=0" in final_fsck, final_fsck
 
     #     `ca-gc-dryrun` must still RUN and answer. Its `preview_deletes` count is deliberately NOT
     #     pinned during Stage A: the preview describes the reclamation that suppression withholds, so

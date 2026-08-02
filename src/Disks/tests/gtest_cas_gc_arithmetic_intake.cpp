@@ -120,6 +120,12 @@ TEST(CasGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
     for (uint64_t i = 1; i <= 5; ++i)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 5},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 3}));
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 4}));
@@ -149,6 +155,12 @@ TEST(CasGcArithmeticIntake, WalkEndsAtFrontierWithoutHold)
     for (uint64_t i = 1; i <= 3; ++i)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -182,6 +194,12 @@ TEST(CasGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
     publishAt(*backend, layout, ns, RefTxnId{2, 2}, "ref_4", 4, DB::UInt128(4));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 3},
+    });
 
     /// The hint hides the seal AND the new epoch's first record: neither the epoch boundary nor its
     /// start may depend on the listing.
@@ -214,6 +232,12 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
     writeSealAt(*backend, layout, ns, RefTxnId{2, 1}, /*prev_epoch_seal=*/RefTxnId{1, 2});
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_2", 2, DB::UInt128(2),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{3, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{2, 1},
+    });
 
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1}));
 
@@ -233,10 +257,9 @@ TEST(CasGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
         << "the walk must cross TWICE, through a hidden epoch it can only reach by the seal chain";
     EXPECT_EQ(intake.at("logs_accounted"), intake.at("logs_applied"));
     EXPECT_EQ(intake.at("logs_applied"), 4u) << "two records and two seals, all applied";
-    /// One absent read per epoch left ({1,3} and {2,2}) plus the frontier at {3,2}. The two reads the
-    /// back-chain itself paid both HIT, so they are not here -- which is the point of the counter: it
-    /// is the 404s, not the crossings.
-    EXPECT_EQ(intake.at("absent_probes"), 3u);
+    /// The checkpoint names the complete, authoritative frontier, so the bounded walk has no absent
+    /// probes to perform. The hidden epoch remains reachable only through the seal chain.
+    EXPECT_EQ(intake.at("absent_probes"), 0u);
 }
 
 /// A round that ends ON a seal (nothing above it yet) leaves the cursor there. The NEXT round must
@@ -251,6 +274,12 @@ TEST(CasGcArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -258,6 +287,7 @@ TEST(CasGcArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
 
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_2", 2, DB::UInt128(2),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{2, 1});
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{2, 1}));
@@ -284,6 +314,12 @@ TEST(CasGcArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClassificationFour)
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     /// {1,3} is never written -- the record that vanished.
     publishAt(*backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 4},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -306,17 +342,26 @@ TEST(CasGcArithmeticIntake, UnconsumedSealCrossingHoldsNamespace)
     const RootNamespace ns{"00/aa@cas@"};
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
-    /// Epoch 1 continues at {1,2} and is sealed at {1,3} -- but {1,2} was lost, so the seal is
-    /// unreachable and epoch 2's records sit above an unconsumed boundary.
-    writeSealAt(*backend, layout, ns, RefTxnId{1, 3});
+    /// Epoch 1's missing `{1,2}` seal is the exact position epoch 2 claims to chain from. With no
+    /// same-epoch witness above it, the later epoch is the only witness and the crossing must hold.
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_2", 2, DB::UInt128(2),
-              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
+              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
     EXPECT_EQ(classificationOf(*backend, layout, ns), 4);
+    const auto coverage = coverageOf(*backend, layout, ns);
+    ASSERT_TRUE(coverage && coverage->hold.has_value());
+    EXPECT_EQ(coverage->hold->reason, HoldReason::UnconsumedSealCrossing);
+    EXPECT_EQ(coverage->hold->offending_position, (RefTxnId{1, 2}));
     EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 0);
 }
 
@@ -338,6 +383,12 @@ TEST(CasGcArithmeticIntake, CrossingFromANonSealRecordIsRefusedEvenWhenTheChainM
     /// `{1,2}` is an ordinary published record, NOT an `EpochSeal` -- and epoch 2 chains to it anyway.
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -392,6 +443,12 @@ TEST(CasGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
     /// leads back to `{2,1}` every time, which is the spin.
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{3, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{2, 1},
+    });
 
     /// Arm only after seeding, so the fixture's own writes are undisturbed and the read counter starts
     /// at the round's first read of this key (`crossFromSeal`'s, which must succeed).
@@ -427,10 +484,22 @@ TEST(CasGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
 
     publishAt(*backend, layout, ns_a, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns_a), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    writeRecoverableCkptForRawFixture(*backend, layout, ns_a, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     publishAt(*backend, layout, ns_b, RefTxnId{1, 1}, "ref_1", 11, DB::UInt128(11), /*birth=*/true);
     publishAt(*backend, layout, ns_b, RefTxnId{1, 2}, "ref_2", 12, DB::UInt128(12));
     writeSealAt(*backend, layout, ns_b, RefTxnId{1, 3});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns_b, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 3},
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -467,6 +536,12 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
     publishAt(*backend, layout, ns, RefTxnId{2, 2}, "ref_4", 4, DB::UInt128(4));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 3},
+    });
 
     backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}));
 
@@ -480,18 +555,10 @@ TEST(CasGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
     EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{2, 2}));
 }
 
-/// A namespace the hint omits ENTIRELY is not FOLDED this round (its whole log is hidden, so the walk
-/// reads nothing new). What must hold is that nothing is damaged by the omission: when the hint shows it
-/// again, the fold resumes and every record's edge is accounted for exactly once.
-/// (Carrying an unhinted namespace's cursor verbatim, and paying it an exact frontier probe, is the
-/// destructive-round frontier proof -- a later task.)
-///
-/// Stage B (Task 4-C): the round still VISITS the namespace and records an `unchanged` coverage row for
-/// it -- discovery is now catalog-authoritative, so a `Live` entry stays in the universe regardless of
-/// what the LIST hides. That is the point of the change: a namespace can no longer be omitted from the
-/// round just by a lying LIST (`CasListLiarEndToEnd`'s whole premise). This test used to pin the OLD,
-/// LIST-driven "not in the universe at all" behaviour; it now pins the coverage row's shape instead.
-TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
+/// A namespace the hint omits ENTIRELY still folds through the checkpoint's authoritative frontier.
+/// Every log key remains readable by exact key, and the cursor reaches `{1,3}` despite the empty hint.
+/// When the hint reappears, it changes neither the cursor nor the owner edges.
+TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheckpoint)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -501,6 +568,12 @@ TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
     for (uint64_t i = 1; i <= 3; ++i)
         publishAt(*backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     for (uint64_t i = 1; i <= 3; ++i)
         backend->hide(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, i}));
 
@@ -509,10 +582,10 @@ TEST(CasGcArithmeticIntake, WhollyOmittedNamespaceFoldsCorrectlyOnceHintReturns)
     const auto hidden_cov = coverageOf(*backend, layout, ns);
     ASSERT_TRUE(hidden_cov.has_value())
         << "the namespace is `Live` in the catalog, so it stays in the universe even fully hidden";
-    EXPECT_EQ(hidden_cov->classification, 1) << "nothing was folded, so the row is `unchanged`";
-    EXPECT_EQ(hidden_cov->last_folded_ref_id, (RefTxnId{}));
+    EXPECT_EQ(hidden_cov->classification, 2) << "the checkpoint's frontier is folded by exact key";
+    EXPECT_EQ(hidden_cov->last_folded_ref_id, (RefTxnId{1, 3}));
 
-    /// The store stops lying: the namespace reappears and folds in full.
+    /// The store stops lying: the already folded namespace reappears.
     backend->revealAll();
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 

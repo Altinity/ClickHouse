@@ -377,6 +377,10 @@ TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
     writeBlobBody(*backend, store->layout(), blob);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    replaceRecoverableCkptForRawFixture(
+        *backend, store->layout(), ns,
+        RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, 1},
+                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
 
     Gc gc(store, kGc);
     gc.runRegularRound();
@@ -430,6 +434,7 @@ TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
     const uint64_t log_seq = appendRefLogSeed(*backend, store->layout(), ns,
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
          ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+    advanceRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefTxnId{1, log_seq});
 
     const RoundReport clamp_report = gc.runRegularRound();
     EXPECT_TRUE(clamp_report.hasAnomaly(ns, /*shard*/0)) << "the missing B body must clamp this log";
@@ -501,9 +506,10 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
     /// missing B body clamps the log AFTER A's `-1` folded.
     writeManifestRaw(*backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(2))});
     deleteManifestBody(*backend, store->layout(), ManifestId{ns, b});
-    appendRefLogSeed(*backend, store->layout(), ns,
+    const uint64_t log_seq = appendRefLogSeed(*backend, store->layout(), ns,
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
          ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+    advanceRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefTxnId{1, log_seq});
 
     const RoundReport rep = gc.runRegularRound();
     ASSERT_TRUE(rep.hasAnomaly(ns, /*shard*/0)) << "the missing B body must clamp this round";
@@ -543,11 +549,13 @@ TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     /// 7 has no lifecycle-specific cleanup pass: terminal folding records evidence, while these bytes
     /// remain inert work for the perpetual janitor and orphan-manifest sweep.
     const RootNamespace ns_removed{"00/cc@cas@"};
-    {
-        RefOp remove_op;
-        remove_op.kind = RefOpKind::RemoveNamespace;
-        appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
-    }
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    const uint64_t removal_log_seq = appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
+    writeRecoverableCkptForRawFixture(
+        *backend, layout, ns_removed,
+        RefCkpt{.life_epoch = 1, .committed_through = RefTxnId{1, removal_log_seq},
+                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt});
     /// Keyed at the life the CATALOG names for this namespace (`appendRefLogSeed` admitted it above),
     /// which is the physical life that owns the eventual janitor work. Spelling the sentinel here instead
     /// would plant debris under the wrong life and make the retention assertion vacuous.
@@ -559,8 +567,8 @@ TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     writeManifestRaw(*backend, layout, ns_removed, removed_body, {blobEntryFor("r", DB::UInt128(9))});
     const String debris_manifest_key = layout.manifestKey(ManifestId{ns_removed, removed_body});
 
-    /// Namespace 3: a live table with a log covered by a durable snapshot -- exactly what a clamp-free
-    /// round's `cleanupRefObjects` would delete (mirrors `CasRefGc.RefObjectCleanupHonorsAllThreeConditions`).
+    /// Namespace 3: a live table with an exact checkpoint-named recovery triple -- exactly what a
+    /// clamp-free round's `cleanupRefObjects` may clean below that base.
     const RootNamespace ns_covered{"00/dd@cas@"};
     const ManifestRef c1 = ref("srv-c:1", 1, 0xCC);
     const ManifestRef c2 = ref("srv-c:2", 2, 0xDD);
@@ -570,15 +578,22 @@ TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJa
     const uint64_t cv2 = publishCommittedTransition(*backend, layout, ns_covered, "t2", std::nullopt, c2);
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns_covered.string(), RefTxnId{1, cv2},
         {committedRow("t1", c1), committedRow("t2", c2)}));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns_covered, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, cv2},
+        .checkpoint_snapshot_id = RefTxnId{1, cv2},
+        .last_epoch_seal = std::nullopt,
+    });
     const String covered_log_key = layout.refLogKey(NamespaceLifeId::stageATransition(ns_covered), RefTxnId{1, cv1});
     ASSERT_TRUE(backend->head(covered_log_key).exists);
 
     /// Trigger the clamp in ns_clamp: drop committed A, add precommit B whose body is absent.
     writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
     deleteManifestBody(*backend, layout, ManifestId{ns_clamp, b});
-    appendRefLogSeed(*backend, layout, ns_clamp,
+    const uint64_t clamp_log_seq = appendRefLogSeed(*backend, layout, ns_clamp,
         {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
          ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns_clamp, RefTxnId{1, clamp_log_seq});
 
     const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(rep.hasAnomaly(ns_clamp, /*shard*/0)) << "the missing B body must clamp this round";

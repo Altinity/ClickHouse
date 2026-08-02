@@ -74,7 +74,7 @@ constexpr uint64_t U64_MAX = std::numeric_limits<uint64_t>::max();
 /// Constraint 15's bound, as a number: the encoded size of the WIDEST `_ckpt` this build can produce
 /// (all three fields present, every integer component at `UINT64_MAX`). Pinned as a literal so that
 /// adding a field, or widening one, fails a test rather than quietly moving the bound.
-constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 176;
+constexpr size_t CKPT_WORST_CASE_ENCODED_BYTES = 234;
 
 /// The high-cardinality side of the size fence, in ONE transaction. Bounded above by the append lane's
 /// 5000-operation cap on a normal-class item (`publishCommittedOps` emits two ops per ref), and kept at
@@ -237,6 +237,41 @@ TEST(CasRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
     const std::optional<RefTxnId> b_checkpoint = RefTxnId{9, 4};
     EXPECT_EQ(mergeCkpt(a, b).checkpoint_snapshot_id, b_checkpoint)
         << "an equal life_epoch must not disturb the other fields' own join";
+}
+
+TEST(CasRefCkptJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
+{
+    const RefCkpt older{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
+                         .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt transitioned{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},
+                                .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 1}};
+    EXPECT_EQ(mergeCkpt(older, transitioned).committed_through, transitioned.committed_through);
+    EXPECT_EQ(mergeCkpt(transitioned, older).committed_through, transitioned.committed_through);
+
+    /// Every committed epoch is materialized. A later frontier may advance only to the immediately
+    /// following numeric writer epoch, otherwise a missing epoch would be mistaken for a proved
+    /// boundary. The log grammar rejects this same skip at the record boundary; `_ckpt` must not
+    /// reintroduce it through its semantic merge.
+    const RefCkpt skipped_epoch{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
+                                    .checkpoint_snapshot_id = std::nullopt,
+                                    .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_THROW(mergeCkpt(older, skipped_epoch), DB::Exception);
+
+    const RefCkpt advanced{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
+                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_EQ(mergeCkpt(advanced, older).committed_through, advanced.committed_through);
+
+    const RefCkpt unsealed{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 1},
+                           .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    EXPECT_THROW(mergeCkpt(older, unsealed), DB::Exception);
+    const RefCkpt stale_prior_seal{.life_epoch = std::nullopt, .committed_through = RefTxnId{10, 1},
+                                   .checkpoint_snapshot_id = std::nullopt,
+                                   .last_epoch_seal = RefTxnId{7, 8}};
+    EXPECT_THROW(mergeCkpt(older, stale_prior_seal), DB::Exception)
+        << "a seal below the lower durable frontier does not connect the two histories";
+    const RefCkpt seal_above_frontier{.life_epoch = std::nullopt, .committed_through = RefTxnId{8, 5},
+                                      .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{8, 6}};
+    EXPECT_THROW(mergeCkpt(older, seal_above_frontier), DB::Exception);
 }
 
 /// THE FIRST OF THE TWO SEQUENCES THAT RAISE `life_epoch` HONESTLY, end to end through the production
@@ -476,6 +511,7 @@ TEST(CasRefCkptJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsAndEpoc
     /// the widest value its type can hold. No real `_ckpt` can encode larger, because there is no field
     /// that is not one of these five integers.
     const RefCkpt worst{.life_epoch = U64_MAX,
+                        .committed_through = RefTxnId{U64_MAX, U64_MAX},
                         .checkpoint_snapshot_id = RefTxnId{U64_MAX, U64_MAX},
                         .last_epoch_seal = RefTxnId{U64_MAX, U64_MAX}};
     const size_t worst_bytes = encodeRefCkpt(worst).size();
@@ -488,9 +524,9 @@ TEST(CasRefCkptJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsAndEpoc
 
     /// The growth term is the decimal width, and it is bounded by that ceiling rather than proportional
     /// to the number of transactions: four orders of magnitude of `ref_sequence` cost four bytes.
-    const RefCkpt at_sequence_1{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = RefTxnId{1, 1}};
-    const RefCkpt at_sequence_10k{.life_epoch = 1, .checkpoint_snapshot_id = RefTxnId{1, 10000}, .last_epoch_seal = RefTxnId{1, 10000}};
-    EXPECT_EQ(encodeRefCkpt(at_sequence_10k).size(), encodeRefCkpt(at_sequence_1).size() + 8);
+    const RefCkpt at_sequence_1{.life_epoch = 1, .committed_through = RefTxnId{1, 1}, .checkpoint_snapshot_id = RefTxnId{1, 1}, .last_epoch_seal = RefTxnId{1, 1}};
+    const RefCkpt at_sequence_10k{.life_epoch = 1, .committed_through = RefTxnId{1, 10000}, .checkpoint_snapshot_id = RefTxnId{1, 10000}, .last_epoch_seal = RefTxnId{1, 10000}};
+    EXPECT_EQ(encodeRefCkpt(at_sequence_10k).size(), encodeRefCkpt(at_sequence_1).size() + 12);
     EXPECT_LE(encodeRefCkpt(at_sequence_10k).size(), worst_bytes);
     EXPECT_LE(encodeRefCkpt(at_sequence_1).size(), worst_bytes);
 

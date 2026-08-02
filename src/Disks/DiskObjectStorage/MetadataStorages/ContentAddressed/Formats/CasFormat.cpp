@@ -43,6 +43,7 @@ constexpr FormatChangePoint REF_CKPT[] = {
     {kContiguousRefStreamsGeneration, kContiguousRefStreamsGeneration},
     {kNamespaceLifeKeyedGeneration, kNamespaceLifeKeyedGeneration},
     {kOpaqueNamespaceLifeLayoutGeneration, kOpaqueNamespaceLifeLayoutGeneration},
+    {kCommittedRefFrontierGeneration, kCommittedRefFrontierGeneration},
 };
 
 /// `cas_ref_catalog` is BORN at generation 4, one generation BEFORE the bump that makes namespace
@@ -57,6 +58,7 @@ constexpr FormatChangePoint GC_MAINTENANCE_STATE[] = {{kUnifiedRefLifeFoldGenera
 constexpr FormatChangePoint POOL_META[] = {
     {1, 1},
     {kPoolGcShardsGeneration, kPoolGcShardsGeneration},
+    {kCommittedRefFrontierGeneration, kCommittedRefFrontierGeneration},
 };
 
 }

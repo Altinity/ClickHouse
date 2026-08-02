@@ -43,6 +43,7 @@ namespace ProfileEvents
     extern const Event CasGcRefWalkPlansBuilt;
     extern const Event CasGcUnmatchedAdoptedParentLives;
     extern const Event CasGcStuckRemovals;
+    extern const Event CasGcNamespaceCleanupLeaks;
     extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
@@ -477,6 +478,8 @@ void Gc::runNamespaceJanitorPage(
         });
         for (const String & anomaly : janitor_result.anomalies)
             LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+        if (janitor_result.leaked)
+            ProfileEvents::increment(ProfileEvents::CasGcNamespaceCleanupLeaks, janitor_result.leaked);
     }
     catch (const std::exception & e)
     {
@@ -485,6 +488,7 @@ void Gc::runNamespaceJanitorPage(
     t.metric("janitor_pages", janitor_result.pages);
     t.metric("janitor_keys", janitor_result.keys);
     t.metric("janitor_deleted", janitor_result.deleted);
+    t.metric("leaked", janitor_result.leaked);
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)
@@ -1409,6 +1413,7 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
             out.witnesses.emplace(ns_str, *ckpt.checkpoint_snapshot_id);
         if (ckpt.life_epoch)
             out.life_epochs.emplace(ns_str, *ckpt.life_epoch);
+        out.recovery_checkpoints.emplace(ns_str, std::move(ckpt));
     }
     return out;
 }
@@ -2056,6 +2061,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         {
             if (parent_cov->hold)
                 ++intake_unhinted_held;
+            else if (checkpoints.recovery_checkpoints.contains(catalog_ns_str))
+                ++intake_unhinted_quiet;
             else if (frontier_probe_budget == 0)
             {
                 ++intake_unprobed_budget;
@@ -2140,7 +2147,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// was lost -- folding from {0,0} would miss those edges and mass-condemn their blobs. Fail closed;
         /// recover with the explicit rebuild. A fresh table (writer already snapshotted, logs still present)
         /// passes because its logs at or below the snapshot survive.
-        if (cursor_it == parent_ref_lives.end() && !listing.snapshots.empty())
+        if (cursor_it == parent_ref_lives.end() && !listing.snapshots.empty()
+            && !checkpoints.recovery_checkpoints.contains(ns_str))
         {
             const RefTxnId newest_snapshot = listing.snapshots.back();
             const bool logs_below_snapshot_gone = listing.logs.empty() || newest_snapshot < listing.logs.front();
@@ -2170,6 +2178,40 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// `checkpoints.life_epochs` for exactly this case; a namespace with neither has a genuinely
         /// unknown genesis, so no probe is taken, nothing is proved, and fail-closed says unproven).
         bool frontier_proven = false;
+
+        /// Use the same frozen catalog row + decoded checkpoint authority as read-only recovery. The
+        /// ref LIST is only a bounded-work hint; it may neither choose this life's genesis nor extend
+        /// its committed frontier.
+        const auto catalog_entry_it = std::lower_bound(
+            catalog_snapshot.catalog.entries.begin(), catalog_snapshot.catalog.entries.end(), ns,
+            [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+        chassert(catalog_entry_it != catalog_snapshot.catalog.entries.end());
+        chassert(catalog_entry_it->ns == ns);
+        chassert(catalog_entry_it->incarnation == target.life_id);
+        std::optional<RefCkpt> checkpoint;
+        if (const auto checkpoint_it = checkpoints.recovery_checkpoints.find(ns_str);
+            checkpoint_it != checkpoints.recovery_checkpoints.end())
+            checkpoint = checkpoint_it->second;
+
+        std::optional<RecoveryGrounding> grounding;
+        String checkpoint_failure;
+        if (const auto bad_checkpoint = checkpoints.undecodable.find(ns_str);
+            bad_checkpoint != checkpoints.undecodable.end())
+        {
+            checkpoint_failure = bad_checkpoint->second;
+        }
+        else
+        {
+            try
+            {
+                grounding = chooseRecoveryGrounding(std::optional<CatalogEntry>{*catalog_entry_it}, checkpoint);
+            }
+            catch (const Exception & e)
+            {
+                checkpoint_failure = e.message();
+            }
+        }
+
         /// The hold THIS round detected, at the position it stopped. It IS the clamp signal: there is
         /// no separate boolean that could disagree with it about whether the namespace stopped.
         std::optional<RefHold> fired;
@@ -2207,6 +2249,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 consider(*it);
             if (const auto ck = checkpoint_witness.find(ns_str); ck != checkpoint_witness.end())
                 consider(ck->second);
+            if (grounding && grounding->committed_through)
+                consider(*grounding->committed_through);
             if (carried_hold)
                 consider(carried_hold->offending_position);
             return nearest;
@@ -2259,34 +2303,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             return crossing.proved() ? std::optional<RefTxnId>(crossing.start) : std::nullopt;
         };
 
-        /// The first position to read. A never-folded namespace has no arithmetic predecessor, so its
-        /// genesis comes from the hint's own floor -- the one hint role arithmetic cannot replace in
-        /// Stage A. The residual is PRE-EXISTING but not cosmetic: a hint that omits the very FIRST
-        /// surviving record of a never-folded namespace starts the walk one record too high, and the
-        /// round then seals a cursor ABOVE a record it never folded -- the same unrecoverable shape this
-        /// walk removes everywhere else, since nothing ever re-reads below the cursor. It is exactly what
-        /// the listing-driven loop did, and it is bounded to a namespace's FIRST fold. Stage B closes it
-        /// structurally by reading `_ckpt.life_epoch` (the namespace's genesis epoch) from the catalog,
-        /// which makes the start `{life_epoch, 1}` and arithmetic like every other step. Do NOT close it
-        /// here by scanning down from `{E, 1}`: below a lost cursor the cleaned range is unbounded, so the
-        /// scan has no bound either, and a namespace whose early logs were legitimately cleaned would 404
-        /// below its own witness and hold every round.
+        /// The first position is arithmetic from the sealed cursor, or from the exact checkpoint's life
+        /// epoch on the first fold. A listing never chooses a logical history start. An unusable
+        /// checkpoint still has a canonical retry position once a cursor exists, so its durable hold
+        /// remains observable rather than degrading into an anonymous anomaly.
         std::optional<RefTxnId> expected;
-        if (cursor == RefTxnId{})
-        {
-            if (!listing.logs.empty())
-                expected = listing.logs.front();
-            else if (const auto le = checkpoints.life_epochs.find(ns_str); le != checkpoints.life_epochs.end())
-                /// Stage B (Task 4-C): the gap this comment used to only describe. A `Live` namespace the
-                /// hint has never listed a log for still has a durable `_ckpt.life_epoch` once it went
-                /// through `completeCreation` -- production publishes that BEFORE any birth chunk -- so
-                /// its genesis position is arithmetic like every other step: `{life_epoch, 1}`. A namespace
-                /// admitted without a `_ckpt` (the test-only bridge) has no entry here and `expected` stays
-                /// `nullopt`, which is the correct fail-closed answer for a genuinely unknown genesis.
-                expected = RefTxnId{le->second, 1};
-        }
-        else
+        if (cursor != RefTxnId{})
             expected = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+        else if (grounding)
+        {
+            expected = RefTxnId{*checkpoint->life_epoch, 1};
+        }
 
         /// C1 fix, continued: a namespace absent from this round's catalog read is UNPROVEN, never
         /// walked. No hold is minted (there is no legitimate position to name -- a fabricated one would
@@ -2305,7 +2332,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             expected.reset();
         }
 
-        /// AN UNDECODABLE `_ckpt` QUARANTINES ITS OWN NAMESPACE AND NOTHING ELSE (spec §5). The object
+        /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else (spec §5). The object
         /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
         /// `witnessAbove` above, and `cleanupRefObjects`' delete boundaries via `result.checkpoints` --
         /// so the damage is confinable, and confining it is the difference between one namespace waiting
@@ -2323,22 +2350,31 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// and there is no walk to stop; the anomaly alone carries it, because the other consumer is
         /// `cleanupRefObjects`, whose boundaries an ABSENT checkpoint WIDENS, and only the round's
         /// destructive gate keeps the snapshot this unreadable object names from being deleted.
-        if (const auto bad_ckpt = checkpoints.undecodable.find(ns_str);
-            bad_ckpt != checkpoints.undecodable.end())
+        if (!grounding)
         {
             LOG_WARNING(logger,
-                "CAS GC ref intake: namespace {} has an undecodable checkpoint -- {}. This namespace "
+                "CAS GC ref intake: namespace {} has no usable checkpoint -- {}. This namespace "
                 "folds nothing and reclaims nothing until that object is repaired; every other "
                 "namespace folds normally.",
-                ns_str, bad_ckpt->second);
+                ns_str, checkpoint_failure);
             if (expected)
                 hold(*expected, HoldReason::CheckpointUndecodable,
-                     "ref intake: the namespace's `_ckpt` is present but undecodable -- its durable "
-                     "checkpoint witness cannot be read, so nothing above the cursor is accountable");
+                     "ref intake: the namespace's `_ckpt` is unavailable or invalid -- its durable "
+                     "checkpoint authority cannot be read, so nothing above the cursor is accountable");
             else
                 report.recordAnomaly(ns, 0, ManifestId{ns, {}},
-                    "ref intake: the namespace's `_ckpt` is present but undecodable (no walk position)");
+                    "ref intake: the catalog life has no usable `_ckpt` (no authoritative walk position)");
             expected.reset();   /// the cursor rides verbatim into this round's seal
+        }
+
+        if (grounding && !grounding->committed_through)
+        {
+            if (cursor == RefTxnId{})
+                frontier_proven = true;
+            else
+                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                    "ref intake: an empty checkpoint frontier cannot explain a nonzero sealed cursor");
+            expected.reset();
         }
 
         /// Whether the record this round last applied (the one `resolved_through` names) was an
@@ -2359,6 +2395,19 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
         while (expected)
         {
+            /// `_ckpt.committed_through` is the inclusive authority ceiling. Stop before reading a
+            /// durable but uncommitted `F+1`, so neither it nor a later 404 can advance this cursor or
+            /// establish the destructive frontier.
+            if (*grounding->committed_through < *expected)
+            {
+                if (resolved_through == *grounding->committed_through)
+                    frontier_proven = true;
+                else
+                    report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                        "ref intake: checkpoint committed_through precedes the sealed cursor");
+                break;
+            }
+
             /// GET + decode the expected record. Absence is the decision point of the whole walk, and
             /// an invalid body is a per-namespace hold: the key belongs to exactly one namespace, so it
             /// can never be grounds for discarding another namespace's fold.
@@ -2369,8 +2418,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 const auto witness = witnessAbove(*expected);
                 if (!witness)
                 {
-                    frontier_proven = true;
-                    break;   /// nothing above: this is the namespace's frontier this round
+                    if (*expected <= *grounding->committed_through)
+                        hold(*expected, HoldReason::GapBelowWitness,
+                             "ref intake: a checkpoint-committed ref log is absent -- its authoritative "
+                             "frontier cannot be complete");
+                    else
+                        frontier_proven = true;
+                    break;
                 }
 
                 if (witness->writer_epoch == expected->writer_epoch)
@@ -2418,7 +2472,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// and it costs exactly this one read per namespace per round. Deliberately distinct from
             /// every other exit -- no anomaly, no hold, nothing wrong -- and it leaves `frontier_proven`
             /// false, so the namespace is merely unproven this round and the round suppresses.
-            if (target.frozen_tail && *target.frozen_tail < *expected)
+            if (target.frozen_tail && *target.frozen_tail < *expected
+                && *grounding->committed_through < *expected)
                 break;
 
             const RefTxnId log_id = *expected;
@@ -2555,11 +2610,31 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             ++logs_applied;                /// probe B1: the SINGLE cursor-advance site
             table_changed = true;
 
-            /// The next position is arithmetic within this epoch. An `EpochSeal` needs no special case
-            /// here: it is applied like any other record (its edge list is empty, so it produces nothing
-            /// -- probe B2's `produced=false`), and the walk simply finds nothing at the position after it
-            /// and crosses through the seal chain above.
-            expected = RefTxnId{log_id.writer_epoch, log_id.ref_sequence + 1};
+            if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
+                    log_id, *last_applied_is_seal, *grounding->committed_through))
+            {
+                if (*last_applied_is_seal && next->writer_epoch != log_id.writer_epoch)
+                {
+                    const auto crossed = crossFromSeal(log_id, last_applied_is_seal, *grounding->committed_through);
+                    if (!crossed)
+                    {
+                        hold(*next, HoldReason::UnconsumedSealCrossing,
+                             "ref intake: checkpoint frontier cannot prove the successor of the epoch seal "
+                             "just consumed");
+                        break;
+                    }
+                    ++intake_epoch_crossings;
+                    closeSegment();
+                    expected = *crossed;
+                }
+                else
+                    expected = *next;
+            }
+            else
+            {
+                frontier_proven = true;
+                expected.reset();
+            }
         }
         closeSegment();
         if (!segments.empty())
@@ -2812,12 +2887,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Same reuse for the checkpoints: the intake walk already paid for them as its second witness, and
     /// the cleanup ranges below are the other consumer of the same fact.
     ///
-    /// An UNDECODABLE `_ckpt` contributes no entry here, which reads as "no checkpoint" and WIDENS this
-    /// namespace's delete boundaries. That is safe for exactly one reason, stated here because it is not
-    /// local: the walk above held (or recorded an anomaly for) every such namespace, so the round's
-    /// destructive gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future
-    /// change that narrows the gate from round-wide to per-namespace must carry this set with it.
-    result.checkpoints = checkpoint_witness;
+    /// An UNDECODABLE `_ckpt` contributes no entry here and therefore grants no cleanup authority. The
+    /// walk above also held (or recorded an anomaly for) every such namespace, so the round's destructive
+    /// gate is shut and `cleanupRefObjects` deletes nothing at all this round. Any future change that
+    /// narrows the gate from round-wide to per-namespace must carry this set with it.
+    result.checkpoints = checkpoints.recovery_checkpoints;
 
     /// Folding the terminal record earns positive cleanup evidence directly on the catalog-admitted
     /// life row. It does not claim that any physical debris was removed: `_ckpt`, stream and `_files`
@@ -3339,15 +3413,32 @@ void Gc::cleanupRefObjects(
             ? row_it->second.coverage.last_folded_ref_id
             : RefTxnId{};
 
-        /// The namespace's own durable tail, which TIGHTENS both delete boundaries and can never widen
-        /// either -- see `planRefCleanup`. Absent for a namespace whose `_ckpt` does not exist yet or has
-        /// never carried a `checkpoint_snapshot_id`, which degrades both boundaries to the cursor and the
-        /// newest covering snapshot alone.
-        std::optional<RefTxnId> checkpoint;
+        /// Only a checkpoint-named RECOVERY TRIPLE licenses deletion. A listed snapshot may have landed
+        /// before its publisher's checkpoint CAS, so it must never be promoted into cleanup authority.
+        /// Validate the exact same-id non-seal `_log` and `_snap` through recovery's one shared helper;
+        /// failure is confined to this namespace and leaks its listed objects for a later round.
+        std::optional<RefCkpt> checkpoint;
         if (const auto ckit = folded.checkpoints.find(ns_str); ckit != folded.checkpoints.end())
             checkpoint = ckit->second;
+        if (!checkpoint || !checkpoint->checkpoint_snapshot_id)
+            continue;
+        const RefTxnId checkpoint_snapshot_id = *checkpoint->checkpoint_snapshot_id;
 
-        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint);
+        std::optional<RefTxnId> retained_log_proof;
+        try
+        {
+            retained_log_proof = readCheckpointSnapshotBase(backend, layout, life, *checkpoint).predecessor_seal_id;
+        }
+        catch (const Exception & e)
+        {
+            LOG_WARNING(logger,
+                "CAS GC ref cleanup retained namespace '{}': checkpoint base {} is not a valid recovery triple: {}",
+                ns_str, renderRefTxnId(checkpoint_snapshot_id), e.message());
+            continue;
+        }
+
+        const RefCleanupPlan plan = planRefCleanup(
+            listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
         for (const RefTxnId & log_id : plan.deletable_logs)
             if (!deleteRefObject(layout.refLogKey(life, log_id)))
                 return;
@@ -3356,7 +3447,7 @@ void Gc::cleanupRefObjects(
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
-            chassert(!checkpoint || snap_id < *checkpoint);
+            chassert(snap_id < checkpoint_snapshot_id);
             if (!deleteRefObject(layout.refSnapshotKey(life, snap_id)))
                 return;
         }
@@ -4024,6 +4115,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
     const RefPlan rebuild_walk_plan = buildRefWalkPlan(
         RoundInput{std::move(rebuild_round_scan), rebuild_work_catalog_cut});
     const std::vector<NamespaceLifeId> rebuild_walk_universe = rebuild_walk_plan.lives();
+    /// The exact checkpoint sample is paired with the same frozen catalog cut that chose the rebuild
+    /// universe. `recoverRefTableDetailedFromAuthority` deliberately has no internal catalog or
+    /// checkpoint read: a later cut could admit a different life or frontier than the one every other
+    /// part of this rebuild is using.
+    const CheckpointWitnesses rebuild_checkpoints = readCheckpointWitnesses({}, rebuild_walk_plan.catalogCut());
 
     if (validate_generation_zero_ref_baseline)
     {
@@ -4152,14 +4248,27 @@ RebuildReport Gc::rebuildBaseline(bool force)
         seen_ns.insert(ns.string());
         ++rep.shards;
 
-        /// Recover the table via the shared snapshot+tail equation: the current
-        /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
-        /// the greatest RefTxnId that verified view included.
-        ///
-        /// The exact-life overload is deliberate: `rebuild_universe` and recovery consume the same
-        /// physical identity from the immutable catalog cut above. No bare-name resolution or
-        /// transitional sentinel fallback can redirect this walk to a different life.
-        const RefTableState st = recoverRefTable(backend, layout, life, onGcEnumerationPage);
+        /// Recover from the exact catalog row and exact checkpoint paired with this plan. A visible
+        /// log above `committed_through` is not logical history yet, and a Live/Removing row without a
+        /// readable checkpoint has no bounded recovery frontier; both cases must refuse rather than
+        /// letting a stream LIST decide what this baseline protects.
+        const auto entry_it = std::lower_bound(
+            rebuild_walk_plan.catalogCut().catalog.entries.begin(), rebuild_walk_plan.catalogCut().catalog.entries.end(), ns,
+            [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+        chassert(entry_it != rebuild_walk_plan.catalogCut().catalog.entries.end());
+        chassert(entry_it->ns == ns);
+        chassert(entry_it->incarnation == life.incarnation);
+        if (const auto bad_checkpoint = rebuild_checkpoints.undecodable.find(ns.string());
+            bad_checkpoint != rebuild_checkpoints.undecodable.end())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS GC rebuild: catalog life {} has an undecodable checkpoint: {}", ns.string(), bad_checkpoint->second);
+        std::optional<RefCkpt> checkpoint;
+        if (const auto checkpoint_it = rebuild_checkpoints.recovery_checkpoints.find(ns.string());
+            checkpoint_it != rebuild_checkpoints.recovery_checkpoints.end())
+            checkpoint = checkpoint_it->second;
+        const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
+            backend, layout, *entry_it, checkpoint);
+        const RefTableState & st = recovered.state;
 
         RefCoverage cov;
         cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps

@@ -276,6 +276,12 @@ TEST(CasRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
     const CatalogEntry entry{.ns = ns, .state = NsState::Live, .incarnation = UInt128(0xcafe),
                              .creator = std::nullopt};
     CasRefCatalog::casAdmitEntry(*backend, layout, 1, entry);
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = store->writerEpoch(),
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     const RefTxnId id = publishBirth(store, ns, "a");
     EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));

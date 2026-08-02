@@ -10,10 +10,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include "cas_test_helpers.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string_view>
 
 namespace DB::ErrorCodes
 {
@@ -109,6 +111,250 @@ private:
     String armed_key;
     std::function<void()> pending_mutation;
 };
+
+enum class FsckListingMode : uint8_t
+{
+    Full,
+    Empty,
+    Partial,
+    Reordered,
+};
+
+/// Distort only one namespace stream LIST after fixture deposition. Exact GET/HEAD and every other
+/// prefix retain ordinary backend semantics, so the test varies the hint and nothing authoritative.
+class FsckListingBackend : public InMemoryBackend
+{
+public:
+    void distort(String prefix_, FsckListingMode mode_)
+    {
+        prefix = std::move(prefix_);
+        mode = mode_;
+    }
+
+    ListPage list(const String & listed_prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = InMemoryBackend::list(listed_prefix, cursor, limit);
+        if (listed_prefix != prefix)
+            return page;
+        if (mode == FsckListingMode::Empty)
+            page.keys.clear();
+        else if (mode == FsckListingMode::Partial && !page.keys.empty())
+            page.keys.erase(page.keys.begin());
+        else if (mode == FsckListingMode::Reordered)
+            std::reverse(page.keys.begin(), page.keys.end());
+        return page;
+    }
+
+private:
+    String prefix;
+    FsckListingMode mode = FsckListingMode::Full;
+};
+
+/// Fail one exact GET without disturbing LIST or any other object read. This keeps the checkpoint
+/// authority stable while proving that fsck distinguishes a transport failure from durable corruption.
+class FailExactGetBackend : public InMemoryBackend
+{
+public:
+    void fail(String key_)
+    {
+        key = std::move(key_);
+    }
+
+    std::optional<GetResult> get(const String & requested_key, Range range) override
+    {
+        if (requested_key == key)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected exact GET failure");
+        return InMemoryBackend::get(requested_key, range);
+    }
+
+private:
+    String key;
+};
+
+/// Publish the exact `_ckpt` authority an ordinary Live test life would have after its first committed
+/// record. Raw ref-log helpers deliberately do not do this: several protocol tests need malformed or
+/// pre-creation states. Fsck tests that exercise a recoverable Live life must make the durable authority
+/// explicit instead of accidentally borrowing the legacy LIST-only recovery rule.
+void writeFsckCheckpoint(Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId committed_through)
+{
+    const CasRefCatalog::Snapshot cut = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(cut.catalog.entries.begin(), cut.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(it, cut.catalog.entries.end());
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+    const String key = layout.refCkptKey(life);
+    const String body = encodeRefCkpt(RefCkpt{
+        .life_epoch = committed_through.writer_epoch,
+        .committed_through = committed_through,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt});
+    const HeadResult current = backend.head(key);
+    const PutResult put = current.exists
+        ? backend.putOverwrite(key, body, current.token)
+        : backend.putIfAbsent(key, body);
+    ASSERT_EQ(put.outcome, PutOutcome::Done);
+}
+
+void writeFsckCheckpointWithBase(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, RefTxnId base,
+    std::optional<RefTxnId> last_epoch_seal = std::nullopt)
+{
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    ASSERT_EQ(backend.putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = base,
+        .checkpoint_snapshot_id = base,
+        .last_epoch_seal = last_epoch_seal})).outcome, PutOutcome::Done);
+}
+
+void expectCheckpointBaseVerdict(
+    const FsckReport & report, const String & exact_base_key, FsckClass expected_class,
+    std::string_view expected_reason)
+{
+    EXPECT_EQ(report.chain_broken, expected_class == FsckClass::ChainBroken ? 1u : 0u);
+    EXPECT_EQ(report.unchecked, expected_class == FsckClass::Unchecked ? 1u : 0u);
+    EXPECT_EQ(report.clean(), expected_class != FsckClass::ChainBroken);
+
+    size_t matching = 0;
+    for (const FsckObject & object : report.objects)
+    {
+        if (object.cls != expected_class || object.key != exact_base_key)
+            continue;
+        ++matching;
+        ASSERT_EQ(object.reachable_from.size(), 1u);
+        EXPECT_NE(object.reachable_from.front().find(expected_reason), String::npos);
+    }
+    EXPECT_EQ(matching, 1u) << "the checkpoint-base verdict must identify its exact named base and cause";
+}
+
+/// Test-only external catalog writer. It changes the namespace's current logical life after fsck took
+/// its catalog cut, precisely the competing-cut mutation that fsck must not splice into its verdict.
+void replaceCatalogLife(Backend & backend, const Layout & layout, const RootNamespace & ns, UInt128 incarnation)
+{
+    CasRefCatalog::Snapshot current = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(current.catalog.entries.begin(), current.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    ASSERT_NE(it, current.catalog.entries.end());
+    it->incarnation = incarnation;
+    it->state = NsState::Live;
+    it->creator.reset();
+    it->removal_started_round.reset();
+    ASSERT_TRUE(current.token.has_value());
+    ASSERT_EQ(backend.putOverwrite(layout.refCatalogKey(), encodeRefCatalog(current.catalog), *current.token).outcome,
+        PutOutcome::Done);
+}
+
+FsckReport runFsckWithListingMode(FsckListingMode mode, std::string_view suffix)
+{
+    auto backend = std::make_shared<FsckListingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/listing_" + String(suffix) + "@cas@"};
+    const ManifestRef r1 = ref(1, 0xD1);
+    const ManifestRef r2 = ref(2, 0xD2);
+    const DB::UInt128 h1 = u128Of("fsck-listing-old-" + String(suffix));
+    const DB::UInt128 h2 = u128Of("fsck-listing-new-" + String(suffix));
+    writeBlobBody(*backend, layout, h1);
+    writeBlobBody(*backend, layout, h2);
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", h1)});
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("a", h2)});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r1);
+    const uint64_t frontier = publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, frontier});
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    backend->distort(layout.namespaceStreamPrefix(life), mode);
+    return runFsck(*store, /*detail=*/true);
+}
+
+void expectListingIndependentFsck(const FsckReport & report)
+{
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.dangling, 0u);
+    EXPECT_EQ(report.ref_records_walked, 2u);
+    EXPECT_EQ(report.reachable, 1u);
+}
+
+struct FsckAuthorityVerdict
+{
+    bool clean = false;
+    uint64_t hard_findings = 0;
+    uint64_t chain_broken = 0;
+    uint64_t unchecked = 0;
+    uint64_t ref_records_walked = 0;
+    uint64_t reachable = 0;
+    uint64_t dangling = 0;
+
+    bool operator==(const FsckAuthorityVerdict &) const = default;
+};
+
+FsckAuthorityVerdict authorityVerdict(const FsckReport & report)
+{
+    uint64_t hard_findings = 0;
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        hard_findings += report.*(finding.value);
+    return FsckAuthorityVerdict{
+        .clean = report.clean(),
+        .hard_findings = hard_findings,
+        .chain_broken = report.chain_broken,
+        .unchecked = report.unchecked,
+        .ref_records_walked = report.ref_records_walked,
+        .reachable = report.reachable,
+        .dangling = report.dangling,
+    };
+}
+
+FsckReport runCheckpointBaseFsckWithListingMode(
+    FsckListingMode mode, std::string_view suffix, bool corrupt_exact_base)
+{
+    auto backend = std::make_shared<FsckListingBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/listing_base_" + String(suffix) + "@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const RefLogTxn birth{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    RefTableState base_state;
+    applyRefLogTxn(base_state, birth);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(base_state, ns.string()));
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    if (corrupt_exact_base)
+    {
+        const String base_snapshot_key = layout.refSnapshotKey(life, base);
+        const HeadResult head = backend->head(base_snapshot_key);
+        EXPECT_TRUE(head.exists);
+        if (head.exists)
+            EXPECT_EQ(backend->deleteExact(base_snapshot_key, head.token).kind, DeleteOutcome::Kind::Deleted);
+    }
+    else
+    {
+        /// This newer pair is deliberately outside `_ckpt.committed_through`. It is inert garbage:
+        /// changing whether LIST happens to reveal it must not add or remove an fsck finding.
+        const RefTxnId unadopted{1, 2};
+        const RefOwnerBinding listed_binding{RefOwnerKind::Precommit, "listed", ref(9, 0xE9)};
+        const RefLogTxn listed_log{
+            .ns = ns.string(),
+            .txn_id = unadopted,
+            .ops = {ownerTransitionOp(std::nullopt, listed_binding)},
+            .prev_epoch_seal = std::nullopt};
+        writeRefLogTxnRaw(*backend, layout, listed_log);
+        RefTableState listed_state = base_state;
+        applyRefLogTxn(listed_state, listed_log);
+        RefTableSnapshot unadopted_snapshot = snapshotOf(listed_state, ns.string());
+        unadopted_snapshot.precommits.push_back(
+            RefOwnerBinding{RefOwnerKind::Precommit, "unlisted", ref(10, 0xEA)});
+        writeRefSnapshotRaw(*backend, layout, unadopted_snapshot);
+    }
+
+    backend->distort(layout.namespaceStreamPrefix(life), mode);
+    return runFsck(*store, /*detail=*/true);
+}
 }
 
 /// A committed ref whose manifest body is present and whose blobs exist => clean.
@@ -120,7 +366,8 @@ TEST(CasFsck, CleanManifestPoolHasNoDangling)
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
@@ -133,7 +380,9 @@ TEST(CasFsck, OwnerVisibleMissingManifestBodyIsError)
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // no body written
+    const uint64_t sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r);  // no body written
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_FALSE(rep.clean());
     EXPECT_GE(rep.dangling, 1u);
@@ -147,7 +396,8 @@ TEST(CasFsck, ReachableBlobMissingIsError)
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});  // no blob body
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_FALSE(rep.clean());
     EXPECT_GE(rep.dangling, 1u);
@@ -165,7 +415,8 @@ TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
 
     /// Hand-built: no helper can mint the un-incarnated shape any more.
     const String lifeless = store->layout().casRefsPrefix() + ns.string() + "/_log/"
@@ -206,7 +457,8 @@ TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, layout, DB::UInt128(1));
     writeManifestRaw(*backend, layout, unique_ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, layout, unique_ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, unique_ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, unique_ns, RefTxnId{1, sequence});
 
     CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*backend, layout);
     snapshot.catalog.entries.push_back(CatalogEntry{
@@ -235,14 +487,9 @@ TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
 /// cut and use the checkpoint-anchored arithmetic walk to read the record.
 ///
 /// Proves `ref_records_walked`, not `dangling`/`clean()`: `checkRefStream` (which this proves runs) has
-/// its own `_ckpt`-anchored arithmetic walk and so is reachable here, but the SEPARATE dangling-manifest
-/// re-resolution (`manifestStillReferenced`, this file) rides `recoverRefTableDetailed`
-/// (`CasRefProtocol.cpp`), which has NO such anchor -- it enumerates a table's logs/snapshots from LIST
-/// alone with no `_ckpt` fallback, so a namespace hidden from LIST this thoroughly still recovers as
-/// EMPTY there, and a dangling manifest under it would be missed by that one check regardless of this
-/// fix. That is a further, broader gap in a function three consumers share (this file, `Gc::rebuildBaseline`'s
-/// disaster-recovery scan, `CasOrphanManifestSweep`'s active-key set) -- flagged separately, out of scope
-/// for what this test pins.
+/// its own `_ckpt`-anchored arithmetic walk and so is reachable here. The distinct
+/// `manifestStillReferenced` recheck now receives the same frozen catalog row and exact `_ckpt` authority;
+/// its competing-cut regression is pinned separately by `MissingManifestRecheckStaysOnInitialCatalogCut`.
 TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
 {
     auto backend = std::make_shared<HintHoleBackend>();
@@ -251,7 +498,8 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
     const RootNamespace ns{"00/hidden_from_list@cas@"};
 
     casAdmitEntry(*backend, layout, ns);
-    appendRefLogSeed(*backend, layout, ns, {});   // one real record: a birth-only ref-log transaction
+    const uint64_t sequence = appendRefLogSeed(
+        *backend, layout, ns, {});   // one real record: a birth-only ref-log transaction
 
     /// `casAdmitEntry` never publishes a `_ckpt` (by its own design), and the write above used
     /// `appendRefLogSeed`'s hardcoded writer_epoch 1. `checkRefStream`'s own walk needs SOME anchor -- a
@@ -261,10 +509,8 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
     /// controls hit and were restructured around (fold-before-hide). fsck has no "fold" step to run
     /// first, so the anchor is published directly, by exact key, before the hide -- the exact-key GET
     /// this enables is unaffected by list-hiding either way.
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
-    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
-                              .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     backend->hidePrefix(layout.namespaceStreamPrefix(life));
 
@@ -277,6 +523,349 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
            "of its keys, or the catalog-authoritative universe supplement did not run";
 }
 
+TEST(CasFsckAuthority, FullListingDoesNotDefineStreamGeometry)
+{
+    expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Full, "full"));
+}
+
+TEST(CasFsckAuthority, EmptyListingDoesNotDefineStreamGeometry)
+{
+    expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Empty, "empty"));
+}
+
+TEST(CasFsckAuthority, PartialListingDoesNotDefineStreamGeometry)
+{
+    expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Partial, "partial"));
+}
+
+TEST(CasFsckAuthority, ReorderedListingDoesNotDefineStreamGeometry)
+{
+    expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Reordered, "reordered"));
+}
+
+/// Stream LIST is not fsck authority. The same exact catalog + `_ckpt` + checkpoint-base triple must
+/// yield the same result when LIST is complete, empty, partial, or reordered. A newer unadopted log and
+/// snapshot are inert garbage, while damage to the exact checkpoint base remains a hard finding under
+/// every listing. Mutation caught: the old LIST-derived snapshot oracle makes only listings that reveal
+/// the unadopted pair non-clean.
+TEST(CasFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
+{
+    const std::array modes{
+        FsckListingMode::Full,
+        FsckListingMode::Empty,
+        FsckListingMode::Partial,
+        FsckListingMode::Reordered,
+    };
+
+    std::optional<FsckAuthorityVerdict> clean_reference;
+    std::optional<FsckAuthorityVerdict> corrupt_reference;
+    for (size_t i = 0; i < modes.size(); ++i)
+    {
+        const FsckAuthorityVerdict clean = authorityVerdict(runCheckpointBaseFsckWithListingMode(
+            modes[i], "clean_" + std::to_string(i), /*corrupt_exact_base=*/false));
+        if (!clean_reference)
+            clean_reference = clean;
+        EXPECT_EQ(clean, *clean_reference);
+        EXPECT_TRUE(clean.clean);
+        EXPECT_EQ(clean.hard_findings, 0u);
+
+        const FsckAuthorityVerdict corrupt = authorityVerdict(runCheckpointBaseFsckWithListingMode(
+            modes[i], "corrupt_" + std::to_string(i), /*corrupt_exact_base=*/true));
+        if (!corrupt_reference)
+            corrupt_reference = corrupt;
+        EXPECT_EQ(corrupt, *corrupt_reference);
+        EXPECT_FALSE(corrupt.clean);
+        EXPECT_EQ(corrupt.chain_broken, 1u);
+        EXPECT_EQ(corrupt.unchecked, 0u);
+        EXPECT_EQ(corrupt.hard_findings, 1u);
+    }
+}
+
+/// A durable but unfrontiered F+1 is not part of this fsck cut. Mutation caught: probing one position
+/// beyond `_ckpt.committed_through` walks the visible record and changes both coverage and reachability.
+TEST(CasFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/visible_f_plus_one@cas@"};
+    const ManifestRef committed_ref = ref(1, 0xE1);
+    const ManifestRef unfrontiered_ref = ref(2, 0xE2);
+    const DB::UInt128 committed_blob = u128Of("fsck-frontier-committed");
+    writeBlobBody(*backend, layout, committed_blob);
+    writeManifestRaw(*backend, layout, ns, committed_ref, {blobEntryFor("a", committed_blob)});
+    const uint64_t frontier = publishCommittedTransition(
+        *backend, layout, ns, "tbl", std::nullopt, committed_ref);
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, frontier});
+
+    /// The object is durable and visible, but `_ckpt` is deliberately NOT advanced to it. The semantic
+    /// convenience wrapper advances `_ckpt`, so deposit this unfrontiered F+1 as the raw transaction
+    /// shape that a stopped writer can leave behind. Its missing manifest would become a false dangle if
+    /// either fsck leg adopted F+1.
+    std::vector<RefOp> unfrontiered_ops;
+    unfrontiered_ops.push_back(ownerTransitionOp(
+        RefOwnerBinding{RefOwnerKind::Committed, "tbl", committed_ref}, std::nullopt));
+    const std::vector<RefOp> commit_ops = publishCommittedOps("tbl", unfrontiered_ref);
+    unfrontiered_ops.insert(unfrontiered_ops.end(), commit_ops.begin(), commit_ops.end());
+    ASSERT_EQ(appendRefLogSeed(*backend, layout, ns, std::move(unfrontiered_ops)), frontier + 1);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 0u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.ref_records_walked, 1u);
+    EXPECT_EQ(report.dangling, 0u);
+    EXPECT_EQ(report.reachable, 1u);
+}
+
+/// INV-2 materializes every burned global epoch, including an empty one, as a sequence-1 seal. A
+/// direct `{1,2}` -> `{7,1}` chain that omits `{2,1}` is therefore data loss, not a legal sparse epoch
+/// transition. Mutation caught: accepting the later head as a shortcut blesses the missing seal.
+TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/skipped_writer_epoch@cas@"};
+
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt});
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
+        .prev_epoch_seal = std::nullopt});
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    /// The codec now rejects this skip. Deposit its old on-disk corruption shape by changing only the
+    /// fixed-width epoch token of an otherwise encodable body, so fsck still proves that a missing
+    /// intermediate epoch is reported rather than treated as a sparse legal transition.
+    String skipped_bytes = encodeRefLogTxn(RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{7, 1}, .ops = {}, .prev_epoch_seal = RefTxnId{6, 1}});
+    const String old_epoch_token = "\"!pse\":\"6\"";
+    const auto old_epoch = skipped_bytes.find(old_epoch_token);
+    ASSERT_NE(old_epoch, String::npos);
+    skipped_bytes.replace(old_epoch, old_epoch_token.size(), "\"!pse\":\"1\"");
+    ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(life, RefTxnId{7, 1}),
+        sealObject(FormatId::RefLog, skipped_bytes)).outcome, PutOutcome::Done);
+
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{7, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{6, 1}})).outcome, PutOutcome::Done);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.chain_broken, 1u);
+    EXPECT_EQ(report.unchecked, 0u);
+    EXPECT_EQ(report.ref_records_walked, 2u);
+}
+
+/// The checkpoint base is the inclusive frontier, so there is no replay tail in which another hole
+/// could satisfy this test. The missing same-id log itself makes the stable exact authority corrupt.
+/// Mutation caught: mapping every `readCheckpointSnapshotBase` failure to `Unchecked` leaves `clean` true.
+TEST(CasFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing_checkpoint_base_log@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::ChainBroken, "has no matching log");
+}
+
+/// A present, valid non-seal base log rules out a stream hole; only its checkpoint-named same-id
+/// snapshot is absent. Stable exact absence is damage, not lost diagnostic coverage.
+TEST(CasFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing_checkpoint_base_snapshot@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::ChainBroken,
+        "is absent under the supplied immutable lifecycle authority");
+}
+
+/// `_ckpt.checkpoint_snapshot_id` names a state snapshot, never an `EpochSeal`. The forged base is an
+/// OLDER seal, deliberately different from `last_epoch_seal`, so comparing checkpoint metadata cannot
+/// expose it: the stream audit must exact-read the base log and reject it before recovery can bless the
+/// same-id snapshot.
+TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint_base_seal@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefLogTxn birth{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    const RefLogTxn seal_txn{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
+        .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, seal_txn);
+    RefOp later_seal;
+    later_seal.kind = RefOpKind::EpochSeal;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{2, 1}, .ops = {later_seal},
+        .prev_epoch_seal = RefTxnId{1, 2}});
+
+    RefTableState through_seal;
+    applyRefLogTxn(through_seal, birth);
+    applyRefLogTxn(through_seal, seal_txn);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = RefTxnId{1, 2},
+        .last_epoch_seal = RefTxnId{2, 1}})).outcome, PutOutcome::Done);
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u)
+        << "the seal is rejected as the checkpoint base, not walked as a normal replay record";
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, RefTxnId{1, 2}), FsckClass::ChainBroken,
+        "names an EpochSeal, not a snapshot base");
+}
+
+/// An unstable transport failure while exact-reading the same valid checkpoint base proves neither
+/// presence nor absence. It remains the honest third answer and must not become a hard finding.
+TEST(CasFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
+{
+    auto backend = std::make_shared<FailExactGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint_base_transport@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    RefTableState state;
+    applyRefLogTxn(state, RefLogTxn{
+        .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(state, ns.string()));
+    writeFsckCheckpointWithBase(*backend, layout, ns, base);
+    backend->fail(layout.refLogKey(life, base));
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, base), FsckClass::Unchecked, "injected exact GET failure");
+}
+
+/// The sampled checkpoint is immutable input, but cleanup may advance `_ckpt` after that sample and
+/// retire its old base before fsck exact-reads it. The miss is then authority instability, not evidence
+/// that either durable checkpoint incarnation was internally corrupt.
+/// Mutation caught: classifying `CORRUPTED_DATA` without rechecking the sampled checkpoint token.
+TEST(CasFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint_base_advanced@cas@"};
+    casAdmitEntry(*backend, layout, ns);
+
+    const RefTxnId old_base{1, 1};
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    writeFsckCheckpointWithBase(*backend, layout, ns, old_base);
+    backend->armOnFirstGet(layout.refLogKey(life, old_base), [&]
+    {
+        const String ckpt_key = layout.refCkptKey(life);
+        const HeadResult head = backend->head(ckpt_key);
+        ASSERT_TRUE(head.exists);
+        ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = std::nullopt,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt}), head.token).outcome, PutOutcome::Done);
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_EQ(report.ref_records_walked, 0u);
+    expectCheckpointBaseVerdict(
+        report, layout.refSnapshotKey(life, old_base), FsckClass::Unchecked,
+        "checkpoint authority changed while validating its snapshot base");
+}
+
+/// A Live catalog row without `_ckpt` is not a recoverable table, even when a listing happens to show a
+/// complete ref log. Mutation caught: replacing the authority-taking recovery with the old LIST replay
+/// makes this audit look clean and silently blesses a life whose durable frontier is unknown.
+TEST(CasFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/live_without_checkpoint@cas@"};
+    const ManifestRef r = ref(1, 0xC1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    /// `publishCommittedTransition` correctly advances `_ckpt`; this test instead deposits the raw
+    /// missing-checkpoint corruption shape that fsck must refuse to recover.
+    std::vector<RefOp> ops = publishCommittedOps("tbl", r);
+    appendRefLogSeed(*backend, store->layout(), ns, std::move(ops));
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_GE(report.unchecked, 1u)
+        << "a Live life with no exact checkpoint cannot be recovered from a convenient LIST";
+    EXPECT_EQ(report.reachable, 0u)
+        << "fsck must not consume refs after the mandatory recovery authority was absent";
+}
+
+/// fsck's missing-manifest recheck runs after its primary walk. If it re-resolves the name from a second
+/// catalog cut, a concurrent rebirth can make the old durable owner disappear from the recheck and hide
+/// a real dangle. The initial cut's row and exact checkpoint must remain the sole authority throughout
+/// the whole fsck call.
+///
+/// Mutation caught: re-resolve `ns` from `manifestStillReferenced`. The first manifest GET changes the
+/// catalog to a fresh, empty life; the second resolution then sees no owner and suppresses the dangle. A
+/// recovery from the original cut continues to see the original owner and reports it.
+TEST(CasFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
+{
+    auto backend = std::make_shared<MutateOnFirstGetBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/frozen_fsck_cut@cas@"};
+    const ManifestRef r = ref(1, 0xC2);
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+    /// `publishCommittedTransition`'s raw fixture log writer uses its documented epoch 1.
+    writeFsckCheckpoint(*backend, layout, ns, RefTxnId{1, sequence});
+
+    backend->armOnFirstGet(layout.manifestKey(ManifestId{ns, r}), [&]
+    {
+        replaceCatalogLife(*backend, layout, ns, UInt128{0xC3});
+    });
+
+    const FsckReport report = runFsck(*store, /*detail=*/true);
+    EXPECT_GE(report.dangling, 1u)
+        << "the initial catalog-cut owner still names the absent manifest despite a later rebirth";
+}
+
 /// A pre-precommit body in an eligible prefix (no owner) is INFO (Unreachable), not an error.
 TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 {
@@ -285,7 +874,8 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
     const RootNamespace ns{"00/aa@cas@"};
     /// Seed a birth-only ref log through the fixture helper, which also admits the catalog row, while
     /// leaving NO committed owner; the manifest body below is orphan debris.
-    appendRefLogSeed(*backend, store->layout(), ns, {});
+    const uint64_t sequence = appendRefLogSeed(*backend, store->layout(), ns, {});
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // eligible
@@ -305,10 +895,13 @@ TEST(CasFsck, CondemnedBlobClassifiesPendingGc)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t publish_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
     Gc gc(store, hexToU128("00000000000000000000000000000001"));
     gc.runRegularRound();
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    const uint64_t drop_sequence = dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
     gc.runRegularRound();   /// -1 folds => zero => condemned into the retired list; blob still present
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
@@ -336,10 +929,14 @@ TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t publish_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
     Gc gc(store, hexToU128("00000000000000000000000000000001"));
     gc.runRegularRound();                                        /// +1 folded into the snapshot
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded (no round)
+    const uint64_t drop_sequence = dropRefTransition(
+        *backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded (no round)
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
@@ -359,10 +956,14 @@ TEST(CasFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t publish_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
     Gc gc(store, hexToU128("00000000000000000000000000000001"));
     gc.runRegularRound();                                        /// +1 folded into the snapshot
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded; the BODY survives
+    const uint64_t drop_sequence = dropRefTransition(
+        *backend, store->layout(), ns, "tbl", r);  /// -1 NOT folded; the BODY survives
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
@@ -388,10 +989,14 @@ TEST(CasFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     const ManifestId id = writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t publish_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, publish_sequence});
     Gc gc(store, hexToU128("00000000000000000000000000000001"));
     gc.runRegularRound();                                        /// +1 folded into the snapshot
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);  /// the owner is gone ...
+    const uint64_t drop_sequence = dropRefTransition(
+        *backend, store->layout(), ns, "tbl", r);  /// the owner is gone ...
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
     deleteManifestBody(*backend, store->layout(), id);           /// ... and so is the body, un-folded
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
@@ -434,7 +1039,8 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
     Gc gc(store, hexToU128("00000000000000000000000000000001"));
     gc.runRegularRound();
 
@@ -485,86 +1091,6 @@ TEST(CasFsck, BodyWithoutMetaIsBenign)
     EXPECT_TRUE(rep.clean());
 }
 
-/// Snapshot integrity oracle (spec §Snapshot Publication): a published snapshot whose bytes equal an
-/// independent replay of its own surviving logs is clean, and the oracle actually RAN (logs present).
-TEST(CasFsckSnapshotOracle, PublishedSnapshotMatchingReplayIsClean)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-
-    /// Publish the CORRECT snapshot: exactly the deterministic replay of the logs, at the greatest log id.
-    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
-    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_TRUE(rep.clean());
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
-    EXPECT_GE(rep.snapshot_oracle_checked, 1u) << "the oracle must actually run when the logs survive";
-}
-
-/// A published snapshot whose bytes are a VALID snapshot object but DIVERGE from the replay of its logs
-/// (here: it carries an extra precommit the logs never added) is a hard ERROR -- caught even though
-/// reachability is unaffected (precommits are not walked), so it surfaces ONLY through the oracle.
-TEST(CasFsckSnapshotOracle, ForgedSnapshotDivergingFromReplayIsError)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-
-    /// Forge a snapshot at the greatest log id: the correct replay plus one phantom precommit binding.
-    /// It is internally valid (decodes fine), so only the byte-compare against the log replay catches it.
-    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
-    RefTableSnapshot forged = snapshotOf(st, ns.string());
-    forged.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "ghost", ref(2, 0xBB)});
-    writeRefSnapshotRaw(*backend, store->layout(), forged);
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 1u);
-    EXPECT_EQ(rep.dangling, 0u) << "the divergence is a snapshot-oracle error, not a reachability dangle";
-    EXPECT_FALSE(rep.clean());
-    bool saw = false;
-    for (const FsckObject & o : rep.objects)
-        if (o.cls == FsckClass::SnapshotOracleMismatch)
-            saw = true;
-    EXPECT_TRUE(saw);
-}
-
-/// Once a table's covered logs are cleaned (the steady state on a GC-caught-up pool), the oracle has no
-/// independent history to replay from and SKIPS the table -- it must never false-positive on a snapshot
-/// whose logs are legitimately gone.
-TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    const uint64_t seq = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-
-    /// Publish the correct snapshot, then delete the log it covers (as GC cleanup would once covered).
-    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
-    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
-    const String log_key = store->layout().refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, seq});
-    const HeadResult h = backend->head(log_key);
-    ASSERT_TRUE(h.exists);
-    backend->deleteExact(log_key, h.token);
-
-    const FsckReport rep = runFsck(*store, /*detail*/true);
-    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
-    EXPECT_EQ(rep.snapshot_oracle_checked, 0u) << "no surviving logs -> the oracle skips, not fails";
-    EXPECT_TRUE(rep.clean());
-}
-
 /// A scan whose deadline is already in the past: partial_on_deadline=false keeps the old
 /// throw-on-timeout contract; partial_on_deadline=true returns the accumulated lower-bound counts
 /// instead of failing empty-handed (the 2026-07-05 campaign lost 5 verdicts to this).
@@ -576,7 +1102,8 @@ TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
 
     const auto past = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     /// partial_on_deadline=false keeps the old contract:
@@ -598,13 +1125,17 @@ TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     const ManifestRef r_a = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeManifestRaw(*backend, store->layout(), ns_a, r_a, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns_a, "tbl", std::nullopt, r_a);
+    const uint64_t sequence_a = publishCommittedTransition(
+        *backend, store->layout(), ns_a, "tbl", std::nullopt, r_a);
+    writeFsckCheckpoint(*backend, store->layout(), ns_a, RefTxnId{1, sequence_a});
 
     const RootNamespace ns_b{"nsb"};
     const ManifestRef r_b = ref(1, 0xB1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(2));
     writeManifestRaw(*backend, store->layout(), ns_b, r_b, {blobEntryFor("b", DB::UInt128(2))});
-    publishCommittedTransition(*backend, store->layout(), ns_b, "tbl", std::nullopt, r_b);
+    const uint64_t sequence_b = publishCommittedTransition(
+        *backend, store->layout(), ns_b, "tbl", std::nullopt, r_b);
+    writeFsckCheckpoint(*backend, store->layout(), ns_b, RefTxnId{1, sequence_b});
 
     const auto scoped = DB::Cas::runFsck(*store, false, {}, {}, false, /*namespace_prefix=*/"nsa");
     EXPECT_EQ(scoped.dangling, 0u);
@@ -632,7 +1163,9 @@ TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
 
     writeBlobBody(*backend, store->layout(), h1);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    const uint64_t initial_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, initial_sequence});
 
     /// Fires strictly between the ref-walk (which captures ref "tbl" -> r1, blob h1, as reachable) and
     /// the HEAD-confirm's physical listing — exactly the window B207 is about.
@@ -640,7 +1173,9 @@ TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
     {
         writeBlobBody(*backend, store->layout(), h2);
         writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", h2)});
-        publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+        const uint64_t repoint_sequence = publishCommittedTransition(
+            *backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+        writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, repoint_sequence});
 
         const String old_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)});
         const HeadResult head = backend->head(old_key);
@@ -665,11 +1200,15 @@ TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
 
     writeBlobBody(*backend, store->layout(), h1);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    const uint64_t initial_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, initial_sequence});
 
     backend->armOnFirstList(store->layout().blobsPrefix(), [&]
     {
-        dropRefTransition(*backend, store->layout(), ns, "tbl", r1);   /// ref dropped since the walk
+        const uint64_t drop_sequence = dropRefTransition(
+            *backend, store->layout(), ns, "tbl", r1);   /// ref dropped since the walk
+        writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, drop_sequence});
 
         const String old_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)});
         const HeadResult head = backend->head(old_key);
@@ -695,7 +1234,8 @@ TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
 
     writeBlobBody(*backend, store->layout(), h);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", h)});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
 
     const String key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)});
     const HeadResult head = backend->head(key);
@@ -723,7 +1263,9 @@ TEST(CasFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
 
     writeBlobBody(*backend, store->layout(), h1);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    const uint64_t initial_sequence = publishCommittedTransition(
+        *backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, initial_sequence});
 
     const String m1_key = store->layout().manifestKey(ManifestId{ns, r1});
     /// Fires strictly between the ref-walk (captures "tbl" -> r1) and the per-ref GET of r1's manifest:
@@ -732,7 +1274,9 @@ TEST(CasFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
     {
         writeBlobBody(*backend, store->layout(), h2);
         writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", h2)});
-        publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+        const uint64_t repoint_sequence = publishCommittedTransition(
+            *backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+        writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, repoint_sequence});
 
         const HeadResult head = backend->head(m1_key);
         ASSERT_TRUE(head.exists);

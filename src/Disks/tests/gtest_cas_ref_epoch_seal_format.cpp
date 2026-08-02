@@ -276,11 +276,10 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-/// Chain-direction (review finding I3): a seal closing epoch E always has id {E, T+1}, and the
-/// transaction chaining to it lives at {E', 1} with E' > E, so `prev_epoch_seal`'s writer_epoch must
-/// be strictly below the referencing transaction's own. Context-free (a property of one transaction),
-/// so it belongs in the structural half; Tasks 2/6 walk this pointer backwards over untrusted decoded
-/// bodies and must not have to re-derive the rule themselves.
+/// Chain direction (review finding I3): a seal closing epoch E always has id `{E, T+1}`, and the
+/// sequence-1 transaction in the next numeric epoch must name it. This remains context-free (a
+/// property of one transaction), so it belongs in the structural half; Tasks 2/6 walk this pointer
+/// backwards over untrusted decoded bodies and must not have to re-derive the rule themselves.
 TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtSameEpoch)
 {
     /// Self-pointer: prev_epoch_seal names the SAME epoch this transaction is in.
@@ -301,6 +300,39 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtFutureEpoch)
     txn.prev_epoch_seal = RefTxnId{9, 3};
     txn.ops.push_back(epochSealOp());
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+/// INV-2 materializes every global writer epoch for an existing life.  A sequence-1 transaction in
+/// epoch E therefore chains to the seal of exactly E-1: accepting an older link would make an omitted
+/// epoch look like a proved boundary and let a fold bypass its missing seal.
+TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealSkippingImmediateEpoch)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{5, 1};
+    txn.prev_epoch_seal = RefTxnId{3, 7};
+    txn.ops.push_back(epochSealOp());
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+/// A damaged object bypasses the encoder, so the decoder must independently reject the same skipped
+/// link before any GC or recovery walker can treat it as boundary evidence.
+TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpliced)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{5, 1};
+    txn.ops.push_back(namespaceBirthOp());
+    const String bytes = encodeRefLogTxn(txn);
+
+    const String needle = "\"rs\":\"1\"";
+    const auto pos = bytes.find(needle);
+    ASSERT_NE(pos, String::npos);
+    String tampered = bytes;
+    tampered.insert(pos + needle.size(), ",\"!pse\":\"3\",\"!pss\":\"1\"");
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
 /// Decode-side pin for the chain-direction rule (review finding I3): the encoder's own check would
@@ -452,7 +484,7 @@ TEST(CasRefEpochSealFormat, FormatBatteryEpochSeal)
     runFormatBattery({FormatId::RefLog,
         [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
         [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
-        "{\"type\":\"cas_ref_log\",\"v\":8}\n"
+        "{\"type\":\"cas_ref_log\",\"v\":9}\n"
         "{\"ns\":\"ns\",\"we\":\"3\",\"rs\":\"1\",\"!pse\":\"2\",\"!pss\":\"9\"}\n"
         "{\"op\":\"epoch_seal\"}\n"
         "{\"n\":1}\n"});

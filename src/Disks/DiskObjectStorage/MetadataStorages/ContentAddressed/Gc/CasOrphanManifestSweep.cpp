@@ -127,6 +127,16 @@ std::optional<RefCoverage> coverageOf(
     return row_it->second.coverage;
 }
 
+/// Return this operation's ONE catalog row for `ns`. Callers hold the enclosing `Snapshot` for their
+/// entire decision; a later name resolution would splice its life into an earlier coverage decision.
+const CatalogEntry * catalogEntryOf(const CasRefCatalog::Snapshot & catalog_cut, const RootNamespace & ns)
+{
+    const auto it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&](const CatalogEntry & entry) { return entry.ns == ns; });
+    return it == catalog_cut.catalog.entries.end() ? nullptr : &*it;
+}
+
 /// The durable `last_folded_ref_id` of a coverage row, `{0, 0}` when there is none — as for a fresh
 /// pool. A manifest removed by a log above this cursor has not had its `-1` decrement folded, so its
 /// body remains load-bearing until the fold catches up.
@@ -152,19 +162,24 @@ struct NamespaceProtection
 ///   rows and live precommits) + manifests removed anywhere in the tail above the durable
 ///   `last_folded_ref_id` (their `-1` is not yet folded, so the GC fold still needs the body).
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
-/// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
-/// deletions on such a throw rather than substituting an empty owner set.
-NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
-                                       const std::optional<RefCoverage> & coverage)
-
+/// invalid transaction (via the authority-grounded recovery / `decodeRefLogTxn`); the caller SKIPS the
+/// namespace's deletions on such a throw rather than substituting an empty owner set.
+NamespaceProtection activeManifestKeys(
+    Pool & store, const CatalogEntry & catalog_entry, const RefCkpt & ckpt,
+    const std::optional<RefCoverage> & coverage)
 {
     NamespaceProtection protection;
     std::set<String> & active = protection.active;
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
+    const RootNamespace & ns = catalog_entry.ns;
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry.ns, catalog_entry.incarnation);
 
     /// Current owners = snapshot + replayed tail (committed rows + live precommits).
-    const RecoveredRefTable recovered = recoverRefTableDetailed(backend, layout, ns, onGcEnumerationPage);
+    /// The exact row and `_ckpt` come from the caller's frozen catalog cut. Do not resolve `ns` here:
+    /// a later catalog cut can name a reborn life and turn this old life into an apparent orphan.
+    const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
+        backend, layout, catalog_entry, ckpt);
     const RefTableState & state = recovered.state;
     for (const auto [ref_name, row] : state.getCommitted())
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
@@ -172,29 +187,101 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
         active.insert(layout.manifestKey(ManifestId{ns, manifest_ref}));
 
     /// Tail-removal protection: every manifest removed by a log ABOVE the durable fold cursor stays active
-    /// until its `-1` folds. LIST the table's logs, decode those above the cursor, and protect each
-    /// removed manifest (a `-1` edge). A namespace-removal transaction names every removed owner explicitly,
-    /// so this also protects a whole removed namespace's bodies until the fold catches up.
+    /// until its `-1` folds. The exact checkpoint frontier is the finite upper bound; LIST cannot decide
+    /// whether a removal exists. A namespace-removal transaction names every removed owner explicitly, so
+    /// this also protects a whole removed namespace's bodies until the fold catches up.
     const RefTxnId cursor = sealedRefCursor(coverage);
-    /// Stage B (Task 4-C): see `CasRefCatalog::resolveLifeOrSentinel`'s doc for why the sentinel
-    /// fallback is correct, not a guess, for a namespace the catalog does not name.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
-    std::vector<RefTxnId> logs;
-    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & lk)
-    {
-        if (const auto parsed = layout.parseRefObjectKey(lk.key);
-            parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Log)
-            logs.push_back(parsed->txn_id);
-    }, 1000, onGcEnumerationPage);
-    std::sort(logs.begin(), logs.end());
+    if (!ckpt.committed_through || !(cursor < *ckpt.committed_through))
+        return protection;
 
-    for (const RefTxnId & id : logs)
+    /// When cleanup has removed the inherited cursor body, only the exact next global epoch may prove
+    /// that cursor was a seal. Asking `crossEpochFromSeal` about `{E+1,1}` preserves its backlink/body
+    /// validation without allowing a later witness to jump over a missing empty-epoch seal.
+    const auto cross_from_missing_cursor = [&](const RefTxnId & from_cursor)
     {
-        if (!(cursor < id))
-            continue;   /// id <= cursor: its edges are already folded
+        if (from_cursor.writer_epoch == std::numeric_limits<uint64_t>::max())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS orphan sweep: folded cursor {} has no representable next epoch",
+                renderRefTxnId(from_cursor));
+        const RefTxnId exact_next_epoch{from_cursor.writer_epoch + 1, 1};
+        const EpochCrossResult crossing = crossEpochFromSeal(
+            backend, layout, ns, from_cursor, std::nullopt, exact_next_epoch, life);
+        if (!crossing.proved())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS orphan sweep: exact next-epoch record {} does not prove that folded cursor {} was its seal "
+                "(cross outcome {})",
+                renderRefTxnId(exact_next_epoch), renderRefTxnId(from_cursor),
+                static_cast<uint8_t>(crossing.outcome));
+        return crossing.start;
+    };
+
+    RefTxnId id;
+    std::optional<RefTxnId> prior;
+    std::optional<bool> prior_is_seal;
+    if (cursor == RefTxnId{} || (ckpt.life_epoch && cursor.writer_epoch < *ckpt.life_epoch))
+    {
+        id = RefTxnId{*ckpt.life_epoch, 1};
+    }
+    else
+    {
+        /// A cursor can name any old epoch's `EpochSeal`, not just `ckpt.last_epoch_seal`. When its
+        /// body survives, decode it and cross with that direct kind evidence. If compaction removed the
+        /// cursor, first try its ordinary same-epoch successor; only a 404 there can ask the shared
+        /// chain proof to establish a cross with kind unknown. That preserves tails after a cleaned
+        /// cursor without guessing that a missing cursor was a seal.
+        const auto cursor_got = backend.get(layout.refLogKey(life, cursor));
+        if (cursor_got)
+        {
+            const RefLogTxn cursor_txn = decodeRefLogTxn(
+                openObject(FormatId::RefLog, cursor_got->bytes), ns.string(), cursor);
+            if (refLogTxnIsEpochSeal(cursor_txn))
+            {
+                if (cursor.writer_epoch == std::numeric_limits<uint64_t>::max())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS orphan sweep: folded epoch seal {} has no representable exact successor",
+                        renderRefTxnId(cursor));
+                id = RefTxnId{cursor.writer_epoch + 1, 1};
+            }
+            else
+            {
+                if (cursor.ref_sequence == std::numeric_limits<uint64_t>::max())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS orphan sweep: folded cursor {} has no representable exact successor",
+                        renderRefTxnId(cursor));
+                id = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+                prior = cursor;
+                prior_is_seal = false;
+            }
+        }
+        else
+        {
+            if (cursor.ref_sequence == std::numeric_limits<uint64_t>::max())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS orphan sweep: folded cursor {} has no representable exact successor",
+                    renderRefTxnId(cursor));
+            id = RefTxnId{cursor.writer_epoch, cursor.ref_sequence + 1};
+            prior = cursor;
+            prior_is_seal = std::nullopt;
+        }
+    }
+
+    while (id <= *ckpt.committed_through)
+    {
         const auto got = backend.get(layout.refLogKey(life, id));
         if (!got)
-            continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
+        {
+            /// A known ordinary predecessor cannot cross an epoch. Only an inherited cursor whose body
+            /// was compacted has unknown kind, and even then INV-2 permits exactly `{E+1,1}` rather than
+            /// an arbitrary later witness.
+            if (!prior || prior_is_seal.has_value())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS orphan sweep: committed tail log {} is absent under the supplied _ckpt frontier",
+                    renderRefTxnId(id));
+            id = cross_from_missing_cursor(*prior);
+            prior.reset();
+            prior_is_seal.reset();
+            continue;
+        }
         const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
         for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             if (edge.change < 0)
@@ -203,6 +290,25 @@ NamespaceProtection activeManifestKeys(Pool & store, const RootNamespace & ns,
                 active.insert(key);
                 protection.tail_removal_targets.insert(key);
             }
+
+        const bool is_seal = refLogTxnIsEpochSeal(txn);
+        if (const std::optional<RefTxnId> next = nextRefLogIdWithinCommittedFrontier(
+                id, is_seal, *ckpt.committed_through))
+        {
+            if (is_seal)
+            {
+                prior.reset();
+                prior_is_seal.reset();
+            }
+            else
+            {
+                prior = id;
+                prior_is_seal = false;
+            }
+            id = *next;
+        }
+        else
+            break;
     }
     return protection;
 }
@@ -213,6 +319,7 @@ NamespaceFoldView namespaceFoldView(Pool & store, const RootNamespace & ns)
 {
     NamespaceFoldView view;
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store.backend(), store.layout());
+    catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
     view.coverage = coverageOf(readAdoptedFoldSeal(store), catalog_cut, ns);
     return view;
 }
@@ -368,12 +475,27 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     /// The §6 premise's durable half, read before the protection view so both share one seal read.
     NamespaceFoldView view;
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store.backend(), store.layout());
+    catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
     view.coverage = coverageOf(readAdoptedFoldSeal(store), catalog_cut, ns);
+    const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, ns);
+    if (!catalog_entry || catalog_entry->state == NsState::Creating)
+        return 0;   /// absent/Creating names have no recovery authority and therefore no deletion authority
 
     NamespaceProtection protection;
     try
     {
-        protection = activeManifestKeys(store, ns, view.coverage);
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry->ns, catalog_entry->incarnation);
+        const std::optional<CkptSample> ckpt = readCkpt(backend, layout, life);
+        if (!ckpt)
+        {
+            const String warning = "CAS orphan sweep: namespace " + ns.string()
+                + " is catalog-named but its required _ckpt is absent; skipped, emptiness not confirmed";
+            LOG_WARNING(getLogger("CasOrphanManifestSweep"), "{}", warning);
+            if (warnings)
+                warnings->push_back(warning);
+            return 0;
+        }
+        protection = activeManifestKeys(store, *catalog_entry, ckpt->ckpt, view.coverage);
         view.tail_removal_targets = protection.tail_removal_targets;
 
     }
@@ -457,10 +579,22 @@ ManifestSweepResult planManifestCursorPage(
     /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 
+    /// Freeze every possible destructive candidate BEFORE the later catalog cut. A same-name rebirth can
+    /// replace this logical manifest key between the observations; classifying the old bytes against the
+    /// later lifecycle cut is safe only when deletion retains the old exact token, so the replacement
+    /// loses `deleteExact`. Do not take a fresh GET after the catalog read: that would splice new-life
+    /// bytes into old candidate selection and authorize their deletion with the new token.
+    std::map<String, std::optional<GetResult>> observed_candidates;
+    if (nomination_budget > 0)
+        for (const ListedKey & listed : page.keys)
+            if (parseListedManifestObject(layout, listed.key))
+                observed_candidates.emplace(listed.key, backend.get(listed.key));
+
     /// One seal and one later catalog cut for the whole page; every namespace joins through those same
     /// immutable observations.
     const std::optional<CasFoldSeal> adopted_seal = readAdoptedFoldSeal(store);
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    catalog_cut.life_index.throwIfAmbiguous("CAS orphan manifest sweep");
 
     std::map<String, bool> eligible_by_prefix;
     std::map<String, NamespaceFoldView> view_by_ns;
@@ -508,17 +642,21 @@ ManifestSweepResult planManifestCursorPage(
             continue;
         }
 
-        const String eligibility_key = parsed->ns.string() + "\n"
-            + std::to_string(parsed->prefix.writer_epoch) + "\n"
-            + std::to_string(parsed->prefix.build_sequence);
-        auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
-        if (eligible_inserted)
-            eligible_it->second = prefixEligible(store, parsed->ns, parsed->prefix);
-        if (!eligible_it->second)
+        const CatalogEntry * catalog_entry = catalogEntryOf(catalog_cut, parsed->ns);
+        if (catalog_entry)
         {
-            ++result.skipped;
-            decided_through = listed.key;
-            continue;
+            const String eligibility_key = parsed->ns.string() + "\n"
+                + std::to_string(parsed->prefix.writer_epoch) + "\n"
+                + std::to_string(parsed->prefix.build_sequence);
+            auto [eligible_it, eligible_inserted] = eligible_by_prefix.emplace(eligibility_key, false);
+            if (eligible_inserted)
+                eligible_it->second = prefixEligible(store, parsed->ns, parsed->prefix);
+            if (!eligible_it->second)
+            {
+                ++result.skipped;
+                decided_through = listed.key;
+                continue;
+            }
         }
 
         auto [view_it, view_inserted] = view_by_ns.emplace(parsed->ns.string(), NamespaceFoldView{});
@@ -526,14 +664,22 @@ ManifestSweepResult planManifestCursorPage(
         if (inserted)
         {
             view_it->second.coverage = coverageOf(adopted_seal, catalog_cut, parsed->ns);
-            const bool catalog_named = std::any_of(
-                catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
-                [&](const CatalogEntry & entry) { return entry.ns == parsed->ns; });
-            if (catalog_named && !catalog_recovery_authoritative)
+            if (catalog_entry && !catalog_recovery_authoritative)
             {
                 LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
-                    "CAS orphan sweep: retaining {} -- catalog-named namespace recovery is still "
-                    "LIST-dependent; exact committed frontier is unavailable", parsed->key);
+                    "CAS orphan sweep: retaining {} -- caller did not authorize catalog-named recovery",
+                    parsed->key);
+                errored_namespaces.insert(parsed->ns.string());
+                ++result.retained_no_coverage;
+                ++result.skipped;
+                decided_through = listed.key;
+                continue;
+            }
+            if (catalog_entry && catalog_entry->state == NsState::Creating)
+            {
+                LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                    "CAS orphan sweep: retaining {} -- catalog namespace is Creating and has no recovery authority",
+                    parsed->key);
                 errored_namespaces.insert(parsed->ns.string());
                 ++result.retained_no_coverage;
                 ++result.skipped;
@@ -544,10 +690,26 @@ ManifestSweepResult planManifestCursorPage(
             /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try
             {
-                NamespaceProtection protection =
-                    activeManifestKeys(store, parsed->ns, view_it->second.coverage);
-                view_it->second.tail_removal_targets = std::move(protection.tail_removal_targets);
-                active_it->second = std::move(protection.active);
+                if (catalog_entry)
+                {
+                    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(
+                        catalog_entry->ns, catalog_entry->incarnation);
+                    const std::optional<CkptSample> ckpt = readCkpt(backend, layout, life);
+                    if (!ckpt)
+                    {
+                        LOG_WARNING(getLogger("CasOrphanManifestSweep"),
+                            "CAS orphan sweep: namespace {} is catalog-named but its required _ckpt is absent; skipping",
+                            parsed->ns.string());
+                        errored_namespaces.insert(parsed->ns.string());
+                    }
+                    else
+                    {
+                        NamespaceProtection protection = activeManifestKeys(
+                            store, *catalog_entry, ckpt->ckpt, view_it->second.coverage);
+                        view_it->second.tail_removal_targets = std::move(protection.tail_removal_targets);
+                        active_it->second = std::move(protection.active);
+                    }
+                }
 
             }
             catch (const Exception & e)
@@ -564,41 +726,50 @@ ManifestSweepResult planManifestCursorPage(
             decided_through = listed.key;
             continue;
         }
-        if (active_it->second.contains(parsed->key))
+        if (catalog_entry && active_it->second.contains(parsed->key))
         {
             ++result.skipped;
             decided_through = listed.key;
             continue;
         }
 
-        /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
-        /// eligibility. A refusal is recorded rather than silent (Constraint 10).
-        String retain_reason;
-        SweepRetainClass retain_class = SweepRetainClass::None;
-        if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
-                                     &retain_reason, &retain_class))
+        /// If the post-observation catalog cut has no row, this candidate was necessarily created by a
+        /// now-dead life: creation publishes its row before any life-owned object. No current life can
+        /// name it, and a concurrent later creation can only replace its token after this observation.
+        /// A catalog-named row instead needs the ordinary coverage/owner proof below.
+        if (catalog_entry)
         {
-            /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
-            /// a counter, which is the only form in which this path can report itself (see
-            /// `ManifestSweepResult`). Both come from the predicate; neither is derived from the other.
-            LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
-                      "CAS orphan sweep: retaining {} -- {}", parsed->key, retain_reason);
-            switch (retain_class)
+            /// THE §6 SAFETY FLOOR, the same predicate `sweepNamespace` calls, under the same watermark
+            /// eligibility. A refusal is recorded rather than silent (Constraint 10).
+            String retain_reason;
+            SweepRetainClass retain_class = SweepRetainClass::None;
+            if (!manifestDeletionPremise(view_it->second, ManifestKey{parsed->key, parsed->prefix},
+                                         &retain_reason, &retain_class))
             {
-                case SweepRetainClass::NoCoverage:     ++result.retained_no_coverage; break;
-                case SweepRetainClass::Hold:           ++result.retained_hold; break;
-                case SweepRetainClass::UnconsumedSeal: ++result.retained_unconsumed_seal; break;
-                case SweepRetainClass::TailRemoval:    ++result.retained_tail_removal; break;
-                case SweepRetainClass::None:           break;   /// unreachable: the premise refused
+                /// The sentence goes to the debug log for whoever is chasing ONE object; the class goes to
+                /// a counter, which is the only form in which this path can report itself (see
+                /// `ManifestSweepResult`). Both come from the predicate; neither is derived from the other.
+                LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                          "CAS orphan sweep: retaining {} -- {}", parsed->key, retain_reason);
+                switch (retain_class)
+                {
+                    case SweepRetainClass::NoCoverage:     ++result.retained_no_coverage; break;
+                    case SweepRetainClass::Hold:           ++result.retained_hold; break;
+                    case SweepRetainClass::UnconsumedSeal: ++result.retained_unconsumed_seal; break;
+                    case SweepRetainClass::TailRemoval:    ++result.retained_tail_removal; break;
+                    case SweepRetainClass::None:           break;   /// unreachable: the premise refused
+                }
+                ++result.skipped;
+                decided_through = listed.key;
+                continue;
             }
-            ++result.skipped;
-            decided_through = listed.key;
-            continue;
         }
 
-        /// Exact GET is load-bearing: the token and the bytes used to derive source identities must be
-        /// one observation. A LIST token plus a later GET could mix manifest incarnations.
-        const auto got = backend.get(parsed->key);
+        /// This exact token and bytes were captured before the catalog cut (see above). A missing body
+        /// has no deletion authority; a later replacement loses the old token at `deleteExact`.
+        const auto observed_it = observed_candidates.find(parsed->key);
+        chassert(observed_it != observed_candidates.end());
+        const std::optional<GetResult> & got = observed_it->second;
         if (!got)
         {
             ++result.skipped;

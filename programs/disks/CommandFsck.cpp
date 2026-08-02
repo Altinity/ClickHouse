@@ -116,7 +116,6 @@ public:
                     case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
                     case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
                     case Cas::FsckClass::StaleEdge:   c = "stale-edge"; break;
-                    case Cas::FsckClass::SnapshotOracleMismatch: c = "snapshot-oracle-mismatch"; break;
                     case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
                     case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
                     case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
@@ -143,12 +142,7 @@ public:
                 "durable id of the same epoch, which contiguity (INV-1) makes impossible without a lost "
                 "record; every transaction above the hole is unreachable (positions are listed as "
                 "`chain-broken` rows under --detail)", report.chain_broken);
-        if (report.snapshot_oracle_mismatches > 0)
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "ca-fsck: {} table snapshot(s) diverge from an independent replay of their logs "
-                "(cache/codec corruption, spec §Snapshot Publication oracle)", report.snapshot_oracle_mismatches);
-        /// The third term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
+        /// A term of `clean()`, and until 2026-07-26 the only one that neither printed nor exited
         /// nonzero — so a corrupt run was invisible twice over. A seal-checksum mismatch is not debris:
         /// `fold`/`zeroInDegree`/`previewDeletes` all fail closed on the same run, so GC cannot make
         /// progress past it, and the audit deliberately continues only so ONE pass enumerates them all.

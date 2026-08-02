@@ -500,20 +500,19 @@ Workload:
   insert/select workload, plus a short high-probability burst. Thread-allocation faults are NOT part
   of this card — they are a different fault class with a different blast radius and live in `S43`.
 - Leg C: disarm, quiesce, `GC` to fixpoint, detail-mode `fsck`, restart both servers, and compare
-  the journal-rebuilt view with the pre-restart view; plus the `fsck` snapshot integrity oracle,
-  which replays each table's surviving covered ref logs and compares the re-encoded snapshot with
-  the published object.
+  the journal-rebuilt view with the pre-restart view. `fsck` derives its ref view from catalog plus
+  exact `_ckpt` authority; stream LIST does not nominate diagnostic state.
 
 Observations:
 
 - `CasRefApplyPoisoned`, `QueryMemoryLimitExceeded`, `CasRefAppendWedged`/`CasRefAppendUnwedged`/
   `CasRefAppendDefiniteFailure`, `CasGcUnmatchedRemoveDeltas` (reported, never gating),
-  `fsck` `stale_edge`/`unaccounted`/`snapshot_oracle_*`, acked-vs-lost blocks, max query duration.
+  `fsck` `stale_edge`/`unaccounted`, acked-vs-lost blocks, max query duration.
 
 Expected:
 
 - Zero `LOGICAL_ERROR`, zero `CasRefApplyPoisoned`, every acked insert present, replicas agree,
-  `fsck` `dangling=0`/`unaccounted=0`/`stale_edge=0` in detail mode, snapshot oracle clean, `GC`
+  `fsck` `dangling=0`/`unaccounted=0`/`stale_edge=0` in detail mode, `GC`
   rounds succeed after disarm, no permanently wedged ref lane, no query hung past its bound.
 - Soundness guard: the run is `inconclusive` unless a TARGETED signal is nonzero (a
   `CasRefApplyPoisoned` transition or a post-PUT apply failpoint hit). A nonzero

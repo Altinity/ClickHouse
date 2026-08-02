@@ -83,23 +83,40 @@ NamespaceJanitorResult NamespaceJanitor::runOnePage(
         if (ambiguous || suppress_deletes || catalog_cut.life_index.resolve(*life_id))
             continue;
 
-        Token token;
-        if (listed.token)
-            token = *listed.token;
-        else
+        std::optional<Token> token = listed.token;
+        if (!token)
         {
-            const HeadResult current = backend.head(listed.key);
-            if (!current.exists)
+            try
+            {
+                const HeadResult current = backend.head(listed.key);
+                if (!current.exists)
+                    continue;
+                token = current.token;
+            }
+            catch (const std::exception & e)
+            {
+                ++result.leaked;
+                result.anomalies.push_back(
+                    "leaked dead-life object '" + listed.key + "': exact HEAD failed: " + e.what());
                 continue;
-            token = current.token;
+            }
         }
         if (!fence_held())
         {
             page_decided = false;
             break;
         }
-        if (backend.deleteExact(listed.key, token).kind == DeleteOutcome::Kind::Deleted)
-            ++result.deleted;
+        try
+        {
+            if (backend.deleteExact(listed.key, *token).kind == DeleteOutcome::Kind::Deleted)
+                ++result.deleted;
+        }
+        catch (const std::exception & e)
+        {
+            ++result.leaked;
+            result.anomalies.push_back(
+                "leaked dead-life object '" + listed.key + "': exact delete failed: " + e.what());
+        }
     }
 
     /// Recheck even when the page had no dead candidate. A tenure that observes fence loss after LIST

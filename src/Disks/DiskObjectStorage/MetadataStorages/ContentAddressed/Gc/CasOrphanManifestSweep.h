@@ -168,6 +168,9 @@ struct ManifestSweepResult
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
 /// log-only. `NotFound`/`TokenMismatch` delete outcomes stay silently spared either way — those are the
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
+/// This direct decommission path relies on the caller's held server-root claim/fence: while that claim
+/// is held, a same-server-root rebirth cannot become live between its catalog cut and exact-token delete.
+/// It still rejects every catalog cut with an ambiguous current life id before making any deletion decision.
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr);
 
@@ -188,8 +191,8 @@ ManifestSweepResult sweepManifestCursorPage(
 
 /// Plan one cursor page without deleting. Every candidate is exact-GET, decoded and identity-validated;
 /// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
-/// Catalog-named namespaces are retain-only unless the caller explicitly supplies a closed recovery
-/// authority (the production recovery path is still LIST-dependent at this stage).
+/// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its
+/// frozen catalog cut and the exact `_ckpt` frontier of the life named there.
 ManifestSweepResult planManifestCursorPage(
     Pool & store,
     const String & cursor,

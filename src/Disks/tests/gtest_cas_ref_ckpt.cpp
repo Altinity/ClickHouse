@@ -15,6 +15,8 @@
 #include <Common/SipHash.h>
 #include <base/hex.h>
 
+#include <Poco/Exception.h>
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -165,24 +167,147 @@ private:
     String watched_key;
 };
 
+/// Records the exact `_ckpt` recovery protocol and injects an ambiguous CAS response. The fault is
+/// armed only after fixture setup, so the journal contains solely the operation under test.
+class AmbiguousCkptBackend : public CountingBackend
+{
+public:
+    enum class Fault : uint8_t
+    {
+        None,
+        CommitThenThrow,
+        ThrowWithoutCommit,
+        AlwaysThrowWithoutCommit,
+    };
+
+    using CountingBackend::casPut;
+    using CountingBackend::get;
+
+    String watched_key;
+    Fault fault = Fault::None;
+    String dominating_bytes;
+    bool fail_resolution_get = false;
+    std::function<void()> before_resolution_get;
+    std::function<void()> after_resolution_get;
+    std::vector<String> journal;
+
+    void arm(const String & key, Fault fault_)
+    {
+        watched_key = key;
+        fault = fault_;
+        watched_get_count = 0;
+        journal.clear();
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (key != watched_key)
+            return CountingBackend::get(key, range);
+
+        journal.push_back("GET");
+        ++watched_get_count;
+        if (watched_get_count >= 2 && before_resolution_get)
+            before_resolution_get();
+        if (watched_get_count == 2 && fail_resolution_get)
+            throw Poco::TimeoutException("AmbiguousCkptBackend: exact-read response lost");
+        auto result = CountingBackend::get(key, range);
+        if (watched_get_count >= 2 && after_resolution_get)
+            after_resolution_get();
+        return result;
+    }
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        if (key != watched_key)
+            return CountingBackend::casPut(key, bytes, expected, meta);
+
+        journal.push_back("CAS");
+        if (fault == Fault::None)
+            return CountingBackend::casPut(key, bytes, expected, meta);
+        const Fault this_fault = fault;
+        if (fault != Fault::AlwaysThrowWithoutCommit)
+            fault = Fault::None;
+        if (this_fault == Fault::CommitThenThrow)
+        {
+            const CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
+            if (result.outcome == CasOutcome::Committed && !dominating_bytes.empty())
+            {
+                const HeadResult head_result = CountingBackend::head(key);
+                EXPECT_EQ(CountingBackend::putOverwrite(key, dominating_bytes, head_result.token).outcome,
+                          PutOutcome::Done);
+            }
+        }
+        throw Poco::TimeoutException("AmbiguousCkptBackend: CAS response lost");
+    }
+
+private:
+    size_t watched_get_count = 0;
+};
+
 }
 
 /// ---------------------------------------------------------------------------------------------
 /// The codec
 /// ---------------------------------------------------------------------------------------------
 
-/// Every combination of the two optionals survives a round trip. Both-absent is the shape a namespace
+/// Every combination of the frontier and existing optionals survives a round trip. Both-absent is the shape a namespace
 /// carries from creation until its first snapshot, so it is a real state and not a degenerate one.
 TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
 {
     const std::vector<RefCkpt> cases = {
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = std::nullopt},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
-        RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,       .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
+        RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1},
     };
     for (const RefCkpt & ckpt : cases)
         EXPECT_EQ(decodeRefCkpt(encodeRefCkpt(ckpt)), ckpt);
+}
+
+TEST(CasRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
+{
+    const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
+                       .committed_through = RefTxnId{9, 11},
+                       .checkpoint_snapshot_id = RefTxnId{9, 10},
+                       .last_epoch_seal = RefTxnId{8, 12}};
+    const String expected = R"({"type":"cas_ref_ckpt","v":9}
+{"le":"7","cte":"9","cts":"11","cse":"9","css":"10","lse":"8","lss":"12"}
+)";
+
+    EXPECT_EQ(encodeRefCkpt(ckpt), expected);
+    EXPECT_EQ(decodeRefCkpt(expected), ckpt);
+}
+
+/// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier
+/// itself when that frontier is the terminal seal, or closes the immediately preceding numeric epoch.
+/// Accepting a gap or a later same-epoch frontier would manufacture a boundary that INV-2 never proved.
+TEST(CasRefCkpt, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
+{
+    const RefCkpt valid{.life_epoch = 7, .committed_through = RefTxnId{8, 5},
+                        .checkpoint_snapshot_id = RefTxnId{7, 4}, .last_epoch_seal = RefTxnId{7, 9}};
+    EXPECT_NO_THROW(encodeRefCkpt(valid));
+
+    const RefCkpt skipped_epoch{.life_epoch = 7, .committed_through = RefTxnId{10, 1},
+                                 .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{7, 9}};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(skipped_epoch); });
+
+    const RefCkpt frontier_after_same_epoch_seal{.life_epoch = 7, .committed_through = RefTxnId{8, 5},
+                                                 .checkpoint_snapshot_id = std::nullopt,
+                                                 .last_epoch_seal = RefTxnId{8, 1}};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+                     [&] { encodeRefCkpt(frontier_after_same_epoch_seal); });
+
+    const RefCkpt unsealed_non_genesis{.life_epoch = 7, .committed_through = RefTxnId{8, 1},
+                                        .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(unsealed_non_genesis); });
+
+    String malformed = encodeRefCkpt(valid);
+    const size_t cte = malformed.find("\"cte\":\"8\"");
+    ASSERT_NE(cte, String::npos);
+    malformed.replace(cte, String{"\"cte\":\"8\""}.size(), "\"cte\":\"10\"");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
 }
 
 /// STRICT means an unknown key is corruption, not something to skip. A `_ckpt` decides deletions, so a
@@ -190,7 +315,7 @@ TEST(CasRefCkpt, RoundTripsEveryFieldCombination)
 /// partly read.
 TEST(CasRefCkpt, RejectsAnUnknownKey)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_1,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
                                               .last_epoch_seal = std::nullopt});
     String with_unknown = good;
     with_unknown.replace(with_unknown.rfind('}'), 1, R"(,"zz":"1"})");
@@ -218,7 +343,7 @@ TEST(CasRefCkpt, RejectsADuplicateKey)
 /// "recovery has no base" and would be trusted.
 TEST(CasRefCkpt, RejectsTruncation)
 {
-    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_2,
+    const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2,
                                               .last_epoch_seal = std::nullopt});
 
     const String header_only = good.substr(0, good.find('\n') + 1);
@@ -238,6 +363,9 @@ TEST(CasRefCkpt, RejectsTruncation)
 
     const String other_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","lss":"2"})" + "\n";
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(other_half); });
+
+    const String frontier_half = good.substr(0, good.find('\n') + 1) + R"({"le":"7","cte":"1"})" + "\n";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(frontier_half); });
 }
 
 TEST(CasRefCkpt, RejectsTrailingBytes)
@@ -261,6 +389,8 @@ TEST(CasRefCkpt, RejectsInvalidFieldsOnEncodeAndOnDecode)
         [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = RefTxnId{1, 0}, .last_epoch_seal = std::nullopt}); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = RefTxnId{0, 1}}); });
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [] { encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt}); });
 
     const String header = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                                 .last_epoch_seal = std::nullopt});
@@ -419,7 +549,7 @@ TEST(CasRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_partial_create"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
-    const RefCkpt publisher{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt publisher{.life_epoch = std::nullopt, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, publisher, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -428,13 +558,13 @@ TEST(CasRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
     EXPECT_EQ(created->ckpt.checkpoint_snapshot_id, ID_1_1);
     EXPECT_FALSE(created->ckpt.life_epoch.has_value()) << "the publisher must not invent a genesis epoch";
 
-    const RefCkpt birth{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt,
+    const RefCkpt birth{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt,
                         .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, birth, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
     const auto completed = readCkpt(*backend, layout, life);
     ASSERT_TRUE(completed.has_value());
-    EXPECT_EQ(completed->ckpt.life_epoch, 5u);
+    EXPECT_EQ(completed->ckpt.life_epoch, 1u);
     EXPECT_EQ(completed->ckpt.checkpoint_snapshot_id, ID_1_1) << "and must not lose the checkpoint on the way in";
 }
 
@@ -447,7 +577,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
     const RootNamespace ns{"srv1/ckpt_conflict"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
@@ -460,13 +590,13 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
         if (interfered)
             return;
         interfered = true;
-        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+        const RefCkpt sealer{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
         const HeadResult h = backend->head(key);
         ASSERT_EQ(backend->putOverwrite(key, encodeRefCkpt(mergeCkpt(base, sealer)), h.token).outcome,
                   PutOutcome::Done);
     };
 
-    const RefCkpt publisher{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt publisher{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, publisher, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
 
@@ -476,7 +606,7 @@ TEST(CasRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
     EXPECT_EQ(sample->ckpt.last_epoch_seal, ID_2_1)
         << "the concurrent writer's seal must survive our retry -- a retry that reused the body read "
            "before the conflict would silently drop it (TLC `_sab_sealclobbersbase`)";
-    EXPECT_EQ(sample->ckpt.life_epoch, 5u);
+    EXPECT_EQ(sample->ckpt.life_epoch, 1u);
     EXPECT_GE(backend->casPutCount(key), 2u) << "the first CAS must have been rejected, not skipped";
 }
 
@@ -490,7 +620,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     const RootNamespace ns{"srv1/ckpt_noop"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt full{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
+    const RefCkpt full{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_2_1, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_2_1};
 
     ASSERT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
@@ -500,7 +630,7 @@ TEST(CasRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
     /// The same contribution again, and a strictly OLDER one: neither adds anything.
     EXPECT_EQ(publishCkpt(*backend, layout, life, full, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
-    const RefCkpt older{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt older{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, older, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::IdenticalSkip);
 
@@ -518,7 +648,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
     const RootNamespace ns{"srv1/ckpt_fenced"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
     ASSERT_EQ(publishCkpt(*backend, layout, life, base, 1, ALWAYS_ADMITTED, generousDeadline()),
               CkptPublishOutcome::Published);
     const Token token_before = backend->head(key).token;
@@ -533,7 +663,7 @@ TEST(CasRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
             "fence generation moved since admission ({})", admitted);
     };
 
-    const RefCkpt advance{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     EXPECT_EQ(publishCkpt(*backend, layout, life, advance, 1, moved_fence, generousDeadline()),
               CkptPublishOutcome::FencedOut);
     EXPECT_EQ(backend->casPutCount(key), writes_before) << "the check precedes the CAS, so nothing is sent";
@@ -550,7 +680,7 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
     const RootNamespace ns{"srv1/ckpt_exhausted"};
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
-    const RefCkpt base{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
+    const RefCkpt base{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = std::nullopt};
 
     auto backend = std::make_shared<GetHookBackend>(key);
     ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
@@ -568,11 +698,151 @@ TEST(CasRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
             backend->putOverwrite(key, encodeRefCkpt(base), h.token);
     };
 
-    const RefCkpt advance{.life_epoch = std::nullopt, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
+    const RefCkpt advance{.life_epoch = std::nullopt, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt};
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { publishCkpt(*backend, layout, life, advance, 1, ALWAYS_ADMITTED, CkptDeadline{[&] { return now; }, 5}); });
     EXPECT_EQ(readCkptOrFail(*backend, layout, life), base) << "no partial state: every attempt either "
                                                              "committed the complete merged body or wrote nothing";
+}
+
+TEST(CasRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_committed"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
+}
+
+TEST(CasRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_retry"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->arm(key, AmbiguousCkptBackend::Fault::ThrowWithoutCommit);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET", "CAS"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
+}
+
+TEST(CasRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_dominating"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt contribution{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    const RefCkpt dominating{.life_epoch = 1, .committed_through = ID_2_1,
+                             .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = ID_2_1};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->dominating_bytes = encodeRefCkpt(dominating);
+    backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+    EXPECT_EQ(publishCkpt(*backend, layout, life, contribution, 7, ALWAYS_ADMITTED, generousDeadline()),
+              CkptPublishOutcome::Published);
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), dominating);
+}
+
+TEST(CasRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguous_read_failed"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    backend->fail_resolution_get = true;
+    backend->arm(key, AmbiguousCkptBackend::Fault::ThrowWithoutCommit);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        publishCkpt(*backend, layout, life, RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                    .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 7,
+                    ALWAYS_ADMITTED, generousDeadline());
+    });
+    EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), base);
+}
+
+TEST(CasRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
+{
+    for (const bool move_before_read : {true, false})
+    {
+        auto backend = std::make_shared<AmbiguousCkptBackend>();
+        const Layout layout{"p"};
+        const NamespaceLifeId life = NamespaceLifeId::stageATransition(
+            RootNamespace{move_before_read ? "srv1/ckpt_fence_before_resolution" : "srv1/ckpt_fence_after_resolution"});
+        const String key = layout.refCkptKey(life);
+        const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                           .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+        ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+        bool admitted = true;
+        const auto move_fence = [&] { admitted = false; };
+        if (move_before_read)
+            backend->before_resolution_get = move_fence;
+        else
+            backend->after_resolution_get = move_fence;
+        backend->arm(key, AmbiguousCkptBackend::Fault::CommitThenThrow);
+
+        const auto check_admission = [&](uint64_t)
+        {
+            if (!admitted)
+                throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "fence moved");
+        };
+        EXPECT_EQ(publishCkpt(*backend, layout, life,
+                              RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                                      .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}, 7,
+                              check_admission, generousDeadline()), CkptPublishOutcome::FencedOut);
+        EXPECT_EQ(backend->journal, (std::vector<String>{"GET", "CAS", "GET"}));
+    }
+}
+
+TEST(CasRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCasAttempts)
+{
+    auto backend = std::make_shared<AmbiguousCkptBackend>();
+    const Layout layout{"p"};
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(RootNamespace{"srv1/ckpt_ambiguity_deadline"});
+    const String key = layout.refCkptKey(life);
+    const RefCkpt base{.life_epoch = 1, .committed_through = ID_1_1,
+                       .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
+    ASSERT_EQ(backend->casPut(key, encodeRefCkpt(base), std::nullopt).outcome, CasOutcome::Committed);
+    uint64_t now = 0;
+    backend->after_resolution_get = [&] { ++now; };
+    backend->arm(key, AmbiguousCkptBackend::Fault::AlwaysThrowWithoutCommit);
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        publishCkpt(*backend, layout, life,
+                    RefCkpt{.life_epoch = std::nullopt, .committed_through = ID_1_2,
+                            .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
+                    7, ALWAYS_ADMITTED, CkptDeadline{[&] { return now; }, 3});
+    });
+    EXPECT_EQ(backend->journal,
+              (std::vector<String>{"GET", "CAS", "GET", "CAS", "GET", "CAS", "GET"}));
+    EXPECT_EQ(readCkptOrFail(*backend, layout, life), base);
 }
 
 /// A `_ckpt` that does not decode is NEVER overwritten. It is the only record of recovery's base and
@@ -586,7 +856,7 @@ TEST(CasRefCkpt, ACorruptCheckpointIsNeverOverwritten)
     const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
     const String key = layout.refCkptKey(life);
     ASSERT_EQ(publishCkpt(*backend, layout, life,
-                          RefCkpt{.life_epoch = std::optional<uint64_t>{5}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
+                          RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = std::nullopt},
                           1, ALWAYS_ADMITTED, generousDeadline()), CkptPublishOutcome::Published);
 
     const String garbage = "not a cas object\n";
@@ -732,7 +1002,8 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
     const String key = store->layout().refCkptKey(life);
     const uint64_t writes_after_birth = backend->casPutCount(key);
-    EXPECT_EQ(writes_after_birth, 1u) << "the birth creates the object with exactly one CAS";
+    EXPECT_EQ(writes_after_birth, 2u)
+        << "birth publishes `life_epoch` before its log, then the durable log's committed frontier";
 
     ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_birth + 1) << "one publication, one checkpoint CAS";
@@ -746,6 +1017,41 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
     EXPECT_EQ(backend->casPutCount(key), writes_after_publish);
     EXPECT_EQ(readCkptOrFail(*backend, store->layout(), life), after_publish->ckpt);
+}
+
+TEST(CasRefCkpt, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{"srv1/no_snapshot_at_seal"};
+    uint64_t predecessor_epoch = 0;
+    {
+        auto predecessor = openPool(backend);
+        predecessor_epoch = predecessor->writerEpoch();
+        ASSERT_EQ(publishRef(predecessor, ns, "ref_1", 1), (RefTxnId{predecessor_epoch, 1}));
+    }
+
+    auto store = openPool(backend);
+    ASSERT_GT(store->writerEpoch(), predecessor_epoch);
+    ASSERT_EQ(store->listRefs(ns).size(), 1u) << "recovery must close the predecessor epoch before publishing";
+
+    const RefTxnId seal_id{predecessor_epoch, 2};
+    const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
+    const String snapshot_key = store->layout().refSnapshotKey(life, seal_id);
+    const String ckpt_key = store->layout().refCkptKey(life);
+    ASSERT_EQ(store->lastEpochSealForTest(ns), std::make_optional(seal_id));
+    ASSERT_EQ(readCkptOrFail(*backend, store->layout(), life).committed_through, std::make_optional(seal_id));
+    const uint64_t snapshot_puts_before = backend->putCount(snapshot_key);
+    const uint64_t ckpt_cas_before = backend->casPutCount(ckpt_key);
+
+    /// Recovery installed the epoch seal as the runtime's greatest applied transaction. The publisher
+    /// must decline it without reaching either durable write.
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    EXPECT_EQ(backend->putCount(snapshot_key), snapshot_puts_before);
+    EXPECT_EQ(backend->casPutCount(ckpt_key), ckpt_cas_before);
+
+    /// Once an ordinary transaction advances the candidate beyond the seal, normal publication resumes.
+    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 1}));
+    EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
 }
 
 /// Publication replays a `NeedsRecovery` lane before it captures a snapshot and advances `_ckpt`.
@@ -874,21 +1180,23 @@ TEST(CasRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
     /// The BODY is checked as exact length plus a 128-bit SipHash of it -- not literally byte for byte,
     /// but any change that survives both is a 128-bit collision at a fixed length, which is the trade for
     /// keeping the assertion readable. It is a function of `{format generation, ns, id, ops,
-    /// chain_link}` only -- no incarnation reaches it. The generation-8 wire cut therefore updates
+    /// chain_link}` only -- no incarnation reaches it. The generation-9 committed-frontier cut updates
     /// the hash while leaving the payload shape and exact length unchanged.
     const auto got = backend->get(key);
     ASSERT_TRUE(got.has_value()) << "the birth chunk must be durable at its canonical key";
     EXPECT_EQ(got->bytes.size(), 177u) << "the sealed ref-log body changed size";
     SipHash body_hash;
     body_hash.update(got->bytes.data(), got->bytes.size());
-    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "5d6227e50bc062a51be2672615e0474c")
+    EXPECT_EQ(getHexUIntLowercase(body_hash.get128()), "784e7fd1ae0010f9cffdac1796730070")
         << "the sealed ref-log body changed content -- preparation must seal the same bytes it sealed "
            "before the extraction";
 }
 
 /// The directive's "preserve backend request counts", asserted rather than assumed: preparation is pure,
 /// so lifting it out must not add or remove a single request. One birth chunk = exactly one write-once
-/// `PUT` at the ref-log key, no read-back, and exactly one `_ckpt` CAS.
+/// `PUT` at the ref-log key, no read-back, plus the two ordered `_ckpt` CASes required by the protocol:
+/// creation publishes `life_epoch` before the log and the append lane publishes `committed_through`
+/// after the log is durable.
 ///
 /// COUNTS per key. Request ORDER is not checked here and cannot be with these counters; the ordering
 /// that matters for a birth -- `_ckpt` before the ref-log `PUT` -- is argued at the call site and would
@@ -912,9 +1220,9 @@ TEST(CasRefCkpt, AppendRequestCountUnchangedByExtraction)
     /// itself, the position the birth chunk is about to occupy. That GET precedes the Committed PUT;
     /// the PUT itself still owes no read-back.
     EXPECT_EQ(backend->getCount(log_key), 1u) << "one grounding probe from recovery, before the birth PUT";
-    EXPECT_EQ(backend->casPutCount(ckpt_key), 1u)
-        << "the birth contributes `life_epoch` in exactly one `_ckpt` CAS -- deciding that contribution "
-           "earlier must not publish it twice, nor move the publish off the birth path";
+    EXPECT_EQ(backend->casPutCount(ckpt_key), 2u)
+        << "the birth contributes `life_epoch` before its log and `committed_through` after the durable "
+           "log; these are two different ordering obligations, not a duplicate publication";
 }
 
 /// The post-durable install region is the reason preparation has to happen where it does: once "this

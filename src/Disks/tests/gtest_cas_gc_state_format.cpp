@@ -23,7 +23,7 @@ TEST(CasFormatBattery, GcState)
     runFormatBattery({FormatId::GcState,
         [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
         [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
-        "{\"type\":\"cas_gc_state\",\"v\":8}\n"
+        currentFormatHeader("cas_gc_state") +
         "{\"rnd\":\"4\",\"gcs\":1,\"sg\":\"9\",\"spt\":\"7\",\"sa\":\"3\",\"msc\":\"\","
         "\"lo\":\"00000000000000000000000000000001\",\"ls\":\"12\"}\n"});
 }
@@ -34,7 +34,7 @@ TEST(CasFormatBattery, GcHeartbeat)
     runFormatBattery({FormatId::GcHeartbeat,
         [&] { return sealObject(FormatId::GcHeartbeat, encodeGcHeartbeat(hb)); },
         [](std::string_view d) { decodeGcHeartbeat(std::string(openObject(FormatId::GcHeartbeat, d))); },
-        "{\"type\":\"cas_gc_hb\",\"v\":8}\n"
+        currentFormatHeader("cas_gc_hb") +
         "{\"by\":\"00000000000000000000000000000001\",\"seq\":\"1741\"}\n"});
 }
 

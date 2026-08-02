@@ -147,13 +147,15 @@ std::map<String, String> refsOf(const PoolPtr & store, const RootNamespace & ns)
 void seedFiveRecordStream(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     seedPoolMetaForRestart(backend, layout.poolPrefix());
-    backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
-                        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                                              .checkpoint_snapshot_id = std::nullopt,
-                                              .last_epoch_seal = std::nullopt}));
     for (uint64_t i = 1; i <= 5; ++i)
         publishAt(backend, layout, ns, RefTxnId{1, i}, "ref_" + std::to_string(i), i,
                   DB::UInt128(i), /*birth=*/i == 1);
+    writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 5},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 }
 
 /// The exact defect shape: ids 3 and 4 invisible while the LATER id 5 is visible.
@@ -281,6 +283,12 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_a", 1, shared, /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_b", 2, shared);
     dropAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_a", publishedManifest(RefTxnId{1, 1}, 1));
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2})});
 
@@ -333,6 +341,12 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
     /// a listing-driven walk would merely stop below it -- deferring the `-1` rather than sealing past
     /// it, which is not the permanent damage this arm is about.
     publishAt(*backend, layout, ns, RefTxnId{1, 3}, "ref_c", 3, unrelated);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 3},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     backend->setListOmissions({layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2})});
 
@@ -471,13 +485,18 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
 
     publishAt(*backend, layout, hidden, RefTxnId{1, 1}, "kept_ref", 1, blob, /*birth=*/true);
     const ManifestRef kept = publishedManifest(RefTxnId{1, 1}, 1);
+    writeRecoverableCkptForRawFixture(*backend, layout, hidden, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
 
-    /// `hidden`'s birth is folded (and its cursor SEALED) while everything is still listed -- a
-    /// namespace with no `_ckpt` (`publishAt`'s raw-fixture admission never publishes one) has no
-    /// genesis signal except a sealed cursor or a visible LIST, so a real fold first is what makes an
-    /// arithmetic (cursor-relative) genesis available for what follows.
+    /// `hidden`'s birth is folded (and its cursor SEALED) while everything is still listed. Its
+    /// checkpoint proves that exact initial frontier; the real fold then makes the arithmetic
+    /// (cursor-relative) genesis available for what follows.
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     store->renewWatermarkOnce();
 
@@ -490,11 +509,18 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
     /// to read past a round's own listed tail even by exact key, so the drop would never fold no matter
     /// how many rounds ran.)
     dropAt(*backend, layout, hidden, RefTxnId{1, 2}, "kept_ref", kept);
+    advanceRecoverableCkptForRawFixture(*backend, layout, hidden, RefTxnId{1, 2});
     backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(hidden)));
 
     publishAt(*backend, layout, visible, RefTxnId{1, 1}, "dropped_ref", 2, blob, /*birth=*/true);
     const ManifestRef dropped = publishedManifest(RefTxnId{1, 1}, 2);
     dropAt(*backend, layout, visible, RefTxnId{1, 2}, "dropped_ref", dropped);
+    writeRecoverableCkptForRawFixture(*backend, layout, visible, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     for (int i = 0; i < 5; ++i)
     {
@@ -511,14 +537,12 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
 
 /// ===================== FSCK =====================
 ///
-/// fsck runs TWO passes over a namespace's ref stream and they do not agree about what a listing is.
+/// fsck runs two checkpoint-grounded passes over a namespace's ref stream.
 ///
 ///   * `checkRefStream` walks arithmetically by exact key. An omitted-but-durable record is a
 ///     non-event to it, exactly as it is to the GC fold. That is the pass the arms below pin.
-///   * the reachability pass then calls `recoverRefTable` -- documented at its call site as "a full
-///     LIST + replay" (`Tools/CasFsck.cpp`) -- to learn which manifests the namespace's refs own.
-///     That one still treats the listing as a census, and these two tests are what makes the
-///     consequence visible rather than theoretical.
+///   * the reachability pass uses the same catalog row and exact `_ckpt` to recover the ref table
+///     without stream enumeration.
 ///
 /// Both arms are written against an HONEST TWIN seeded by the same code, not against hand-written
 /// expectations: the claim is "identical to the truth", and a pass that quietly examined fewer records
@@ -545,6 +569,8 @@ TEST(CasListLiarEndToEnd, FsckArithmeticStreamAuditIsUnmovedByAHiddenMiddle)
 
     EXPECT_TRUE(truth.clean()) << "the oracle itself must be clean, or the comparison means nothing";
     EXPECT_GT(truth.ref_records_walked, 0u);
+    EXPECT_GT(truth.reachable, 0u)
+        << "the honest oracle must recover at least one live object, or reachability equality is vacuous";
 
     /// The arithmetic pass: a hidden record is a non-event, and no finding is manufactured out of it.
     EXPECT_TRUE(under_lie.clean())
@@ -555,36 +581,16 @@ TEST(CasListLiarEndToEnd, FsckArithmeticStreamAuditIsUnmovedByAHiddenMiddle)
     EXPECT_EQ(under_lie.ref_records_walked, truth.ref_records_walked)
         << "the arithmetic walk must read the SAME number of records under the lie";
 
-    /// THE GAP, PINNED SO IT CANNOT BE FORGOTTEN. The listing-driven replay meets `{1,5}` right after
-    /// `{1,2}`, refuses the non-contiguous tail with `CORRUPTED_DATA`, and fsck's per-namespace catch
-    /// turns that into the `Unchecked` verdict -- so the audit computes NO reachability for a namespace
-    /// that is in perfect health. That is fail-CLOSED (it reports that it could not check, rather than a
-    /// false all-clear), which is why `clean()` above still holds and why this is a coverage hole and
-    /// not a loss.
-    ///
-    /// The end state, once the replay walks arithmetically like everything else, is
-    /// `unchecked == 0` and `reachable == truth.reachable`. This assertion is deliberately written to
-    /// FAIL on that day so the fix updates it, instead of the residual quietly outliving its cause.
-    EXPECT_EQ(under_lie.unchecked, 1u)
-        << "expected the KNOWN Stage A residual: fsck's reachability replay is listing-driven, so the "
-           "namespace comes back `Unchecked`. If this now reads 0, the replay was made arithmetic -- "
-           "delete this assertion and restore the `reachable == truth.reachable` equality below";
-    EXPECT_EQ(under_lie.reachable, 0u)
-        << "and with the namespace unchecked, fsck computes no reachability for it at all";
+    EXPECT_EQ(under_lie.unchecked, 0u)
+        << "an omitted durable record must not turn a healthy checkpoint-bounded namespace unchecked";
+    EXPECT_EQ(under_lie.reachable, truth.reachable)
+        << "the reachability recovery must observe the same exact committed frontier under the lie";
 }
 
-/// THE WORSE HALF, AND THE REASON THE ARM ABOVE IS NOT THE WHOLE STORY. A hidden record in the MIDDLE
-/// makes the listing-driven replay meet a non-contiguous tail, and it fails closed. A hidden record at
-/// the TAIL produces no such contradiction: the replay simply ends one transaction early and returns a
-/// table that looks complete. Nothing throws, nothing is `Unchecked`, and fsck reports a clean bill of
-/// health over a ref set that is missing an ACKED publish.
-///
-/// This is the blocker's own recovery shape, still live inside fsck's replay -- and the same
-/// `recoverRefTableDetailed` builds the orphan-manifest sweep's DELETION premise
-/// (`Gc/CasOrphanManifestSweep.cpp`, `activeManifestKeys`), where a silently short owner set is a
-/// manifest body deleted out from under a live ref. Nothing can fire today, because Stage A suppresses
-/// every destructive site; this test is here so the flip is not made while this is still true.
-TEST(CasListLiarEndToEnd, FsckReachabilityReplaySilentlyLosesAHiddenTailTransaction)
+/// A hidden tail record is the silent variant of the historical residual: a LIST-driven replay could
+/// return a plausible but short table. Checkpoint-bounded recovery must produce the honest table even
+/// though the list omission is served.
+TEST(CasListLiarEndToEnd, FsckReachabilityRecoveryMatchesTruthUnderAHiddenTailTransaction)
 {
     const Layout layout("p");
     const RootNamespace ns{"00/fsck_tail@cas@"};
@@ -605,21 +611,16 @@ TEST(CasListLiarEndToEnd, FsckReachabilityReplaySilentlyLosesAHiddenTailTransact
 
     ASSERT_GT(lying_backend->holesServed(), 0u)
         << "the omission was never actually served -- the test would pass vacuously";
+    EXPECT_GT(truth.reachable, 0u)
+        << "the honest oracle must recover at least one live object, or reachability equality is vacuous";
 
     /// The arithmetic pass is unmoved here too: it probes `{1,5}` by exact key and finds it.
     EXPECT_EQ(under_lie.chain_broken, 0u);
     EXPECT_EQ(under_lie.ref_records_walked, truth.ref_records_walked)
         << "the arithmetic walk reads the hidden tail by exact key, so it counts the same records";
 
-    /// THE RESIDUAL. `reachable` short of the truth with `unchecked == 0` is the silent variant: the
-    /// audit believes it saw the whole table. Pinned for the same reason as the arm above -- when the
-    /// replay becomes arithmetic these two become equal and this assertion must be replaced by that
-    /// equality.
     EXPECT_EQ(under_lie.unchecked, 0u)
-        << "a hidden TAIL creates no contradiction for the replay, so nothing marks the namespace "
-           "unchecked -- that is exactly what makes this variant silent";
-    EXPECT_LT(under_lie.reachable, truth.reachable)
-        << "expected the KNOWN Stage A residual: the listing-driven replay ends one transaction early, "
-           "so fsck's reachable set is short. If these are now equal, the replay was made arithmetic -- "
-           "replace this with `EXPECT_EQ(under_lie.reachable, truth.reachable)`";
+        << "a LIST omission must not make a checkpoint-bounded namespace unchecked";
+    EXPECT_EQ(under_lie.reachable, truth.reachable)
+        << "the exact committed frontier must include the hidden tail transaction";
 }

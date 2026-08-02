@@ -36,6 +36,44 @@ void checkRefCkptInvariants(const RefCkpt & ckpt, std::string_view what)
     };
     check_id(ckpt.checkpoint_snapshot_id, "checkpoint_snapshot_id");
     check_id(ckpt.last_epoch_seal, "last_epoch_seal");
+    check_id(ckpt.committed_through, "committed_through");
+    if (!ckpt.committed_through && (ckpt.checkpoint_snapshot_id || ckpt.last_epoch_seal))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS {}: checkpoint_snapshot_id and last_epoch_seal require committed_through", what);
+    if (ckpt.committed_through)
+    {
+        if (ckpt.life_epoch && ckpt.committed_through->writer_epoch < *ckpt.life_epoch)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: committed_through must not precede life_epoch", what);
+        if (ckpt.checkpoint_snapshot_id && *ckpt.committed_through < *ckpt.checkpoint_snapshot_id)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: checkpoint_snapshot_id must not exceed committed_through", what);
+        if (ckpt.last_epoch_seal && *ckpt.committed_through < *ckpt.last_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: last_epoch_seal must not exceed committed_through", what);
+
+        /// The checkpoint carries the same finite proof as the ref-log chain. A current epoch is either
+        /// closed at the frontier itself, or its frontier follows the seal of exactly the preceding
+        /// numeric epoch. A seal from the same epoch below the frontier would claim that an epoch kept
+        /// accepting transactions after it was closed; a larger gap would let a missing epoch masquerade
+        /// as a proved boundary.
+        if (ckpt.last_epoch_seal)
+        {
+            if (*ckpt.last_epoch_seal != *ckpt.committed_through
+                && ckpt.last_epoch_seal->writer_epoch + 1 != ckpt.committed_through->writer_epoch)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS {}: last_epoch_seal must equal committed_through or close its immediately preceding writer epoch",
+                    what);
+        }
+        else if (ckpt.life_epoch && ckpt.committed_through->writer_epoch > *ckpt.life_epoch)
+        {
+            /// With a known genesis epoch, an unsealed later epoch has no chain evidence. Leave the
+            /// unknown-genesis contribution representable: another checkpoint writer may still merge
+            /// the genesis fact before this partial contribution is encoded as durable authority.
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: committed_through after life_epoch requires last_epoch_seal", what);
+        }
+    }
 }
 
 String encodeRefCkpt(const RefCkpt & ckpt)
@@ -55,6 +93,8 @@ String encodeRefCkpt(const RefCkpt & ckpt)
         writeKey(out, "le", first);
         writeU64StringValue(out, *ckpt.life_epoch);
     }
+    if (ckpt.committed_through)
+        writeRefTxnIdFields(out, first, "cte", "cts", *ckpt.committed_through);
     if (ckpt.checkpoint_snapshot_id)
         writeRefTxnIdFields(out, first, "cse", "css", *ckpt.checkpoint_snapshot_id);
     if (ckpt.last_epoch_seal)
@@ -91,10 +131,14 @@ RefCkpt decodeRefCkpt(std::string_view data)
     std::optional<uint64_t> css;
     std::optional<uint64_t> lse;
     std::optional<uint64_t> lss;
+    std::optional<uint64_t> cte;
+    std::optional<uint64_t> cts;
     String key;
     while (r.nextKey(key))
     {
         if (key == "le") ckpt.life_epoch = r.readU64String();
+        else if (key == "cte") cte = r.readU64String();
+        else if (key == "cts") cts = r.readU64String();
         else if (key == "cse") cse = r.readU64String();
         else if (key == "css") css = r.readU64String();
         else if (key == "lse") lse = r.readU64String();
@@ -112,6 +156,12 @@ RefCkpt decodeRefCkpt(std::string_view data)
         if (!cse || !css)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: checkpoint_snapshot_id needs both cse and css");
         ckpt.checkpoint_snapshot_id = RefTxnId{*cse, *css};
+    }
+    if (cte || cts)
+    {
+        if (!cte || !cts)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_ref_ckpt: committed_through needs both cte and cts");
+        ckpt.committed_through = RefTxnId{*cte, *cts};
     }
     if (lse || lss)
     {

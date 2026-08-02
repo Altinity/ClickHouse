@@ -68,8 +68,11 @@ CAS-walks the dead tail via the dedicated `slot-occupy` primitive
 `EpochSeal`, terminating the walk); `Created` → the seal occupies `(E, T+1)` and the `Late
 Predecessor PUT` ghost can never land — the store's conditional create is the fence. Grammar: a seal
 transaction contains exactly one seal operation; `prev_epoch_seal` is required on exactly sequence 1
-of every non-genesis epoch (including a sequence-1 seal closing an empty epoch) and forbidden
-elsewhere. A dying lane that observes the seal retries `T+1`, never mints `T+2` (state-derived ids).
+of every non-genesis epoch (including a sequence-1 seal closing an empty epoch), names the seal of
+the immediately preceding numeric writer epoch, and is forbidden elsewhere. A missing intermediate
+epoch or a checkpoint frontier after a seal in that same numeric epoch is `CORRUPTED_DATA`, never a
+shortcut a fold, recovery, `fsck`, or orphan sweep may interpret. A dying lane that observes the seal
+retries `T+1`, never mints `T+2` (state-derived ids).
 
 **INV-3 — the catalog, with opaque life identities.** `cas/ref_catalog`, token-CAS like `gc/state`:
 `namespace → {state: Creating | Live | Removing, incarnation}` (+ creator fence identity while
@@ -354,7 +357,18 @@ writer or `LIST` happened to observe. Every acknowledged chunk is at or below it
 algorithm serves the append lane, snapshot publisher and sealer: read → validate → merge a bounded
 monotone contribution → token-CAS; identical merged body → return without a CAS; retries are bound to
 the recovery deadline. A checkpoint snapshot and `last_epoch_seal` may never exceed
-`committed_through`; a contribution that would do so is corruption rather than a partial update.
+`committed_through`; a contribution that would do so is corruption rather than a partial update. A
+checkpoint snapshot may also never name **any** `EpochSeal`: a seal changes epoch arithmetic but is
+not a state-bearing snapshot base. The publisher's local guard is candidate equality with
+`last_epoch_seal`, but that producer rule is not a recovery proof: before accepting a nonempty
+`checkpoint_snapshot_id`, every reader exact-reads and decodes the matching `_log` and rejects an
+`EpochSeal` **before** it reads the same-id `_snap`. The check is mandatory even when the base equals
+the frontier and therefore has no replay tail; fsck uses the same check. A corrupt old checkpoint base
+is fail-closed on that exact validation or when arithmetic replay lacks a required key at or below the
+frontier. Cleanup consequently retains the matching non-seal `_log` while `_ckpt` names the base: the
+recovery anchor is the bounded triple `_ckpt` + same-id `_snap` + same-id non-seal `_log`, costing one
+retained log and one exact `GET` per recovery. Recovery does not infer a kind from `LIST` or surviving
+objects.
 The append order is immutable log PUT → `_ckpt.committed_through` CAS → in-memory install/acknowledge →
 allocation of the next id. A birth first publishes `life_epoch`, as required by creation ordering,
 then writes the birth log and advances `committed_through`. An epoch-seal contribution advances
@@ -475,14 +489,18 @@ still leave the explicit-UUID route unguarded.
 
 ## 4. Recovery {#recovery}
 
-Catalog (state + opaque life id) → exact `_ckpt` → exact-key snapshot (revalidation rule) → finite
-arithmetic replay ending exactly at `committed_through` → CAS-walk + seal → install. A stream `LIST`
-may offer a newer snapshot candidate, diagnostics and garbage nominations; it never supplies genesis,
-the committed frontier or a stop condition. A hinted snapshot above `committed_through` is ignored and
-surfaced, not adopted. Without a base, replay starts at `{life_epoch, 1}`. With a base, it starts at
+Catalog (state + opaque life id) → exact `_ckpt` → exact-key checkpoint snapshot (revalidation rule)
+→ finite arithmetic replay ending exactly at `committed_through` → CAS-walk + seal → install. Recovery
+performs **no stream `LIST`**: a well-formed listed snapshot can still describe an uncommitted state, so
+an enumeration cannot even be a performance base. The checkpoint alone names the base, and any missing
+required replay key at or below its frontier is corruption. Without a base, replay starts at
+`{life_epoch, 1}`. With a base, it starts at
 the base's successor. A readable checkpoint with no `committed_through` represents a life with no
 committed transaction and needs no read-only replay. Missing a required key at or below a present
 `committed_through`, an invalid chain link, or an unreadable required checkpoint is corruption.
+
+`LIST` remains only GC/janitor discovery: it may nominate foreign-incarnation debris for leak-only
+cleanup, but it is not part of either read-only or writer recovery.
 
 Writer-mount recovery has one additional bounded duty. If the append attempt may have landed after
 the durable frontier, it exact-reads the single deterministic successor. Matching bytes and a valid
@@ -669,9 +687,9 @@ without copying adopted-parent, CAS-resolution or drain ordering into `CaRefDelt
 model still owns only fold/key-set semantics; its parent, hint, hold and checkpoint adapter-mint
 sabotage remains the control for forbidden row admission.
 
-RED-first fault-injected controls, the load-bearing set: the cross-namespace hidden-`+1` vs visible
-`-1` (dies without the frontier proof); held namespace → `FORCE REBUILD` → hint hides the witness →
-`B:-1` (dies without hold carry); carried hold with the namespace omitted from the hint; late `+1`
+RED-first fault-injected controls, the load-bearing set: a LIST omission that drops a catalog target;
+a carried hold whose exact offending position is not retried; a committed gap under total hint
+omission; held namespace → `FORCE REBUILD` (dies if the hold is released before fold/adoption); late `+1`
 after the probe during condemnation/graduation/deletion rounds;
 `Creating`/`Removing` catalog races and deletion with a stale or held ref-life row; a cached writer
 paused across `Live→Removing` cannot append positive ownership, including CAS-retry and fence-change
@@ -696,7 +714,7 @@ publication). The full enumerated list from rounds 5–9 rides in the implementa
 | v1–v4 certificate stack (prev links, seal intervals, pointers, authorities, generations, `R*`, tombstones) | Rejected by the user as accretion; deleted. |
 | Full head-CAS commit chain (blinded consult) | Rejected for Task 5b: it adds a second mutable authority and a new object graph while expressing the same committed-through fact now carried by `_ckpt`. Revisit only if independently desired multi-chunk segment batching justifies that surface. |
 | Serial exact `GET N+1` until absence | Rejected: every probe is a full S3 round trip, a concurrent writer makes the stop unstable, and a 404 proves object absence rather than committed-history completeness. |
-| Recovery from a complete stream `LIST` | Rejected: completeness is the premise under test and cannot be a recovery fallback. The list remains scheduling, diagnostics and leak-only cleanup input. |
+| Recovery from a complete stream `LIST` | Rejected: completeness is the premise under test and cannot be a recovery fallback. Recovery performs zero stream `LIST` calls; enumeration remains only GC/janitor leak-only cleanup discovery. |
 | `seq_floor` in the catalog instead of incarnations | Rejected by the user's churn scenario: floors for dead names never retire → unbounded catalog. Incarnations make debris inert WITHOUT a physical-empty proof, so an entry deletes as soon as its removal completes rather than waiting on one. |
 | Delete the incarnation entirely; forbid exact `RootNamespace` reuse forever | **Proposed and withdrawn, 2026-07-31**, after two independent reviews of the whole phase. It is coherent, and it needs somewhere to remember every retired name — which is the same shape as the `seq_floor` row above, so it fails for the same reason, one level up. A never-deleted `Retired` catalog state grows by one row per historical namespace and eventually refuses admission at the object cap; **normal UUID churn does not bound it**, since every fresh UUID also leaves a permanent row. No bounded exact compaction exists for opaque names, because compacting a retirement record and certifying physical emptiness are the same problem. A marker object outside the catalog bounds nothing either and reintroduces the marker class this design removes. Independently, permanent non-reuse is a regression against supported workflows (§3). |
 | Retirement as a `Retired` catalog state, or as a marker object | Rejected with the row above; both are only needed if the incarnation is deleted. Keeping it means **nothing has to remember a dead namespace at all** — the entry is deleted, debris is inert under its unreferenced opaque life id, and the catalog stays O(active). |

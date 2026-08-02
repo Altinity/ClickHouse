@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
@@ -1037,8 +1039,8 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 /// `MaintenanceTrimCompactsEverythingOnce` were removed with the snapshot+log ref model. They asserted
 /// GC compacts a MUTABLE shard journal in place (INV-JOURNAL-COVERAGE / `gc_trim_min_events` gates).
 /// Immutable `_log` objects are never trimmed in place: covered `_log`/`_snap` keys are DELETED by
-/// ref-object cleanup once BOTH the durable cursor AND an observed snapshot cover them -- exercised in
-/// `gtest_cas_ref_gc.cpp` (RefObjectCleanupHonorsAllThreeConditions).)
+/// ref-object cleanup once BOTH the durable cursor AND a checkpoint-named validated recovery triple
+/// cover them -- exercised in `gtest_cas_ref_gc.cpp` (`RefObjectCleanupRetainsCheckpointNamedTriple`).)
 
 /// ---- INTENTIONALLY NOT PORTED (covered elsewhere or obsolete in the manifest model) ----
 ///
@@ -1545,6 +1547,12 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// watermark, is what this test varies.
     publishAt(*backend, store->layout(), ns, RefTxnId{1, 1}, "tbl", /*build_sequence=*/7,
               DB::UInt128(0xB10B1), /*birth=*/true);
+    writeRecoverableCkptForRawFixture(*backend, store->layout(), ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
@@ -1562,6 +1570,17 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     writeSealAt(*backend, store->layout(), ns, RefTxnId{1, 2});
     publishAt(*backend, store->layout(), ns, RefTxnId{2, 1}, "tbl2", /*build_sequence=*/7,
               DB::UInt128(0xB10B2), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    ASSERT_TRUE(life.has_value());
+    const String ckpt_key = store->layout().refCkptKey(*life);
+    const auto old_ckpt = backend->get(ckpt_key);
+    ASSERT_TRUE(old_ckpt.has_value());
+    ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    }), old_ckpt->token).outcome, PutOutcome::Done);
 
     /// The list budget is one key per round, so reclaiming both debris bodies takes a circuit.
     for (int round = 0; round < 12; ++round)

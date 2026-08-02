@@ -287,7 +287,7 @@ public:
     /// unresolved-`PUT` state; cleanup methods expose sweep eligibility; publication methods expose
     /// settling, snapshot identity, and tail accounting. Every observer below is resident-only: it
     /// performs no catalog/backend I/O and never materializes or recovers a runtime.
-    /// Returns the number of LIST/GET recovery restarts recorded for `ns`.
+    /// Returns the number of exact-read recovery restarts recorded for `ns`.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
@@ -355,8 +355,20 @@ public:
     /// candidate is installed into the live state -- the seam a test uses to prove that the region
     /// between "durable" and "recorded" can no longer strand a transaction (a throw injected there is
     /// the only way left to simulate the OLD post-durable apply failure, since the install itself is now
-    /// allocation-free and cannot throw). Null in production.
-    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed, PostDurableInstall };
+    /// allocation-free and cannot throw). `PostInstallPreAck` fires after the candidate swap and overlay
+    /// materialization, outside the allocation-denied scope and state lock, but before any waiter is
+    /// marked done or notified. It is the deterministic acknowledgment-order seam. Null in production.
+    enum class CarvePhaseForTest
+    {
+        PlanSeenRefs,
+        PlanBatchGrow,
+        PlanReserveOwned,
+        PublishPop,
+        ValidateFinalOps,
+        ChunkReseed,
+        PostDurableInstall,
+        PostInstallPreAck,
+    };
     void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
 
     /// Installs the negative control for the post-durable install region (see
@@ -565,11 +577,15 @@ public:
         /// because for a birth chunk that publish IS the first durable effect and preparation is by
         /// definition everything strictly before it.
         std::optional<RefCkpt> birth_contribution;
+        /// Published after the log object commits and before this candidate may be installed or
+        /// acknowledged. Every transaction advances `committed_through`; an epoch-seal transaction
+        /// contributes the same id as `last_epoch_seal` in this one atomic checkpoint merge.
+        RefCkpt commit_contribution;
     };
 
     /// The pure half of `commitRefChunk`: derive the candidate state, the transaction, the canonical key
-    /// and sealed bytes, the complete attempt, and a namespace birth's `_ckpt` contribution -- all of it
-    /// decided before anything can be durable.
+    /// and sealed bytes, the complete attempt, a namespace birth's pre-log `_ckpt` contribution, and
+    /// the post-log committed-frontier contribution -- all decided before anything can be durable.
     ///
     /// `static` on purpose, and it is load-bearing rather than stylistic: with no `this` no MEMBER backend
     /// is reachable, and `static` is what removes the injected one -- so "backend-free" is
@@ -700,7 +716,11 @@ private:
         /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
         RefTableState state;
-        /// Exact attempt owned by `Writing` or `Wedged`. Empty in every other lane state.
+        /// Exact attempt owned by `Writing` or `Wedged`, and retained by `NeedsRecovery` while an
+        /// otherwise-admitted writer recovery must still adjudicate the precise durable successor it
+        /// expected. It is cleared only when recovery installs its result or the attempt reaches a
+        /// conclusive terminal outcome; losing these bytes would turn a foreign replacement into an
+        /// indistinguishable ordinary recovery transaction.
         std::optional<RefAppendAttempt> append_attempt;
         RefLaneState lane_state = RefLaneState::Ready;
         /// The `EpochSeal` transaction that closed this namespace's PREVIOUS writer epoch -- exactly the
@@ -727,7 +747,7 @@ private:
         /// moment the live epoch advances past the seal's. Nothing else writes it: a seal is durable
         /// evidence, never a local guess.
         std::optional<RefTxnId> last_epoch_seal;
-        uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
+        uint64_t recovery_restarts = 0;           /// diagnostic: exact-GET restarts forced by a vanished object
         /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
         /// overhead and the fixed safety margin, computed once at recovery.
         uint64_t snapshot_budget = 0;
@@ -989,13 +1009,17 @@ private:
     /// `admitted_generation` is the ONE fence generation this whole recovery was admitted under: the
     /// walk presents it to every `slotOccupy` and to the `_ckpt` CAS, and the caller presents the same
     /// value once more immediately before installing.
+    /// `retained_attempt` is copied under `state_mutex` before the unlocked walk. It is evidence from
+    /// this runtime's admitted writer, not a second recovery authority: only the exact slot it names
+    /// is compared byte-for-byte, and a successor seal remains the existing conclusive-loss case.
     /// `cancelled` is the CALLER's latch, threaded in rather than kept locally: a cancellation is
     /// reported through the retry-later class (the caller should retry, against the FRESH incarnation),
     /// so without it the transient loop reads the stop as a blip and re-drives the very work the remount
     /// just stopped -- while the barrier blocks waiting for that recovery to finish.
     std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
-        std::optional<String> & hole_detail, bool & cancelled);
+        const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
+        bool & cancelled);
 
     /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Two independent
     /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, or a self-remount
@@ -1136,6 +1160,10 @@ private:
     CkptPublishOutcome publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
                                                uint64_t admitted_generation,
                                                const std::function<void(uint64_t)> & check_admission);
+
+    /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
+    /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.
+    bool hasStateBearingSnapshotCandidateUnderStateLock(const RefTableRuntime & rt) const;
 
     /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so
     /// both the trigger (`maybeScheduleSnapshotPublish`) and the settlement re-evaluation share ONE

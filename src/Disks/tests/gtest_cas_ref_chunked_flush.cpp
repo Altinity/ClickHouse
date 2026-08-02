@@ -97,7 +97,7 @@ PoolPtr openPool(const BackendPtr & backend)
 /// production birth mints a random incarnation and those computed keys land nowhere real.
 void publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    DB::Cas::tests::casAdmitEntry(s->backend(), s->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(s->backend(), s->layout(), ns, s->liveWriterEpoch());
     PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
@@ -342,7 +342,7 @@ TEST(RefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
 /// `dropNamespace` itself builds the one removal transaction.
 TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/dropns_over_cap"};
     constexpr size_t kTotalRefs = static_cast<size_t>(ref_txn_max_ops) + 200;
@@ -368,8 +368,26 @@ TEST(RefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
         committed.push_back(committedRow(paddedRefName(i), ManifestRef{epoch, i + 1, 1}));
     ASSERT_GT(committed.size(), ref_txn_max_ops);
 
+    /// Recovery's checkpoint anchor includes the same-id ordinary log. The synthetic snapshot stands
+    /// for a long prior history, while this genesis record supplies the retained non-seal witness the
+    /// real publisher would necessarily leave at the selected id.
+    DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = RefTxnId{epoch, 1},
+        .ops = {DB::Cas::tests::namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt});
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), RefTxnId{epoch, 1}, committed));
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = epoch,
+        .committed_through = RefTxnId{epoch, 1},
+        .checkpoint_snapshot_id = RefTxnId{epoch, 1},
+        .last_epoch_seal = std::nullopt,
+    });
+    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+    backend->resetCounts();
     ASSERT_EQ(store->listRefs(ns).size(), kTotalRefs);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{epoch, 1})), 1u);
+    EXPECT_EQ(backend->getCount(layout.refSnapshotKey(life, RefTxnId{epoch, 1})), 1u);
 
     DropNamespaceStats stats;
     EXPECT_NO_THROW(stats = store->dropNamespace(ns));

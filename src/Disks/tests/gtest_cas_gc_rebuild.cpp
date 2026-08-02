@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefCkptFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -226,6 +227,132 @@ TEST(CasGcRebuild, HealthyStateRequiresForce)
     EXPECT_NO_THROW(gc.runRegularRound());
 }
 
+/// The post-LIST catalog cut and its exact `_ckpt` are REBUILD's authority. A visible later log is
+/// not admitted merely because a LIST would find it: it may be a durable-but-unfrontiered writer
+/// attempt, and folding its missing manifest would turn a safe rebuild into a false refusal.
+///
+/// This catches a regression back to the legacy `recoverRefTable` overload, whose full LIST-derived
+/// replay consumes the second transaction and therefore refuses on `unfrontiered`'s missing body.
+TEST(CasGcRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/rebuild-frozen-frontier@cas@"};
+    const UInt128 life_id{0xF001};
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_id);
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+        CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
+
+    const ManifestRef admitted = ref(1, 0xA1);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, ns, admitted, {blobEntryFor("a", DB::UInt128(1))});
+
+    std::vector<RefOp> first_ops{namespaceBirthOp()};
+    const auto admitted_ops = publishCommittedOps("admitted", admitted);
+    first_ops.insert(first_ops.end(), admitted_ops.begin(), admitted_ops.end());
+    writeRefLogTxnRaw(*backend, layout,
+        RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(first_ops), .prev_epoch_seal = std::nullopt});
+
+    /// This record is real and listable, but the writer never published it through `_ckpt`.
+    const ManifestRef unfrontiered = ref(2, 0xB2);
+    writeRefLogTxnRaw(*backend, layout,
+        RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = publishCommittedOps("unfrontiered", unfrontiered),
+                  .prev_epoch_seal = std::nullopt});
+    ASSERT_TRUE(backend->head(layout.refLogKey(life, RefTxnId{1, 2})).exists);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+
+    Gc gc(store, kGc);
+    const RebuildReport report = gc.rebuildBaseline(/*force=*/false);
+
+    ASSERT_TRUE(report.performed) << report.refusal;
+    EXPECT_EQ(report.committed_refs, 1u);
+}
+
+/// A catalog-admitted life without its exact checkpoint has no bounded recovery frontier. REBUILD
+/// must refuse rather than falling back to a list-derived history and publishing a baseline it cannot
+/// prove complete.
+TEST(CasGcRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/rebuild-missing-checkpoint@cas@"};
+    const UInt128 life_id{0xF002};
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+        CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
+
+    const ManifestRef admitted = ref(1, 0xA2);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns, admitted, {blobEntryFor("a", DB::UInt128(2))});
+    std::vector<RefOp> ops{namespaceBirthOp()};
+    const auto admitted_ops = publishCommittedOps("admitted", admitted);
+    ops.insert(ops.end(), admitted_ops.begin(), admitted_ops.end());
+    writeRefLogTxnRaw(*backend, layout,
+        RefLogTxn{.ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = std::move(ops), .prev_epoch_seal = std::nullopt});
+
+    Gc gc(store, kGc);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
+
+    const auto state = backend->get(layout.gcStateKey());
+    ASSERT_TRUE(state);
+    EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u)
+        << "a rejected recovery must not adopt a new baseline";
+}
+
+/// A syntactically valid snapshot at an OLDER `EpochSeal` id must not let REBUILD synthesize a
+/// baseline. The forged base differs from `last_epoch_seal`, so metadata equality cannot reject it;
+/// REBUILD must use the retained same-id log witness.
+TEST(CasGcRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/rebuild-checkpoint-base-seal@cas@"};
+    const UInt128 life_id{0xF003};
+    CasRefCatalog::casAdmitEntry(*backend, layout, store->poolConfig().gc_shards,
+        CatalogEntry{.ns = ns, .state = NsState::Live, .incarnation = life_id});
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, life_id);
+
+    const RefLogTxn birth{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, birth);
+    RefOp seal;
+    seal.kind = RefOpKind::EpochSeal;
+    const RefLogTxn seal_txn{
+        .ns = ns.string(), .txn_id = RefTxnId{1, 2}, .ops = {seal},
+        .prev_epoch_seal = std::nullopt};
+    writeRefLogTxnRaw(*backend, layout, seal_txn);
+    RefOp later_seal;
+    later_seal.kind = RefOpKind::EpochSeal;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(), .txn_id = RefTxnId{2, 1}, .ops = {later_seal},
+        .prev_epoch_seal = RefTxnId{1, 2}});
+    RefTableState through_seal;
+    applyRefLogTxn(through_seal, birth);
+    applyRefLogTxn(through_seal, seal_txn);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(through_seal, ns.string()));
+
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = RefTxnId{1, 2},
+        .last_epoch_seal = RefTxnId{2, 1}})).outcome, PutOutcome::Done);
+
+    Gc gc(store, kGc);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)gc.rebuildBaseline(/*force=*/false); });
+
+    const auto state = backend->get(layout.gcStateKey());
+    ASSERT_TRUE(state);
+    EXPECT_EQ(decodeGcState(state->bytes).snap_generation, 0u)
+        << "a rejected checkpoint base must not publish a REBUILD baseline";
+}
+
 TEST(CasGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -242,6 +369,11 @@ TEST(CasGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         next.entries[0].removal_started_round = 1;
         return next;
     });
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::fromCatalogEntry(ns, life_id)), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
     const uint64_t plans_before
         = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
@@ -305,7 +437,8 @@ TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
     const ManifestRef pre = ref(7, 0xC1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(9));
     writeManifestRaw(*backend, store->layout(), ns, pre, {blobEntryFor("p", DB::UInt128(9))});
-    addPrecommitTransition(*backend, store->layout(), ns, /*build_id*/ DB::UInt128(0x77), "part_pre", std::nullopt, pre);
+    addPrecommitTransition(
+        *backend, store->layout(), ns, /*build_id*/ DB::UInt128(0x77), "part_pre", std::nullopt, pre);
 
     /// No round before the rebuild: the journal still carries the create-precommit event (a round's
     /// eager trim would cut it — the trimmed-but-live case is the next test). gc/state absent =>

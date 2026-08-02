@@ -164,6 +164,7 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
     const RootNamespace ns{"srv1/db/tbl"};
 
     const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
+                       .committed_through = RefTxnId{7, 9},
                        .checkpoint_snapshot_id = RefTxnId{7, 9},
                        .last_epoch_seal = RefTxnId{6, 4}};
 
@@ -174,6 +175,7 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
     EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":7)"), String::npos) << json;
+    EXPECT_NE(json.find(R"("committed_through":{"writer_epoch":7,"ref_sequence":9})"), String::npos) << json;
     EXPECT_NE(json.find(R"("writer_epoch":7,"ref_sequence":9)"), String::npos) << json;
     EXPECT_NE(json.find(R"("writer_epoch":6,"ref_sequence":4)"), String::npos) << json;
 }

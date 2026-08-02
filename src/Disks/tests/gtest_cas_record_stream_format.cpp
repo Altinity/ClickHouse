@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
+#include <fmt/format.h>
 #include <vector>
 
 using namespace DB;
@@ -68,7 +69,8 @@ std::vector<SourceEdgeRecord> decodeRun(const String & bytes)
 TEST(CasRecordStream, EmptyRunRoundTripsAndChecksumMatches)
 {
     const String bytes = encodeRun({});
-    EXPECT_EQ(bytes, "{\"type\":\"cas_run\",\"v\":8,\"kind\":\"source_edge\"}\n{\"n\":0}\n");
+    EXPECT_EQ(bytes, fmt::format(
+        "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", currentCompatibilityVersion()));
 
     ReadBufferFromMemory in(bytes.data(), bytes.size());
     SourceEdgeRunReader reader(in);
@@ -224,8 +226,8 @@ TEST(CasRecordStream, HeaderGates)
     }
     /// Future version -> UNKNOWN_FORMAT_VERSION.
     {
-        const String s = "{\"type\":\"cas_run\",\"v\":" + std::to_string(G_BUILD + 1)
-            + ",\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        const String s = fmt::format(
+            "{{\"type\":\"cas_run\",\"v\":{},\"kind\":\"source_edge\"}}\n{{\"n\":0}}\n", currentCompatibilityVersion() + 1);
         ReadBufferFromMemory in(s.data(), s.size());
         try
         {

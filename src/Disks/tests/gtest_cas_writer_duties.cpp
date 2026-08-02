@@ -98,7 +98,7 @@ TEST(CasWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
     const RootNamespace ns{"srv1/writer_duty_adopt"};
-    DB::Cas::tests::casAdmitEntry(*backend, store->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
 
     ManifestId abandoned_id;
     auto abandoned = stageEmptyManifest(store, ns, "abandoned", abandoned_id);
@@ -290,7 +290,8 @@ TEST(CasWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = budget,
     });
-    DB::Cas::tests::casAdmitEntry(*backend, predecessor->layout(), ns);
+    DB::Cas::tests::casAdmitRecoverableEntry(
+        *backend, predecessor->layout(), ns, predecessor->liveWriterEpoch());
 
     ManifestId abandoned_id;
     auto abandoned = stageEmptyManifest(predecessor, ns, "abandoned", abandoned_id);

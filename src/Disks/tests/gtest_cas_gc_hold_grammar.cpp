@@ -111,10 +111,25 @@ private:
 void writeCkptAt(
     Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & checkpoint)
 {
-    backend.putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)),
-                        encodeRefCkpt(RefCkpt{.life_epoch = std::nullopt,
-                                              .checkpoint_snapshot_id = checkpoint,
-                                              .last_epoch_seal = std::nullopt}));
+    writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = checkpoint,
+        .checkpoint_snapshot_id = checkpoint,
+        .last_epoch_seal = std::nullopt,
+    });
+}
+
+/// Establish only the immutable recovery frontier for a raw-log fixture. Unlike `writeCkptAt`, this
+/// does not claim a snapshot exists: rebuild tests need to replay the log through this exact position.
+void writeCommittedCkptAt(
+    Backend & backend, const Layout & layout, const RootNamespace & ns, const RefTxnId & committed_through)
+{
+    writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = committed_through,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 }
 
 /// The newest fold seal, scanning downward from the adopted generation (a completed round's gc/state
@@ -670,6 +685,7 @@ TEST(CasGcHoldGrammar, GapBelowWitnessNamesTheExactAbsentPosition)
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     /// {1,3} never existed; {1,4} is durable AND listed, so the gap is impossible under contiguity.
     publishAt(*backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 4});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -695,6 +711,12 @@ TEST(CasGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
     /// sits in another epoch, and the crossing has nothing to prove itself from.
     publishAt(*backend, layout, ns, RefTxnId{2, 1}, "ref_2", 2, DB::UInt128(2),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 3});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 3},
+    });
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -717,6 +739,7 @@ TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     backend->putIfAbsent(layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{1, 2}), "this is not a cas_ref_log object");
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 2});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -741,6 +764,7 @@ TEST(CasGcHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     deleteManifestBody(*backend, layout,
                        ManifestId{ns, ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1}});
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 2});
 
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -787,6 +811,12 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
     /// A third epoch keeps the unstable position from reading as a frontier.
     publishAt(*backend, layout, ns, RefTxnId{3, 1}, "ref_3", 3, DB::UInt128(3),
               /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{2, 1});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{3, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{2, 1},
+    });
     backend->flaky = layout.refLogKey(NamespaceLifeId::stageATransition(ns), RefTxnId{2, 1});
 
     Gc gc(store, kGc);
@@ -874,6 +904,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         publishAt(backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
         publishAt(backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
         publishAt(backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+        writeCommittedCkptAt(backend, layout, ns, RefTxnId{1, 4});
         EXPECT_TRUE(gc.runRegularRound().acquired_lease);
         EXPECT_EQ(holdOf(backend, layout, ns).offending_position, (RefTxnId{1, 3}));
 
@@ -906,7 +937,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
         const Layout & layout = store->layout();
         Gc gc(store, kGc);
         seedPool(*backend, layout, gc);
-        writeCkptAt(*backend, layout, ns, RefTxnId{1, 6});
+        advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 6});
         backend->hide(layout.refCkptKey(NamespaceLifeId::stageATransition(ns)));
 
         ASSERT_TRUE(gc.runRegularRound().acquired_lease);
@@ -962,6 +993,15 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 
     /// Work only a round that COMPLETES can fold.
     publishAt(*backend, layout, good, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(12));
+    const String good_ckpt_key = layout.refCkptKey(NamespaceLifeId::stageATransition(good));
+    const HeadResult good_ckpt_head = backend->head(good_ckpt_key);
+    ASSERT_TRUE(good_ckpt_head.exists);
+    ASSERT_EQ(backend->putOverwrite(good_ckpt_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = RefTxnId{1, 2},
+        .last_epoch_seal = std::nullopt,
+    }), good_ckpt_head.token).outcome, PutOutcome::Done);
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1028,6 +1068,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomaly
     /// A lone `_ckpt` with an undecodable body, and NOTHING else under that namespace.
     backend->putIfAbsent(layout.refCkptKey(NamespaceLifeId::stageATransition(phantom)), "this is not a cas_ref_ckpt");
     publishAt(*backend, layout, good, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(11), /*birth=*/true);
+    writeCommittedCkptAt(*backend, layout, good, RefTxnId{1, 1});
 
     const RoundReport report = gc.runRegularRound();
     ASSERT_TRUE(report.acquired_lease);
@@ -1079,6 +1120,7 @@ RefHold seedHeldThenUnhinted(
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
     publishAt(*backend, layout, ns, RefTxnId{1, 4}, "ref_4", 4, DB::UInt128(4));
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 4});
 
     EXPECT_TRUE(gc.runRegularRound().acquired_lease);
     const RefHold hold = holdOf(*backend, layout, ns);
@@ -1210,6 +1252,7 @@ TEST(CasGcHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
     const RootNamespace ns{"00/aa@cas@"};
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
 
@@ -1259,6 +1302,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     const RootNamespace ns{"00/aa@cas@"};
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const GcState after_first = decodeGcState(backend->get(layout.gcStateKey())->bytes);
@@ -1267,6 +1311,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
 
     publishAt(*backend, layout, ns, RefTxnId{1, 2}, "ref_2", 2, DB::UInt128(2));
+    advanceRecoverableCkptForRawFixture(*backend, layout, ns, RefTxnId{1, 2});
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const GcState after_second = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(after_second.snap_generation, older_generation) << "the fixture needs two generations";
@@ -1381,6 +1426,7 @@ TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
     const RootNamespace ns{"00/aa@cas@"};
 
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
     Gc gc(store, kGc);
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);
     const UInt128 life_id = catalogLifeIdForTest(*backend, layout, ns);
@@ -1530,6 +1576,7 @@ TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTh
 
     /// No round has run, so there is no `gc/state` and no seal — only owner state to rebuild from.
     publishAt(*backend, layout, ns, RefTxnId{1, 1}, "ref_1", 1, DB::UInt128(1), /*birth=*/true);
+    writeCommittedCkptAt(*backend, layout, ns, RefTxnId{1, 1});
     ASSERT_FALSE(backend->head(layout.gcStateKey()).exists);
 
     using ProfileEvents::global_counters;

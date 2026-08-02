@@ -81,7 +81,7 @@ def test_partial_margin_cannot_produce_a_nonpositive_budget(monkeypatch):
 
 def test_partial_result_is_parsed_with_its_flag_and_reason(monkeypatch):
     line = ("reachable=10 dangling=0 unreachable=0 pending_gc=0 awaiting_gc=0 unaccounted=0 "
-            "stale_edge=0 corrupted_runs=0 snapshot_oracle_mismatches=0 snapshot_oracle_checked=0 "
+            "stale_edge=0 corrupted_runs=0 "
             "physical_bytes=1 referenced_logical_bytes=1 distinct_blobs=1 total_blob_refs=1 "
             "dedup_ratio=1.0 partial=1 reason='fsck: exceeded the deadline during listing'")
     _capture_cmd(monkeypatch, stdout=line + "\n")

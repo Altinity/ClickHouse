@@ -12,10 +12,13 @@
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
+#include <Poco/StreamChannel.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -57,6 +60,7 @@ namespace ProfileEvents
 {
 extern const Event CasGcRefWalkPlansBuilt;
 extern const Event CasGcUnmatchedAdoptedParentLives;
+extern const Event CasGcNamespaceCleanupLeaks;
 }
 
 namespace
@@ -205,11 +209,77 @@ private:
     bool conflict_next_catalog_cas = false;
 };
 
+class PostFoldUnreadableTerminalBackend final : public CountingBackend
+{
+public:
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = CountingBackend::list(prefix, cursor, limit);
+        if (prefix.ends_with("/cas/ns/"))
+            for (ListedKey & listed : page.keys)
+                listed.token.reset();
+        return page;
+    }
+
+    HeadResult head(const String & key) override
+    {
+        if (key == unreadable_key)
+            throw std::runtime_error("injected post-fold terminal read failure for " + key);
+        return CountingBackend::head(key);
+    }
+
+    void makeUnreadable(String key)
+    {
+        unreadable_key = std::move(key);
+    }
+
+    bool existsIgnoringFault(const String & key)
+    {
+        return InMemoryBackend::head(key).exists;
+    }
+
+private:
+    String unreadable_key;
+};
+
+class ScopedCasGcLogCapture
+{
+public:
+    ScopedCasGcLogCapture()
+        : logger(getLogger("CasGc"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedCasGcLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const
+    {
+        return stream.str();
+    }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
+};
+
 struct CompletedRemovingFixture
 {
     RootNamespace ns;
     UInt128 life_id{};
     String checkpoint_key;
+    String checkpoint_bytes;
 };
 
 CompletedRemovingFixture seedCompletedRemoving(
@@ -219,9 +289,19 @@ CompletedRemovingFixture seedCompletedRemoving(
     CompletedRemovingFixture fixture{
         .ns = RootNamespace{"00/drain-race@cas@"},
         .life_id = UInt128{177},
-        .checkpoint_key = {}};
+        .checkpoint_key = {},
+        .checkpoint_bytes = {}};
     CasRefCatalog::casAdmitEntry(backend, layout, store->poolConfig().gc_shards, CatalogEntry{
         .ns = fixture.ns, .state = NsState::Live, .incarnation = fixture.life_id});
+    fixture.checkpoint_key = layout.refCkptKey(
+        NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
+    fixture.checkpoint_bytes = encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+    backend.putIfAbsent(fixture.checkpoint_key, fixture.checkpoint_bytes);
     EXPECT_TRUE(store->namespaceFilesLifeIfReadable(fixture.ns));
     CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
     {
@@ -248,9 +328,6 @@ CompletedRemovingFixture seedCompletedRemoving(
     state.lease = GcLease{.owner = lease_owner, .seq = 1};
     backend.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
 
-    fixture.checkpoint_key = layout.refCkptKey(
-        NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
-    backend.putIfAbsent(fixture.checkpoint_key, "old-life checkpoint bytes");
     return fixture;
 }
 
@@ -838,10 +915,22 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
                    .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/aa@cas@"};
-    /// Review C1: pin `ns` into the catalog before its first touch -- the control arm below needs a
-    /// PROVABLE frontier under `AuthoritativeForTest`, and a namespace absent from the catalog is now
-    /// (correctly) unproven regardless of that policy, per the walk-loop fix.
+    /// The control arm below needs a recoverable catalog life whose frontier is exactly the carried
+    /// cursor. An empty non-seal transaction is a valid genesis that recovers to an empty table while
+    /// leaving the manifest epoch below the cursor's epoch.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = RefTxnId{6, 1},
+        .ops = {},
+        .prev_epoch_seal = std::nullopt,
+    });
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 6,
+        .committed_through = RefTxnId{6, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     /// Two manifest bodies no ref ever named, under a build the durable floor has already passed.
     const ManifestRef r1{.writer_epoch = 5, .build_sequence = 0xCA01, .manifest_ordinal = 1};
@@ -890,11 +979,9 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
 /// THE TALLY ARITHMETIC, at a PARTIAL budget — the case neither 0 nor the default reaches.
 ///
 /// `frontier_namespaces` is the denominator an operator reads as "the round's universe", and the
-/// integration test reads it too. It has to describe the set the round actually SEALED: the walked
-/// namespaces plus the ones the budget skipped whose cursors were carried, and nothing else. With
-/// three quiet namespaces and a budget of one, the round probes exactly one of them, carries the other
-/// two verbatim, and the published tally must be 3 = 1 proven + 2 unprobed — a denominator strictly
-/// larger than the numerator, which is the shape that suppresses.
+/// integration test reads it too. A valid checkpoint at every quiet namespace's carried cursor is
+/// authoritative independently of LIST and the probe budget: all three lives are proven without
+/// successor probes, so the budget leaves no namespace unprobed.
 TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSet)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
@@ -913,7 +1000,8 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
     for (const RootNamespace & ns : {a, b, c})
         ASSERT_NE(sealedCursorOf(*backend, layout, ns), (RefTxnId{})) << ns.string();
 
-    /// All three go unhinted at once, so the budget of one cannot cover them.
+    /// All three go unhinted at once. Their valid checkpoint frontiers still prove their carried
+    /// cursors, so this does not consume the successor-probe budget.
     for (const RootNamespace & ns : {a, b, c})
         backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(ns)));
 
@@ -927,26 +1015,34 @@ TEST(CasGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
     gc.setPhaseSink({});
 
     ASSERT_FALSE(intake.empty()) << "the intake phase must have emitted its row";
-    EXPECT_EQ(intake["unhinted_quiet_walked"], 1u) << "the budget permits exactly one probe";
-    EXPECT_EQ(intake["frontier_unprobed_budget"], 2u) << "the other two are not probed at all";
-    EXPECT_EQ(intake["frontier_proven"], 1u) << "only the probed namespace can be proven";
+    EXPECT_EQ(intake["unhinted_quiet_walked"], 3u)
+        << "a valid checkpoint frontier makes every quiet life eligible without a successor probe";
+    EXPECT_EQ(intake["frontier_unprobed_budget"], 0u)
+        << "the CTE authority, not the probe budget, decides these quiet lives";
+    EXPECT_EQ(intake["frontier_proven"], 3u)
+        << "each carried cursor equals its valid checkpoint frontier";
     EXPECT_EQ(intake["frontier_namespaces"], 3u)
-        << "the denominator is the SEALED set: 1 walked + 2 carried. It is derived from the rows the "
-           "carry loop added, so it cannot describe a universe different from the seal";
-    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"])
-        << "a partial budget must leave the frontier incomplete";
+        << "the denominator is the complete authoritative set of sealed quiet lives";
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"])
+        << "a valid CTE frontier remains authoritative even when LIST omits every namespace";
 
     /// And the seal really does carry all three rows — the denominator's claim, checked against the
     /// object it describes rather than against another counter.
     for (const RootNamespace & ns : {a, b, c})
+    {
         EXPECT_NE(sealedCursorOf(*backend, layout, ns), (RefTxnId{}))
             << "every namespace in the tally must have a sealed cursor: " << ns.string();
+        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+        const auto checkpoint = readCkpt(*backend, layout, life);
+        ASSERT_TRUE(checkpoint.has_value());
+        EXPECT_EQ(checkpoint->ckpt.committed_through, (RefTxnId{1, 1}))
+            << "LIST omission and the probe budget do not alter a valid CTE";
+    }
 }
 
-/// A namespace the hint has stopped mentioning but whose cursor the seal still carries costs exactly
-/// ONE exact `GET` -- at its expected-next position -- and that `GET` coming back absent IS its
-/// frontier proof.
-TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
+/// A checkpoint boundary already equal to the carried cursor proves a quiet catalog life complete;
+/// GC must not manufacture a successor `GET` merely because its LIST is empty.
+TEST(CasGcFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSuccessorGet)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -954,6 +1050,12 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     const RootNamespace quiet{"00/quiet@cas@"};
 
     publish(*backend, layout, quiet, "ref_1", 1, DB::UInt128(0x11));
+    replaceRecoverableCkptForRawFixture(*backend, layout, quiet, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);
@@ -965,12 +1067,161 @@ TEST(CasGcFrontierGate, AQuietKnownNamespaceCostsExactlyOneExactGet)
     /// Now the store stops listing the namespace entirely.
     backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
     backend->resetCounts();
-    runRegularRoundReclaiming(gc);
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
 
     const String expected_next =
         layout.refLogKey(NamespaceLifeId::stageATransition(quiet), RefTxnId{sealed.writer_epoch, sealed.ref_sequence + 1});
-    EXPECT_EQ(backend->getCount(expected_next), 1u)
-        << "exactly one exact probe at the arithmetic successor of the sealed cursor";
+    EXPECT_EQ(backend->getCount(expected_next), 0u)
+        << "the inclusive checkpoint boundary proves this quiet life without a successor probe";
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"])
+        << "the inherited cursor already at the checkpoint boundary is destructive-eligible";
+}
+
+/// A checkpoint must never retreat below a sealed cursor. Its inclusive frontier can prove a cursor
+/// already at that point, but cannot explain one that has advanced beyond it.
+TEST(CasGcFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-behind-inherited-cursor@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfb));
+    publish(*backend, layout, ns, "second", 2, DB::UInt128(0xfc));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const String checkpoint_key = layout.refCkptKey(life);
+    const HeadResult checkpoint_head = backend->head(checkpoint_key);
+    ASSERT_TRUE(checkpoint_head.exists);
+    ASSERT_EQ(backend->putOverwrite(checkpoint_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    }), checkpoint_head.token).outcome, PutOutcome::Done);
+
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    EXPECT_FALSE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// A carried `EpochSeal` may have its authoritative successor in the next epoch. The arithmetic
+/// successor in the sealed epoch is absent by design, so the exact checkpoint frontier must nominate
+/// the shared seal-chain crossing before that absence is classified as a same-epoch gap.
+TEST(CasGcFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-inherited-seal-crossing@cas@"};
+    const DB::UInt128 crossed_blob(0xfd);
+
+    casAdmitEntry(*backend, layout, ns);
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "birth", 1, DB::UInt128(0xfe), /*birth=*/true);
+    writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+
+    publishAt(*backend, layout, ns, RefTxnId{2, 1}, "crossed", 2, crossed_blob,
+              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 2});
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const String checkpoint_key = layout.refCkptKey(life);
+    const HeadResult checkpoint_head = backend->head(checkpoint_key);
+    ASSERT_TRUE(checkpoint_head.exists);
+    ASSERT_EQ(backend->putOverwrite(checkpoint_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    }), checkpoint_head.token).outcome, PutOutcome::Done);
+
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    EXPECT_TRUE(report.anomalies.empty());
+    EXPECT_GT(inDegreeOf(*backend, layout, crossed_blob), 0);
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// The exact checkpoint successor must chain to the seal just consumed. Merely being in the next epoch
+/// is insufficient: an incorrect predecessor would skip an unclosed history segment forever.
+TEST(CasGcFrontierGate, CheckpointFrontierRejectsWrongPredecessorAfterFreshEpochSeal)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-wrong-fresh-seal-predecessor@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    publishAt(*backend, layout, ns, RefTxnId{1, 1}, "birth", 1, DB::UInt128(0xff), /*birth=*/true);
+    writeSealAt(*backend, layout, ns, RefTxnId{1, 2});
+    publishAt(*backend, layout, ns, RefTxnId{2, 1}, "wrong_predecessor", 2, DB::UInt128(0x100),
+              /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, 1});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    EXPECT_FALSE(report.anomalies.empty());
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
 }
 
 /// A namespace that was WRONGLY quiet -- the hint hid a record that is durably there -- is walked this
@@ -984,6 +1235,12 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
     const DB::UInt128 late_blob(0x77);
 
     publish(*backend, layout, quiet, "ref_1", 1, DB::UInt128(0x11));
+    replaceRecoverableCkptForRawFixture(*backend, layout, quiet, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
     runRegularRoundReclaiming(gc);
@@ -992,6 +1249,16 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 
     /// A second publish lands, and the store hides the namespace from every LIST at the same moment.
     publish(*backend, layout, quiet, "ref_2", 2, late_blob);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, quiet);
+    const String checkpoint_key = layout.refCkptKey(life);
+    const HeadResult checkpoint_head = backend->head(checkpoint_key);
+    ASSERT_TRUE(checkpoint_head.exists);
+    ASSERT_EQ(backend->putOverwrite(checkpoint_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    }), checkpoint_head.token).outcome, PutOutcome::Done);
     backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
 
     runRegularRoundReclaiming(gc);
@@ -1002,10 +1269,361 @@ TEST(CasGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
         << "the hidden publish's edge folded this round -- the hint never mentioned it";
 }
 
-/// When the probe budget runs out before every known namespace has been reached, the round still
-/// commits (cursors seal, the fold advances) and destroys NOTHING. The unprobed namespaces keep their
-/// cursors: dropping one because a round ran out of budget would hand the next round a namespace to
-/// re-fold from `{0, 0}`, which is far worse than the unproven frontier it already is.
+/// The catalog life is grounded by its exact decoded `_ckpt`, not by the round's listing or a later
+/// absent probe. A durable `F+1` is physically present but not committed history, so this fold may apply
+/// only `F`; in particular it must not read `F+2`. Reaching `F` still proves the checkpoint-bounded
+/// cut, so the physical successor cannot suppress otherwise eligible destructive work.
+TEST(CasGcFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccessor)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-bounds-fold@cas@"};
+    const DB::UInt128 committed_blob(0xf1);
+    const DB::UInt128 beyond_frontier_blob(0xf2);
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "committed", 1, committed_blob);
+    const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, beyond_frontier_blob);
+    writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = RefTxnId{1, 2},
+        .ops = publishCommittedOps("durable_but_uncommitted", uncommitted),
+        .prev_epoch_seal = std::nullopt,
+    });
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    backend->resetCounts();
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+    EXPECT_EQ(inDegreeOf(*backend, layout, beyond_frontier_blob), 0)
+        << "a durable log above `_ckpt.committed_through` is not foldable history";
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
+        << "the checkpoint frontier stops the walk before `F+1`";
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 3})), 0u)
+        << "a 404 above `F+1` must not authorize the destructive frontier";
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"])
+        << "the consumed checkpoint frontier, not the physical successor, authorizes this cut";
+}
+
+/// With no physical successor at all, consuming the exact inclusive checkpoint frontier proves this
+/// catalog life complete. This is the control for the same bounded-cut proof exercised with a durable
+/// uncommitted successor above.
+TEST(CasGcFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSuccessor)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-complete-fold@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf3));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    backend->resetCounts();
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
+        << "the checkpoint boundary proves the cut without a post-frontier 404";
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// The same cut remains complete when the durable uncommitted successor is hidden from every LIST.
+/// Exact reads still serve that successor, but the checkpoint ceiling must leave it untouched and must
+/// not let the list omission suppress the checkpoint-bounded destructive path.
+TEST(CasGcFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
+{
+    auto backend = std::make_shared<CountingHintHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/checkpoint-hidden-successor@cas@"};
+    const DB::UInt128 beyond_frontier_blob(0xf4);
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "committed", 1, DB::UInt128(0xf5));
+    const ManifestRef uncommitted{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, beyond_frontier_blob);
+    writeManifestRaw(*backend, layout, ns, uncommitted, {blobEntryFor("data.bin", beyond_frontier_blob)});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = ns.string(),
+        .txn_id = RefTxnId{1, 2},
+        .ops = publishCommittedOps("hidden_durable_but_uncommitted", uncommitted),
+        .prev_epoch_seal = std::nullopt,
+    });
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    backend->hide(layout.refLogKey(life, RefTxnId{1, 2}));
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    backend->resetCounts();
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_GT(backend->holesServed(), 0u) << "the F+1 log must really be hidden from LIST";
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+    EXPECT_EQ(inDegreeOf(*backend, layout, beyond_frontier_blob), 0);
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
+        << "the hidden durable successor is outside the checkpoint cut";
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// The checkpoint's inclusive endpoint is itself a durable witness. If that exact log is absent,
+/// the namespace is corrupt rather than complete; a 404 at the endpoint must not authorize cleanup.
+TEST(CasGcFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFrontier)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing-committed-checkpoint-log@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xf6));
+    publish(*backend, layout, ns, "missing_but_committed", 2, DB::UInt128(0xf7));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const String missing_key = layout.refLogKey(life, RefTxnId{1, 2});
+    const HeadResult missing_head = backend->head(missing_key);
+    ASSERT_TRUE(missing_head.exists);
+    ASSERT_EQ(backend->deleteExact(missing_key, missing_head.token).kind, DeleteOutcome::Kind::Deleted);
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+    EXPECT_FALSE(report.anomalies.empty()) << "the missing committed checkpoint record is corruption";
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// A checkpoint may name a durable record that the round's LIST omitted. Exact GETs must still fold
+/// that committed record; the frozen list tail is only a scheduling hint, never a history boundary.
+TEST(CasGcFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityCeiling)
+{
+    auto backend = std::make_shared<CountingHintHoleBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/hidden-committed-checkpoint-log@cas@"};
+    const DB::UInt128 hidden_blob(0xf8);
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xf9));
+    publish(*backend, layout, ns, "hidden_but_committed", 2, hidden_blob);
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    backend->hide(layout.refLogKey(life, RefTxnId{1, 2}));
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_GT(backend->holesServed(), 0u) << "the committed endpoint must really be omitted from LIST";
+    EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
+    EXPECT_GT(inDegreeOf(*backend, layout, hidden_blob), 0);
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// A valid checkpoint with no committed record is an authoritative empty history. It is complete for
+/// a never-folded life without probing a fabricated first transaction.
+TEST(CasGcFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/empty-checkpoint-frontier@cas@"};
+
+    casAdmitRecoverableEntry(*backend, layout, ns);
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_TRUE(report.anomalies.empty());
+    ASSERT_FALSE(intake.empty());
+    EXPECT_EQ(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// Empty history cannot explain an inherited cursor. An operator-corrupted checkpoint that erases its
+/// own committed boundary must clamp the life rather than silently authorize destruction.
+TEST(CasGcFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/empty-checkpoint-after-cursor@cas@"};
+
+    casAdmitEntry(*backend, layout, ns);
+    publish(*backend, layout, ns, "first", 1, DB::UInt128(0xfa));
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 1}));
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const String checkpoint_key = layout.refCkptKey(life);
+    const HeadResult checkpoint_head = backend->head(checkpoint_key);
+    ASSERT_TRUE(checkpoint_head.exists);
+    ASSERT_EQ(backend->putOverwrite(checkpoint_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    }), checkpoint_head.token).outcome, PutOutcome::Done);
+
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(report.acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_FALSE(report.anomalies.empty()) << "an empty checkpoint cannot explain a nonzero cursor";
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// A catalog `Live` life without its exact checkpoint cannot derive either its genesis or a frontier
+/// from the ref LIST. Even a durable listed first log must be retained until the authority is repaired.
+TEST(CasGcFrontierGate, CatalogLifeWithoutCheckpointDefersWithoutUsingListedFrontier)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/missing-checkpoint-fold@cas@"};
+    const DB::UInt128 blob(0xc7);
+
+    casAdmitEntry(*backend, layout, ns);
+    const ManifestRef manifest{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
+    writeBlobBody(*backend, layout, blob);
+    writeManifestRaw(*backend, layout, ns, manifest, {blobEntryFor("data.bin", blob)});
+    appendRefLogSeed(*backend, layout, ns, publishCommittedOps("must_remain_unfolded", manifest));
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    ASSERT_FALSE(readCkpt(*backend, layout, life).has_value());
+
+    std::map<String, UInt64> intake;
+    Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    backend->resetCounts();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    gc.setPhaseSink({});
+
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, /*shard=*/0), 0u);
+    EXPECT_EQ(inDegreeOf(*backend, layout, blob), 0)
+        << "a missing checkpoint must defer rather than fold the listed log";
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 1})), 0u)
+        << "the listed log is not authority for a checkpoint-less catalog life";
+    EXPECT_EQ(backend->getCount(layout.refLogKey(life, RefTxnId{1, 2})), 0u)
+        << "the next 404 is not authority for a checkpoint-less catalog life";
+    EXPECT_EQ(backend->deleteTotal(), 0u) << deletedKeysMessage(*backend);
+    ASSERT_FALSE(intake.empty());
+    EXPECT_LT(intake["frontier_proven"], intake["frontier_namespaces"]);
+}
+
+/// A valid checkpoint frontier proves a quiet unhinted life without spending the successor-probe budget.
+/// A zero budget therefore cannot suppress unrelated destructive work merely because this life is absent
+/// from LIST.
 TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
@@ -1024,38 +1642,35 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
     const RefTxnId quiet_cursor = sealedCursorOf(*backend, layout, quiet);
     ASSERT_NE(quiet_cursor, (RefTxnId{}));
 
-    /// The quiet namespace goes unhinted, and the budget is zero, so it is never probed. The busy
-    /// namespace meanwhile drops its ref, which would otherwise condemn and delete the blob.
+    /// The quiet namespace goes unhinted and the budget is zero. Its CTE still proves the carried
+    /// cursor, while the busy namespace drops its ref and may proceed through reclamation.
     backend->hidePrefix(layout.namespaceStreamPrefix(NamespaceLifeId::stageATransition(quiet)));
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
     drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
 
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "budget exhausted means an unproven frontier means no destruction. Deleted:"
-        << deletedKeysMessage(*backend);
-    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
+    EXPECT_GT(backend->deleteTotal(), 0u)
+        << "the quiet life's checkpoint authority leaves unrelated deletion eligible";
+    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
+        << "the busy life's removal remains reclaimable despite the quiet LIST omission";
     EXPECT_EQ(sealedCursorOf(*backend, layout, quiet), quiet_cursor)
         << "the unprobed namespace's cursor rides verbatim -- it is never dropped";
+    const NamespaceLifeId quiet_life = *CasRefCatalog::lifeIfCataloged(*backend, layout, quiet);
+    const auto quiet_checkpoint = readCkpt(*backend, layout, quiet_life);
+    ASSERT_TRUE(quiet_checkpoint.has_value());
+    EXPECT_EQ(quiet_checkpoint->ckpt.committed_through, quiet_cursor)
+        << "the quiet life's valid CTE is unaffected by LIST omission and a zero probe budget";
     EXPECT_GT(decodeGcState(backend->get(layout.gcStateKey())->bytes).round, 1u)
         << "the round still commits; only its destructive half is withheld";
 }
 
-/// ===================== A CARRIED HOLD SUPPRESSES, STRUCTURALLY =====================
+/// ===================== A COMMITTED GAP IS REDETECTED UNTIL REPAIRED =====================
 ///
-/// The gate's second term reads the HOLD SET off the seal it is about to make durable, instead of
-/// relying on the fact that a hold also happens to record an anomaly. Proving that takes the one shape
-/// where the two come apart: a hold DETECTED by an earlier round and merely CARRIED by this one, on a
-/// round whose own walk ended quietly and recorded nothing.
-///
-/// Reaching it takes the lying store. Round 1 sees the gap at {1,3} below a LISTED {1,4} -- impossible
-/// under contiguity -- and holds there. The store then stops listing {1,4}. Round 2's walk finds
-/// nothing above the absent {1,3} (the carried hold sits AT {1,3}, and a position is not a witness
-/// strictly above itself), so it reads an honest frontier and detects nothing at all. The hold rides
-/// forward regardless, because a hold clears only by RESOLVING its position -- and it is the hold set,
-/// not that round's silence, that has to keep the round from destroying.
-TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
+/// A hold's committed checkpoint frontier remains a durable witness of its own gap. Hiding the later
+/// log from LIST cannot make that gap quiet: every retry exact-reads the missing position, redetects the
+/// hold, and suppresses destructive work until an operator repairs the record stream.
+TEST(CasGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1075,14 +1690,37 @@ TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
     txn.txn_id = RefTxnId{1, 4};
     txn.ops = publishCommittedOps("ref_4", orphan_ref);
     writeRefLogTxnRaw(*backend, layout, txn);
+    replaceRecoverableCkptForRawFixture(*backend, layout, held, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 4},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     Gc gc(store, kGc);
-    runRegularRoundReclaiming(gc);
+    std::map<String, UInt64> first_intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            first_intake = rec.metrics;
+    });
+    const RoundReport first_round = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
     store->renewWatermarkOnce();
     ASSERT_EQ(sealedCursorOf(*backend, layout, held), (RefTxnId{1, 2}))
         << "round 1 must stop below the gap and hold there";
+    ASSERT_FALSE(first_intake.empty());
+    EXPECT_GT(first_intake["tables_clamped"], 0u);
+    EXPECT_GT(first_intake["tables_held"], 0u);
+    EXPECT_FALSE(first_round.anomalies.empty());
 
-    /// The witness goes quiet. From here the walk of `held` detects nothing whatsoever.
+    const NamespaceLifeId held_life = *CasRefCatalog::lifeIfCataloged(*backend, layout, held);
+    const auto held_checkpoint = readCkpt(*backend, layout, held_life);
+    ASSERT_TRUE(held_checkpoint.has_value());
+    EXPECT_EQ(held_checkpoint->ckpt.committed_through, (RefTxnId{1, 4}));
+
+    /// Hiding `{1,4}` from LIST does not hide the committed CTE frontier. The next round exact-reads
+    /// the missing `{1,3}`, re-detects the gap, and seals a fresh hold.
     backend->hidePrefix(layout.refLogKey(NamespaceLifeId::stageATransition(held), RefTxnId{1, 4}));
 
     /// Meanwhile a blob elsewhere becomes condemnable, so the round has real destructive work to decline.
@@ -1090,14 +1728,34 @@ TEST(CasGcFrontierGate, ACarriedHoldSuppressesOnARoundThatDetectedNothing)
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
+    std::map<String, UInt64> second_intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            second_intake = rec.metrics;
+    });
+    const RoundReport second_round = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+    store->renewWatermarkOnce();
+
+    ASSERT_FALSE(second_intake.empty());
+    EXPECT_GT(second_intake["tables_clamped"], 0u)
+        << "the committed `{1,4}` frontier is a durable witness that re-detects the missing `{1,3}`";
+    EXPECT_GT(second_intake["tables_held"], 0u)
+        << "the fresh clamp preserves the unresolved hold in the next sealed coverage";
+    EXPECT_FALSE(second_round.anomalies.empty());
+
+    drive(store, gc, /*rounds*/ 4, UniversePolicy::AuthoritativeForTest);
 
     EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "a hold the seal still carries suppresses the round even when the round itself saw nothing. "
+        << "the re-detected committed gap suppresses each round's destructive work. "
            "Deleted:" << deletedKeysMessage(*backend);
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
     EXPECT_EQ(sealedCursorOf(*backend, layout, held), (RefTxnId{1, 2}))
-        << "and the quiet has not cleared the hold -- its position is still unresolved";
+        << "the committed gap remains unresolved and the cursor cannot advance through it";
+    const auto final_checkpoint = readCkpt(*backend, layout, held_life);
+    ASSERT_TRUE(final_checkpoint.has_value());
+    EXPECT_EQ(final_checkpoint->ckpt.committed_through, (RefTxnId{1, 4}));
 }
 
 /// ===================== THE TEMPORAL LEMMA, ALL THREE ARMS =====================
@@ -1277,7 +1935,8 @@ TEST(CasGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSour
 /// ===================== CLEANUP RANGES ARE COMPUTED, NOT ENUMERATED =====================
 ///
 /// `planRefCleanup` is pure, so the boundary arithmetic is pinned directly rather than inferred from a
-/// round's side effects. The checkpoint can only ever TIGHTEN both boundaries.
+/// round's side effects. Its sole coverage authority is the checkpoint-named base; a listed snapshot
+/// is merely a physical observation until the same-id triple has been validated.
 
 TEST(CasGcFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCursor)
 {
@@ -1285,19 +1944,23 @@ TEST(CasGcFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCu
     listing.logs = {{1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}};
     listing.snapshots = {{1, 5}};
 
-    /// No checkpoint: the boundary is min(newest snapshot, cursor) = {1,4}.
+    /// No checkpoint means no recovery base at all. A snapshot PUT that has not reached the `_ckpt`
+    /// CAS must retain every listed object.
     const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 4});
-    EXPECT_EQ(without.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}, {1, 3}, {1, 4}}));
+    EXPECT_TRUE(without.deletable_logs.empty());
+    EXPECT_TRUE(without.deletable_snapshots.empty());
 
-    /// A checkpoint BELOW the cursor tightens it to {1,2}.
+    /// A checkpoint BELOW the cursor tightens it to {1,2}. Its exact `_log` witness must survive,
+    /// so cleanup may remove only the strictly older entry.
     const RefCleanupPlan with = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 2});
-    EXPECT_EQ(with.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}}))
-        << "nothing above min(checkpoint, cursor) may be deleted";
+    EXPECT_EQ(with.deletable_logs, (std::vector<RefTxnId>{{1, 1}}))
+        << "the checkpoint witness and everything above it must survive";
 
-    /// A checkpoint ABOVE both changes nothing: it can only tighten.
+    /// Once validation has established a later checkpoint base, its earlier covered history is
+    /// reclaimable even if the hot fold cursor has not yet reached that base.
     const RefCleanupPlan ahead = planRefCleanup(listing, RefTxnId{1, 4}, RefTxnId{1, 9});
-    EXPECT_EQ(ahead.deletable_logs, without.deletable_logs)
-        << "a checkpoint ahead of the round's own observations never widens the range";
+    EXPECT_EQ(ahead.deletable_logs, (std::vector<RefTxnId>{{1, 1}, {1, 2}, {1, 3}, {1, 4}}));
+    EXPECT_EQ(ahead.deletable_snapshots, (std::vector<RefTxnId>{{1, 5}}));
 }
 
 TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStrictlyOlderOnesGo)
@@ -1306,9 +1969,9 @@ TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
     listing.logs = {{1, 1}, {1, 2}, {1, 3}};
     listing.snapshots = {{1, 1}, {1, 2}, {1, 3}};
 
-    /// Without a checkpoint the newest snapshot is the boundary and the two older ones go.
+    /// A LIST-only newest snapshot is never a cleanup boundary.
     const RefCleanupPlan without = planRefCleanup(listing, RefTxnId{1, 3});
-    EXPECT_EQ(without.deletable_snapshots, (std::vector<RefTxnId>{{1, 1}, {1, 2}}));
+    EXPECT_TRUE(without.deletable_snapshots.empty());
 
     /// With the checkpoint AT {1,2}, only {1,1} is strictly below it. The snapshot the checkpoint names
     /// is the one a recovering reader samples, so it must survive its own cleanup.
@@ -1320,6 +1983,89 @@ TEST(CasGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
     EXPECT_TRUE(oldest.deletable_snapshots.empty());
 }
 
+/// Cleanup shares recovery's validator rather than inferring its own authority from a LIST. The
+/// missing-base case is the no-checkpoint range above; the three physical triple failures below must
+/// each reject exactly the checkpoint-named candidate.
+TEST(CasGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnapshotAndSeal)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout{"p"};
+    const RefTxnId base{1, 1};
+    const RefCkpt checkpoint{
+        .life_epoch = 1,
+        .committed_through = base,
+        .checkpoint_snapshot_id = base,
+        .last_epoch_seal = std::nullopt};
+    CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+
+    {
+        const RootNamespace ns{"00/cleanup-missing-base-log@cas@"};
+        casAdmitEntry(*backend, layout, ns);
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
+    }
+    {
+        const RootNamespace ns{"00/cleanup-missing-base-snapshot@cas@"};
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = base, .ops = {namespaceBirthOp()}, .prev_epoch_seal = std::nullopt});
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
+    }
+    {
+        const RootNamespace ns{"00/cleanup-seal-is-not-base@cas@"};
+        writeSealAt(*backend, layout, ns, base);
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base));
+        EXPECT_THROW((void)readCheckpointSnapshotBase(*backend, layout, life, checkpoint), DB::Exception);
+    }
+}
+
+TEST(CasGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCannotLicenseDeletion)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout{"p"};
+    CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+    const RefTxnId seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    const auto expect_no_deletion_authority = [&](const RootNamespace & ns, std::optional<RefTxnId> backlink)
+    {
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+            .prev_epoch_seal = std::nullopt});
+        writeSealAt(*backend, layout, ns, seal_id);
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+            .ns = ns.string(), .txn_id = base_id, .ops = {}, .prev_epoch_seal = backlink});
+        writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), base_id));
+        const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+
+        std::optional<RefTxnId> validated_base;
+        try
+        {
+            (void)readCheckpointSnapshotBase(*backend, layout, life, RefCkpt{
+                .life_epoch = 1,
+                .committed_through = base_id,
+                .checkpoint_snapshot_id = base_id,
+                .last_epoch_seal = seal_id});
+            validated_base = base_id;
+        }
+        catch (const DB::Exception &)
+        {
+        }
+
+        RefTableListing listing;
+        listing.logs = {{1, 1}, seal_id, base_id};
+        listing.snapshots = {{1, 1}, base_id};
+        const RefCleanupPlan plan = planRefCleanup(listing, base_id, validated_base);
+        EXPECT_TRUE(plan.deletable_logs.empty());
+        EXPECT_TRUE(plan.deletable_snapshots.empty());
+    };
+
+    expect_no_deletion_authority(RootNamespace{"00/cleanup-base-missing-backlink@cas@"}, std::nullopt);
+    expect_no_deletion_authority(RootNamespace{"00/cleanup-base-wrong-backlink@cas@"}, RefTxnId{1, 99});
+}
+
 /// Folding a namespace terminal records evidence but performs no lifecycle-specific physical cleanup.
 /// The checkpoint is inert debris for the perpetual janitor, and no `_cleanup` marker is published.
 TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor)
@@ -1328,10 +2074,13 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace removed{"00/removed@cas@"};
+    const RefOp birth_op = namespaceBirthOp();
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{
-        .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {remove_op}, .prev_epoch_seal = std::nullopt});
+        .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {birth_op}, .prev_epoch_seal = std::nullopt});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 2}, .ops = {remove_op}, .prev_epoch_seal = std::nullopt});
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
     CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
     {
@@ -1347,7 +2096,18 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     });
     const String ckpt_key = layout.refCkptKey(life);
     backend->putIfAbsent(ckpt_key, encodeRefCkpt(RefCkpt{
-        .life_epoch = 1, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    }));
+
+    /// The removal evidence must arise from a replay-valid terminal lifecycle, rather than merely
+    /// from a raw terminal record that the recovery state machine refuses.
+    const RecoveredRefTable recovered = recoverRefTableDetailedAtCatalogCutForTest(
+        *backend, layout, CasRefCatalog::read(*backend, layout), removed);
+    EXPECT_EQ(recovered.state.getLifecycle(), RefLifecycle::Removed);
+    EXPECT_EQ(recovered.state.getRemoveTxnId(), (RefTxnId{1, 2}));
 
     Gc gc(store, kGc);
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
@@ -1358,7 +2118,7 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     const auto row_it = seal.ref_lives.find(life.incarnation);
     ASSERT_NE(row_it, seal.ref_lives.end());
     ASSERT_TRUE(row_it->second.cleanup_evidence.has_value());
-    EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 1}));
+    EXPECT_EQ(row_it->second.cleanup_evidence->remove_txn_id, (RefTxnId{1, 2}));
     EXPECT_TRUE(backend->head(ckpt_key).exists);
     for (const String & key : backend->touchedKeys())
         EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
@@ -1368,6 +2128,98 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
     EXPECT_TRUE(backend->head(ckpt_key).exists);
     EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
+}
+
+/// Once a terminal has folded, a later physical read failure is janitor debt, not lifecycle evidence
+/// loss. Removing this per-key leak handling would either make the signal disappear or let one dead
+/// object prevent the janitor from considering the rest of its page.
+TEST(CasGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingProgress)
+{
+    auto backend = std::make_shared<PostFoldUnreadableTerminalBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace removed{"00/post-fold-unreadable@cas@"};
+    const RootNamespace progressing{"00/post-fold-progress@cas@"};
+
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt});
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 2}, .ops = {remove_op},
+        .prev_epoch_seal = std::nullopt});
+    const NamespaceLifeId removed_life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == removed;
+        });
+        if (it == next.entries.end())
+            throw std::runtime_error("test fixture lost removing catalog row");
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(removed_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    })).outcome, PutOutcome::Done);
+
+    const DB::UInt128 blob(0xfeed);
+    const ManifestRef manifest = publish(*backend, layout, progressing, "victim", 1, blob);
+    const ManifestId manifest_id{progressing, manifest};
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    const GcState folded_state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal folded_seal = decodeFoldSeal(
+        backend->get(layout.foldSealKey(folded_state.snap_generation, folded_state.snap_attempt))->bytes);
+    const auto folded_row = folded_seal.ref_lives.find(removed_life.incarnation);
+    ASSERT_NE(folded_row, folded_seal.ref_lives.end());
+    ASSERT_TRUE(folded_row->second.cleanup_evidence.has_value());
+
+    dropRefTransition(*backend, layout, progressing, "victim", manifest);
+    const String terminal_key = layout.refLogKey(removed_life, RefTxnId{1, 2});
+    const String later_dead_residue = layout.refLogKey(removed_life, RefTxnId{1, 3});
+    ASSERT_EQ(backend->putIfAbsent(later_dead_residue, "dead residue after the folded terminal").outcome,
+        PutOutcome::Done);
+    backend->makeUnreadable(terminal_key);
+
+    std::map<String, UInt64> namespace_cleanup;
+    const uint64_t leaks_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load();
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "namespace_cleanup")
+            namespace_cleanup = record.metrics;
+    });
+    ScopedCasGcLogCapture log_capture;
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(report.acquired_lease);
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed))
+        << "post-fold physical cleanup cannot gate catalog removal";
+    EXPECT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, progressing));
+    EXPECT_EQ(report.manifests_deleted, 1u)
+        << "the janitor leak cannot promote itself into pool-wide destructive suppression";
+    EXPECT_FALSE(backend->head(layout.manifestKey(manifest_id)).exists);
+    EXPECT_TRUE(backend->existsIgnoringFault(terminal_key));
+    EXPECT_FALSE(backend->existsIgnoringFault(later_dead_residue))
+        << "one unreadable key cannot stop the perpetual janitor from deciding the rest of its page";
+    ASSERT_FALSE(namespace_cleanup.empty());
+    EXPECT_EQ(namespace_cleanup["leaked"], 1u);
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load() - leaks_before,
+        1u);
+    const String captured = log_capture.captured();
+    EXPECT_NE(captured.find(terminal_key), String::npos);
+    EXPECT_NE(captured.find("leak"), String::npos);
 }
 
 TEST(CasGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDeletion)
@@ -1679,6 +2531,12 @@ TEST(CasGcFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
         next.entries.front().removal_started_round = 1;
         return next;
     });
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
 
     Gc gc(store, kGc);
@@ -1815,7 +2673,7 @@ TEST(CasGcFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListi
 
     ASSERT_TRUE(leader_a_failure);
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
-    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, "old-life checkpoint bytes");
+    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, fixture.checkpoint_bytes);
     EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
 }
 
@@ -1851,7 +2709,7 @@ TEST(CasGcFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
     EXPECT_LT(stream_list, fresh_catalog_cut);
 
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
-    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, "old-life checkpoint bytes");
+    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, fixture.checkpoint_bytes);
     EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
 }
 

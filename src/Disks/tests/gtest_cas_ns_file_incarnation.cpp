@@ -159,6 +159,15 @@ TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
         return next;
     });
 
+    /// Only a `Live` catalog row is readable. Give that exact life the empty checkpoint authority
+    /// that production creation publishes; the other rows deliberately remain raw lifecycle states.
+    writeRecoverableCkptForRawFixture(*backend, layout, live, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
     backend->resetCounts();
     EXPECT_FALSE(store->namespaceFilesLifeIfReadable(creating));
     EXPECT_FALSE(store->namespaceFilesLifeIfReadable(removing));
@@ -196,6 +205,12 @@ TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
         appendRefLogSeed(*backend, layout, ns, {remove_op});
     }
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, ns);
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
     const String debris_key = layout.namespaceFileKey(life, kFile);
     backend->putIfAbsent(debris_key, "1\n");
     backend->putIfAbsent(layout.namespaceFileKey(life, "deduplication_logs/deduplication_log_1.txt"), "records");

@@ -2,12 +2,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Common/Exception.h>
 #include <algorithm>
+#include <limits>
 
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int INVALID_STATE;
 }
 }
 
@@ -33,6 +35,27 @@ std::optional<T> maxKnown(const std::optional<T> & a, const std::optional<T> & b
     if (!b)
         return a;
     return std::max(*a, *b);
+}
+
+std::optional<RefTxnId> mergeCommittedThrough(const RefCkpt & a, const RefCkpt & b)
+{
+    if (!a.committed_through)
+        return b.committed_through;
+    if (!b.committed_through)
+        return a.committed_through;
+    if (a.committed_through->writer_epoch == b.committed_through->writer_epoch)
+        return std::max(*a.committed_through, *b.committed_through);
+
+    const RefCkpt & higher = *a.committed_through < *b.committed_through ? b : a;
+    const RefCkpt & lower = *a.committed_through < *b.committed_through ? a : b;
+    if (lower.committed_through->writer_epoch + 1 != higher.committed_through->writer_epoch
+        || !higher.last_epoch_seal
+        || *higher.last_epoch_seal < *lower.committed_through
+        || *higher.committed_through < *higher.last_epoch_seal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS _ckpt: cross-epoch committed_through requires the immediately next writer epoch and "
+            "a seal covering the lower frontier without exceeding the higher frontier");
+    return higher.committed_through;
 }
 
 /// `life_epoch` MAY NOT DECREASE, and this is the whole of that rule. It lives HERE, at the publish
@@ -107,9 +130,58 @@ RefCkpt mergeCkpt(const RefCkpt & a, const RefCkpt & b)
     /// the values it legitimately takes only ever RISE, which is what makes the max right here and what
     /// lets `publishCkpt` refuse the fall separately.)
     merged.life_epoch = maxKnown(a.life_epoch, b.life_epoch);
+    merged.committed_through = mergeCommittedThrough(a, b);
     merged.checkpoint_snapshot_id = maxKnown(a.checkpoint_snapshot_id, b.checkpoint_snapshot_id);
     merged.last_epoch_seal = maxKnown(a.last_epoch_seal, b.last_epoch_seal);
+    /// Contributions may omit independent facts, but the resulting durable shape may not. In
+    /// particular, if one writer supplies `life_epoch` and another supplies a later frontier, their
+    /// merge must carry the chain evidence before `publishCkpt` can encode it.
+    if (merged.committed_through)
+        checkRefCkptInvariants(merged, "_ckpt merge");
     return merged;
+}
+
+RecoveryGrounding chooseRecoveryGrounding(const std::optional<CatalogEntry> & catalog_state,
+                                          const std::optional<RefCkpt> & ckpt)
+{
+    if (!catalog_state || catalog_state->state == NsState::Creating)
+        throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace is absent or Creating");
+    if (catalog_state->state != NsState::Live && catalog_state->state != NsState::Removing)
+        throw Exception(ErrorCodes::INVALID_STATE, "CAS recovery grounding: namespace has an unsupported lifecycle state");
+    if (!ckpt || !ckpt->life_epoch)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery grounding: a Live or Removing namespace requires a readable _ckpt with life_epoch");
+
+    checkRefCkptInvariants(*ckpt, "recovery grounding");
+    RecoveryGrounding result;
+    result.committed_through = ckpt->committed_through;
+    if (!result.committed_through)
+    {
+        if (ckpt->checkpoint_snapshot_id || ckpt->last_epoch_seal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery grounding: a checkpoint without committed_through cannot name a snapshot or epoch seal");
+        return result;
+    }
+
+    if (ckpt->checkpoint_snapshot_id && ckpt->last_epoch_seal
+        && *ckpt->checkpoint_snapshot_id == *ckpt->last_epoch_seal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS recovery grounding: checkpoint_snapshot_id must not name last_epoch_seal");
+
+    if (ckpt->checkpoint_snapshot_id)
+        result.base = ckpt->checkpoint_snapshot_id;
+    if (result.base)
+    {
+        if (result.base->ref_sequence == std::numeric_limits<uint64_t>::max())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS recovery grounding: checkpoint base has no representable successor");
+        result.walk_from = RefTxnId{result.base->writer_epoch, result.base->ref_sequence + 1};
+    }
+    else if (!result.base)
+    {
+        result.walk_from = RefTxnId{*ckpt->life_epoch, 1};
+    }
+    return result;
 }
 
 std::optional<CkptSample> readCkpt(Backend & backend, const Layout & layout, const NamespaceLifeId & life)
@@ -128,6 +200,8 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
                                const CkptDeadline & deadline)
 {
     const String key = layout.refCkptKey(life);
+    std::optional<CkptSample> current;
+    bool have_current = false;
 
     for (size_t attempt = 0; attempt < MAX_CKPT_CAS_ATTEMPTS; ++attempt)
     {
@@ -137,7 +211,11 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// Read the WHOLE body every attempt. A retry after a conflict must merge against what is
         /// there NOW: reusing the previous attempt's reading is precisely the read-modify-write with
         /// the merge left out, one round later.
-        const std::optional<CkptSample> current = readCkpt(backend, layout, life);
+        if (!have_current)
+        {
+            current = readCkpt(backend, layout, life);
+            have_current = true;
+        }
 
         /// The one rule the commutative merge cannot state, and it has to be decided HERE, before the
         /// merge: the semantic maximum turns a decrease into a body identical to the stored one, which
@@ -173,7 +251,17 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
         /// so issuing the write anyway would mint a fresh token per no-op and turn every other writer's
         /// in-flight CAS into a conflict, for a body byte-identical to the one already stored.
         if (current && merged == current->ckpt)
+        {
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                return CkptPublishOutcome::FencedOut;
+            }
             return CkptPublishOutcome::IdenticalSkip;
+        }
 
         /// AFTER the read, BEFORE the CAS, on EVERY attempt (spec §3). A generation that moved since
         /// admission means this writer's lease incarnation is gone and the body it just merged is
@@ -192,10 +280,57 @@ CkptPublishOutcome publishCkpt(Backend & backend, const Layout & layout, const N
 
         const std::optional<Token> expected =
             current ? std::optional<Token>{current->token} : std::nullopt;
-        if (backend.casPut(key, encodeRefCkpt(merged), expected).outcome == CasOutcome::Committed)
-            return CkptPublishOutcome::Published;
+        /// Encode before entering the ambiguity catch. Allocation or invariant failures happen before
+        /// any request is sent and must propagate as themselves, not trigger a needless resolution GET.
+        const String merged_bytes = encodeRefCkpt(merged);
+        try
+        {
+            if (backend.casPut(key, merged_bytes, expected).outcome == CasOutcome::Committed)
+                return CkptPublishOutcome::Published;
+        }
+        catch (...)
+        {
+            /// A thrown CAS response does not say whether the object changed. Never retry its bytes
+            /// from memory: first point-read the exact mutable object, including its fresh token. If
+            /// that observation includes this contribution under the semantic join, the write is
+            /// resolved durable; otherwise that exact observation is the only valid base for a retry.
+            try
+            {
+                current = readCkpt(backend, layout, life);
+                have_current = true;
+            }
+            catch (...)
+            {
+                throwCasWriteRetryLater("CAS _ckpt for namespace '" + life.ns.string()
+                    + "': a CAS response was ambiguous and the mandatory exact-read resolution failed ("
+                    + getCurrentExceptionMessage(/*with_stacktrace*/ false) + ")");
+            }
+
+            try
+            {
+                check_fence_or_throw(admitted_generation);
+            }
+            catch (...)
+            {
+                return CkptPublishOutcome::FencedOut;
+            }
+
+            if (current && lifeEpochWouldDecrease(current->ckpt, contribution))
+                throwLifeEpochDecrease(current->ckpt, contribution, key);
+
+            const RefCkpt resolved_merge = current ? mergeCkpt(current->ckpt, contribution) : contribution;
+            if (current && resolved_merge == current->ckpt)
+                return CkptPublishOutcome::Published;
+
+            /// `current` is the exact observation made after the ambiguous response. The next loop
+            /// iteration retries the SAME contribution against its token (or expected absence), with
+            /// no blind CAS and no redundant intervening GET.
+            continue;
+        }
         /// `Conflict`: the incarnation we read is no longer current, so another writer's merge landed
         /// first. Nothing of ours was written; re-read and merge against the winner.
+        current.reset();
+        have_current = false;
     }
 
     /// Fail closed. Every attempt was all-or-nothing, so there is no partial state -- only an

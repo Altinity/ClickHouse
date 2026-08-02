@@ -12,6 +12,7 @@ struct NamespaceJanitorResult
     uint64_t pages = 0;
     uint64_t keys = 0;
     uint64_t deleted = 0;
+    uint64_t leaked = 0;
     std::vector<String> anomalies;
 };
 

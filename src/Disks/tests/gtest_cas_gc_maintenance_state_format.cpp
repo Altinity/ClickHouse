@@ -1,6 +1,7 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcMaintenanceStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcMaintenanceState.h>
+#include <fmt/format.h>
 
 using namespace DB::Cas;
 
@@ -46,8 +47,8 @@ TEST(CasGcMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
     EXPECT_NE(layout.gcMaintenanceStateKey(), layout.gcHbKey());
 
     const GcMaintenanceState empty;
-    EXPECT_EQ(encodeGcMaintenanceState(empty),
-        "{\"type\":\"cas_gc_maintenance_state\",\"v\":8}\n{\"cur\":\"\"}\n");
+    EXPECT_EQ(encodeGcMaintenanceState(empty), fmt::format(
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"cur\":\"\"}}\n", currentCompatibilityVersion()));
     const GcMaintenanceState state{.janitor_cursor = R"(cas/ns/a/"quoted"\\next)"};
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(state)), state);
 }
@@ -170,9 +171,9 @@ TEST(CasGcMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
     const String key = layout.gcMaintenanceStateKey();
-    const String future =
-        "{\"type\":\"cas_gc_maintenance_state\",\"v\":" + std::to_string(G_BUILD + 1) + "}\n{\"cur\":\"\"}\n";
-    ASSERT_EQ(backend.putIfAbsent(key, future).outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent(key, fmt::format(
+        "{{\"type\":\"cas_gc_maintenance_state\",\"v\":{}}}\n{{\"cur\":\"\"}}\n", currentCompatibilityVersion() + 1)).outcome,
+        PutOutcome::Done);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { (void)readGcMaintenanceState(backend, layout); });
     EXPECT_EQ(backend.casPutCount(key), 0u);

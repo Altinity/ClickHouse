@@ -21,6 +21,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
@@ -256,6 +258,9 @@ inline DB::Cas::ManifestEntry blobEntryFor(const String & path, const DB::UInt12
 /// snapshot+log objects GC and recovery actually read); the seeding wrappers below emit through them.
 inline void writeRefLogTxnRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn);
+inline void publishRecoverableCkptForSemanticWrapper(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & txn_id);
 inline DB::Cas::RefOp namespaceBirthOp();
 inline std::vector<DB::Cas::RefOp> publishCommittedOps(
     const String & ref_name, const DB::Cas::ManifestRef & manifest_ref);
@@ -351,7 +356,9 @@ inline uint64_t publishCommittedTransition(
             DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, ref_name, *old_ref}, std::nullopt));
     const std::vector<DB::Cas::RefOp> commit_ops = publishCommittedOps(ref_name, new_ref);
     ops.insert(ops.end(), commit_ops.begin(), commit_ops.end());
-    return appendRefLogSeed(backend, layout, ns, std::move(ops));
+    const uint64_t sequence = appendRefLogSeed(backend, layout, ns, std::move(ops));
+    publishRecoverableCkptForSemanticWrapper(backend, layout, ns, RefTxnId{1, sequence});
+    return sequence;
 }
 
 /// Drop a committed ref (old committed / new none). Edge -1. Returns the allocated `ref_sequence`.
@@ -359,8 +366,10 @@ inline uint64_t dropRefTransition(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
     const String & ref_name, const DB::Cas::ManifestRef & old_ref, uint64_t /*shard*/ = 0)
 {
-    return appendRefLogSeed(backend, layout, ns,
+    const uint64_t sequence = appendRefLogSeed(backend, layout, ns,
         {ownerTransitionOp(DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, ref_name, old_ref}, std::nullopt)});
+    publishRecoverableCkptForSemanticWrapper(backend, layout, ns, RefTxnId{1, sequence});
+    return sequence;
 }
 
 /// Add a precommit binding (optional owner-removal of a stale committed manifest, then add-precommit of
@@ -377,7 +386,9 @@ inline uint64_t addPrecommitTransition(
             DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, final_ref_name, *old_ref}, std::nullopt));
     ops.push_back(ownerTransitionOp(
         std::nullopt, DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, final_ref_name, new_ref}));
-    return appendRefLogSeed(backend, layout, ns, std::move(ops));
+    const uint64_t sequence = appendRefLogSeed(backend, layout, ns, std::move(ops));
+    publishRecoverableCkptForSemanticWrapper(backend, layout, ns, RefTxnId{1, sequence});
+    return sequence;
 }
 
 /// Promote a precommit to committed at the SAME manifest_ref (old=Precommit, new=Committed). No edge
@@ -387,10 +398,12 @@ inline uint64_t promoteTransition(
     const DB::UInt128 & /*build_id*/, const String & final_ref_name, const DB::Cas::ManifestRef & ref,
     uint64_t /*shard*/ = 0)
 {
-    return appendRefLogSeed(backend, layout, ns,
+    const uint64_t sequence = appendRefLogSeed(backend, layout, ns,
         {ownerTransitionOp(
             DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, final_ref_name, ref},
             DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, final_ref_name, ref})});
+    publishRecoverableCkptForSemanticWrapper(backend, layout, ns, RefTxnId{1, sequence});
+    return sequence;
 }
 
 /// Exact-token delete of a manifest body (HEAD then deleteExact). No-op when absent.
@@ -1031,11 +1044,9 @@ inline void writeRefSnapshotRaw(
 ///   1. the incarnation is a deterministic namespace-derived fixture id, not a fresh random mint;
 ///   2. this entry reaches `Live` with NO `_ckpt` at all, whereas production only ever reaches `Live`
 ///      through `completeCreation`, which publishes `_ckpt` FIRST (INV-4). Several fixtures exist
-///      SPECIFICALLY to build a table with no `_ckpt` (recovery grounding independent of the
-///      checkpoint) -- publishing one here to "match production" would destroy exactly what those
-///      tests test. `Gc::readCheckpointWitnesses` already tolerates an absent `_ckpt` (only a
-///      present-but-undecodable one is held), so this costs nothing today; an assumption anywhere
-///      that `Live` implies a `_ckpt` exists is what would be wrong, not this fixture.
+///      SPECIFICALLY to build a table with no `_ckpt`, but they must exercise that corruption directly:
+///      lifecycle-authoritative recovery correctly rejects a `Live` or `Removing` row without a
+///      readable `life_epoch`. Ordinary fixtures use `casAdmitRecoverableEntry` below instead.
 inline void casAdmitEntry(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns)
 {
     const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
@@ -1048,6 +1059,178 @@ inline void casAdmitEntry(DB::Cas::Backend & backend, const DB::Cas::Layout & la
     entry.state = NsState::Live;
     entry.incarnation = NamespaceLifeId::stageATransition(ns).incarnation;
     CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
+}
+
+/// Write the checkpoint frontier that makes a raw `Live` fixture a normal recoverable life. Raw logs
+/// intentionally do not synthesize `_ckpt`: many tests need the missing-checkpoint corruption shape.
+/// A test that invokes lifecycle-authoritative recovery therefore has to state its exact frontier here.
+inline void writeRecoverableCkptForRawFixture(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefCkpt & ckpt)
+{
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&] (const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == catalog_cut.catalog.entries.end())
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' has no catalog entry", ns.string());
+
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+    const PutResult put = backend.putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(ckpt));
+    if (put.outcome != PutOutcome::Done)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' could not publish its checkpoint", ns.string());
+}
+
+/// Advance an existing recoverable raw fixture's exact checkpoint frontier. This intentionally never
+/// creates a missing `_ckpt` or repairs an invalid one: those are distinct raw corruption fixtures.
+inline void advanceRecoverableCkptForRawFixture(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & through)
+{
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&] (const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == catalog_cut.catalog.entries.end())
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' has no catalog entry", ns.string());
+
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+    const std::optional<CkptSample> sample = readCkpt(backend, layout, life);
+    if (!sample)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' has no checkpoint to advance", ns.string());
+
+    chooseRecoveryGrounding(*it, sample->ckpt);
+    if (!sample->ckpt.committed_through || through <= *sample->ckpt.committed_through)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' cannot advance its checkpoint monotonically", ns.string());
+
+    RefCkpt advanced = sample->ckpt;
+    advanced.committed_through = through;
+    if (backend.casPut(layout.refCkptKey(life), encodeRefCkpt(advanced), sample->token).outcome != CasOutcome::Committed)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' could not advance its checkpoint", ns.string());
+}
+
+/// Replace an existing recoverable raw fixture checkpoint with the caller's complete next state.
+/// Unlike `advanceRecoverableCkptForRawFixture`, this does not preserve any field implicitly: callers
+/// that model a snapshot or epoch-seal change must name the entire authoritative checkpoint. Missing or
+/// invalid current checkpoints stay corruption fixtures and are never repaired here.
+inline void replaceRecoverableCkptForRawFixture(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefCkpt & next)
+{
+    const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(backend, layout);
+    const auto it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&] (const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it == catalog_cut.catalog.entries.end())
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' has no catalog entry", ns.string());
+
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(it->ns, it->incarnation);
+    const std::optional<CkptSample> existing = readCkpt(backend, layout, life);
+    if (!existing)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' has no checkpoint to replace", ns.string());
+
+    chooseRecoveryGrounding(*it, existing->ckpt);
+    chooseRecoveryGrounding(*it, next);
+    if (next.life_epoch != existing->ckpt.life_epoch)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' cannot replace its checkpoint with a different life epoch", ns.string());
+    if (existing->ckpt.committed_through
+        && (!next.committed_through || *next.committed_through < *existing->ckpt.committed_through))
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' cannot regress its checkpoint frontier", ns.string());
+
+    if (backend.casPut(layout.refCkptKey(life), encodeRefCkpt(next), existing->token).outcome != CasOutcome::Committed)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "raw recovery fixture for namespace '{}' could not replace its checkpoint", ns.string());
+}
+
+/// Publish the checkpoint authority a semantic fixture wrapper owes immediately after its durable raw
+/// log transaction. Raw writers deliberately do not call this: missing, stale, and malformed `_ckpt`
+/// fixtures are meaningful corruption inputs. A semantic wrapper creates the first valid authority or
+/// advances the existing exact checkpoint without discarding its snapshot or epoch-seal fields.
+inline void publishRecoverableCkptForSemanticWrapper(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    const DB::Cas::RefTxnId & txn_id)
+{
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    if (!life)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "semantic ref fixture for namespace '{}' was not admitted", ns.string());
+
+    if (!readCkpt(backend, layout, *life))
+    {
+        const PutResult put = backend.putIfAbsent(layout.refCkptKey(*life), encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = txn_id,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt,
+        }));
+        if (put.outcome == PutOutcome::Done)
+            return;
+    }
+
+    advanceRecoverableCkptForRawFixture(backend, layout, ns, txn_id);
+}
+
+/// Admit an otherwise empty `Live` fixture together with the immutable checkpoint authority that a
+/// production-created life already has. This is deliberately a SEPARATE helper from `casAdmitEntry`:
+/// raw fixtures that exercise a missing or corrupt `_ckpt` must keep constructing that invalid shape
+/// explicitly. The empty frontier is valid because no raw log has been published yet; a fixture that
+/// seeds logs instead has to name its own exact `committed_through` through
+/// `writeRecoverableCkptForRawFixture`.
+inline void casAdmitRecoverableEntry(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
+    uint64_t life_epoch = 1)
+{
+    casAdmitEntry(backend, layout, ns);
+
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(backend, layout, ns);
+    if (!life)
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "recoverable raw fixture for namespace '{}' was not admitted", ns.string());
+
+    if (backend.head(layout.refCkptKey(*life)).exists)
+        return;
+
+    writeRecoverableCkptForRawFixture(backend, layout, ns, RefCkpt{
+        .life_epoch = life_epoch,
+        .committed_through = std::nullopt,
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+}
+
+/// Recover from the caller's catalog cut, reading `_ckpt` exactly once for the row in that same cut.
+/// Keeping the cut an argument forces raw-fixture consumers to make the immutable authority visible;
+/// this helper never resolves the namespace or re-reads the catalog on their behalf.
+inline DB::Cas::RecoveredRefTable recoverRefTableDetailedAtCatalogCutForTest(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const CasRefCatalog::Snapshot & catalog_cut,
+    const DB::Cas::RootNamespace & ns)
+{
+    std::optional<CatalogEntry> catalog_entry;
+    const auto it = std::find_if(
+        catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(),
+        [&] (const CatalogEntry & entry) { return entry.ns == ns; });
+    if (it != catalog_cut.catalog.entries.end())
+        catalog_entry = *it;
+
+    std::optional<RefCkpt> ckpt;
+    if (catalog_entry)
+    {
+        const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(catalog_entry->ns, catalog_entry->incarnation);
+        if (const std::optional<CkptSample> sample = readCkpt(backend, layout, life))
+            ckpt = sample->ckpt;
+    }
+
+    return recoverRefTableDetailedFromAuthority(backend, layout, catalog_entry, ckpt);
 }
 
 /// Writes `txn` at `_log/<txn_id>` (create-if-absent). Admits `txn.ns` into the catalog first

@@ -206,30 +206,33 @@ TEST(CasRefIntake, GroupRefKeys)
     EXPECT_THROW(groupRefKeys(layout, {"p/cas/ns/stream/not-an-id/_log/" + renderRefTxnId(rid(1, 1))}), DB::Exception);
 }
 
-/// spec §Step 6: a log is deletable only under all three conditions; older snapshots may go too.
-TEST(CasRefIntake, PlanRefCleanupThreeConditions)
+/// A LIST can observe a snapshot after its PUT but before the `_ckpt` CAS makes it a recovery base.
+/// That physical object proves nothing by itself: without a checkpoint-named triple, cleanup leaks
+/// rather than deleting either the genesis log or the unacknowledged snapshot.
+TEST(CasRefIntake, PlanRefCleanupRequiresCheckpointNamedBase)
 {
     RefTableListing listing;
     listing.logs = {rid(1, 1), rid(1, 2), rid(1, 3)};
     listing.snapshots = {rid(1, 2)};   /// newest observed snapshot X = (1,2)
 
-    /// Full coverage (cursor past everything): logs <= X and <= cursor are deletable; (1,3) > X stays.
+    /// Even a complete-looking listing and cursor do not license cleanup without the checkpoint's
+    /// exact base. This is the snapshot-PUT-before-checkpoint-CAS sabotage.
     {
         const auto plan = planRefCleanup(listing, rid(1, 3), {});
-        EXPECT_EQ(plan.deletable_logs, (std::vector<RefTxnId>{rid(1, 1), rid(1, 2)}));
+        EXPECT_TRUE(plan.deletable_logs.empty());
         EXPECT_TRUE(plan.deletable_snapshots.empty());
     }
-    /// Cursor lagging behind the snapshot: only logs <= cursor are deletable (condition 1).
+    /// A smaller cursor cannot turn that incomplete authority into a cleanup range.
     {
         const auto plan = planRefCleanup(listing, rid(1, 1), {});
-        EXPECT_EQ(plan.deletable_logs, (std::vector<RefTxnId>{rid(1, 1)}));
+        EXPECT_TRUE(plan.deletable_logs.empty());
     }
-    /// Older snapshots (< X) are deletable; X itself is retained.
+    /// Nor may a newer listed snapshot reclaim an older listed snapshot before `_ckpt` names a base.
     {
         RefTableListing two_snaps = listing;
         two_snaps.snapshots = {rid(1, 1), rid(1, 2)};
         const auto plan = planRefCleanup(two_snaps, rid(1, 3), {});
-        EXPECT_EQ(plan.deletable_snapshots, (std::vector<RefTxnId>{rid(1, 1)}));
+        EXPECT_TRUE(plan.deletable_snapshots.empty());
     }
     /// No snapshot => no coverage boundary => empty plan (condition 2).
     {
@@ -239,4 +242,18 @@ TEST(CasRefIntake, PlanRefCleanupThreeConditions)
         EXPECT_TRUE(plan.deletable_logs.empty());
         EXPECT_TRUE(plan.deletable_snapshots.empty());
     }
+}
+
+/// The checkpoint recovery anchor is a triple: `_ckpt`, its same-id `_snap`, and the same-id ordinary
+/// `_log` that proves the id is not an `EpochSeal`. Cleanup may reclaim older covered logs, but must
+/// retain that one witness for recovery and fsck.
+TEST(CasRefIntake, PlanRefCleanupRetainsCheckpointBaseLog)
+{
+    RefTableListing listing;
+    listing.logs = {rid(1, 1), rid(1, 2), rid(1, 3)};
+    listing.snapshots = {rid(1, 2)};
+
+    const RefCleanupPlan plan = planRefCleanup(listing, rid(1, 3), rid(1, 2));
+    EXPECT_EQ(plan.deletable_logs, (std::vector<RefTxnId>{rid(1, 1)}));
+    EXPECT_TRUE(plan.deletable_snapshots.empty());
 }
