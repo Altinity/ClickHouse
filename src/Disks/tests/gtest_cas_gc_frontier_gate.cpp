@@ -12,10 +12,13 @@
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
+#include <Poco/StreamChannel.h>
+
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 
@@ -57,6 +60,7 @@ namespace ProfileEvents
 {
 extern const Event CasGcRefWalkPlansBuilt;
 extern const Event CasGcUnmatchedAdoptedParentLives;
+extern const Event CasGcNamespaceCleanupLeaks;
 }
 
 namespace
@@ -203,6 +207,71 @@ private:
     bool release_catalog_cas = false;
     bool lose_next_catalog_cas_response = false;
     bool conflict_next_catalog_cas = false;
+};
+
+class PostFoldUnreadableTerminalBackend final : public CountingBackend
+{
+public:
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = CountingBackend::list(prefix, cursor, limit);
+        if (prefix.ends_with("/cas/ns/"))
+            for (ListedKey & listed : page.keys)
+                listed.token.reset();
+        return page;
+    }
+
+    HeadResult head(const String & key) override
+    {
+        if (key == unreadable_key)
+            throw std::runtime_error("injected post-fold terminal read failure for " + key);
+        return CountingBackend::head(key);
+    }
+
+    void makeUnreadable(String key)
+    {
+        unreadable_key = std::move(key);
+    }
+
+    bool existsIgnoringFault(const String & key)
+    {
+        return InMemoryBackend::head(key).exists;
+    }
+
+private:
+    String unreadable_key;
+};
+
+class ScopedCasGcLogCapture
+{
+public:
+    ScopedCasGcLogCapture()
+        : logger(getLogger("CasGc"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedCasGcLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const
+    {
+        return stream.str();
+    }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
 };
 
 struct CompletedRemovingFixture
@@ -2059,6 +2128,98 @@ TEST(CasGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
     EXPECT_TRUE(backend->head(ckpt_key).exists);
     EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
+}
+
+/// Once a terminal has folded, a later physical read failure is janitor debt, not lifecycle evidence
+/// loss. Removing this per-key leak handling would either make the signal disappear or let one dead
+/// object prevent the janitor from considering the rest of its page.
+TEST(CasGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingProgress)
+{
+    auto backend = std::make_shared<PostFoldUnreadableTerminalBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace removed{"00/post-fold-unreadable@cas@"};
+    const RootNamespace progressing{"00/post-fold-progress@cas@"};
+
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 1}, .ops = {namespaceBirthOp()},
+        .prev_epoch_seal = std::nullopt});
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        .ns = removed.string(), .txn_id = RefTxnId{1, 2}, .ops = {remove_op},
+        .prev_epoch_seal = std::nullopt});
+    const NamespaceLifeId removed_life = CasRefCatalog::resolveLifeOrSentinel(*backend, layout, removed);
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current)
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == removed;
+        });
+        if (it == next.entries.end())
+            throw std::runtime_error("test fixture lost removing catalog row");
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(removed_life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    })).outcome, PutOutcome::Done);
+
+    const DB::UInt128 blob(0xfeed);
+    const ManifestRef manifest = publish(*backend, layout, progressing, "victim", 1, blob);
+    const ManifestId manifest_id{progressing, manifest};
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    const GcState folded_state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    const CasFoldSeal folded_seal = decodeFoldSeal(
+        backend->get(layout.foldSealKey(folded_state.snap_generation, folded_state.snap_attempt))->bytes);
+    const auto folded_row = folded_seal.ref_lives.find(removed_life.incarnation);
+    ASSERT_NE(folded_row, folded_seal.ref_lives.end());
+    ASSERT_TRUE(folded_row->second.cleanup_evidence.has_value());
+
+    dropRefTransition(*backend, layout, progressing, "victim", manifest);
+    const String terminal_key = layout.refLogKey(removed_life, RefTxnId{1, 2});
+    const String later_dead_residue = layout.refLogKey(removed_life, RefTxnId{1, 3});
+    ASSERT_EQ(backend->putIfAbsent(later_dead_residue, "dead residue after the folded terminal").outcome,
+        PutOutcome::Done);
+    backend->makeUnreadable(terminal_key);
+
+    std::map<String, UInt64> namespace_cleanup;
+    const uint64_t leaks_before
+        = ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load();
+    gc.setPhaseSink([&](const GcPhaseRecord & record)
+    {
+        if (record.phase == "namespace_cleanup")
+            namespace_cleanup = record.metrics;
+    });
+    ScopedCasGcLogCapture log_capture;
+    const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
+
+    ASSERT_TRUE(report.acquired_lease);
+    EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed))
+        << "post-fold physical cleanup cannot gate catalog removal";
+    EXPECT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, progressing));
+    EXPECT_EQ(report.manifests_deleted, 1u)
+        << "the janitor leak cannot promote itself into pool-wide destructive suppression";
+    EXPECT_FALSE(backend->head(layout.manifestKey(manifest_id)).exists);
+    EXPECT_TRUE(backend->existsIgnoringFault(terminal_key));
+    EXPECT_FALSE(backend->existsIgnoringFault(later_dead_residue))
+        << "one unreadable key cannot stop the perpetual janitor from deciding the rest of its page";
+    ASSERT_FALSE(namespace_cleanup.empty());
+    EXPECT_EQ(namespace_cleanup["leaked"], 1u);
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load() - leaks_before,
+        1u);
+    const String captured = log_capture.captured();
+    EXPECT_NE(captured.find(terminal_key), String::npos);
+    EXPECT_NE(captured.find("leak"), String::npos);
 }
 
 TEST(CasGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDeletion)

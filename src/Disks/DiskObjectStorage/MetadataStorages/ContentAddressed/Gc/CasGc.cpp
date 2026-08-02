@@ -43,6 +43,7 @@ namespace ProfileEvents
     extern const Event CasGcRefWalkPlansBuilt;
     extern const Event CasGcUnmatchedAdoptedParentLives;
     extern const Event CasGcStuckRemovals;
+    extern const Event CasGcNamespaceCleanupLeaks;
     extern const Event CasGcRebuildVirginByEnumeration;
     extern const Event CasGcRefScanDisagreements;
     extern const Event CasGcUnappliedFoldedTxns;
@@ -477,6 +478,8 @@ void Gc::runNamespaceJanitorPage(
         });
         for (const String & anomaly : janitor_result.anomalies)
             LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
+        if (janitor_result.leaked)
+            ProfileEvents::increment(ProfileEvents::CasGcNamespaceCleanupLeaks, janitor_result.leaked);
     }
     catch (const std::exception & e)
     {
@@ -485,6 +488,7 @@ void Gc::runNamespaceJanitorPage(
     t.metric("janitor_pages", janitor_result.pages);
     t.metric("janitor_keys", janitor_result.keys);
     t.metric("janitor_deleted", janitor_result.deleted);
+    t.metric("leaked", janitor_result.leaked);
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal, UniversePolicy policy)

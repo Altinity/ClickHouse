@@ -346,16 +346,11 @@ public:
     /// `Backend`/`Layout`, so a caller that is about to append anyway (and so already holds a fresh
     /// read for its OWN purposes) pays no second GET here.
     ///
-    /// NOT YET ENFORCED ON THE PRODUCTION REF-WRITE PATH -- state this plainly rather than let the
-    /// spec sentence above read as a claim the tree already satisfies. `CasRefLedger::commitRefChunk`
-    /// (today's `RefOpKind::NamespaceBirth` writer) does not call this function and consults no catalog
-    /// state before a ref-log `PUT`: adding a per-write catalog GET to that path would add a protocol
-    /// step to ref writes, which the standing veto on protocol-step additions forbids regardless of
-    /// cost. The refusal therefore has to ride on wherever existence/discovery lives, which is Task 4's
-    /// catalog-backed universe (plan `0cf11354aa0`, "Task 4 owns closing the Creating-forbids-publication
-    /// gap on the production path" -- a task step, not a citation). Until that lands, a namespace sitting
-    /// in `Creating` does not actually block a concurrent production ref write to the same name; this
-    /// function is exercised today only by this module's own tests and by any FUTURE caller Task 4 adds.
+    /// Production publication is catalog-governed by construction: an ordinary `appendRefOps` first
+    /// resolves the namespace lifecycle, refuses a foreign live `Creating` row without writing, and
+    /// cannot publish the initial stream object until creation has published `_ckpt` and moved the row
+    /// to `Live`. This helper states the same admission rule for callers that already own a catalog cut;
+    /// it is not the production append path's enforcement seam.
     static void checkPublicationAdmittedOrThrow(const RefCatalog & catalog, const RootNamespace & ns);
 };
 
