@@ -1413,23 +1413,27 @@ after the generation-7 cut.
   retryable refusal; the paced perpetual janitor; the reader-absence predicate answered from the
   catalog cut.
 
-**Execution status, 2026-08-01.** The opaque-id layout, mandatory fail-closed catalog and atomic
-bootstrap prerequisites are landed as `6a3dd6a9245`, `2b8475fc6f6` and `21ce9e99f4d`. Step 1's core
-non-minting change is landed as `a600c2e433c`; its two explicit follow-ups below remain open. The TLA+
-phase-0 gate is being completed by this design amendment before C++ work resumes. Production Steps
-2–11 are not implemented: the tree still contains the legacy fold collections, cleanup marker and
-removal lifecycle. Checked boxes in the Task 5 body therefore mean completed prerequisites or model
-gates, never implied production implementation.
+**Execution status, 2026-08-02: COMPLETE.** The opaque-id, catalog and atomic-bootstrap prerequisites
+landed first; `bf396ffa50d` and its model/review chain established the pre-fold drain and publication
+barrier. `2a5bb563b26`, `8fb37da10b0`, `95ae0d54a54` and `54aa4812450` then separated lifecycle
+reconciliation, immutable round plans and life runtimes, and leak-only maintenance state before
+`111bb12a407` added the perpetual janitor. The lifecycle-cleanup chain through `224aacd8eb9` retired
+the special removal machinery, and `765c50b7cb93` closed the final stale-prose and post-fold
+unreadable-terminal observability residuals. The focused residual gate passes 21/21; the previously
+final full CA gate passes 1929/1929 and the two object-storage selectors pass 3/3. The Task 5 audit
+found no remaining implementation or model obligation. A symmetric direct regression for the
+exact-delete exception branch remains a minor test-strengthening follow-up; the implementation is
+already symmetric and nonblocking, so it does not reopen Task 5.
 
 #### Step 1 — reads and removals stop minting (LANDED, `a600c2e433c`) {#t5-step1}
 
 Kept here for the record: the three ref-layer entry points no longer mint. Two follow-ups it left open
 belong to this task.
 
-- [ ] **Split the zero-mutation pin per entry point.** One test each for `listRefs`, `resolveRef` via
+- [x] **Split the zero-mutation pin per entry point.** One test each for `listRefs`, `resolveRef` via
   DROP DETACHED, and table-dir removal, and each must pin **zero catalog mutation in the operation
   journal** — final byte-equality permits mint-then-delete.
-- [ ] **`DROP` may cancel a stalled `Creating`; an ordinary read may not.** Step 1 made a `Creating`
+- [x] **`DROP` may cancel a stalled `Creating`; an ordinary read may not.** Step 1 made a `Creating`
   entry read as absent everywhere, which turned `DROP` into a no-op and left a dead creator's entry
   blocking recreation. Restore the asymmetry as a **lifecycle** capability: live creator fence → typed
   retry-later, zero mutations; terminal fence → exact-CAS-delete the complete observed `Creating` row,
@@ -1441,24 +1445,24 @@ belong to this task.
 
 #### Step 2 — one narrow deletion transition {#t5-step2}
 
-- [ ] **Close positive append admission before publishing `Removing`.** Under the local append lane,
+- [x] **Close positive append admission before publishing `Removing`.** Under the local append lane,
   serialize `Live → Removing` with the catalog CAS: once `Removing` is observed, no already-held
   runtime/handle may reopen a positive append lane. Keep admission closed while a catalog CAS retries.
   If the operation fails before a durable transition, it may reopen only after a fresh exact catalog
   observation still proves `Live` under the same life and fence; otherwise it fails closed. The terminal
   append follows under that same admitted removal ownership. This is the lifecycle admission bound, not
   a fresh-name-resolution check.
-- [ ] **Red-first admission tests.** Deterministically pause a cached writer holding its life across
+- [x] **Red-first admission tests.** Deterministically pause a cached writer holding its life across
   the catalog transition and prove it cannot append positive ownership after `Removing` is visible.
   Separately force a catalog CAS retry and a fence change: admission remains closed during the retry,
   and a failed pre-durable attempt reopens only after the fresh exact `Live` observation under the same
   life/fence. Preserve the separate unauthorized-terminal test in Step 5.
-- [ ] Add immutable `removal_started_round` to `Removing`: sample the adopted `gc/state.round` before
+- [x] Add immutable `removal_started_round` to `Removing`: sample the adopted `gc/state.round` before
   `Live → Removing`, store both changes in that catalog CAS, and reject the field on `Creating`/`Live`.
   It is diagnostic age, not a fence; a stale sample can only surface an already-`Removing` row
   conservatively early. Codec shape and boundary-size tests cover the field. Do **not** add a fourth
   catalog state.
-- [ ] Export one narrow GC mutation `deleteCompletedRemoving(exact_observed_row,
+- [x] Export one narrow GC mutation `deleteCompletedRemoving(exact_observed_row,
   authoritative_parent_row)`. It succeeds only when the exact catalog row is still `Removing`, the
   matching row from the currently adopted parent seal has cleanup evidence for that life, and the same
   row has no durable hold. Absence of evidence never proves completion. Invoke it only from the
@@ -1466,10 +1470,10 @@ belong to this task.
   present a historical seal. Thread the GC leader generation as an authorization fence, but do not
   mistake a separated fence re-read for cross-object atomicity: successor publication is prevented by
   the helping barrier below.
-- [ ] **No-hold precondition, enforced rather than derived.** Plant a hold in the same life row, attempt
+- [x] **No-hold precondition, enforced rather than derived.** Plant a hold in the same life row, attempt
   deletion and require refusal. A second sabotage supplies evidence for another id; it also refuses.
   The API consumes one coherent catalog row plus one coherent fold row, not a caller-computed boolean.
-- [ ] **Catalog deletion is exported for exactly two shapes.** The other is Step 1's separate
+- [x] **Catalog deletion is exported for exactly two shapes.** The other is Step 1's separate
   `cancelStalledCreating`, requiring the exact observed `Creating` row and a terminal creator fence.
   There is no generic remove-by-name mutation. **Negative tests:** `Live` is never deletable; an
   unproved, mismatched or held `Removing` row is not deletable; a live-fenced `Creating` is not
@@ -1483,7 +1487,7 @@ The key-set equality is the proof boundary:
 `keys(plan.ref_lives) = {row.life_id | row.state ∈ {Live, Removing}}`. Tests attack that boundary by
 making each adapter attempt to mint a row; they do not duplicate a lifecycle predicate at each site.
 
-- [ ] **Carry the complete round catalog snapshot, not `live_incarnation`.** The lossy map cannot
+- [x] **Carry the complete round catalog snapshot, not `live_incarnation`.** The lossy map cannot
   distinguish absent from `Creating`, yet this task's hint classifier, plan builder,
   deletion API and janitor require exactly those distinctions. `Gc::fold` and REBUILD take exactly ONE
   plan/intake `CasRefCatalog::Snapshot` after the completed hot LIST and thread it through the
@@ -1491,14 +1495,14 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   pre-fold drain's catalog observations and complete rescans are separate operations and are never
   reusable as the plan cut. Task 6 generalizes the same seam to the remaining
   reader/fsck/decommission call sites and deletes the sentinel fallback.
-- [ ] Replace `per_ns_shard` and `ns_cleanup_items` with
+- [x] Replace `per_ns_shard` and `ns_cleanup_items` with
   `map<life_id, RefLifeFoldState{RefCoverage, optional<RefCleanupEvidence>}> ref_lives`. Delete
   `cursorKey`, `parseCursorKey`, the `"<namespace>/0"` grammar and every ref-shard-zero branch. The
   strict codec accepts each canonical fixed-width `life_id` once, rejects duplicates and rejects the
   generation-6 split grammar at the generation-7 pool-open cut. `RefCleanupEvidence` carries only terminal
   and removal transaction evidence; its owning `life_id` is the map key. It carries neither a duplicate
   logical name/incarnation pair nor a redundant `Pending`/`Completed` state.
-- [ ] Implement one pure `buildRefWalkPlan(catalog_cut, inputs)` entry point. `inputs` contains parent
+- [x] Implement one pure `buildRefWalkPlan(catalog_cut, inputs)` entry point. `inputs` contains parent
   coverage, listed hints, holds and checkpoint/tail observations. The function first creates the row
   set from `Live`/`Removing` catalog rows, then its internal adapters may only attach data to those rows:
   matching parent coverage, a listed hint resolved through the cut's reverse index, a matching hold,
@@ -1509,15 +1513,15 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   returned plan's key set and all admitted input evidence; the sole target `emplace` remains inside the
   catalog loop. Folding consumes the plan as const input and writes newly earned cleanup evidence only
   into its separate `FoldResult`/successor-row output, never back into the plan.
-- [ ] **C++ cleanup pin for cp2/cp6.** Rewrite the stale comment in `Pool/CasRefCatalog.h` which says
+- [x] **C++ cleanup pin for cp2/cp6.** Rewrite the stale comment in `Pool/CasRefCatalog.h` which says
   production does not enforce catalog `Creating` before life objects and `Live` before the first stream
   PUT. The production ordering is already authoritative; this formal amendment records the pending
   comment cleanup but does not stage C++.
-- [ ] **REBUILD calls the same constructor.** It may provide different coverage observations, but it
+- [x] **REBUILD calls the same constructor.** It may provide different coverage observations, but it
   cannot own a second row-admission rule. Tests compare the key set produced by ordinary GC and REBUILD
   from the same catalog cut and sabotage each adapter in turn; `Creating` and absent ids
   remain unrepresentable even when parent coverage, a LIST hint, a hold or `_ckpt` names them.
-- [ ] **The adopted parent authorizes deletion and may remain adopted.** After the pre-fold catalog CAS,
+- [x] **The adopted parent authorizes deletion and may remain adopted.** After the pre-fold catalog CAS,
   a deferred invocation leaves that parent in `gc/state`; a folding invocation's first new plan drops
   the absent id before any adapter runs. **Tests:** drain and then DEFER, create the same logical name
   with a new `life_id`, and prove the planted predecessor row is neither work nor suppression; then run
@@ -1525,7 +1529,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
 
 #### Step 4 — delete special removal cleanup; keep the two evidence failures distinct {#t5-step4}
 
-- [ ] **Delete the marker-driven `Pending → Completed` handshake.** The fold that consumes the
+- [x] **Delete the marker-driven `Pending → Completed` handshake.** The fold that consumes the
   terminal writes cleanup evidence into the existing life row directly; its presence is durable evidence of
   the terminal fold, not a claim that physical deletion succeeded. Delete the whole special
   post-adoption namespace-removal cleanup pass together with its pending/completed phases and
@@ -1536,17 +1540,17 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   Delete `RefNsCleanupState`, the separate item's wire record and its `state` field; re-pin the unified
   life-row grammar and recalculate its per-entry reservation constant. The generation-7 recreate-only
   cut rejects the old `pending`/`completed` field shape when the pool opens.
-- [ ] **A terminal record unreadable BEFORE it folds is lost evidence.** Removal legitimately blocks in
+- [x] **A terminal record unreadable BEFORE it folds is lost evidence.** Removal legitimately blocks in
   `Removing`; surface it as a terminal-corrupt stuck removal. **Do not promise `REBUILD` as the escape**
   — nothing establishes it can reconstruct that exact terminal. The credible exits are restoring the
   object or recreating the pool, and the message must say so rather than naming a verb that may not
   work.
-- [ ] **A terminal unreadable AFTER it folded is a cleanup failure and stays leak-only.** The evidence
+- [x] **A terminal unreadable AFTER it folded is a cleanup failure and stays leak-only.** The evidence
   is already durable in the ref-life row; the terminal object matters only to later physical
   reclamation. Entry deletion lands and the residue remains ordinary janitor/orphan-sweep work under a
   **non-suppressing leak counter** — not an anomaly, which would let physical cleanup back into the
   lifecycle through a side door.
-- [ ] **The no-gating proof becomes literal again.** `NamespaceRemovalDoesNotListOrDeleteFiles` pins
+- [x] **The no-gating proof becomes literal again.** `NamespaceRemovalDoesNotListOrDeleteFiles` pins
   that lifecycle completion performs no namespace-owned physical LIST and no physical delete. Plant
   `_files`, `_ckpt`, stream residue and a namespace-scoped manifest; require cleanup evidence to become
   durable, the next invocation's catalog-only drain to delete the row, and every planted byte to remain
@@ -1556,7 +1560,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
 
 #### Step 5 — next-invocation pre-fold drain, then successor publication {#t5-step5}
 
-- [ ] After lease acquisition, read and validate the authoritative adopted parent seal, then read one
+- [x] After lease acquisition, read and validate the authoritative adopted parent seal, then read one
   complete catalog snapshot. For every exact `Removing` row whose matching parent life row has cleanup
   evidence and no hold, perform the exact catalog CAS. The catalog token covers the whole object, so
   this is a serial rescan: select one eligible row deterministically from a complete snapshot; after
@@ -1570,7 +1574,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   after that LIST, take ONE fresh authoritative full-catalog `{token, value}` cut, construct the sole
   `buildRefWalkPlan` intake from that cut plus the completed LIST observations, and only then decide or
   publish. The drain performs zero physical LISTs/deletes and does not consult `suppress_destructive`.
-- [ ] **The stale-leader/helping test is the cross-object proof.** A observes an eligible row and stalls
+- [x] **The stale-leader/helping test is the cross-object proof.** A observes an eligible row and stalls
   before its catalog CAS. B steals the lease, independently drains that row, completes the hot LIST,
   takes the fresh cut and
   adopts the successor; in that trace A's old exact CAS loses. An already-issued A CAS may instead
@@ -1579,7 +1583,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   A delete, and require the invariant to fail. The operation journal pins `B lease CAS -> exact catalog
   CAS resolved -> completed hot LIST -> ONE fresh catalog cut -> buildRefWalkPlan -> successor seal
   PUT/adoption`.
-- [ ] **DEFER and `REBUILD` cannot bypass the barrier.** A deferred invocation deletes eligible rows,
+- [x] **DEFER and `REBUILD` cannot bypass the barrier.** A deferred invocation deletes eligible rows,
   completes the hot LIST, consumes the later cut and builds the plan before its early return. Healthy
   `FORCE REBUILD` acquires the lease, drains from the authoritative parent, completes the hot LIST and
   only then takes its rebuild cut. With absent/undecodable
@@ -1587,12 +1591,12 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
   catalog mutations based on a seal discovered by LIST; it may adopt a reconstructed baseline, whose
   eligible rows are drained by the next authoritative invocation. A stale pre-lease rebuild cut is
   never used for successor construction.
-- [ ] **Crash and CAS-resolution pins.** Stop after evidence adoption, before catalog CAS, after the CAS
+- [x] **Crash and CAS-resolution pins.** Stop after evidence adoption, before catalog CAS, after the CAS
   response is lost, and after committed deletion. In every case the next invocation either resolves
   the exact row or aborts before successor work; immediate same-name rebirth gets a different
   `life_id`, and the deliberately retained `_ckpt` is eventually deleted only by the janitor. No
   physical delete is a precondition for the catalog CAS.
-- [ ] **Unauthorized terminal append is refused.** A non-owner without a claimed fence cannot append the
+- [x] **Unauthorized terminal append is refused.** A non-owner without a claimed fence cannot append the
   terminal record. A happy-path owner test cannot catch this check's removal.
 
 #### Checkpoint 5.5 — TDD/TLA gate for the post-LIST cut {#t5-checkpoint-5-5}
@@ -1620,24 +1624,24 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
 
 #### Step 6 — the refusal has no assistance protocol {#t5-step6}
 
-- [ ] Typed retry-later for `Removing`, naming the terminal-fold/removal completion it waits for. Never
+- [x] Typed retry-later for `Removing`, naming the terminal-fold/removal completion it waits for. Never
   `LOGICAL_ERROR`. **Test:** the eventual success is driven by the real removal sequence, not by a
   fixture erasing the entry.
-- [ ] `CREATE` may wake the existing scheduler, then returns retry-later. It may not fold a terminal,
+- [x] `CREATE` may wake the existing scheduler, then returns retry-later. It may not fold a terminal,
   run cleanup, drive a GC round or mutate the predecessor. **No wait loops, no new worker and no second
   deletion driver. Test:** while the predecessor is `Removing`, `CREATE` performs zero durable
   mutations beyond the in-memory wake; after the real GC deletion it succeeds on its ordinary path.
 
 #### Step 7 — rebirth {#t5-step7}
 
-- [ ] **Test that actually tests same-name rebirth.** Pre-install nonzero predecessor coverage, reuse the
+- [x] **Test that actually tests same-name rebirth.** Pre-install nonzero predecessor coverage, reuse the
   same writer epoch, run the real removal, and **prove the same `RootNamespace` was reused** — an
   `Atomic` fixture silently mints a fresh UUID and therefore never exercises this. Rebirth immediately
   while the old ref-life row is still the adopted seal, then run the first post-deletion GC round.
   Assert the new `life_id` receives a new row with zero coverage,
   while the predecessor id is absent. Keying by `life_id`, not logical name, makes inheritance
   structurally impossible.
-- [ ] **Rebirth runtime acceptance contract.** A runtime captured under the predecessor remains bound
+- [x] **Rebirth runtime acceptance contract.** A runtime captured under the predecessor remains bound
   to that life and never observes or mutates successor state; a fresh name lookup after rebirth gets a
   distinct runtime. Stop an old reader before its state lock, an old append before enqueue, and an old
   publisher before completion; delete and rebirth the same `RootNamespace`; prove each old operation
@@ -1652,7 +1656,7 @@ making each adapter attempt to mint a row; they do not duplicate a lifecycle pre
 and before any Step-8 code.** It creates semantic ownership boundaries now; Task 13 remains the later
 behavior-preserving mechanical split of the large translation units after the performance baseline.
 
-- [ ] **Extract one synchronous `CatalogLifecycleReconciler`.** It alone owns selection of an eligible
+- [x] **Extract one synchronous `CatalogLifecycleReconciler`.** It alone owns selection of an eligible
   adopted-parent `Removing` row, the exact catalog CAS, the mandatory resolution read and the N+1
   rescan loop. Its result keeps two facts orthogonal: `AuthorityStatus::{Authoritative,FencedOut}` and
   `CatalogResolution::{DrainComplete,ExactRowAbsent,ExactRowReplaced,ExactRowStillPresent}`; it also
@@ -1668,7 +1672,7 @@ behavior-preserving mechanical split of the large translation units after the pe
   fold, seal publication, `gc/state` mutation or janitor work. **Tests:** retain the direct absent and
   replacement winner races, the stale-leader no-successor-work journal pins and the exact N-row N+1
   catalog-read assertion as the component's contract.
-- [ ] **Freeze `RoundInput` and `RefPlan` after construction.** After the reconciler returns an
+- [x] **Freeze `RoundInput` and `RefPlan` after construction.** After the reconciler returns an
   authoritative conclusive drain, one completed hot stream LIST and its later full-catalog cut build a
   single `RoundInput`. The sole `buildRefWalkPlan` consumes it and returns one `RefPlan`; downstream
   DEFER, fold, frontier and publication paths receive const views and may not rediscover, append,
@@ -1676,7 +1680,7 @@ behavior-preserving mechanical split of the large translation units after the pe
   `FoldResult`/successor rows. Normal and healthy `REBUILD` use the same builder. **Tests:** every
   producer named by the proof changes only the builder's input, and a stale/pre-drain cut or post-build
   target injection cannot affect the consumed plan.
-- [ ] **Install the name-slot plus immutable-life runtime cache.** Keep logical routing separate from
+- [x] **Install the name-slot plus immutable-life runtime cache.** Keep logical routing separate from
   physical mutable state: `RootNamespace -> RefNameSlot -> RefLifeRuntime`, with the runtime indexed by
   `(life_id, admitted_fence_generation)`. `admitted_fence_generation` is the existing local mount-fence
   generation captured when the runtime is created. The raw generation advances on both
@@ -1689,7 +1693,7 @@ behavior-preserving mechanical split of the large translation units after the pe
   handles structurally unable to target a successor. Extend `CaRefLaneCore` with simultaneous old/new
   runtime identities and sabotages for old-handle-to-current-slot retargeting; prove immutable runtime
   identity and that predecessor work cannot mutate successor objects.
-- [ ] **Create a separate leak-only `GcMaintenanceState`.** Store the janitor's opaque pagination token
+- [x] **Create a separate leak-only `GcMaintenanceState`.** Store the janitor's opaque pagination token
   under `<prefix>/gc/maintenance_state` with `FormatId::GcMaintenanceState = 25` and its own token-CAS
   discipline, never inside `gc/state`, the adopted seal or any
   safety/adoption CAS. Losing, repeating or resetting maintenance progress may leak or repeat work only;
@@ -1700,13 +1704,13 @@ behavior-preserving mechanical split of the large translation units after the pe
   reread/repeat. Corrupt progress is replaced with canonical empty progress only by exact-token CAS;
   losing that reset changes nothing else. Pin format-registry, codec, layout, absent/create-conflict and
   corrupt-reset tests before Step 8 consumes the type.
-- [ ] **Checkpoint gate:** focused reconciler tests, immutable-runtime races, cache/remount/shutdown
+- [x] **Checkpoint gate:** focused reconciler tests, immutable-runtime races, cache/remount/shutdown
   tests, `CaRefLaneCore` safe/sabotage configurations, the full prefold TLA runner, and the complete CA
   unit gate are GREEN and independently reviewed before Step 8 begins.
 
 #### Step 8 — the perpetual janitor {#t5-step8}
 
-- [ ] **One bounded scan over the ownership tree, separate from the hot stream LIST.** Task 4d makes the
+- [x] **One bounded scan over the ownership tree, separate from the hot stream LIST.** Task 4d makes the
   round's correctness/performance enumeration `LIST(cas/ns/stream/)`; it deliberately does not pay for
   `_files` or `_ckpt`. The janitor alone walks `LIST(cas/ns/)`, at a fixed page/key budget per round,
   storing ONE cleanup-only backend cursor in the separate `GcMaintenanceState` object. The cursor has no
@@ -1717,14 +1721,14 @@ behavior-preserving mechanical split of the large translation units after the pe
   normally scheduled round begin at the start.
   Keep the work in `namespace_cleanup`; publish `janitor_pages`, `janitor_keys` and
   `janitor_deleted` for Task 11's inventory.
-- [ ] **A suppressed DEFER page retains its cursor.** A DEFER invocation lacks the fold's destructive
+- [x] **A suppressed DEFER page retains its cursor.** A DEFER invocation lacks the fold's destructive
   proof, but still runs one bounded `namespace_cleanup` page with deletion suppressed and its metrics
   published. A valid suppressed page publishes **no cursor advance**, so the next authorized fold retries
   it. Advancing would phase-lock alternating `DEFER`/fold rounds (`A` dead page: `DEFER A→B`, fold
   `B→A`) and leak A forever. Corrupt/backend-rejected progress keeps the existing fail-closed exact-reset
   rule. Gate this with `CaNamespaceJanitorCursorCore`: the honest model proves `<> ~deadA`; the isolated
   `AdvanceSuppressed` sabotage produces the fair `A-defer → B-fold → A` liveness counterexample.
-- [ ] **One physical classifier, joined to the catalog authority.** Parse the fixed family and
+- [x] **One physical classifier, joined to the catalog authority.** Parse the fixed family and
   `life_id`; do not reconstruct a `RootNamespace` from the key and do not consult `_path`. The immutable
   post-page cut's reverse index classifies an id currently named by any `Creating`, `Live` or `Removing`
   row as retained. An id absent from this cut is a dead-life candidate because the LIST
@@ -1732,7 +1736,7 @@ behavior-preserving mechanical split of the large translation units after the pe
   but only this janitor path may turn absence into a physical deletion candidate. A malformed key under
   either namespace family is anomaly-and-continue; a loose object under `roots/` is outside this scan
   entirely.
-- [ ] **Creation-before-object ordering closes the new-life race.** Catalog `Creating{name→life_id}` is
+- [x] **Creation-before-object ordering closes the new-life race.** Catalog `Creating{name→life_id}` is
   durable before any stream/state object of that id. The janitor orders each page as
   `LIST page → fresh catalog GET/decode → classify page → exact-token deletes under the GC fence`.
   One catalog read PER PAGE is sufficient and is the required shape: an object already returned by the
@@ -1740,12 +1744,12 @@ behavior-preserving mechanical split of the large translation units after the pe
   would have preceded the object; a creation after the cut cannot have placed an object into the earlier
   page. Do not reintroduce one catalog GET per key. A duplicate current id is the Task-4d catalog
   corruption path and suppresses the page's deletes; exact-token mismatch retains a stale-writer rewrite.
-- [ ] The janitor is **perpetual** and there is no lifecycle-specific bounded attempt: it is the only
+- [x] The janitor is **perpetual** and there is no lifecycle-specific bounded attempt: it is the only
   reclaimer of a dead life's objects after the catalog row that named the id has gone. Folding it into removal would
   make a LIST omission a permanent leak; retaining the row until physical emptiness would put storage
   liveness back on the lifecycle path. Suppression performs no delete, cursor progress may still be
   retained only under the existing safe publication order, and a later cycle retries the key.
-- [ ] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable stream or
+- [x] **Tests:** a suppressed round deletes nothing; a token mismatch retains; an unparseable stream or
   state key records and continues; restart mid-scan resumes from the durable cursor; end-of-tree resets
   it; invalid, oversized and backend-rejected cursors surface, delete zero janitor objects and reset only
   durable cleanup progress for a later round; cursor-update CAS failure does not fail
@@ -1758,13 +1762,13 @@ behavior-preserving mechanical split of the large translation units after the pe
 
 #### Step 9 — the `_cleanup` class and the `Removed` snapshot die together {#t5-step9}
 
-- [ ] Rewire **fresh name resolution** onto the catalog cut first — `Removing` or absent
+- [x] Rewire **fresh name resolution** onto the catalog cut first — `Removing` or absent
   resolves as absent — then delete the `_cleanup` marker, its publication, the marker-driven
   `Pending → Completed` promotion and the `Removed` lifecycle snapshot. Delete `namespaceIsRemoved`:
   hot paths already holding a life handle retain the stated stale-or-`NotFound` contract and must not
   add a catalog request, while a new caller cannot obtain that handle through the catalog cut. Leaving
   either artefact keeps a physical-empty vestige alive with no reader.
-- [ ] **Test:** plant an old-life file and prevent its cleanup, then assert the backend still holds the
+- [x] **Test:** plant an old-life file and prevent its cleanup, then assert the backend still holds the
   bytes while a **fresh name resolution** answers absent — otherwise absence may hold merely because the
   object vanished, which would pass while the predicate was wrong. A separately retained stale handle
   may still return the old bytes or `NotFound`, never bytes from a reborn life. Assert from the operation
@@ -1772,12 +1776,12 @@ behavior-preserving mechanical split of the large translation units after the pe
 
 #### Step 10 — diagnostics that do not suppress {#t5-step10}
 
-- [ ] An input ref-life row whose id has no walkable catalog row is **counted and logged** — ProfileEvent
+- [x] An input ref-life row whose id has no walkable catalog row is **counted and logged** — ProfileEvent
   plus one line naming the id — then dropped by `buildRefWalkPlan`, and **does not set
   `suppress_destructive`**. It cannot become output work because adapters cannot mint rows. The shape
   means stale input state or corruption, but retaining it would recreate the unbounded dead-cursor
   history and suppressing on it would bring back the measured pool-wide stall. Alert-and-discard.
-- [ ] Stuck-removal surfacing fires when a `Removing` row has no matching cleanup evidence for N rounds;
+- [x] Stuck-removal surfacing fires when a `Removing` row has no matching cleanup evidence for N rounds;
   compare the current adopted round with the row's immutable `removal_started_round` using subtraction
   guarded by `current >= started`, not overflow-prone `started + N`; validate N is nonzero. If folding
   recorded an exact-read failure, name that unreadable key; otherwise report only that no terminal has
@@ -1789,11 +1793,11 @@ behavior-preserving mechanical split of the large translation units after the pe
 
 #### Step 11 — capacity, models, hygiene {#t5-step11}
 
-- [ ] **Capacity is intentionally boring.** Charge one worst-form `RefLifeFoldState` per catalog entry,
+- [x] **Capacity is intentionally boring.** Charge one worst-form `RefLifeFoldState` per catalog entry,
   including coverage, hold and optional cleanup evidence. Separately over-cover `btr` rows per run
   segment and `cnd` rows per GC shard; neither is charged per entry. Refuse admission loudly; removal is
   never refused. There is no separate cursor/`nsc` index-set proof because there is only one ref-life row.
-- [ ] **TLA phase 0, gated before code:** `CaRefCatalogCore` models catalog-only deletion with positive
+- [x] **TLA phase 0, gated before code:** `CaRefCatalogCore` models catalog-only deletion with positive
   cleanup evidence, the no-hold precondition and exact observation, with no cleanup-attempt variable or
   sabotage. A new focused `CaRefPreFoldDrainCore` owns the two-GC-actor protocol: adopted-parent proof,
   exact and ambiguous catalog CAS outcomes, helping after takeover, and the mandatory barrier before
@@ -1821,15 +1825,15 @@ behavior-preserving mechanical split of the large translation units after the pe
   **Capture of physical identity by perpetual cleanup stays, with its capture-time test and at least one
   stale-leader-after-rebirth data-loss sabotage** — ordering does not revoke a running actor's local
   copy, so janitor/orphan-sweep work must never re-derive a reborn target from a logical name.
-- [ ] **Task 7 gets no removal-finalization branches.** A cataloged `Removing` row remains owned and is
+- [x] **Task 7 gets no removal-finalization branches.** A cataloged `Removing` row remains owned and is
   recovered under the claimed writer fence; `Removing` without `_ckpt` is corruption because no
   lifecycle path deletes the checkpoint before the catalog row. Once GC deletes the row, decommission
   has no logical owner to finalize and the perpetual janitor owns all opaque residue.
-- [ ] Hygiene, one line each: delete `per_ns_shard`, `ns_cleanup_items`, their string-key helpers and
+- [x] Hygiene, one line each: delete `per_ns_shard`, `ns_cleanup_items`, their string-key helpers and
   every false comment about ref shard zero; delete the accepted-cost comment describing a removal path
   that did not exist when written; keep the note that the admission bound does **not** free at
   `Live → Removing` — capacity returns only when the exact row deletion lands.
-- [ ] **Gates and commit:** the CA battery under one `flock` hold covering build and gate, both
+- [x] **Gates and commit:** the CA battery under one `flock` hold covering build and gate, both
   object-storage lanes, and commits by explicit path.
 
 #### What died, and why — do not re-add {#t5-died}
