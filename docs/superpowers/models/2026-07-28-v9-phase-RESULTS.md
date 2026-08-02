@@ -586,6 +586,37 @@ empty_blobs                 green       green                            1      
 ALL EXPECTATIONS MET
 ```
 
+#### Ack-floor whole-suite conversion {#ack-floor-whole-suite}
+
+`run_ackfloor.sh` now turns all 19 configs into one sabotage-first gate. The pre-change no-argument
+probe was only an interface red: the single-config driver stopped at its usage check before TLC. With
+the official pinned jar and `TLC_WORKERS=auto`, the asserted family gate produced:
+
+```text
+CONFIG                    EXPECT      RESULT                           SECONDS  VERDICT
+sab_ackbeforedrain        violation   violation:INV_NO_DANGLE          1        PASS
+sab_ackwithoutread        violation   violation:INV_NO_DANGLE          2        PASS
+sab_adopttoken            violation   violation:INV_NO_RETURN          0        PASS
+sab_clampnosuppress       violation   violation:INV_NO_DANGLE          1        PASS
+sab_ignorefloor           violation   violation:INV_NO_DANGLE          1        PASS
+sab_openbeforeload        violation   violation:INV_NO_DANGLE          0        PASS
+sab_rebuilddropedge       violation   violation:INV_NO_DANGLE          2        PASS
+sab_rebuildkeepretired    violation   violation:INV_NO_DANGLE          1        PASS
+sab_rebuildlowround       violation   violation:INV_NO_DANGLE          3        PASS
+sab_skipshard             violation   violation:INV_NO_DANGLE          1        PASS
+sab_sleeperrearm          violation   violation:INV_NO_DANGLE          0        PASS
+stage1                    green       green                            112      PASS
+empty_blobs               green       green                            1        PASS
+witness_clamp             violation   violation:W_ClampHappens         0        PASS
+witness_copyforward       violation   violation:W_CopyForwardHappens   0        PASS
+witness_delete            violation   violation:W_DeleteHappens        1        PASS
+witness_rebuild           violation   violation:W_RebuildHappens       0        PASS
+witness_recreate          violation   violation:W_RecreateHappens      1        PASS
+witness_spare             violation   violation:W_SpareHappens         0        PASS
+
+ALL EXPECTATIONS MET
+```
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
