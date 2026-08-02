@@ -735,7 +735,8 @@ private:
     /// only STRICTLY BELOW `min(newest covering snapshot, checkpoint)` -- so the snapshot the checkpoint
     /// itself names always survives. A namespace with no entry (no `_ckpt` yet, or one that has never
     /// carried a `checkpoint_snapshot_id`) degrades to the cursor/snapshot boundaries alone.
-    void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
+    void cleanupRefObjects(
+        const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
     /// discards cursor progress and must not fail the already-completed GC round. Returns the page's

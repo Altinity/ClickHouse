@@ -109,6 +109,105 @@ public:
     }
     bool arm = false;
 };
+
+/// Moves one of the two authorities `cleanupRefObjects` must revalidate at a precise ref-log delete
+/// boundary. The target object's own token is untouched, so only an authority check can refuse it.
+class RefCleanupAuthorityRaceBackend : public CountingBackend
+{
+public:
+    enum class Authority : uint8_t
+    {
+        Catalog,
+        GcFence,
+    };
+
+    enum class Timing : uint8_t
+    {
+        BeforeFirstDelete,
+        AfterFirstDelete,
+    };
+
+    void arm(
+        Authority authority_, Timing timing_, const Layout & layout,
+        const String & first_cleanup_key_)
+    {
+        authority = authority_;
+        timing = timing_;
+        catalog_key = layout.refCatalogKey();
+        gc_state_key = layout.gcStateKey();
+        first_cleanup_key = first_cleanup_key_;
+        armed = true;
+    }
+
+    HeadResult head(const String & key) override
+    {
+        HeadResult result = CountingBackend::head(key);
+        if (armed && timing == Timing::BeforeFirstDelete && key == first_cleanup_key)
+            moveAuthority();
+        return result;
+    }
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        DeleteOutcome result = CountingBackend::deleteExact(key, token);
+        if (armed && timing == Timing::AfterFirstDelete && key == first_cleanup_key)
+            moveAuthority();
+        return result;
+    }
+
+private:
+    void moveAuthority()
+    {
+        armed = false;
+        const String & key = authority == Authority::Catalog ? catalog_key : gc_state_key;
+        const auto got = CountingBackend::get(key);
+        if (!got)
+            throw std::runtime_error("test-injected cleanup authority object is absent");
+
+        String bytes = got->bytes;
+        if (authority == Authority::GcFence)
+        {
+            GcState moved = decodeGcState(bytes);
+            ++moved.lease.seq;
+            bytes = encodeGcState(moved);
+        }
+        if (CountingBackend::casPut(key, bytes, got->token).outcome != CasOutcome::Committed)
+            throw std::runtime_error("test-injected cleanup authority move lost its CAS");
+    }
+
+    Authority authority = Authority::Catalog;
+    Timing timing = Timing::BeforeFirstDelete;
+    String catalog_key;
+    String gc_state_key;
+    String first_cleanup_key;
+    bool armed = false;
+};
+
+struct RefCleanupFixture
+{
+    String first_log_key;
+    String second_log_key;
+};
+
+RefCleanupFixture seedTwoCoveredLogs(
+    RefCleanupAuthorityRaceBackend & backend, const Layout & layout,
+    const RootNamespace & ns)
+{
+    DB::Cas::tests::casAdmitEntry(backend, layout, ns);
+    const ManifestRef r1 = mref(1);
+    const ManifestRef r2 = mref(2);
+    writeManifestRaw(backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    const uint64_t v1 = publishCommittedTransition(backend, layout, ns, "t1", std::nullopt, r1);
+    const uint64_t v2 = publishCommittedTransition(backend, layout, ns, "t2", std::nullopt, r2);
+    writeRefSnapshotRaw(backend, layout,
+        minimalLiveSnapshot(ns.string(), RefTxnId{1, v2},
+            {committedRow("t1", r1), committedRow("t2", r2)}));
+    const NamespaceLifeId life = NamespaceLifeId::stageATransition(ns);
+    return {
+        .first_log_key = layout.refLogKey(life, RefTxnId{1, v1}),
+        .second_log_key = layout.refLogKey(life, RefTxnId{1, v2})};
+}
 }
 
 /// (1) A >1000-key ref scan folds every pre-existing log exactly once: the cursor advances to the greatest
@@ -315,6 +414,82 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     /// the older snapshot (< newest) is deleted; the newest is retained.
     EXPECT_FALSE(backend->head(old_snap_key).exists) << "an older snapshot must be deleted";
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the newest snapshot must be retained";
+}
+
+TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
+    backend->arm(
+        RefCleanupAuthorityRaceBackend::Authority::Catalog,
+        RefCleanupAuthorityRaceBackend::Timing::BeforeFirstDelete, layout, keys.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_TRUE(backend->head(keys.first_log_key).exists);
+    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
+    backend->arm(
+        RefCleanupAuthorityRaceBackend::Authority::Catalog,
+        RefCleanupAuthorityRaceBackend::Timing::AfterFirstDelete, layout, keys.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(backend->head(keys.first_log_key).exists);
+    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+TEST(CasRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
+    backend->arm(
+        RefCleanupAuthorityRaceBackend::Authority::GcFence,
+        RefCleanupAuthorityRaceBackend::Timing::BeforeFirstDelete, layout, keys.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_TRUE(backend->head(keys.first_log_key).exists);
+    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 0u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
+}
+
+TEST(CasRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+{
+    auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RefCleanupFixture keys = seedTwoCoveredLogs(*backend, layout, RootNamespace{"00/aa@cas@"});
+    backend->arm(
+        RefCleanupAuthorityRaceBackend::Authority::GcFence,
+        RefCleanupAuthorityRaceBackend::Timing::AfterFirstDelete, layout, keys.first_log_key);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    EXPECT_FALSE(backend->head(keys.first_log_key).exists);
+    EXPECT_TRUE(backend->head(keys.second_log_key).exists);
+    EXPECT_EQ(backend->deleteCount(keys.first_log_key), 1u);
+    EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake

@@ -1174,7 +1174,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
         if (trim_enabled)
-            cleanupRefObjects(folded, suppress_destructive);
+            cleanupRefObjects(folded, state.lease, suppress_destructive);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("trim_enabled", trim_enabled ? 1 : 0);
         t.metric("namespaces_planned", folded.ref_tables.size());
@@ -3241,7 +3241,8 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     retain_rollup_passes_since_report = 0;
 }
 
-void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
+void Gc::cleanupRefObjects(
+    const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive)
 {
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
     /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
@@ -3252,20 +3253,6 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     const Layout & layout = store->layout();
     if (!folded.catalog_cut)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS GC ref cleanup: fold result carries no catalog cut");
-
-    /// Backend exposes only token-conditional `deleteExact` (no batch-delete primitive), so cleanup is a
-    /// per-key HEAD + exact-token delete (like the orphan sweep). Ref objects are immutable and their keys
-    /// are never reused (a recreated namespace uses a greater writer_epoch), so a NotFound / TokenMismatch
-    /// is benign debris, never a lost race -- tolerated, never a throw.
-    const auto deleteRefObject = [&](const String & key)
-    {
-        const HeadResult h = backend.head(key);
-        if (h.exists)
-        {
-            backend.deleteExact(key, h.token);
-            ProfileEvents::increment(ProfileEvents::CasRefCleanupObjectsDeleted);   /// cleanup object deletion
-        }
-    };
 
     for (const auto & [ns_str, listing] : folded.ref_tables)
     {
@@ -3280,7 +3267,71 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         if (entry_it == folded.catalog_cut->catalog.entries.end() || entry_it->ns != ns
             || (entry_it->state != NsState::Live && entry_it->state != NsState::Removing))
             continue;
+        const CatalogEntry observed_entry = *entry_it;
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
+
+        /// Current-life ref cleanup is not the dead-life janitor: every irreversible key delete must
+        /// still be licensed by the SAME complete catalog observation and GC lease that adopted the
+        /// fold. Re-read both after the target HEAD and immediately before `deleteExact`. A moved token,
+        /// changed row/life, missing or unreadable authority object, or changed owner/sequence stops the
+        /// whole cleanup pass. Continuing with another row/key would turn a refusal into a fallback.
+        const auto deleteRefObject = [&](const String & key)
+        {
+            const HeadResult h = backend.head(key);
+            if (!h.exists)
+                return true;
+
+            try
+            {
+                const CasRefCatalog::Snapshot current_catalog = CasRefCatalog::read(backend, layout);
+                current_catalog.life_index.throwIfAmbiguous("CAS GC ref cleanup revalidation");
+                const auto current_entry_it = std::lower_bound(
+                    current_catalog.catalog.entries.begin(), current_catalog.catalog.entries.end(), ns,
+                    [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });
+                const std::optional<NamespaceLifeId> current_life
+                    = current_catalog.life_index.resolve(life.incarnation);
+                if (current_catalog.token != folded.catalog_cut->token
+                    || current_entry_it == current_catalog.catalog.entries.end()
+                    || current_entry_it->ns != ns || *current_entry_it != observed_entry
+                    || !current_life || *current_life != life)
+                {
+                    LOG_DEBUG(logger,
+                        "CAS GC ref cleanup stopped before deleting '{}': catalog observation/life moved",
+                        key);
+                    return false;
+                }
+
+                const auto current_state_object = backend.get(layout.gcStateKey());
+                if (!current_state_object)
+                {
+                    LOG_WARNING(logger,
+                        "CAS GC ref cleanup stopped before deleting '{}': mandatory gc/state is absent",
+                        key);
+                    return false;
+                }
+                const GcState current_state = decodeGcState(current_state_object->bytes);
+                if (current_state.lease.owner != adopted_lease.owner
+                    || current_state.lease.seq != adopted_lease.seq)
+                {
+                    LOG_DEBUG(logger,
+                        "CAS GC ref cleanup stopped before deleting '{}': GC fence moved",
+                        key);
+                    return false;
+                }
+            }
+            catch (const std::exception & e)
+            {
+                LOG_WARNING(logger,
+                    "CAS GC ref cleanup stopped before deleting '{}': authority revalidation failed: {}",
+                    key, e.what());
+                return false;
+            }
+
+            backend.deleteExact(key, h.token);
+            ProfileEvents::increment(ProfileEvents::CasRefCleanupObjectsDeleted);   /// cleanup object deletion
+            return true;
+        };
+
         const auto row_it = folded.fold_seal.ref_lives.find(entry_it->incarnation);
         const RefTxnId durable_cursor = row_it != folded.fold_seal.ref_lives.end()
             ? row_it->second.coverage.last_folded_ref_id
@@ -3296,14 +3347,16 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 
         const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, checkpoint);
         for (const RefTxnId & log_id : plan.deletable_logs)
-            deleteRefObject(layout.refLogKey(life, log_id));
+            if (!deleteRefObject(layout.refLogKey(life, log_id)))
+                return;
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
         {
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
             chassert(!checkpoint || snap_id < *checkpoint);
-            deleteRefObject(layout.refSnapshotKey(life, snap_id));
+            if (!deleteRefObject(layout.refSnapshotKey(life, snap_id)))
+                return;
         }
     }
 }
