@@ -37,9 +37,8 @@ Notation:
 | Block-framed record stream, magic `CARN` | Embedded in `PartManifest`; also under GC attempt prefixes | Custom sorted-record binary, implemented as `RunFile` | `RunFileWriter` callers | `RunFileReader`, `RunMerger` | Ordered record streams for manifests and GC data-plane data. |
 | GC state, magic `CAGT` | `<prefix>/gc/state` | `GcStateProto` protobuf | `Gc` lease/round code | `Gc`, writer publish gate through `RetireView`, store status helpers | Global GC round, lease, snap generation, and current retired-set refs. |
 | GC heartbeat | `<prefix>/gc/hb` | Fixed 24-byte binary | `Gc` heartbeat code | GC lease stealing code | Advisory liveness pulse independent of round progress. |
-| Fold seal, magic `CAFS` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/fold_seal` | `FoldSealProto` protobuf | GC fold through `encodeFoldSeal` and `putDeterministicArtifact` | later GC rounds, rebuild, `fsck`, orphan sweep | Write-once coverage record and run references for a generation. |
+| Fold seal, type `cas_fold_seal` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/fold_seal` | Strict tagged text with `rfl`, `btr`, and `cnd` rows | GC fold through `encodeFoldSeal` and `putDeterministicArtifact` | later GC rounds, rebuild, `fsck`, orphan sweep | Write-once life coverage, run references, and condemned summaries for a generation. |
 | Blob target run, magic `CARN` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/blob_target/<shard>/<seq>` | `RunFile` | `CasBlobInDegree` and GC rebuild/fold paths | GC in-degree merge, `fsck` | Blob in-degree/source-edge data for one GC shard. |
-| Part-manifest cleanup run, magic `CARN` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>` | `RunFile` | GC cleanup bundling path | No current runtime reader found; only serialized through `FoldSealProto` | Legacy/replay artifact for tokened manifest cleanup; likely obsolete in the current one-pass GC. |
 | Retired set, magic `CART` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/retired/<round>/<shard>` | `RetiredSetProto` protobuf | GC retirement publication | writer publish gate through `RetireView`, GC deletion, `fsck` | Current condemned object incarnations per GC shard. |
 | Outcome log, magic `CAGO` | `<prefix>/gc/gen/<gen>/attempt/<attempt>/outcomes/<round>/<shard>` | `GcOutcomeLogProto` protobuf | GC delete/recheck path | GC replay/adoption path, observability | Idempotent record of delete/recheck outcomes. |
 | Owner anchor, magic `CAOW` | `<prefix>/gc/server-roots/<srid>/owner` | `OwnerProto` protobuf | `claimOwnerOrThrow` | mount/open path | Sticky binding from `server_root_id` to server UUID. |
@@ -50,12 +49,13 @@ Notation:
 
 ## Format Families {#format-families}
 
-The current system has five families:
+The current system has six families:
 
 - Protobuf metadata with `CasHeader`: the default for mutable/control/write-once metadata.
 - Fixed binary envelope: currently only `CABL` blobs.
 - Block-framed record format: `CARN`, implemented by `RunFile`.
 - Binary part manifest: `CAPT` `PartManifest`.
+- Strict raw tagged text control objects: `cas_fold_seal`.
 - Raw passthrough bytes: namespace verbatim files and mountpoint objects.
 
 There is also one exceptional fixed binary control record: `GcHeartbeat`. It is not raw user data,
@@ -263,8 +263,6 @@ files to `CABL` blobs. It is also the source identity for GC source edges and ma
 
 - Embedded inside `PartManifest` for manifest entries.
 - `<prefix>/gc/gen/<gen>/attempt/<attempt>/blob_target/<shard>/<seq>` for blob-target in-degree runs.
-- `<prefix>/gc/gen/<gen>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>` for
-  part-manifest cleanup bundles.
 
 **Naming:** the word `run` is external-sort/LSM jargon and is not self-explanatory here. In design
 docs, call the format "`CARN` block-framed record stream" or "`CARN` record format". `RunFile` is the
@@ -390,6 +388,9 @@ generation/parent-generation meta line, records appear in fixed tagged order:
 
 The object ends with a record-count trailer. There is no name-keyed ref-shard row and no persisted
 `part_manifest_cleanup` run: manifest cleanup executes from the round's in-memory cleanup map.
+Terminal cleanup evidence in an `rfl` row participates in the proof for later exact catalog-row
+removal; the perpetual namespace janitor independently reclaims the dead life's stream, checkpoint,
+and namespace-file bytes.
 
 **Producer:** GC fold creates it through `encodeFoldSeal` and stores it with
 `putDeterministicArtifact`, so replay of the same attempt must reproduce identical bytes.
@@ -407,33 +408,27 @@ byte caps, deterministic ordering, duplicate-key rejection, and pinned raw stora
 
 - The coverage classification set `{0, 1, 2, 4}` is closed and validated before narrowing to its byte.
 - A classification-4 `rfl` record requires a canonical hold; other classifications forbid one.
-- The `RunRef` checksum comments and writer behavior disagree; see `RunRef` below.
+- Every `btr` row carries the whole-object checksum that readers verify before acting on the run.
 
 ## Run Reference Subformat {#run-reference-subformat}
 
-`RunRefProto` is not a standalone object. It appears inside `FoldSealProto`.
+`RunRef` is not a standalone object. Each value is encoded as one `btr` row inside `cas_fold_seal`.
 
 **Fields:**
 
 - `key`: object key of a write-once `RunFile`.
-- `checksum_hi` and `checksum_lo`: a 128-bit checksum field.
+- `checksum`: the whole-object chained CityHash128 stored in the row's `ck` field.
 - `shard`: GC shard, required for `blob_target_runs`.
 - `generation`: physical generation namespace that holds the run.
 
-**Producer:** `CasBlobInDegree` and GC cleanup paths create `RunRef` values when they write run
-files. Parent-carry code may copy existing refs verbatim into a new seal.
+**Producer:** `CasBlobInDegree` creates `RunRef` values when it writes source-edge runs. Parent-carry
+code may copy existing refs verbatim into a new seal.
 
-**Consumers:** GC and `fsck` resolve runs through the key, shard, and generation fields.
+**Consumers:** GC and `fsck` resolve runs through the key, shard, and generation fields. GC streams
+each run and verifies its whole-object checksum before acting on its rows.
 
 **Purpose:** decouple the logical generation from the physical key namespace. With parent reference
 carry, a generation can refer to a run physically stored under an older generation.
-
-**Notes:**
-
-- The proto comment says `RunFooter` checksum, but current writers store `cityHash128` over the full
-  run bytes.
-- Readers do not verify the checksum before trusting the run.
-- Standardize this as either a mandatory full-object artifact hash or remove it from the protocol.
 
 ## Blob Target Run `CARN` {#blob-target-run-carn}
 
@@ -456,35 +451,31 @@ carry, a generation can refer to a run physically stored under an older generati
   multiple replicas or workers.
 - Consumers should open it through a typed helper that verifies expected `RunKind` and `key_schema`.
 
-## Part Manifest Cleanup Run `CARN` {#part-manifest-cleanup-run-carn}
+## Historical Part Manifest Cleanup Run `CARN` {#part-manifest-cleanup-run-carn}
 
-**Storage path:** `<prefix>/gc/gen/<gen>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>`.
+This subsection records a removed design and is not part of the current persisted-format inventory.
+Older trees stored cleanup bundles at
+`<prefix>/gc/gen/<gen>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>`.
 
-**Body:** `RunFile` containing manifest object keys and tokens.
+**Historical body:** `RunFile` rows containing manifest object keys and tokens.
 
-**Producer:** GC cleanup bundling path writes rows derived from manifest keys and observed tokens.
+**Historical producer and consumer:** the GC cleanup bundling path wrote these rows and sealed their
+references in `FoldSealProto.part_manifest_cleanup`. The audited implementation had no runtime reader
+for the bundles.
 
-**Consumers:** no current runtime reader found. The run is referenced from
-`FoldSealProto.part_manifest_cleanup`, and the seal codec round-trips the refs, but current post-CAS
-manifest deletion uses the in-memory `folded.mf_cleanup` map directly. The orphan sweep scans
-`cas/manifests/` directly rather than reading these bundles.
+**Current behavior:** `cas_fold_seal` has no cleanup-run field. Post-CAS manifest deletion uses the
+in-memory `folded.mf_cleanup` map, and the orphan sweep scans `cas/manifests/` directly. Namespace-life
+bytes are a separate concern owned by the perpetual namespace janitor.
 
-**Purpose:** originally, keep manifest cleanup work deterministic and bounded while avoiding a large
-protobuf array in the fold seal. Historically this came from the sharded GC design where cleanup
+**Historical purpose:** keep manifest cleanup work deterministic and bounded while avoiding a large
+array in the fold seal. The design came from the sharded GC plan where cleanup
 workers owned disjoint `ManifestId` ranges/namespaces and contributed bundle refs into
 `CasFoldSeal.part_manifest_cleanup`.
 
 **Notes:**
 
-- This now looks like leftover scaffolding from the unfinished sharded/replay design. The current
-  one-pass ack-floor round deletes owner-removed manifest bodies after the single `gc/state` CAS from
-  `folded.mf_cleanup`, not from the persisted bundle.
-- `manifestCleanupShard` exists, but the current writer always uses owner shard `0` for the cleanup
-  bundle and no distributed cleanup worker consumes shard-owned cleanup runs.
-- If recovery after the post-CAS manifest-delete window should replay exact manifest deletes from a
-  durable object, this run needs a real reader and tests. Otherwise remove the run, the
-  `FoldSealProto.part_manifest_cleanup` field, `Layout::partManifestCleanupKey`, and the round-trip
-  tests that only preserve the unused field.
+- The removed names above are retained only to explain older artifacts and documentation.
+- No current producer, consumer, layout key, or fold-seal field implements this design.
 
 ## Retired Set `CART` {#retired-set-cart}
 
@@ -691,11 +682,9 @@ The current inconsistencies are concentrated:
 - `cas_format.proto` has an incomplete magic table.
 - `GcHeartbeat` is unversioned control state.
 - `RunFile` and `PartManifest` use `format_version` as a compatibility gate.
-- `RunRef` checksum and `PartManifest.payload_digest` are persisted but not consistently verified.
+- `PartManifest.payload_digest` is persisted but not consistently verified.
 - Several enum fields are decoded through casts and need explicit domain validation.
 - Some placeholder ids, kinds, and fields look ahead of current call sites.
-- `part_manifest_cleanup` is written and sealed but has no current runtime reader; it is likely an
-  obsolete remnant of the unfinished sharded GC cleanup-worker plan.
 - `gc_shards > 1` is supported as sharded data layout and local per-shard reducer execution, not as a
   distributed map-reduce-like GC. `CasGcScheduler` runs one `Gc::runRegularRound` behind one GC
   lease; it does not distribute reducer ownership across replicas.
@@ -727,8 +716,7 @@ harder to audit.
 
 Cleanups:
 
-- Complete the magic table with `OwnerProto`, `ServerEpochProto`, `MountLeaseProto`, and
-  `FoldSealProto`.
+- Complete the magic table with `OwnerProto`, `ServerEpochProto`, and `MountLeaseProto`.
 - Remove stale references to JSON, tree objects, and old snap/watermark formats except in explicit
   historical notes.
 - Reserve removed fields and names in proto when appropriate; do not keep removed runtime concepts
@@ -809,8 +797,6 @@ Remove or demote these unless a current producer and consumer exists:
 - Unused `RunKind` values.
 - `TreeId` if no live code still needs it as a type boundary.
 - `changePoints` until the first real format generation test, or keep it but add a migration test.
-- `FoldSealProto.part_manifest_cleanup` and `partManifestCleanupKey` unless a real replay/recovery
-  reader is implemented.
 - Distributed sharded-GC scaffolding comments/classes such as cleanup-worker ownership language,
   `CoordinatorPlan`, and `manifestCleanupShard` unless the current code grows an actual reducer
   scheduler and replay path.
