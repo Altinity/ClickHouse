@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include "cas_test_helpers.h"
@@ -10,7 +11,6 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_FORMAT_VERSION;
 }
 
@@ -28,8 +28,8 @@ namespace DB::ErrorCodes
 /// WHY THE KEY IS THE FIX AND THE DELETE IS NOT. After the re-key the old file is at a prefix the new
 /// life cannot name. It is unreachable whether or not it was ever deleted, so a blind LIST costs
 /// STORAGE and nothing else -- the directive's "LIST omission may only leak storage, never visibility,
-/// rebirth or deletion safety". `OldFileHiddenByListIsInvisibleAfterRebirth` asserts exactly that split
-/// by leaving the old object physically present and byte-intact.
+/// rebirth or deletion safety". `ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval` asserts exactly
+/// that split by leaving the old object physically present and byte-intact through the real lifecycle.
 ///
 /// WHAT REBIRTH NO LONGER WAITS FOR. Catalog removal depends on folded terminal evidence for the old
 /// opaque life, not on a physical-empty proof. `RebirthDoesNotWaitForFilesToBeEmpty` keeps old `_files`
@@ -45,103 +45,84 @@ namespace
 const String kNsString = "00/aa@cas@";
 const String kFile = "format_version.txt";
 
-/// Two DELIBERATELY DISTINGUISHABLE incarnations. Hand-picked rather than random so a failure message
-/// names which life a key belongs to, and both differ from the deterministic fixture id returned by
-/// `stageATransition`; the parser must return the id encoded in the key.
-const UInt128 kInc1 = hexToU128("11111111111111111111111111111111");
-const UInt128 kInc2 = hexToU128("22222222222222222222222222222222");
-
 const UInt128 kGcId = hexToU128("00000000000000000000000000000001");
 
-/// Admit `ns` as `Live` at exactly `incarnation`, through the catalog's own public admission primitive.
-void admitLifeAt(Backend & backend, const Layout & layout, const RootNamespace & ns, const UInt128 & incarnation)
+/// Create a real catalog life and a replay-valid `Live` ref table through the production writer path.
+void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns, const String & ref)
 {
-    CatalogEntry entry;
-    entry.ns = ns;
-    entry.state = NsState::Live;
-    entry.incarnation = incarnation;
-    CasRefCatalog::casAdmitEntry(backend, layout, 1, entry);
-}
-
-/// Complete the catalog-only half of removal through the production exact-deletion authority. This
-/// fixture supplies the adopted-parent evidence that a real prior fold would have made durable.
-void retireCatalogEntry(Backend & backend, const Layout & layout, const RootNamespace & ns)
-{
-    CasRefCatalog::casUpdate(backend, layout, [&](const RefCatalog & current)
-    {
-        RefCatalog next = current;
-        const auto it = std::find_if(next.entries.begin(), next.entries.end(), [&](const CatalogEntry & entry)
-        {
-            return entry.ns == ns;
-        });
-        if (it == next.entries.end())
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Missing fixture catalog entry '{}'", ns.string());
-        it->state = NsState::Removing;
-        it->removal_started_round = 1;
-        return next;
-    });
-
-    const CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(backend, layout);
-    const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(), [&](const CatalogEntry & entry)
-    {
-        return entry.ns == ns;
-    });
-    ASSERT_NE(it, snapshot.catalog.entries.end());
-    CasFoldSeal parent;
-    parent.ref_lives.emplace(it->incarnation, RefLifeFoldState{
-        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 1}},
-        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 1}}});
-    ASSERT_EQ(CasRefCatalog::deleteCompletedRemoving(
-        backend, layout, *it, parent, 1,
-        [](uint64_t) { return CasRefCatalog::LeaderFenceStatus::Held; }),
-        CasRefCatalog::CompletedRemovingDeleteOutcome::Deleted);
+    PartWriteInfo info;
+    info.intended_namespace = ns;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = store->beginPartWrite(info);
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, ref, id);
+    build->promote(ns, ref, build->buildId(), id);
 }
 
 }
 
-/// THE HEADLINE HOLE. An old life's file that the store's enumeration omits is invisible to the reborn
-/// namespace -- and the object is still physically there, which is the point: correctness comes from
-/// the KEY, not from having managed to delete it.
-TEST(CasNsFileIncarnation, OldFileHiddenByListIsInvisibleAfterRebirth)
+/// THE COUPLED HEADLINE. A real removal reaches a catalog-absent cut even when LIST permanently omits
+/// an old-life file. A cold reader follows that catalog cut rather than the physical residue, while an
+/// already-held exact life remains stale-or-NotFound and can never cross into the successor life.
+TEST(CasNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
 {
-    auto backend = std::make_shared<HintHoleBackendOn<InMemoryBackend>>();
-    PoolPtr store = openPoolForTest(backend);
+    auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
+    PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
     const Layout & layout = store->layout();
     const RootNamespace ns{kNsString};
+    const String old_bytes = "old-life\n";
+    const String successor_bytes = "successor-life\n";
 
-    /// Life 1 writes one namespace file, and the store then starts lying about it in LIST only: `get`,
-    /// `head`, `putIfAbsent` and `deleteExact` stay honest, exactly like the real defect.
-    admitLifeAt(*backend, layout, ns, kInc1);
-    const NamespaceLifeId life1 = NamespaceLifeId::fromCatalogEntry(ns, kInc1);
-    store->putNamespaceFile(life1, kFile, "1\n");
-    const String key1 = layout.namespaceFileKey(life1, kFile);
-    backend->hide(key1);
+    publishWithProductionBirth(store, ns, "predecessor");
+    const std::optional<NamespaceLifeId> old_life = store->namespaceFilesLifeIfReadable(ns);
+    ASSERT_TRUE(old_life);
+    store->putNamespaceFile(*old_life, kFile, old_bytes);
+    const String old_key = layout.namespaceFileKey(*old_life, kFile);
+    backend->hide(old_key);
 
-    ASSERT_TRUE(backend->head(key1).exists) << "the lie must be in LIST only -- the object is durable";
-    ASSERT_TRUE(store->listNamespaceFiles(life1).empty())
+    ASSERT_TRUE(backend->head(old_key).exists) << "the lie must be in LIST only -- the object is durable";
+    ASSERT_TRUE(store->listNamespaceFiles(*old_life).empty())
         << "precondition: enumeration omits the file, so no cleanup pass can ever find it";
+    const size_t holes_before_gc = backend->holesServed();
 
-    /// The namespace is removed and created again under the SAME NAME at a different life. Nothing
-    /// deleted the old file, and nothing can.
-    retireCatalogEntry(*backend, layout, ns);
-    admitLifeAt(*backend, layout, ns, kInc2);
+    store->dropNamespace(ns);
+    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns));
 
-    /// Resolved the way production resolves it -- from the catalog, not from a life the test built.
-    /// Hand-constructing `life2` here would assert that two different keys hold different things,
-    /// which was never in doubt; what is in doubt is which life a READER lands on.
-    const std::optional<NamespaceLifeId> life2 = store->namespaceFilesLifeIfReadable(ns);
-    ASSERT_TRUE(life2.has_value());
-    EXPECT_EQ(life2->incarnation, kInc2) << "the reborn namespace must read at its OWN life";
+    Gc gc(store, kGcId);
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred) << "N: the production terminal must fold";
+    ASSERT_TRUE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns))
+        << "the terminal fold alone must not erase its catalog row";
+    (void)runRegularRoundReclaiming(gc);
+    ASSERT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, ns))
+        << "N+1: the pre-fold drain must erase the exact completed Removing row";
+    ASSERT_GT(backend->holesServed(), holes_before_gc)
+        << "the GC janitor must observe the injected LIST hole after the explicit precondition LIST";
 
-    EXPECT_FALSE(store->getNamespaceFile(*life2, kFile).has_value())
-        << "the previous life's file must be structurally unreachable from the new life";
-    EXPECT_TRUE(store->listNamespaceFiles(*life2).empty());
+    const auto old_head = backend->head(old_key);
+    ASSERT_TRUE(old_head.exists) << "logical removal must not depend on physical empty";
+    const auto old_object = backend->get(old_key);
+    ASSERT_TRUE(old_object);
+    EXPECT_EQ(old_object->bytes, old_bytes);
 
-    /// The old object is untouched -- storage leaked, visibility not.
-    EXPECT_TRUE(backend->head(key1).exists);
-    const auto still_there = backend->get(key1);
-    ASSERT_TRUE(still_there.has_value());
-    EXPECT_EQ(still_there->bytes, "1\n") << "the leak is a storage leak: the bytes are intact and inert";
+    PoolPtr cold = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "cold-reader", .gc_fold_max_defer_rounds = 0});
+    EXPECT_FALSE(cold->namespaceFilesLifeIfReadable(ns))
+        << "a fresh reader follows the absent catalog row, not discoverable or exact-key old bytes";
+
+    publishWithProductionBirth(store, ns, "successor");
+    const std::optional<NamespaceLifeId> successor_life = cold->namespaceFilesLifeIfReadable(ns);
+    ASSERT_TRUE(successor_life);
+    ASSERT_NE(successor_life->incarnation, old_life->incarnation);
+    cold->putNamespaceFile(*successor_life, kFile, successor_bytes);
+    EXPECT_EQ(cold->getNamespaceFile(*successor_life, kFile), successor_bytes);
+
+    const std::optional<String> retained_old = store->getNamespaceFile(*old_life, kFile);
+    EXPECT_TRUE(!retained_old || *retained_old == old_bytes)
+        << "an exact predecessor life may be stale or NotFound, but never aliases successor bytes";
+    EXPECT_NE(retained_old, std::optional<String>{successor_bytes});
+
+    for (const String & key : backend->touchedKeys())
+        EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
 }
 
 /// The non-minting reader assignment site accepts exactly a catalog `Live` row. `Creating`,
