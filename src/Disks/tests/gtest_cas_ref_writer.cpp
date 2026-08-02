@@ -1075,8 +1075,10 @@ TEST(RefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
     const RootNamespace ns{"srv1/warm"};
-    publishEmptyPart(store, ns, "part_1");   /// setup: births + populates the table (not measured)
+    publishEmptyPart(store, ns, "part_1");
+    publishEmptyPart(store, ns, "part_2");
     ASSERT_TRUE(store->resolveRef(ns, "part_1").has_value());
+    ASSERT_TRUE(store->resolveRef(ns, "part_2").has_value());
 
     const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(*backend, store->layout(), ns);
     const String log_prefix = store->layout().namespaceStreamPrefix(life) + "_log/";
@@ -1092,23 +1094,116 @@ TEST(RefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     const uint64_t put_before = backend->putTotal();
     const uint64_t ckpt_get_before = backend->getCount(ckpt_key);
     const uint64_t ckpt_cas_before = backend->casPutCount(ckpt_key);
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool pre_carve_entered = false;
+    bool post_install_entered = false;
+    bool release_post_install = false;
+    bool follower_returned = false;
+    store->setRefPreCarveHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        if (pre_carve_entered)
+            return;
+        pre_carve_entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return store->refQueuePendingForTest(ns) >= 2; });
+    });
     store->setCarveHookForTest([&](CasRefLedger::CarvePhaseForTest phase)
     {
-        if (phase == CasRefLedger::CarvePhaseForTest::PostDurableInstall)
-            backend->recordRequestJournalEvent("INSTALL");
+        if (phase != CasRefLedger::CarvePhaseForTest::PostInstallPreAck)
+            return;
+        backend->recordRequestJournalEvent("INSTALL");
+        std::unique_lock lock(mutex);
+        post_install_entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_post_install; });
     });
 
-    store->dropRef(ns, "part_1");
-    backend->recordRequestJournalEvent("ACK");
+    std::exception_ptr leader_error;
+    std::exception_ptr follower_error;
+    std::thread leader([&]
+    {
+        try
+        {
+            store->dropRef(ns, "part_1");
+        }
+        catch (...)
+        {
+            leader_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return pre_carve_entered; });
+    }
+    std::thread follower([&]
+    {
+        try
+        {
+            store->dropRef(ns, "part_2");
+            backend->recordRequestJournalEvent("FOLLOWER ACK");
+            {
+                std::lock_guard lock(mutex);
+                follower_returned = true;
+            }
+            cv.notify_all();
+        }
+        catch (...)
+        {
+            follower_error = std::current_exception();
+        }
+    });
+    while (store->refQueuePendingForTest(ns) < 2)
+        std::this_thread::yield();
+    cv.notify_all();
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return post_install_entered; });
+    }
+
+    bool follower_returned_before_release = false;
+    {
+        std::lock_guard lock(mutex);
+        follower_returned_before_release = follower_returned;
+    }
+    std::exception_ptr observation_error;
+    bool part_1_visible = true;
+    bool part_2_visible = true;
+    try
+    {
+        part_1_visible = store->resolveRef(ns, "part_1").has_value();
+        part_2_visible = store->resolveRef(ns, "part_2").has_value();
+    }
+    catch (...)
+    {
+        observation_error = std::current_exception();
+    }
+    {
+        std::lock_guard lock(mutex);
+        release_post_install = true;
+    }
+    cv.notify_all();
+    leader.join();
+    follower.join();
+    store->setRefPreCarveHookForTest(nullptr);
     store->setCarveHookForTest(nullptr);
 
+    EXPECT_FALSE(follower_returned_before_release)
+        << "a co-batched waiter returned before the installed transaction was acknowledged";
+    EXPECT_FALSE(observation_error);
+    EXPECT_FALSE(part_1_visible);
+    EXPECT_FALSE(part_2_visible)
+        << "both co-batched mutations must be visible before either waiter can return success";
+    EXPECT_FALSE(leader_error);
+    EXPECT_FALSE(follower_error);
     EXPECT_EQ(backend->listTotal(), list_before) << "a warm mutation performs no LIST";
     EXPECT_EQ(backend->putTotal(), put_before + 1) << "exactly one body PUT with create-if-absent";
     EXPECT_EQ(backend->getCount(ckpt_key), ckpt_get_before + 1)
         << "one committed chunk pays exactly one checkpoint GET";
     EXPECT_EQ(backend->casPutCount(ckpt_key), ckpt_cas_before + 1)
         << "one committed chunk pays exactly one checkpoint CAS";
-    EXPECT_FALSE(store->resolveRef(ns, "part_1").has_value());
 
     const std::vector<String> journal = backend->requestJournal();
     ASSERT_EQ(journal.size(), 5u);
@@ -1116,7 +1211,7 @@ TEST(RefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     EXPECT_EQ(journal[1], "GET " + ckpt_key);
     EXPECT_EQ(journal[2], "CAS " + ckpt_key);
     EXPECT_EQ(journal[3], "INSTALL");
-    EXPECT_EQ(journal[4], "ACK");
+    EXPECT_EQ(journal[4], "FOLLOWER ACK");
 
     const auto durable_ckpt = readCkpt(*backend, store->layout(), life);
     ASSERT_TRUE(durable_ckpt);

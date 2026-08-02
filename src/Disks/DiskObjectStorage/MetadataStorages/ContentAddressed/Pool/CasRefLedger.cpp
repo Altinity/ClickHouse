@@ -3668,6 +3668,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     ns.string(), id.writer_epoch, id.ref_sequence)));
                 return false;
             }
+            if (carve_hook_for_test)
+                carve_hook_for_test(CarvePhaseForTest::PostInstallPreAck);
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, chunk_survivors.size());
             {

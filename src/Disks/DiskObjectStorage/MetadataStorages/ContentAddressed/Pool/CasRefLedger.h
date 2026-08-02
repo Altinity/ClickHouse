@@ -355,8 +355,20 @@ public:
     /// candidate is installed into the live state -- the seam a test uses to prove that the region
     /// between "durable" and "recorded" can no longer strand a transaction (a throw injected there is
     /// the only way left to simulate the OLD post-durable apply failure, since the install itself is now
-    /// allocation-free and cannot throw). Null in production.
-    enum class CarvePhaseForTest { PlanSeenRefs, PlanBatchGrow, PlanReserveOwned, PublishPop, ValidateFinalOps, ChunkReseed, PostDurableInstall };
+    /// allocation-free and cannot throw). `PostInstallPreAck` fires after the candidate swap and overlay
+    /// materialization, outside the allocation-denied scope and state lock, but before any waiter is
+    /// marked done or notified. It is the deterministic acknowledgment-order seam. Null in production.
+    enum class CarvePhaseForTest
+    {
+        PlanSeenRefs,
+        PlanBatchGrow,
+        PlanReserveOwned,
+        PublishPop,
+        ValidateFinalOps,
+        ChunkReseed,
+        PostDurableInstall,
+        PostInstallPreAck,
+    };
     void setCarveHookForTest(std::function<void(CarvePhaseForTest)> hook) { carve_hook_for_test = std::move(hook); }
 
     /// Installs the negative control for the post-durable install region (see

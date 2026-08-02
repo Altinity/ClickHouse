@@ -86,9 +86,10 @@ struct CaseSync
     bool entered = false;                        /// guarded by m: the first flush reached the pre-carve hook
     /// Per-`CarvePhaseForTest` invocation counter, indexed by `static_cast<int>(phase)`. Sized off the
     /// enum's last enumerator rather than a literal: the array was already undersized once (it predates
-    /// `ChunkReseed`, and `PostDurableInstall` followed), and it is out of bounds only because every
-    /// call site happens to filter to a lower-numbered phase first -- a trap for the next phase added.
-    std::atomic<int> phase_hits[static_cast<size_t>(CasRefLedger::CarvePhaseForTest::PostDurableInstall) + 1] = {};
+    /// `ChunkReseed`; `PostDurableInstall` and `PostInstallPreAck` followed), and it is out of bounds only
+    /// because every call site happens to filter to a lower-numbered phase first -- a trap for the next
+    /// phase added.
+    std::atomic<int> phase_hits[static_cast<size_t>(CasRefLedger::CarvePhaseForTest::PostInstallPreAck) + 1] = {};
 };
 
 /// The newest `_log/` transaction currently present for `ns`, decoded from the backend directly (no Pool
