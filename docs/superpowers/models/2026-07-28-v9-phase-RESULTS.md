@@ -526,6 +526,26 @@ ALL EXPECTATIONS MET
 The witness row is deliberately an exact expected violation: accepting any nonzero TLC exit would not
 prove that the honest delete path is reachable.
 
+#### Edge-before-observe whole-suite conversion {#edge-before-observe-whole-suite}
+
+`run_ebo.sh` now runs its four independent guard sabotages before the reduced positive model. The old
+no-argument invocation failed on an unbound `$1` before TLC started. With the official pinned jar and
+`TLC_WORKERS=auto`, the asserted family gate produced:
+
+```text
+CONFIG                  EXPECT      RESULT                           SECONDS  VERDICT
+sab_late_edge           violation   violation:INV_NO_DANGLE          1        PASS
+sab_no_adopt_check      violation   violation:INV_NO_DANGLE          0        PASS
+sab_no_k3_adopt_check   violation   violation:INV_NO_DANGLE          0        PASS
+sab_no_k3_head          violation   violation:INV_NO_DANGLE          1        PASS
+reduced                 green       green                            0        PASS
+
+ALL EXPECTATIONS MET
+```
+
+Although all four sabotages target `INV_NO_DANGLE`, each remains a separate row because each removes a
+different load-bearing order or adoption guard.
+
 ### The unaudited residual worth naming: `CaGcRootLocalPartManifestCore` {#unaudited-residual}
 
 Of the twelve models outside this audit's scope, one is squarely in the defect's blast radius and
