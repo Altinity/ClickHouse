@@ -45,3 +45,7 @@ while IFS= read -r suite; do
 done < "$SUITES_FILE"
 echo "TOTALS: pass=$total_pass fail=$total_fail abort=$total_abort" >> "$OUT"
 echo "DONE"
+# A gate that records failures but exits 0 is not a gate.
+if [ $((total_fail + total_abort)) -gt 0 ]; then
+    exit 1
+fi

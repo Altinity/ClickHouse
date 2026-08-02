@@ -127,7 +127,7 @@ contradicts the completion claim. Both sections carry an explicit
   manifest sweep (discovery), plus unrelated pool/root/probe code. `Tools/CasFsck.cpp` enumerates only
   `blobsPrefix` and manifest prefixes, never the ref stream.
 
-### 4. "What died — do not re-add" (`{#t5-died}`)
+### 4. "What died — do not re-add" (the old plan's `t5-died` list) {#t5-what-died}
 
 Checked against production code under
 `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed`:
@@ -2019,7 +2019,7 @@ endpoints:
 
 ---
 
-### 4. Dependency map: handoff vs. plan `{#parallel-execution-lanes}`
+### 4. Dependency map: handoff vs. the old plan's parallel-execution-lanes section {#docs-dependency-map}
 
 **The handoff and the plan disagree about Task 6's place in the critical path, and the handoff is right.**
 

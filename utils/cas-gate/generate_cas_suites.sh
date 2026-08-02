@@ -33,10 +33,12 @@ declare -A EXCLUDE_REASONS=(
     [TestCascadeWriteBufferWithDisk]="generic cascade write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS"
 )
 
-# Every suite name that appears in a TEST(...)/TEST_F(...) macro in any CAS test source file -- the
-# SOURCE OF TRUTH for what must be accounted for, independent of naming convention.
-mapfile -t source_suites < <(grep -ohP '^TEST(_F)?\(\s*\w+' gtest_ca*.cpp gtest_cas*.cpp 2>/dev/null \
-    | sed -E 's/^TEST(_F)?\(\s*//' | sort -u)
+# Every suite name that appears in a TEST(...)/TEST_F(...)/TEST_P(...) macro in any CAS test source
+# file -- the SOURCE OF TRUTH for what must be accounted for, independent of naming convention.
+# TEST_P suites appear in the binary only under their instantiation prefixes (`<Inst>/<Suite>`), which
+# the matching below resolves.
+mapfile -t source_suites < <(grep -ohP '^TEST(_F|_P)?\(\s*\w+' gtest_ca*.cpp gtest_cas*.cpp 2>/dev/null \
+    | sed -E 's/^TEST(_F|_P)?\(\s*//' | sort -u)
 
 # Every suite name the BUILT BINARY actually contains (catches source-vs-binary drift: a stale build,
 # or a suite whose only test is behind a compile-time #ifdef).
@@ -46,26 +48,52 @@ mapfile -t binary_suites < <("$BIN" --gtest_list_tests 2>/dev/null \
 declare -A in_binary
 for s in "${binary_suites[@]}"; do in_binary["$s"]=1; done
 
+# Suites compile-time guarded by the LOGICAL_ERROR death-test split: they exist only in
+# debug/sanitizer builds, so absence from a release binary is the EXPECTED state, not drift. This is
+# an EXPLICIT list on purpose -- a name-pattern skip would silently drop the next new suite; a new
+# guarded suite must be added here deliberately, with the build that contains it verified once.
+KNOWN_COMPILE_GUARDED=(
+    CasBlobDigestDeathTest CasBlobUploadPoolDeathTest CasFoldSealFormatDeathTest
+    CasFormatTraitsDeathTest CasGcHoldGrammarDeathTest CasGcStateFormatDeathTest
+    CasNamespaceLifeIdDeathTest CasNsCreationLifecycleDeathTest CasPartFolderAccessDeathTest
+    CasPromoteRepublishDeathTest CasRefCatalogDeathTest CasRefCatalogFormatDeathTest
+    CasRefCatalogRemovalDeathTest CasRefInstallSafetyDeathTest CasRequestControllerCreateDeathTest
+    CasUploadDetachedDeathTest CasUploadFanoutDeathTest CasWiringExchangeDeathTest
+    CasWiringOpsDeathTest
+)
+declare -A known_guarded
+for s in "${KNOWN_COMPILE_GUARDED[@]}"; do known_guarded["$s"]=1; done
+
 included=()
 unclaimed=()
 for s in "${source_suites[@]}"; do
     if [ -n "${EXCLUDE_REASONS[$s]-}" ]; then
         continue   # explicitly excluded, with a non-empty reason
     fi
-    if [ -z "${in_binary[$s]+x}" ]; then
-        # *DeathTest suites are compile-time guarded by the LOGICAL_ERROR death-test split: they exist
-        # only in debug/sanitizer builds. Absent from a release binary is the EXPECTED state, not
-        # drift; present in a debug binary they are included like any other suite (the branch below
-        # never fires for them there).
-        if [[ "$s" == *DeathTest ]]; then
-            continue
-        fi
-        # Named in source but not in the built binary: could be a stale build, or dead code behind an
-        # #ifdef. Either way it needs a human decision, not a silent drop.
-        unclaimed+=("$s (in source, NOT in built binary -- stale build? dead #ifdef?)")
+    if [ -n "${in_binary[$s]+x}" ]; then
+        included+=("$s")
         continue
     fi
-    included+=("$s")
+    # TEST_P suites live in the binary only under instantiation prefixes: include every `<Inst>/<s>`
+    # spelling, so the emitted filter names what is actually runnable.
+    param_spellings=()
+    for b in "${binary_suites[@]}"; do
+        if [[ "$b" == */"$s" ]]; then
+            param_spellings+=("$b")
+        fi
+    done
+    if [ "${#param_spellings[@]}" -gt 0 ]; then
+        included+=("${param_spellings[@]}")
+        continue
+    fi
+    if [ -n "${known_guarded[$s]+x}" ]; then
+        continue   # known compile-time-guarded death-test suite, absent from this build type
+    fi
+    # Named in source but not in the built binary: could be a stale build, dead code behind an
+    # #ifdef, or a new compile-guarded suite not yet in the explicit list. Either way it needs a
+    # human decision, not a silent drop.
+    unclaimed+=("$s (in source, NOT in built binary -- stale build? dead #ifdef? new guarded suite?)")
+    continue
 done
 
 if [ "${#unclaimed[@]}" -gt 0 ]; then

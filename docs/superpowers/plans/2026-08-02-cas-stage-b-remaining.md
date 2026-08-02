@@ -79,8 +79,10 @@ command and its output; the baseline figures are expectations, not facts to trus
 
 ## Global Constraints {#global-constraints}
 
-- Branch `cas-gc-rebuild` in `/home/mfilimonov/workspace/ClickHouse/master` only. Never rebase,
-  amend, or switch branches. Ordinary follow-up commits.
+- Never rebase or amend anywhere; ordinary follow-up commits only. MAIN
+  (`/home/mfilimonov/workspace/ClickHouse/master`) stays on `cas-gc-rebuild` and never switches
+  branches; LANE-G creates `laneg/<task>` branches per the `{#two-worktrees}` map — that is the
+  one sanctioned branch-switching surface.
 - One production writer at a time on overlapping `CasRefLedger`/`CasGc` seams. Read-only audits and
   log analysis may run in parallel.
 - Every build/test run redirects to a unique file under `build/` (e.g.
@@ -216,7 +218,9 @@ commit>` and hand finished ordinary commits back to MAIN for integration. No pus
 
 **Cross-worktree resource rules:**
 - Full CA gates and `unit_tests_dbms` builds are serialized ACROSS worktrees with
-  `flock tmp/unit_tests.lock` (two concurrent gates have exhausted `/tmp` inodes on this box —
+  `flock "$(git rev-parse --git-common-dir)/unit_tests.lock"` — the common dir is SHARED by both
+  worktrees, while each worktree's `tmp/` is its own directory and would silently give each lane
+  a different lock (two concurrent gates have exhausted `/tmp` inodes on this box —
   check `df -i` if a gate fails strangely).
 - Praktika integration runs and ca-soak scenarios: at most ONE on the box at any time, owned by
   MAIN (praktika prunes docker containers/volumes and would kill a running soak).
@@ -831,8 +835,9 @@ warning does not carry enough information to attribute it.
 
 **Files:**
 - Modify: `.../Gc/CasGc.h` (`UniversePolicy`: `kDefault` → the authoritative value; rename
-  `AuthoritativeForTest` → `Authoritative`; update the `kDefault` comment to name ALL return
-  items)
+  `AuthoritativeForTest` → `Authoritative`; the `kDefault` comment is rewritten to invariant +
+  reason only, per Step 1 — the return-item inventory lives in the task report, never in the
+  comment)
 - Modify: `src/Disks/tests/gtest_cas_list_liar_end_to_end.cpp` (the ONE intentional Stage-B edit:
   the kill-shot survives on PROOF, not suppression; the explicit-`AuthoritativeForTest` variant
   collapses into the production case)
