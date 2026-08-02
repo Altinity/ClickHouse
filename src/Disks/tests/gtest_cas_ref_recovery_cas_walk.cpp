@@ -938,6 +938,60 @@ TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{1, 3}));
 }
 
+TEST(CasRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingPastIt)
+{
+    struct Case
+    {
+        String suffix;
+        uint64_t live_epoch;
+        RefTxnId occupant;
+        RefTxnId forbidden_successor;
+        bool occupant_is_seal;
+    };
+    const std::vector<Case> cases{
+        {"seal", 3, {1, 2}, {2, 1}, true},
+        {"straggler", 2, {1, 2}, {1, 3}, false},
+    };
+
+    for (const Case & test_case : cases)
+    {
+        SCOPED_TRACE(test_case.suffix);
+        auto backend = std::make_shared<LateMaterializeBackend>();
+        const Layout layout("p");
+        const RootNamespace ns{"srv1/occupied_frontier_" + test_case.suffix};
+        const RefTxnId initial_frontier{1, 1};
+
+        burnEpochsUpTo(*backend, layout, test_case.live_epoch);
+        seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
+        seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
+        const NamespaceLifeId life = catalogLife(*backend, layout, ns);
+        backend->late_key = layout.refLogKey(life, test_case.occupant);
+        const RefLogTxn occupant = test_case.occupant_is_seal
+            ? makeSealTxn(ns, test_case.occupant)
+            : makeOrdinaryTxn(ns, test_case.occupant, "late", /*birth=*/false);
+        backend->late_bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(occupant));
+
+        uint64_t fake_now = 1'000'000;
+        PoolConfig config = walkTestConfig();
+        config.boot_ms_fn = [&fake_now] { return fake_now; };
+        config.cas_request_budget.recovery_retry_budget_ms = 1;
+        config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
+        config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
+        auto store = openWalkPool(backend, config);
+        store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+
+        backend->ambiguous_cas_substr = layout.refCkptKey(life);
+        backend->ambiguous_cas_count = 100'000;
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
+
+        EXPECT_TRUE(backend->get(layout.refLogKey(life, test_case.occupant)));
+        EXPECT_FALSE(backend->get(layout.refLogKey(life, test_case.forbidden_successor)))
+            << "recovery advanced before exact _ckpt certified the occupied object";
+        EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, initial_frontier);
+        EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+    }
+}
+
 /// Two BURNED epochs -- mounted, never written to, and abandoned. `CasPool`'s epoch allocator mints and
 /// never reclaims, so this is the normal shape of a pool that has restarted a few times, not an
 /// anomaly. Each empty epoch is closed by its own sequence-1 seal, and each carries the previous seal as
@@ -976,6 +1030,100 @@ TEST(CasRefRecoveryCasWalk, TwoBurnedEmptyEpochsProduceTwoChainedSequenceOneSeal
     EXPECT_FALSE(readLogTxn(*backend, layout, ns, RefTxnId{4, 1}).has_value())
         << "epoch 4 is LIVE -- sealing it would close the epoch this mount writes in";
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{3, 1}));
+}
+
+TEST(CasRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNextEpochSeal)
+{
+    auto backend = std::make_shared<HidingListBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_frontier_before_next"};
+    const RefTxnId initial_frontier{1, 1};
+    const RefTxnId first_seal{1, 2};
+    const RefTxnId second_seal{2, 1};
+    const RefTxnId cold_remount_frontier{3, 1};
+
+    burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/3);
+    seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
+    const NamespaceLifeId life = catalogLife(*backend, layout, ns);
+
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config = walkTestConfig();
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.cas_request_budget.recovery_retry_budget_ms = 1;
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
+    auto store = openWalkPool(backend, config);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+
+    backend->ambiguous_cas_substr = layout.refCkptKey(life);
+    backend->ambiguous_cas_count = 100'000;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
+
+    EXPECT_TRUE(backend->get(layout.refLogKey(life, first_seal)))
+        << "the first recovery seal became durable before its frontier attempt";
+    EXPECT_FALSE(backend->get(layout.refLogKey(life, second_seal)))
+        << "recovery may not create a second object while the first is still above exact _ckpt";
+    EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, initial_frontier);
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+
+    /// Restart cold, without the failed mount's `NeedsRecovery` attempt. The first seal is durable but
+    /// still outside `_ckpt`; the remount must recover and certify it before it may create `{2,1}`.
+    backend->ambiguous_cas_count = 0;
+    store.reset();
+    auto cold_store = openWalkPool(backend);
+    ASSERT_EQ(cold_store->liveWriterEpoch(), 4u);
+    ASSERT_EQ(cold_store->listRefs(ns).size(), 1u);
+    EXPECT_TRUE(backend->get(layout.refLogKey(life, second_seal)));
+    EXPECT_TRUE(backend->get(layout.refLogKey(life, cold_remount_frontier)));
+    EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, cold_remount_frontier);
+}
+
+/// A straggler is not an exception to the recovered-successor rule. When it materializes in the seal
+/// slot, recovery adopts it as the one object above its accepted checkpoint and must certify that exact
+/// frontier before it can create the following seal at the new `T+1`.
+TEST(CasRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingItsFollowingSeal)
+{
+    auto backend = std::make_shared<LateMaterializeBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/straggler_frontier_before_seal"};
+    const RefTxnId initial_frontier{1, 1};
+    const RefTxnId straggler{1, 2};
+    const RefTxnId following_seal{1, 3};
+
+    burnEpochsUpTo(*backend, layout, /*target_live_epoch=*/2);
+    seedTxn(*backend, layout, ns, initial_frontier, "a", /*birth=*/true);
+    seedCkpt(*backend, layout, ns, lifeEpochCkpt(1, initial_frontier));
+    const NamespaceLifeId life = catalogLife(*backend, layout, ns);
+    backend->late_key = layout.refLogKey(life, straggler);
+    backend->late_bytes = sealObject(FormatId::RefLog,
+        encodeRefLogTxn(makeOrdinaryTxn(ns, straggler, "late", /*birth=*/false)));
+
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config = walkTestConfig();
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.cas_request_budget.recovery_retry_budget_ms = 1;
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 1;
+    auto store = openWalkPool(backend, config);
+    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+
+    backend->ambiguous_cas_substr = layout.refCkptKey(life);
+    backend->ambiguous_cas_count = 100'000;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->listRefs(ns); });
+
+    EXPECT_TRUE(backend->get(layout.refLogKey(life, straggler)))
+        << "the straggler occupied the recovery seal slot";
+    EXPECT_FALSE(backend->get(layout.refLogKey(life, following_seal)))
+        << "recovery may not create a seal after an adopted straggler above exact _ckpt";
+    EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, initial_frontier);
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+
+    backend->ambiguous_cas_count = 0;
+    ASSERT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_TRUE(backend->get(layout.refLogKey(life, following_seal)));
+    EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, following_seal);
 }
 
 /// GENESIS. A namespace born at epoch 5 has no epochs 1-4 of its own: they are not "empty epochs it

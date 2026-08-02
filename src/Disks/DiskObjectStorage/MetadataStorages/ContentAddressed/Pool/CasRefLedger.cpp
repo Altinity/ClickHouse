@@ -1134,6 +1134,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     RefLogTxn applied = seal_txn;
                     apply_one(std::move(applied), seal_bytes.size());
                     ProfileEvents::increment(ProfileEvents::CasRefRecoveryEpochSealed);
+                    if (!publish_recovered_frontier(seal_txn))
+                        return std::nullopt;
                     ++epoch;
                     sequence = 1;
                     slot_attempts_this_epoch = 0;
@@ -1148,7 +1150,10 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     RefLogTxn occupant = decodeRefLogTxn(
                         openObject(FormatId::RefLog, occupied.occupant_bytes), ns.string(), id);
                     const bool occupant_is_seal = refLogTxnIsEpochSeal(occupant);
+                    const RefLogTxn frontier_txn = occupant;
                     apply_one(std::move(occupant), occupied.occupant_bytes.size());
+                    if (!publish_recovered_frontier(frontier_txn))
+                        return std::nullopt;
                     if (occupant_is_seal)
                     {
                         /// A concurrent recoverer closed this epoch (or our own earlier attempt did, and
