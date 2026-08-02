@@ -20,7 +20,7 @@ CONSTANTS
     SabotageAcceptNamespaceMismatch, SabotageAcceptRefMismatch,
     SabotageMutableAsReachability, SabotagePromoteAfterMissingBody,
     SabotageAdvancePastMissingBodyPrecommit,
-    \* ---- Phase 2: token-diff discovery (rev.15 token split) ----
+    \* ---- Phase 2: token-diff discovery (rev.15 token split) — RETIRED, no active config sets EnableTokenDiff = TRUE ----
     EnableTokenDiff,            \* TRUE -> discover MAY skip an unchanged shard's body read
     TokenObservable,            \* TRUE -> LIST surfaces a per-shard token (supportsListTokens); FALSE -> always read
     SabotageSkipChangedShard,   \* skip a shard whose listed root token actually advanced past the folded token (must dangle)
@@ -859,7 +859,14 @@ WMutableUpdate(m) ==
                     mPrefix, sweepEligible, extraShared, listedTok, foldedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
     /\ UNCHANGED attemptVars
 
-\* ---- Phase 2: token-diff discovery (spec §Discovery; the rev.15 token split) ----
+\* ---- Phase 2: token-diff discovery (spec §Discovery; the rev.15 token split) — RETIRED ----
+\* Never adopted: no production seam skips the fold-discovery read on a LIST-derived token match. The
+\* landed intake design instead keeps that read unconditional (the exact-key GET at the durable cursor
+\* is itself the frontier proof of "nothing new"), because a hot LIST is untrusted for a correctness
+\* decision — it may only offer candidates, diagnostics, or garbage nominations, never elide a read this
+\* premise treats as safe to skip. `EnableTokenDiff`/`TokenObservable`/`GDiscoverSkip`/`GDiscoverRead` and
+\* their two Sabotage* controls stay as a historical negative-space record (no active config sets
+\* `EnableTokenDiff = TRUE` any longer); the four configs that once exercised this arm are removed.
 \* The token-diff skip CLAIMS a shard's fold coverage WITHOUT reading its body: it advances the durable
 \* fold cursor to the journal end (the shard is declared "covered this round") while emitting NO source
 \* edges and NOT re-sealing foldedTok. This is exactly the "elide the body read / re-fold" of §Discovery.
