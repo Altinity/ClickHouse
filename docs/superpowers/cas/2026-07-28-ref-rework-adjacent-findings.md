@@ -12,18 +12,15 @@ matters once the core lands; severity is the reviewer's.
 
 ---
 
-## R1. Verbatim-file rebirth aliasing — [today, major] {#r1-verbatim-alias}
+## R1. Verbatim-file rebirth aliasing — [closed, 2026-08-02] {#r1-verbatim-alias}
 
-> **SUPERSEDED IN PART, 2026-07-30** (recorded because R7 carried its supersession note and this one
-> did not, so the register disagreed with itself about whether it reflects the amendment): the
-> NAMESPACE-FILE half of this hazard is closed structurally by
-> `docs/superpowers/specs/2026-07-29-cas-stage-b-namespace-life-amendments.md` §2 — files move to
-> `roots/<ns>/<inc>/_files/<relative-name>`, so an old-incarnation file is foreign-keyed by
-> construction and cannot become visible to a re-born namespace. What survives of R1 is anything
-> OUTSIDE that re-key (loose mountpoint objects keep today's identity by design), and the body below
-> still describes the pre-amendment boundary — read it as the historical statement of the problem,
-> not as the current contract. Stage B Task 9 is now a CLOSURE NOTE recording where each sub-hazard
-> went, not a spec-writing task.
+> **CLOSED.** Stage B re-keyed namespace files to
+> `cas/ns/state/<life_id>/_files/<relative-name>` and bound reads and delayed writes to the exact
+> `NamespaceLifeId` selected before rebirth. The independent loose mountpoint-object audit found no
+> namespace/catalog re-resolution: those objects remain at `roots/<server_root_id>/<path>` and cannot
+> be retargeted by same-name namespace rebirth. The evidence and per-sub-hazard disposition are in
+> [the R1 closure note](./2026-08-02-r1-verbatim-file-aliasing-closure.md). The body below is retained
+> as the historical statement of the pre-amendment problem, not the current contract.
 
 Verbatim files are keyed `{namespace, file_name}` only (`CasLayout.h` ~:175; `CasPlainObjects` has
 no incarnation parameter). Rebirth is gated by the `_cleanup` marker, whose "physically empty" proof
