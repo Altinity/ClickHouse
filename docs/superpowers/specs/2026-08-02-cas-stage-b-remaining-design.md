@@ -76,11 +76,15 @@ made before the new plan's execution begins, adds together:
 5. the new seeded ledger
    (`.superpowers/sdd/2026-08-02-cas-stage-b-remaining/progress.md`), recording the tree-verified
    baseline states — including the states the old ledger never carried (6b rename landed at
-   `9d92c84ee37`; 7a/7b explicitly unstarted; the exact Task-6 landed/missing split of §4).
+   `9d92c84ee37`; 7a/7b explicitly unstarted; the exact Task-6 landed/missing split of §4);
+6. the CA-gate tooling, versioned: `utils/cas-gate/generate_cas_suites.sh` and
+   `utils/cas-gate/run_cas_gate_per_suite.sh` (today untracked `tmp/` scripts every gate step
+   depends on — a fresh worktree would not contain them, which would break the plan's
+   self-containment).
 
 At no commit boundary do two execution authorities coexist, and the plan does not describe its own
 creation. The new plan's first task (T0) therefore starts **after** publication and contains only
-the PROSE batch and the model-tool preflight.
+the PROSE batch, the model-tool preflight, and a verification run of the published gate tooling.
 
 ## 4. Verified baseline the plan starts from {#baseline}
 
@@ -231,20 +235,24 @@ Gate: full CA. Own commit and review; T2 does not block T6.
 
 ### T4 — Task 8 closure {#t4}
 
-**Q-1 decision — debris ownership, adopted:**
+**Q-1 decision — debris ownership, adopted (corrected in review: the duty settles ownership, it
+does not delete bodies):**
 
-- the writer cleanup duty **owns** provably `Rejected` debris (absence of durable publication
-  proven) and is retired only **after** the exact deletion succeeds or absence is confirmed;
-  a cleanup failure retains the duty for retry — the duty is never removed first, so no stop
-  between the two actions can leave debris ownerless;
-- `Uncertain` or potentially `Durable` bodies are **never** deleted by the writer path;
-- such bodies are nominated and deleted by the orphan sweep after its own reachability and
-  authority checks.
+- the writer cleanup duty **owns precommit-owner settlement and the active-build-floor pin, not
+  physical body deletion**: append the exact `OwnerTransition` (or observe conclusive absence),
+  only then `retireBuildSeq`, only then remove the duty; a settlement failure retains the duty
+  for retry, so no stop between actions leaves the obligation ownerless;
+- **physical unreachable bodies of `Rejected`/`Uncertain`/`Durable` attempts remain
+  GC/orphan-sweep-owned** — the writer path never exact-deletes a body;
+- the orphan sweep nominates and deletes those bodies after its own reachability and authority
+  checks.
 
 This is simpler and safer than making `CasPartWriteTxn` reason simultaneously about transaction
 outcome and global reachability. Acceptance conditions, each a test or measurement in this task:
 
-1. the reject-arm wedge-drain test proves `Rejected` debris does not leak forever;
+1. the reject-arm wedge-drain test proves `Rejected` settlement does not leak forever, AND the
+   physical body of a rejected attempt is proven eventually nominated and swept (end-to-end, not
+   only the wedge clearing);
 2. orphan-sweep tests cover eventual nomination for `Uncertain`/`Durable` bodies;
 3. missing attribution leads to suppression, never to a destructive fallback;
 4. accounting states explicitly which owner holds each debris class.
@@ -328,8 +336,11 @@ The requirement body is carried into the new plan from the old Task 11, shortene
 AMD tidy lane in its own `build_tidy`; executable-prose sweep; the residual-cleanup gate row —
 which the new plan **enumerates explicitly, item by item with a disposition column** (the audit
 stays evidence/provenance, never a requirement source an executor must load). The row's content,
-fixed here: the Task-1 review minors 1–7 and the re-review's MINOR-B plus NITs C–F (copied
-verbatim into the new plan at plan-writing time); Task 5's deferred symmetric regression test for
+fixed here: the Task-1 review minors (the verbatim enumeration did not survive in any artifact —
+the plan carries the six recoverable characterizations as the final walkable list, and the
+midpoint audit records the loss once as historical-unrecoverable; T8 performs no archaeology);
+the re-review's MINOR-B (discharged in Task 1c — verify the guard) and NITs C–F (lost; closed as
+historical-unrecoverable per the audit); Task 5's deferred symmetric regression test for
 the exact-delete exception branch; the two comment-policy citations audit-t8 named (the
 `writeFile` directive reference; the `stageATransition` comment, which T1(c) deletes anyway); the
 Q-2 ABA-edge sequencing observation; and the 10b sharding-arm `KNOWN` model debt (named in T7's
@@ -393,7 +404,9 @@ T4(8-close) ──────────────────────�
 
 ## 7. Execution discipline {#discipline}
 
-Carried unchanged from Stage-B practice: SDD with per-slice TDD where tests are new (mutation
+Subagent-driven development is MANDATORY for the production tasks (plan tasks T1–T7); every slice
+runs the cycle implementor → specification review → code-quality review → ordinary commit.
+Carried unchanged from Stage-B practice: per-slice TDD where tests are new (mutation
 demonstrations, labelled as such per T3's wording, where tests exist before their evidence);
 ordinary commits, never rebase/amend; build/test logs to unique files under `build/` with
 independent subagent analysis of completed logs; TLC reruns only when the model, invariants,
