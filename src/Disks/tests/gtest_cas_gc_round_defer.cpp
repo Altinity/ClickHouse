@@ -101,7 +101,8 @@ TEST(CasGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
 TEST(CasGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPoolForTest(backend);
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 2});
     const Layout & layout = store->layout();
 
     injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/2,
