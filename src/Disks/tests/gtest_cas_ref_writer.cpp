@@ -984,6 +984,41 @@ TEST(RefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     EXPECT_TRUE(refs.contains("part_1"));
 }
 
+TEST(RefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSameLifeRebirth)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/writer_terminal_gap"};
+
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
+    RefOp remove;
+    remove.kind = RefOpKind::RemoveNamespace;
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        ns.string(), RefTxnId{1, 2}, {std::move(remove)}, std::nullopt});
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{
+        ns.string(), RefTxnId{2, 1}, {namespaceBirthOp()}, std::nullopt});
+    writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, 2},
+    });
+
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    const String next_log_key = layout.refLogKey(life, RefTxnId{2, 2});
+    auto store = openPool(backend);
+    const uint64_t installs_before = store->recoveryInstallCountForTest();
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)store->listRefs(ns); });
+    EXPECT_FALSE(store->refTableRecoveredForTest(ns));
+    EXPECT_EQ(store->recoveryInstallCountForTest(), installs_before);
+
+    EXPECT_ANY_THROW((void)publishEmptyPart(store, ns, "must_not_allocate"));
+    EXPECT_EQ(backend->putCount(next_log_key), 0u)
+        << "an unrecovered malformed life must not allocate the next writer position";
+}
+
 /// Latest snapshot plus tail recovery (spec unit test list): a snapshot covering ref "a", a tail that
 /// drops "a" and publishes "b", and a STALE log at/below the snapshot id that must be ignored (its
 /// content, if replayed, would corrupt the result -- proving the "ignore log keys at or below the

@@ -909,6 +909,10 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 }
                 RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
                 const bool is_seal = refLogTxnIsEpochSeal(txn);
+                const std::optional<RefTxnId> next_committed_id
+                    = sampled_frontier && id <= *sampled_frontier
+                    ? nextRefLogIdWithinCommittedFrontier(id, is_seal, *sampled_frontier)
+                    : std::nullopt;
                 const RefLogTxn frontier_txn = txn;
                 apply_one(std::move(txn), got->bytes.size());
                 if (above_sampled_frontier)
@@ -954,7 +958,13 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                         ++sequence;
                     continue;
                 }
-                if (is_seal)
+                if (next_committed_id)
+                {
+                    epoch = next_committed_id->writer_epoch;
+                    sequence = next_committed_id->ref_sequence;
+                    slot_attempts_this_epoch = 0;
+                }
+                else if (is_seal)
                 {
                     /// This epoch is closed. Its stream cannot continue, so the next durable id of this
                     /// namespace is sequence 1 of the next epoch -- including when that epoch is at or
@@ -972,18 +982,6 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             }
 
             /// ---- Absent. Hole, end of the live stream, or a dead epoch to close ----
-            if (builder.lifecycle() != RefLifecycle::Live && sampled_frontier
-                && epoch < sampled_frontier->writer_epoch)
-            {
-                /// A terminal record closes this epoch without an epoch-seal object. If the exact
-                /// frontier proves that the same catalog life later contains a new birth, advance to
-                /// that epoch's sequence 1; the absent tail of the terminal epoch is not a dense-stream
-                /// hole. An absence in the frontier's own epoch is still corruption below.
-                ++epoch;
-                sequence = 1;
-                slot_attempts_this_epoch = 0;
-                continue;
-            }
             if (sampled_frontier && id <= *sampled_frontier)
             {
                 /// This id belongs to the inclusive committed range. A 404 cannot shorten that range:
