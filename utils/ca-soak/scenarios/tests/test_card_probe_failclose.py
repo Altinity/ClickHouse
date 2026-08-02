@@ -1,4 +1,4 @@
-"""The P0 cards' counter probe must FAIL rather than report a clean zero it never read.
+"""The P0 cards' fail-close probes and opaque-life injection seams.
 
 Codex phase-A finding F4: both cards caught every exception from `events_snapshot` and skipped that
 node, so a probe that failed on every node returned `{counter: 0}` and the "no always-zero counter
@@ -11,9 +11,17 @@ does not — the sneaky one, because the answering node supplies plausible numbe
 answers but omits a requested counter, which would otherwise read as zero.
 """
 
+import inspect
+
 import pytest
 
-from scenarios.cards.s38_late_put_injection import _VIOLATION_EVENTS, _violation_counters
+from scenarios.cards.s38_late_put_injection import (
+    _VIOLATION_EVENTS,
+    _discover_single_life_id,
+    _injected_log_observation,
+    _violation_counters,
+)
+from scenarios.cards.s43_same_uuid_recreation import S43
 
 
 class _Node:
@@ -81,3 +89,57 @@ def test_a_missing_counter_is_not_a_zero():
     cl = _Cluster(_Node("n1", partial))
     with pytest.raises(RuntimeError, match="did not return"):
         _violation_counters(cl, _VIOLATION_EVENTS)
+
+
+class _S3Prefixes:
+    def __init__(self, prefixes):
+        self.prefixes = prefixes
+
+    def list_objects_v2(self, **kwargs):
+        assert kwargs == {
+            "Bucket": "test",
+            "Prefix": "soak_pool/cas/ns/stream/",
+            "Delimiter": "/",
+        }
+        return {"CommonPrefixes": [{"Prefix": prefix} for prefix in self.prefixes]}
+
+
+def test_single_table_life_discovery_accepts_one_direct_opaque_id():
+    life_id = "0123456789abcdef0123456789abcdef"
+    assert _discover_single_life_id(
+        _S3Prefixes([f"soak_pool/cas/ns/stream/{life_id}/"])) == life_id
+
+
+@pytest.mark.parametrize(
+    "prefixes",
+    [
+        [],
+        [
+            "soak_pool/cas/ns/stream/0123456789abcdef0123456789abcdef/",
+            "soak_pool/cas/ns/stream/fedcba9876543210fedcba9876543210/",
+        ],
+        ["soak_pool/cas/ns/stream/not-a-life-id/"],
+        ["soak_pool/cas/ns/stream/0123456789ABCDEF0123456789ABCDEF/"],
+        ["soak_pool/cas/ns/stream/0123456789abcdef0123456789abcdef/_log/"],
+    ],
+)
+def test_single_table_life_discovery_refuses_ambiguous_or_noncanonical_children(prefixes):
+    assert _discover_single_life_id(_S3Prefixes(prefixes)) is None
+
+
+def test_injected_log_observation_records_opaque_life_without_deleted_namespace_local():
+    observation = _injected_log_observation("0123456789abcdef0123456789abcdef", "key", "txn", b"body")
+    assert observation == {
+        "life_id": "0123456789abcdef0123456789abcdef",
+        "key": "key",
+        "txn_id": "txn",
+        "body": "body",
+    }
+
+
+def test_s43_freezes_absence_then_forces_a_write_before_discovering_life2():
+    source = inspect.getsource(S43.run)
+    absence_verdict = source.index('"the recreated table does not absorb the previous life\'s state"')
+    control_insert = source.index(f"INSERT INTO {{_TABLE}} VALUES")
+    life2_discovery = source.index("life2_life_id = _discover_single_life_id(s3)")
+    assert absence_verdict < control_insert < life2_discovery

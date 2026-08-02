@@ -6,9 +6,9 @@ mount was superseded writes under an epoch its successor has already sealed, so 
 conclusively rejected. This one scenario removes that defence on purpose:
 
   * the POOL is recreated over the same prefix, so the epoch counter starts from the beginning again;
-  * the TABLE is recreated with the SAME uuid, so it lands on the same namespace path;
-  * therefore a survivor of the previous life writing at `{1,2}` is NOT writing under a sealed epoch.
-    It is writing at the id that, arithmetically, is the second transaction of the new life.
+  * the TABLE is recreated with the SAME uuid, but the catalog gives it a fresh opaque life id;
+  * therefore a survivor of the previous life writing at `{1,2}` remains under the predecessor's
+    stream and is structurally unreachable from the new life.
 
 What actually defends here is QUIESCE: dropping the table and unmounting the pool stops the writer
 before the prefix is reused, so no such transaction can still be in flight. This card removes that
@@ -35,10 +35,14 @@ The card asserts the safety property in the form that does not depend on WHICH r
      empty — because "refused loudly" and "started clean and ignored it" are both safe, and pinning
      one of them as the only acceptable outcome would make this card fail on a correct change.
 
+With opaque life ids this card no longer claims that an old transaction can alias the recreated
+table's stream: that collision is structurally impossible and the post-bootstrap control below pins
+the two ids as distinct. The adversarial value retained here is the earlier mount boundary — a fresh
+pool must not bootstrap over even one residual old-life object whose catalog no longer exists.
+
 An injected object that is simply never read is the third safe outcome, and it is why (1) is the
-verdict rather than "the query must throw": the walk reads by exact key from the namespace's birth,
-so a body at an id the new life has not reached yet is not on any path until the new life allocates
-that far.
+verdict rather than "the query must throw": the walk is catalog-keyed by opaque life id, so an old-life
+body is not on the new life's path at any sequence.
 """
 
 from soak.cluster import QueryError
@@ -52,7 +56,7 @@ from .s38_late_put_injection import (
     _POOL_PREFIX,
     _REF_LOG_SUFFIX,
     _S3_BUCKET,
-    _discover_table_namespace,
+    _discover_single_life_id,
     _list_keys,
     _render_ref_txn_id,
     _restamp_ref_log_txn,
@@ -64,13 +68,11 @@ _TABLE = "w3_recreated"
 # The CA disk these configs mount (storage_conf_s38_ch{1,2}.xml name the policy's single disk `ca`).
 _DISK = "ca"
 
-# Fixed so the two lives of the table share a namespace path. The whole scenario is that the second
-# life reuses the first life's prefix, which a fresh uuid would quietly avoid.
+# Fixed so the logical table identity is deliberately reused. The catalog must still allocate a
+# distinct opaque physical life id for the second life.
 _UUID = "3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
 
-# The survivor's queued write: sequence 2 of writer epoch 1. In the RECREATED pool that is exactly
-# the id the new life's second transaction would take, which is what makes this the one shape the
-# epoch cannot fence.
+# The survivor's queued write: sequence 2 of writer epoch 1 in the predecessor's opaque stream.
 _SURVIVOR_EPOCH = 1
 _SURVIVOR_SEQ = 2
 
@@ -124,7 +126,7 @@ from .s38_late_put_injection import _violation_counters  # fail-aware; see its d
 @register
 class S43(Scenario):
     name = "S43"
-    title = "same-uuid recreation over a reused prefix: a survivor's write is not absorbed"
+    title = "same-uuid pool recreation refuses a residual survivor write"
     priority = "P0"
     compose_variant = "s38"   # for the published RustFS port; the injection needs direct pool access
     param_table = {
@@ -156,17 +158,17 @@ class S43(Scenario):
                                           "would have nothing recognisable to absorb"))
 
         s3 = _s3_client()
-        ns = _discover_table_namespace(s3, "ca_soak_ch1")
-        result.observations["namespace"] = ns
-        if ns is None or _UUID not in ns:
+        life_id = _discover_single_life_id(s3)
+        result.observations["life_id"] = life_id
+        if life_id is None:
             result.add(Verdict.inconclusive(
-                "the pinned uuid appears in the namespace path",
-                f"a namespace under cas/refs/ca_soak_ch1/ containing {_UUID}",
-                f"discovered ns={ns!r} — cannot demonstrate prefix reuse without it"))
+                "life 1 has one opaque stream",
+                "exactly one canonical 32-hex child under cas/ns/stream/",
+                "the single-table pool did not expose one unambiguous life-id child"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
-        log_prefix = f"{_POOL_PREFIX}/cas/refs/{ns}/_log/"
+        log_prefix = f"{_POOL_PREFIX}/cas/ns/stream/{life_id}/_log/"
         life1_keys = _list_keys(s3, log_prefix)
         if not life1_keys:
             result.add(Verdict.inconclusive(
@@ -294,9 +296,9 @@ class S43(Scenario):
             return
 
         # =====================================================================================
-        # Life 2, as the control: same uuid, same namespace path, on a pool that has now legitimately
-        # bootstrapped over the reused prefix. It must be EMPTY — nothing of life 1 survives, and the
-        # survivor is gone rather than absorbed.
+        # Life 2, as the control: same uuid, fresh opaque life id, on a pool that has now legitimately
+        # bootstrapped over the reused pool prefix. It must be EMPTY — nothing of life 1 survives, and
+        # the survivor is gone rather than absorbed.
         # =====================================================================================
         before = _violation_counters(cl, _VIOLATION_EVENTS)
         create_error = None
@@ -319,6 +321,7 @@ class S43(Scenario):
         result.observations["life2"] = {
             "create_error": create_error, "touch_error": touch_error, "rows": life2_rows,
             "checksum": life2_checksum, "life1_checksum": life1_checksum,
+            "life_id": None, "life1_life_id": life_id,
             "violation_counters": {"before": before, "after": after},
             "outcome": ("create refused" if create_error else
                         "touch refused" if touch_error else
@@ -336,14 +339,57 @@ class S43(Scenario):
             result.observations["life2"]["outcome"], not absorbed,
             "" if not absorbed else
             f"the recreated table returned {life2_rows} row(s) over a reused prefix. A survivor's "
-            f"queued transaction was absorbed into a new life: the epoch could not fence it (the "
-            f"pool's counter was reset) and quiesce was the only defence"))
+            f"queued transaction was absorbed despite the opaque life-id boundary"))
         if life2_checksum is not None:
             result.add(Verdict.check(
                 "life 2's checksum is not life 1's",
                 "the two lives do not agree — they share only a prefix, not a state",
                 f"life1={life1_checksum!r} life2={life2_checksum!r}",
                 life2_checksum != life1_checksum or life1_rows == 0, ""))
+
+        # `CREATE TABLE` and an empty read need not allocate a catalog life: namespace creation is
+        # write-side/lazy. Only after the absence verdict above is frozen do we write one recognizable
+        # control row. That forces a real life-2 stream without letting the control hide absorption.
+        control_id = 0x5A43
+        control_payload = "life2-control"
+        control_error = None
+        control_rows = None
+        life2_rows_after_control = None
+        life2_life_id = None
+        if create_error is None and touch_error is None and life2_rows == 0:
+            try:
+                cl.node1.command(
+                    f"INSERT INTO {_TABLE} VALUES ({control_id}, '{control_payload}')")
+                control_rows = int(cl.node1.scalar(
+                    f"SELECT count() FROM {_TABLE} WHERE id = {control_id} "
+                    f"AND payload = '{control_payload}'") or 0)
+                life2_rows_after_control = int(cl.node1.scalar(f"SELECT count() FROM {_TABLE}") or 0)
+                life2_life_id = _discover_single_life_id(s3)
+            except QueryError as e:
+                control_error = str(e)[:400]
+
+            result.add(Verdict.check(
+                "life 2 contains only the recognizable control row",
+                "the forced write succeeds and exposes exactly one matching row and one total row",
+                {"error": control_error, "matching": control_rows, "total": life2_rows_after_control},
+                control_error is None and control_rows == 1 and life2_rows_after_control == 1,
+                "" if control_error is None and control_rows == 1 and life2_rows_after_control == 1 else
+                "the post-absence control could not establish a clean, recognizable life 2"))
+            result.add(Verdict.check(
+                "same-uuid recreation receives a distinct opaque life id",
+                f"one canonical life id different from predecessor {life_id}",
+                life2_life_id,
+                life2_life_id is not None and life2_life_id != life_id,
+                "" if life2_life_id is not None and life2_life_id != life_id else
+                "the forced life-2 write did not produce an unambiguous fresh physical life"))
+
+        result.observations["life2_control"] = {
+            "error": control_error,
+            "matching_rows": control_rows,
+            "total_rows": life2_rows_after_control,
+            "life_id": life2_life_id,
+        }
+        result.observations["life2"]["life_id"] = life2_life_id
 
         measured = sorted(set(before) & set(after))
         moved = {e: after[e] - before[e] for e in measured if after[e] > before[e]}

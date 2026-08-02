@@ -84,15 +84,12 @@ _HUGE_SEQ = 0xFFFFFFFFFFFFFFFE
 # LATE_PUT_VIOLATION_NOTES), and this card asserts them around the injection specifically.
 _VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CasGcUnappliedFoldedTxns", "CasRefRecoveryStreamHole")
 
-_REF_LEAF_NAMES = {"_log", "_snap", "_cleanup"}
-
-
 def _render_ref_txn_id(writer_epoch: int, ref_sequence: int) -> str:
     """Mirrors `renderRefTxnId` (CasRefIds.h): two 16-digit lowercase hex fields joined by '-'."""
     return f"{writer_epoch:016x}-{ref_sequence:016x}"
 
 
-# `Layout::refLogKey` is `<ns prefix>_log/<render>` + `storedSuffix(FormatId::RefLog)`, and RefLog is
+# `Layout::refLogKey` is `<life stream prefix>_log/<render>` + `storedSuffix(FormatId::RefLog)`, and RefLog is
 # `CompressionPolicy::Always` (`CasFormat.cpp:110`), so every ref-log object's key ends `.zst` and its
 # BODY is zstd. Both facts bit the first run of this card: the listing parsed to zero ids because the
 # suffix broke the id parse, and the body would not have decoded as text either.
@@ -190,23 +187,33 @@ def _list_keys(s3, prefix: str) -> list:
         token = resp.get("NextContinuationToken")
 
 
-# `RootNamespace` is per-SERVER (`server_root_id`, e.g. "ca_soak_ch1"), not per-table: a bare
-# `cas/refs/<server_root_id>/` LIST shows only ONE child, "store/" — the actual per-table namespace
-# nests further, `store/<uuid-shard3>/<uuid>@cas@/`, ending in the `_log`/`_snap`/`_cleanup` siblings.
-# Walk down while each level has exactly one child (true for a single-table pool) until a level's
-# children include one of the three ref-object leaf names; that walked path IS the namespace string
-# `refsNamespacePrefix` expects. Returns None (ambiguous/unexpected shape) rather than guessing.
-def _discover_table_namespace(s3, server_root_id: str, max_depth: int = 8):
-    cur = f"{_POOL_PREFIX}/cas/refs/{server_root_id}/"
-    for _ in range(max_depth):
-        children = _list_common_prefixes(s3, cur)
-        leafs = {c.rstrip("/").rsplit("/", 1)[-1] for c in children}
-        if leafs & _REF_LEAF_NAMES:
-            return cur[len(f"{_POOL_PREFIX}/cas/refs/"):].rstrip("/")
-        if len(children) != 1:
-            return None   # ambiguous (0 or >1 children before reaching a leaf) — never guess
-        cur = children[0]
-    return None
+# S38 and S43 deliberately create one table in an otherwise empty pool. The current layout therefore
+# exposes exactly one DIRECT child under `cas/ns/stream/`: its opaque, canonical 32-hex life id. Do not
+# reconstruct a logical namespace from storage keys; the catalog is the only such mapping. Refuse zero,
+# multiple, malformed, uppercase, or nested children rather than guessing which life the card should
+# inject into.
+def _discover_single_life_id(s3):
+    prefix = f"{_POOL_PREFIX}/cas/ns/stream/"
+    children = _list_common_prefixes(s3, prefix)
+    if len(children) != 1:
+        return None
+    child = children[0]
+    if not child.startswith(prefix) or not child.endswith("/"):
+        return None
+    life_id = child[len(prefix):-1]
+    if len(life_id) != 32 or any(c not in "0123456789abcdef" for c in life_id):
+        return None
+    return life_id
+
+
+def _injected_log_observation(life_id: str, key: str, txn_id: str, body: bytes) -> dict:
+    """Stable report shape for the real post-injection path; storage keys expose a life id, not `ns`."""
+    return {
+        "life_id": life_id,
+        "key": key,
+        "txn_id": txn_id,
+        "body": body.decode(errors="replace"),
+    }
 
 
 def _text_log_count(node, since: str, needle: str) -> int:
@@ -380,17 +387,17 @@ class S38(Scenario):
             return
 
         s3 = _s3_client()
-        ns = _discover_table_namespace(s3, "ca_soak_ch1")
-        result.observations["discovered_namespace"] = ns
-        if ns is None:
+        life_id = _discover_single_life_id(s3)
+        result.observations["discovered_life_id"] = life_id
+        if life_id is None:
             result.add(Verdict.inconclusive(
-                "namespace discovered for injection",
-                "a walk from cas/refs/ca_soak_ch1/ reaches a _log/_snap/_cleanup leaf",
-                "namespace walk did not resolve to an unambiguous single leaf"))
+                "opaque life id discovered for injection",
+                "exactly one canonical 32-hex child under cas/ns/stream/",
+                "the single-table pool did not expose one unambiguous life-id child"))
             _common.standard_end(ctx, result, [_TABLE])
             return
 
-        log_prefix = f"{_POOL_PREFIX}/cas/refs/{ns}/_log/"
+        log_prefix = f"{_POOL_PREFIX}/cas/ns/stream/{life_id}/_log/"
         ids = [i for i in (_parse_ref_txn_id(k[len(log_prefix):]) for k in _list_keys(s3, log_prefix))
                if i is not None]
         epochs = sorted({e for e, _ in ids})
@@ -476,9 +483,8 @@ class S38(Scenario):
         ctx.log(f"S38: injecting a late dead-epoch log ABOVE the seal at "
                 f"s3://{_S3_BUCKET}/{injected_key} ({len(injected_body)} bytes)")
         s3.put_object(Bucket=_S3_BUCKET, Key=injected_key, Body=injected_body)
-        result.observations["injected_log"] = {
-            "ns": ns, "key": injected_key, "txn_id": injected_id,
-            "body": injected_body.decode(errors="replace")}
+        result.observations["injected_log"] = _injected_log_observation(
+            life_id, injected_key, injected_id, injected_body)
 
         since_inject = cl.node1.scalar("SELECT toString(now())")
         violations_before = _violation_counters(cl, _VIOLATION_EVENTS)

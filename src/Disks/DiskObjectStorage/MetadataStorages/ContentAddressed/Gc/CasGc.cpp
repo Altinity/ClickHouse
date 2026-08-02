@@ -2540,8 +2540,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             for (const auto & [mid, tok] : log_mf_cleanup)
                 result.mf_cleanup.emplace(mid, tok);
 
-            /// A fully-folded remove_namespace transaction hands its {ns, remove_txn_id} to the
-            /// namespace-cleanup item; its owner-removal edges were folded above.
+            /// A fully-folded `remove_namespace` transaction hands its `{ns, remove_txn_id}` to the
+            /// life row's cleanup evidence; its owner-removal edges were folded above.
             if (const auto removal = removalTxnId(txn))
                 new_removals.emplace_back(ns, *removal);
             if (!segment_first)

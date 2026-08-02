@@ -17,8 +17,8 @@ S06 proves a very wide part stays under the manifest hard cap (or fails early wi
 and that a column-subset read does not fetch every blob. S07 is a negative card that makes a
 best-effort attempt to trip a cap and, when the cap is not reachable at feasible dev SQL scale, still
 verifies the fail-closed PROPERTY (no live ref on a rejected manifest, clean pool). S08 creates many
-small parts fast and checks per-table ref-object CAS contention stays bounded (refs now live as
-per-table `_log`/`_snap` objects under `cas/refs/<ns>/`, not a fixed-fanout `root_shards` shard set).
+small parts fast and checks per-life ref-object CAS contention stays bounded (refs now live as
+`_log`/`_snap` objects under `cas/ns/stream/<life-id>/`, not a fixed-fanout `root_shards` shard set).
 """
 
 import time
@@ -38,8 +38,8 @@ K_MAX_MANIFEST_INLINE_TOTAL = 16 * MIB
 K_MAX_LARGEST_INLINE_ENTRY = 1 * MIB
 
 # `root_shards` (a small, config-bounded root-manifest shard fan-out) was removed: refs for a table
-# now live as one `_log` object per ref-publish CAS plus occasional `_snap`/`_cleanup` objects
-# (`CasLayout.h::refLogKey`/`refSnapshotKey`, under `cas/refs/<ns>/`), so the live ref-object count
+# now live as one `_log` object per ref-publish CAS plus occasional `_snap` objects
+# (`CasLayout.h::refLogKey`/`refSnapshotKey`, under `cas/ns/stream/<life-id>/`), so the live ref-object count
 # scales with the number of ref-publish operations rather than a fixed shard count. There is no tight
 # a-priori bound any more, so S08 checks only a generous per-insert sanity ceiling below (catches a
 # runaway/leak, not a small architectural fan-out limit).
@@ -70,7 +70,7 @@ def _wide_select(n_cols, *, rows, base=0):
 
 def _manifests_shape():
     """Best-effort {_manifests:{objects,bytes}, refs:{objects,bytes}, _ok} from the pool shape.
-    `refs` is the live per-table ref-object subtree (`cas/refs/<ns>/_log|_snap|_cleanup/`); the old
+    `refs` is the live per-table immutable ref-stream subtree (`_log|_snap`); the old
     `roots` bucket (bare top-level `roots/<srid>/`) is a mount-safety precondition subtree only,
     not where ref data lives, since the `root_shards` shard-fanout placement was removed."""
     shape = observe.pool_shape(timeout_s=120)
@@ -470,7 +470,7 @@ class S08(Scenario):
 
         # Ref-object pool shape at peak — must not exceed the manifest hard caps. `root_shards`
         # placement (a small, config-bounded root-manifest shard fan-out) is gone; a table's ref
-        # objects now live under `cas/refs/<ns>/` (pool_shape "refs" bucket), growing with the number
+        # objects now live under `cas/ns/stream/<life-id>/` (pool_shape "refs" bucket), growing with the number
         # of ref-publish operations rather than a fixed shard count — see the module-level comment on
         # `REF_OBJECTS_SANITY_MULTIPLIER`.
         peak_shape = _manifests_shape()
@@ -493,7 +493,7 @@ class S08(Scenario):
                 ref_objs, ref_objs <= sanity_bound,
                 "" if ref_objs <= sanity_bound else f"far more ref objects ({ref_objs}) than the sanity "
                                                     f"bound ({sanity_bound}) for {n_parts} inserts — "
-                                                    "possible ref-object leak under cas/refs/<ns>/"))
+                                                    "possible ref-object leak under cas/ns/stream/<life-id>/"))
             result.add(Verdict.check(
                 "ref-object body under manifest hard cap (generous sanity bound)",
                 f"mean ref-object body < {K_MAX_MANIFEST_ENCODED_BYTES/MIB:.0f} MiB",

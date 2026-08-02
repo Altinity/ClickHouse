@@ -632,7 +632,7 @@ std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn);
 
 /// The `remove_txn_id` of a transaction that ends its namespace's life (contains a `remove_namespace`
 /// operation), or `nullopt`. The value equals `txn.txn_id`. The round routes it into the durable
-/// `{namespace, remove_txn_id}` namespace-cleanup item.
+/// cleanup evidence of that life's fold-state row.
 std::optional<RefTxnId> removalTxnId(const RefLogTxn & txn);
 
 /// One table's surviving ref-object keys from this round's global `LIST`, split by kind and sorted

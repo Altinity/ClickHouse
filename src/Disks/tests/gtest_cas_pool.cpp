@@ -1069,8 +1069,8 @@ TEST(CasPool, UpdateRefPublishedAtUpdatesPublishedAtMs)
 }
 
 /// Task 11: dropNamespace removes every owner through the ref-log `remove_namespace` transaction and
-/// performs NO physical deletion at all -- verbatim files survive until GC's namespace-cleanup item
-/// (Task 12) reclaims the whole `@cas@` namespace. So after the drop every ref resolves away and
+/// performs NO physical deletion at all -- verbatim files survive until GC's perpetual janitor
+/// reclaims the dead life. So after the drop every ref resolves away and
 /// `listRefs` is empty, but the verbatim files remain readable.
 TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
 {
@@ -1093,8 +1093,8 @@ TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
         EXPECT_FALSE(s->resolveRef(ns, name).has_value());
     EXPECT_TRUE(s->listRefs(ns).empty());
 
-    /// Task 11: the writer performs NO physical deletion; verbatim files survive until Task 12's
-    /// namespace-cleanup item reclaims the whole @cas@ namespace.
+    /// The writer performs NO physical deletion; verbatim files survive until the perpetual janitor
+    /// reclaims the dead life.
     EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "format_version.txt").has_value());
     EXPECT_TRUE(s->getNamespaceFile(NamespaceLifeId::stageATransition(ns), "uuid.txt").has_value());
 

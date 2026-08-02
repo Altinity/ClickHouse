@@ -79,18 +79,18 @@ objects in the bucket.
 
 This is worth stating precisely because it is the first question a reviewer asks.
 
-- Each server owns its own **ref namespace** (`cas/refs/<server_root_id>/…`) and writes only to
-  objects under it.
+- Each server owns the catalog rows whose logical names begin with its `server_root_id`; each row
+  maps that name to an opaque `life_id`, and the server writes only that life's stream/state objects.
 - The **shared** resource is the `blobs/` content space, which is addressed purely by content hash
   and is therefore write-once and conflict-free by construction — two servers writing the same
   content write the same key with the same bytes.
 - The only mutual exclusion required for correctness is a **conditional write** on a single object
   (create-if-absent / compare-and-swap on token).
 
-That is a shared-nothing design. It is explicitly *not* a globally mutable shared catalog with
-serializable multi-writer access (the SharedMergeTree model). There is no coordinator, no
-metadata service, and — verified by grep over the whole CAS tree — **no ZooKeeper/Keeper usage
-at all** inside the pool protocol. (The class named `MountLeaseKeeper` in
+That is a shared-nothing data plane with a compact, token-CAS namespace catalog — not a coordinator
+or a serializable metadata service in the `SharedMergeTree` model. There is no external coordinator,
+and — verified by grep over the whole CAS tree — **no ZooKeeper/Keeper usage at all** inside the pool
+protocol. (The class named `MountLeaseKeeper` in
 `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h:64` is a
 lease renewer, not a Keeper client.) Keeper remains involved only where
 `ReplicatedMergeTree` already used it, for replication log and part-set consensus.
@@ -126,7 +126,7 @@ these four.
 ```mermaid
 graph TD
     subgraph MUT["Mutable — exactly one kind"]
-        R["<b>Ref state</b><br/>part name → manifest id<br/>published as an append-only<br/>log + periodic snapshots<br/><code>cas/refs/&lt;srid&gt;/&lt;ns&gt;/…</code>"]
+        R["<b>Ref state</b><br/>part name → manifest id<br/>published as an append-only<br/>log + periodic snapshots<br/><code>cas/ns/stream/&lt;life-id&gt;/…</code>"]
     end
     subgraph IMM["Immutable — write-once, never rewritten"]
         M["<b>Part manifest</b><br/>the complete file list of one part<br/><code>cas/manifests/&lt;srid&gt;/&lt;ns&gt;/&lt;build&gt;/&lt;ord&gt;.zst</code>"]
@@ -545,9 +545,9 @@ exactly one field, the pool prefix. Reviewing key construction means reviewing t
 | **Blob body** | `<prefix>/blobs/<algo>/<hex[0:2]>/<hex>` | `blobKey(ref)` `CasLayout.cpp:34-37` |
 | **Blob meta** (condemnation marker) | `<blobKey>.meta` | `blobMetaKey(ref)` `CasLayout.cpp:39-42` |
 | **Part manifest** | `<prefix>/cas/manifests/<ns>/<epoch-hex>-<buildseq-hex>/<NNNNNN>.zst` | `manifestKey(id)` `CasLayout.h:205-211` |
-| **Ref log** (one transaction) | `<prefix>/cas/refs/<ns>/_log/<epoch-hex>-<seq-hex>.zst` | `refLogKey` `CasLayout.h:130-133` |
-| **Ref snapshot** | `<prefix>/cas/refs/<ns>/_snap/<epoch-hex>-<seq-hex>.zst` | `refSnapshotKey` `CasLayout.h:138-141` |
-| Ref cleanup marker (0 bytes) | `<prefix>/cas/refs/<ns>/_cleanup/<epoch-hex>-<seq-hex>` | `refCleanupMarkerKey` `CasLayout.h:145-148` |
+| **Ref log** (one transaction) | `<prefix>/cas/ns/stream/<life-id>/_log/<epoch-hex>-<seq-hex>.zst` | `refLogKey` |
+| **Ref snapshot** | `<prefix>/cas/ns/stream/<life-id>/_snap/<epoch-hex>-<seq-hex>.zst` | `refSnapshotKey` |
+| Namespace checkpoint | `<prefix>/cas/ns/state/<life-id>/_ckpt.zst` | `refCkptKey` |
 | Server-root owner | `<prefix>/gc/server-roots/<srid>/owner` | `ownerKey` `CasLayout.h:333-337` |
 | Server-root epoch | `<prefix>/gc/server-roots/<srid>/epoch` | `epochKey` `CasLayout.h:339-343` |
 | Mount lease | `<prefix>/gc/server-roots/<srid>/mount` | `mountKey` `CasLayout.h:345-349` |
@@ -556,7 +556,7 @@ exactly one field, the pool prefix. Reviewing key construction means reviewing t
 | Fold seal | `<prefix>/gc/gen/<gen>/attempt/<att>/fold_seal` | `foldSealKey` `CasLayout.h:263-267` |
 | Source-edge run segment | `<prefix>/gc/gen/<gen>/attempt/<att>/blob_target/<shard>/<seq>` | `blobTargetRunKey` `CasLayout.h:270-275` |
 | GC outcome log | `<prefix>/gc/gen/<gen>/attempt/<att>/outcomes/<round>/<shard>.zst` | `outcomesKey` `CasLayout.h:290-294` |
-| Verbatim namespace file | `<prefix>/roots/<ns>/_files/<name>` | `namespaceFileKey` `CasLayout.h:179-189` |
+| Verbatim namespace file | `<prefix>/cas/ns/state/<life-id>/_files/<name>` | `namespaceFileKey` |
 | Loose mountpoint object | `<prefix>/roots/<key>` | `mountpointObjectKey` `CasLayout.h:229-235` |
 | S3 staging scratch | `<prefix>/staging/<srid>/…` | `CasLayout.h:308-314` |
 | Capability probe scratch | `<prefix>/_probe/<u128hex>/{token,cas}` | `Backend/CasProbe.cpp:15-22` |
@@ -576,7 +576,7 @@ algorithms, 32 for SHA-256).
    of its digest, read big-endian explicitly so a little-endian host can never silently reshard
    (`Gc/CasGcShardPlan.h:19-45`).
 
-Prefixes used for discovery LISTs: `cas/refs/`, `cas/manifests/`, `blobs/` (deliberately without
+Prefixes used for discovery LISTs: `cas/ns/stream/`, `cas/ns/`, `cas/manifests/`, `blobs/` (deliberately without
 the algorithm segment, so one recursive LIST covers every algorithm), `roots/`,
 `gc/server-roots/`. Note `staging/` is a top-level sibling that **no GC LIST ever touches** — it
 is reclaimed only by its own server's next mount.
@@ -589,8 +589,9 @@ column file and one small inline file, written at `writer_epoch = 1, sequence = 
 ```
 ca-pool/_pool_meta
 
-ca-pool/cas/refs/srv1/store/3f2/3f2a1b7c-…-abcdefabcdef@cas@/_log/0000000000000001-0000000000000003.zst
-ca-pool/cas/refs/srv1/store/3f2/3f2a1b7c-…-abcdefabcdef@cas@/_snap/0000000000000001-0000000000000003.zst
+ca-pool/cas/ns/stream/0123456789abcdef0123456789abcdef/_log/0000000000000001-0000000000000003.zst
+ca-pool/cas/ns/stream/0123456789abcdef0123456789abcdef/_snap/0000000000000001-0000000000000003.zst
+ca-pool/cas/ns/state/0123456789abcdef0123456789abcdef/_ckpt.zst
 
 ca-pool/cas/manifests/srv1/store/3f2/3f2a1b7c-…-abcdefabcdef@cas@/0000000000000001-0000000000000003/000001.zst
 
@@ -718,10 +719,11 @@ scale with pool size.
 
 1. **Parse** → `table_uuid = 3f2a1b7c-…`, `part_name = all_1_1_0`, `file = data.bin`.
 2. **Route** → `ns = srv1/store/3f2/3f2a1b7c-…@cas@`, `ref = all_1_1_0`, `file = data.bin`.
-3. **Ref log** → `ca-pool/cas/refs/srv1/store/3f2/3f2a1b7c-…@cas@/_log/0000000000000001-0000000000000003.zst`
-4. **Manifest** → `ca-pool/cas/manifests/srv1/store/3f2/3f2a1b7c-…@cas@/0000000000000001-0000000000000003/000001.zst`
-5. **Entry** `data.bin` → `placement = Blob`, `ref = {XXH3_128, a1b2…1728}`
-6. **Blob** → `ca-pool/blobs/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728`
+3. **Catalog** → `ns` maps to opaque `life_id = 0123456789abcdef0123456789abcdef`.
+4. **Ref log** → `ca-pool/cas/ns/stream/0123456789abcdef0123456789abcdef/_log/0000000000000001-0000000000000003.zst`
+5. **Manifest** → `ca-pool/cas/manifests/srv1/store/3f2/3f2a1b7c-…@cas@/0000000000000001-0000000000000003/000001.zst`
+6. **Entry** `data.bin` → `placement = Blob`, `ref = {XXH3_128, a1b2…1728}`
+7. **Blob** → `ca-pool/blobs/xxh3/a1/a1b2c3d4e5f60708b1c2d3e4f5061728`
 
 ---
 
@@ -915,9 +917,10 @@ is validated and immutable, and it is deliberately **not** derived from `ServerU
 ≤ 255 bytes, no empty / `.` / `..` segment, no `_files` or `_manifests` segment, fail-closed
 `BAD_ARGUMENTS` with no sanitising fallback).
 
-It roots four subtrees — `gc/server-roots/<srid>/`, `roots/<srid>/`, `cas/refs/<srid>/`,
-`cas/manifests/<srid>/` — plus `staging/<srid>/`. Note that `blobs/` is **not** under it: content
-is pool-global, which is what makes cross-server dedup work.
+It roots `gc/server-roots/<srid>/`, `roots/<srid>/`, `cas/manifests/<srid>/` and
+`staging/<srid>/`, and owns catalog names equal to or below `<srid>`. Namespace stream/state keys
+are deliberately opaque and do not embed the server root. Note that `blobs/` is **not** under it:
+content is pool-global, which is what makes cross-server dedup work.
 
 ### 8.2 The owner claim {#owner-claim}
 
@@ -932,9 +935,10 @@ is pool-global, which is what makes cross-server dedup work.
 | owner absent **but** subtree non-empty | `CORRUPTED_DATA` — "identity lost over existing data" |
 | lost the `putIfAbsent` race | re-read; equal uuid ⇒ proceed, else `CORRUPTED_DATA` |
 
-"Provably empty" means a 1-key LIST returns nothing on **all three** of `cas/refs/<srid>/`,
-`cas/manifests/<srid>/`, `roots/<srid>/`. The owner object is never deleted and never reassigned;
-decommission tombstones it in place.
+"Provably empty" means an authoritative decoded catalog names no life owned by `srid`, and 1-key
+LIST probes find nothing under either `cas/manifests/<srid>/` or `roots/<srid>/`. Opaque dead-life
+debris under `cas/ns/` alone cannot identify a logical owner. The owner object is never deleted and
+never reassigned; decommission tombstones it in place.
 
 A **second server with a different uuid** is refused at two independent gates and can never take
 over, regardless of lease expiry. A **same-uuid live twin** (two processes sharing one uuid file
@@ -996,9 +1000,11 @@ Control plane — exactly three objects per server root:
 | `gc/server-roots/<srid>/epoch` | durable-monotone **next** `writer_epoch` | CAS-bumped on every writable mount and remount |
 | `gc/server-roots/<srid>/mount` | liveness lease **+** `min_active` watermark | claimed at mount, `putOverwrite` every beat, `gc_fenced` by GC, terminal farewell on clean stop |
 
-Data plane rooted at the srid: ref logs, ref snapshots and cleanup markers under
-`cas/refs/<srid>/<ns>/`; part manifests under `cas/manifests/<srid>/<ns>/<build>/`; verbatim files
-under `roots/<srid>/…`; and S3 staging under `staging/<srid>/`, which is excluded from every GC
+Logical ownership is rooted at the srid, but ref and namespace-file keys do not encode that logical
+name. The catalog maps each namespace to an opaque physical life id; immutable logs and snapshots live
+under `cas/ns/stream/<life-id>/`, while checkpoints and verbatim files live under
+`cas/ns/state/<life-id>/`. Part manifests remain under
+`cas/manifests/<srid>/<ns>/<build>/`; S3 staging remains under `staging/<srid>/`, outside every GC
 LIST and reclaimed solely by that same server's next mount.
 
 ### 8.6 The two monotone counters {#counters}
@@ -1300,13 +1306,15 @@ table is quiescent, unreferenced, leaderless and **not wedged**.
 
 ### 10.3 In S3 {#in-s3}
 
-Three immutable object kinds under `cas/refs/<ns>/`:
+Two immutable object kinds under `cas/ns/stream/<life-id>/`:
 
 | Kind | Key | Content |
 |---|---|---|
 | log | `…/_log/<epoch-hex>-<seq-hex>.zst` | exactly **one** transaction: `{ns, txn_id, ops[]}` |
-| snapshot | `…/_snap/<epoch-hex>-<seq-hex>.zst` | the whole table: lifecycle, sorted committed rows + precommits |
-| cleanup marker | `…/_cleanup/<epoch-hex>-<seq-hex>` | zero bytes — GC's proof that a namespace removal physically completed |
+| snapshot | `…/_snap/<epoch-hex>-<seq-hex>.zst` | one live table image: sorted committed rows + precommits |
+
+Mutable/path-addressed state is separate under `cas/ns/state/<life-id>/`: `_ckpt.zst` and
+`_files/<relative-name>`. None of these object families is a namespace-removal completion marker.
 
 `RefTxnId = {writer_epoch, ref_sequence}` is rendered as two fixed-width 16-hex fields, so
 **lexical key order equals tuple order**. Ids are **per-namespace and contiguous** (INV-1): within one
@@ -1377,8 +1385,8 @@ mount's recovery replays it. Between `promote`'s log and its caller, re-driving 
 
 Recovery is lazy per table, on first touch (`Pool/CasRefLedger.cpp:394-736`):
 
-1. One paginated LIST of `cas/refs/<ns>/`; every key is strictly re-parsed and re-matched against
-   the namespace (untrusted input).
+1. One paginated LIST of `cas/ns/stream/<life-id>/`; every key is strictly re-parsed and re-matched
+   against the catalog-resolved life and namespace carried in the object body (untrusted input).
 2. Take the **greatest** snapshot; GET and decode with key↔body binding validation.
 3. Stream every log strictly greater than it through a replay builder — GET, decode, apply,
    discard, one transaction resident at a time.
@@ -1416,16 +1424,19 @@ through the precommit set, never through `resolveRef`.
 
 ### 10.6 How GC sees the live set {#gc-sees-refs}
 
-GC never queries the ledger. Per round it LISTs `cas/refs/`, groups keys by table, and GETs every
-log above the durable per-table cursor in ascending order, extracting manifest edges (§9.5). The
-cursor advances per **fully folded** log. A missing manifest body clamps that table below the log;
-an undecodable body or an unrecognised transition shape aborts ref folding for the whole round.
+GC never queries the ledger. Per round it LISTs `cas/ns/stream/`, joins the listed opaque life ids
+against one catalog cut, and builds the only ref walk plan. It GETs every admitted log above the
+adopted life row's coverage in ascending order, extracting manifest edges (§9.5). Coverage advances
+per **fully folded** log. A missing manifest body clamps that life below the log; an undecodable body
+or an unrecognised transition shape holds only that life below the log while other lives continue.
+Any such hold suppresses destructive actions pool-wide for that round.
 
-**Namespace removal** is a two-party handshake worth tracing in review: the writer appends the exact
-removals plus `RemoveNamespace` and best-effort publishes a constant-size `Removed` snapshot — and
-deletes nothing. GC then drains the namespace physically, publishes the zero-byte `_cleanup/<id>`
-marker, and republishes the `Removed` snapshot if absent. That marker is the **exact** precondition
-the writer's `precommitAdd` requires before it may re-birth the namespace.
+**Namespace removal** has no physical-empty handshake. The writer changes the catalog row from
+`Live` to `Removing`, appends the exact removals plus `RemoveNamespace`, and deletes nothing.
+The fold attaches cleanup evidence to that opaque life row. A later invocation's pre-fold drain
+exact-CAS-deletes the matching `Removing` catalog row before any successor plan can be published.
+The perpetual namespace janitor and orphan-manifest sweep reclaim physical debris independently;
+same-name birth waits only for the catalog row to disappear.
 
 ---
 
@@ -1488,9 +1499,10 @@ HEAD**. Both `DefiniteFailure` and `Unresolved` throw retry-later.
 
 **Step 2 — `precommitAdd`.** The intent (target namespace, final ref name, manifest) is recorded
 **before** the append, precisely because an unresolved append may have landed. One ref-log
-transaction adds the precommit binding. Re-birthing a `Removed` namespace additionally requires
-this mount to have *observed* the exact `_cleanup/<remove_txn_id>` marker (§10.6). On return the
-precommit is durable — and only now may the writer adopt existing blobs.
+transaction adds the precommit binding. A same-name birth is refused with retry-later while the
+catalog still says `Removing`; once the predecessor row is absent, creation receives a new opaque
+life id and starts its own stream. On return the precommit is durable — and only now may the writer
+adopt existing blobs.
 
 **Step 3 — blob upload fan-out.** One task per **unique** `BlobRef`, deterministic dispatch order,
 one pre-sized result slot per ref. The calling thread only submits and joins, never occupies a pool
@@ -1714,37 +1726,41 @@ deserves scrutiny in review.
 
 ```mermaid
 flowchart TD
-    P1["1 lease — acquire / renew / steal"] --> P2["2 heartbeat_floor — LIST mounts, fence the provably dead"]
-    P2 --> P3{"3 defer_decision"}
-    P3 -->|"nothing changed and no graduation due"| DEF["<b>DEFER — early return</b><br/>no fold, no delete, NO CAS"]
-    P3 --> P4["4 parent_seal_read"]
-    P4 --> P5["5 fold_ref_list — LIST cas/refs/, group by table, probe A"]
-    P5 --> P6["6 fold_seal_read — parent cursors"]
-    P6 --> P7["7 fold_ref_intake — GET each new ref log,<br/>HEAD+GET each manifest edge → BlobDeltas"]
-    P7 --> P8["8 fold_ns_cleanup_scan"]
-    P8 --> P9["9 fold_reduce — the merge: spare / graduate / condemn / redelete"]
-    P9 --> P10["10 fold_seal_write — write-once deterministic seal"]
-    P10 --> P11["11 pending_deletes — <b>THE single content-delete site</b><br/>deleteExact of last round's delete_pending"]
-    P11 --> P12["12 meta_pool_wait — drain condemn-marker writes"]
-    P12 --> P13["13 round_commit — prune, then <b>THE single gc/state CAS</b>"]
-    P13 --> P14["14 handoff_reclaim (post-CAS)"]
-    P14 --> P15["15 manifest_deletes — bodies whose −1 the CAS just adopted"]
-    P15 --> P16["16 namespace_cleanup"]
-    P16 --> P17["17 ref_object_cleanup — prune covered logs and superseded snapshots"]
-    P17 --> P18["18 orphan_sweep — one cursor page (never fails the round)"]
+    P1["1 lease — acquire / renew / steal"] --> P2["2 pre_fold_ref_drain — resolve adopted removal evidence"]
+    P2 --> P3["3 heartbeat_floor — LIST mounts, fence the provably dead"]
+    P3 --> P4{"4 defer_decision — LIST stream and build catalog-keyed plan"}
+    P4 -->|"nothing changed and no graduation due"| DEF["<b>DEFER — early return</b><br/>suppressed janitor page, no fold, no gc/state CAS"]
+    P4 --> P5["5 ref_list_probe — sampled quality check"]
+    P5 --> P6["6 parent_seal_read"]
+    P6 --> P7["7 fold_ref_group"]
+    P7 --> P8["8 fold_seal_read — adopted life rows"]
+    P8 --> P9["9 fold_ref_intake — GET each new ref log,<br/>GET each manifest edge → BlobDeltas"]
+    P9 --> P10["10 fold_reduce — the merge: spare / graduate / condemn / redelete"]
+    P10 --> P11["11 fold_seal_write — write-once deterministic seal"]
+    P11 --> P12["12 pending_deletes — <b>THE single content-delete site</b><br/>deleteExact of last round's delete_pending"]
+    P12 --> P13["13 meta_pool_wait — drain condemn-marker writes"]
+    P13 --> P14["14 round_commit — prune, then <b>THE single gc/state CAS</b>"]
+    P14 --> P15["15 handoff_reclaim (post-CAS)"]
+    P15 --> P16["16 manifest_deletes — bodies whose −1 the CAS just adopted"]
+    P16 --> P17["17 namespace_cleanup — one perpetual-janitor page"]
+    P17 --> P18["18 ref_object_cleanup — prune covered current-life logs and snapshots"]
+    P18 --> P19["19 orphan_sweep — one cursor page (never fails the round)"]
 ```
 
 Orderings that are load-bearing and should be checked in review:
 
-- **16 before 17**: the `Removed` snapshot must be durable before the logs it covers are deleted.
-- **15 after 13**: manifest bodies are deleted only after the CAS adopted their decrements.
-- **13's prune before the CAS**: a pre-CAS destructive action may rely only on already-published
+- **2 before 4**: a row proved complete by the adopted parent is resolved before DEFER or any
+  successor plan/artifact can publish.
+- **16 after 14**: manifest bodies are deleted only after the CAS adopted their decrements.
+- **14's prune before the CAS**: a pre-CAS destructive action may rely only on already-published
   state.
 
-**Clamp suppression.** `suppress_destructive = !anomalies.empty()` is computed **once** and threaded
-into the merge, the ref cleanup and the namespace cleanup so they cannot desynchronise. Under
-suppression there is no graduation, no redelete and no ref or namespace deletion; condemnation and
-sparing continue, because both are non-destructive.
+**Clamp suppression.** `suppress_destructive = !anomalies.empty() || !carried_holds.empty() ||
+!frontier_complete` is computed **once** and threaded into the merge, current-life ref cleanup and
+the perpetual namespace janitor so they cannot desynchronise. A dropped parent life row is diagnostic
+only and deliberately does not suppress valid same-round deletion. Under suppression there is no
+graduation, no redelete and no ref or namespace deletion; condemnation and sparing continue, because
+both are non-destructive.
 
 **Fail-closed aborts** (a throw before the CAS means nothing is adopted): unapplied transactions,
 cursor/apply inequality, a missing adopted seal, a table with a snapshot but no surviving log and no
@@ -1753,15 +1769,16 @@ is on).
 
 ### 13.3 The one-pass commit and what persists between rounds {#gc-state}
 
-`gc/state` is the **entire** durable GC control state: `round`, `gc_shards`, `snap_generation`,
+`gc/state` is the durable safety and round-adoption state: `round`, `gc_shards`, `snap_generation`,
 `snap_pruned_through`, `snap_attempt`, `manifest_sweep_cursor`, and the lease. Exactly one CAS per
-round publishes it; the fold itself no longer CASes.
+round publishes it; the fold itself no longer CASes. Leak-only janitor progress is independently
+durable in `gc/maintenance_state` and never participates in round adoption.
 
 **The fold seal *is* the coverage record** (`Formats/CasFoldSealFormat.h:84-102`): generation,
-parent generation, per-namespace-shard coverage with the last folded ref id, references to the
-source-edge run segments, a per-shard condemned summary, and namespace-cleanup items. It is encoded
-deterministically, so a replayed round produces byte-identical bytes and adopts its own output
-(§7.5).
+parent generation, one `ref_lives` row per catalog-admitted opaque life (coverage plus optional
+cleanup evidence), references to the source-edge run segments, and a per-shard condemned summary.
+It is encoded deterministically, so a replayed round produces byte-identical bytes and adopts its
+own output (§7.5).
 
 Two things reviewers often expect and will not find:
 
@@ -1778,8 +1795,8 @@ not persisted and is conservative when lost.
 
 ### 13.4 Finding orphans {#gc-orphans}
 
-**In-degree is a set of source edges, not a refcount** (§9.5). Universe discovery is a LIST of
-`cas/refs/` — there is no registry object any more.
+**In-degree is a set of source edges, not a refcount** (§9.5). Stream discovery is a LIST of
+`cas/ns/stream/`; the catalog cut is the authority that admits opaque life ids to the walk plan.
 
 A blob becomes a candidate when its edge set becomes empty and it was touched this pass: one HEAD
 captures the **exact incarnation token and size** that a future delete will name. A blob merely
@@ -1851,16 +1868,12 @@ A shard with an empty delta bucket **and** no condemned entries in the parent su
 parent's run references verbatim — **zero run I/O** ("pure carry"). A missing parent summary entry
 on a non-fresh pool is `CORRUPTED_DATA`, never silently treated as zero.
 
-> **Doc drift:** `04-gc-protocol.md:683` still lists `Gc::reclaimDroppedShards`. It no longer exists
-> — with the snapshot+log ref model there is no mutable per-namespace shard object to tombstone, and
-> physical namespace reclamation is the namespace-cleanup item instead.
-
 ### 13.7 Pruning old objects {#gc-pruning}
 
-- **Ref logs and snapshots** (phase 17): a log is deletable only when it is covered by **both** the
-  durable fold cursor **and** a durable snapshot; snapshots strictly older than the newest observed
-  one are deletable. A `remove_namespace` log is retained until its cleanup item completes. There is
-  no batch delete, so it is HEAD + `deleteExact` per key.
+- **Current-life ref logs and snapshots** (phase 18): a log is deletable only when it is covered by
+  **both** durable fold coverage and a durable live snapshot; snapshots strictly older than the
+  newest observed one are deletable. Dead-life stream/state objects are instead ordinary work for
+  the perpetual namespace janitor. There is no batch delete, so it is HEAD + `deleteExact` per key.
 - **Generations** (phase 13): keep the last `gc_snap_generations_to_keep` (default 3; 0 means keep
   everything, for forensics). Pruning is wholesale — LIST the generation prefix and delete
   everything under it, including deposed-leader debris and attempt-scoped outcome sets. Bounded to
@@ -1876,11 +1889,11 @@ Per **folding** round, with `N` live mounts, `S` ref tables and `S_changed` tabl
 
 | Operation | Count | Note |
 |---|---|---|
-| LIST `cas/refs/` | **1 full enumeration** | performed in `defer_decision` and *retained* for `fold_ref_list`. The store-quality detector ("probe A") adds a second enumeration, but only on sampled rounds — `gc_probe_a_period`, default every 16th |
+| LIST `cas/ns/stream/` | **1 full enumeration** | performed in `defer_decision` and retained for `fold_ref_group`. The store-quality detector ("probe A") adds a second enumeration, but only on sampled rounds — `gc_probe_a_period`, default every 16th |
 | LIST `gc/server-roots/` | 1 | plus 1 GET per mount |
 | GET the adopted fold seal | **5** | explicitly instrumented, not yet optimised |
 | GET ref logs | 1 per new log | |
-| HEAD + GET manifests | **1 + 1 per emitted edge** | there is no manifest-body cache *within* a round |
+| GET manifests | **1 per emitted edge** | there is no manifest-body cache *within* a round |
 | PUT run segments | 1 per non-pure-carry shard | plus 1 fold seal |
 | HEAD blobs | 1 per newly condemned | |
 | DELETE | 1 per graduate | free of charge on S3 |
@@ -1888,11 +1901,12 @@ Per **folding** round, with `N` live mounts, `S` ref tables and `S_changed` tabl
 
 The measured GET formula is exact: `S3GetObject = ref-log body GETs + manifest body GETs`, on every
 sampled row. The often-quoted "4.15 GETs per log" is simply `1 + edges_per_log`, and
-`edges_per_log` climbs from 1.54 to 3.73 as backlog grows. Round trips are `logs + 2 × edges` at a
+`edges_per_log` climbs from 1.54 to 3.73 as backlog grows. Round trips are `logs + edges` at a
 flat ~0.5 ms per round trip across a 140× request range.
 
 An **idle** round is one LIST sweep, `N` heartbeat GETs and one CAS. A **deferred** round is cheaper
-still: one LIST, three seal GETs, the lease GET/PUT and the heartbeat floor — and **no CAS at all**.
+still: one LIST, three seal GETs, the lease GET/PUT and the heartbeat floor — and no `gc/state` CAS.
+Its suppressed janitor page may independently repair or advance `gc/maintenance_state` by CAS.
 A measured 416-round `Success` sample cost roughly **$0.007** in total S3 charges.
 
 > **Doc drift:** the per-round cost table in `07-s3-budget.md:279-289` predates retired-in-snapshot

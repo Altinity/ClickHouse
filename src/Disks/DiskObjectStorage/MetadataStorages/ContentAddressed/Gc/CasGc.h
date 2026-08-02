@@ -800,9 +800,8 @@ private:
     /// `holes`), `gc_anomaly` audit rows, `CasGcProbeA*` ProfileEvents, and the text log.
     void sampleRefListQuality(const RefPlan & walk_plan, uint64_t current_round);
 
-    /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
-    /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
-
+    /// (`reclaimDroppedShards` was removed with the snapshot+log ref model: there is no mutable
+    /// per-namespace shard object to tombstone and reclaim; the perpetual janitor owns dead-life bytes.)
 
     /// Attempt-scoped generation retention. The sole reclaimer — bounded per round and fail-open on a benign
     /// 404 (never throw during a prune — it would only wedge GC):

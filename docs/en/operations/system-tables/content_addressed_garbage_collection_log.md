@@ -70,14 +70,14 @@ The phases, in execution order:
 | `phase` | What it covers | Dominant I/O |
 |---|---|---|
 | `lease` | Acquire, renew, or observe the GC lease. The only phase a `NotALeader` round emits. | `gc/state` `GET` + `CAS` |
+| `pre_fold_ref_drain` | Resolve catalog rows whose terminal fold evidence is already adopted before this invocation publishes or defers. | catalog `GET` + exact `CAS` |
 | `heartbeat_floor` | Classify every mount slot and fence out the dead ones. | `LIST` of the mount prefix, one `GET` per mount, one `PUT` per fence |
 | `defer_decision` | The skip-unchanged decision: graduation check plus the round's one enumeration of the ref prefix. | one full ref-prefix `LIST`, two fold-seal `GET`s |
 | `ref_list_probe` | The sampled ref-prefix store-quality detector. Emitted on every folding round; it only enumerates anything on the rounds its cadence makes due, and it aborts and gates nothing. | one full ref-prefix `LIST` on a due round, none otherwise |
 | `parent_seal_read` | Capture the pre-fold seal's run refs for the hand-off reclaim. | one fold-seal `GET` |
 | `fold_ref_group` | Regroup the round's enumeration into per-table listings — what this round will fold. | none |
 | `fold_seal_read` | The adopted fold seal, read twice at the same generation and attempt. | two fold-seal `GET`s |
-| `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `HEAD`+`GET` per manifest edge |
-| `fold_ns_cleanup_scan` | Advance the namespace-cleanup items by testing physical emptiness. | two prefix `LIST`s per unfinished item |
+| `fold_ref_intake` | Read and fold every new ref log and the manifest bodies its edges name. | one `GET` per new log, one `GET` per manifest edge |
 | `fold_reduce` | The per-shard in-degree merge: condemn, spare, graduate. | prior-run streaming `GET`s, one `HEAD` per zero-transition candidate, run `PUT`s |
 | `fold_seal_write` | Publish the new fold seal. | one `PUT` |
 | `pending_deletes` | The single content-delete site: exact-token deletes of previously published `delete_pending` entries, plus the outcome logs. | one `DELETE` per entry, one outcome-log `PUT` per shard |
@@ -85,7 +85,7 @@ The phases, in execution order:
 | `round_commit` | The generation-retention prune and the round's single `gc/state` `CAS`. | prune `LIST`s and deletes, one `CAS` |
 | `handoff_reclaim` | Wholesale-reclaim generations a moved run ref stranded below the retention cursor. | prefix `LIST`s and deletes |
 | `manifest_deletes` | Exact-token deletes of owner-removed manifest bodies, after their decrements were adopted. | one `DELETE` per body |
-| `namespace_cleanup` | The namespace-cleanup item passes (markers, `Removed`-snapshot republication, prefix deletes). | prefix deletes, snapshot `PUT`s |
+| `namespace_cleanup` | Run one bounded `cas/ns/` page across the stream and state subtrees for the perpetual dead-life janitor. This phase is physical reclamation, not a lifecycle gate. | one namespace-root page `LIST`, catalog cut, exact-token deletes |
 | `ref_object_cleanup` | Delete ref logs covered by both the durable fold cursor and a durable snapshot, plus superseded snapshots. | one `HEAD` + one `DELETE` per deletable object |
 | `orphan_sweep` | The budgeted, cursor-paced orphan part-manifest backstop. | budgeted `LIST` and deletes |
 

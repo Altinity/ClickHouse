@@ -516,11 +516,11 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
 }
 
-/// A10 follow-up: the round-side destructive gates -- `runNamespaceCleanupPasses`' physical Pending-item
-/// reclaim AND `cleanupRefObjects`' covered ref-object deletion -- must ALSO honor the round's ONE
+/// A10 follow-up: the round-side destructive gates -- the perpetual dead-life janitor AND
+/// `cleanupRefObjects`' covered ref-object deletion -- must ALSO honor the round's ONE
 /// `suppress_destructive` decision, not just fold()'s merge-side reducers pinned above. A clamp anomaly in
-/// one namespace must suppress destructive cleanup POOL-WIDE: a namespace mid-removal (a `Pending`
-/// namespace-cleanup item with un-reclaimed physical debris) must not be swept, and an unrelated live
+/// one namespace must suppress destructive cleanup POOL-WIDE: dead-life physical debris must not be
+/// swept, and an unrelated live
 /// table's snapshot-covered ref-log must not be deleted, in the SAME clamped round. A clean round
 /// afterward proves the setup really was cleanup-eligible, not vacuously untouched.
 TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJanitorWork)
