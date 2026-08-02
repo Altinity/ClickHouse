@@ -25,6 +25,7 @@
 #                                                (the observed 0x1430c/0x1430d shape).
 #                                                A violation is the EVIDENCE, so it is a PASS.
 #   frontier_sab_*           -> exact named Task 5b ordering/frontier invariant
+#   frontier_sab_snapshotatseal -> snapshot bases never name epoch-seal records
 #   frontier_witness_*       -> reachability controls for every crash/race recovery window
 #   frontier_safe            -> GREEN     LogDurable -> FrontierDurable -> Installed -> Acknowledged
 # Exits nonzero if any expectation is unmet.
@@ -56,6 +57,7 @@ CONFIGS=(
   "frontier_sab_staleadvance    violation INV_EXACT_COMMITTED_FRONTIER"
   "frontier_sab_snapshotabove   violation INV_SNAPSHOT_NOT_ABOVE_FRONTIER"
   "frontier_sab_sealabove       violation INV_SEAL_NOT_ABOVE_FRONTIER"
+  "frontier_sab_snapshotatseal  violation INV_SNAPSHOT_NOT_EPOCH_SEAL"
   "frontier_witness_crash_prepared violation W_CRASH_PREPARED"
   "frontier_witness_crash_logdurable violation W_CRASH_LOG_DURABLE"
   "frontier_witness_crash_frontierdurable violation W_CRASH_FRONTIER_DURABLE"
@@ -85,6 +87,7 @@ if [[ "${REFSNAPLOG_FOCUSED:-0}" == 1 ]]; then
     "frontier_sab_staleadvance    violation INV_EXACT_COMMITTED_FRONTIER"
     "frontier_sab_snapshotabove   violation INV_SNAPSHOT_NOT_ABOVE_FRONTIER"
     "frontier_sab_sealabove       violation INV_SEAL_NOT_ABOVE_FRONTIER"
+    "frontier_sab_snapshotatseal  violation INV_SNAPSHOT_NOT_EPOCH_SEAL"
     "frontier_witness_crash_prepared violation W_CRASH_PREPARED"
     "frontier_witness_crash_logdurable violation W_CRASH_LOG_DURABLE"
     "frontier_witness_crash_frontierdurable violation W_CRASH_FRONTIER_DURABLE"

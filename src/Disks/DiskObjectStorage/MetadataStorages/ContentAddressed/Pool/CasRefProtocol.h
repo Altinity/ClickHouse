@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <base/types.h>
 #include <algorithm>
 #include <cstdint>
@@ -747,7 +748,32 @@ struct RecoveredRefTable
 {
     RefTableState state;
     std::optional<RefTxnId> newest_snapshot_id;
+    /// The exact lifecycle authority's last sealed epoch. The authoritative read-only entry point
+    /// copies this from its immutable `_ckpt` input; it is deliberately not inferred from LIST.
+    std::optional<RefTxnId> last_epoch_seal;
+    /// A listed snapshot named an id above the exact checkpoint frontier and was ignored. This is
+    /// diagnostic evidence of stale enumeration, never an authority input.
+    bool ignored_hinted_snapshot_above_frontier = false;
+    /// A listed snapshot at or below the exact frontier was rejected after exact reads. This is
+    /// diagnostic evidence only: a `LIST` result never changes the immutable recovery authority.
+    bool discarded_hinted_snapshot = false;
 };
+
+/// Recover a ref table from ONE immutable lifecycle authority cut supplied by the caller. `catalog_entry`
+/// is either the exact row from that caller's frozen catalog cut or absence from that same cut; `ckpt` is
+/// the exact decoded `_ckpt` that caller read for the row's `NamespaceLifeId`. This function does NOT
+/// GET the catalog or `_ckpt` itself: accepting a later, competing cut would make its result disagree
+/// with the caller's other decisions. `chooseRecoveryGrounding` makes absent/Creating names non-recoverable
+/// and requires a readable `_ckpt` with `life_epoch` for Live/Removing.
+///
+/// A stream LIST is only a snapshot-performance hint. The replay is exact point GETs from the selected
+/// base through inclusive `committed_through`; a missing checkpoint-named base or committed log is
+/// corruption under this immutable authority. In particular, this read-only API never probes or adopts
+/// `F+1`. Callers that still rely on the legacy LIST-only entry points must migrate explicitly; those
+/// compatibility shims are deleted once all consumers pass their frozen `RefPlan::catalogCut` rows.
+RecoveredRefTable recoverRefTableDetailedFromAuthority(
+    Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    const std::optional<RefCkpt> & ckpt, const std::function<void()> & on_page_fetched = {});
 
 /// Recover one table's state via the shared recovery equation:
 /// one `LIST` of the table prefix, the newest valid snapshot, and replay of the later log tail through the
@@ -762,6 +788,8 @@ struct RecoveredRefTable
 /// `on_page_fetched`, if set, fires once per physical `backend.list` page across every restart attempt --
 /// a GC-owned caller's hook for a page-level ProfileEvents counter; fsck/offline-repair callers leave it
 /// unset.
+/// Temporary LIST-only migration shim. It is intentionally NOT an overload of the authoritative API above:
+/// callers must make their use of legacy self-resolution visible until the next migration deletes it.
 RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                           const std::function<void()> & on_page_fetched = {},
                                           unsigned max_restarts = 3);

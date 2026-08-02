@@ -942,6 +942,12 @@ TEST(RefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
     const RootNamespace ns{"srv1/birth_only"};
 
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}, std::nullopt});
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     auto store = openPool(backend);
     EXPECT_TRUE(store->listRefs(ns).empty());
@@ -960,6 +966,12 @@ TEST(RefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
         {namespaceBirthOp(), publishCommittedOps("part_1", m1)[0]}, std::nullopt});
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
         {publishCommittedOps("part_1", m1)[1]}, std::nullopt});
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     auto store = openPool(backend);
     const auto resolved = store->resolveRef(ns, "part_1");
@@ -996,6 +1008,12 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
     tail_ops.push_back(publishCommittedOps("b", mb)[0]);
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops, std::nullopt});
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 6},
+        .checkpoint_snapshot_id = RefTxnId{1, 5},
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     auto store = openPool(backend);
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
@@ -1022,13 +1040,26 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
     /// UNADMITTED namespace mints a fresh RANDOM incarnation rather than adopting the sentinel the raw
     /// fixture writes at.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RefTxnId snap_x{1, 10};
     writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
-    backend->vanish_once_keys.insert(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x));
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 10},
+        .checkpoint_snapshot_id = snap_x,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+    backend->vanish_once_keys.insert(layout.refSnapshotKey(life, snap_x));
     backend->on_vanish_fire = [&]
     {
         const RefTxnId snap_y{1, 20};
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_y, {committedRow("b", mb)}));
+        const auto before = backend->get(layout.refCkptKey(life));
+        ASSERT_TRUE(before);
+        ASSERT_EQ(backend->casPut(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = RefTxnId{1, 20},
+            .checkpoint_snapshot_id = snap_y,
+            .last_epoch_seal = std::nullopt}), before->token).outcome, CasOutcome::Committed);
     };
 
     auto store = openPool(backend);
@@ -1055,15 +1086,26 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     /// further down is a real production read that would otherwise mint a fresh RANDOM incarnation
     /// for this unadmitted namespace instead of adopting the sentinel the raw fixture writes at.
     DB::Cas::tests::casAdmitEntry(*backend, layout, ns);
+    const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, layout, ns);
     const RootNamespace other_ns{"srv1/other"};
     DB::Cas::RefTableSnapshot foreign;
     foreign.ns = other_ns.string();
     foreign.snapshot_id = snap_x;
-    backend->putIfAbsent(layout.refSnapshotKey(NamespaceLifeId::stageATransition(ns), snap_x),
-                         DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign)));
+    const String snapshot_key = layout.refSnapshotKey(life, snap_x);
+    ASSERT_EQ(backend->putIfAbsent(snapshot_key,
+        DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign))).outcome,
+        PutOutcome::Done);
+    ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = snap_x,
+        .checkpoint_snapshot_id = snap_x,
+        .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
 
     auto store = openPool(backend);
+    backend->resetCounts();
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "anything"); });
+    EXPECT_EQ(backend->getCount(snapshot_key), 1u)
+        << "the corruption must come from decoding the required checkpoint snapshot";
 }
 
 /// ===================================================================================
@@ -2757,6 +2799,58 @@ TEST(RefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
     }
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_before)
         << "reads within the backoff window must not re-dispatch a publish (the storm latch is broken)";
+}
+
+/// Recovery can leave the runtime at an epoch seal with a tail already above the threshold. The seal
+/// is not snapshot-serializable, so admission itself must reject it: letting execution reject it would
+/// make settlement immediately dispatch another identical background attempt. A later ordinary record
+/// must re-enable the same scheduler.
+TEST(RefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntilOrdinarySuccessor)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/recovered_seal_no_storm"};
+
+    {
+        PoolConfig predecessor_config;
+        predecessor_config.snapshot_log_count_threshold = 1ULL << 40;
+        predecessor_config.snapshot_log_bytes_threshold = 1ULL << 40;
+        auto predecessor = openPoolWithConfig(backend, predecessor_config);
+        DB::Cas::tests::casAdmitEntry(*backend, predecessor->layout(), ns);
+        const NamespaceLifeId life = *CasRefCatalog::lifeIfCataloged(*backend, predecessor->layout(), ns);
+        ASSERT_EQ(backend->putIfAbsent(predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+            .life_epoch = predecessor->liveWriterEpoch(),
+            .committed_through = std::nullopt,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
+        publishEmptyPart(predecessor, ns, "before_seal");
+        const auto before = backend->get(predecessor->layout().refCkptKey(life));
+        ASSERT_TRUE(before);
+        ASSERT_EQ(backend->casPut(predecessor->layout().refCkptKey(life), encodeRefCkpt(RefCkpt{
+            .life_epoch = predecessor->liveWriterEpoch(),
+            .committed_through = RefTxnId{predecessor->liveWriterEpoch(), 2},
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt}), before->token).outcome, CasOutcome::Committed);
+    }
+
+    PoolConfig successor_config;
+    successor_config.snapshot_log_count_threshold = 0;
+    successor_config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto successor = openPoolWithConfig(backend, successor_config);
+
+    EXPECT_TRUE(successor->resolveRef(ns, "before_seal").has_value());
+    successor->waitForSnapshotPublishSettleForTest(ns);
+    const auto dispatched_at_seal = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    for (int i = 0; i < 5; ++i)
+        EXPECT_TRUE(successor->resolveRef(ns, "before_seal").has_value());
+    successor->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_at_seal)
+        << "a recovered seal must not dispatch or re-dispatch an unpublishable snapshot candidate";
+
+    publishEmptyPart(successor, ns, "after_seal");
+    successor->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_at_seal + 1)
+        << "an ordinary successor above the seal must make the threshold candidate publishable again";
 }
 
 /// While one background publish is in flight (blocked mid-PUT), further reads must NOT dispatch a

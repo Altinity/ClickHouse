@@ -989,6 +989,41 @@ TEST(CasRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     EXPECT_EQ(readCkptOrFail(*backend, store->layout(), life), after_publish->ckpt);
 }
 
+TEST(CasRefCkpt, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    const RootNamespace ns{"srv1/no_snapshot_at_seal"};
+    uint64_t predecessor_epoch = 0;
+    {
+        auto predecessor = openPool(backend);
+        predecessor_epoch = predecessor->writerEpoch();
+        ASSERT_EQ(publishRef(predecessor, ns, "ref_1", 1), (RefTxnId{predecessor_epoch, 1}));
+    }
+
+    auto store = openPool(backend);
+    ASSERT_GT(store->writerEpoch(), predecessor_epoch);
+    ASSERT_EQ(store->listRefs(ns).size(), 1u) << "recovery must close the predecessor epoch before publishing";
+
+    const RefTxnId seal_id{predecessor_epoch, 2};
+    const NamespaceLifeId life = liveLifeOrFail(*backend, store->layout(), ns);
+    const String snapshot_key = store->layout().refSnapshotKey(life, seal_id);
+    const String ckpt_key = store->layout().refCkptKey(life);
+    ASSERT_EQ(store->lastEpochSealForTest(ns), std::make_optional(seal_id));
+    ASSERT_EQ(readCkptOrFail(*backend, store->layout(), life).committed_through, std::make_optional(seal_id));
+    const uint64_t snapshot_puts_before = backend->putCount(snapshot_key);
+    const uint64_t ckpt_cas_before = backend->casPutCount(ckpt_key);
+
+    /// Recovery installed the epoch seal as the runtime's greatest applied transaction. The publisher
+    /// must decline it without reaching either durable write.
+    EXPECT_FALSE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+    EXPECT_EQ(backend->putCount(snapshot_key), snapshot_puts_before);
+    EXPECT_EQ(backend->casPutCount(ckpt_key), ckpt_cas_before);
+
+    /// Once an ordinary transaction advances the candidate beyond the seal, normal publication resumes.
+    ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 1}));
+    EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
+}
+
 /// Publication replays a `NeedsRecovery` lane before it captures a snapshot and advances `_ckpt`.
 TEST(CasRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
 {

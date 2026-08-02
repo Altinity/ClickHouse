@@ -354,7 +354,13 @@ writer or `LIST` happened to observe. Every acknowledged chunk is at or below it
 algorithm serves the append lane, snapshot publisher and sealer: read → validate → merge a bounded
 monotone contribution → token-CAS; identical merged body → return without a CAS; retries are bound to
 the recovery deadline. A checkpoint snapshot and `last_epoch_seal` may never exceed
-`committed_through`; a contribution that would do so is corruption rather than a partial update.
+`committed_through`; a contribution that would do so is corruption rather than a partial update. A
+checkpoint snapshot may also never name **any** `EpochSeal`: a seal changes epoch arithmetic but is
+not a state-bearing snapshot base. The publisher's local guard is candidate equality with
+`last_epoch_seal`; the producer invariant gives recovery every retained base the one uniform successor
+`{E, S + 1}`, with no durable object-kind bit or backward scan. A corrupt old checkpoint base is
+fail-closed when that arithmetic replay lacks a required key at or below the frontier; recovery does
+not infer a kind from surviving objects.
 The append order is immutable log PUT → `_ckpt.committed_through` CAS → in-memory install/acknowledge →
 allocation of the next id. A birth first publishes `life_epoch`, as required by creation ordering,
 then writes the birth log and advances `committed_through`. An epoch-seal contribution advances
@@ -478,8 +484,12 @@ still leave the explicit-UUID route unguarded.
 Catalog (state + opaque life id) → exact `_ckpt` → exact-key snapshot (revalidation rule) → finite
 arithmetic replay ending exactly at `committed_through` → CAS-walk + seal → install. A stream `LIST`
 may offer a newer snapshot candidate, diagnostics and garbage nominations; it never supplies genesis,
-the committed frontier or a stop condition. A hinted snapshot above `committed_through` is ignored and
-surfaced, not adopted. Without a base, replay starts at `{life_epoch, 1}`. With a base, it starts at
+the committed frontier or a stop condition. A hinted snapshot above `committed_through`, or one whose
+exact matching log is absent, unreadable or an `EpochSeal`, is ignored and surfaced rather than
+adopted. That matching-log validation applies only to a hint-only offer above the checkpoint base, so
+it is not cleanup-eligible; a checkpoint-named base uses the uniform successor and any missing required
+replay key at or below the frontier is corruption. Without a base, replay starts at
+`{life_epoch, 1}`. With a base, it starts at
 the base's successor. A readable checkpoint with no `committed_through` represents a life with no
 committed transaction and needs no read-only replay. Missing a required key at or below a present
 `committed_through`, an invalid chain link, or an unreadable required checkpoint is corruption.

@@ -923,6 +923,185 @@ EpochCrossResult crossEpochFromSeal(Backend & backend, const Layout & layout, co
     return result;
 }
 
+RecoveredRefTable recoverRefTableDetailedFromAuthority(
+    Backend & backend, const Layout & layout, const std::optional<CatalogEntry> & catalog_entry,
+    const std::optional<RefCkpt> & ckpt, const std::function<void()> & on_page_fetched)
+{
+    /// LIST only nominates a potentially useful base snapshot. The frozen catalog row and `_ckpt`
+    /// supplied by the caller determine every semantic boundary; this function must not re-read either
+    /// mutable object, because that would splice two catalog cuts into one recovery result.
+    /// Reject nonrecoverable lifecycle authority BEFORE an optional physical hint. Aside from avoiding
+    /// pointless I/O, this makes the promised lifecycle error deterministic rather than allowing a
+    /// transient LIST failure to hide it.
+    RecoveryGrounding grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+    /// `chooseRecoveryGrounding` has just established that this is a Live/Removing row. Constructing
+    /// the life from that SAME value, rather than resolving the name again, preserves the caller's
+    /// catalog-cut join.
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(
+        catalog_entry->ns, catalog_entry->incarnation);
+    const RootNamespace & ns = life.ns;
+
+    std::optional<RefTxnId> greatest_hinted_snapshot;
+    forEachListedKey(backend, layout.namespaceStreamPrefix(life), [&](const ListedKey & listed)
+    {
+        std::optional<ParsedRefObjectKey> parsed;
+        try
+        {
+            parsed = layout.parseRefObjectKey(listed.key);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                throw;
+        }
+        if (parsed && parsed->life_id == life.incarnation && parsed->kind == RefObjectKind::Snap
+            && (!greatest_hinted_snapshot || *greatest_hinted_snapshot < parsed->txn_id))
+            greatest_hinted_snapshot = parsed->txn_id;
+    }, 1000, on_page_fetched);
+    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, greatest_hinted_snapshot);
+
+    std::optional<RefTxnId> base_id = grounding.base;
+    bool base_is_hint_only = greatest_hinted_snapshot && base_id == greatest_hinted_snapshot
+        && (!ckpt->checkpoint_snapshot_id || *ckpt->checkpoint_snapshot_id < *greatest_hinted_snapshot);
+    bool discarded_hinted_snapshot = false;
+    std::optional<RefTableSnapshot> base_snapshot;
+    uint64_t base_snapshot_bytes = 0;
+    std::optional<RefReplayBuilder> builder;
+    while (base_id)
+    {
+        const auto got = backend.get(layout.refSnapshotKey(life, *base_id));
+        if (!got)
+        {
+            /// A nominated LIST snapshot may disappear or have been stale. It has no authority, so
+            /// retry from the checkpoint's exact base without treating its absence as stream damage.
+            if (base_is_hint_only)
+            {
+                discarded_hinted_snapshot = true;
+                grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+                base_id = grounding.base;
+                base_is_hint_only = false;
+                continue;
+            }
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS read-only recovery for namespace '{}': checkpoint-named base snapshot {}-{} is absent "
+                "under the supplied immutable lifecycle authority",
+                ns.string(), base_id->writer_epoch, base_id->ref_sequence);
+        }
+
+        if (base_is_hint_only)
+        {
+            try
+            {
+                /// A snapshot is only a performance hint until its matching transaction proves it is a
+                /// real state-bearing cut. A seal cannot be such a cut: selecting it would make LIST
+                /// decide epoch geometry, so fall back to the immutable checkpoint grounding instead.
+                const auto matching_log = backend.get(layout.refLogKey(life, *base_id));
+                if (!matching_log)
+                {
+                    discarded_hinted_snapshot = true;
+                    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+                    base_id = grounding.base;
+                    base_is_hint_only = false;
+                    continue;
+                }
+                const RefLogTxn matching_txn = decodeRefLogTxn(
+                    openObject(FormatId::RefLog, matching_log->bytes), ns.string(), *base_id);
+                if (refLogTxnIsEpochSeal(matching_txn))
+                {
+                    discarded_hinted_snapshot = true;
+                    grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+                    base_id = grounding.base;
+                    base_is_hint_only = false;
+                    continue;
+                }
+                base_snapshot = decodeRefTableSnapshot(
+                    openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
+                /// `decodeRefTableSnapshot` validates the wire form, but snapshots also carry table
+                /// invariants such as cross-owner manifest uniqueness. Validate those semantics before
+                /// allowing a LIST-only candidate to become the replay base: unlike an immutable
+                /// checkpoint base, a bad hint is discarded and recovery returns to its exact grounding.
+                /// Construct the real replay builder here, so a valid hint is semantically validated
+                /// exactly once and the tail reuses that already-validated state.
+                builder.emplace(std::move(base_snapshot), got->bytes.size());
+            }
+            catch (const Exception & e)
+            {
+                if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                    throw;
+                discarded_hinted_snapshot = true;
+                /// `emplace` receives ownership of the decoded snapshot. If semantic construction
+                /// throws, the moved-from optional must not become the fallback's accidental base.
+                base_snapshot.reset();
+                grounding = chooseRecoveryGrounding(catalog_entry, ckpt, std::nullopt);
+                base_id = grounding.base;
+                base_is_hint_only = false;
+                continue;
+            }
+        }
+        else
+        {
+            base_snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *base_id);
+            base_snapshot_bytes = got->bytes.size();
+        }
+        break;
+    }
+
+    if (!builder)
+        builder.emplace(std::move(base_snapshot), base_snapshot_bytes);
+    if (grounding.walk_from && grounding.committed_through)
+    {
+        RefTxnId id = *grounding.walk_from;
+        while (id <= *grounding.committed_through)
+        {
+            const auto got = backend.get(layout.refLogKey(life, id));
+            if (!got)
+            {
+                /// `NamespaceLifeId` is opaque and unique to one logical life. A later birth has a
+                /// different stream prefix, so no absent slot at or below this life's exact frontier
+                /// can be explained as a rebirth; it is always durable-data loss.
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS read-only recovery for namespace '{}': committed log id {}-{} is absent under "
+                    "the supplied immutable checkpoint frontier {}-{}",
+                    ns.string(), id.writer_epoch, id.ref_sequence,
+                    grounding.committed_through->writer_epoch, grounding.committed_through->ref_sequence);
+            }
+
+            RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
+            const bool is_seal = refLogTxnIsEpochSeal(txn);
+            const int64_t footprint = static_cast<int64_t>(decodedRefLogTxnFootprint(txn));
+            reportReplayMemoryDelta(footprint);
+            SCOPE_EXIT({ reportReplayMemoryDelta(-footprint); });
+            builder->applyOne(std::move(txn), got->bytes.size());
+
+            if (is_seal)
+            {
+                if (id.writer_epoch == std::numeric_limits<uint64_t>::max())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS read-only recovery for namespace '{}': epoch seal {}-{} has no representable successor",
+                        ns.string(), id.writer_epoch, id.ref_sequence);
+                ++id.writer_epoch;
+                id.ref_sequence = 1;
+            }
+            else
+            {
+                if (id.ref_sequence == std::numeric_limits<uint64_t>::max())
+                    throw Exception(ErrorCodes::CORRUPTED_DATA,
+                        "CAS read-only recovery for namespace '{}': log id {}-{} has no representable successor",
+                        ns.string(), id.writer_epoch, id.ref_sequence);
+                ++id.ref_sequence;
+            }
+        }
+    }
+
+    RecoveryResult result = std::move(*builder).finish();
+    return RecoveredRefTable{
+        .state = std::move(result.state),
+        .newest_snapshot_id = result.newest_snapshot_id,
+        .last_epoch_seal = ckpt->last_epoch_seal,
+        .ignored_hinted_snapshot_above_frontier = grounding.ignored_hinted_snapshot_above_frontier,
+        .discarded_hinted_snapshot = discarded_hinted_snapshot};
+}
+
 RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
                                           const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {
@@ -1049,7 +1228,12 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
         }
 
         RecoveryResult result = std::move(builder).finish();
-        return RecoveredRefTable{std::move(result.state), result.newest_snapshot_id};
+        return RecoveredRefTable{
+            .state = std::move(result.state),
+            .newest_snapshot_id = result.newest_snapshot_id,
+            .last_epoch_seal = std::nullopt,
+            .ignored_hinted_snapshot_above_frontier = false,
+            .discarded_hinted_snapshot = false};
     }
 }
 

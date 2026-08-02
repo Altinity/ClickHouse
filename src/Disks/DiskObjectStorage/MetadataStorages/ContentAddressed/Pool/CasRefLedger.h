@@ -1161,6 +1161,10 @@ private:
                                                uint64_t admitted_generation,
                                                const std::function<void(uint64_t)> & check_admission);
 
+    /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
+    /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.
+    bool hasStateBearingSnapshotCandidateUnderStateLock(const RefTableRuntime & rt) const;
+
     /// The Live + single-in-flight-gate + backoff + tail-threshold admission decision, factored out so
     /// both the trigger (`maybeScheduleSnapshotPublish`) and the settlement re-evaluation share ONE
     /// authority. The caller MUST hold `rt.state_mutex`; on admission this increments

@@ -1932,7 +1932,13 @@ RecoveryGrounding chooseRecoveryGrounding(const CatalogEntry & catalog_state,
                                           const std::optional<RefTxnId> & greatest_hinted_snapshot);
 ```
 - Grounding rules: choose the greater checkpoint/hinted snapshot as the base only when the candidate
-  is at or below `committed_through`; a hint above the frontier is ignored and diagnosed. With a base,
+  is at or below `committed_through`; a hint above the frontier, or a hint-only candidate above the
+  checkpoint base whose exact snapshot/log validation is absent, corrupt or an `EpochSeal`, is ignored
+  and diagnosed. A checkpoint-named base is not backwalked or matched against a log: it relies on the
+  producer invariant and the uniform arithmetic successor `{E, S + 1}`. A persisted checkpoint snapshot
+  may never name any `EpochSeal`; the publisher enforces its local candidate-equals-`last_epoch_seal`
+  guard. A resulting missing required replay key at or below the frontier is corruption. With a
+  base,
   walk from its successor through the inclusive frontier; without a base and with a frontier, walk
   from `{life_epoch, 1}` through it. A readable checkpoint with no frontier represents a life with no
   committed transaction and requires no replay. Never derive genesis, the frontier or a stop from log

@@ -75,7 +75,8 @@ CONSTANTS
     SabotageInstallAboveFrontier,    \* recovery installs an unfrontiered object
     SabotageStaleFrontier,           \* a stale writer advances without a valid same-fence proof
     SabotageSnapshotAboveFrontier,   \* checkpoint snapshot exceeds `committed_through`
-    SabotageSealAboveFrontier        \* checkpoint seal exceeds `committed_through`
+    SabotageSealAboveFrontier,       \* checkpoint seal exceeds `committed_through`
+    SabotageSnapshotAtSeal           \* checkpoint snapshot names an epoch-seal record
 
 Seqs == 1..MaxSeq                    \* ids a writer may append
 Ids  == 1..(MaxSeq + 1)              \* + the slot a frontier seal may occupy
@@ -891,6 +892,7 @@ FrontierOldWriterLosesToSeal ==
 
 FrontierPublishSnapshotBody ==
     /\ frontier.snapshotBodyThrough < frontier.committedThrough
+    /\ frontier.committedThrough # frontier.lastEpochSeal
     /\ frontier' =
         [frontier EXCEPT !.snapshotBodyThrough = frontier.committedThrough]
     /\ UNCHANGED frontierWitness
@@ -951,6 +953,16 @@ FrontierSealAboveCheckpoint ==
         [frontier EXCEPT !.lastEpochSeal = frontier.committedThrough + 1]
     /\ UNCHANGED frontierWitness
 
+FrontierSnapshotAtSeal ==
+    /\ SabotageSnapshotAtSeal
+    /\ frontier.lastEpochSeal # 0
+    /\ frontier.checkpointSnapshot # frontier.lastEpochSeal
+    /\ frontier' =
+        [frontier EXCEPT
+            !.checkpointSnapshot = frontier.lastEpochSeal,
+            !.checkpointToken = @ + 1]
+    /\ UNCHANGED frontierWitness
+
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
 
@@ -980,6 +992,7 @@ FrontierStep ==
     \/ FrontierAckBeforeCheckpoint \/ FrontierAllocateBeforeCheckpoint
     \/ FrontierInstallUncommitted \/ FrontierStaleAdvance
     \/ FrontierSnapshotAboveCheckpoint \/ FrontierSealAboveCheckpoint
+    \/ FrontierSnapshotAtSeal
 
 LegacyNext ==
     /\ ~FrontierSlice
@@ -1062,6 +1075,13 @@ INV_SNAPSHOT_NOT_ABOVE_FRONTIER ==
 INV_SEAL_NOT_ABOVE_FRONTIER ==
     ~FrontierSlice \/ frontier.lastEpochSeal <= frontier.committedThrough
 
+(* A snapshot is always a state-bearing record. An epoch seal only changes arithmetic geometry, so
+   publishing it as a checkpoint base would require recovery to retain a durable kind bit or backwalk.
+   The production guard consequently forbids it rather than making that special case persistent. *)
+INV_SNAPSHOT_NOT_EPOCH_SEAL ==
+    ~FrontierSlice \/ frontier.checkpointSnapshot = 0
+        \/ frontier.objectKind[frontier.checkpointSnapshot] # "seal"
+
 (* Reachability controls. Each is checked in its own witness config; violation means the honest
    crash/race window was reached while all safety invariants preceding it remained green. *)
 W_CRASH_PREPARED == ~frontierWitness.crashPrepared
@@ -1108,5 +1128,5 @@ THEOREM Spec =>
       /\ INV_EXACT_COMMITTED_FRONTIER /\ INV_INSTALL_NOT_ABOVE_FRONTIER
       /\ INV_ACK_NOT_BEFORE_FRONTIER /\ INV_ACK_NOT_BEFORE_INSTALL
       /\ INV_NEXT_ID_NOT_BEFORE_FRONTIER /\ INV_SNAPSHOT_NOT_ABOVE_FRONTIER
-      /\ INV_SEAL_NOT_ABOVE_FRONTIER)
+      /\ INV_SEAL_NOT_ABOVE_FRONTIER /\ INV_SNAPSHOT_NOT_EPOCH_SEAL)
 =============================================================================

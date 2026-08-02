@@ -3988,6 +3988,14 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     return false;
 }
 
+bool CasRefLedger::hasStateBearingSnapshotCandidateUnderStateLock(const RefTableRuntime & rt) const
+{
+    /// The newest snapshot must be strictly older than the candidate. A seal advances epoch geometry
+    /// but carries no table state, so it is never a snapshot candidate.
+    return rt.state.getLifecycle() == RefLifecycle::Live
+        && (!rt.newest_snapshot_id || *rt.newest_snapshot_id < rt.state.getGreatestApplied())
+        && (!rt.last_epoch_seal || *rt.last_epoch_seal != rt.state.getGreatestApplied());
+}
 
 bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
 {
@@ -4000,7 +4008,8 @@ bool CasRefLedger::admitSnapshotPublishUnderStateLock(RefTableRuntime & rt)
     const uint64_t now = boot_ms_now_fn();
     if (!rt.catalog_life_invalidated.load(std::memory_order_acquire)
         && !rt.superseded_by_remount.load(std::memory_order_acquire)
-        && rt.state.getLifecycle() == RefLifecycle::Live
+        /// Use the execution predicate at admission too, so settlement cannot redispatch a recovered seal.
+        && hasStateBearingSnapshotCandidateUnderStateLock(rt)
         /// Single-in-flight gate: at most one background publish per table.
         && rt.pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
         /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
@@ -4290,10 +4299,8 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         /// between certification and capture.
         if (rt->lane_state != RefLaneState::Ready)
             blocked_lane = rt->lane_state;
-        else if (rt->state.getLifecycle() != RefLifecycle::Live)
-            return false;   /// terminal state is never snapshotted; dead-life cleanup is janitor work
-        else if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
-            return false;   /// nothing above the newest snapshot
+        else if (!hasStateBearingSnapshotCandidateUnderStateLock(*rt))
+            return false;   /// shares admission: terminal, covered, and seal candidates are all inert
         else
         {
             candidate_state = rt->state;
