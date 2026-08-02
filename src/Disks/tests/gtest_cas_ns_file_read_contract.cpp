@@ -219,8 +219,8 @@ TEST(CasNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 }
 
 /// `listNamespaceFiles` derives its LIST prefix from `layout.namespaceFilesPrefix(life)` -- a physical
-/// life-scoped stream, not the catalog. Listing under a held life must cost exactly that one LIST and
-/// nothing against `layout.refCatalogKey()`.
+/// life-scoped stream, not the catalog. Listing under a held life must cost exactly one LIST of the
+/// files prefix and nothing else.
 TEST(CasNamespaceFileReadContract, ListThroughHeldLifeIssuesZeroCatalogRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -238,13 +238,10 @@ TEST(CasNamespaceFileReadContract, ListThroughHeldLifeIssuesZeroCatalogRequests)
     std::sort(sorted_names.begin(), sorted_names.end());
     EXPECT_EQ(sorted_names, (std::vector<String>{"a.txt", "b.txt"}));
 
-    /// Positive control: the journal did record a LIST against the namespace-file stream prefix, so
-    /// the zero below is an absence and not a recorder that never saw anything.
-    EXPECT_GT(backend->listCount(prefix), 0u);
-
-    EXPECT_EQ(backend->headCount(store->layout().refCatalogKey()), 0u);
-    EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), 0u);
-    EXPECT_EQ(backend->casPutCount(store->layout().refCatalogKey()), 0u);
-    EXPECT_EQ(backend->putCount(store->layout().refCatalogKey()), 0u);
-    EXPECT_EQ(backend->putOverwriteCount(store->layout().refCatalogKey()), 0u);
+    /// Positive control: the journal recorded exactly one LIST against the namespace-file stream
+    /// prefix and nothing else, so the touched-set assertion below names an absence, not a
+    /// recorder that never saw anything.
+    EXPECT_EQ(backend->listCount(prefix), 1u);
+    EXPECT_EQ(backend->listTotal(), 1u);
+    EXPECT_EQ(backend->touchedKeys(), std::vector<String>{prefix});
 }
