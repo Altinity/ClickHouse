@@ -68,13 +68,66 @@ CONSTANTS
     SabotageScanIsTruth,             \* the reader folds what the LIST hint returned, not the walk
     SabotageCleanupAboveCkpt,        \* cleanup deletes logs above `ckpt.base`
     SabotageStaleCkptCorruption,     \* cleanup deletes the snapshot `ckpt.base` still points at
-    SabotageSealClobbersBase         \* the sealer writes back its SAMPLED base instead of merging
+    SabotageSealClobbersBase,        \* the sealer writes back its SAMPLED base instead of merging
+    FrontierSlice,                   \* Task 5b's focused log -> frontier -> install/ack state machine
+    SabotageAckBeforeFrontier,       \* acknowledge a durable log before `_ckpt.committed_through`
+    SabotageAllocateBeforeFrontier,  \* allocate the successor id before the frontier is durable
+    SabotageInstallAboveFrontier,    \* recovery installs an unfrontiered object
+    SabotageStaleFrontier,           \* a stale writer advances without a valid same-fence proof
+    SabotageSnapshotAboveFrontier,   \* checkpoint snapshot exceeds `committed_through`
+    SabotageSealAboveFrontier        \* checkpoint seal exceeds `committed_through`
 
 Seqs == 1..MaxSeq                    \* ids a writer may append
 Ids  == 1..(MaxSeq + 1)              \* + the slot a frontier seal may occupy
 Ops  == {"none", "birth", "mut", "remove"}
 Lifes == {"empty", "live", "removed"}
 EmptyState == [life |-> "empty", committed |-> {}, removeSeq |-> 0]
+
+FrontierPhases ==
+    {"Idle", "Prepared", "LogDurable", "FrontierIssued", "FrontierDurable",
+     "CheckpointRead", "RecoveryValidated", "SealDurable",
+     "Installed", "Acknowledged", "NeedsRecovery", "Rejected"}
+FrontierKinds == {"none", "log", "seal"}
+FrontierFences == 1..2
+FrontierState ==
+    [phase : FrontierPhases,
+     currentFence : FrontierFences,
+     candidateId : 0..MaxSeq,
+     candidateFence : 0..2,
+     candidateKind : FrontierKinds,
+     objectKind : [Seqs -> FrontierKinds],
+     objectFence : [Seqs -> 0..2],
+     objectPrev : [Seqs -> 0..MaxSeq],
+     committedThrough : 0..MaxSeq,
+     checkpointSnapshot : 0..MaxSeq,
+     snapshotBodyThrough : 0..MaxSeq,
+     lastEpochSeal : 0..MaxSeq,
+     installedThrough : 0..MaxSeq,
+     acknowledgedThrough : 0..MaxSeq,
+     nextId : 1..(MaxSeq + 1),
+     issuedId : 0..MaxSeq,
+     issuedFence : 0..2,
+     issuedKind : FrontierKinds,
+     issuedToken : 0..(3 * MaxSeq + 4),
+     checkpointToken : 0..(3 * MaxSeq + 4),
+     sampledThrough : 0..MaxSeq,
+     sampledToken : 0..(3 * MaxSeq + 4),
+     lostResponsePending : BOOLEAN,
+     recoveryAdoptingSuccessor : BOOLEAN,
+     validFrontierProofs : SUBSET Seqs]
+
+FrontierWitnessState ==
+    [crashPrepared : BOOLEAN,
+     crashLogDurable : BOOLEAN,
+     crashFrontierDurable : BOOLEAN,
+     crashInstalled : BOOLEAN,
+     lostFrontierResponse : BOOLEAN,
+     exactSuccessorAdopted : BOOLEAN,
+     oldWriterLostToSeal : BOOLEAN,
+     issuedCasLinearizedAfterFenceMove : BOOLEAN,
+     snapshotPublishedAtFrontier : BOOLEAN,
+     sealPublishedAtFrontier : BOOLEAN,
+     lostSealResponseResolved : BOOLEAN]
 
 VARIABLES
     op,            \* [Ids -> Ops]   content bound to an id at ATTEMPT time (durable iff in writtenEver)
@@ -107,18 +160,22 @@ VARIABLES
     rTail,         \* SUBSET Seqs    ids this recovery will fold above the base
     rScanPos,      \* hint-enumeration cursor (resume-after-last-returned-key)
     rSeenLogs,     \* SUBSET Seqs    ids the hint enumeration returned
-    rRestarts      \* restart counter
+    rRestarts,     \* restart counter
+    frontier,      \* Task 5b's focused checkpoint-frontier state
+    frontierWitness \* reachability controls for every required honest crash/race window
 
 storeVars  == << op, writtenEver, logs, snaps, publishedEver, snapCov >>
 laneVars   == << pendingSlot, ambiguousEver >>
 sealVars   == << sealedIds, concludedEver >>
 ghostVars  == << burnedIds, orphanIds, phantomEver >>
 readerVars == << rPhase, rBase, rWalkPos, rTail, rScanPos, rSeenLogs, rRestarts >>
+legacyVars == << op, writtenEver, logs, snaps, publishedEver, snapCov, ckpt,
+                 pendingSlot, ambiguousEver, sealedIds, concludedEver,
+                 burnedIds, orphanIds, phantomEver,
+                 rPhase, rBase, rWalkPos, rTail, rScanPos, rSeenLogs, rRestarts >>
+frontierVars == << frontier, frontierWitness >>
 
-vars == << op, writtenEver, logs, snaps, publishedEver, snapCov, ckpt,
-           pendingSlot, ambiguousEver, sealedIds, concludedEver,
-           burnedIds, orphanIds, phantomEver,
-           rPhase, rBase, rWalkPos, rTail, rScanPos, rSeenLogs, rRestarts >>
+vars == << legacyVars, frontierVars >>
 
 MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
@@ -175,6 +232,44 @@ Init ==
     /\ rScanPos = 0
     /\ rSeenLogs = {}
     /\ rRestarts = 0
+    /\ frontier =
+        [phase |-> "Idle",
+         currentFence |-> 1,
+         candidateId |-> 0,
+         candidateFence |-> 0,
+         candidateKind |-> "none",
+         objectKind |-> [i \in Seqs |-> "none"],
+         objectFence |-> [i \in Seqs |-> 0],
+         objectPrev |-> [i \in Seqs |-> 0],
+         committedThrough |-> 0,
+         checkpointSnapshot |-> 0,
+         snapshotBodyThrough |-> 0,
+         lastEpochSeal |-> 0,
+         installedThrough |-> 0,
+         acknowledgedThrough |-> 0,
+         nextId |-> 1,
+         issuedId |-> 0,
+         issuedFence |-> 0,
+         issuedKind |-> "none",
+         issuedToken |-> 0,
+         checkpointToken |-> 0,
+         sampledThrough |-> 0,
+         sampledToken |-> 0,
+         lostResponsePending |-> FALSE,
+         recoveryAdoptingSuccessor |-> FALSE,
+         validFrontierProofs |-> {}]
+    /\ frontierWitness =
+        [crashPrepared |-> FALSE,
+         crashLogDurable |-> FALSE,
+         crashFrontierDurable |-> FALSE,
+         crashInstalled |-> FALSE,
+         lostFrontierResponse |-> FALSE,
+         exactSuccessorAdopted |-> FALSE,
+         oldWriterLostToSeal |-> FALSE,
+         issuedCasLinearizedAfterFenceMove |-> FALSE,
+         snapshotPublishedAtFrontier |-> FALSE,
+         sealPublishedAtFrontier |-> FALSE,
+         lostSealResponseResolved |-> FALSE]
 
 ReaderInactive == rPhase = "idle"
 
@@ -486,10 +581,380 @@ ReaderReset ==
     /\ UNCHANGED storeVars /\ UNCHANGED << ckpt >>
     /\ UNCHANGED laneVars /\ UNCHANGED sealVars /\ UNCHANGED ghostVars
 
+(* ---- Task 5b: exact committed frontier ----
+
+   This focused slice is selected by `FrontierSlice`; legacy v9 configs leave it frozen. It makes
+   the four externally meaningful states distinct: the immutable log is durable, its exact-chain
+   checkpoint contribution is durable, the value is installed, and the caller is acknowledged
+   (which is also when the successor id becomes allocatable). The checkpoint contribution carries
+   an explicit proof bit for each committed id. The object's immutable producer fence is distinct
+   from the checkpoint request's admission fence: recovery may contribute an exact old-fence
+   successor using a CAS issued under its new current fence. Every request binds the exact sampled
+   checkpoint token. An already-issued request may linearize after only the fence moves, but an
+   intervening checkpoint update invalidates it and a stale actor may not issue a new request.
+
+   `objectPrev` is the exact chain link. A record or seal at `T+1` is the only object writer recovery
+   may adopt above `committedThrough`; no action chases a second successor. Snapshot and seal fields
+   share the checkpoint frontier and may never exceed it. *)
+
+FrontierObjectIsExact(id, kind) ==
+    /\ id \in Seqs
+    /\ frontier.objectKind[id] = kind
+    /\ frontier.objectFence[id] \in FrontierFences
+    /\ frontier.objectPrev[id] = id - 1
+
+FrontierCandidateMatchesObject ==
+    /\ FrontierObjectIsExact(frontier.candidateId, frontier.candidateKind)
+    /\ frontier.objectFence[frontier.candidateId] = frontier.candidateFence
+
+FrontierStartLog ==
+    /\ frontier.phase = "Idle"
+    /\ frontier.nextId \in Seqs
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Prepared",
+            !.candidateId = frontier.nextId,
+            !.candidateFence = frontier.currentFence,
+            !.candidateKind = "log",
+            !.issuedId = 0,
+            !.issuedFence = 0,
+            !.issuedKind = "none",
+            !.issuedToken = 0,
+            !.sampledThrough = 0,
+            !.sampledToken = 0,
+            !.lostResponsePending = FALSE,
+            !.recoveryAdoptingSuccessor = FALSE]
+    /\ UNCHANGED frontierWitness
+
+FrontierLogDurable ==
+    /\ frontier.phase = "Prepared"
+    /\ frontier.candidateKind = "log"
+    /\ frontier.objectKind[frontier.candidateId] = "none"
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "LogDurable",
+            !.objectKind[frontier.candidateId] = "log",
+            !.objectFence[frontier.candidateId] = frontier.candidateFence,
+            !.objectPrev[frontier.candidateId] = frontier.candidateId - 1]
+    /\ UNCHANGED frontierWitness
+
+(* A new runtime fence can arrive before the old request resolves. It prevents NEW old-fence
+   checkpoint requests; it does not cancel one the store already admitted. *)
+FrontierMoveFence ==
+    /\ frontier.currentFence = 1
+    /\ frontier' = [frontier EXCEPT !.currentFence = 2]
+    /\ UNCHANGED frontierWitness
+
+FrontierIssueCheckpoint ==
+    /\ frontier.phase = "LogDurable"
+    /\ frontier.candidateId = frontier.committedThrough + 1
+    /\ FrontierCandidateMatchesObject
+    /\ frontier.currentFence = frontier.candidateFence
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "FrontierIssued",
+            !.issuedId = frontier.candidateId,
+            !.issuedFence = frontier.currentFence,
+            !.issuedKind = frontier.candidateKind,
+            !.issuedToken = frontier.checkpointToken,
+            !.recoveryAdoptingSuccessor = FALSE]
+    /\ UNCHANGED frontierWitness
+
+(* After a crash, recovery first samples the exact checkpoint and its token. If the one exact
+   successor belongs to the old writer, the NEW mount admits the checkpoint CAS under its CURRENT
+   fence; the immutable object's producer fence is intentionally independent. *)
+FrontierIssueRecoverySuccessor ==
+    /\ frontier.phase = "CheckpointRead"
+    /\ frontier.checkpointToken = frontier.sampledToken
+    /\ frontier.candidateId = frontier.sampledThrough + 1
+    /\ frontier.sampledThrough = frontier.committedThrough
+    /\ FrontierCandidateMatchesObject
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "FrontierIssued",
+            !.issuedId = frontier.candidateId,
+            !.issuedFence = frontier.currentFence,
+            !.issuedKind = frontier.candidateKind,
+            !.issuedToken = frontier.sampledToken,
+            !.recoveryAdoptingSuccessor = TRUE]
+    /\ UNCHANGED frontierWitness
+
+FrontierCheckpointLinearizes(response) ==
+    /\ response \in {"delivered", "lost"}
+    /\ frontier.phase = "FrontierIssued"
+    /\ frontier.checkpointToken = frontier.issuedToken
+    /\ frontier.issuedId = frontier.committedThrough + 1
+    /\ FrontierObjectIsExact(frontier.issuedId, frontier.issuedKind)
+    /\ frontier.issuedFence \in FrontierFences
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = IF response = "lost" THEN "NeedsRecovery" ELSE "FrontierDurable",
+            !.committedThrough = frontier.issuedId,
+            !.lastEpochSeal =
+                IF frontier.issuedKind = "seal" THEN frontier.issuedId ELSE @,
+            !.checkpointToken = @ + 1,
+            !.lostResponsePending = (response = "lost"),
+            !.validFrontierProofs = @ \cup {frontier.issuedId}]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT
+            !.issuedCasLinearizedAfterFenceMove =
+                @ \/ (frontier.currentFence # frontier.issuedFence)]
+
+FrontierInstall ==
+    /\ frontier.phase = "FrontierDurable"
+    /\ frontier.issuedKind = "log"
+    /\ frontier.candidateId <= frontier.committedThrough
+    /\ FrontierCandidateMatchesObject
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Installed",
+            !.installedThrough = frontier.candidateId]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT
+            !.exactSuccessorAdopted =
+                @ \/ (frontier.recoveryAdoptingSuccessor
+                       /\ frontier.objectFence[frontier.candidateId] # frontier.issuedFence)]
+
+FrontierAcknowledge ==
+    /\ frontier.phase = "Installed"
+    /\ frontier.installedThrough = frontier.candidateId
+    /\ frontier.candidateId <= frontier.committedThrough
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Acknowledged",
+            !.acknowledgedThrough = frontier.candidateId,
+            !.nextId = frontier.candidateId + 1]
+    /\ UNCHANGED frontierWitness
+
+FrontierFinish ==
+    /\ frontier.phase \in {"Acknowledged", "Rejected"}
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Idle",
+            !.candidateId = 0,
+            !.candidateFence = 0,
+            !.candidateKind = "none",
+            !.issuedId = 0,
+            !.issuedFence = 0,
+            !.issuedKind = "none",
+            !.issuedToken = 0,
+            !.sampledThrough = 0,
+            !.sampledToken = 0,
+            !.lostResponsePending = FALSE,
+            !.recoveryAdoptingSuccessor = FALSE]
+    /\ UNCHANGED frontierWitness
+
+(* A crash loses only runtime state. Durable objects and the checkpoint remain. *)
+FrontierCrash ==
+    /\ frontier.phase \in {"Prepared", "LogDurable", "FrontierDurable", "Installed"}
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "NeedsRecovery",
+            !.installedThrough = frontier.acknowledgedThrough]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT
+            !.crashPrepared = @ \/ (frontier.phase = "Prepared"),
+            !.crashLogDurable = @ \/ (frontier.phase = "LogDurable"),
+            !.crashFrontierDurable = @ \/ (frontier.phase = "FrontierDurable"),
+            !.crashInstalled = @ \/ (frontier.phase = "Installed")]
+
+(* Every ambiguous/lost-response recovery begins with a real exact checkpoint read. The sampled
+   token must still match before either install or a successor contribution is allowed. *)
+FrontierReadCheckpoint ==
+    /\ frontier.phase = "NeedsRecovery"
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "CheckpointRead",
+            !.sampledThrough = frontier.committedThrough,
+            !.sampledToken = frontier.checkpointToken]
+    /\ UNCHANGED frontierWitness
+
+FrontierRecoverAbsentAttempt ==
+    /\ frontier.phase = "CheckpointRead"
+    /\ frontier.checkpointToken = frontier.sampledToken
+    /\ frontier.candidateId = frontier.sampledThrough + 1
+    /\ frontier.objectKind[frontier.candidateId] = "none"
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Idle",
+            !.candidateId = 0,
+            !.candidateFence = 0,
+            !.candidateKind = "none",
+            !.issuedId = 0,
+            !.issuedFence = 0,
+            !.issuedKind = "none",
+            !.issuedToken = 0,
+            !.sampledThrough = 0,
+            !.sampledToken = 0,
+            !.lostResponsePending = FALSE,
+            !.recoveryAdoptingSuccessor = FALSE]
+    /\ UNCHANGED frontierWitness
+
+FrontierValidateDurableCandidate ==
+    /\ frontier.phase = "CheckpointRead"
+    /\ frontier.checkpointToken = frontier.sampledToken
+    /\ frontier.candidateId # 0
+    /\ frontier.candidateId <= frontier.sampledThrough
+    /\ FrontierCandidateMatchesObject
+    /\ frontier' = [frontier EXCEPT !.phase = "RecoveryValidated"]
+    /\ UNCHANGED frontierWitness
+
+FrontierInstallValidated ==
+    /\ frontier.phase = "RecoveryValidated"
+    /\ frontier.checkpointToken = frontier.sampledToken
+    /\ frontier.candidateId <= frontier.sampledThrough
+    /\ FrontierCandidateMatchesObject
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Installed",
+            !.installedThrough = frontier.candidateId,
+            !.lostResponsePending = FALSE]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT
+            !.lostFrontierResponse =
+                @ \/ (frontier.lostResponsePending
+                       /\ frontier.recoveryAdoptingSuccessor
+                       /\ frontier.objectFence[frontier.candidateId] # frontier.issuedFence),
+            !.exactSuccessorAdopted =
+                @ \/ (frontier.recoveryAdoptingSuccessor
+                       /\ frontier.objectFence[frontier.candidateId] # frontier.issuedFence)]
+
+(* The successor's seal first wins the conditional-create slot. Its CURRENT-fence checkpoint CAS is
+   a separate request; that request atomically publishes both `lastEpochSeal` and the frontier and
+   may itself lose its response. *)
+FrontierSuccessorSealCreate ==
+    /\ frontier.phase = "Prepared"
+    /\ frontier.currentFence = 2
+    /\ frontier.candidateFence = 1
+    /\ frontier.candidateId = frontier.committedThrough + 1
+    /\ frontier.objectKind[frontier.candidateId] = "none"
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "SealDurable",
+            !.objectKind[frontier.candidateId] = "seal",
+            !.objectFence[frontier.candidateId] = frontier.currentFence,
+            !.objectPrev[frontier.candidateId] = frontier.committedThrough]
+    /\ UNCHANGED frontierWitness
+
+FrontierIssueSuccessorSeal ==
+    /\ frontier.phase = "SealDurable"
+    /\ frontier.candidateId = frontier.committedThrough + 1
+    /\ FrontierObjectIsExact(frontier.candidateId, "seal")
+    /\ frontier.objectFence[frontier.candidateId] = frontier.currentFence
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "FrontierIssued",
+            !.issuedId = frontier.candidateId,
+            !.issuedFence = frontier.currentFence,
+            !.issuedKind = "seal",
+            !.issuedToken = frontier.checkpointToken,
+            !.recoveryAdoptingSuccessor = FALSE]
+    /\ UNCHANGED frontierWitness
+
+FrontierFinishSealPublication ==
+    /\ frontier.phase = "FrontierDurable"
+    /\ frontier.issuedKind = "seal"
+    /\ frontier.lastEpochSeal = frontier.issuedId
+    /\ frontier.committedThrough = frontier.issuedId
+    /\ frontier' = [frontier EXCEPT !.phase = "Rejected"]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT !.sealPublishedAtFrontier = TRUE]
+
+FrontierResolveLostSeal ==
+    /\ frontier.phase = "CheckpointRead"
+    /\ frontier.lostResponsePending
+    /\ frontier.issuedKind = "seal"
+    /\ frontier.checkpointToken = frontier.sampledToken
+    /\ frontier.sampledThrough = frontier.candidateId
+    /\ frontier.lastEpochSeal = frontier.candidateId
+    /\ FrontierObjectIsExact(frontier.candidateId, "seal")
+    /\ frontier' =
+        [frontier EXCEPT
+            !.phase = "Rejected",
+            !.lostResponsePending = FALSE]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT
+            !.sealPublishedAtFrontier = TRUE,
+            !.lostSealResponseResolved = TRUE]
+
+FrontierOldWriterLosesToSeal ==
+    /\ frontier.phase \in {"FrontierDurable", "NeedsRecovery", "CheckpointRead", "Rejected"}
+    /\ frontier.candidateKind = "log"
+    /\ frontier.objectKind[frontier.candidateId] = "seal"
+    /\ frontier.objectFence[frontier.candidateId] = frontier.currentFence
+    /\ frontier.candidateFence # frontier.currentFence
+    /\ frontier.committedThrough = frontier.candidateId
+    /\ frontier.lastEpochSeal = frontier.candidateId
+    /\ UNCHANGED frontier
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT !.oldWriterLostToSeal = TRUE]
+
+FrontierPublishSnapshotBody ==
+    /\ frontier.snapshotBodyThrough < frontier.committedThrough
+    /\ frontier' =
+        [frontier EXCEPT !.snapshotBodyThrough = frontier.committedThrough]
+    /\ UNCHANGED frontierWitness
+
+FrontierPublishSnapshotCheckpoint ==
+    /\ frontier.checkpointSnapshot < frontier.snapshotBodyThrough
+    /\ frontier.snapshotBodyThrough <= frontier.committedThrough
+    /\ frontier' =
+        [frontier EXCEPT
+            !.checkpointSnapshot = frontier.snapshotBodyThrough,
+            !.checkpointToken = @ + 1]
+    /\ frontierWitness' =
+        [frontierWitness EXCEPT !.snapshotPublishedAtFrontier = TRUE]
+
+(* ---- Task 5b load-bearing sabotages ---- *)
+
+FrontierAckBeforeCheckpoint ==
+    /\ SabotageAckBeforeFrontier
+    /\ frontier.phase = "LogDurable"
+    /\ frontier' =
+        [frontier EXCEPT !.acknowledgedThrough = frontier.candidateId]
+    /\ UNCHANGED frontierWitness
+
+FrontierAllocateBeforeCheckpoint ==
+    /\ SabotageAllocateBeforeFrontier
+    /\ frontier.phase = "LogDurable"
+    /\ frontier' = [frontier EXCEPT !.nextId = frontier.candidateId + 1]
+    /\ UNCHANGED frontierWitness
+
+FrontierInstallUncommitted ==
+    /\ SabotageInstallAboveFrontier
+    /\ frontier.phase = "LogDurable"
+    /\ frontier' =
+        [frontier EXCEPT !.installedThrough = frontier.candidateId]
+    /\ UNCHANGED frontierWitness
+
+FrontierStaleAdvance ==
+    /\ SabotageStaleFrontier
+    /\ frontier.phase = "Prepared"
+    /\ frontier.currentFence # frontier.candidateFence
+    /\ frontier.candidateId = frontier.committedThrough + 1
+    /\ frontier.objectKind[frontier.candidateId] = "none"
+    /\ frontier' =
+        [frontier EXCEPT !.committedThrough = frontier.candidateId]
+    /\ UNCHANGED frontierWitness
+
+FrontierSnapshotAboveCheckpoint ==
+    /\ SabotageSnapshotAboveFrontier
+    /\ frontier.committedThrough < MaxSeq
+    /\ frontier' =
+        [frontier EXCEPT !.checkpointSnapshot = frontier.committedThrough + 1]
+    /\ UNCHANGED frontierWitness
+
+FrontierSealAboveCheckpoint ==
+    /\ SabotageSealAboveFrontier
+    /\ frontier.committedThrough < MaxSeq
+    /\ frontier' =
+        [frontier EXCEPT !.lastEpochSeal = frontier.committedThrough + 1]
+    /\ UNCHANGED frontierWitness
+
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
 
-Next ==
+LegacyStep ==
     \/ WriterAppend \/ WAttemptAmbiguous \/ WResolveDurable
     \/ WResolveConclusiveReject \/ WResolveSealRejected \/ WOrphanLands
     \/ LatePredecessorPut
@@ -499,7 +964,34 @@ Next ==
     \/ RWalkStep \/ RWalkVanish \/ RSealSlot \/ RAdoptStraggler
     \/ RScanStep \/ RScanInstall
     \/ ReaderReset
-    \/ NoOp
+
+FrontierStep ==
+    \/ FrontierStartLog \/ FrontierLogDurable \/ FrontierMoveFence
+    \/ FrontierIssueCheckpoint
+    \/ \E response \in {"delivered", "lost"} : FrontierCheckpointLinearizes(response)
+    \/ FrontierInstall \/ FrontierAcknowledge \/ FrontierFinish \/ FrontierCrash
+    \/ FrontierReadCheckpoint \/ FrontierRecoverAbsentAttempt
+    \/ FrontierValidateDurableCandidate \/ FrontierInstallValidated
+    \/ FrontierIssueRecoverySuccessor
+    \/ FrontierSuccessorSealCreate \/ FrontierIssueSuccessorSeal
+    \/ FrontierFinishSealPublication \/ FrontierResolveLostSeal
+    \/ FrontierOldWriterLosesToSeal
+    \/ FrontierPublishSnapshotBody \/ FrontierPublishSnapshotCheckpoint
+    \/ FrontierAckBeforeCheckpoint \/ FrontierAllocateBeforeCheckpoint
+    \/ FrontierInstallUncommitted \/ FrontierStaleAdvance
+    \/ FrontierSnapshotAboveCheckpoint \/ FrontierSealAboveCheckpoint
+
+LegacyNext ==
+    /\ ~FrontierSlice
+    /\ LegacyStep
+    /\ UNCHANGED frontierVars
+
+FrontierNext ==
+    /\ FrontierSlice
+    /\ FrontierStep
+    /\ UNCHANGED legacyVars
+
+Next == LegacyNext \/ FrontierNext \/ NoOp
 
 Spec == Init /\ [][Next]_vars
 
@@ -541,6 +1033,50 @@ INV_NO_PHANTOM == ~ phantomEver
    vanish": under this witness there is nothing to vanish. *)
 W_NO_HINT_HOLE == ~ (rPhase = "done" /\ \E i \in logs : i > rBase /\ i \notin rTail)
 
+(* Task 5b safety: durable logical history is exactly the contiguous, token-CAS-proved chain named
+   by `_ckpt.committed_through`. Install, acknowledgement and successor allocation may trail that
+   fact but can never lead it. *)
+INV_EXACT_COMMITTED_FRONTIER ==
+    ~FrontierSlice \/
+    \A i \in 1..frontier.committedThrough :
+        /\ frontier.objectKind[i] # "none"
+        /\ frontier.objectFence[i] \in FrontierFences
+        /\ frontier.objectPrev[i] = i - 1
+        /\ i \in frontier.validFrontierProofs
+
+INV_INSTALL_NOT_ABOVE_FRONTIER ==
+    ~FrontierSlice \/ frontier.installedThrough <= frontier.committedThrough
+
+INV_ACK_NOT_BEFORE_FRONTIER ==
+    ~FrontierSlice \/ frontier.acknowledgedThrough <= frontier.committedThrough
+
+INV_ACK_NOT_BEFORE_INSTALL ==
+    ~FrontierSlice \/ frontier.acknowledgedThrough <= frontier.installedThrough
+
+INV_NEXT_ID_NOT_BEFORE_FRONTIER ==
+    ~FrontierSlice \/ frontier.nextId <= frontier.committedThrough + 1
+
+INV_SNAPSHOT_NOT_ABOVE_FRONTIER ==
+    ~FrontierSlice \/ frontier.checkpointSnapshot <= frontier.committedThrough
+
+INV_SEAL_NOT_ABOVE_FRONTIER ==
+    ~FrontierSlice \/ frontier.lastEpochSeal <= frontier.committedThrough
+
+(* Reachability controls. Each is checked in its own witness config; violation means the honest
+   crash/race window was reached while all safety invariants preceding it remained green. *)
+W_CRASH_PREPARED == ~frontierWitness.crashPrepared
+W_CRASH_LOG_DURABLE == ~frontierWitness.crashLogDurable
+W_CRASH_FRONTIER_DURABLE == ~frontierWitness.crashFrontierDurable
+W_CRASH_INSTALLED == ~frontierWitness.crashInstalled
+W_LOST_FRONTIER_RESPONSE == ~frontierWitness.lostFrontierResponse
+W_EXACT_SUCCESSOR_ADOPTED == ~frontierWitness.exactSuccessorAdopted
+W_OLD_WRITER_LOST_TO_SEAL == ~frontierWitness.oldWriterLostToSeal
+W_ISSUED_CAS_LINEARIZED_AFTER_FENCE_MOVE ==
+    ~frontierWitness.issuedCasLinearizedAfterFenceMove
+W_SNAPSHOT_PUBLISHED_AT_FRONTIER == ~frontierWitness.snapshotPublishedAtFrontier
+W_SEAL_PUBLISHED_AT_FRONTIER == ~frontierWitness.sealPublishedAtFrontier
+W_LOST_SEAL_RESPONSE_RESOLVED == ~frontierWitness.lostSealResponseResolved
+
 TypeOK ==
     /\ op \in [Ids -> Ops]
     /\ writtenEver \subseteq Seqs
@@ -564,6 +1100,13 @@ TypeOK ==
     /\ rScanPos \in 0..MaxSeq
     /\ rSeenLogs \subseteq Seqs
     /\ rRestarts \in 0..MaxRestarts
+    /\ frontier \in FrontierState
+    /\ frontierWitness \in FrontierWitnessState
 
-THEOREM Spec => [](TypeOK /\ INV_RECOVERY /\ INV_NOFAIL /\ INV_DENSE /\ INV_NO_GHOST /\ INV_NO_PHANTOM)
+THEOREM Spec =>
+    [](TypeOK /\ INV_RECOVERY /\ INV_NOFAIL /\ INV_DENSE /\ INV_NO_GHOST /\ INV_NO_PHANTOM
+      /\ INV_EXACT_COMMITTED_FRONTIER /\ INV_INSTALL_NOT_ABOVE_FRONTIER
+      /\ INV_ACK_NOT_BEFORE_FRONTIER /\ INV_ACK_NOT_BEFORE_INSTALL
+      /\ INV_NEXT_ID_NOT_BEFORE_FRONTIER /\ INV_SNAPSHOT_NOT_ABOVE_FRONTIER
+      /\ INV_SEAL_NOT_ABOVE_FRONTIER)
 =============================================================================

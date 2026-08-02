@@ -12,6 +12,65 @@ once the property it rests on has been seen red). TLC 2.19 (tla2tools, Java 21),
 `java -XX:+UseParallelGC -workers auto`, 32 workers. Every number below is real TLC output from the
 run of 2026-07-28, not an estimate. Whole harness: **129 s, 15/15 expectations met.**
 
+## Task 5b exact committed-frontier extension {#task-5b-exact-committed-frontier-extension}
+
+The 2026-08-02 extension adds the distinct runtime states `LogDurable`, `FrontierDurable`,
+`Installed`, and `Acknowledged`. The exact `_ckpt.committed_through` frontier is the only durable
+authority for install, acknowledgement, successor allocation, snapshot publication, and seal
+publication. Immutable object producer fences are deliberately separate from checkpoint-CAS
+admission fences: after a remount, the current writer may checkpoint exactly one valid old-fence
+successor at `frontier + 1`. Every checkpoint CAS binds an exact sampled token, so an intervening
+checkpoint update invalidates it; a request already issued under the then-current fence may still
+linearize after a fence move.
+
+Recovery after an ambiguous response performs an explicit exact `_ckpt` read and validates both
+the sampled token and exact chain before installing. Seal publication is two actions: a
+conditional-create of the immutable seal, followed by a same-contribution checkpoint CAS that
+atomically advances `lastEpochSeal` and `committedThrough`. Both delivered and lost seal-CAS
+responses are covered. The honest model also publishes snapshot bodies before checkpointing them,
+and neither snapshots nor seals may name a value above the frontier.
+
+The focused official gate was:
+
+```bash
+TLC_JAR=../../../tmp/tla2tools-official.jar \
+  REFSNAPLOG_FOCUSED=1 TLC_WORKERS=1 ./run_refsnaplog.sh
+```
+
+The pinned checker SHA-256 is
+`cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`. The runner's mandatory
+positive temporal smoke was green (2 generated / 1 distinct, depth 1), and all 19 focused
+expectations were met:
+
+| cfg | expected result | states (gen / distinct) | depth | s |
+|---|---|---:|---:|---:|
+| `_frontier_sab_ackbefore` | `INV_ACK_NOT_BEFORE_FRONTIER` violated | 14 / 11 | 4 | 2 |
+| `_frontier_sab_nextbefore` | `INV_NEXT_ID_NOT_BEFORE_FRONTIER` violated | 14 / 11 | 4 | 2 |
+| `_frontier_sab_installabove` | `INV_INSTALL_NOT_ABOVE_FRONTIER` violated | 14 / 11 | 4 | 1 |
+| `_frontier_sab_staleadvance` | `INV_EXACT_COMMITTED_FRONTIER` violated | 18 / 13 | 4 | 2 |
+| `_frontier_sab_snapshotabove` | `INV_SNAPSHOT_NOT_ABOVE_FRONTIER` violated | 4 / 4 | 2 | 2 |
+| `_frontier_sab_sealabove` | `INV_SEAL_NOT_ABOVE_FRONTIER` violated | 4 / 4 | 2 | 1 |
+| `_frontier_witness_crash_prepared` | `W_CRASH_PREPARED` violated as evidence | 7 / 6 | 3 | 2 |
+| `_frontier_witness_crash_logdurable` | `W_CRASH_LOG_DURABLE` violated as evidence | 13 / 10 | 4 | 1 |
+| `_frontier_witness_crash_frontierdurable` | `W_CRASH_FRONTIER_DURABLE` violated as evidence | 53 / 32 | 6 | 2 |
+| `_frontier_witness_crash_installed` | `W_CRASH_INSTALLED` violated as evidence | 93 / 55 | 7 | 2 |
+| `_frontier_witness_lostresponse` | exact-read lost-response recovery reached | 888 / 412 | 11 | 1 |
+| `_frontier_witness_exactsuccessor` | new-fence adoption of exact old-fence successor reached | 290 / 154 | 9 | 2 |
+| `_frontier_witness_oldwriterseal` | old writer's log loses to successor seal | 124 / 71 | 7 | 2 |
+| `_frontier_witness_issuedlinearizes` | already-issued CAS linearizes after fence move | 48 / 28 | 6 | 1 |
+| `_frontier_witness_snapshot` | honest snapshot publication reached | 103 / 59 | 7 | 2 |
+| `_frontier_witness_seal` | delivered seal publication reached | 123 / 70 | 7 | 2 |
+| `_frontier_witness_lostseal` | lost seal-CAS response resolved by exact read | 250 / 134 | 8 | 1 |
+| `_frontier_safe` | **GREEN** | 103,335 / 35,166 | 36 | 3 |
+| `_v9_safe` (unchanged legacy control) | **GREEN** | 7,949,790 / 1,701,470 | 48 | 70 |
+
+The earlier full-suite attempt also completed the unchanged `_v9_safe_deep` control green at
+177,992,259 generated / 32,925,718 distinct states, depth 61, in 325 s. The following
+`_v9_flip_latepred_deep` run was stopped for resource pressure after 118 s at depth 28, with
+36,641,133 generated / 7,959,696 distinct / 2,023,004 queued states. It is **incomplete, not a
+green result**; the completed 2026-07-28 baseline for that same legacy config remains recorded in
+the historical table below. Per the focused review gate, the expensive deep run was not repeated.
+
 Constants unless the row says otherwise: `MaxSeq = 4`, `MaxRestarts = 2`.
 
 ## Headline
