@@ -167,7 +167,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         Rec row = start;
         row.event_type = Rec::EventType::Phase;
         row.phase = p.phase;
-        row.phase_duration_us = p.duration_us;
+        row.phase_duration_microseconds = p.duration_us;
         row.phase_metrics = p.metrics;
         row.profile_events = p.profile_events;
         emit(row);

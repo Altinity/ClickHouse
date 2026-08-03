@@ -21,12 +21,12 @@ from soak.signals import CAS_SIGNAL_EVENTS, PhaseCoverage, SignalTracker
 PHASE_ROWS = "\n".join([
     json.dumps({"phase": "fold_ref_group", "rounds": "2", "calls": "2", "total_us": "5000",
                 "max_us": "3000", "logs_accounted": "0", "logs_applied": "0",
-                "txns_unapplied": "0", "ref_folding_aborted": "0",
+                "transactions_unapplied": "0", "ref_folding_aborted": "0",
                 "metrics": {"ref_keys_listed": "12", "ref_folding_aborted": "0"},
                 "events": {"S3ListObjects": "6"}}),
     json.dumps({"phase": "fold_ref_intake", "rounds": "2", "calls": "2", "total_us": "800",
                 "max_us": "500", "logs_accounted": "9", "logs_applied": "9",
-                "txns_unapplied": "0", "ref_folding_aborted": "0",
+                "transactions_unapplied": "0", "ref_folding_aborted": "0",
                 "metrics": {"logs_accounted": "9", "logs_applied": "9"}, "events": {}}),
 ])
 

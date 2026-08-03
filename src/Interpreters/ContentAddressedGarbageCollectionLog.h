@@ -46,7 +46,7 @@ struct ContentAddressedGarbageCollectionLogElement
 
     String round_id;                           /// correlator for every row of one round attempt
     String phase;                              /// empty on START/FINISH
-    UInt64 phase_duration_us = 0;              /// PHASE rows only
+    UInt64 phase_duration_microseconds = 0;              /// PHASE rows only
     std::map<String, UInt64> phase_metrics;    /// PHASE rows only
 
     static std::string name() { return "ContentAddressedGarbageCollectionLog"; }

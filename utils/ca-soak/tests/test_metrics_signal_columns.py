@@ -56,7 +56,7 @@ def test_gc_phase_rows_persist(tmp_path):
     parsed = parse_phase_summary("\n".join([
         _phase_row("fold_ref_group", total_us="900", ref_folding_aborted="2",
                    metrics={"ref_keys_listed": "10"}, events={"S3ListObjects": "4"}),
-        _phase_row("fold_reduce", total_us="100", txns_unapplied="1"),
+        _phase_row("fold_reduce", total_us="100", transactions_unapplied="1"),
     ]))
     written = metrics_mod.record_phases(
         conn, metrics_mod.phase_row_dicts(1234, "GC checkpoint", "Node(ch1)", parsed))
@@ -68,4 +68,4 @@ def test_gc_phase_rows_persist(tmp_path):
     # The whole maps survive the run: the load study does not yet know which key it will need.
     assert '"ref_keys_listed": 10' in by_phase["fold_ref_group"]["metrics_json"]
     assert '"S3ListObjects": 4' in by_phase["fold_ref_group"]["events_json"]
-    assert by_phase["fold_reduce"]["txns_unapplied"] == 1
+    assert by_phase["fold_reduce"]["transactions_unapplied"] == 1

@@ -239,7 +239,7 @@ TEST(CASOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
     ASSERT_TRUE(fold_reduce.has_value());
     EXPECT_EQ(fold_reduce->metrics.at("unmatched_removes"), 0u)
         << "the orphan source retirements are exact removes against a present edge, never an unmatched one";
-    EXPECT_EQ(fold_reduce->metrics.at("txns_unapplied"), 0u)
+    EXPECT_EQ(fold_reduce->metrics.at("transactions_unapplied"), 0u)
         << "the retirement input rides the reducer alongside ordinary deltas without stranding a "
            "committed+produced ref transaction unapplied";
 }

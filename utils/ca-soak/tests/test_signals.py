@@ -171,7 +171,7 @@ def _phase_row(phase, **kw):
         "max_us": "600",
         "logs_accounted": "0",
         "logs_applied": "0",
-        "txns_unapplied": "0",
+        "transactions_unapplied": "0",
         "ref_folding_aborted": "0",
         "metrics": {},
         "events": {},
@@ -193,17 +193,17 @@ def test_phase_summary_sql_scopes_to_phase_rows_and_the_window():
     # round_id, not `round`: `round` is 0 on Start and nonexistent on a non-leader round, i.e. absent
     # from exactly the rounds worth correlating.
     assert "uniqExact(round_id)" in sql
-    for detector in ("logs_accounted", "logs_applied", "txns_unapplied"):
+    for detector in ("logs_accounted", "logs_applied", "transactions_unapplied"):
         assert f"phase_metrics['{detector}']" in sql
 
 
 def test_parse_phase_summary_accepts_json_quoted_64bit_integers():
     """ClickHouse quotes UInt64 in JSON by default (`output_format_json_quote_64bit_integers`)."""
-    text = _phase_row("fold_reduce", total_us="123456", txns_unapplied="2",
+    text = _phase_row("fold_reduce", total_us="123456", transactions_unapplied="2",
                       metrics={"shards_reduced": "8"}, events={"S3ListObjects": "40"})
     rows = parse_phase_summary(text)
     assert rows[0]["total_us"] == 123456
-    assert rows[0]["txns_unapplied"] == 2
+    assert rows[0]["transactions_unapplied"] == 2
     assert rows[0]["metrics"] == {"shards_reduced": 8}
     assert rows[0]["events"] == {"S3ListObjects": 40}
 
@@ -225,11 +225,11 @@ def test_summarize_surfaces_the_detector_values():
     text = "\n".join([
         _phase_row("fold_ref_group", ref_folding_aborted="1"),
         _phase_row("fold_ref_intake", logs_accounted="10", logs_applied="7"),
-        _phase_row("fold_reduce", txns_unapplied="3"),
+        _phase_row("fold_reduce", transactions_unapplied="3"),
     ])
     s = summarize_phases(parse_phase_summary(text))
     assert s["detector"]["fold_ref_group.ref_folding_aborted"] == 1
-    assert s["detector"]["fold_reduce.txns_unapplied"] == 3
+    assert s["detector"]["fold_reduce.transactions_unapplied"] == 3
     # The identity the intake pair exists to check: every position the sealed cut covers reached the
     # single cursor-advance site.
     assert s["intake_mismatch"] == 3
@@ -320,10 +320,10 @@ def test_phase_coverage_counts_gaps_and_empty_windows_apart():
     c.observe(None)
     c.observe(summarize_phases([]))
     c.observe(summarize_phases(parse_phase_summary(
-        _phase_row("fold_reduce", max_us="900", txns_unapplied="1"))))
+        _phase_row("fold_reduce", max_us="900", transactions_unapplied="1"))))
     assert (c.attempts, c.gaps, c.empty, c.captured) == (3, 1, 1, 1)
     assert c.worst_phase_us["fold_reduce"] == 900
-    assert c.detector_peak["fold_reduce.txns_unapplied"] == 1
+    assert c.detector_peak["fold_reduce.transactions_unapplied"] == 1
 
 
 def test_phase_coverage_report_warns_when_never_captured():

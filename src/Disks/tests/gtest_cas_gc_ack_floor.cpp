@@ -882,7 +882,7 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
             ++fence_out_rows;
             EXPECT_EQ(e.outcome, "fenced");
             EXPECT_FALSE(e.reason.empty());
-            const auto it = e.detail.find("srid");
+            const auto it = e.detail.find("server_root_id");
             ASSERT_NE(it, e.detail.end());
             EXPECT_EQ(it->second, srid2);
         }

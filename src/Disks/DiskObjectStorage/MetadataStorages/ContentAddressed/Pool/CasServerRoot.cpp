@@ -333,7 +333,7 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
     e.object_kind = CasEventObjectKind::None;
     e.outcome = branch;
     e.reason = reason;
-    e.detail["srid"] = srid;
+    e.detail["server_root_id"] = srid;
     e.detail["branch"] = branch;
     if (observed)
     {

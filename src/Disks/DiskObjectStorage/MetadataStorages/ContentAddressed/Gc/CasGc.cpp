@@ -590,7 +590,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.outcome = "fenced";
                 e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
                            "fence (prevents a resumed sleeper from mutating)";
-                e.detail = {{"srid", srid}};
+                e.detail = {{"server_root_id", srid}};
             });
 
         /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
@@ -2839,7 +2839,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     intake_timer->metric("logs_accounted", logs_accounted_this_round);
     intake_timer->metric("logs_applied", logs_applied_this_round);
     intake_timer->metric("deltas_emitted", deltas.size());
-    intake_timer->metric("txns_opened", ledger.txns.size());
+    intake_timer->metric("transactions_opened", ledger.txns.size());
     intake_timer->metric("tables_scanned", ref_tables.size());
     intake_timer->metric("tables_changed", intake_tables_changed);
     intake_timer->metric("tables_clamped", intake_tables_clamped);
@@ -2998,7 +2998,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     ///
     /// PHASE 9/18 `fold_reduce`: the prior-run streaming GETs, one HEAD per zero-transition candidate,
     /// and the run PUTs -- the heaviest phase of a folding round on a pool with churn. It also carries
-    /// probe B2's verdict (`txns_unapplied`), which is 0 on every committed round because a nonzero
+    /// probe B2's verdict (`transactions_unapplied`), which is 0 on every committed round because a nonzero
     /// value throws a few lines below; the row is therefore the forensic record of a round that failed.
     std::optional<GcPhaseTimer> reduce_timer;
     reduce_timer.emplace(phase_sink, "fold_reduce");
@@ -3196,7 +3196,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// PROBE B2's ledger verdict, computed inside the reduce phase so the row carries it; the
     /// fail-closed throw it drives stays below, at its original site before the seal write.
     const std::vector<uint32_t> unapplied_txns = ledger.unapplied();
-    txns_unapplied_this_round = unapplied_txns.size();
+    transactions_unapplied_this_round = unapplied_txns.size();
     {
         uint64_t graduated = 0;
         uint64_t spared = 0;
@@ -3220,7 +3220,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// Published separately from `suppress_destructive` so a reader can tell the frontier term apart
         /// from the anomaly and hold terms without re-deriving the formula from the tally.
         reduce_timer->metric("frontier_complete", result.frontier_complete ? 1 : 0);
-        reduce_timer->metric("txns_unapplied", txns_unapplied_this_round);
+        reduce_timer->metric("transactions_unapplied", transactions_unapplied_this_round);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row
 

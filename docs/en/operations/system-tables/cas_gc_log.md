@@ -34,7 +34,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `event_time_microseconds` ([DateTime64(6)](/sql-reference/data-types/datetime64)) — Event time with microseconds precision.
 - `event_type` ([Enum8](/sql-reference/data-types/enum)) — `Start` or `Finish` of a GC round, or one `Phase` of it.
 - `disk_name` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The content-addressed disk the round ran on.
-- `srid` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The `server_root_id` of the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against [`system.cas_mounts`](/operations/system-tables/cas_mounts).
+- `server_root_id` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Identifies the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against [`system.cas_mounts`](/operations/system-tables/cas_mounts).
 - `gc_id` ([String](/sql-reference/data-types/string)) — The GC scheduler instance id (which mounter ran the round).
 - `trigger` ([Enum8](/sql-reference/data-types/enum)) — `Scheduled` (background tick) or `Manual` (`SYSTEM` command).
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — The GC round number (`0` on a `Start` row).
@@ -55,7 +55,7 @@ specified (it is enabled by default in the shipped `config.xml`).
 - `ProfileEvents` ([Map(LowCardinality(String), UInt64)](/sql-reference/data-types/map)) — On a `Start`/`Finish` row, the per-round `ProfileEvents` delta (the `CAS*` counters and S3/disk events for this round). On a `Phase` row, **that phase's** delta, so `GROUP BY phase` over `ProfileEvents['S3ListObjects']` attributes the round's `LIST` budget to the phase that spent it.
 - `round_id` ([String](/sql-reference/data-types/string)) — The correlator for every row of one round attempt: its `Start`, each of its `Phase` rows, and its `Finish`. Minted per attempt, so unlike `round` it exists even for a round that never committed and for a round that never led. Group by this column to reconstruct one round.
 - `phase` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The GC phase this row describes; empty on `Start`/`Finish`. See [Per-phase rows](#per-phase-rows) for the phase list.
-- `phase_duration_us` ([UInt64](/sql-reference/data-types/int-uint)) — The wall-clock duration of this phase, in microseconds (`Phase` rows only). Microseconds rather than milliseconds because several phases are routinely sub-millisecond and the point of the row is to see when they are not.
+- `phase_duration_microseconds` ([UInt64](/sql-reference/data-types/int-uint)) — The wall-clock duration of this phase, in microseconds (`Phase` rows only). Microseconds rather than milliseconds because several phases are routinely sub-millisecond and the point of the row is to see when they are not.
 - `phase_metrics` ([Map(LowCardinality(String), UInt64)](/sql-reference/data-types/map)) — Phase-specific semantic counts (`Phase` rows only) that a phase computes for itself and no `ProfileEvents` counter can supply. The verb counts ride the `ProfileEvents` column of the same row.
 
 ## Per-phase rows {#per-phase-rows}
@@ -93,13 +93,13 @@ Which phase dominates a round:
 ```sql
 SELECT phase,
        count() AS rounds,
-       quantile(0.5)(phase_duration_us) AS p50_us,
-       quantile(0.99)(phase_duration_us) AS p99_us,
-       sum(phase_duration_us) AS total_us
+       quantile(0.5)(phase_duration_microseconds) AS p50_microseconds,
+       quantile(0.99)(phase_duration_microseconds) AS p99_microseconds,
+       sum(phase_duration_microseconds) AS total_microseconds
 FROM system.cas_gc_log
 WHERE event_type = 'Phase' AND disk_name = 'ca'
 GROUP BY phase
-ORDER BY total_us DESC;
+ORDER BY total_microseconds DESC;
 ```
 
 Which phase spends the `LIST` budget:
@@ -116,7 +116,7 @@ One round, in order — including a round that failed, which is why the correlat
 not `round`:
 
 ```sql
-SELECT phase, phase_duration_us, phase_metrics, ProfileEvents['S3ListObjects'] AS lists
+SELECT phase, phase_duration_microseconds, phase_metrics, ProfileEvents['S3ListObjects'] AS lists
 FROM system.cas_gc_log
 WHERE round_id = '...' AND event_type = 'Phase'
 ORDER BY event_time_microseconds;

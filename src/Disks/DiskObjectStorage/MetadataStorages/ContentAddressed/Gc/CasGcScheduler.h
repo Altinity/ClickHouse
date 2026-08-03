@@ -67,7 +67,7 @@ struct GcRoundLogRecord
     /// Wall time of this phase. MICROseconds, not milliseconds: `meta_pool_wait`, `round_commit` and
     /// `parent_seal_read` are routinely sub-millisecond and the whole point of the row is seeing when
     /// they are not.
-    UInt64 phase_duration_us = 0;
+    UInt64 phase_duration_microseconds = 0;
     /// Phase-specific semantic counts (`Phase` rows only). The per-phase verb counts ride
     /// `profile_events` above instead, so no verb columns are invented.
     std::map<String, UInt64> phase_metrics;

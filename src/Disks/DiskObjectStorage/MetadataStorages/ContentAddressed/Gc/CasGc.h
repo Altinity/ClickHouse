@@ -953,7 +953,7 @@ private:
     /// deltas never reached a shard reducer. 0 on every COMMITTED round -- a nonzero value is
     /// accompanied by the fold's fail-closed throw, so the value only ever exists as the forensic
     /// record of a round that then failed.
-    uint64_t txns_unapplied_this_round = 0;
+    uint64_t transactions_unapplied_this_round = 0;
 
 public:
     /// TEST SEAM: expose catalog-based universe discovery so unit tests can assert it against a catalog

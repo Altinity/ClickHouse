@@ -137,7 +137,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.type = CasEventType::MemberDecommission;
         e.outcome = "begin";
         e.reason = "operator decommission of pool member";
-        e.detail = {{"srid", victim_srid}};
+        e.detail = {{"server_root_id", victim_srid}};
     });
 
     /// The pre-impersonation catalog cut is the complete ownership universe. Physical life keys carry
@@ -204,7 +204,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             e.type = CasEventType::MemberDecommission;
             e.outcome = "namespace_removed";
             e.reason = "decommission dropped a victim namespace";
-            e.detail = {{"srid", victim_srid}, {"namespace", ns_str},
+            e.detail = {{"server_root_id", victim_srid}, {"namespace", ns_str},
                         {"committed", std::to_string(stats.committed_refs)},
                         {"precommits", std::to_string(stats.precommits)}};
         });
@@ -464,7 +464,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.type = CasEventType::MemberDecommission;
         e.outcome = "end";
         e.reason = "decommission finished";
-        e.detail = {{"srid", victim_srid},
+        e.detail = {{"server_root_id", victim_srid},
                     {"namespaces_removed", std::to_string(report.namespaces_removed)},
                     {"warnings", std::to_string(report.warnings.size())},
                     {"slot_removed", report.slot_removed ? "1" : "0"}};

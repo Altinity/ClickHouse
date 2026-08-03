@@ -552,7 +552,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.profile_events = r.profile_events;
         e.round_id = r.round_id;
         e.phase = r.phase;
-        e.phase_duration_us = r.phase_duration_us;
+        e.phase_duration_microseconds = r.phase_duration_microseconds;
         e.phase_metrics = r.phase_metrics;
         /// Best-effort: SystemLog::add never blocks GC; a full queue drops the row with a warning.
         log->add(std::move(e));

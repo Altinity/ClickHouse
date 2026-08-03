@@ -420,7 +420,7 @@ TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
 
     /// Probe B2's verdict. Nonzero would have thrown, so the row can only ever read 0 on a round that
     /// reached its Finish -- which is the point: the column is the round's own attestation.
-    EXPECT_EQ(metricsOf(rows, 0, "fold_reduce").at("txns_unapplied"), 0u);
+    EXPECT_EQ(metricsOf(rows, 0, "fold_reduce").at("transactions_unapplied"), 0u);
 
     /// The honest gap: the meta pool's work runs on other threads, so this row's ProfileEvents delta is
     /// empty by construction and these two counts are its ONLY signal. They must be real numbers.

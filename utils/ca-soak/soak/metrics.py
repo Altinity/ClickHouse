@@ -25,7 +25,7 @@ _COLS = ["ts", "node", "parts_active", "parts_inactive", "table_rows", "bytes_on
 # values have their own columns because they are asserted-on, and the maps are kept whole because the
 # load study that comes next does not know yet which key it will need.
 _PHASE_COLS = ["ts", "checkpoint", "node", "phase", "rounds", "calls", "total_us", "max_us",
-               "logs_accounted", "logs_applied", "txns_unapplied",
+               "logs_accounted", "logs_applied", "transactions_unapplied",
                "ref_folding_aborted", "metrics_json", "events_json"]
 
 _PHASE_TEXT_COLS = ("checkpoint", "node", "phase", "metrics_json", "events_json")
@@ -92,7 +92,7 @@ def phase_row_dicts(ts: int, checkpoint: str, node: str, parsed_rows) -> list:
             "max_us": r["max_us"],
             "logs_accounted": r["logs_accounted"],
             "logs_applied": r["logs_applied"],
-            "txns_unapplied": r["txns_unapplied"],
+            "transactions_unapplied": r["transactions_unapplied"],
             "ref_folding_aborted": r["ref_folding_aborted"],
             "metrics_json": json.dumps(r["metrics"], sort_keys=True),
             "events_json": json.dumps(r["events"], sort_keys=True),

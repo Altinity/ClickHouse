@@ -272,7 +272,7 @@ TEST(CASMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
               MountClaimResult::Claimed);
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::MountClaim);
-    EXPECT_EQ(seen[0].detail.at("srid"), "a");
+    EXPECT_EQ(seen[0].detail.at("server_root_id"), "a");
     EXPECT_EQ(seen[0].detail.at("branch"), "mint");
 
     /// a FOREIGN uuid claiming a live slot -> mount_conflict carrying the current holder's identity
@@ -280,7 +280,7 @@ TEST(CASMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
     (void)claimMount(*backend, layout, "a", UInt128{2}, 1, now_ms, /*ttl_ms=*/10'000, {}, sink);
     ASSERT_FALSE(seen.empty());
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
-    EXPECT_EQ(seen.back().detail.at("srid"), "a");
+    EXPECT_EQ(seen.back().detail.at("server_root_id"), "a");
     /// The conflict must carry the ORIGINAL holder's identity (uuid 1, the minter) — not the
     /// foreign claimer's (uuid 2).
     EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(UInt128{1}));

@@ -9,7 +9,7 @@ Two families:
 * **`system.events` counters** (`CAS_SIGNAL_EVENTS`) — the `Cas*` `ProfileEvents` that carry a
   correctness or availability verdict. Read per metrics tick and, fail-closed, at every checkpoint.
 * **The per-phase GC log** (`system.cas_gc_log`, `event_type='Phase'`,
-  landed 2026-07-26 in `d412f85f749`) — eighteen rows per folding round carrying `phase_duration_us`,
+  landed 2026-07-26 in `d412f85f749`) — eighteen rows per folding round carrying `phase_duration_microseconds`,
   a phase-specific `phase_metrics` map and that phase's `ProfileEvents` delta. Summarised per
   checkpoint into the metrics sqlite so the load study has material that survives the run.
 
@@ -282,12 +282,12 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 #                                      LIST) …
 #   fold_ref_intake.logs_applied     — … versus logs that reached the single cursor-advance site.
 #                                      Inequality means the cursor advanced over unapplied work.
-#   fold_reduce.txns_unapplied       — folded+merged transactions whose blob deltas never reached a
+#   fold_reduce.transactions_unapplied       — folded+merged transactions whose blob deltas never reached a
 #                                      shard reducer. The fail-closed twin of CASGCUnappliedFoldedTransactions.
 DETECTOR_METRICS = (
     ("fold_ref_intake", "logs_accounted"),
     ("fold_ref_intake", "logs_applied"),
-    ("fold_reduce", "txns_unapplied"),
+    ("fold_reduce", "transactions_unapplied"),
     # Not a detector value but the verdict the detectors drive: the round refused to fold.
     ("fold_ref_group", "ref_folding_aborted"),
 )
@@ -295,7 +295,7 @@ DETECTOR_METRICS = (
 # Scalar columns pulled out of `phase_metrics` by name. `map['absent']` is a DEFINED zero for a
 # ClickHouse Map, so these columns are exact whatever the aggregate does with absent keys — unlike
 # reading them back out of a summed map, whose zero-key behaviour we would be depending on.
-_DETECTOR_COLUMNS = ("logs_accounted", "logs_applied", "txns_unapplied",
+_DETECTOR_COLUMNS = ("logs_accounted", "logs_applied", "transactions_unapplied",
                      "ref_folding_aborted")
 
 
@@ -314,7 +314,7 @@ def phase_summary_sql(since_ts: int) -> str:
         f"sum(phase_metrics['{c}']) AS {c}" for c in _DETECTOR_COLUMNS)
     return (
         "SELECT phase, uniqExact(round_id) AS rounds, count() AS calls, "
-        "sum(phase_duration_us) AS total_us, max(phase_duration_us) AS max_us, "
+        "sum(phase_duration_microseconds) AS total_us, max(phase_duration_microseconds) AS max_us, "
         f"{detectors}, "
         "sumMap(CAST(phase_metrics, 'Map(String, UInt64)')) AS metrics, "
         "sumMap(CAST(`ProfileEvents`, 'Map(String, UInt64)')) AS events "

@@ -47,13 +47,13 @@ public:
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "ca-drop-member: open the CA disk read-only (a writable open would claim this tool's "
-                "own srid; the decommission claim happens internally)");
+                "own server_root_id; the decommission claim happens internally)");
 
         const auto host_store = ca->store();
         const auto report = Cas::decommissionPoolMember(
             host_store->poolBackendPtr(), host_store->poolConfig(), srid);
 
-        std::cout << "srid=" << report.srid << "\n"
+        std::cout << "server_root_id=" << report.srid << "\n"
                   << "namespaces_removed=" << report.namespaces_removed << "\n"
                   << "namespaces_already_removed=" << report.namespaces_already_removed << "\n"
                   << "committed_refs_removed=" << report.committed_refs_removed << "\n"

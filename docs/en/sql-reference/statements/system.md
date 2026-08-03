@@ -502,11 +502,11 @@ On success it returns one row with columns `disk`, `performed`, `round`, `genera
 
 ### SYSTEM CAS DROP POOL MEMBER {#system-cas-drop-pool-member}
 
-Permanently decommissions a dead member (`server_root_id`, or `srid`) of a content-addressed disk
-pool. It claims the member's mount slot as an administrative writer — fencing that `srid` from ever
+Permanently decommissions a dead member (`server_root_id`) of a content-addressed disk
+pool. It claims the member's mount slot as an administrative writer — fencing that `server_root_id` from ever
 writing again — then drops every table namespace the member owned, drains eligible manifest debris,
 staging objects, and mountpoint objects belonging to it, and retires the mount slot once all drains
-are confirmed. This is a **destructive, irreversible** operation: only run it once the `srid` is
+are confirmed. This is a **destructive, irreversible** operation: only run it once the `server_root_id` is
 confirmed permanently dead, since it fences the member out even if it later comes back online, and
 it deletes namespace and drain state that cannot be recovered.
 
@@ -515,10 +515,10 @@ transitions, and it does not synchronously reclaim shared blob content — remov
 makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.
 
 ```sql
-SYSTEM CAS DROP POOL MEMBER 'srid' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
+SYSTEM CAS DROP POOL MEMBER 'server_root_id' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
 ```
 
-Both `srid` and `disk_name` are required string literals (an `srid` is an opaque server-root path
+Both `server_root_id` and `disk_name` are required string literals (a `server_root_id` is an opaque server-root path
 that may contain `/`, not a plain identifier, so it cannot be written unquoted).
 
 The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
