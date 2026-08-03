@@ -121,6 +121,17 @@ per commit; full CA gate at lane closures.
   construction on the grounded fixture; TEST-2; codex T5-2 cadence 5→32; T5-3 phase-list sync);
   t6b-impl on LANE-G (`laneg/t6b` from `e497c4a0e6e`, 3 slices). Prose batches D44/D45 recorded.
   `[gc-frontier-one-list]` (BACKLOG:136) deferred to a separate focused session AFTER Stage B.
+- T6b (work-envelope budgets): **COMPLETE and INTEGRATED** — full `laneg/t6b` arc (8 commits
+  through `ae11315badb`) cherry-picked clean into cas-gc-rebuild ending `e8b0d0220b0`. Nine
+  per-round budget settings (six from the slices + three C-fixes), all fail-close, mutation-proven,
+  full CA gate green both builds (278/296, 0 fail 0 abort). Review APPROVE-WITH-NONBLOCKING
+  (t6b-review.md); C1/C2/C4 closed by `0255a67f419`. The codex T6 REJECT is ANSWERED with honest
+  residuals: T6-1 count axes bounded, retained-BYTE axis reduced (1000→100 bodies) NOT bounded;
+  `recoverRefTableDetailedFromAuthority` internal cost = one coarse unit, NOT bounded (correct seam:
+  fsck/rebuild need the complete table); capped spared entries lose their audit outcome record
+  (one-shot log, settlement itself unconditional — INV_NO_LOSS holds); defaults UNCALIBRATED by
+  design — T8 soak calibrates, incl. the `gc_round_sweep_namespace_budget=20` throughput watch item.
+  Fix round (TEST-1/TEST-2 + codex T5-2/T5-3) landed earlier as `7b9a8fc8f2d`+`075b2ed5f01`.
 - T7 (model lane): **COMPLETE**. Lane B: aab2a21d699 + e1599389f93 (10c runners pinned/recorded;
   10f disclosure; shared temporal-smoke regex hardened). Lane A: integrated as afed91f65d2 (A1:
   listedTok RETIRED, 4 configs removed) + e05a62a7b17 (A2: ninth battery — 42/44 immediate, live
