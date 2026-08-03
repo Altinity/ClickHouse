@@ -309,8 +309,9 @@ TEST(CasGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
         << "the hot walk must enumerate the stream tree exactly once";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
         << "the bounded janitor page is a distinct ownership-tree enumeration";
-    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 2u)
-        << "generation zero has no drain read: one cut builds the hot walk plan and one follows the janitor page";
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 3u)
+        << "generation zero has no drain read: one cut builds the hot walk plan, one follows the janitor "
+           "page, and `planManifestCursorPage` takes its own";
     const auto fold_decision = std::find_if(phases.begin(), phases.end(), [](const GcPhaseRecord & phase)
     {
         return phase.phase == "defer_decision";

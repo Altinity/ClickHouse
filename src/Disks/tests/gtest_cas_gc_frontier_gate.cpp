@@ -472,6 +472,7 @@ struct GateVerdict
     bool suppress_destructive = false;
     uint64_t frontier_namespaces = 0;
     uint64_t frontier_proven = 0;
+    uint64_t frontier_unprobed_budget = 0;
 };
 
 GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy policy)
@@ -500,6 +501,8 @@ GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy
                 verdict.frontier_namespaces = *total;
             if (const auto proven = value("frontier_proven"))
                 verdict.frontier_proven = *proven;
+            if (const auto unprobed = value("frontier_unprobed_budget"))
+                verdict.frontier_unprobed_budget = *unprobed;
         }
     });
     gc.runRegularRound({}, /*allow_steal*/true, policy);
@@ -591,18 +594,23 @@ TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductio
 
     Gc gc(store, kGc);
     backend->resetCounts();
+    GateVerdict verdict;
     for (int i = 0; i < 5; ++i)
     {
-        gc.runRegularRound();
+        const GateVerdict round = runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
+        if (round.saw_fold)
+            verdict = round;
         store->renewWatermarkOnce();
     }
 
+    ASSERT_TRUE(verdict.saw_fold) << "no round folded, so none published a gate verdict";
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the blob a hidden namespace still owns must survive";
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "a catalog-named namespace that cannot prove its own frontier leaves the round-wide frontier "
-           "incomplete, so the round destroys NOTHING. Deleted:"
-        << deletedKeysMessage(*backend);
+    EXPECT_TRUE(verdict.frontier_complete)
+        << "the exact-key probe reads at `cursor + 1` and a LIST hole cannot hide an exact key, so the "
+           "catalog-named hidden namespace IS provable — if this is false the blob above survived on "
+           "suppression instead of on its own in-degree, which proves nothing about the edge";
+    EXPECT_FALSE(verdict.suppress_destructive);
 }
 
 /// The arm above asserts "nothing was deleted", which does not on its own distinguish the gate correctly
@@ -796,8 +804,16 @@ TEST(CasGcFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamil
 
     const RootNamespace damaged{"00/damaged@cas@"};
     publish(*backend, layout, damaged, "damaged_ref", 42, DB::UInt128(0xda43));
-    ASSERT_EQ(backend->putOverwrite(layout.refCkptKey(fixture::fixtureLife(damaged)),
-                                    "not a checkpoint").outcome, CasOutcome::Committed);
+    /// Resolved through the catalog, not minted from the namespace name: the corruption has to land on
+    /// the very object the round's own life resolution will read, or the round folds normally and this
+    /// test measures nothing.
+    const std::optional<NamespaceLifeId> damaged_life =
+        CasRefCatalog::lifeIfCataloged(*backend, layout, damaged);
+    ASSERT_TRUE(damaged_life.has_value()) << "the publish must have left a catalog entry to resolve";
+    const std::optional<CkptSample> damaged_ckpt = readCkpt(*backend, layout, *damaged_life);
+    ASSERT_TRUE(damaged_ckpt.has_value()) << "the publish must have left a `_ckpt` to damage";
+    ASSERT_EQ(backend->casPut(layout.refCkptKey(*damaged_life), "not a checkpoint",
+                              damaged_ckpt->token).outcome, CasOutcome::Committed);
 
     backend->resetCounts();
     std::vector<size_t> anomaly_counts;
@@ -873,15 +889,25 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
     Gc gc(store, kGc);
     const DB::UInt128 blob = buildPoolWithWorkAtEverySite(backend, store, gc);
 
-    /// The cursor has to be SEALED while the namespace is still listed -- a hinted target does not spend
-    /// the budget, and an unhinted one with no cursor is a different shape (no genesis at all) that the
-    /// budget never reaches. So: publish, seal under a suppressed round so nothing drains early, then hide.
+    /// The budget is spent only on a namespace the round knows about and can reach NO other way. Three
+    /// conditions, and all three are load-bearing: a SEALED cursor (an unhinted namespace with no cursor
+    /// is a no-genesis shape the budget never reaches), NO listing (a hinted target is walked for free),
+    /// and NO readable `_ckpt` (a recoverable checkpoint proves the frontier without spending a probe --
+    /// which is why publishing and hiding alone leaves the namespace provable and measures nothing).
     const RootNamespace quiet{"00/quiet@cas@"};
     publish(*backend, layout, quiet, "quiet_ref", 43, DB::UInt128(0x9a1e));
     runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
     ASSERT_NE(sealedCursorOf(*backend, layout, quiet), (RefTxnId{}))
         << "without a sealed cursor the namespace never becomes a budget-spending probe target";
-    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
+
+    const std::optional<NamespaceLifeId> quiet_life =
+        CasRefCatalog::lifeIfCataloged(*backend, layout, quiet);
+    ASSERT_TRUE(quiet_life.has_value());
+    const std::optional<CkptSample> quiet_ckpt = readCkpt(*backend, layout, *quiet_life);
+    ASSERT_TRUE(quiet_ckpt.has_value()) << "there must be a `_ckpt` to remove";
+    ASSERT_EQ(backend->deleteExact(layout.refCkptKey(*quiet_life), quiet_ckpt->token).kind,
+              DeleteOutcome::Kind::Deleted);
+    backend->hidePrefix(layout.namespaceStreamPrefix(*quiet_life));
 
     backend->resetCounts();
     const GateVerdict verdict = runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
@@ -889,6 +915,9 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
         runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
 
     ASSERT_TRUE(verdict.saw_fold);
+    EXPECT_GT(verdict.frontier_unprobed_budget, 0u)
+        << "this arm must suppress on the BUDGET term; a zero here means some other suppressor fired and "
+           "the test would pass without ever exhausting a budget";
     EXPECT_LT(verdict.frontier_proven, verdict.frontier_namespaces)
         << "the unprobed namespace must count toward the universe and not toward the proofs";
     EXPECT_FALSE(verdict.frontier_complete);
