@@ -353,3 +353,166 @@ provenance"
   `CasBlobInDegree`, `CasThreeCursorMerge`, `CasGcAckFloor`, `CasGcCondemnMarker`, `CasGcRound`,
   `CasGcSnapRetention`, `CasRefGc`, `CasSweepDeletionPremise` at `build/t6b_comments_test.log` —
   **81/81 tests passed**.
+
+## C-fix follow-up — 2026-08-03 (findings C1, C2, C4)
+
+The independent review (`t6b-review.md`, APPROVE-WITH-NONBLOCKING) named three residuals in what landed:
+the `GcOutcomes` audit log's `spared` arm was uncapped (C1), `folded.mf_cleanup`'s post-CAS delete phase
+was uncapped (C2), and the post-CAS generation-prefix hand-off shared one budget with the ordinary prune,
+letting a prune-heavy round starve the hand-off to zero (C4). This round closes all three with the same
+`GcRoundWorkBudget` pattern the landed slices use: a new field, a matching `ContentAddressedSettings` /
+`PoolConfig` setting, checked before the work, fail-closed on exhaustion.
+
+**Commit:** `0255a67f419` — "ca: gc — outcome, manifest-cleanup and handoff arms under the round budget".
+
+### C1 — `GcOutcomes` outcome-entry cap
+
+New `gc_round_outcome_entry_budget` (default 5000, 0 = unbounded) and `GcRoundWorkBudget::max_outcome_entries`
+/ `outcome_entries_used` / `outcomeEntryAvailable()` in `Gc/CasBlobInDegree.h`. Checked in `Gc::runRegularRound`
+(`Gc/CasGc.cpp`) at both `outcomes[shard].entries.push_back` call sites (the `redelete` loop and the `spared`
+loop) — the cap is a single round-cumulative total across both, matching how every other `GcRoundWorkBudget`
+field is documented (cumulative over the round, not per-shard or per-family).
+
+**Before improvising the "excess entries stay in the durable retired pipeline" framing the dispatch
+suggested, I checked what `spared` actually is:** `settleEntry` (`Gc/CasBlobInDegree.cpp`) settles an entry
+to `spared` UNCONDITIONALLY whenever its recomputed in-degree is `> 0` — INV_NO_LOSS, "recovery wins even
+past the floor" — and that decision already REMOVES the entry from `still_retired` before this outcome-log
+loop ever runs. There is no "still-condemned" state left to carry for a spared entry: it genuinely regained
+a reference and correctly leaves the pipeline regardless of any budget. So the outcome-entry cap here bounds
+ONLY the audit-log write — the `GcOutcomes` object PUT — never the settlement decision itself. On exhaustion,
+`ProfileEvents::CasGcRetiredSpared`, the `GcRecheckVerdict` event, and `forgetCondemnMarker` all still run for
+every entry; only the `OutcomeEntry` push into the per-shard log is skipped. This matches the escape clause in
+the dispatch ("if the outcome record is not load-bearing for correctness, proceed") rather than the assumed
+retain-shaped exhaustion, so I did not stop to ask.
+
+**Test:** `CasGcRound.OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning` (`gtest_cas_gc_round.cpp`) —
+five blobs condemned (owner dropped, indegree 0, durable retired rows), then, BEFORE graduation, a fresh
+manifest re-references all five (the `CasThreeCursorMerge.RecoverySpares` shape driven through the real
+round path). With `gc_round_outcome_entry_budget = 2`: `RoundReport::spared` (tallied from the capped log)
+reports exactly 2, while `CasGcRetiredSpared` increments by the full 5 and all five blobs survive at
+indegree 1 — the decisions all happened; only the audit trail is capped.
+
+**Mutation:** removed the `if (round_work_budget.outcomeEntryAvailable())` guard around the `spared` loop's
+push (kept the counter increment). Result: `total_spared_reported` reported 5 instead of 2 — red for the
+exact stated reason. Reverted; `md5sum` of `Gc/CasGc.cpp` matches the pre-mutation backup and no `MUTATION`
+marker survives in the tree.
+
+### C2 — manifest-cleanup cap: durable-vs-leak determination
+
+New `gc_round_manifest_cleanup_budget` (default 5000) and `GcRoundWorkBudget::max_manifest_cleanup_objects`
+/ `manifest_cleanup_objects_used` / `manifestCleanupAvailable()`. Checked before each `deleteExact` in the
+`manifest_deletes` phase (`Gc/CasGc.cpp`), `break`ing on exhaustion; `t.metric("skipped_budget", ...)` records
+how many were declined.
+
+**Durability determination, with code evidence (the dispatch's required branch point):** `folded.mf_cleanup`
+is **NOT durable across rounds — one-shot from the fold.** In `Gc::foldRefTableIntoLog`'s ref-log intake
+(`Gc/CasGc.cpp`), a transaction's owner-removal edge populates `log_mf_cleanup` only while its log is being
+folded, and that log's cursor (`ledger.markCommitted`, and the durable `last_folded_ref_id` written into
+`result.fold_seal` by THIS round's single `gc/state` CAS) advances PAST it in the very same round — before
+the post-CAS `manifest_deletes` phase even runs. A later round's intake starts strictly above that cursor and
+can never re-fold the same log, so it never re-populates `mf_cleanup` for that manifest. This means a budget-
+declined entry has no pipeline to be "carried" in; the only remaining reclaimer is the orphan-manifest sweep,
+exactly the crash-case backstop the phase's pre-existing comment already named. I corrected that comment (it
+previously said "the bodies are re-derived from the next round's own fold," which is not what the code does)
+to state the one-shot/leak-to-sweep contract directly, since it is directly load-bearing for this fix's
+correctness and I was already editing the adjacent lines.
+
+**Test:** `CasGcRound.ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep` — five tables' manifests
+all owner-removed in one fold; with `gc_round_manifest_cleanup_budget = 2`, exactly 2 bodies are deleted this
+round (`rep.manifests_deleted == 2`) while 3 survive it unchanged. **Non-vacuity/convergence:** the test then
+drives a real epoch crossing (`writeSealAt` + `publishAt` + a manual `RefCkpt` update, mirroring
+`OrphanManifestCursorSweepDeletesAndPersistsCursor`) and a synthetic dead-builder watermark
+(`setWatermarkMinActive`, root id resolved from the namespace's own first path segment per
+`floorForNamespace`), then drives further rounds until the orphan-manifest sweep — a DIFFERENT, pre-existing
+mechanism — reclaims all 5 manifests. This proves the budget-declined remainder is not lost, only handed to
+the correct backstop.
+
+**Mutation:** removed the `if (!round_work_budget.manifestCleanupAvailable()) break;` check (kept the counter
+increment). Result: all 5 manifests deleted in one round instead of 2 — `surviving == 0` instead of 3, red for
+the exact stated reason. Reverted and verified byte-identical.
+
+### C4 — hand-off's own reserve
+
+New `gc_round_handoff_prefix_wholesale_budget` (default 5000) and `GcRoundWorkBudget::max_handoff_prefix_wholesale_objects`
+/ `handoff_prefix_wholesale_objects_used` / `handoffPrefixWholesaleRemaining()`, separate from
+`max_prefix_wholesale_objects` (now prune-only). The post-CAS hand-off site in `Gc::runRegularRound` draws
+from `handoffPrefixWholesaleRemaining()` instead of the prune's shared `prefixWholesaleRemaining()`.
+
+**Seam choice, justified:** the dispatch offered two options — give the hand-off its own reserved budget, or
+run its draw before the prune's. I checked whether reordering alone would suffice, since it is the smaller
+change: it does not, because the hand-off's own eligibility test (`old_ref.generation <= state.snap_pruned_through`)
+reads THIS round's freshly-committed cursor, which the PRUNE phase computes and CASes durably before the
+post-CAS hand-off phase even begins — the hand-off cannot run first without reading a stale cursor. A
+separate reserve is therefore the only seam that does not restructure the round's CAS ordering. It is also the
+right one on the merits: the prune is safe to under-serve any round (its cursor never regresses, so a
+partially-drained generation is simply finished later), while the hand-off is a documented ONE-SHOT event
+whose only reclaimer past this round is `fsck` — so the round that must never be shortchanged is the hand-off,
+not the prune. A separate reserve makes that the structural default rather than a matter of budget luck.
+
+**Test:** `CasGcRetention.HandoffOwnBudgetSurvivesAPruneHeavyRound` — combines the two existing test shapes in
+one round: a debris-heavy generation only the ordinary prune ever touches (mid-drain over several rounds on a
+starvation-small prune budget of 2, mirroring `PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration`),
+running concurrently with an idle-carried ref that finally moves off its own generation (mirroring
+`HandOffDeletesSupersededRef`) in one of those very same mid-drain rounds. Two non-obvious preconditions turned
+out to be load-bearing and are asserted/commented in the test:
+- **`gc_shards = 2`, with the "keep" and "debris" blobs routed to different shards** (deliberately-constructed
+  digests with differing high-64 bits, since `blobShard` reads only that half). With the default single shard,
+  ANY delta anywhere rewrites the pool's one shared blob-target run every round (carrying every unrelated
+  blob's row forward), which silently drags the "kept" ref's own generation forward the moment the debris
+  table is touched — destroying the idle-carry the test depends on. This was caught by a first attempt at this
+  test going green for the wrong reason (the "kept" generation was reclaimed before the intended contended
+  round, observed directly via a temporary debug instrumentation pass, not inferred).
+- **`gc_snap_generations_to_keep = 5`, not the more aggressive `keep = 1` other hand-off tests use**, and the
+  debris generation is minted well AHEAD of the cursor. Otherwise the debris generation's OWN drop-fold would
+  itself be immediately hand-off-eligible that same round (the identical one-round "parent-seal-protects,
+  then hand-off claims" shape `HandOffDeletesSupersededRef` exercises deliberately) — meaning the debris would
+  be drained by the HAND-OFF's reserve, never by the prune, and the test would not exercise contention at all.
+  This was also caught empirically, not derived up front.
+
+With both preconditions in place: the load-bearing assertions show the prune consumes its entire separate
+2-object budget on the debris generation THIS round (`debris_residue_before - debris_residue_after == 2`)
+while the hand-off, drawing from its own 5-object reserve, still fully empties the generation the kept ref
+just moved off (`backend->list(handoff_prefix, ...).keys.empty()`) — the exact invariant the finding names:
+a round with any prefix-wholesale budget at all must never leave the hand-off starved by the prune.
+
+**Mutation:** reverted the hand-off's draw to `round_work_budget.prefixWholesaleRemaining()` /
+`prefix_wholesale_objects_used` (the pre-fix shared pool). Result: the hand-off generation was left non-empty
+(`backend->list(handoff_prefix, ...).keys.empty()` is `false`) — red for the exact stated reason. Reverted and
+verified byte-identical.
+
+### Gates
+
+| gate | result | log |
+|---|---|---|
+| release build `unit_tests_dbms` | `NINJA_EXIT=0` | `build/t6c_build_final_release.log` |
+| ASan build `unit_tests_dbms` | `NINJA_EXIT=0` | `build_asan/t6c_build_asan2.log` |
+| touched suites, release (`CasGcRound`/`CasGcRetention`/`CasGcSnapRetention`/`CasThreeCursorMerge`/`CasBlobInDegree`/`CasGcAckFloor`/`CasRefGc`) | 73/73 | `build/t6c_final_restore_test.log` (post-mutation-restore rerun) |
+| touched suites, ASan (same filter) | 73/73 | `build_asan/t6c_asan_test.log` |
+| full CA gate, release (`generate_cas_suites.sh` + `run_cas_gate_per_suite.sh`) | 278 suites, 21 excluded, 0 unclaimed; **pass=278 fail=0 abort=0** | `build/t6c_gate_gen_release.log`, `build/t6c_gate_release.log`, `build/per_suite_results.txt` |
+| full CA gate, ASan (same) | 296 suites, 3 excluded, 0 unclaimed; **pass=296 fail=0 abort=0** | `build_asan/t6c_gate_asan.log`, `build_asan/per_suite_results.txt` |
+| mutation A (C1) build+run | red for the stated reason, then reverted+rebuilt clean | `build/t6c_mutA_build.log`, `build/t6c_mutA_test.log` |
+| mutation B (C2) build+run | red for the stated reason, then reverted+rebuilt clean | `build/t6c_mutB_build.log`, `build/t6c_mutB_test.log` |
+| mutation C (C4) build+run | red for the stated reason, then reverted+rebuilt clean | `build/t6c_mutC_build.log`, `build/t6c_mutC_test.log` |
+
+Builds were verified `NINJA_EXIT=0` before any test result was trusted, in every row above. No soak was run
+(none was requested for this slice).
+
+### Files touched
+
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp`
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp`
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h`
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp`
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h`
+- `src/Disks/tests/gtest_cas_gc_round.cpp`
+
+### Deviations from the dispatch
+
+None of substance. The dispatch left the C2 durability determination and the C4 seam choice open pending
+investigation; both are resolved above with code evidence rather than assumed. One incidental correction: the
+`manifest_deletes` phase's pre-existing header comment ("bodies are re-derived from the next round's own
+fold") was inaccurate given what the C2 investigation established, and I fixed that one sentence in the same
+commit since it sits directly above the lines I was editing and states the fact this fix's correctness rests
+on.
+  **81/81 tests passed**.
