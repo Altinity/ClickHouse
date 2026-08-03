@@ -749,3 +749,12 @@ a build on a box with headroom.
 Per-test classification: (c) build-shape/timing assumption broken under sanitizer instrumentation —
 same class as `8f9e63c7a19`, not (a) a real CAS bug, not (b) a CI-infra assumption unrelated to the
 product, not (d) flake (3-for-3 deterministic on the failing commit rules that out).
+
+### Watchdog 02:04 {#wd-0204}
+- CI-fix sanity: 2/2 PASSED locally under ASan (CIFIX_EXIT=0); real proof awaits the next CI round
+  (fix in branch as aacc233dc13; no pushes per standing order).
+- Sharded test run #4: the REWRITE WORKS (B/C key-layout assertions passed) — failure is substance:
+  6 CA fatal/error 'DANGLE' text_log entries on node2 after kill-restart under gc_shards=2. Regime
+  change: potential product signal; t8-lead directed to full RCA (verbatim lines, transient-vs-
+  persistent discriminator, fsck evidence) before any fix. Rewrite cap lifted — test is detecting.
+- Soak stage remains queued behind this RCA.
