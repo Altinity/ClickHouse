@@ -7,11 +7,25 @@ def sh(cmd):
 
 BASE = sh("git merge-base altinity/antalya-26.6 HEAD").strip()
 
+# Scratch/quarantine/vendor trees are never documentation, even when their
+# content happens to trip the CAS regex (raw source dumps, vendored
+# compare-and-swap changelogs, etc).
+EXCLUDE_PREFIXES = ("tmp/", "trash/", "__cache__/", "b170_smoke_pool/", "disks/", "ci/tmp/")
+
+def is_excluded(p):
+    if any(p.startswith(prefix) for prefix in EXCLUDE_PREFIXES):
+        return True
+    if os.path.basename(p) == "CMakeLists.txt" or p.endswith(".cmake.txt"):
+        return True
+    return False
+
 # 1. All md/txt added/modified on the branch.
-diff_files = sh(f"git diff {BASE}..HEAD --name-only --diff-filter=AM -- '*.md' '*.txt'").splitlines()
+diff_files = [f for f in sh(f"git diff {BASE}..HEAD --name-only --diff-filter=AM -- '*.md' '*.txt'").splitlines()
+              if not is_excluded(f)]
 
 # 2. Untracked md/txt anywhere in the tree that mention CAS (the diff cannot see these).
-untracked = sh("git ls-files --others --exclude-standard -- '*.md' '*.txt'").splitlines()
+untracked = [f for f in sh("git ls-files --others --exclude-standard -- '*.md' '*.txt'").splitlines()
+             if not is_excluded(f)]
 cas_re = re.compile(r'content[- _]address|\bCAS\b|\bca-(soak|fsck|gc)\b|RefLedger|part.manifest', re.I)
 untracked_cas = []
 for f in untracked:
@@ -27,6 +41,7 @@ explicit = [
     "utils/ca-soak/scenarios/BACKLOG.md",
     "utils/ca-soak/scenarios/RUN_HISTORY.md",
     "utils/ca-soak/scenarios/gc_wedge_forensics_20260710.txt",
+    "diff_25_8_26_3.md",
 ]
 
 seen, rows = set(), []

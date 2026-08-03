@@ -8,3 +8,5 @@ Repo-root junk that is OUT of the doc corpus but needs later cleanup. No action 
 - `disks/` — leftover disk-state directory from local CAS testing.
 - `config_file_for_test.xml` — stray test config file.
 - `compare_clickhouse_version*` (`compare_clickhouse_version.sh`, `compare_clickhouse_version_25.3.result`, `compare_clickhouse_version_26.3.result`) — version-comparison scratch files.
+- `tmp/` — the repo's designated scratch directory (see `CLAUDE.md`); contains raw source/diff dumps from earlier archaeology sessions, not documentation prose.
+- `trash/` — quarantine directory for removed/vendored material (e.g. `trash/contrib/rust_vendor/...`); its Rust-crate `CHANGELOG`/`README` files matched the CAS detector only via the unrelated compare-and-swap sense of "CAS".
