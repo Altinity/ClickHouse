@@ -40,22 +40,6 @@ public:
     /// concurrent bootstrap winner is accepted only after its object is read and decoded.
     static Snapshot initializeEmptyForNewPool(Backend & backend, const Layout & layout);
 
-    /// Stage B (Task 4-C): the REAL catalog life for `ns` if a `Live`/`Removing` entry names it, else
-    /// the deterministic Stage-A fixture identity (`NamespaceLifeId::stageATransition`). For
-    /// non-production discovery-path
-    /// readers -- `recoverRefTableDetailed`, fsck's exact stream walk, `CasOrphanManifestSweep`'s
-    /// active-key set -- which must find whatever a mounted writer actually wrote (a catalog-minted
-    /// incarnation, since Task 4-C's production birth wiring) while staying correct for raw fixtures
-    /// that explicitly seed an empty catalog and then admit a deterministic transition life. For
-    /// namespaces absent from that present catalog, the transitional identity is the only other one
-    /// such fixtures can use. `Creating` is excluded exactly as
-    /// `Gc::discoverUniverse` excludes it: no
-    /// publication can exist under an entry still being created, so there is nothing to resolve to.
-    ///
-    /// NOT for the mounted writer's own open path -- that is `CasRefLedger::resolveNamespaceLife`, which
-    /// MINTS a fresh random life when none exists rather than using a fixture-derived identity.
-    static NamespaceLifeId resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns);
-
     /// The catalog's life for `ns` if a `Live`/`Removing` entry names it, else `nullopt` -- ONE catalog
     /// read and, crucially, NO WRITE OF ANY KIND. This is the resolution a READ or a REMOVAL uses: it
     /// answers "this namespace does not exist" instead of making it exist, which is what

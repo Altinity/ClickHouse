@@ -25,6 +25,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Common/Exception.h>
+#include <Common/SipHash.h>
 #include <Common/thread_local_rng.h>
 
 #include <base/hex.h>
@@ -258,6 +259,10 @@ inline DB::Cas::ManifestEntry blobEntryFor(const String & path, const DB::UInt12
 /// snapshot+log objects GC and recovery actually read); the seeding wrappers below emit through them.
 inline void writeRefLogTxnRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn);
+namespace fixture
+{
+    inline DB::Cas::NamespaceLifeId fixtureLife(const DB::Cas::RootNamespace & ns);
+}
 inline void publishRecoverableCkptForSemanticWrapper(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
     const DB::Cas::RefTxnId & txn_id);
@@ -294,7 +299,7 @@ inline uint64_t appendRefLogSeed(
     /// sentinel), exactly as `writeRefLogTxnRaw` below now does -- otherwise this scan can miss a REAL
     /// incarnation's existing log/snap objects, wrongly conclude the table has none, and prepend a second
     /// `namespaceBirthOp` on top of a namespace that already has one.
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(backend, layout, ns).value_or(fixture::fixtureLife(ns));
     const String prefix = layout.namespaceStreamPrefix(life);
     uint64_t greatest_seq = 0;
     bool any_log_or_snap = false;
@@ -877,9 +882,17 @@ inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & la
 ///      would emit without driving a real writer to produce it.
 namespace fixture
 {
+    /// The deterministic identity a raw fixture uses for a namespace before any catalog entry exists:
+    /// a stable hash of the namespace name, so two fixture writes against the same namespace (and a
+    /// later read) always agree on where to look, without needing a catalog entry to agree through.
+    /// Production incarnations are always catalog-minted (`CasRefCatalog::createNamespace`); this is
+    /// deliberately not that, and every raw fixture below depends on it staying stable byte-for-byte.
     inline DB::Cas::NamespaceLifeId fixtureLife(const DB::Cas::RootNamespace & ns)
     {
-        return DB::Cas::NamespaceLifeId::stageATransition(ns);
+        UInt128 fixture_incarnation = sipHash128(ns.string().data(), ns.string().size());
+        if (fixture_incarnation == 0)
+            fixture_incarnation = 1;
+        return DB::Cas::NamespaceLifeId::fromCatalogEntry(ns, fixture_incarnation);
     }
 }
 
@@ -1041,23 +1054,19 @@ inline void writeRefSnapshotRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefTableSnapshot & snapshot)
 {
     const DB::Cas::RootNamespace ns{snapshot.ns};
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(backend, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refSnapshotKey(life, snapshot.snapshot_id);
     backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(snapshot)));
 }
 
-/// Stage B (Task 4-C): admits `ns` into the catalog as a `Live` entry, IDEMPOTENTLY (a no-op once `ns`
-/// already carries any entry, of any state -- a test that drove one there itself through the real
-/// catalog API is left alone). Pinned to the deterministic Stage-A fixture incarnation
-/// (`NamespaceLifeId::stageATransition`), NOT `CasRefCatalog::createNamespace`'s fresh-random mint:
-/// every raw fixture below keys its ref-log/snapshot objects at that SAME derived id, so a randomly
-/// minted incarnation would not match them and the fold's own R10 incarnation filter
-/// (`{#r10-groupref-alias}`) would drop every one of their keys as belonging to a dead life --
-/// reproducing the exact 164-test failure this function exists to close, through a different door.
+/// Admits `ns` into the catalog as a `Live` entry, IDEMPOTENTLY (a no-op once `ns` already carries
+/// any entry, of any state -- a test that drove one there itself through the real catalog API is left
+/// alone). Pinned to the deterministic `fixture::fixtureLife` incarnation, NOT
+/// `CasRefCatalog::createNamespace`'s fresh-random mint: every raw fixture below keys its ref-log/
+/// snapshot objects at that SAME derived id, so a randomly minted incarnation would not match them and
+/// the fold's own R10 incarnation filter (`{#r10-groupref-alias}`) would drop every one of their keys
+/// as belonging to a dead life.
 ///
-/// BRIDGE, not a resting place -- but NOT this task's to close. `stageATransition` itself remains for
-/// the READER paths until Task 6 replumbs them; ITS deletion and the tree-wide zero-grep gate belong to
-/// Task 6, and this call site is one more use under that SAME existing gate, not a new one to track.
 /// All ten raw-write helpers place ref-log bytes at states production's real birth path structurally
 /// cannot produce (INV-1 holes, out-of-order ids, a table with no `_ckpt` -- see the Task 4-B map), so
 /// they can never route through `createNamespace` and mint a real incarnation of their own.
@@ -1274,15 +1283,15 @@ inline DB::Cas::RecoveredRefTable recoverRefTableDetailedAtCatalogCutForTest(
 /// `CasRefLedger::resolveNamespaceLife`) with a raw follow-up write to the SAME namespace (a
 /// repoint/removal simulation, say) needs this write to land where the real content already lives, not
 /// at an unrelated sentinel prefix the fold never reads for that namespace. `casAdmitEntry` above is a
-/// no-op once any entry exists, so `resolveLifeOrSentinel` here resolves to whichever life is ALREADY
-/// on record -- the real one if a real birth landed first, the sentinel if this call is what admitted
-/// it (via `casAdmitEntry`, moments ago, in this same function).
+/// no-op once any entry exists, so resolving the catalog life here yields whichever life is ALREADY on
+/// record -- the real one if a real birth landed first, the fixture identity if this call is what
+/// admitted it (via `casAdmitEntry`, moments ago, in this same function).
 inline void writeRefLogTxnRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn)
 {
     const DB::Cas::RootNamespace ns{txn.ns};
     casAdmitEntry(backend, layout, ns);
-    const NamespaceLifeId life = CasRefCatalog::resolveLifeOrSentinel(backend, layout, ns);
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(backend, layout, ns).value_or(fixture::fixtureLife(ns));
     const String key = layout.refLogKey(life, txn.txn_id);
     backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)));
 }

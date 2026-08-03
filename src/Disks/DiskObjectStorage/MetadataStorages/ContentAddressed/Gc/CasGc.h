@@ -543,10 +543,10 @@ private:
         std::map<String, RefTableListing> ref_tables;
 
         /// The round's complete immutable post-LIST catalog cut (review C3). Every later consumer in
-        /// the SAME round (`cleanupRefObjects`) must look a namespace up here rather than re-resolving via
-        /// `CasRefCatalog::resolveLifeOrSentinel`, which re-reads the catalog and can see a DIFFERENT
-        /// answer if the namespace was dropped and recreated between the fold's walk and the later call
-        /// -- the exact "delete plan computed under one life, applied under another" shape C3 named.
+        /// the SAME round (`cleanupRefObjects`) must look a namespace up here rather than issuing an
+        /// independent catalog re-read, which can see a DIFFERENT answer if the namespace was dropped
+        /// and recreated between the fold's walk and the later call -- the exact "delete plan computed
+        /// under one life, applied under another" shape C3 named.
         /// Keeping the full cut also preserves the distinction between an absent namespace and a
         /// cataloged but non-walkable `Creating` row; reducing it to a `Live`/`Removing` map loses that
         /// lifecycle fact. A namespace absent from this cut has no legitimate destructive key space;

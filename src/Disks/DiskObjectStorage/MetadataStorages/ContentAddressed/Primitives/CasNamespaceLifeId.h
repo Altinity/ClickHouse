@@ -1,7 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
-#include <Common/SipHash.h>
 #include <base/types.h>
 #include <optional>
 #include <string_view>
@@ -98,21 +97,6 @@ struct NamespaceLifeId
     /// Stage B Task 6 adds the second permanent factory, `fromLiveHandle`: a live reader carries the
     /// id its table was opened under and never re-derives it, so the read side pays no catalog
     /// request (spec §2). It is absent here because the handle type does not exist yet.
-
-    /// TRANSITIONAL -- Stage B Tasks 1 and 1c ONLY, and the ONLY way to reach a life-keyed object from
-    /// a bare namespace. Those tasks migrate the ref-layer AND namespace-file key helpers to this type
-    /// before the catalog that mints real incarnations exists (Task 2) and before the reader paths carry
-    /// handles (Task 6). The transitional identity is a stable opaque hash of the namespace so raw
-    /// fixtures cannot violate Task 4d's pool-wide uniqueness rule merely by naming two namespaces.
-    /// Task 6 DELETES it, gated on a tree-wide grep for `stageATransition`
-    /// finding no build inputs. Do not call it from new code.
-    static NamespaceLifeId stageATransition(RootNamespace ns)
-    {
-        UInt128 transition_incarnation = sipHash128(ns.string().data(), ns.string().size());
-        if (transition_incarnation == 0)
-            transition_incarnation = 1;
-        return NamespaceLifeId{std::move(ns), transition_incarnation};
-    }
 
 private:
     /// Kept private so only the explicit factories above can construct a logical/physical pair.

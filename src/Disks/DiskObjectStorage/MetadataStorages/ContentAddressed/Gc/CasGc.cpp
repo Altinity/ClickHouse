@@ -1365,8 +1365,8 @@ Gc::CheckpointWitnesses Gc::readCheckpointWitnesses(const std::map<String, RefTa
     {
         const RootNamespace ns{ns_str};
         /// Review C3: use the SAME complete catalog cut the round's walk resolved, never an independent
-        /// `resolveLifeOrSentinel` re-read. A namespace absent from the cut, or present only as a
-        /// non-walkable `Creating` row, has no admitted witness key to read this round.
+        /// catalog re-read. A namespace absent from the cut, or present only as a non-walkable
+        /// `Creating` row, has no admitted witness key to read this round.
         const auto entry_it = std::lower_bound(
             catalog_cut.catalog.entries.begin(), catalog_cut.catalog.entries.end(), ns,
             [](const CatalogEntry & entry, const RootNamespace & needle) { return entry.ns < needle; });

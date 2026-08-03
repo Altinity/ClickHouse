@@ -82,16 +82,6 @@ std::optional<NamespaceLifeId> CasRefCatalog::lifeIfCataloged(
     return std::nullopt;
 }
 
-NamespaceLifeId CasRefCatalog::resolveLifeOrSentinel(Backend & backend, const Layout & layout, const RootNamespace & ns)
-{
-    /// Expressed in terms of `lifeIfCataloged` rather than repeating its filter: two copies of "which
-    /// entry states name a usable life" is exactly the kind of pair that drifts apart, and the two
-    /// callers differ ONLY in what they do about absence.
-    if (auto cataloged = lifeIfCataloged(backend, layout, ns))
-        return *cataloged;
-    return NamespaceLifeId::stageATransition(ns);
-}
-
 std::vector<NamespaceLifeId> CasRefCatalog::liveUniverse(Backend & backend, const Layout & layout)
 {
     const Snapshot snap = read(backend, layout);
