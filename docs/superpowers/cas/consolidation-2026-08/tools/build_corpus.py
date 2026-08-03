@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Freeze the CAS doc corpus into corpus-manifest.tsv. Idempotent."""
+import subprocess, sys, os, re
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True).stdout
+
+BASE = sh("git merge-base altinity/antalya-26.6 HEAD").strip()
+
+# 1. All md/txt added/modified on the branch.
+diff_files = sh(f"git diff {BASE}..HEAD --name-only --diff-filter=AM -- '*.md' '*.txt'").splitlines()
+
+# 2. Untracked md/txt anywhere in the tree that mention CAS (the diff cannot see these).
+untracked = sh("git ls-files --others --exclude-standard -- '*.md' '*.txt'").splitlines()
+cas_re = re.compile(r'content[- _]address|\bCAS\b|\bca-(soak|fsck|gc)\b|RefLedger|part.manifest', re.I)
+untracked_cas = []
+for f in untracked:
+    try:
+        with open(f, errors='replace') as fh:
+            if cas_re.search(fh.read(65536)):
+                untracked_cas.append(f)
+    except OSError:
+        pass
+
+# 3. Explicit adds from the user (tracked or not).
+explicit = [
+    "utils/ca-soak/scenarios/BACKLOG.md",
+    "utils/ca-soak/scenarios/RUN_HISTORY.md",
+    "utils/ca-soak/scenarios/gc_wedge_forensics_20260710.txt",
+]
+
+seen, rows = set(), []
+def group_of(p):
+    for prefix in ("docs/superpowers/specs", "docs/superpowers/plans", "docs/superpowers/reports",
+                   "docs/superpowers/worklogs", "docs/superpowers/models", "docs/superpowers/cas",
+                   ".superpowers", "utils/ca-soak", "docs/en", ".claude"):
+        if p.startswith(prefix):
+            return prefix
+    return "other"
+
+for p, tracked in [(f, "Y") for f in diff_files + explicit] + [(f, "N") for f in untracked_cas]:
+    if p in seen or not os.path.exists(p):
+        continue
+    if p.endswith((".tla", ".cfg")):
+        continue
+    seen.add(p)
+    lines = sum(1 for _ in open(p, errors='replace'))
+    last = sh(f"git log -1 --format=%ad --date=short -- '{p}'").strip() if tracked == "Y" else "untracked"
+    rows.append((p, tracked, lines, last, group_of(p)))
+
+rows.sort()
+out = os.path.join(os.path.dirname(__file__), "..", "corpus-manifest.tsv")
+with open(out, "w") as f:
+    f.write("path\ttracked\tlines\tlast_commit\tgroup\n")
+    for r in rows:
+        f.write("\t".join(map(str, r)) + "\n")
+print(f"{len(rows)} files, {sum(r[2] for r in rows)} lines", file=sys.stderr)
