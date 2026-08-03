@@ -34,15 +34,15 @@ The exact entry point can change during implementation, but the contract should 
 
 Recommended default runtime is 15 minutes. Scale tests may have a separate prefill phase that is not
 counted in the 15 minute measurement window, but the prefilled pool must be validated with
-`clickhouse-disks ca-fsck` before the measured phase starts.
+`clickhouse-disks cas-fsck` before the measured phase starts.
 
 ## Common hard assertions
 
 These assertions apply to every positive scenario unless a scenario explicitly states a stricter rule:
 
 - SQL correctness: all replicas return the same aggregates as the scenario oracle.
-- Storage correctness: `clickhouse-disks ca-fsck --detail` reports `dangling = 0`.
-- `GC` safety: `clickhouse-disks ca-gc-dryrun` delete candidates are a subset of the `ca-fsck` unreachable
+- Storage correctness: `clickhouse-disks cas-fsck --detail` reports `dangling = 0`.
+- `GC` safety: `clickhouse-disks cas-gc-dryrun` delete candidates are a subset of the `cas-fsck` unreachable
   set at quiescence.
 - Event audit: `system.cas_log` contains no `read_missing`, `dangling_access`,
   `corrupt_dangle`, `corrupt_decode`, `snap_journal_incoherent`, or `exception` rows unless the scenario is
@@ -129,7 +129,7 @@ They should be treated as first-class scenario targets, not as speculative notes
 - Cold readers (recovery, `fsck`, `GC` fold) pay one `GET` per log above the newest snapshot;
   directory-style operations and table drop are driven by the per-table ref state, not by a shard
   fanout.
-- `ca-gc-dryrun` may be incomplete for `gc_shards > 1`. `previewDeletes` currently previews
+- `cas-gc-dryrun` may be incomplete for `gc_shards > 1`. `previewDeletes` currently previews
   `zeroInDegree` only for target shard `0`. This is not the delete path, but it can make the dry-run
   subset oracle blind to candidates in other target shards.
 - Live structural inspection during precommit-first publish is tricky. Between `precommitAdd` and

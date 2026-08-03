@@ -17,7 +17,7 @@ namespace ErrorCodes
 }
 
 /// Read-only "decode any object" command: takes the RAW object-storage key (e.g. as printed by
-/// `ca-gc-dryrun` or `fsck`) rather than a ClickHouse-relative path, GETs its bytes straight from
+/// `cas-gc-dryrun` or `fsck`) rather than a ClickHouse-relative path, GETs its bytes straight from
 /// the pool's backend, and dispatches to `Cas::caInspectToJson` (the same free function the unit
 /// tests exercise directly against encoder output). Never writes; safe to run against a live pool.
 class CommandCaInspect final : public ICommand
@@ -25,7 +25,7 @@ class CommandCaInspect final : public ICommand
 public:
     CommandCaInspect() : ICommand("CommandCaInspect")
     {
-        command_name = "ca-inspect";
+        command_name = "cas-inspect";
         description = "Decode a content-addressed pool object (by its raw object-storage key) to JSON (read-only).";
         options_description.add_options()("key", po::value<String>(), "the raw object-storage key to decode (mandatory, positional)");
         positional_options_description.add("key", 1);
@@ -39,18 +39,18 @@ public:
 
         auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
         if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-inspect: '{}' is not an object-storage disk", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: '{}' is not an object-storage disk", disk->getName());
 
         auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
         if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-inspect: disk '{}' is not content-addressed", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: disk '{}' is not content-addressed", disk->getName());
 
         if (!ca->isReadOnly())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-inspect: open the CA disk read-only");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: open the CA disk read-only");
 
         const auto got = ca->store()->backend().get(key);
         if (!got)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-inspect: key '{}' does not exist", key);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-inspect: key '{}' does not exist", key);
 
         const Cas::Layout & layout = ca->store()->layout();
         std::optional<Cas::NamespaceLifeId> resolved_life;

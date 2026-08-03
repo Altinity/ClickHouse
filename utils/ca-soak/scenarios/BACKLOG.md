@@ -69,7 +69,7 @@ bottom. Each entry: a short id/title, the run it came from, what was observed, a
 - **Logged (UTC):** 2026-06-27T21:01:18
 - **Severity:** suspected-bug / HIGH (storage leak; safety preserved)
 - **Run:** diagnostic (manual repro on cas-gc-part-manifest-impl @ ae0cc27b1bf5, CH 26.6.1.1)
-- **Observed:** REPRO: fresh pool; create 3-4 ReplicatedMergeTree tables on storage_policy='ca' (wide parts), insert, DROP TABLE ... SYNC all; then issue explicit `SYSTEM CAS GC RUN ca` on BOTH replicas concurrently (or alongside the 2s background scheduler). Result: a stable residual of UNREACHABLE content blobs + part-manifests is left FOREVER (e.g. 5 blobs/~413KB incl a 411KB payload .bin + 2 _manifests tagged reclaimable-pre-precommit). fsck dangling=0 throughout (NO data loss); ca-gc-dryrun lists the orphans as deletable (zeroInDegree); but GC rounds report candidates_marked=0 after the first generation completes, and never delete them. GC log shows many Finish rows with outcome=Error ('CAS gc fold: fold seal ... occupied by divergent bytes (concurrent leader); retry' / ABORTED 236) and NotALeader; gc_fold_begin=40 vs gc_fold_end ok=11 (most folds aborted). CONTRAST: the SAME drop drained to unreachable=0 within ~5s when reclaimed by BACKGROUND GC alone, and single-node SERIAL explicit GC drained 16->0 in one round. So the leak is triggered specifically by CONCURRENT GC LEADERS — explicit `SYSTEM ... GC` (runGarbageCollectionRoundNow) appears NOT to be lease-gated the way the background CasGcScheduler is, so it can run concurrently with the other replica's lease holder. The fold seal correctly aborts the divergent fold (safety: no over-delete, dangling=0), but the colliding/aborted round advances GC generation/cursor state past owner-removal events that were never folded, so those blobs' in-degree never reaches zero in the persistent snapshot and they are never retired (a fresh full re-fold via dryrun still sees them as zero-in-degree). Liveness/reclaim bug, not safety.
+- **Observed:** REPRO: fresh pool; create 3-4 ReplicatedMergeTree tables on storage_policy='ca' (wide parts), insert, DROP TABLE ... SYNC all; then issue explicit `SYSTEM CAS GC RUN ca` on BOTH replicas concurrently (or alongside the 2s background scheduler). Result: a stable residual of UNREACHABLE content blobs + part-manifests is left FOREVER (e.g. 5 blobs/~413KB incl a 411KB payload .bin + 2 _manifests tagged reclaimable-pre-precommit). fsck dangling=0 throughout (NO data loss); cas-gc-dryrun lists the orphans as deletable (zeroInDegree); but GC rounds report candidates_marked=0 after the first generation completes, and never delete them. GC log shows many Finish rows with outcome=Error ('CAS gc fold: fold seal ... occupied by divergent bytes (concurrent leader); retry' / ABORTED 236) and NotALeader; gc_fold_begin=40 vs gc_fold_end ok=11 (most folds aborted). CONTRAST: the SAME drop drained to unreachable=0 within ~5s when reclaimed by BACKGROUND GC alone, and single-node SERIAL explicit GC drained 16->0 in one round. So the leak is triggered specifically by CONCURRENT GC LEADERS — explicit `SYSTEM ... GC` (runGarbageCollectionRoundNow) appears NOT to be lease-gated the way the background CasGcScheduler is, so it can run concurrently with the other replica's lease holder. The fold seal correctly aborts the divergent fold (safety: no over-delete, dangling=0), but the colliding/aborted round advances GC generation/cursor state past owner-removal events that were never folded, so those blobs' in-degree never reaches zero in the persistent snapshot and they are never retired (a fresh full re-fold via dryrun still sees them as zero-in-degree). Liveness/reclaim bug, not safety.
 - **Proposed action:** MAINTAINER DECISION (design-sensitive, TLA+-proven GC core — NOT auto-fixed). Options: (a) make explicit runGarbageCollectionRoundNow acquire/respect the GC lease+fence exactly like the background scheduler, so a non-leader explicit round is a clean NotALeader no-op (no concurrent fold); (b) make the fold-abort path on fold-seal divergence NOT advance the generation/cursor past unfolded owner-removal events (so a later round re-folds them); (c) both. Add a TLA+ liveness/coverage check that every owner-removal event is eventually folded even under concurrent-leader aborts. HARNESS already mitigated: forced_gc_to_fixpoint + gc_drive_round now drive a SINGLE replica serially (commit on scenarios branch) so the suite does not manufacture the collision; scenario S33 added as a regression guard that deliberately drives concurrent explicit GC and asserts no reclaim leak.
 - **RESOLVED 2026-06-28 (attempt-scoped generation).** Root cause was structural: each per-round `gc/gen/<gen>/…` write-once artifact (fold seal, completion seal, in-degree run, part-manifest-cleanup bundle) was keyed by generation ALONE, so a deposed leader wrote a FINAL-key seal before its lease-guarded `gc/state` CAS failed → orphaned write-once seal → every later round recomputed the same generation, hit divergent bytes, and threw `ABORTED` "concurrent leader" forever (`foldDeltasIntoGeneration` also ignored the `putIfAbsent` outcome → divergent run vs seal). Fix: every per-round artifact (incl. `retired`/`outcomes`, which `RetireView` LISTs writer-side) is now written under the folding leader's **attempt** (`= lease.seq`, fresh per round) at `gc/gen/<gen>/attempt/<a>/…`; one lease-guarded fold-adopt CAS sets `(snap_generation, snap_attempt)` (CAS #1) and the completion advance inherits it (CAS #2); ALL readers/resume/prune/RetireView resolve only the adopted `(snap_generation, snap_attempt)`. A deposed leader's artifacts land under its own unadopted attempt — invisible to every decision path — so concurrent leaders never collide on a final-key seal; the next honest round folds a fresh attempt and drains. Deterministic artifacts now go through `putDeterministicArtifact` (byte-equal-or-`CORRUPTED_DATA`); unadopted-attempt debris is reclaimed by the wholesale `gc/gen/<g>/` retention prune. Spec `docs/superpowers/specs/2026-06-28-cas-gc-attempt-scoped-generation-design.md`; plan `docs/superpowers/plans/2026-06-28-cas-gc-attempt-scoped-generation.md`; worklog `docs/superpowers/worklogs/2026-06-28-cas-gc-attempt-scoped-generation-worklog.md`. TLA+ Gate A green (`INV_ONLY_ADOPTED_VIEWABLE` + R0; sabotage `SabotageDeposedLeaderWritesFinalGen` counterexamples; inertness exact) committed `cd27ac6`; 10 code commits `e9d898d`..`b4dde7e` on `cas-gc-part-manifest-impl`; unit regression `CasGcAttempt.DeposedFoldAttemptDoesNotWedge` + decoy tests (`NonAdoptedAttemptSealIgnored`, `NonAdoptedAttemptRetiredSetInvisible`) all green. **S33 LIVENESS verdict flipped: a nonzero residual is now a real regression, not an intended signal.** Still TODO: run S33 on a soak host to confirm end-to-end drain (needs docker RustFS + 2-node cluster — not run in the unattended dev env).
 
@@ -91,7 +91,7 @@ bottom. Each entry: a short id/title, the run it came from, what was observed, a
 
 - **Logged (UTC):** 2026-06-27T21:05:34
 - **Severity:** diagnosis / MAINTAINER DECISION (design-sensitive, TLA+-proven core)
-- **Observed:** Call path: InterpreterSystemQuery::runContentAddressedGarbageCollection (InterpreterSystemQuery.cpp:2165) -> ContentAddressedMetadataStorage::runGarbageCollectionRoundNow (ContentAddressedMetadataStorage.cpp:282) -> CasGcScheduler::runOneRoundNow (CasGcScheduler.cpp:159) -> Cas::Gc::runRegularRound (CasGc.cpp:71). Explicit GC DOES acquire the lease (CasGc.cpp:76 acquireOrRenewLease) but a lease window still admits two concurrent folds. MECHANISM: fold() computes new_generation=snap_generation+1, putIfAbsent's the fold_seal (CasGc.cpp:441); on PreconditionFailed it compares bytes and THROWS ABORTED on divergence (CasGc.cpp:444-446) BEFORE updating snap_generation + CAS'ing gc/state (CasGc.cpp:450-451). So the loser's gc/state never advances to N+1. fold_seal and gc/state are NOT atomic. Next round reads cursors from generation N (CasGc.cpp:215 / readSealedCursors CasGc.cpp:1129); if N has no seal, parent_cursors is EMPTY and the fold restarts from cursor=0, but the durable fold_seal(N+1) written by the winner is never re-adopted into gc/state, so owner-removal events folded in the divergent N+1 fold are never re-folded -> those blobs' in-degree never reaches 0 -> never retired. A fresh full re-fold (ca-gc-dryrun previewDeletes) still sees them at zero in-degree, hence the dryrun-vs-actual discrepancy. Relates to TLA+ MonotoneGC cursor invariant (CaGcRootLocalPartManifestCore.tla:1112-1114, 208-214).
+- **Observed:** Call path: InterpreterSystemQuery::runContentAddressedGarbageCollection (InterpreterSystemQuery.cpp:2165) -> ContentAddressedMetadataStorage::runGarbageCollectionRoundNow (ContentAddressedMetadataStorage.cpp:282) -> CasGcScheduler::runOneRoundNow (CasGcScheduler.cpp:159) -> Cas::Gc::runRegularRound (CasGc.cpp:71). Explicit GC DOES acquire the lease (CasGc.cpp:76 acquireOrRenewLease) but a lease window still admits two concurrent folds. MECHANISM: fold() computes new_generation=snap_generation+1, putIfAbsent's the fold_seal (CasGc.cpp:441); on PreconditionFailed it compares bytes and THROWS ABORTED on divergence (CasGc.cpp:444-446) BEFORE updating snap_generation + CAS'ing gc/state (CasGc.cpp:450-451). So the loser's gc/state never advances to N+1. fold_seal and gc/state are NOT atomic. Next round reads cursors from generation N (CasGc.cpp:215 / readSealedCursors CasGc.cpp:1129); if N has no seal, parent_cursors is EMPTY and the fold restarts from cursor=0, but the durable fold_seal(N+1) written by the winner is never re-adopted into gc/state, so owner-removal events folded in the divergent N+1 fold are never re-folded -> those blobs' in-degree never reaches 0 -> never retired. A fresh full re-fold (cas-gc-dryrun previewDeletes) still sees them at zero in-degree, hence the dryrun-vs-actual discrepancy. Relates to TLA+ MonotoneGC cursor invariant (CaGcRootLocalPartManifestCore.tla:1112-1114, 208-214).
 - **Proposed action:** MAINTAINER DECISION — all options touch the fold-seal divergence check that exists to catch concurrency violations; re-run the TLA+ model after any change. Ranked options from the investigation: (1) LOCALIZED (lowest-risk, ~4 lines at CasGc.cpp:441-447): on divergent/PreconditionFailed fold_seal, ADOPT the durable fold_seal (decode existing bytes into result.fold_seal) instead of throwing, then proceed to the gc/state CAS (CasGc.cpp:450-451) which still serializes a single winner via ABORTED — caveat: this weakens a deliberate concurrency-violation tripwire, so it MUST be re-checked against the proven safety invariants. (2) reverse write order: CAS gc/state (snap_generation=N+1) BEFORE writing fold_seal, so the pointer never lags the seal (medium risk; changes crash-recovery in tryResumeIncompleteRound CasGc.cpp:1345). (3) full atomic fold_seal+snap_generation transaction (design change, high risk). RECOMMEND maintainer evaluate (1) with a TLA+ liveness/coverage extension proving every owner-removal event is eventually folded even under concurrent-leader aborts. Suite mitigations already in place: single-leader GC driving (gc_drive_round/forced_gc_to_fixpoint) + S33 regression guard.
 
 ## S03-20260627T211033-1: forced GC left 8 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible
@@ -639,12 +639,12 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Run:** 20260702T055623_S31_seed20260702
 - **Observed:** scenario raised: cluster did not become healthy after reset
 
-## S31-20260702T060328-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+## S31-20260702T060328-1: cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
 
 - **Logged (UTC):** 2026-07-02T06:03:53
 - **Severity:** suspected-bug
 - **Run:** 20260702T060328_S31_seed20260702
-- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+- **Observed:** cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
 
 ## S13-20260702T060416-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
 
@@ -687,7 +687,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   `docker kill -s KILL` one writer mid-burst (its lease stops renewing; it holds a stale `observed_gc_round`).
   Wait past `mount_lease_ttl_ms + skew_margin` and drive GC: assert the round FENCES OUT the dead writer
   (`RoundReport::fence_outs == 1`, a `gc_fence_out` audit row, its mount body `gc_fenced = true`), the floor
-  advances past its stale ack, and condemned blobs drain. Then run `clickhouse-disks ca-fsck`: assert
+  advances past its stale ack, and condemned blobs drain. Then run `clickhouse-disks cas-fsck`: assert
   `dangling == 0` throughout — the fence-out must never let GC delete a blob a still-live writer references
   (the surviving writer's fresh incarnations are spared). Guards the safety half of fence-out.
 
@@ -1130,9 +1130,9 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 ## F3-single-leader-dryrun-overproposal (2026-07-07, S18/S25/S26) — RESOLVED: over-strict oracle, NOT a tool/CA defect
 - **CORRECTION (evidence beat my first hypothesis):** I initially guessed `previewDeletes` reads a
   stale fold seal and over-proposes REACHABLE blobs. WRONG. A minimal repro (create/insert/DROP →
-  forced-GC-to-fixpoint → fsck-detail + ca-gc-dryrun) showed: fixpoint residual=7, fsck
+  forced-GC-to-fixpoint → fsck-detail + cas-gc-dryrun) showed: fixpoint residual=7, fsck
   classes `{reachable:6, pending-gc:7}`, dryrun proposes exactly the **7 `pending-gc`** objects — ZERO
-  reachable. So `ca-gc-dryrun` is CORRECT: it previews the next round's deletes = condemned objects in
+  reachable. So `cas-gc-dryrun` is CORRECT: it previews the next round's deletes = condemned objects in
   the two-phase graduation pipeline. The candidate count equalling the reclaimable residual in the
   sweep (S25 10=10, S26 63=63) is the same signal.
 - **Real root cause = the SCENARIO ORACLE.** `assert_dryrun_subset` accepted only fsck `class=="unreachable"`,
@@ -1331,11 +1331,11 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   hand-decoding protobuf/custom-binary objects (root-shard journals, manifest bodies, mount leases, gc state)
   by `od -tx1`. There is no supported way to inspect a decoded CA object. The decoders already exist in the
   codebase (`decodeRootShard`, `decodePartManifest`, `decodeMountLease`, `decodeGcState`).
-- **Proposed action:** expose the decoders via `clickhouse-disks` (which already hosts `ca-fsck`/
-  `ca-gc-dryrun`) as e.g. `ca-inspect <key>` → human-readable JSON for any CA object; optionally extend fsck
+- **Proposed action:** expose the decoders via `clickhouse-disks` (which already hosts `cas-fsck`/
+  `cas-gc-dryrun`) as e.g. `cas-inspect <key>` → human-readable JSON for any CA object; optionally extend fsck
   detail to report the "why" per key (`reachable-via` / `spared-by-precommit` / `eligible`) so leaks like this
   surface directly. Ends hand hex-decoding of the bucket.
-- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`, commit `82bc0df7df8`).** Added `clickhouse-disks ca-inspect
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`, commit `82bc0df7df8`).** Added `clickhouse-disks cas-inspect
   <key>` — read-only, dispatches by key layout to the existing decoders (`decodeRootShard`/
   `decodePartManifest`/`decodeMountLease`/`decodeGcState`/`decodeFoldSeal`/`decodeRetiredSet` + the
   `CasEnvelope` header for `blobs/`) and prints human-readable JSON; unknown key → `BAD_ARGUMENTS` listing
@@ -1863,7 +1863,7 @@ STILL OPEN (debt):
 - TLA+ wedge regression gate — needs committed-removal scoping / meta-model (fold into Phase-B Gate B).
 - CA-ASAN-SUITE — negative-LOGICAL_ERROR tests abort under abort-on-logical-error builds (GTEST_SKIP guard).
 - INTROSPECTION-3 part 2 — namespace-qualify manifest object_hash in the event log (collision footgun).
-- INTROSPECTION-2 — verify done (ca-inspect exists + used); confirm/close.
+- INTROSPECTION-2 — verify done (cas-inspect exists + used); confirm/close.
 - 4 non-correctness CA-s3 stateless fails: 03582/03800 (parallel-replica timeouts), 00933 (TTL timing),
   03829 (write-path memory). + ~31 local-env fails (not CA).
 - PROMOTE-OVER-COMMITTED-LEAK / ABANDON-RETIRE-ORDERING (2026-07-08, prior-session audit) — status unverified.
@@ -1988,12 +1988,12 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 - **Run:** 20260713T172032_S13_seed42
 - **Observed:** S13 residual unreachable=2 after forced GC; classified by prefix={}
 
-## S31-20260713T174441-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+## S31-20260713T174441-1: cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
 
 - **Logged (UTC):** 2026-07-13T17:45:15
 - **Severity:** suspected-bug
 - **Run:** 20260713T174441_S31_seed42
-- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+- **Observed:** cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
 
 
 ## S13-20260713T172032-3: GC-side backstop for stale live precommit bindings — open spec question
@@ -2162,12 +2162,12 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 - **Run:** 20260717T215644_S07_seed1
 - **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
 
-## S31-20260718T001753-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+## S31-20260718T001753-1: cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
 
 - **Logged (UTC):** 2026-07-18T00:19:08
 - **Severity:** suspected-bug
 - **Run:** 20260718T001753_S31_seed1
-- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+- **Observed:** cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
 
 ## S36-20260718T002431-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 479. DB::Exception: Part '
 

@@ -6,7 +6,7 @@ At periodic quiesced checkpoints it HARD-ASSERTS the invariants the CURRENT CA d
 BOTH replicas equal the model exactly (no loss, no divergence), fsck `dangling==0` (INV-NO-LOSS:
 every ref-reachable object exists), fsck `stale_edge==0` (no blob whose every source edge names a
 manifest that no longer exists — such a blob's in-degree is pinned above zero and the incremental GC
-can never reclaim it; `ca-fsck` itself does not exit nonzero on this, so the checkpoint is the only
+can never reclaim it; `cas-fsck` itself does not exit nonzero on this, so the checkpoint is the only
 gate), and the GC dry-run preview is a subset of the fsck `unreachable`
 set (GC never plans to delete a reachable object). The residual fsck `unreachable` after the
 incremental GC reaches its fixpoint is TRACKED, not failed on: it is the known M-F Full-GC debris
@@ -106,7 +106,7 @@ METRICS_INTERVAL_S = 60
 GB = 1024 ** 3
 
 # search_orphaned_parts_disks='local' (B143): the harness config defines a SECOND CA disk `ca_ro`
-# (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks ca-fsck` applet)
+# (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks cas-fsck` applet)
 # which is NOT in the `ca` storage policy. On a server RESTART (Phase-2 chaos), MergeTreeData's
 # orphaned-parts scan (`loadDataParts`, default `search_orphaned_parts_disks=any`) iterates EVERY
 # disk in the context map -- including the remote `ca_ro` -- finds the policy parts under its
@@ -698,7 +698,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # INV-NO-STALE-EDGE: no blob may be left whose every source edge names a manifest that no longer
     # exists. Such a blob's in-degree is pinned above zero forever, so the incremental GC will never
     # reclaim it -- and until the class existed it was reported as an `AwaitingGc` "expected, no action
-    # needed" backlog, which is what hid it. `ca-fsck` does NOT exit nonzero on it -- `CommandFsck.cpp`
+    # needed" backlog, which is what hid it. `cas-fsck` does NOT exit nonzero on it -- `CommandFsck.cpp`
     # throws on `dangling`, `chain_broken`, `corrupted_runs` and
     # `lifeless_keys`, and `stale_edge` is the ONE `clean()` term deliberately left out (it is
     # detail-mode-only) -- so the `exit_code` gate above does not cover this and THIS assert is the
@@ -724,7 +724,7 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     # them until now. Loud, not fatal: it is a harness gap, so the fix is to extend
     # `soak/fsck.py:known_classes` -- but the run must say so instead of quietly narrowing its view.
     if f.get("unknown_detail_classes"):
-        log(f"WARNING [fsck-whitelist] ca-fsck emitted detail classes this harness does not know: "
+        log(f"WARNING [fsck-whitelist] cas-fsck emitted detail classes this harness does not know: "
             f"{f['unknown_detail_classes']} — objects in those classes were DROPPED from the "
             f"checkpoint's view. Extend soak/fsck.py:known_classes.")
 
@@ -736,11 +736,11 @@ def checkpoint(driver, cluster, model, phase, *, strict_unreachable=False):
     _corrupted = sum(1 for row in f.get("detail", []) if row["class"] == "corrupted-run")
     if _corrupted:
         log(f"WARNING [corrupted-run] {_corrupted} fsck detail row(s) in class `corrupted-run` — a GC "
-            f"source-edge run's seal checksum disagrees with its bytes. ca-fsck's exit code gates this "
+            f"source-edge run's seal checksum disagrees with its bytes. cas-fsck's exit code gates this "
             f"class, so a run reaching here with exit_code 0 is itself suspect; investigate.")
 
     # GC never plans to delete a REACHABLE object: {dryrun delete set} subset of {fsck deletion-pipeline}.
-    # The "retired-in-snapshot" refactor made ca-gc-dryrun (previewDeletes) emit a SUPERSET: not only
+    # The "retired-in-snapshot" refactor made cas-gc-dryrun (previewDeletes) emit a SUPERSET: not only
     # fresh zero-in-degree `unreachable` blobs but ALSO every condemned-pipeline blob (a kCondemned row
     # in the GC snapshot run), with reason delete_pending / awaiting_graduation. In lock-step, fsck now
     # classifies a condemned-but-present blob as `pending-gc` / `awaiting-gc` (NOT `unreachable`), so
@@ -900,7 +900,7 @@ def capture_phase_summary(cluster, label, *, since_ts, coverage, conn=None, ts=N
     return written
 
 
-# A summary `ca-fsck` is O(backlog). At 180 s -- the value until 2026-07-29 -- it began timing out on a
+# A summary `cas-fsck` is O(backlog). At 180 s -- the value until 2026-07-29 -- it began timing out on a
 # ~29 GiB soak pool, and every timeout SKIPS that checkpoint's `dangling == 0` and dryrun-subset
 # assertions while the checkpoint still prints OK with zeros that are the skip rather than a reading.
 # A slow gate is far better than a skipped one, so the budget is 600 s and every skip is recorded in

@@ -4,7 +4,7 @@ Measured motivation, not hypothetical: in the 4-hour Part B soak, 4 of 39 checkp
 post-GC fsck gate to a 180 s timeout — `dangling`, `stale_edge` and the dryrun-subset assert all skipped —
 plus 4 more entry-gate skips. The gate drops out exactly when the pool is large, which is when it matters.
 
-The mechanism was an INVERSION of two budgets. `run_fsck` bounded the SUBPROCESS at 180 s while `ca-fsck`'s
+The mechanism was an INVERSION of two budgets. `run_fsck` bounded the SUBPROCESS at 180 s while `cas-fsck`'s
 own scan deadline defaulted to 600 s, so the process was always killed before its internal deadline could
 fire — which is the only path that prints the accumulated `partial=1` counts. `--partial` existed in the
 product the whole time and could never be reached from here.

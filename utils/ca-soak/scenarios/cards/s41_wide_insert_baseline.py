@@ -437,7 +437,7 @@ class S41(Scenario):
         self._verdicts(ctx, result, plain, ca, rows)
 
         # Standard quiesced end checkpoint on the CA table (fsck dangling==0 etc.). The plain-S3
-        # table is invisible to ca-fsck (different pool prefix) — drop it so only the CA table
+        # table is invisible to cas-fsck (different pool prefix) — drop it so only the CA table
         # remains for the checkpoint's structural assertions.
         try:
             sql.drop_table_both(cl, "s41_plain")

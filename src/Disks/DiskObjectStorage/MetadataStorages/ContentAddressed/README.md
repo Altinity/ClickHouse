@@ -160,10 +160,10 @@ GC sharding, hash algorithm, request budgets) is parsed in
 ## Operations and observability
 
 - `clickhouse-disks` verbs (all require the disk opened read-only): `fsck`
-  (independent reachability audit of refs → manifests → blobs), `ca-inspect`
-  (decode one pool object by its raw key to JSON), `ca-gc-dryrun` (preview the
-  next GC round's deletes), `ca-gc-rebuild` (disaster-recovery rebuild of the
-  `gc/state` baseline), `ca-drop-member` (decommission a dead pool member).
+  (independent reachability audit of refs → manifests → blobs), `cas-inspect`
+  (decode one pool object by its raw key to JSON), `cas-gc-dryrun` (preview the
+  next GC round's deletes), `cas-gc-rebuild` (disaster-recovery rebuild of the
+  `gc/state` baseline), `cas-drop-member` (decommission a dead pool member).
 - `system.cas_log` — one row per CAS protocol event
   (uploads, adopts, promotes, condemns, deletes, mount-slot writes, ...);
   the primary audit trail when investigating pool state.

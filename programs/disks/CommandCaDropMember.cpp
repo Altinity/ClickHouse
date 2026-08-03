@@ -23,7 +23,7 @@ class CommandCaDropMember final : public ICommand
 public:
     CommandCaDropMember() : ICommand("CommandCaDropMember")
     {
-        command_name = "ca-drop-member";
+        command_name = "cas-drop-member";
         description = "Decommission a DEAD pool member: erase its namespaces, debris, staging, roots "
                       "objects and mount slot. Refuses a live member. Open the CA disk read-only "
                       "(the admin claim is made internally).";
@@ -38,15 +38,15 @@ public:
 
         auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
         if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-drop-member: '{}' is not an object-storage disk", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-drop-member: '{}' is not an object-storage disk", disk->getName());
 
         auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
         if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-drop-member: disk '{}' is not content-addressed", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas-drop-member: disk '{}' is not content-addressed", disk->getName());
 
         if (!ca->isReadOnly())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "ca-drop-member: open the CA disk read-only (a writable open would claim this tool's "
+                "cas-drop-member: open the CA disk read-only (a writable open would claim this tool's "
                 "own server_root_id; the decommission claim happens internally)");
 
         const auto host_store = ca->store();

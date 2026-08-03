@@ -32,7 +32,7 @@
 /// (tokened) blob body hand-deleted before the gate, then resurrected — is protocol-unreachable under
 /// EDGE-BEFORE-OBSERVE: a tokened leaf under a durable precommit closure cannot be GC-deleted in the
 /// putBlob→promote window, and promote no longer re-validates tokened leaves at all. Deleting a
-/// putBlob'd body out-of-band is corruption, which is `ca-fsck`'s domain, not the promote gate's.
+/// putBlob'd body out-of-band is corruption, which is `cas-fsck`'s domain, not the promote gate's.
 
 namespace DB::ErrorCodes
 {
@@ -262,7 +262,7 @@ TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 /// (DELETED, Phase A) RevalidateAbsentTokenedBlobResurrectsFromSource — see the file-header note: a
 /// hand-deleted putBlob'd (tokened) body is protocol-unreachable under EDGE-BEFORE-OBSERVE (a tokened
 /// leaf under a durable precommit closure cannot be GC-deleted in the putBlob→promote window, and promote
-/// no longer re-validates tokened leaves). Out-of-band body deletion is `ca-fsck`'s domain.
+/// no longer re-validates tokened leaves). Out-of-band body deletion is `cas-fsck`'s domain.
 
 TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {

@@ -989,7 +989,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             {
                 cls = FsckClass::StaleEdge;
                 note = "all " + std::to_string(stale_edges) + " source edges name manifests that no longer "
-                       "exist — unreclaimable by the incremental GC (needs `ca-gc-rebuild`); NOT expected, investigate";
+                       "exist — unreclaimable by the incremental GC (needs `cas-gc-rebuild`); NOT expected, investigate";
             }
             else
             {

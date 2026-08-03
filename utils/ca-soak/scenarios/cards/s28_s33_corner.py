@@ -11,7 +11,7 @@ known-bug regression guard that the existing S01-S27 set does not exercise:
 - S30: repeated create/drop namespace churn (checklist #6 — namespace registration is MONOTONE;
   `dropNamespace` clears refs/files but never removes the namespace from the GC registry, leaving a
   permanent GC fanout).
-- S31: `ca-gc-dryrun` completeness under `gc_shards>1` (checklist #9 — `previewDeletes` previews
+- S31: `cas-gc-dryrun` completeness under `gc_shards>1` (checklist #9 — `previewDeletes` previews
   `zeroInDegree` only for target shard 0, so the dry-run subset oracle can be blind to deletable
   candidates in other shards).
 - S32: TTL expiry reclaim (core path with no existing card).
@@ -481,13 +481,13 @@ class S30(Scenario):
 
 
 # ---------------------------------------------------------------------------
-# S31: ca-gc-dryrun completeness under gc_shards>1
+# S31: cas-gc-dryrun completeness under gc_shards>1
 # ---------------------------------------------------------------------------
 
 @register
 class S31(Scenario):
     name = "S31"
-    title = "ca-gc-dryrun completeness under gc_shards>1"
+    title = "cas-gc-dryrun completeness under gc_shards>1"
     priority = "P1"
     # Runs on the gc_shards2 compose variant; the runner resets to it before run(). The runner does
     # NOT auto-restore default afterwards — the next scenario resets to its own variant.
@@ -552,7 +552,7 @@ class S31(Scenario):
             ctx.log(f"S31: post-drop fsck failed: {e}")
 
         # --- capture the dry-run PREVIEW set BEFORE GC actually deletes ----------------------
-        # ca-gc-dryrun previews zeroInDegree only for target shard 0 (checklist #9), so under
+        # cas-gc-dryrun previews zeroInDegree only for target shard 0 (checklist #9), so under
         # gc_shards>1 it can be BLIND to deletable candidates routed to shard >= 1.
         try:
             dry = lifecycle.dryrun()
@@ -564,9 +564,9 @@ class S31(Scenario):
             dry_count = None
             dry_keys = set()
             result.add(Verdict.inconclusive(
-                "ca-gc-dryrun completeness under gc_shards>1",
+                "cas-gc-dryrun completeness under gc_shards>1",
                 "dryrun preview == set GC actually deletes",
-                f"ca-gc-dryrun failed: {e}"))
+                f"cas-gc-dryrun failed: {e}"))
 
         # --- now drive GC to fixpoint and measure what GC actually DELETES -------------------
         gc_before = _gc_log_since(ctx)
@@ -605,13 +605,13 @@ class S31(Scenario):
             pending_now = fsck_post_drop.get("pending_gc")
         if dry_count is None or pending_now is None:
             result.add(Verdict.inconclusive(
-                "ca-gc-dryrun completeness under gc_shards>1",
+                "cas-gc-dryrun completeness under gc_shards>1",
                 "dryrun preview covers the same-instant condemned set across all shards",
                 f"missing a comparable count (dry_count={dry_count}, pending_gc={pending_now})"))
         else:
             complete = dry_count >= int(pending_now)
             result.add(Verdict.check(
-                "ca-gc-dryrun completeness under gc_shards>1",
+                "cas-gc-dryrun completeness under gc_shards>1",
                 "dryrun preview count >= same-instant fsck pending_gc (all shards)",
                 f"dryrun previewed {dry_count}; fsck pending_gc {pending_now} "
                 f"(cumulative multi-round reclaim ~{deleted_total or blobs_reclaimed} is "
@@ -751,7 +751,7 @@ class S33(Scenario):
     fold seal. The fold-abort path correctly preserves SAFETY (`fsck dangling==0`, no over-delete),
     but it advances GC generation/cursor state past owner-removal events that were never folded, so
     those blobs' in-degree never reaches zero in the persistent snapshot and they are never retired
-    — even though `fsck`/`ca-gc-dryrun` report them as deletable (zeroInDegree on a fresh full fold).
+    — even though `fsck`/`cas-gc-dryrun` report them as deletable (zeroInDegree on a fresh full fold).
 
     This card DELIBERATELY manufactures the collision (concurrent explicit GC on node1 AND node2),
     then stops the hammering and gives background + single-node serial GC a chance to recover.

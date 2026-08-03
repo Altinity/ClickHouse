@@ -6,7 +6,7 @@
 namespace DB::Cas
 {
 
-/// Read-only decode-to-JSON dispatch for `clickhouse-disks ca-inspect` (and its unit tests): given
+/// Read-only decode-to-JSON dispatch for `clickhouse-disks cas-inspect` (and its unit tests): given
 /// any key that could live in a content-addressed pool plus the raw bytes stored at it, decode with
 /// the matching codec and render the struct's fields as human-readable JSON. `layout` supplies the
 /// pool's key shapes (there is no live pool/backend access here — pure function of (key, bytes)), so

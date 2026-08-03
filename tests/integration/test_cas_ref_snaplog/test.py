@@ -104,7 +104,7 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     ), "expected content objects to rise above baseline after inserts"
 
     # Read-only fsck agrees while data is present: no authoritative ref names a missing object.
-    live_fsck = _disks(node, "ca-fsck")
+    live_fsck = _disks(node, "cas-fsck")
     assert "dangling=0" in live_fsck, live_fsck
 
     # (3) Rename one table: data must survive (its ref namespace and its logs/snapshots are unaffected).
@@ -162,9 +162,9 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     assert deleted > 0, "the pool's content drained but GC's own bookkeeping reports no deletion"
 
     # (6) Read-only consumers on the DRAINED pool.
-    final_fsck = _disks(node, "ca-fsck")
+    final_fsck = _disks(node, "cas-fsck")
     assert "dangling=0" in final_fsck, final_fsck
 
-    #     `ca-gc-dryrun` on a fully drained pool has nothing left to preview.
-    dryrun = _disks(node, "ca-gc-dryrun")
+    #     `cas-gc-dryrun` on a fully drained pool has nothing left to preview.
+    dryrun = _disks(node, "cas-gc-dryrun")
     assert "preview_deletes=0" in dryrun, dryrun

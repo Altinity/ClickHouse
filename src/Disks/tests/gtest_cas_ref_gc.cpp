@@ -685,7 +685,7 @@ TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
 /// tables, replace one (dropping a blob), publish a covering snapshot, drive GC to a fixpoint, and
 /// assert the fold + ref-object cleanup + snapshot lifecycle plus the two read-only consumers:
 /// `runFsck(*store).clean()` (the fsck CLI's verdict, oracle included) and `gc.previewDeletes().empty()`
-/// (what `ca-gc-dryrun` reports). This is the deterministic permanent twin the unit sweep keeps running.
+/// (what `cas-gc-dryrun` reports). This is the deterministic permanent twin the unit sweep keeps running.
 TEST(CASRefGc, RefSnaplogLifecycleE2E)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -737,11 +737,11 @@ TEST(CASRefGc, RefSnaplogLifecycleE2E)
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
 
     /// Read-only consumers agree: fsck recovers through the exact checkpoint base and reports no dangle,
-    /// while ca-gc-dryrun has no pending content deletes. Covered LIST debris is not diagnostic authority.
+    /// while cas-gc-dryrun has no pending content deletes. Covered LIST debris is not diagnostic authority.
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
-    EXPECT_TRUE(gc.previewDeletes().empty()) << "ca-gc-dryrun equivalent: no pending content deletes";
+    EXPECT_TRUE(gc.previewDeletes().empty()) << "cas-gc-dryrun equivalent: no pending content deletes";
 }
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor

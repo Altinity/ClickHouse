@@ -42,7 +42,7 @@ def assert_fsck_clean(result, fsck: dict):
     return [v]
 
 
-# fsck object classes that a `ca-gc-dryrun` candidate may legitimately fall into. `ca-gc-dryrun`
+# fsck object classes that a `cas-gc-dryrun` candidate may legitimately fall into. `cas-gc-dryrun`
 # previews the NEXT GC round's deletes, which is the union of:
 #   - `unreachable`  — orphan objects GC has not condemned yet;
 #   - `pending-gc` / `awaiting-gc` — objects already CONDEMNED, sitting in the two-phase graduation

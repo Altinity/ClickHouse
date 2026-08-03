@@ -1079,7 +1079,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         for (const Cas::UnattributableNamespaceKey & bad : listing.skipped)
             LOG_ERROR(getLogger("ContentAddressedTransaction"),
                 "removeRecursive('{}'): key '{}' names no namespace life and was left in place ({}). "
-                "Every namespace this enumeration did name is still dropped; run `ca-fsck` to enumerate "
+                "Every namespace this enumeration did name is still dropped; run `cas-fsck` to enumerate "
                 "such keys.", path, bad.key, bad.reason);
         for (const auto & ns : listing.namespaces)
             metadata_storage.partAccess()->dropNamespace(Cas::RootNamespace{ns});

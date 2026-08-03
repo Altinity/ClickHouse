@@ -462,7 +462,7 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
 }
 
 /// The word vocabulary a row's marker byte renders as, matching the `cas_run` NDJSON's own `"m"` field
-/// words (`CasRecordStreamFormat.cpp`'s private `markerToWord`) so ca-inspect speaks the same vocabulary
+/// words (`CasRecordStreamFormat.cpp`'s private `markerToWord`) so cas-inspect speaks the same vocabulary
 /// as the on-disk format rather than inventing a second one.
 String sourceEdgeRowKindName(char marker)
 {
@@ -512,7 +512,7 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
         SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
         if (payload.empty())
             throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "ca-inspect: source-edge run row for blob {} has an empty payload", blobIdOf(ref));
+                "cas-inspect: source-edge run row for blob {} has an empty payload", blobIdOf(ref));
         const char marker = payload[0];
 
         distinct_blobs.insert(ref);
@@ -538,7 +538,7 @@ String renderBlobTargetRun(const ParsedBlobTargetRunKey & parsed, std::string_vi
                 break;
             default:
                 throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                    "ca-inspect: source-edge run row for blob {} has an unknown marker 0x{:02x}",
+                    "cas-inspect: source-edge run row for blob {} has an unknown marker 0x{:02x}",
                     blobIdOf(ref), static_cast<uint8_t>(marker));
         }
         rows.push_back(row.str());
@@ -576,7 +576,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     {
         if (!resolved_life || resolved_life->incarnation != life_id)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "ca-inspect: life_id {} has no unique resolution in the supplied catalog cut",
+                "cas-inspect: life_id {} has no unique resolution in the supplied catalog cut",
                 renderIncarnation(life_id));
         return *resolved_life;
     };
@@ -593,7 +593,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         const auto parsed = layout.parseRefObjectKey(key);
         if (!parsed)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                "ca-inspect: key under cas/ns/stream is not a recognized ref-object key '{}'", key);
+                "cas-inspect: key under cas/ns/stream is not a recognized ref-object key '{}'", key);
         const NamespaceLifeId & life = requireResolvedLife(parsed->life_id);
         if (parsed->kind == RefObjectKind::Snap)
             return renderRefTableSnapshot(decodeRefTableSnapshot(
@@ -601,7 +601,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         if (parsed->kind == RefObjectKind::Log)
             return renderRefLogTxn(decodeRefLogTxn(
                 openObject(FormatId::RefLog, bytes), life.ns.string(), parsed->txn_id));
-        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "ca-inspect: unhandled ref-object kind for key '{}'", key);
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "cas-inspect: unhandled ref-object kind for key '{}'", key);
     }
 
     if (key == layout.gcStateKey())
@@ -630,7 +630,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         return renderEnvelopeHeader(decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob));
 
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-        "ca-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
+        "cas-inspect: unrecognized key layout '{}' (recognized: cas/ns/stream, cas/ns/state, cas/manifests, "
         "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, gc/gen/*/attempt/*/blob_target/*/*, "
         "retired, blobs, blobs/*.meta)", key);
 }

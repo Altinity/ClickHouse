@@ -142,7 +142,7 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-02T05:55:37 | S21 | 20260702 | dev | 900s | inconclusive | fb5934de521b | 20260702T055512_S21_seed20260702 |  |
 | 2026-07-02T05:56:17 | S26 | 20260702 | dev | 900s | pass | fb5934de521b | 20260702T055551_S26_seed20260702 |  |
 | 2026-07-02T06:01:31 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T055623_S31_seed20260702 | cluster did not become healthy after reset |
-| 2026-07-02T06:03:53 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060328_S31_seed20260702 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-02T06:03:53 | S31 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060328_S31_seed20260702 | cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 0 but GC reclaimed ~40 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
 | 2026-07-02T06:12:51 | S13 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T060416_S13_seed20260702 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
 | 2026-07-02T06:14:56 | S10 | 20260702 | dev | 900s | fail | fb5934de521b | 20260702T061431_S10_seed20260702 |  |
 | 2026-07-02T06:17:28 | S10 | 20260702 | dev | 900s | inconclusive | 3a054b9ffe67 | 20260702T061700_S10_seed20260702 |  |
@@ -319,7 +319,7 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-13T17:42:59 | S28 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174223_S28_seed42 |  |
 | 2026-07-13T17:43:33 | S29 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T174308_S29_seed42 |  |
 | 2026-07-13T17:44:26 | S30 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174349_S30_seed42 |  |
-| 2026-07-13T17:45:15 | S31 | 42 | dev | 900s | fail | dcdaf479cd2c | 20260713T174441_S31_seed42 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-13T17:45:15 | S31 | 42 | dev | 900s | fail | dcdaf479cd2c | 20260713T174441_S31_seed42 | cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
 | 2026-07-13T17:46:01 | S32 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174536_S32_seed42 |  |
 | 2026-07-13T17:46:44 | S33 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174614_S33_seed42 |  |
 | 2026-07-13T17:47:38 | S34 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174656_S34_seed42 |  |
@@ -407,7 +407,7 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-18T00:15:10 | S28 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001339_S28_seed1 |  |
 | 2026-07-18T00:15:53 | S29 | 1 | ci | 900s | inconclusive | 4420b5a3498b | 20260718T001510_S29_seed1 |  |
 | 2026-07-18T00:17:53 | S30 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001553_S30_seed1 |  |
-| 2026-07-18T00:19:08 | S31 | 1 | ci | 900s | fail | 4420b5a3498b | 20260718T001753_S31_seed1 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-18T00:19:08 | S31 | 1 | ci | 900s | fail | 4420b5a3498b | 20260718T001753_S31_seed1 | cas-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
 | 2026-07-18T00:19:46 | S32 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001908_S32_seed1 |  |
 | 2026-07-18T00:20:54 | S33 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001946_S33_seed1 |  |
 | 2026-07-18T00:22:55 | S34 | 1 | ci | 900s | pass | b4196a7017f7 | 20260718T002054_S34_seed1 |  |

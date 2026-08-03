@@ -60,7 +60,7 @@ def _count(prefix):
 
 
 def _disks(node, query):
-    # Run a clickhouse-disks command against the read-only CA window over the same pool — ca-fsck refuses
+    # Run a clickhouse-disks command against the read-only CA window over the same pool — cas-fsck refuses
     # a writable pool, so it must go through disk_ca_ro (the ref-snaplog integration test's idiom).
     return node.exec_in_container(
         [
@@ -271,10 +271,10 @@ def test_drop_dead_pool_member_heals_the_pool():
     # must never be hard corruption on the way there, which is why `lifeless_keys` is checked on every
     # poll and not only at the end.
     for _ in range(RECLAIM_RETRIES):
-        fsck = _disks(node1, "ca-fsck")
+        fsck = _disks(node1, "cas-fsck")
         assert "lifeless_keys=0" in fsck, fsck
         janitor_pending_match = re.search(r"\bjanitor_pending=(\d+)", fsck)
-        assert janitor_pending_match, "ca-fsck summary is missing the janitor_pending field: {}".format(fsck)
+        assert janitor_pending_match, "cas-fsck summary is missing the janitor_pending field: {}".format(fsck)
         if int(janitor_pending_match.group(1)) == 0:
             break
         time.sleep(RECLAIM_SLEEP)

@@ -5,7 +5,7 @@ T8's soak run (c) ("decommission") requires the victim member to carry catalog e
 Removing` at the moment it is decommissioned -- exactly the shape `gtest_cas_decommission_catalog_
 duties.cpp` characterizes at the unit level (`makeRemoving` + the retirement-fence tests), but never
 exercised end-to-end against a live cluster. No existing card decommissions a pool member at all: no
-scenario invokes the `ca-drop-member` tool (`programs/disks/CommandCaDropMember.cpp`, backed by `Cas::
+scenario invokes the `cas-drop-member` tool (`programs/disks/CommandCaDropMember.cpp`, backed by `Cas::
 decommissionPoolMember`).
 
 Mechanics (modelled on `soak/fsck.py`'s `run_fsck`/`run_dryrun`, the only existing wrapper around the
@@ -14,10 +14,10 @@ Mechanics (modelled on `soak/fsck.py`'s `run_fsck`/`run_dryrun`, the only existi
     to clear (kill the victim node immediately after the `DROP TABLE`s return, before its own GC/janitor
     would have retired them) -- this is what makes the entries HIDDEN: still `Removing`, not yet
     condemned, and the member that would have finished retiring them is gone;
-  - kill the victim container (`docker kill`) so it is unambiguously DEAD (`ca-drop-member` refuses a
+  - kill the victim container (`docker kill`) so it is unambiguously DEAD (`cas-drop-member` refuses a
     live member);
   - from a SURVIVING node, run `docker exec <survivor> clickhouse disks --disk ca_ro --query
-    "ca-drop-member <victim_srid>"` (the read-only-disk contract `CommandCaDropMember.cpp` requires);
+    "cas-drop-member <victim_srid>"` (the read-only-disk contract `CommandCaDropMember.cpp` requires);
   - assert the tool's own report accounts for the hidden `Removing` rows (`namespaces_removed` covers
     them, not just `Live` ones) and that forced GC afterward completes them (fsck clean, no leaked
     checkpoints).
@@ -35,12 +35,12 @@ Mechanics (modelled on `soak/fsck.py`'s `run_fsck`/`run_dryrun`, the only existi
      `namespaces_removed` count, with no separate hidden-`Removing`-specific figure. The card's
      verdict (`namespaces_removed >= len(tables)`) is written to that aggregate, which is what the
      tool actually exposes.
-  4. Fixed: a live run showed `ca-drop-member` refusing immediately after `docker kill` with "pool
+  4. Fixed: a live run showed `cas-drop-member` refusing immediately after `docker kill` with "pool
      member is alive or contended -- mount lease held by ... (expires_at_ms=...)". `docker kill`
      does not shorten the lease the victim already renewed before dying, and
      `Cas::Pool::mountWritable`'s decommission path takes one unbounded-wait-free snapshot compare
      against the lease's `expires_at_ms` with no bounded-wait variant. The card now polls
-     `ca-drop-member` for up to `mount_lease_ttl_ms` + one `mount_renew_period` + the `chaos.py`
+     `cas-drop-member` for up to `mount_lease_ttl_ms` + one `mount_renew_period` + the `chaos.py`
      FREEZE_LONG fence margin (60s total, 5s interval) before treating a persistent
      "alive or contended" refusal as a real failure.
   5. Fixed: `sql.create_ca_table` only ran on `node` (node1); a `ReplicatedMergeTree` materializes
@@ -53,7 +53,7 @@ Mechanics (modelled on `soak/fsck.py`'s `run_fsck`/`run_dryrun`, the only existi
      there was nothing of the victim's own to be hidden. The card now also drops each table on the
      victim, with that drop's own return awaited before the kill.
 
-Live validation run (seed 4, 2026-08-03, after fixes 4-6): `ca-drop-member` reported
+Live validation run (seed 4, 2026-08-03, after fixes 4-6): `cas-drop-member` reported
 `namespaces_removed=3` (matching `victim_tables=3`) and several `CAS orphan sweep: retained ...`
 warnings for manifests whose "epoch 1's closing seal is not consumed" -- a real, benign artifact of
 decommissioning mid-epoch that the tool correctly leaves for the normal GC path rather than deleting
@@ -79,7 +79,7 @@ _TABLE_PREFIX = "s45_victim"
 
 
 def _run_drop_member(container: str, srid: str, timeout_s: float = 300.0) -> dict:
-    """Invoke `ca-drop-member` against `srid` from `container`. Reuses `soak/fsck.py`'s own
+    """Invoke `cas-drop-member` against `srid` from `container`. Reuses `soak/fsck.py`'s own
     `_CLICKHOUSE_DISKS` invocation prefix (the `ca_ro` disk is only defined in the standalone
     fsck-only config, not the server's own config.d -- `--config-file
     /etc/clickhouse-server/config.xml` would hit UNKNOWN_DISK)."""
@@ -87,7 +87,7 @@ def _run_drop_member(container: str, srid: str, timeout_s: float = 300.0) -> dic
         "docker", "exec", container,
         *_CLICKHOUSE_DISKS,
         "--disk", "ca_ro",
-        "--query", f"ca-drop-member {srid}",
+        "--query", f"cas-drop-member {srid}",
     ]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     out = {"exit_code": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
@@ -114,7 +114,7 @@ _LEASE_POLL_INTERVAL_S = 5.0
 
 
 def _run_drop_member_after_lease_lapses(container: str, srid: str) -> dict:
-    """Poll `ca-drop-member` until the victim's mount lease has provably lapsed (ABORTED /
+    """Poll `cas-drop-member` until the victim's mount lease has provably lapsed (ABORTED /
     "alive or contended") or `_LEASE_WAIT_BOUND_S` is exceeded. Any other failure is returned
     immediately without retrying -- retrying would mask a real defect as a timing flake."""
     deadline = time.monotonic() + _LEASE_WAIT_BOUND_S
@@ -131,7 +131,7 @@ class S45(Scenario):
     name = "S45"
     title = "decommission a victim member with hidden Removing catalog entries"
     priority = "P1"
-    needs_infra = None  # built for T8; requires ca-drop-member wired into the compose image (gap #2/#3 above)
+    needs_infra = None  # built for T8; requires cas-drop-member wired into the compose image (gap #2/#3 above)
 
     param_table = {
         "dev": {"victim_tables": 3, "rows_per_table": 100},
@@ -176,7 +176,7 @@ class S45(Scenario):
         ctx.write_json("s45_drop_member_report.json", report)
 
         result.add(Verdict.check(
-            "ca-drop-member exits cleanly", "exit_code == 0",
+            "cas-drop-member exits cleanly", "exit_code == 0",
             f"exit_code={report.get('exit_code')}", report.get("exit_code") == 0,
             f"stderr: {report.get('stderr', '')[:500]}"))
 

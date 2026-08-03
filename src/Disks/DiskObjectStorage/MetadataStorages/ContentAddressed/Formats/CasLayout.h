@@ -348,7 +348,7 @@ public:
     /// missing/foreign top-level prefix, a missing `attempt`/`blob_target` literal segment, a missing
     /// generation/attempt/shard/seq segment, a non-canonical decimal component (empty, non-digit, a
     /// leading zero other than a bare "0", or a value that overflows `uint64_t`), or trailing garbage.
-    /// Foreign/malformed keys return `std::nullopt`, never throw -- callers (`ca-inspect`) classify by
+    /// Foreign/malformed keys return `std::nullopt`, never throw -- callers (`cas-inspect`) classify by
     /// key shape, not by validity. Defined out-of-line in `CasLayout.cpp`, where the key construction
     /// and parsing helpers remain together.
     std::optional<ParsedBlobTargetRunKey> parseBlobTargetRunKey(std::string_view key) const;

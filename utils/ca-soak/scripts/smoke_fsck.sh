@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the fsck / ca-gc-dryrun wrappers (Task 7).
+# Smoke test for the fsck / cas-gc-dryrun wrappers (Task 7).
 #
 # Brings the CA cluster up, creates the `ca_stress` table, inserts a few rows on ch1,
 # syncs ch2, then invokes `run_fsck` and `run_dryrun` via the Python wrapper and
@@ -66,7 +66,7 @@ raw = subprocess.run(
      "clickhouse", "disks",
      "--config-file", "/etc/clickhouse-server/config.xml",
      "--disk", "ca_ro",
-     "--query", "ca-fsck"],
+     "--query", "cas-fsck"],
     capture_output=True, text=True,
 )
 summary_line = next(

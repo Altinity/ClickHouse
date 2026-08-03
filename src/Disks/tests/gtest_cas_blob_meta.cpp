@@ -184,7 +184,7 @@ TEST(CASBlobMeta, DeduplicationCacheAdmitsWidth32Digest)
     EXPECT_FALSE(store->dedupCacheContains(narrow_ref)) << "a 32-byte digest must not collide with its zero-tailed 16-byte prefix";
 }
 
-/// `ca-inspect` dispatch (CasInspect.cpp): a `.meta` key must decode as a BlobMeta, NOT fall through
+/// `cas-inspect` dispatch (CasInspect.cpp): a `.meta` key must decode as a BlobMeta, NOT fall through
 /// to the `blobs/` envelope branch (the `.meta` key shares the `blobsPrefix()` prefix with a body key).
 TEST(CASBlobMeta, InspectRendersCondemnedMeta)
 {

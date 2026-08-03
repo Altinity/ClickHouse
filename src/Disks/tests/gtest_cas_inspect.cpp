@@ -27,7 +27,7 @@ BlobRef bh(uint64_t n)
 
 }
 
-/// Stage-1 T12 (spec §4 "RefOp payload removal"): `ca-inspect` renders the renamed `SetPublishedAt`
+/// Stage-1 T12 (spec §4 "RefOp payload removal"): `cas-inspect` renders the renamed `SetPublishedAt`
 /// op kind, and neither the ref-log nor the ref-snapshot rendering carries a `payload_size` key --
 /// `RefOp`/`RefCommittedRow` no longer have a `payload` field to size.
 
@@ -105,7 +105,7 @@ TEST(CASInspect, RendersCommittedRowWithNoPayloadSizeKey)
 }
 
 /// A blob-target source-edge run segment (`Layout::blobTargetRunKey`) is the ground truth for every
-/// in-degree question; `ca-inspect` decodes it with the typed `SourceEdgeRunView` reader (not by hand)
+/// in-degree question; `cas-inspect` decodes it with the typed `SourceEdgeRunView` reader (not by hand)
 /// and must distinguish an active edge from a condemned sentinel row, decoding the latter's fields.
 TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
 {

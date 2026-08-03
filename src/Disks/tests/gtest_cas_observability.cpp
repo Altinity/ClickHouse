@@ -246,7 +246,7 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
            "a fresh condemn of the same blob would carry -- not the raw physical (header-included) size";
 }
 
-/// Task 3 (Part B, `clickhouse-disks ca-inspect`): `caInspectToJson` is a FREE function (no
+/// Task 3 (Part B, `clickhouse-disks cas-inspect`): `caInspectToJson` is a FREE function (no
 /// disk/backend involved) that decodes any CA bucket object at `key` and renders it as JSON, purely
 /// by matching `key` against `Layout`'s prefixes/key-shapes and calling the matching `decode*`.
 /// These tests drive it directly against real encoder output (one per recognized key shape) plus the

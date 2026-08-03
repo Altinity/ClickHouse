@@ -1,4 +1,4 @@
-"""CA soak harness — fsck / ca-gc-dryrun invocation and output parsing.
+"""CA soak harness — fsck / cas-gc-dryrun invocation and output parsing.
 
 `parse_fsck_summary` and `parse_dryrun` are pure functions (no I/O); they are unit-tested
 independently of the running cluster.
@@ -11,7 +11,7 @@ import subprocess
 
 
 #: How far INSIDE the subprocess budget the scan's own deadline is placed when `partial=True`.
-#: `ca-fsck --timeout N --partial` prints the counts it accumulated before N; that printing only happens
+#: `cas-fsck --timeout N --partial` prints the counts it accumulated before N; that printing only happens
 #: if the process is still alive, so the subprocess budget must outlast N. The margin covers process
 #: start-up, the final summary write, and the `--detail` row dump.
 PARTIAL_MARGIN_S = 20
@@ -26,7 +26,7 @@ class FsckTimeout(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def parse_fsck_summary(line: str) -> dict:
-    """Parse the single summary line emitted by `clickhouse-disks ca-fsck`.
+    """Parse the single summary line emitted by `clickhouse-disks cas-fsck`.
 
     The line has the form:
         reachable=N dangling=N unreachable=N physical_bytes=N
@@ -63,7 +63,7 @@ def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
     A stale-edge blob carries only source edges naming manifests that no longer exist anywhere in the
     pool, so the matching `-1` can never fold: its in-degree is pinned above zero for good and the
     incremental GC will never reclaim it. It looks exactly like an `AwaitingGc` backlog, which is the
-    label that used to hide it — so the soak asserts it, and `ca-fsck` itself does NOT: `CommandFsck`
+    label that used to hide it — so the soak asserts it, and `cas-fsck` itself does NOT: `CommandFsck`
     throws (nonzero exit) on `dangling`, `chain_broken`, `corrupted_runs`
     and `lifeless_keys`, but not on this class, which means the harness's existing `exit_code != 0` gate
     does not cover it at all. `stale_edge` is the ONLY `clean()` term left out of that set, and this
@@ -94,7 +94,7 @@ def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
     """
     if "stale_edge" not in fsck_result:
         return ("absent",
-                "fsck result carries no `stale_edge` field. `ca-fsck` prints it on every summary line "
+                "fsck result carries no `stale_edge` field. `cas-fsck` prints it on every summary line "
                 "(programs/disks/CommandFsck.cpp), so this binary predates the StaleEdge class and the "
                 "checkpoint cannot prove the class is empty. Failing CLOSED — a missing key is not zero.")
     value = fsck_result["stale_edge"]
@@ -132,7 +132,7 @@ def stale_edge_verdict(fsck_result: dict, *, detail: bool) -> tuple:
 
 
 def parse_dryrun(text: str) -> dict:
-    """Parse the full stdout of `clickhouse-disks ca-gc-dryrun`.
+    """Parse the full stdout of `clickhouse-disks cas-gc-dryrun`.
 
     Expected format::
 
@@ -181,10 +181,10 @@ _CLICKHOUSE_DISKS = [
 
 def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
              timeout_s: float = 600.0, partial: bool = False) -> dict:
-    """Run `clickhouse disks --disk <disk> --query "ca-fsck [--detail]"` in the container.
+    """Run `clickhouse disks --disk <disk> --query "cas-fsck [--detail]"` in the container.
 
     Uses the read-only disk (``ca_ro`` by default) so the mutating capability probe is
-    skipped.  ``ca-fsck`` exits nonzero when ``dangling > 0`` (invariant INV-NO-LOSS).
+    skipped.  ``cas-fsck`` exits nonzero when ``dangling > 0`` (invariant INV-NO-LOSS).
 
     Returns a dict with:
     - all fields from the summary line (``reachable``, ``dangling``, ``unreachable``, …)
@@ -197,7 +197,7 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     (an O(pool) scan can take 40+ minutes under load — B146/B154).  ``subprocess.run``
     kills the child process automatically on ``TimeoutExpired`` in Python 3.x.
     """
-    query = "ca-fsck --detail" if detail else "ca-fsck"
+    query = "cas-fsck --detail" if detail else "cas-fsck"
     if partial:
         # Put the scan's own deadline strictly INSIDE the subprocess budget. Until 2026-07-26 these two
         # were inverted -- subprocess 180s, product default 600s -- so the process was always killed
@@ -214,7 +214,7 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        raise FsckTimeout(f"ca-fsck (detail={detail}) exceeded {timeout_s}s on {container}")
+        raise FsckTimeout(f"cas-fsck (detail={detail}) exceeded {timeout_s}s on {container}")
 
     # The summary line starts with "reachable="; find the first such line.
     summary_line = next(
@@ -265,7 +265,7 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
 
 
 def run_dryrun(container: str, disk: str = "ca_ro", timeout_s: float = 600.0) -> dict:
-    """Run `clickhouse disks --disk <disk> --query ca-gc-dryrun` in the container.
+    """Run `clickhouse disks --disk <disk> --query cas-gc-dryrun` in the container.
 
     Returns the parsed output of `parse_dryrun`.
 
@@ -276,12 +276,12 @@ def run_dryrun(container: str, disk: str = "ca_ro", timeout_s: float = 600.0) ->
         "docker", "exec", container,
         *_CLICKHOUSE_DISKS,
         "--disk", disk,
-        "--query", "ca-gc-dryrun",
+        "--query", "cas-gc-dryrun",
     ]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        raise FsckTimeout(f"ca-gc-dryrun exceeded {timeout_s}s on {container}")
+        raise FsckTimeout(f"cas-gc-dryrun exceeded {timeout_s}s on {container}")
     result = parse_dryrun(p.stdout)
     result["exit_code"] = p.returncode
     result["stdout"] = p.stdout

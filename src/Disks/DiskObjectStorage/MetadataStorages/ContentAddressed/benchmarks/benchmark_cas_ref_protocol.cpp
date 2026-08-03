@@ -10,7 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
-/// Pure measurement, no pass/fail assertions -- see the ca-gc-rebuild BACKLOG.md entries
+/// Pure measurement, no pass/fail assertions -- see the cas-gc-rebuild BACKLOG.md entries
 /// "OPTIMIZATION OPPORTUNITY -- ref-ledger JSON encoding writes byte-by-byte" and the (now
 /// RESOLVED) "admits() re-encodes the WHOLE ref table once per state-growing op" entry for the
 /// investigation these benchmarks measure. Build with `-DENABLE_BENCHMARKS=ON` and run the

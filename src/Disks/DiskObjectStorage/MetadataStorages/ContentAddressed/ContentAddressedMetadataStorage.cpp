@@ -1533,7 +1533,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                 LOG_WARNING(log,
                     "existsDirectory('{}'): {} key(s) under this scope name no namespace life, so it "
                     "cannot be proven empty and is reported as PRESENT. First such key: '{}' ({}). Run "
-                    "`ca-fsck` to enumerate them all.",
+                    "`cas-fsck` to enumerate them all.",
                     path, listing.skipped.size(), listing.skipped.front().key, listing.skipped.front().reason);
                 return true;
             }

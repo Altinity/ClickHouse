@@ -826,7 +826,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
         else
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "CAS decommission '{}': unknown pool member (no owner anchor and no mount lease). "
-                "Nothing to decommission; if victim objects linger without a slot, run ca-fsck.",
+                "Nothing to decommission; if victim objects linger without a slot, run cas-fsck.",
                 victim_srid);
     }
     config.server_id = *victim_uuid;

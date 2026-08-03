@@ -55,7 +55,7 @@ def test_run_fsck_timeout_message_includes_container(monkeypatch):
 def test_run_dryrun_timeout_raises_FsckTimeout(monkeypatch):
     """`run_dryrun` converts `subprocess.TimeoutExpired` → `FsckTimeout`."""
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: (_ for _ in ()).throw(_make_timeout_expired()))
-    with pytest.raises(FsckTimeout, match="ca-gc-dryrun.*exceeded.*600"):
+    with pytest.raises(FsckTimeout, match="cas-gc-dryrun.*exceeded.*600"):
         run_dryrun("fake-container", timeout_s=600)
 
 

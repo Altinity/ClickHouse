@@ -2423,7 +2423,7 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
 }
 
 /// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
-/// keyword (YAGNI -- the offline `clickhouse-disks ca-fsck --detail` applet already covers per-object
+/// keyword (YAGNI -- the offline `clickhouse-disks cas-fsck --detail` applet already covers per-object
 /// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
 /// 2026-07-29, and is no longer one where findings are concerned -- see the rule stated at
 /// `stale_edge` below. `CommandFsck.cpp`'s `formatFsckSummary` line carries the same fields.
@@ -2441,7 +2441,7 @@ ColumnsDescription contentAddressedFsckColumns()
         /// consumer ever gets, so a hard finding the row omits is a finding no query can see — the same
         /// shape that hid `corrupted_runs` from the text summary for months. The row was a deliberate
         /// subset until 2026-07-29 and `stale_edge`/`corrupted_runs` were invisible from SQL while
-        /// `clickhouse-disks ca-fsck` surfaced them; then
+        /// `clickhouse-disks cas-fsck` surfaced them; then
         /// `lifeless_keys` was added to `clean` in 2026-07-30 and missed here too. Every time, the rule
         /// was written in prose, and every time the prose did not hold.
         ///

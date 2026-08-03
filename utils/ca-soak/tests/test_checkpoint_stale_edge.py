@@ -132,7 +132,7 @@ def test_an_unknown_detail_class_is_reported_loudly(stubbed):
 
 
 def test_a_corrupted_run_row_is_reported(stubbed):
-    """`corrupted-run` is an ERROR class that neither ca-fsck's exit code nor its summary line
+    """`corrupted-run` is an ERROR class that neither cas-fsck's exit code nor its summary line
     surfaces — it is observable only as a detail row, which is why the report is keyed on one."""
     def fsck(detail):
         r = dict(CLEAN_SUMMARY, unreachable=1)

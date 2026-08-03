@@ -3,7 +3,7 @@
          ClickHouse node. Defines BOTH the content-addressed disk under test AND a plain S3 disk
          (standard `metadata_type=local` S3 disk) so the card measures the identical wide INSERT on
          each and reports the CA-vs-plain slowdown factor. The two disks use DIFFERENT pool prefixes
-         so `ca-fsck` / `pool_shape` (scoped to `soak_pool`) never see the plain-S3 objects. -->
+         so `cas-fsck` / `pool_shape` (scoped to `soak_pool`) never see the plain-S3 objects. -->
     <storage_configuration>
         <disks>
             <!-- Disk under test: content-addressed over RustFS. Byte-for-byte the same knobs as the
