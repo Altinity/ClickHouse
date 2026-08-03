@@ -128,7 +128,7 @@ TEST(CasGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
     backend->resetCounts();
 
     Gc gc(store, hexToU128("0000000000000000000000000000000a"));
-    EXPECT_THROW(gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest), DB::Exception);
+    EXPECT_THROW(gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative), DB::Exception);
     EXPECT_EQ(backend->deleteTotal(), 0u);
     EXPECT_THROW(gc.rebuildBaseline(/*force=*/true), DB::Exception);
 }
@@ -187,7 +187,7 @@ TEST(CasGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt});
 
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_TRUE(report.anomalies.empty());
     EXPECT_FALSE(report.deferred);
     EXPECT_EQ(inDegreeOf(*backend, layout, UInt128(22)), 1);
@@ -234,7 +234,7 @@ TEST(CasGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
     std::vector<GcPhaseRecord> phases;
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
 
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_FALSE(report.deferred) << "the forced catalog-only fold must reach checkpoint intake";
     EXPECT_GT(backend->getCount(layout.refCkptKey(current_life)), 0u)
         << "the catalog-derived current life must drive an exact checkpoint GET";
@@ -286,7 +286,7 @@ TEST(CasGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
                    PutOutcome::Done);
     }
 
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_TRUE(report.anomalies.empty());
     EXPECT_FALSE(backend->list(layout.namespaceStreamPrefix(forgotten_life), "", 100).keys.empty());
 }
@@ -336,7 +336,7 @@ TEST(CasGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
     std::vector<GcPhaseRecord> phases;
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
 
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     bool saw_stalled_birth_anomaly = false;
     bool saw_genuinely_gone_anomaly = false;
     for (const RoundAnomaly & a : report.anomalies)

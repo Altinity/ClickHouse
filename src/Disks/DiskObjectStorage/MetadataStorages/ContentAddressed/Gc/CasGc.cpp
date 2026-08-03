@@ -1086,12 +1086,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// the old generation on this very round and the next round's parent seal no longer names it.
         /// Nothing revisits it: `snap_pruned_through` is already past that generation and the wholesale
         /// prune only walks forward. The prefix is left to `fsck`, which is the same outcome this site
-        /// already documents for a crash in this window (see the PHASE 14/18 comment above) -- the
-        /// difference is that in Stage A every round is suppressed, so it is systematic rather than
-        /// incidental. Bounded and not a correctness problem; it stops when Stage B's Task 7b flips
-        /// `UniversePolicy::kDefault`. Filed: `docs/superpowers/cas/BACKLOG.md`
-        /// `{#suppressed-handoff-consumption}`; pinned by
-        /// `CasGcFrontierGate.TheHandOffReclaimIsInertUnderSuppression`, which asserts both halves.
+        /// already documents for a crash in this window (see the PHASE 14/18 comment above). Bounded --
+        /// one small run per shard per occurrence of a suppressed round that also folded a delta -- and
+        /// not a correctness problem, but it is the one place where the gate costs something permanent,
+        /// so it is asserted rather than left to be discovered.
         static const std::vector<RunRef> kNoRuns;
         const std::vector<RunRef> & handoff_candidates =
             suppress_destructive ? kNoRuns : parent_seal_runs;
@@ -1215,10 +1213,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         t.metric("listed", sweep.listed);
         t.metric("deleted", sweep.deleted);
         t.metric("skipped", sweep.skipped);
-        /// THE §6 PREMISE'S SHARE OF `skipped`, BY REASON CLASS. In Stage A these four are very nearly
-        /// the whole story of the sweep: rule (1) is satisfiable only for a closed-and-folded epoch, so
-        /// the ordinary outcome of a healthy pass is that everything examined was RETAINED, and without
-        /// these numbers that is indistinguishable on the row from a pass that found nothing to do.
+        /// THE §6 PREMISE'S SHARE OF `skipped`, BY REASON CLASS. Rule (1) is satisfiable only for a
+        /// closed-and-folded epoch, so a pass in which everything examined was RETAINED is an ordinary
+        /// outcome, and without these numbers it is indistinguishable on the row from a pass that found
+        /// nothing to do.
         /// A row where `deleted` is 0 and all four are 0 means the sweep genuinely had no candidates.
         t.metric("retained_no_coverage", sweep.retained_no_coverage);
         t.metric("retained_hold", sweep.retained_hold);
@@ -1577,8 +1575,8 @@ Gc::GenerationSealProbe Gc::probeGenerationForSeal(uint64_t generation)
 
 uint64_t Gc::FoldResult::FrontierDeficit::total() const
 {
-    return no_catalog_entry + checkpoint_unusable + checkpoint_frontier_empty + committed_below_cursor
-        + held + append_above_frozen_tail + probe_budget + fold_aborted + unattributed;
+    return checkpoint_unusable + checkpoint_frontier_empty + committed_below_cursor
+        + held + probe_budget + fold_aborted + unattributed;
 }
 
 String Gc::FoldResult::FrontierDeficit::describe() const
@@ -1592,12 +1590,10 @@ String Gc::FoldResult::FrontierDeficit::describe() const
             out += ", ";
         out += fmt::format("{}={}", name, count);
     };
-    add("no_catalog_entry", no_catalog_entry);
     add("checkpoint_unusable", checkpoint_unusable);
     add("checkpoint_frontier_empty", checkpoint_frontier_empty);
     add("committed_below_cursor", committed_below_cursor);
     add("held", held);
-    add("append_above_frozen_tail", append_above_frozen_tail);
     add("probe_budget", probe_budget);
     add("fold_aborted", fold_aborted);
     add("unattributed", unattributed);
@@ -1609,12 +1605,10 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
     switch (reason)
     {
         case FrontierUnproven::Proven: return;
-        case FrontierUnproven::NoCatalogEntry: ++no_catalog_entry; return;
         case FrontierUnproven::CheckpointUnusable: ++checkpoint_unusable; return;
         case FrontierUnproven::CheckpointFrontierEmpty: ++checkpoint_frontier_empty; return;
         case FrontierUnproven::CommittedBelowCursor: ++committed_below_cursor; return;
         case FrontierUnproven::Held: ++held; return;
-        case FrontierUnproven::AppendAboveFrozenTail: ++append_above_frozen_tail; return;
         case FrontierUnproven::Unattributed: ++unattributed; return;
     }
 }
@@ -1970,18 +1964,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const std::map<String, RefTxnId> & checkpoint_witness = checkpoints.witnesses;
 
     /// WHICH NAMESPACES THIS ROUND WALKS -- i.e. THE ROUND'S UNIVERSE, the set the destructive gate owes
-    /// a frontier proof for (spec §5; `UniversePolicy` for why Stage A refuses to trust it):
+    /// a frontier proof for (spec §5; `UniversePolicy` for why only the catalog can bound it): EVERY
+    /// `Live`/`Removing` row of this round's frozen catalog cut, and nothing else.
     ///
-    ///     (every namespace this round's hint names) ∪ (every namespace the adopted seal carries a
-    ///     shard-0 cursor for)
-    ///
-    /// The second half is a UNION, and that direction is the whole point: `discoverUniverse` is a hint
-    /// and its mechanism has not changed, but a hint that goes quiet about a namespace can now only ADD
-    /// nothing -- it can no longer SHRINK the obligation, because the cursor keeps the namespace in the
-    /// set. A held namespace was already carried for a narrower reason (a hold must force an exact retry
-    /// of its offending position even when the hint omits the namespace entirely -- otherwise a store
-    /// that stops listing a namespace clears its hold, precisely the failure the hold exists to
-    /// prevent); the union generalizes that from held namespaces to every known one.
+    /// The listing is a HINT and cannot change that set in either direction. It cannot SHRINK it -- a
+    /// store that goes quiet about a namespace, or stops listing one to clear its hold, leaves the
+    /// catalog row and therefore the obligation untouched -- and it cannot GROW it either, since a
+    /// physical id the catalog does not name is inert debris rather than a namespace to prove.
     ///
     /// A namespace with no hint entry walks against an EMPTY listing: it has no hint witnesses, but it
     /// still reads its expected-next by exact key -- ONE `GET`, whose absence IS the frontier proof and
@@ -1994,7 +1983,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// does not reach are simply unproven, which suppresses the round's destruction. In a healthy pool
     /// that budget is rarely touched; dead physical lives are excluded by the catalog-built plan.
 
-    /// THE ROUND'S WORK-SET IS FROZEN AT THE ROUND-START LISTING, AND THAT IS WHAT MAKES A ROUND END.
+    /// THE ROUND'S WORK-SET IS FROZEN AT ROUND START, AND THAT IS WHAT MAKES A ROUND END.
     ///
     /// Arithmetic intake reads the next id by exact key, so on its own it walks WHILE RECORDS EXIST --
     /// and a namespace whose writer appends concurrently therefore has no last record to reach. Round
@@ -2004,66 +1993,37 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// its cursors, the sampled store-quality detector, ref-object cleanup -- so the backlog the round
     /// was falling behind on grows without bound.
     ///
-    /// The bound is the LISTING THE ROUND ALREADY TOOK. Its greatest listed id per namespace (the
-    /// LISTED TAIL, in `RefTxnId` epoch-major order) is a position that existed when the round started,
-    /// so folding up to it and stopping is finite work fixed at round start, whatever the writer does
-    /// meanwhile. Contiguity (INV-1) is what makes the tail ALONE a sufficient summary of the listing:
-    /// the ids between the cursor and the tail are exactly `cursor+1 .. tail`, so nothing about which
-    /// individual ids were listed matters, and a listing that omits ids in the MIDDLE stays the
-    /// non-event it became when intake went arithmetic -- the walk GETs them by computed key regardless.
-    ///
-    /// NO NEW PERSISTED STATE. A round that reaches its frozen tail seals `last_folded_ref_id == tail`,
-    /// so the cursor IS the remembered tail and the next round's comparison is against a number the seal
-    /// already carried.
+    /// The bound is `_ckpt.committed_through`, snapshotted once per namespace before the walk (see
+    /// `readCheckpointWitnesses`) and never re-read within the round: the ceiling test at the top of the
+    /// walk refuses every position above it, so the work is fixed at round start whatever the writer
+    /// does meanwhile. It is also the AUTHORITY ceiling -- a record above it is durable but is not
+    /// logical history yet -- so ONE comparison serves both purposes and there is no second bound that
+    /// could drift out of agreement with it. NO NEW PERSISTED STATE: the number is read from an object
+    /// the fold reads anyway.
     ///
     /// THE BOUND IS ON FOLDING, NOT ON READING, and that distinction is the whole design.
     ///
     /// The walk still reads its expected-next exactly as before -- one exact `GET` at `cursor + 1` --
-    /// because that read IS the frontier proof: an absent expected-next with no witness above it is the
-    /// ONLY thing anywhere that sets `frontier_proven`, and a namespace that stops being read stops being
+    /// because that read IS the frontier proof, and a namespace that stops being read stops being
     /// provable. An unprovable namespace leaves `frontier_complete` false forever, which suppresses every
     /// destructive decision, which stops ref-object cleanup, which means its listing never drains and it
     /// never becomes provable by any other route either. So "skip reading a quiet namespace" is not a
     /// cheaper version of this design; it is a GC that permanently reclaims nothing. The saving it
     /// appears to offer is exactly one `GET` per namespace per round, and that `GET` is the proof.
     ///
-    /// The bound therefore sits AFTER the read: a record found ABOVE the frozen tail arrived after this
-    /// round's listing, and the walk stops there WITHOUT folding it. At most one such record is read per
-    /// namespace per round -- the peek that discovers the writer moved -- and none is ever folded, which
-    /// is exactly what removes the chase. Reaching the tail is NOT a frontier proof (nothing was observed
-    /// absent), so the namespace is unproven and the round suppresses. Stopping early can only ever cost
-    /// reclamation latency, never safety.
-    ///
-    /// Three classes, reported on the phase row:
-    ///   * `tail > cursor` -- the round's real work: fold `cursor+1 .. tail`, then peek once;
+    /// The listed tail bounds nothing, but it is still CLASSIFIED for the phase row, in three classes:
+    ///   * `tail > cursor` -- the round has records to fold;
     ///   * `tail == cursor` -- the listing shows nothing new, so the walk folds nothing and its single
     ///     read is the frontier probe. On a wide pool this is most namespaces, most rounds;
     ///   * `tail < cursor` -- the listing's greatest id is BELOW a cursor we folded through. Cleanup
     ///     deletes logs from the bottom up, so a listed log below the cursor with none at or above it is
     ///     a stale or lying listing, not a shape cleanup produces. The cursor is the truth (the sampled
     ///     store-quality detector is this class's observer).
-    /// A namespace with NO LISTED LOGS AT ALL has no tail to freeze and keeps the unbounded walk. That is
-    /// the quiescent shape (cleanup removes every log at or below `min(snapshot, cursor)`) and also the
-    /// shape a store that HIDES a namespace's records produces -- where reading past a tail the listing
-    /// refuses to admit to is the entire point, and where a bound would hand the liar the omission it was
-    /// hoping for.
-    ///
-    /// A HELD namespace's bound is `max(tail, offending_position)`, and the `max` is what keeps the
-    /// bound from contradicting the retry obligation: a hold clears only by resolving its offending
-    /// position by exact key (spec §5), and that position can sit above the listed tail (a crossing holds
-    /// at `{E', 1}` while the tail is still in `E`, and a hold whose record the listing omits is
-    /// precisely the case a bound must not hide). So the walk always reaches it, and once the hold CLEARS
-    /// the walk continues no further than the frozen tail -- without which a held-and-hot namespace would
-    /// resume chasing the tail the moment its hold cleared.
     struct WalkTarget
     {
         String ns;
         UInt128 life_id{};
         const RefTableListing * listing;
-        /// The greatest id this namespace may FOLD this round, or `nullopt` for an unbounded walk
-        /// (unhinted targets, and hinted ones whose listing carries no log at all). Reading is not
-        /// bounded -- see above for why the expected-next read must always happen.
-        std::optional<RefTxnId> frozen_tail;
     };
 
     static const RefTableListing kNoListing;
@@ -2107,20 +2067,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         else if (listing_it == ref_tables.end())
             ++intake_catalog_only;
 
-        if (listing->logs.empty())
-        {
-            walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing, std::nullopt});
+        walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing});
+        if (listing->logs.empty() || (parent_cov && parent_cov->hold))
             continue;
-        }
 
         const RefTxnId tail = listing->logs.back();
-        if (parent_cov && parent_cov->hold)
-        {
-            walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing,
-                                    std::max(tail, parent_cov->hold->offending_position)});
-            continue;
-        }
-
         const RefTxnId cursor = parent_cov ? parent_cov->last_folded_ref_id : RefTxnId{};
         if (cursor < tail)
             ++intake_tails_advanced;
@@ -2128,7 +2079,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             ++intake_tails_unchanged;
         else
             ++intake_tails_below_cursor;
-        walk_targets.push_back({catalog_ns_str, catalog_incarnation, listing, tail});
     }
 
     for (const WalkTarget & target : walk_targets)
@@ -2138,36 +2088,20 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (ref_folding_aborted)
             break;
         const RootNamespace ns{ns_str};
-        /// Stage B (Task 4-C): this round's own catalog read (`live_incarnation`, built once above for
-        /// the R10 filter) names every namespace's REAL incarnation; a namespace it does not name (a
-        /// raw-fixture test that never touched the catalog) uses its deterministic Stage-A fixture id,
-        /// which is the only other identity such a namespace could have keyed its objects at.
-        const bool catalog_names_this_namespace = true;
+        /// Every walk target came out of this round's own catalog read, so its incarnation is the REAL
+        /// one and the life below is minted from a catalog entry rather than guessed from a key.
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, target.life_id);
 
         /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}).
         ///
-        /// Id ordering NO LONGER subsumes remove+recreate. It used to: the sequence was pool-wide and
-        /// never re-derived, so a recreated namespace's first log always carried a greater id than
-        /// anything folded under it. Under INV-1 (`nextRefTxnId`) ids are derived per namespace from that
-        /// table's own state, so a namespace removed and recreated WITHIN ONE writer epoch -- after its
-        /// logs were cleaned and its runtime re-recovered from nothing -- restarts at `{E, 1}`, at or
-        /// below this cursor. The walk below starts at `cursor + 1`, so those edges would never fold and
-        /// the recreated refs' manifests would look unreferenced.
-        ///
-        /// Nothing today prunes the cursor when the namespace vanishes -- a prior version of this
-        /// comment claimed otherwise ("written ONLY for namespaces in THIS round's listing, so a
-        /// fully-deleted namespace leaves no cursor behind"), which is FALSE (increment review NEW-2):
-        /// `walk_targets` includes every namespace with a `parent_cursors` entry regardless of whether
-        /// this round's listing mentions it at all, so the new seal's ref-life row re-carries the SAME
-        /// cursor forward every round, forever, entry or no entry. This is Stage A residual behaviour --
-        /// no removal API exists yet to even trigger it (`CasRefCatalog` has no entry-deletion primitive
-        /// -- see `deferred-docs-fixes.md` D19/NEW-4-6) -- and is safe ONLY because ALL destruction stays
-        /// suppressed under `UniversePolicy::kDefault` until Task 5 lands. Task 5 owns BOTH halves this
-        /// comment used to gloss over concretely: pruning the cursor once the removal's marker and
-        /// retirement are durable, and only then. Do not "fix" the same-epoch-rebirth id-ordering gap
-        /// above by comparing ids -- the structural closure is Stage B's catalog incarnations (cursors
-        /// keyed by `(namespace, incarnation)`, not by name), which Task 5/6 own.
+        /// Id ordering does NOT subsume remove+recreate: under INV-1 (`nextRefTxnId`) ids are derived per
+        /// namespace from that table's own state, so a namespace removed and recreated within one writer
+        /// epoch restarts at `{E, 1}`, at or below a cursor sealed for the PREVIOUS life -- and the walk
+        /// starts at `cursor + 1`, so those edges would never fold and the recreated refs' manifests
+        /// would look unreferenced. That is closed STRUCTURALLY, not by comparing ids: this map and the
+        /// walk targets are both keyed by CATALOG INCARNATION, so a rebirth is a different key and
+        /// inherits no cursor, and a life the catalog no longer names contributes no walk target and
+        /// therefore re-carries no cursor into the new seal. Do not "fix" it by comparing ids.
         const auto cursor_it = parent_ref_lives.find(target.life_id);
         const RefTxnId cursor = cursor_it != parent_ref_lives.end()
             ? cursor_it->second.coverage.last_folded_ref_id : RefTxnId{};
@@ -2349,24 +2283,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             expected = RefTxnId{*checkpoint->life_epoch, 1};
         }
 
-        /// C1 fix, continued: a namespace absent from this round's catalog read is UNPROVEN, never
-        /// walked. No hold is minted (there is no legitimate position to name -- a fabricated one would
-        /// become a permanent false witness, the same reason the undecodable-`_ckpt`-no-position arm
-        /// just below mints none either), so the only way this can suppress destruction is the anomaly
-        /// and the frontier staying incomplete -- which is exactly what should suppress it.
-        ///
-        /// This branch is a fail-closed invariant check for a logical walk target. Physical ids absent
-        /// from the post-LIST cut were already discarded as inert debris before `ref_tables` was built.
-        if (!catalog_names_this_namespace)
-        {
-            report.recordAnomaly(ns, 0, ManifestId{ns, {}},
-                "ref intake: this namespace has no catalog entry (Live/Removing) this round -- its "
-                "frontier cannot be proven from a real key space, so it is treated as unproven rather "
-                "than walked at a fabricated one");
-            unproven_reason = FoldResult::FrontierUnproven::NoCatalogEntry;
-            expected.reset();
-        }
-
         /// An unavailable or invalid `_ckpt` quarantines its own namespace and nothing else (spec §5). The object
         /// belongs to exactly one namespace and both of its consumers are keyed by that namespace --
         /// `witnessAbove` above, and `cleanupRefObjects`' delete boundaries via `result.checkpoints` --
@@ -2460,12 +2376,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 const auto witness = witnessAbove(*expected);
                 if (!witness)
                 {
-                    if (*expected <= *grounding->committed_through)
-                        hold(*expected, HoldReason::GapBelowWitness,
-                             "ref intake: a checkpoint-committed ref log is absent -- its authoritative "
-                             "frontier cannot be complete");
-                    else
-                        frontier_proven = true;
+                    /// The ceiling test above already refused everything past `committed_through`, so
+                    /// this absent position is committed and its record owes us an answer.
+                    hold(*expected, HoldReason::GapBelowWitness,
+                         "ref intake: a checkpoint-committed ref log is absent -- its authoritative "
+                         "frontier cannot be complete");
                     break;
                 }
 
@@ -2508,19 +2423,6 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 expected = *crossed;
                 continue;
             }
-            /// THE FROZEN WORK-SET'S EDGE. This record is real and readable, and it is ABOVE the tail the
-            /// round's listing showed -- so it arrived after the round started. Stop without folding it:
-            /// that is what makes the round's work finite at round start however fast the writer appends,
-            /// and it costs exactly this one read per namespace per round. Deliberately distinct from
-            /// every other exit -- no anomaly, no hold, nothing wrong -- and it leaves `frontier_proven`
-            /// false, so the namespace is merely unproven this round and the round suppresses.
-            if (target.frozen_tail && *target.frozen_tail < *expected
-                && *grounding->committed_through < *expected)
-            {
-                unproven_reason = FoldResult::FrontierUnproven::AppendAboveFrozenTail;
-                break;
-            }
-
             const RefTxnId log_id = *expected;
 
             /// Probe B2: open this transaction's ledger entry. A clamped log is opened but never
@@ -3064,11 +2966,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// gate reads the seal it is about to make durable.
     const std::vector<std::pair<UInt128, RefHold>> carried_holds = result.carriedHolds();
 
-    /// Term 3, the universe seam. `AuthoritativeForTest` means the CALLER has constructed a closed
-    /// universe and the per-namespace proofs may decide on their own; anything else -- which in
-    /// production is the only possibility -- refuses, because Stage A cannot enumerate the namespaces
-    /// the proofs would have to cover. See `UniversePolicy`.
-    const bool universe_authoritative = policy == UniversePolicy::AuthoritativeForTest;
+    /// Term 3, the universe seam. `Authoritative` means the round's universe is the catalog's own
+    /// `Live`/`Removing` set, so the per-namespace proofs decide on their own; `StageA_Suppressed`
+    /// refuses outright, which is the posture a test asserting inertness selects. See `UniversePolicy`.
+    const bool universe_authoritative = policy == UniversePolicy::Authoritative;
     /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md
     /// {#r11-empty-universe-vacuous}`): `frontier_proven == frontier_namespaces` is `0 == 0` -- TRUE --
     /// on an empty universe, which is not a proof of anything: a fresh pool, a damaged catalog, or a
@@ -3088,24 +2989,20 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (suppress_destructive)
     {
         ProfileEvents::increment(ProfileEvents::CasGcClampSuppressedPasses);
-        /// LEVEL SPLIT, deliberately. A pass suppressed by an anomaly, a hold, or an exhausted probe
-        /// budget has a per-round cause an operator can chase, and that is a WARNING. A pass suppressed
-        /// ONLY by the Stage-A universe constant is a static property of the build -- true on every
-        /// round of every pool -- so warning about it would emit one alarm per round forever and train
-        /// operators to ignore the channel that carries the real ones. It is still reported, at Info,
-        /// with the same numbers.
+        /// LEVEL SPLIT, deliberately. A pass suppressed by an anomaly, a hold, an unproven namespace or
+        /// an empty universe has a per-round cause an operator can chase, and that is a WARNING. A pass
+        /// suppressed because the CALLER refused to supply a universe carries no such cause -- nothing on
+        /// the pool explains it -- so it is reported at Info with the same numbers rather than raising an
+        /// alarm nobody can act on.
         ///
-        /// An AUTHORITATIVE-but-EMPTY universe (R11's guard above, `frontier_namespaces == 0`) is a
-        /// per-round cause, not a static one: unlike Stage A's constant suppression, this is exactly the
-        /// "a fresh pool, a damaged catalog, or a read that legitimately returns nothing" case R11 names
-        /// -- something an operator can and should chase -- so it counts as a `per_round_cause` even
-        /// though the bare equality `frontier_proven != frontier_namespaces` reads `0 != 0` (false) and
-        /// would otherwise miss it.
+        /// An AUTHORITATIVE-but-EMPTY universe (`frontier_namespaces == 0`) is a per-round cause and is
+        /// named explicitly here, because the bare equality `frontier_proven != frontier_namespaces`
+        /// reads `0 != 0` (false) and would otherwise miss it.
         const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
             || result.frontier_proven != result.frontier_namespaces
             || (universe_authoritative && result.frontier_namespaces == 0);
         const char * const universe_note =
-            universe_authoritative ? "" : "; the universe itself is not provable this stage";
+            universe_authoritative ? "" : "; the caller supplied no universe";
         /// The per-cause breakdown of the unproven namespaces. Without it "N of M proven" names a
         /// deficit but not its cause, and the causes want opposite operator responses.
         const String deficit_note = result.frontier_deficit.total() == 0
@@ -3137,7 +3034,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             state.manifest_sweep_cursor,
             store->poolConfig().manifest_sweep_list_budget_keys,
             store->poolConfig().manifest_sweep_delete_budget_keys,
-            policy == UniversePolicy::AuthoritativeForTest);
+            /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
+            /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
+            /// authoritative universe means, and is why this is the gate's term and not a separate one.
+            universe_authoritative);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),
@@ -3262,6 +3162,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         reduce_timer->metric("spared", spared);
         reduce_timer->metric("redelete_pending", redelete_pending);
         reduce_timer->metric("suppress_destructive", suppress_destructive ? 1 : 0);
+        /// Published separately from `suppress_destructive` so a reader can tell the frontier term apart
+        /// from the anomaly and hold terms without re-deriving the formula from the tally.
+        reduce_timer->metric("frontier_complete", result.frontier_complete ? 1 : 0);
         reduce_timer->metric("txns_unapplied", txns_unapplied_this_round);
     }
     reduce_timer.reset();   /// emits the `fold_reduce` row
@@ -3353,8 +3256,8 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
     if (!changed && ++retain_rollup_passes_since_report < kRetainRollupRepeatPasses)
         return;
 
-    /// INFO, not WARNING: in Stage A retention is the CORRECT outcome (rule (1) is satisfiable only for
-    /// a closed-and-folded epoch), so warning here would raise an alarm on every healthy round. It is
+    /// INFO, not WARNING: retention is the CORRECT outcome whenever rule (1) is unsatisfiable (it is
+    /// satisfiable only for a closed-and-folded epoch), so warning here would alarm on healthy rounds. It is
     /// still the operator's answer to "why is manifest debris not shrinking?", which is why it is not
     /// left at DEBUG with the per-object sentences.
     /// The "X of Y" denominator is the RETAINED total, not `skipped`. `skipped` is a strictly larger

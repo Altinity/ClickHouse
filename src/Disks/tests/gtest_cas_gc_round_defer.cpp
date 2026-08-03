@@ -200,7 +200,7 @@ TEST(CasGcRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
     backend->resetCounts();
 
     Gc gc(store, kGc);
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_FALSE(report.deferred);
     EXPECT_EQ(backend->getCount(log_key), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
@@ -219,7 +219,7 @@ TEST(CasGcRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
     backend->resetCounts();
 
     Gc gc(store, kGc);
-    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_FALSE(report.deferred);
     EXPECT_EQ(backend->getCount(snapshot_key), 0u);
     EXPECT_EQ(backend->deleteTotal(), 0u);
@@ -441,7 +441,7 @@ TEST(CasGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
 
     backend->resetCounts();
     phases.clear();
-    const RoundReport folded = gc.runRegularRound({}, true, UniversePolicy::AuthoritativeForTest);
+    const RoundReport folded = gc.runRegularRound({}, true, UniversePolicy::Authoritative);
     ASSERT_TRUE(folded.acquired_lease);
     ASSERT_FALSE(folded.deferred)
         << "gc_fold_max_defer_rounds=1 forces the round immediately following one DEFER to fold";

@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
-/// THE FROZEN WORK-SET (the bounded fold walk).
+/// THE BOUNDED FOLD WALK.
 ///
 /// Arithmetic ref intake reads the next record by exact key -- `cursor + 1` -- and stops when that read
 /// comes back absent. That is exact and immune to a lying listing, and it is also, on its own, a walk
@@ -16,24 +16,23 @@
 /// minutes, and with them nothing that paces on rounds -- fold seal, cursors, the sampled store-quality
 /// detector, ref-object cleanup -- ever ran again.
 ///
-/// The fix bounds what a round FOLDS by the enumeration it already took: each namespace's greatest
-/// LISTED id (its tail) existed at round start, so folding up to it is finite work fixed before the
-/// round began.
+/// The bound is `_ckpt.committed_through`, snapshotted once per namespace before the walk and never
+/// re-read within the round, so the work is finite and fixed before the round began however fast the
+/// writer appends. It is the AUTHORITY ceiling too -- a record above it is durable but is not logical
+/// history yet -- so ONE comparison both terminates the round and refuses to fold uncommitted work.
 ///
-/// IT DOES NOT BOUND WHAT THE ROUND READS, and that is not an oversight. The absent read at `cursor + 1`
-/// is the ONLY producer of a frontier proof anywhere in GC, an unproven namespace suppresses all
+/// IT DOES NOT BOUND WHAT THE ROUND READS, and that is not an oversight. The read at `cursor + 1`
+/// produces the frontier proof, an unproven namespace suppresses all
 /// destructive work, and suppression stops the ref-object cleanup that would have drained the listing --
 /// so a namespace that stops being read can never become provable again by any route. "Skip the quiet
 /// namespace entirely" therefore is not a cheaper version of this design, it is a GC that permanently
-/// reclaims nothing; the saving is one `GET` and that `GET` is the proof. The bound sits AFTER the read
-/// instead: a record found above the frozen tail arrived after the listing, and the walk stops there
-/// WITHOUT folding it. One such record is read per namespace per round; none is ever folded.
+/// reclaims nothing; the saving is one `GET` and that `GET` is the proof.
 ///
 /// So the properties these tests pin are:
-///   * a round folds through its round-start tail and no further, whatever lands meanwhile;
+///   * a round folds through its round-start committed frontier and no further, whatever lands meanwhile;
 ///   * a namespace whose tail did not move folds NOTHING and a matching CTE proves its carried cursor;
 ///   * a round where no tail moved is skipped outright by the existing defer machinery;
-///   * stopping at the tail is NOT a frontier proof, so such a round destroys nothing;
+///   * a raw record ABOVE the committed frontier neither extends the fold nor suppresses destruction;
 ///   * a manifest edge fold costs one GET and never a HEAD;
 ///   * a namespace that folded nothing still keeps its sealed coverage row.
 
@@ -230,8 +229,8 @@ TEST(CasGcBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
     ASSERT_TRUE(cov.has_value()) << "the round must seal a coverage row for the namespace it walked";
     EXPECT_EQ(cov->last_folded_ref_id, (RefTxnId{1, planted}))
         << "the walk must fold through the round-start tail and no further -- it chased the writer";
-    EXPECT_FALSE(cov->hold.has_value()) << "stopping at the frozen tail is not a hold";
-    EXPECT_NE(cov->classification, 4) << "stopping at the frozen tail is not a clamp";
+    EXPECT_FALSE(cov->hold.has_value()) << "reaching the committed frontier is not a hold";
+    EXPECT_NE(cov->classification, 4) << "reaching the committed frontier is not a clamp";
     EXPECT_EQ(metric(intake, "tails_advanced"), 1u);
     EXPECT_EQ(metric(intake, "logs_applied"), planted) << "exactly the round-start backlog was folded";
 
@@ -349,11 +348,10 @@ TEST(CasGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
         << "the still-quiet namespace's CTE proves its carried frontier without a probe";
 }
 
-/// ===================== (d) STOPPING AT THE TAIL IS NOT A FRONTIER PROOF =====================
+/// ============ (d) A RAW RECORD ABOVE THE COMMITTED FRONTIER PROVES AND SUPPRESSES NOTHING ============
 ///
-/// This is the safety argument, and it has to be checked under `AuthoritativeForTest`: the production
-/// default suppresses destruction for a reason unrelated to this change, so the same test on the default
-/// would pass whatever the frozen tail did to the proofs.
+/// This is the safety argument. It is stated under an explicit `Authoritative` policy so that the claim
+/// is about the frontier terms and not about which policy the caller happened to pass.
 ///
 /// The CTE fixes the namespace's committed frontier at `{1,3}`. A raw record ABOVE that frontier was
 /// never committed, so it is neither a reason to extend the fold nor a reason to suppress destruction:
@@ -376,7 +374,7 @@ TEST(CasGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
     writeTxnAt(*backend, layout, ns, RefTxnId{1, 2}, publishCommittedOps("doomed", doomed));
     dropRefTransition(*backend, layout, ns, "doomed", doomed);
 
-    /// One record lands mid-round, above the frozen tail.
+    /// One record lands mid-round, above the committed frontier.
     backend->arm(&layout, ns, /*published_through*/ 3, /*max_appends*/ 1);
 
     /// From HERE the deletes are the ROUND's. Opening the pool runs a capability probe that writes and
@@ -385,11 +383,11 @@ TEST(CasGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
     backend->resetCounts();
 
     Gc gc(store, kGc);
-    const std::map<String, UInt64> intake = runRoundCapturingIntake(gc, UniversePolicy::AuthoritativeForTest);
+    const std::map<String, UInt64> intake = runRoundCapturingIntake(gc, UniversePolicy::Authoritative);
 
     ASSERT_EQ(backend->publishedThrough(), 4u) << "the mid-round appender never fired";
     ASSERT_EQ(metric(intake, "tails_advanced"), 1u) << "the namespace must have been walked";
-    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3})) << "and folded exactly its frozen tail";
+    EXPECT_EQ(cursorOf(*backend, layout, ns), (RefTxnId{1, 3})) << "and folded exactly its committed frontier";
     EXPECT_EQ(metric(intake, "frontier_proven"), 1u)
         << "the CTE, not the raw record beyond it, fixes the namespace frontier";
     EXPECT_EQ(metric(intake, "frontier_namespaces"), 1u) << "it is still in the round's universe";
@@ -406,8 +404,8 @@ TEST(CasGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
 
 /// A store that hides a namespace's records from every LIST does not lose them: the namespace goes
 /// QUIET, and a quiet namespace is exactly the shape the exact-key probe at `cursor + 1` exists for. It
-/// has no listed tail, so the frozen bound never applies to it -- which is deliberate, because bounding
-/// a namespace by a tail the liar refuses to admit to would hand it the omission it was hoping for.
+/// has no listed tail at all, and no bound is taken from a listing anyway -- bounding a namespace by a
+/// tail the liar refuses to admit to would hand it the omission it was hoping for.
 TEST(CasGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();

@@ -555,18 +555,13 @@ inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layou
 /// ONE round that is allowed to RECLAIM -- the name is the point, so that grepping for the tests whose
 /// subject is reclamation finds exactly them.
 ///
-/// The destructive gate refuses to act on a universe it cannot enumerate, and Stage A never can
-/// (`UniversePolicy`), so a round left on the production default reclaims NOTHING. A test whose subject
-/// is reclamation therefore has to say so, and this is where it says it: it asserts that the universe
-/// IT built is closed, which for a unit test over an `InMemoryBackend` is true by construction -- the
-/// test wrote every object in the pool.
-///
-/// It is a spelled-out call, not a seam: production reaches `runRegularRound` with no third argument
-/// and there is no other way in. Tests that are NOT about reclamation should keep calling
-/// `gc.runRegularRound()` plainly -- on the production default they exercise the gate itself.
+/// The policy is spelled out rather than defaulted so that grepping this name finds every test whose
+/// subject is reclamation, and so that a future change to the default cannot silently change what those
+/// tests mean. It says the same thing the production default says (`UniversePolicy`); a test whose
+/// subject is a SUPPRESSOR passes `StageA_Suppressed` explicitly instead.
 inline DB::Cas::RoundReport runRegularRoundReclaiming(DB::Cas::Gc & gc)
 {
-    return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::AuthoritativeForTest);
+    return gc.runRegularRound({}, /*allow_steal*/true, DB::Cas::UniversePolicy::Authoritative);
 }
 
 /// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's

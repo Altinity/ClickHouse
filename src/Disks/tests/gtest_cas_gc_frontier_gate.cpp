@@ -46,17 +46,17 @@ namespace DB::ErrorCodes
 /// happens to imply it -- but the invariant is the hold SET, not that coincidence, and the gate reads
 /// the seal directly so that a future change to anomaly recording cannot quietly open it.
 ///
-/// The third term is where Stage A admits what it cannot do. The universe is
-/// `(sealed cursors) ∪ (this round's hint)`, two sources that can BOTH omit a namespace at once, and
-/// the scenario that makes that fatal is the one these tests open with: a hidden acked `+1` in a
-/// namespace neither source names, while a visible `-1` elsewhere drives the shared blob's OBSERVABLE
-/// in-degree to zero. Every proof the round holds comes back clean and the blob is still owned. So
-/// `UniversePolicy::kDefault` is `StageA_Suppressed` and production destroys NOTHING this stage; the
-/// per-namespace logic below is reached only by a test that has constructed a closed universe and says
-/// so. Stage B's catalog makes the universe knowable and its Task 7b flips that one constant.
+/// The third term is the SET, and only the catalog supplies it. The scenario that makes that so is the
+/// one these tests open with: a hidden acked `+1` in a namespace no listing mentions and no sealed cursor
+/// names, while a visible `-1` elsewhere drives the shared blob's OBSERVABLE in-degree to zero. Every
+/// proof the round holds comes back clean and the blob is still owned. It survives because the round's
+/// universe is the catalog's `Live`/`Removing` set, so that namespace is a member the round owes a proof
+/// for and cannot supply one -- neither the listing's silence nor the missing cursor can shrink the set.
 ///
-/// Everything here is written so that flip is a source change and not a redesign: the per-namespace
-/// proofs, the quiet-namespace probes, the budget, and every gated site are live and tested now.
+/// The tests here come in two shapes. Ones whose subject is the OPEN gate run on the production path,
+/// with no policy argument at all. Ones whose subject is a SUPPRESSOR either pass `StageA_Suppressed`
+/// explicitly or arrange the suppressing condition on the pool, and assert every delete family inert PER
+/// FAMILY -- an aggregate zero can hide one family running while another did not.
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -462,6 +462,67 @@ String deletedKeysMessage(const CountingBackend & backend)
     return out.empty() ? String{" (none)"} : out;
 }
 
+/// The gate's own verdict for one round, READ OFF THE PHASE ROWS rather than recomputed in the test. A
+/// test that re-derived `frontier_complete` from the tally would agree with a wrong formula just as
+/// readily as with the right one.
+struct GateVerdict
+{
+    bool saw_fold = false;
+    bool frontier_complete = false;
+    bool suppress_destructive = false;
+    uint64_t frontier_namespaces = 0;
+    uint64_t frontier_proven = 0;
+};
+
+GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy policy)
+{
+    GateVerdict verdict;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        const auto value = [&](const char * name) -> std::optional<UInt64>
+        {
+            const auto it = rec.metrics.find(name);
+            return it == rec.metrics.end() ? std::nullopt : std::optional<UInt64>{it->second};
+        };
+        if (rec.phase == "fold_reduce")
+        {
+            if (const auto complete = value("frontier_complete"))
+            {
+                verdict.saw_fold = true;
+                verdict.frontier_complete = *complete != 0;
+            }
+            if (const auto suppress = value("suppress_destructive"))
+                verdict.suppress_destructive = *suppress != 0;
+        }
+        else if (rec.phase == "fold_ref_intake")
+        {
+            if (const auto total = value("frontier_namespaces"))
+                verdict.frontier_namespaces = *total;
+            if (const auto proven = value("frontier_proven"))
+                verdict.frontier_proven = *proven;
+        }
+    });
+    gc.runRegularRound({}, /*allow_steal*/true, policy);
+    gc.setPhaseSink({});
+    store->renewWatermarkOnce();
+    return verdict;
+}
+
+/// Every delete family a round can reach, asserted PER FAMILY: an aggregate zero can hide one family
+/// running while another did not.
+void expectEveryDeleteFamilyInert(const CountingBackend & backend, const char * where)
+{
+    EXPECT_EQ(backend.deleteCountForKeysContaining("/blobs/"), 0u) << where << ": blob delete";
+    EXPECT_EQ(backend.deleteCountForKeysContaining("/cas/manifests/"), 0u)
+        << where << ": manifest-body delete";
+    EXPECT_EQ(backend.deleteCountForKeysContaining("/gc/gen/"), 0u)
+        << where << ": generation prune and hand-off reclaim";
+    EXPECT_EQ(backend.deleteCountForKeysContaining("/cas/ns/stream/"), 0u)
+        << where << ": covered-log / superseded-snapshot cleanup";
+    EXPECT_EQ(backend.deleteTotal(), 0u)
+        << where << ": a family not named above also ran. Deleted:" << deletedKeysMessage(backend);
+}
+
 }
 
 /// ===================== THE KILL SHOT: A HIDDEN `+1` IN AN UNKNOWN NAMESPACE =====================
@@ -469,14 +530,12 @@ String deletedKeysMessage(const CountingBackend & backend)
 /// Two namespaces share one blob. `visible` publishes it and then drops it, so the round observes
 /// `+1` then `-1` and reads the blob's in-degree as zero. `hidden` also owns it -- durably, acked,
 /// readable by exact key -- but is absent from the round's LIST hint AND has never been folded, so it
-/// has no sealed cursor either. Neither source names it, and every per-namespace proof the round can
+/// has no sealed cursor either. Neither of those names it, and every per-namespace proof the round can
 /// take comes back clean.
 ///
-/// This is the scenario the Stage-A constant exists for, and the three arms below are the whole
-/// argument: the production default refuses; flipping the constant while the namespace is genuinely
-/// outside the universe DELETES the blob (so the constant is load-bearing, not decorative); and once
-/// the namespace is inside the universe, the probe finds the hidden `+1` and the blob is safe on the
-/// per-namespace logic alone -- which is exactly what Stage B will rely on.
+/// The three arms below are the whole argument: the round refuses because the CATALOG names `hidden` and
+/// its own frontier is unproven; the blob still drains once `hidden` honestly proves that frontier; and a
+/// namespace inside the universe with a sealed cursor has its hidden `+1` found by the exact-key probe.
 
 namespace
 {
@@ -515,6 +574,11 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
 }
 }
 
+/// Rounds on the PRODUCTION path -- no policy argument -- because that is what the claim is about. What
+/// refuses is not a caller declining to supply a universe: `hidden` was born through the real writer path
+/// so the CATALOG names it, it therefore counts toward `frontier_namespaces` regardless of what the LIST
+/// hides, and having sealed no cursor it cannot prove its own frontier. `frontier_proven ==
+/// frontier_namespaces` fails on member count alone.
 TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductionDefault)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
@@ -527,50 +591,27 @@ TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductio
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::kDefault);
+    for (int i = 0; i < 5; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the blob a hidden namespace still owns must survive";
     EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "the production default proves no frontier, so the round destroys NOTHING. Deleted:"
+        << "a catalog-named namespace that cannot prove its own frontier leaves the round-wide frontier "
+           "incomplete, so the round destroys NOTHING. Deleted:"
         << deletedKeysMessage(*backend);
 }
 
-/// THE CONSTANT USED TO BE LOAD-BEARING HERE, and no longer is -- Stage B (Task 4-C) closed the gap it
-/// demonstrated. Same pool, same hidden `+1`; the caller still asserts the universe is closed (a lie it
-/// tells deliberately), but discovery is now catalog-authoritative: `hidden` is `Live` in the catalog, so
-/// it stays a member of `frontier_namespaces` regardless of what the LIST hides, and it never sealed a
-/// cursor, so its OWN frontier is provably unproven. `frontier_proven == frontier_namespaces` therefore
-/// fails on member count alone, and destructive work stays suppressed even though the caller asserted the
-/// universe closed. The blob survives. This is a strict improvement: the old failure mode this test
-/// pinned was exactly the "list liar" vulnerability `CasListLiarEndToEnd`'s whole suite is about, and it
-/// is gone even under the deliberately-dangerous test override, not merely under the production default.
-TEST(CasGcFrontierGate, TheSameHiddenPlusOneSurvivesEvenWhenTheUniverseIsDeclaredAuthoritative)
-{
-    auto backend = std::make_shared<CountingHintHoleBackend>();
-    const RootNamespace hidden{"00/hidden@cas@"};
-    const RootNamespace visible{"00/visible@cas@"};
-    const DB::UInt128 blob(0x5ade);
-
-    auto store = buildCrossNamespaceScenario(backend, hidden, visible, blob, /*fold_hidden_first=*/false);
-    const Layout & layout = store->layout();
-
-    Gc gc(store, kGc);
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
-
-    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
-        << "`hidden` is catalog-Live and never proved its own frontier, so the round-wide frontier stays "
-           "incomplete and nothing irreversible runs, even though the caller declared the universe closed";
-}
-
-/// Review I4: the two arms above assert "nothing was deleted" and "nothing was deleted" -- neither now
-/// distinguishes the gate correctly refusing from the round simply never deleting anything at all. This
-/// is the replacement positive control: `hidden` is genuinely folded through its OWN drop of the same
+/// The arm above asserts "nothing was deleted", which does not on its own distinguish the gate correctly
+/// refusing from the round simply never deleting anything at all. This
+/// is the positive control: `hidden` is genuinely folded through its OWN drop of the same
 /// blob (an honest exact-key read of a record the LIST still hides -- the arithmetic-intake mechanism
 /// this whole file is about), so its frontier is REALLY proven, not merely declared so, and the blob is
-/// REALLY unreferenced by both namespaces. The round drains it. Proves the machinery this task changed
-/// can still reclaim genuine garbage once every namespace is honestly proven -- the two zero-deletion
-/// arms above would pass identically if the round were simply incapable of ever deleting anything.
+/// REALLY unreferenced by both namespaces. The round drains it -- the zero-deletion arm above would pass
+/// identically if the round were simply incapable of ever deleting anything.
 TEST(CasGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
@@ -602,7 +643,7 @@ TEST(CasGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier
     const ManifestRef dropped = publish(*backend, layout, visible, "dropped_ref", 2, blob);
     dropRefTransition(*backend, layout, visible, "dropped_ref", dropped);
 
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 5, UniversePolicy::Authoritative);
 
     EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
         << "both namespaces genuinely proved their frontier and the blob is genuinely unreferenced -- "
@@ -624,18 +665,19 @@ TEST(CasGcFrontierGate, AKnownNamespaceIsProbedByExactKeyAndItsHiddenEdgeSavesTh
     const Layout & layout = store->layout();
 
     Gc gc(store, kGc);
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 5, UniversePolicy::Authoritative);
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the cursor kept the namespace in the universe, so its frontier was probed and its edge folded";
 }
 
-/// ===================== THE PRODUCTION DEFAULT IS INERT, PROOFS OR NO PROOFS =====================
+/// ===================== THE GATE FORMULA, TERM BY TERM =====================
 ///
-/// A pool with nothing hidden, nothing held, no anomaly, and every namespace walked to an honest
-/// end-of-stream: every per-namespace proof is green. The production default still destroys nothing,
-/// because the term it fails is the one about the SET, not about any namespace in it.
-TEST(CasGcFrontierGate, ProductionDefaultDestroysNothingEvenWithEveryProofGreen)
+/// The healthy case first, because every suppressor arm below is only meaningful against it: a pool with
+/// nothing hidden, nothing held, no anomaly, and every namespace walked to an honest end-of-stream OPENS
+/// the gate and reclaims. The two booleans are read off the fold's own rows, so a formula that computed
+/// them differently would fail here rather than agree with the test.
+TEST(CasGcFrontierGate, AHealthyCatalogRoundOpensTheGateAndReclaims)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -648,18 +690,20 @@ TEST(CasGcFrontierGate, ProductionDefaultDestroysNothingEvenWithEveryProofGreen)
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::kDefault);
+    const GateVerdict verdict = runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
 
-    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "no anomaly, no hold, every namespace proven -- and still inert, because Stage A cannot "
-           "prove the universe. Deleted:" << deletedKeysMessage(*backend);
+    ASSERT_TRUE(verdict.saw_fold) << "the round did not fold, so it published no gate verdict";
+    EXPECT_TRUE(verdict.frontier_complete)
+        << "every namespace in a healthy catalog universe reached a proven frontier";
+    EXPECT_FALSE(verdict.suppress_destructive)
+        << "no anomaly, no hold, a complete frontier -- the gate has nothing left to refuse on";
+    EXPECT_GT(verdict.frontier_namespaces, 0u)
+        << "a zero-namespace universe would satisfy the equality vacuously; this pool must not be one";
+    EXPECT_EQ(verdict.frontier_proven, verdict.frontier_namespaces);
 
-    /// The control: the very same pool reclaims once the universe is declared closed. Without it this
-    /// test would also pass on a pool where nothing was ever condemnable.
-    drive(store, gc, /*rounds*/ 4, UniversePolicy::AuthoritativeForTest);
-    EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists)
-        << "the pool WAS reclaimable; only the universe seam was holding it";
+    /// And the gate being open is worth something: the condemned blob actually drains.
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob))
+        << "an unsuppressed round must reclaim a blob no ref owns any more";
 }
 
 /// ===================== EVERY DESTRUCTIVE SITE, INDIVIDUALLY =====================
@@ -701,6 +745,10 @@ DB::UInt128 buildPoolWithWorkAtEverySite(const std::shared_ptr<CountingBackend> 
 }
 }
 
+/// (3a) THE NEGATIVE-POLICY SEAM, and the per-site inventory at the same time. A caller that supplies no
+/// universe suppresses on that term ALONE: this pool has no anomaly, no hold, and a frontier every
+/// per-namespace probe proves -- the control at the end of the test is what says so, since the identical
+/// pool drains on the production path.
 TEST(CasGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -710,31 +758,143 @@ TEST(CasGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
     Gc gc(store, kGc);
     const DB::UInt128 blob = buildPoolWithWorkAtEverySite(backend, store, gc);
 
-    /// From here on the rounds run on the production default: every site has work queued and every site
-    /// must decline it.
+    /// From here on the rounds supply NO universe: every site has work queued and every site must
+    /// decline it.
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 6, UniversePolicy::kDefault);
+    const GateVerdict verdict = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
+    for (int i = 0; i < 5; ++i)
+        runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
 
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "a suppressed round performs NO destructive work at any site. Deleted:"
-        << deletedKeysMessage(*backend);
-
-    /// And the same statement per site, so a failure names the leak rather than just its count.
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/blobs/"), 0u) << "pre-CAS blob delete";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u) << "manifest-body delete";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
-        << "generation prune and hand-off reclaim";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/ns/stream/"), 0u)
-        << "covered-log / superseded-snapshot cleanup";
-
+    ASSERT_TRUE(verdict.saw_fold) << "the round did not fold, so it published no gate verdict";
+    EXPECT_FALSE(verdict.frontier_complete)
+        << "with no universe supplied the frontier can never be complete, whatever the probes proved";
+    EXPECT_TRUE(verdict.suppress_destructive);
+    expectEveryDeleteFamilyInert(*backend, "no universe supplied");
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
 
-    /// The control again: the identical pool DOES reclaim at those sites once the universe is closed,
-    /// so the zeros above are the gate at work and not an empty work queue.
-    drive(store, gc, /*rounds*/ 4, UniversePolicy::AuthoritativeForTest);
+    /// The control: the identical pool DOES reclaim at those sites on the production path, so the zeros
+    /// above are the gate at work and not an empty work queue -- and it is also what makes the "on that
+    /// term alone" claim above true rather than assumed.
+    drive(store, gc, /*rounds*/ 4, UniversePolicy::kDefault);
     EXPECT_GT(backend->deleteTotal(), 0u)
-        << "the work queue was real -- an authoritative round drains it";
+        << "the work queue was real -- a round with a universe drains it";
     EXPECT_FALSE(backend->head(blobKeyOf(layout, blob)).exists);
+}
+
+/// (1) ONE ANOMALY. A namespace whose `_ckpt` is present but undecodable records the "no usable
+/// checkpoint" anomaly, and the round declines every site on that. It leaves the frontier incomplete too,
+/// so what this arm pins is "an anomaly suppresses", not "only the anomaly does" -- which is why every
+/// assertion below is about inertness and not about which term fired.
+TEST(CasGcFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamily)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    Gc gc(store, kGc);
+    const DB::UInt128 blob = buildPoolWithWorkAtEverySite(backend, store, gc);
+
+    const RootNamespace damaged{"00/damaged@cas@"};
+    publish(*backend, layout, damaged, "damaged_ref", 42, DB::UInt128(0xda43));
+    ASSERT_EQ(backend->putOverwrite(layout.refCkptKey(fixture::fixtureLife(damaged)),
+                                    "not a checkpoint").outcome, CasOutcome::Committed);
+
+    backend->resetCounts();
+    std::vector<size_t> anomaly_counts;
+    for (int i = 0; i < 6; ++i)
+    {
+        anomaly_counts.push_back(gc.runRegularRound().anomalies.size());
+        store->renewWatermarkOnce();
+    }
+
+    EXPECT_GT(anomaly_counts.front(), 0u)
+        << "the undecodable `_ckpt` must be RECORDED, not silently absorbed -- a silent exit would make "
+           "this test pass for the wrong reason";
+    expectEveryDeleteFamilyInert(*backend, "one anomaly");
+    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
+}
+
+/// (2) ONE CARRIED HOLD. The gate's second term reads the SEAL, not this round's anomaly list, so the
+/// round that matters here is a LATER one: the hold was detected earlier, rides forward because its
+/// offending position is still unresolved, and must suppress on its own.
+TEST(CasGcFrontierGate, ACarriedHoldSuppressesEveryDeleteFamily)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    Gc gc(store, kGc);
+    const DB::UInt128 blob = buildPoolWithWorkAtEverySite(backend, store, gc);
+
+    /// A committed gap: the checkpoint says `{1,2}` is committed while only `{1,1}` was ever written, so
+    /// the walk reads `{1,2}` absent BELOW its authority ceiling and holds there. Nothing repairs it, so
+    /// every later round re-detects the same position and carries the same hold.
+    const RootNamespace gapped{"00/gapped@cas@"};
+    publish(*backend, layout, gapped, "gapped_ref", 44, DB::UInt128(0x6a9));
+    replaceRecoverableCkptForRawFixture(*backend, layout, gapped, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
+    std::map<String, UInt64> intake;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "fold_ref_intake")
+            intake = rec.metrics;
+    });
+    gc.runRegularRound();
+    gc.setPhaseSink({});
+    store->renewWatermarkOnce();
+    ASSERT_FALSE(intake.empty());
+    ASSERT_GT(intake.at("tables_held"), 0u)
+        << "the gap must be HELD, or the later rounds carry nothing and this test proves nothing";
+
+    backend->resetCounts();
+    for (int i = 0; i < 5; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+    expectEveryDeleteFamilyInert(*backend, "one carried hold");
+    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
+}
+
+/// (3c) THE PROBE BUDGET. A namespace with a sealed cursor, no `_ckpt` and no listing left can be proven
+/// only by a successor probe; a zero budget denies it one, so it counts toward the universe and not toward
+/// the proofs, and the equality fails.
+TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
+{
+    auto backend = std::make_shared<CountingHintHoleBackend>();
+    auto store = openPoolWithProbeBudget(backend, /*budget*/ 0);
+    const Layout & layout = store->layout();
+
+    Gc gc(store, kGc);
+    const DB::UInt128 blob = buildPoolWithWorkAtEverySite(backend, store, gc);
+
+    /// The cursor has to be SEALED while the namespace is still listed -- a hinted target does not spend
+    /// the budget, and an unhinted one with no cursor is a different shape (no genesis at all) that the
+    /// budget never reaches. So: publish, seal under a suppressed round so nothing drains early, then hide.
+    const RootNamespace quiet{"00/quiet@cas@"};
+    publish(*backend, layout, quiet, "quiet_ref", 43, DB::UInt128(0x9a1e));
+    runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
+    ASSERT_NE(sealedCursorOf(*backend, layout, quiet), (RefTxnId{}))
+        << "without a sealed cursor the namespace never becomes a budget-spending probe target";
+    backend->hidePrefix(layout.namespaceStreamPrefix(fixture::fixtureLife(quiet)));
+
+    backend->resetCounts();
+    const GateVerdict verdict = runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
+    for (int i = 0; i < 5; ++i)
+        runRoundCapturingGate(store, gc, UniversePolicy::kDefault);
+
+    ASSERT_TRUE(verdict.saw_fold);
+    EXPECT_LT(verdict.frontier_proven, verdict.frontier_namespaces)
+        << "the unprobed namespace must count toward the universe and not toward the proofs";
+    EXPECT_FALSE(verdict.frontier_complete);
+    EXPECT_TRUE(verdict.suppress_destructive);
+    expectEveryDeleteFamilyInert(*backend, "exhausted probe budget");
+    EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
 }
 
 /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r11-empty-universe-vacuous}`):
@@ -762,7 +922,7 @@ TEST(CasGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 8, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 8, UniversePolicy::Authoritative);
 
     /// Per-delete-family, not an aggregate: an aggregate zero can hide one family that ran while
     /// another did not (the same lesson R11's own writeup draws from this campaign's
@@ -794,7 +954,7 @@ TEST(CasGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
     backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(empty_ns)),
         encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
                               .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
-    drive(store, gc, /*rounds*/ 8, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 8, UniversePolicy::Authoritative);
     EXPECT_FALSE(backend->head(layout.blobKey(blob_ref)).exists)
         << "the work WAS real -- once the universe is provably closed (even trivially), it drains";
 }
@@ -822,7 +982,7 @@ TEST(CasGcFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
     for (uint64_t i = 7; i <= 10; ++i)
     {
         publish(*backend, layout, ns, "ref_" + std::to_string(i), i, DB::UInt128(0x2000 + i));
-        gc.runRegularRound();
+        gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::StageA_Suppressed);
         store->renewWatermarkOnce();
     }
 
@@ -870,14 +1030,14 @@ TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
         << "and still retained, because a live ref pins it";
 
     /// A real delta moves the shard's run off the old generation. This is the round the hand-off would
-    /// reclaim it on -- and it runs on the production default.
+    /// reclaim it on -- and it supplies no universe.
     const ManifestRef r2{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1};
     writeBlobBody(*backend, layout, DB::UInt128(0xb2));
     writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("data.bin", DB::UInt128(0xb2))});
     publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
 
     backend->resetCounts();
-    gc.runRegularRound();
+    gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::StageA_Suppressed);
 
     EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
         << "a suppressed round hands nothing off. Deleted:" << deletedKeysMessage(*backend);
@@ -893,8 +1053,7 @@ TEST(CasGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     /// already past it and the prune never goes back. The prefix is left to `fsck`, which is exactly
     /// the outcome the site's own doc comment already records for a crash in the same window ("the
     /// cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop").
-    /// Bounded (one small run per shard per occurrence) and not a correctness problem -- but in
-    /// Stage A every round is suppressed, so every such transition leaks rather than one in a crash.
+    /// Bounded (one small run per shard per occurrence) and not a correctness problem.
     ///
     /// The hand-off itself is not going untested: `CasGcRetention.HandOffDeletesSupersededRef` drives
     /// the same transition on an authoritative round and asserts the prefix IS reclaimed.
@@ -956,7 +1115,7 @@ TEST(CasGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
     backend->resetCounts();
     for (int i = 0; i < 4; ++i)
     {
-        gc.runRegularRound();
+        gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::StageA_Suppressed);
         store->renewWatermarkOnce();
     }
 
@@ -1653,7 +1812,7 @@ TEST(CasGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
     dropRefTransition(*backend, layout, busy, "busy_ref", mref);
 
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 5, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 5, UniversePolicy::Authoritative);
 
     EXPECT_GT(backend->deleteTotal(), 0u)
         << "the quiet life's checkpoint authority leaves unrelated deletion eligible";
@@ -1750,7 +1909,7 @@ TEST(CasGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
         << "the fresh clamp preserves the unresolved hold in the next sealed coverage";
     EXPECT_FALSE(second_round.anomalies.empty());
 
-    drive(store, gc, /*rounds*/ 4, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 4, UniversePolicy::Authoritative);
 
     EXPECT_EQ(backend->deleteTotal(), 0u)
         << "the re-detected committed gap suppresses each round's destructive work. "
@@ -1887,7 +2046,7 @@ TEST(CasGcFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
     ASSERT_NE(fresh_token, condemned_token) << "a resurrect must displace the condemned incarnation";
 
     /// GC's delayed delete still names the OLD token. It cannot touch the new object.
-    drive(store, gc, /*rounds*/ 2, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 2, UniversePolicy::Authoritative);
 
     ASSERT_TRUE(backend->head(key).exists)
         << "the resurrected incarnation survives the delete published against its predecessor";
@@ -1929,7 +2088,7 @@ TEST(CasGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSour
         << "at the midpoint both owners are durable; the handoff never dips to zero";
 
     dropRefTransition(*backend, layout, source, "part_1", source_ref);
-    drive(store, gc, /*rounds*/ 4, UniversePolicy::AuthoritativeForTest);
+    drive(store, gc, /*rounds*/ 4, UniversePolicy::Authoritative);
 
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the source released its edge only after the receiver's was durable, so nothing may collect it";

@@ -29,46 +29,32 @@ namespace DB::Cas
 /// A round may destroy only while holding a FRONTIER PROOF for EVERY namespace that can hold a live
 /// edge — because reachability is a property of the whole pool, not of one namespace. The proof per
 /// namespace is cheap and exact (one `GET` at the cursor's arithmetic successor, `CasGc.cpp`'s intake
-/// walk). What Stage A cannot supply is the SET the proofs must cover: there is no catalog, so the
-/// round's universe is `(namespaces with a cursor in the adopted fold seal) ∪ (this round's LIST hint)`
-/// — two sources that can BOTH omit a namespace at once.
+/// walk). What those proofs cannot supply is the SET they must cover, and only the catalog supplies it:
+/// a listing may omit a durable namespace, and a sealed fold cursor names only namespaces some round
+/// already folded, so neither source bounds the set on its own.
 ///
-/// The scenario that makes this a correctness question rather than a tidiness one (codex finding 1,
-/// quoted): a hidden acked `+1` lands in a namespace absent from BOTH the hint and `gc/state`, while a
-/// visible `-1` elsewhere drives the shared blob's OBSERVABLE in-degree to zero. Every namespace the
-/// round knows about is walked to a proven frontier, every probe comes back clean, and the round would
-/// delete a blob a durable committed edge still owns. No amount of per-namespace proof detects it: the
-/// namespace is not in the set being proved.
-///
-/// So Stage A does not pretend. `StageA_Suppressed` makes `frontier_incomplete` unconditionally true,
-/// which suppresses every destructive site in the round — the pool leaks until Stage B, and that is the
-/// deliberate trade. Stage B's catalog makes the universe knowable; its Task 7b flips `kDefault` to a
-/// value that consults the per-namespace proofs, and that ONE LINE is the entire flip. Nothing else in
-/// the gate changes shape, which is why the per-namespace logic is written and tested now.
-///
-/// PRODUCTION-UNREACHABLE, BY CONSTRUCTION: the policy is a PARAMETER with a default, not an override.
-/// `AuthoritativeForTest` is passed EXPLICITLY by gtests at the round entry with a CLOSED universe they
-/// construct themselves; the single production call site (`CasGcScheduler`) passes nothing. There is no
-/// config key, no environment variable, no runtime flag, no settable member and no test-hook struct
-/// that can reach it — a test-only header cannot override a constant compiled into production code, so
-/// none is offered.
+/// The scenario that makes this a correctness question rather than a tidiness one: a hidden acked `+1`
+/// lands in a namespace absent from BOTH the hint and `gc/state`, while a visible `-1` elsewhere drives
+/// the shared blob's OBSERVABLE in-degree to zero. Every namespace the round knows about is walked to a
+/// proven frontier, every probe comes back clean, and the round would delete a blob a durable committed
+/// edge still owns. No amount of per-namespace proof detects it: the namespace is not in the set being
+/// proved.
 enum class UniversePolicy : uint8_t
 {
-    /// The universe is not knowable this stage; every round suppresses all destruction.
+    /// The caller supplies no universe, so `frontier_incomplete` is unconditionally true and every
+    /// destructive site in the round declines. Passed explicitly by a test whose SUBJECT is the
+    /// suppression; nothing in production selects it.
     StageA_Suppressed = 0,
-    /// The caller asserts that the universe it constructed is CLOSED, so the per-namespace frontier
-    /// proofs decide the gate on their own. Only gtests may assert this.
-    AuthoritativeForTest = 1,
+    /// The round's universe is the catalog's own `Live`/`Removing` set, so the per-namespace frontier
+    /// proofs decide the gate on their own.
+    Authoritative = 1,
 
-    /// STAGE B'S TASK 7b EDITS EXACTLY THIS LINE. Flipping it un-suppresses destruction, so every test
-    /// that carries a STAGE-A RETURN ITEM marker for a weakened deletion assertion must be restored in
-    /// the same change: `CasGcLog.EmitsStartFinishWithCounts` (gtest_cas_gc_log.cpp), the displacement
-    /// test in `gtest_ca_wiring.cpp` that currently asserts `EXPECT_GT(after.unreachable, 0u)`, and the
-    /// three stateless tests `05008_ca_gc_snap_prune.sh`, `04290_content_addressed_no_leftovers.sh` and
-    /// `04295_content_addressed_mutation_no_leftovers.sh`. Grep for "STAGE-A RETURN ITEM" to find them
-    /// all -- this line is where the flip happens, but the marker in a test file alone is not enough to
-    /// surface that the flip obligates a restoration there too.
-    kDefault = StageA_Suppressed,
+    /// The gate opens only on a COMPLETE, CATALOG-PROVEN frontier: the universe is non-empty and every
+    /// namespace in it reached a proven frontier, no anomaly was recorded, and no hold rides forward.
+    /// Any one of those failing suppresses every destructive site POOL-WIDE — narrowing the suppression
+    /// to the offending namespace would be unsound, because blob in-degree is a pool-wide property and
+    /// no ownership partition of the blob space exists.
+    kDefault = Authoritative,
 };
 
 /// The logical (GC-bookkeeping) size of a retired object: a blob subtracts the pool's fixed
@@ -435,8 +421,8 @@ public:
     /// dead-incumbent recovery stays the loop's job.
     ///
     /// `policy` is the destructive gate's universe seam — see `UniversePolicy`. Production passes
-    /// nothing; a gtest that has constructed a CLOSED universe passes `AuthoritativeForTest` here, and
-    /// this parameter is the ONLY way to reach the per-namespace frontier logic.
+    /// nothing; a test whose subject is the suppressed gate passes `StageA_Suppressed` here, which is
+    /// the only way to reach that posture.
     RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true,
                                 UniversePolicy policy = UniversePolicy::kDefault);
 
@@ -582,8 +568,8 @@ private:
         bool suppress_destructive = false;
 
         /// Whether EVERY namespace in this round's universe reached a proven frontier — see
-        /// `UniversePolicy` for what the universe is and why Stage A refuses to trust it. False under
-        /// `StageA_Suppressed` no matter what the per-namespace probes found.
+        /// `UniversePolicy` for what the universe is and why the catalog is the only source that can
+        /// bound it. False under `StageA_Suppressed` no matter what the per-namespace probes found.
         bool frontier_complete = false;
 
         /// The universe's size and how much of it this round proved, for the `fold_ref_intake` row: a
@@ -594,37 +580,33 @@ private:
         /// because the round's frontier-probe budget ran out first. Each one is an unproven frontier.
         uint64_t frontier_unprobed_budget = 0;
 
-        /// WHY the unproven namespaces are unproven, one bucket each, so the buckets sum to
-        /// `frontier_namespaces - frontier_proven`. Without this an operator reading "N of M proven"
-        /// can see that the round suppressed but not which of the several unrelated causes did it,
-        /// and the causes want opposite responses: a hold or a missing catalog entry is something to
-        /// chase, an exhausted probe budget is something to raise.
-        ///
-        /// `unattributed` exists so that an exit which leaves a namespace unproven WITHOUT naming
-        /// itself surfaces as a number rather than disappearing into the total. It is expected to be
-        /// zero on every round; a nonzero value means this enumeration has stopped being exhaustive.
-        /// The reason ONE namespace ended its walk unproven. `Proven` is the absence of a reason;
-        /// every other value names the exit that produced it.
+        /// The reason ONE namespace ended its walk unproven. `Proven` is the absence of a reason; every
+        /// other value names the exit that produced it. `Unattributed` is what an exit that forgets to
+        /// name itself is reported as, so it surfaces as a number instead of disappearing into some
+        /// other bucket. A value is added here only together with the exit that sets it — an enumerator
+        /// no exit can reach makes the deficit claim a cause the code cannot produce.
         enum class FrontierUnproven : uint8_t
         {
             Proven,
-            NoCatalogEntry,
             CheckpointUnusable,
             CheckpointFrontierEmpty,
             CommittedBelowCursor,
             Held,
-            AppendAboveFrozenTail,
             Unattributed,
         };
 
+        /// WHY the round's unproven namespaces are unproven, one bucket each, so the buckets sum to
+        /// `frontier_namespaces - frontier_proven`. Without it an operator reading "N of M proven" sees
+        /// that the round suppressed but not which of several unrelated causes did it, and the causes
+        /// want opposite responses: a hold is something to chase, an exhausted probe budget is something
+        /// to raise. `unattributed` is expected to be zero on every round; a nonzero value means the
+        /// reason enumeration has stopped being exhaustive over the walk's exits.
         struct FrontierDeficit
         {
-            uint64_t no_catalog_entry = 0;
             uint64_t checkpoint_unusable = 0;
             uint64_t checkpoint_frontier_empty = 0;
             uint64_t committed_below_cursor = 0;
             uint64_t held = 0;
-            uint64_t append_above_frozen_tail = 0;
             uint64_t probe_budget = 0;
             uint64_t fold_aborted = 0;
             uint64_t unattributed = 0;
@@ -918,9 +900,9 @@ private:
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
 
-    /// Throttle for the orphan sweep's retention rollup. In Stage A the premise retains on nearly every
-    /// pass, so an unconditional `LOG_INFO` would emit the same sentence every round forever and train
-    /// operators to filter out the channel carrying the answer they need. It is reported when the
+    /// Throttle for the orphan sweep's retention rollup. The premise retains on any pass whose epochs are
+    /// not closed-and-folded, so an unconditional `LOG_INFO` would repeat the same sentence for as long as
+    /// that lasts and train operators to filter out the channel carrying the answer they need. It is reported when the
     /// verdict CHANGES (a different top reason class, or a different count), and otherwise re-stated
     /// every `kRetainRollupRepeatPasses` passes so a newly-arrived operator is never left with silence
     /// they would have to read as "nothing to report". Leader-owned and in-memory: a fresh leader

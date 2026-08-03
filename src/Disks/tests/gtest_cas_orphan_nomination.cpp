@@ -269,8 +269,8 @@ TEST(CasOrphanNomination, TokenAbaIsRetainedAndSurfaced)
 
 /// Nomination PLANNING itself is gated on `!suppress_destructive`
 /// (`Gc::fold`'s orphan_sweep call site), not merely its eventual delete -- a suppressed pass must
-/// never even LIST candidates. `gc.runRegularRound()` with no third argument is the production
-/// default (`UniversePolicy::kDefault`), which is exactly this suppressed universe.
+/// never even LIST candidates. The suppressed universe is selected explicitly, because that is the
+/// subject: a round on the production default would open the gate and sweep.
 TEST(CasOrphanNomination, SuppressedRoundNominatesNothing)
 {
     ReadyFixture f = makeReadyFixture();
@@ -278,7 +278,8 @@ TEST(CasOrphanNomination, SuppressedRoundNominatesNothing)
     std::optional<GcPhaseRecord> orphan_sweep;
     f.gc->setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "orphan_sweep") orphan_sweep = rec; });
 
-    ASSERT_TRUE(f.gc->runRegularRound().acquired_lease);
+    ASSERT_TRUE(f.gc->runRegularRound({}, /*allow_steal*/true,
+                                     UniversePolicy::StageA_Suppressed).acquired_lease);
 
     ASSERT_TRUE(orphan_sweep.has_value());
     EXPECT_EQ(orphan_sweep->metrics.at("suppressed"), 1u);
