@@ -555,9 +555,16 @@ void DiskObjectStorageTransaction::copyFileImpl(
 
     runner.waitForAllToFinishAndRethrowFirstError();
 
+    if (blobs_to_create.empty() && !metadata_storage->supportsEmptyFilesWithoutBlobs())
+    {
+        writeFile(to_file_path, 0, WriteMode::Rewrite, write_settings)->finalize();
+        return;
+    }
+
     /// [TXN-ONE-PIPELINE] Routed through dispatch for uniformity. Unreachable on CA (Audit 6):
     /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
-    /// point, so CA never queues here. On ordinary storage dispatch queues exactly as before.
+    /// point (and the empty-source case returns via the real writeFile above), so CA never queues here.
+    /// On ordinary storage dispatch queues exactly as before.
     dispatch([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
