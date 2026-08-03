@@ -528,17 +528,18 @@ void expectEveryDeleteFamilyInert(const CountingBackend & backend, const char * 
 
 }
 
-/// ===================== THE KILL SHOT: A HIDDEN `+1` IN AN UNKNOWN NAMESPACE =====================
+/// ===================== A HIDDEN `+1` IN AN UNKNOWN NAMESPACE =====================
 ///
 /// Two namespaces share one blob. `visible` publishes it and then drops it, so the round observes
 /// `+1` then `-1` and reads the blob's in-degree as zero. `hidden` also owns it -- durably, acked,
-/// readable by exact key -- but is absent from the round's LIST hint AND has never been folded, so it
-/// has no sealed cursor either. Neither of those names it, and every per-namespace proof the round can
-/// take comes back clean.
+/// readable by exact key -- but is absent from the round's LIST hint. Its own publish still carries a
+/// real checkpoint, so the arithmetic walk finds and folds its `+1` by exact key regardless of what the
+/// LIST omits.
 ///
-/// The three arms below are the whole argument: the round refuses because the CATALOG names `hidden` and
-/// its own frontier is unproven; the blob still drains once `hidden` honestly proves that frontier; and a
-/// namespace inside the universe with a sealed cursor has its hidden `+1` found by the exact-key probe.
+/// The three arms below are the whole argument: the exact-key probe finds `hidden`'s edge and saves the
+/// blob on a complete frontier; the blob still drains once `hidden` also honestly folds its own removal;
+/// and a namespace inside the universe with a sealed cursor has its hidden `+1` found by the exact-key
+/// probe the same way.
 
 namespace
 {
@@ -577,12 +578,11 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
 }
 }
 
-/// Rounds on the PRODUCTION path -- no policy argument -- because that is what the claim is about. What
-/// refuses is not a caller declining to supply a universe: `hidden` was born through the real writer path
-/// so the CATALOG names it, it therefore counts toward `frontier_namespaces` regardless of what the LIST
-/// hides, and having sealed no cursor it cannot prove its own frontier. `frontier_proven ==
-/// frontier_namespaces` fails on member count alone.
-TEST(CasGcFrontierGate, HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductionDefault)
+/// Rounds on the PRODUCTION path -- no policy argument -- because that is what the claim is about.
+/// `hidden`'s own publish left it a real checkpoint, so the arithmetic walk's exact-key probe finds and
+/// folds its `+1` no matter what the LIST hides: the blob survives on its own complete, proven frontier,
+/// not on the round declining to touch anything.
+TEST(CasGcFrontierGate, AHiddenEdgeIsFoundByTheExactKeyProbeAndSavesTheBlobOnACompleteFrontier)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};

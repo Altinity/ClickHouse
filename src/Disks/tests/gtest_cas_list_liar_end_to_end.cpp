@@ -88,13 +88,17 @@ ManifestRef publishedManifest(const RefTxnId & id, uint64_t build_sequence)
 }
 
 /// One round plus everything a verdict in this file is allowed to rest on: the report (which carries
-/// the anomaly list) and the two intake phase rows (which carry the hold count and the one remaining
-/// whole-round ref abort).
+/// the anomaly list), the two intake phase rows (which carry the hold count and the one remaining
+/// whole-round ref abort), and the gate's own verdict off `fold_reduce` (read, not recomputed, so a test
+/// cannot agree with a wrong formula just as readily as with the right one).
 struct RoundEvidence
 {
     RoundReport report;
     std::map<String, UInt64> intake;   /// `fold_ref_intake`
     std::map<String, UInt64> group;    /// `fold_ref_group`
+    bool saw_fold = false;
+    bool frontier_complete = false;
+    bool suppress_destructive = false;
 };
 
 RoundEvidence runRoundCapturing(Gc & gc, UniversePolicy policy)
@@ -106,6 +110,14 @@ RoundEvidence runRoundCapturing(Gc & gc, UniversePolicy policy)
             evidence.intake = rec.metrics;
         else if (rec.phase == "fold_ref_group")
             evidence.group = rec.metrics;
+        else if (rec.phase == "fold_reduce")
+        {
+            evidence.saw_fold = true;
+            if (const auto it = rec.metrics.find("frontier_complete"); it != rec.metrics.end())
+                evidence.frontier_complete = it->second != 0;
+            if (const auto it = rec.metrics.find("suppress_destructive"); it != rec.metrics.end())
+                evidence.suppress_destructive = it->second != 0;
+        }
     });
     evidence.report = gc.runRegularRound({}, /*allow_steal*/ true, policy);
     gc.setPhaseSink({});
@@ -182,15 +194,6 @@ PoolPtr openRecoveryPool(const std::shared_ptr<LiarBackend> & backend)
 {
     seedPoolMetaForRestart(*backend, "p");
     return Pool::open(backend, recoveryPoolConfig());
-}
-
-/// Every key the backend was asked to delete, for a failing zero-delete assertion's message.
-String deletedKeysMessage(const CountingBackend & backend)
-{
-    String out;
-    for (const String & key : backend.deletedKeys())
-        out += "\n    " + key;
-    return out.empty() ? String{" (none)"} : out;
 }
 
 }
@@ -369,38 +372,59 @@ TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaim
         << "and the still-owned blob is untouched";
 }
 
-/// ===================== THE CROSS-NAMESPACE KILL SHOT =====================
+/// ===================== THE CROSS-NAMESPACE SHOT =====================
 ///
-/// The one shape arithmetic intake cannot save on its own, because it is not about walking a namespace:
-/// it is about which namespaces there ARE.
+/// The shape that is not about walking a single namespace: it is about a namespace the store hides in
+/// its ENTIRETY, never just one record inside it.
 ///
 /// Two namespaces share a blob. `visible` publishes it and then drops it, so the round observes `+1`
 /// then `-1` and reads the blob's in-degree as zero. `hidden` also owns it -- durably, acked, readable
-/// by exact key -- but the store omits its ENTIRE ref stream, so no listing mentions it, and it has
-/// never been folded, so it has no sealed cursor either. What saves the blob is that neither of those
-/// is the round's universe: `hidden` was born through the real writer path, so the CATALOG names it and
-/// it counts toward `frontier_namespaces` no matter what the listing omits, while having sealed no
-/// cursor it cannot prove its own frontier. `frontier_proven == frontier_namespaces` fails on member
-/// count alone, so the round-wide frontier is incomplete and nothing irreversible runs.
+/// by exact key -- but the store omits its ENTIRE ref stream, so no listing mentions it. `hidden`'s own
+/// publish still leaves it a real `_ckpt`, and a `_ckpt` is read by exact key, so the arithmetic walk's
+/// first probe finds and folds `hidden`'s `+1` regardless of what the listing omits: the blob survives
+/// on its own complete, folded frontier.
 ///
-/// (`gtest_cas_gc_frontier_gate.cpp` owns the destructive gate's own inventory -- every gated site,
-/// the probe budget, the hold set. This is the same scenario reached through the LIST liar, as the end
-/// of the blocker's own story.)
+/// This is NOT a duplicate of `gtest_cas_gc_frontier_gate.cpp`'s twin: that file's backend hides only a
+/// hint prefix, while this one is the end-to-end LIST-liar backend from this file's own header -- the
+/// distinct thing this test proves is that arithmetic intake reads a record the backend actively hides
+/// from every enumeration, in the full pipeline (real pool, real recovery-shaped checkpoints), not that
+/// the gate's universe/count terms hold. `gtest_cas_gc_frontier_gate.cpp` owns those terms: its
+/// (3a)/(3b)/(3c) suppressor arms are what pin `universe_authoritative`, the empty-universe floor, and
+/// the probe budget -- terms this fixture cannot exercise, because grounding both namespaces here makes
+/// `frontier_namespaces > 0` and `universe_authoritative` true unconditionally.
 
 namespace
 {
-/// Build the shared-blob scenario and return the manifest `visible` will drop.
+/// Build the shared-blob scenario and return the manifest `visible` will drop. Both namespaces are
+/// grounded with a real `_ckpt` reflecting what was actually published (`writeRecoverableCkptForRawFixture`,
+/// the idiom every other test in this file uses): otherwise neither namespace has a usable checkpoint at
+/// all, the round suppresses on that anomaly alone, and the scenario proves nothing about `hidden`
+/// specifically.
 ManifestRef buildKillShot(const std::shared_ptr<LiarBackend> & backend, const Layout & layout,
                           const RootNamespace & hidden, const RootNamespace & visible,
                           const DB::UInt128 & blob)
 {
     publishAt(*backend, layout, hidden, RefTxnId{1, 1}, "kept_ref", 1, blob, /*birth=*/true);
+    writeRecoverableCkptForRawFixture(*backend, layout, hidden, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
+
     publishAt(*backend, layout, visible, RefTxnId{1, 1}, "dropped_ref", 2, blob, /*birth=*/true);
     const ManifestRef dropped = publishedManifest(RefTxnId{1, 1}, 2);
     dropAt(*backend, layout, visible, RefTxnId{1, 2}, "dropped_ref", dropped);
+    writeRecoverableCkptForRawFixture(*backend, layout, visible, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, 2},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = std::nullopt,
+    });
 
     /// The whole of `hidden`'s ref stream goes invisible -- the namespace itself is what the listing
-    /// stops mentioning, not a record inside it.
+    /// stops mentioning, not a record inside it. Its `_ckpt` stays readable by exact key, which is what
+    /// lets the arithmetic walk find and fold its birth despite the omission.
     backend->setListOmissions({layout.refLogKey(fixture::fixtureLife(hidden), RefTxnId{1, 1}),
                                layout.refCkptKey(fixture::fixtureLife(hidden))});
     return dropped;
@@ -408,9 +432,10 @@ ManifestRef buildKillShot(const std::shared_ptr<LiarBackend> & backend, const La
 }
 
 /// Rounds on the PRODUCTION path -- no policy argument anywhere -- because that is the posture the
-/// claim is about: the blob survives on the catalog's membership plus `hidden`'s own unproven frontier,
-/// not on a caller declining to supply a universe.
-TEST(CasListLiarEndToEnd, AnEntirelyHiddenNamespacesEdgeIsRefusedByTheProductionDefault)
+/// claim is about: the arithmetic walk's exact-key probe reaches `hidden`'s birth despite the store
+/// hiding its whole stream from every listing, so the frontier it proves is complete and the blob
+/// survives on its own folded in-degree, not on a caller declining to supply a universe.
+TEST(CasListLiarEndToEnd, AHiddenNamespacesBirthIsFoundByExactKeyAndSavesTheBlobOnACompleteFrontier)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -423,20 +448,27 @@ TEST(CasListLiarEndToEnd, AnEntirelyHiddenNamespacesEdgeIsRefusedByTheProduction
 
     Gc gc(store, kGc);
     backend->resetCounts();
+    RoundEvidence evidence;
     for (int i = 0; i < 5; ++i)
     {
-        gc.runRegularRound();
+        const RoundEvidence round = runRoundCapturing(gc, UniversePolicy::kDefault);
+        if (round.saw_fold)
+            evidence = round;
         store->renewWatermarkOnce();
     }
 
+    ASSERT_TRUE(evidence.saw_fold) << "no round folded, so none published a gate verdict";
     ASSERT_GT(backend->holesServed(), 0u)
         << "the omission was never actually served -- the test would pass vacuously";
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists)
         << "the blob a hidden namespace still owns must survive";
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "`hidden` is catalog-Live and never proved its own frontier, so the round-wide frontier is "
-           "incomplete and the round destroys NOTHING. Deleted:"
-        << deletedKeysMessage(*backend);
+    EXPECT_EQ(backend->deleteCount(blobKeyOf(layout, blob)), 0u)
+        << "not merely still present: the blob must never even be offered for deletion";
+    EXPECT_TRUE(evidence.frontier_complete)
+        << "`hidden`'s own `_ckpt` is read by exact key, so its frontier is provable despite the "
+           "listing omission -- if this is false the blob above survived on suppression instead of on "
+           "its own in-degree, which proves nothing about the edge";
+    EXPECT_FALSE(evidence.suppress_destructive);
 }
 
 /// The arm above asserts "nothing was deleted", which on its own does not distinguish the gate correctly
