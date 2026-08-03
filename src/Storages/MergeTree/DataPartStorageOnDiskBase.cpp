@@ -415,14 +415,14 @@ void DataPartStorageOnDiskBase::backup(
     auto disk = volume->getDisk();
 
     /// B34: the temporary-hard-link BACKUP path (used for Ordinary, non-UUID databases) calls
-    /// disk->createHardLink with a non-part-shaped temp path, which on a content_addressed disk
+    /// disk->createHardLink with a non-part-shaped temp path, which on a CAS disk
     /// would otherwise surface as a raw LOGICAL_ERROR. Fail closed with a clear message instead.
     /// The pointer-holding path (make_temporary_hard_links=false, used by Atomic/UUID databases)
-    /// uses getStorageObjects and round-trips on a content_addressed disk, so it is left untouched.
+    /// uses getStorageObjects and round-trips on a CAS disk, so it is left untouched.
     if (make_temporary_hard_links && disk->isContentAddressed())
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
-            "BACKUP via temporary hard links is not supported on a content_addressed disk yet (B16/B34); "
+            "BACKUP via temporary hard links is not supported on a CAS disk yet (B16/B34); "
             "use an Atomic database (which backs up via pointer-holding) instead; disk '{}'",
             disk->getName());
 
@@ -532,7 +532,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
 {
     auto disk = volume->getDisk();
 
-    /// A content_addressed disk models a part as one atomic unit (N files -> one manifest -> one ref).
+    /// A CAS disk models a part as one atomic unit (N files -> one manifest -> one ref).
     /// The per-file createHardLink autocommit Backup uses with no enclosing transaction would publish a
     /// one-file ref per file and overwrite the destination, leaving the clone with only its last file
     /// (the B21 corruption mode — seen as system.detached_parts listing metadata_version.txt instead of

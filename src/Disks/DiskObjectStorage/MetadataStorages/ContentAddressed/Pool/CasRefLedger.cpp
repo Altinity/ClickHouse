@@ -4571,7 +4571,7 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
             RootMutationOrigin::Writer, RootMutationKind::ReclaimPrecommit);
 
         /// Audit each binding this sweep reclaimed, so
-        /// `system.content_addressed_log` records the reclaim and the "abandoned precommits
+        /// `system.cas_log` records the reclaim and the "abandoned precommits
         /// reclaimed" counter is falsifiable (it had ZERO emit sites before). A binding gathered above
         /// that is GONE from the live state after the committed append was reclaimed by this sweep's
         /// work -- either this chunk's own ops or this lane's just-resolved wedged predecessor txn (a

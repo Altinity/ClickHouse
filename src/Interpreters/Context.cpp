@@ -6243,7 +6243,7 @@ std::shared_ptr<ContentAddressedGarbageCollectionLog> Context::getContentAddress
     SharedLockGuard lock(shared->mutex);
     if (!shared->system_logs)
         return {};
-    return shared->system_logs->content_addressed_garbage_collection_log;
+    return shared->system_logs->cas_gc_log;
 }
 
 std::shared_ptr<ContentAddressedLog> Context::getContentAddressedLog() const
@@ -6251,7 +6251,7 @@ std::shared_ptr<ContentAddressedLog> Context::getContentAddressedLog() const
     SharedLockGuard lock(shared->mutex);
     if (!shared->system_logs)
         return {};
-    return shared->system_logs->content_addressed_log;
+    return shared->system_logs->cas_log;
 }
 
 std::shared_ptr<BackgroundSchedulePoolLog> Context::getBackgroundSchedulePoolLog() const

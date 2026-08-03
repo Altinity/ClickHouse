@@ -36,7 +36,7 @@ namespace
 void initializeBlobUploadPool(size_t size)
 {
     if (size == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "content_addressed_blob_upload_pool_size must not be 0");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas_blob_upload_pool_size must not be 0");
 
     std::lock_guard lock(pool_mutex);
     if (pool_instance)
@@ -199,7 +199,7 @@ void initializeCondemnedUploadAdmission(uint64_t configured_capacity_bytes, size
     if (capacity == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "The CAS condemned-upload memory cap resolves to 0 bytes "
-            "(content_addressed_condemned_upload_memory_bytes and the derived pool_size * 64 MiB are both 0)");
+            "(cas_condemned_upload_memory_bytes and the derived pool_size * 64 MiB are both 0)");
 
     std::lock_guard lock(admission_mutex);
     if (admission_instance)

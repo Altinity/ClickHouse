@@ -8,7 +8,7 @@ namespace DB
 
 class Context;
 
-/// system.content_addressed_mounts: one row per CAS mount slot (`gc/server-roots/<server_root_id>/mount`)
+/// system.cas_mounts: one row per CAS mount slot (`gc/server-roots/<server_root_id>/mount`)
 /// visible from every content-addressed disk — live lease state for operators (who holds which
 /// slot, renewal health, fenced/terminated). Read-only, one LIST + one GET per slot per disk.
 /// The `is_leader` column is per-disk and supersedes the retired process-global `CasGcIsLeader` metric.

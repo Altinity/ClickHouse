@@ -167,7 +167,7 @@ struct RoundReport
 /// One phase of one GC round. Pure data with no Interpreters dependency -- the same discipline
 /// `GcRoundLogRecord` follows, so the round engine can be instrumented without linking the system-log
 /// machinery. `CasGcScheduler` converts it into one `Phase` row of
-/// `system.content_addressed_garbage_collection_log`.
+/// `system.cas_gc_log`.
 ///
 /// DELIBERATELY NO VERB COLUMNS. `profile_events` is this phase's delta of the ordinary process
 /// counters, so `ProfileEvents['S3ListObjects']` on a `Phase` row answers "which phase burns the LIST

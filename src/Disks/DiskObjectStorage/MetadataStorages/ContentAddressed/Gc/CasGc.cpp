@@ -675,7 +675,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// is still the round that was already adopted BEFORE this round started: `state.round` is the
             /// honest, already-durable round number, while `new_round` (`state.round + 1`) would report a
             /// round that never actually happened. Use `state.round` so `RoundReport::round` and the
-            /// `system.content_addressed_garbage_collection_log` row it feeds never print a fabricated
+            /// `system.cas_gc_log` row it feeds never print a fabricated
             /// round number on a deferred round.
             report.round = state.round;
             EventEmitter{*store}.emit([&](CasEvent & e)

@@ -410,7 +410,7 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
 
     /// A directory is not an object: fs::file_size would throw "Is a directory". Treat it as a
     /// missing object (nullopt) so callers probing whether a path is a readable object do not get
-    /// a raw filesystem error (B38: system.remote_data_paths traversal on a content_addressed pool).
+    /// a raw filesystem error (B38: system.remote_data_paths traversal on a CAS pool).
     if (fs::is_directory(path, error))
         return {};
 

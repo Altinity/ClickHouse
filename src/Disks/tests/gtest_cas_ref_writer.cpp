@@ -1621,7 +1621,7 @@ TEST(CasRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 }
 
 /// B3: `Pool::wedgedRefLaneCount()` (the accessor `CasGcScheduler::gcHealth()` reads for
-/// `system.content_addressed_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
+/// `system.cas_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
 /// wedge -- neither a cached-but-healthy table nor an unrelated table's own successful mutation may move
 /// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
 TEST(CasRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)

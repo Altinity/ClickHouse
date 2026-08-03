@@ -319,7 +319,7 @@ String describeMountHolder(const MountLease & m)
 
 /// The mount-slot "foreign writer" audit instrument: every mount-slot WRITE
 /// (`MountClaim`/`MountRelease`) and every OBSERVED foreign/conflicting body (`MountConflict`)
-/// becomes one `system.content_addressed_log` row. `observed` is the CURRENT decoded body at the
+/// becomes one `system.cas_log` row. `observed` is the CURRENT decoded body at the
 /// point of decision — for a conflict it carries the identity that made us refuse (holder_uuid/
 /// hostname/pid/epoch/seq/expires); null when no body was observed (e.g. a bare CAS race).
 /// No-op when `sink` is unset, so a disabled log does no per-call work.

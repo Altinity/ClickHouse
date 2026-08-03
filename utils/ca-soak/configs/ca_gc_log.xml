@@ -1,9 +1,9 @@
 <clickhouse>
-    <!-- B168/CA-GC-introspection: enable system.content_addressed_garbage_collection_log (not in the
+    <!-- B168/CA-GC-introspection: enable system.cas_garbage_collection_log (not in the
          stock image config.xml). Short flush interval so soak stats materialize quickly. -->
-    <content_addressed_garbage_collection_log>
+    <cas_garbage_collection_log>
         <database>system</database>
-        <table>content_addressed_garbage_collection_log</table>
+        <table>cas_garbage_collection_log</table>
         <flush_interval_milliseconds>2000</flush_interval_milliseconds>
-    </content_addressed_garbage_collection_log>
+    </cas_garbage_collection_log>
 </clickhouse>

@@ -313,7 +313,7 @@ TEST(CasOperationGate, FactoryClassWorksOnVanished)
     storage->store()->setLifecycleForTest(PoolLifecycle::VanishedForgotten);   /// one force from Live
 
     EXPECT_NO_THROW({ auto tx = storage->createTransaction(); (void)tx; });
-    EXPECT_EQ(storage->getType(), MetadataStorageType::ContentAddressed);
+    EXPECT_EQ(storage->getType(), MetadataStorageType::CAS);
     EXPECT_NO_THROW((void)storage->getPath());
     EXPECT_NO_THROW((void)storage->isContentAddressed());
 }

@@ -111,7 +111,7 @@ void MergeTreeDeduplicationLog::load()
             // already exist, and rotate() creates the writer when there are none. Any other object
             // storage returns here: a missing dir means there is genuinely nothing and nowhere to write.
             const auto type = object_storage->getMetadataStorage()->getType();
-            if (type != MetadataStorageType::Plain && type != MetadataStorageType::ContentAddressed)
+            if (type != MetadataStorageType::Plain && type != MetadataStorageType::CAS)
                 return;
         }
     }

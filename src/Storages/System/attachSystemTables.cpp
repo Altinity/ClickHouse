@@ -247,7 +247,7 @@ void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, b
     attachNoDescription<StorageSystemPartsColumns>(context, system_database, "parts_columns", "Contains a list of columns of all currently existing parts of all MergeTree tables. Each column is represented by a single row.");
     attachNoDescription<StorageSystemProjectionPartsColumns>(context, system_database, "projection_parts_columns", "Contains a list of columns of all currently existing projection parts of all MergeTree tables. Each column is represented by a single row.");
     attachNoDescription<StorageSystemDisks>(context, system_database, "disks", "Contains information about disks defined in the server configuration.");
-    attachNoDescription<StorageSystemContentAddressedMounts>(context, system_database, "content_addressed_mounts",
+    attachNoDescription<StorageSystemContentAddressedMounts>(context, system_database, "cas_mounts",
         "One row per content-addressed (CAS) mount slot: live lease state per server root id — who holds "
         "which slot, renewal health, fenced/terminated state.");
     attachNoDescription<StorageSystemStoragePolicies>(context, system_database, "storage_policies", "Contains information about storage policies and volumes defined in the server configuration.");

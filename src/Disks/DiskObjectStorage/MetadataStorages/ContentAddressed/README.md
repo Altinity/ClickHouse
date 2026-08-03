@@ -164,7 +164,7 @@ GC sharding, hash algorithm, request budgets) is parsed in
   (decode one pool object by its raw key to JSON), `ca-gc-dryrun` (preview the
   next GC round's deletes), `ca-gc-rebuild` (disaster-recovery rebuild of the
   `gc/state` baseline), `ca-drop-member` (decommission a dead pool member).
-- `system.content_addressed_log` — one row per CAS protocol event
+- `system.cas_log` — one row per CAS protocol event
   (uploads, adopts, promotes, condemns, deletes, mount-slot writes, ...);
   the primary audit trail when investigating pool state.
 - The GC and writer paths also emit `ProfileEvents` counters (grep

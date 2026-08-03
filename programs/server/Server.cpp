@@ -395,8 +395,8 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_size;
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_free_size;
     extern const ServerSettingsUInt64 format_parsing_thread_pool_queue_size;
-    extern const ServerSettingsUInt64 content_addressed_blob_upload_pool_size;
-    extern const ServerSettingsUInt64 content_addressed_condemned_upload_memory_bytes;
+    extern const ServerSettingsUInt64 cas_blob_upload_pool_size;
+    extern const ServerSettingsUInt64 cas_condemned_upload_memory_bytes;
     extern const ServerSettingsUInt64 page_cache_history_window_ms;
     extern const ServerSettingsString page_cache_policy;
     extern const ServerSettingsDouble page_cache_size_ratio;
@@ -1720,10 +1720,10 @@ try
         server_settings[ServerSetting::max_format_parsing_thread_pool_free_size],
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
 
-    DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::content_addressed_blob_upload_pool_size]);
+    DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::cas_blob_upload_pool_size]);
     DB::Cas::initializeCondemnedUploadAdmission(
-        server_settings[ServerSetting::content_addressed_condemned_upload_memory_bytes],
-        server_settings[ServerSetting::content_addressed_blob_upload_pool_size]);
+        server_settings[ServerSetting::cas_condemned_upload_memory_bytes],
+        server_settings[ServerSetting::cas_blob_upload_pool_size]);
 
     std::string path_str = getCanonicalPath(String(server_settings[ServerSetting::path]), original_working_directory);
     fs::path path = path_str;

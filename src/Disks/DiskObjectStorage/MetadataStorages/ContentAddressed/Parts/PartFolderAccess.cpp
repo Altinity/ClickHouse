@@ -674,7 +674,7 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
 
         /// Audit a successful conditional removal exactly like `CasRefLedger::dropRef` audits its own
         /// unconditional one -- otherwise a rollback drop (this method's only caller, as of Task 3)
-        /// would be invisible in `system.content_addressed_log`. Byte-neutral to the ref-log: this is
+        /// would be invisible in `system.cas_log`. Byte-neutral to the ref-log: this is
         /// an audit event only, emitted after the removal is already durable.
         if (removed && store->hasEventSink())
         {

@@ -102,7 +102,7 @@ echo "PASS: Data parity - both nodes have 3 rows, sum=$ch1_sum"
 echo ""
 echo "--- Step 6: Assertion 2 - Relink path taken ---"
 # Look for the 'part_manifest_v1' cookie or 'relink' keyword in ch2's log after our operation
-relink_evidence=$(tail -n "+$log_pos_before" "$CH2_LOG" 2>/dev/null | grep -i "relink\|part_manifest_v1\|content_addressed_relink" | head -20 || echo "")
+relink_evidence=$(tail -n "+$log_pos_before" "$CH2_LOG" 2>/dev/null | grep -i "relink\|part_manifest_v1\|cas_relink" | head -20 || echo "")
 echo "ch2 relink log evidence:"
 if [ -z "$relink_evidence" ]; then
     echo "  (no relink log lines found after position $log_pos_before)"

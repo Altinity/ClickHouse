@@ -57,7 +57,7 @@ TEST(CasContentAddressedSettings, UnknownKeyRejected)
 TEST(CasContentAddressedSettings, ObjectStorageKeysSkipped)
 {
     auto cfg = makeConfig(
-        "<metadata_type>content_addressed</metadata_type><type>object_storage</type>"
+        "<metadata_type>cas</metadata_type><type>object_storage</type>"
         "<object_storage_type>s3</object_storage_type><endpoint>http://x/y</endpoint>"
         "<access_key_id>k</access_key_id><secret_access_key>s</secret_access_key>"
         "<server_root_id>srv1</server_root_id>"
@@ -66,12 +66,12 @@ TEST(CasContentAddressedSettings, ObjectStorageKeysSkipped)
         /// sets `path` -- the generic local-object-storage pool root, consumed by
         /// `ObjectStorageFactory`/`IDisk`, same class as `endpoint`/`access_key_id` above -- and it
         /// was missing from `non_cas_keys`, which threw `UNKNOWN_SETTING` at server startup.
-        "<path>content_addressed_pool/</path>"
+        "<path>cas_pool/</path>"
         /// Regression pin: `name`, read generically by `DiskFromAST` for the inline SQL `disk(...)`
         /// form used by the `05002`-`05015` CAS stateless tests, was likewise missing and threw
         /// `UNKNOWN_SETTING` for every one of those tests (only the XML-config `path` gap was fixed
         /// first; `name` surfaced once the stateless lane actually ran end to end).
-        "<name>content_addressed_test_disk</name>"
+        "<name>cas_test_disk</name>"
         /// Regression pin: `use_fake_transaction`, validated generically in
         /// `RegisterDiskObjectStorage.cpp` for every metadata type that needs a real transaction (not
         /// a CAS-specific check), must reach that check rather than being rejected here as unknown --

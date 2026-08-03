@@ -6715,9 +6715,9 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     can_execute_alter_on_disk = std::ranges::contains(supported_commands, command.type);
                     break;
                 }
-                case MetadataStorageType::ContentAddressed:
+                case MetadataStorageType::CAS:
                 {
-                    /// On a content_addressed disk a part clone is cheap: identical content has the same
+                    /// On a CAS disk a part clone is cheap: identical content has the same
                     /// `part_id`, so cloning is publishing a ref (no byte copy). The clone path is now
                     /// transactional — `DataPartStorageOnDiskBase::freeze` runs the whole clone through ONE
                     /// CA transaction, and `moveDirectory` re-keys the detached-staging → active rename into
@@ -6758,7 +6758,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     if (!std::ranges::contains(supported_commands, command.type))
                         throw Exception(
                             ErrorCodes::SUPPORT_IS_DISABLED,
-                            "Partition operation ALTER TABLE {} is not supported on a content_addressed disk yet "
+                            "Partition operation ALTER TABLE {} is not supported on a CAS disk yet "
                             "(it clones parts file-by-file with no transaction, which would corrupt the clone); disk '{}'",
                             command.typeToString(), disk->getName());
                     break;

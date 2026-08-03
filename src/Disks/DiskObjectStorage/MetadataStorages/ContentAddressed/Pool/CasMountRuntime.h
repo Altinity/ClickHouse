@@ -226,7 +226,7 @@ public:
 
     /// Wall-clock second (`system_clock`, seconds since epoch) at which the pool ENTERED its current
     /// non-`Live` lifecycle state, or 0 while `Live`. This is the `since` the non-gated
-    /// `system.content_addressed_mounts` lifecycle snapshot (spec §7) reports. Written (release) at each
+    /// `system.cas_mounts` lifecycle snapshot (spec §7) reports. Written (release) at each
     /// lifecycle edge — `noteLeaseLost`/`enterIdentityLost`/`enterVanished` set it to now, `noteRemounted`
     /// clears it to 0 — and by `setLifecycleForTest`, so a forced state carries a `since` indistinguishable
     /// from a naturally-reached one.

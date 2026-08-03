@@ -519,7 +519,7 @@ struct NonTerminalMountSlot
 /// writer appending its old-format transactions into the new pool. Writes nothing.
 std::vector<NonTerminalMountSlot> probeNonTerminalMountSlots(Backend & b, const Layout & l);
 
-/// A read-only snapshot of one server's mount slot, for introspection (`system.content_addressed_mounts`).
+/// A read-only snapshot of one server's mount slot, for introspection (`system.cas_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
 /// will fence it), `terminated` (clean farewell: `min_active == UINT64_MAX`), `fenced` (`gc_fenced`),
 /// `corrupt` (body failed to decode — surfaced as a row, never an exception).

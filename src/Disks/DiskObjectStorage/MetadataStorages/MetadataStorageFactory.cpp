@@ -216,7 +216,7 @@ static void registerPlainRewritableMetadataStorage(MetadataStorageFactory & fact
 
 static void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
 {
-    factory.registerMetadataStorageType("content_addressed", [](
+    factory.registerMetadataStorageType("cas", [](
         const std::string & name,
         const Poco::Util::AbstractConfiguration & config,
         const std::string & config_prefix,

@@ -83,7 +83,7 @@ namespace ContentAddressedSetting
 
 namespace
 {
-/// The `lifecycle` column value for `system.content_addressed_mounts` (spec §7): the pool lifecycle
+/// The `lifecycle` column value for `system.cas_mounts` (spec §7): the pool lifecycle
 /// condition collapsed to the operator-facing vocabulary. The two `Vanished*` sub-states both map to the
 /// bare `vanished` -- the sub-state (replaced/forgotten) lives in the `lifecycle_reason` column,
 /// so a `NULL`-free `lifecycle` stays a small, stable enumerated set.
@@ -131,7 +131,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   transactionIsStagingOverlay, supportsAtomicFileWrites, supportsTransactionalMutableFiles,
 ///   areBlobPathsRandom, getHardlinkCount, createTransaction (I/O-free -- allocates a txn), getPoolUUID,
 ///   serverRootId, scratchPath, stagingBackend, conditionalCopySupported, objectStorage, gcHealth,
-///   lifecycleSnapshot (both non-store()-gated introspection reads for system.content_addressed_mounts --
+///   lifecycleSnapshot (both non-store()-gated introspection reads for system.cas_mounts --
 ///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
 ///   parseStagingBackend/parsePartFolderValidate/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
@@ -433,7 +433,7 @@ std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gc
 {
     /// A brief pointer_mutex snapshot only -- this must NEVER wait behind gc_scheduler_mutex (an
     /// in-flight round can hold that for a long time; an unprivileged SELECT on
-    /// system.content_addressed_mounts must not stall behind it). The snapshot keeps the scheduler
+    /// system.cas_mounts must not stall behind it). The snapshot keeps the scheduler
     /// alive via its own refcount even if `shutdown` concurrently resets the member, and
     /// CasGcScheduler::gcHealth() is itself lock-free (atomic reads), so calling it outside any lock
     /// here is safe.

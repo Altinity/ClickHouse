@@ -88,7 +88,7 @@ enum class CasOpAdmission : uint8_t
     TruthAbsent,
 };
 
-/// A non-gated lifecycle snapshot of one content-addressed disk for `system.content_addressed_mounts`
+/// A non-gated lifecycle snapshot of one content-addressed disk for `system.cas_mounts`
 /// (rev.7 spec §7, [C5]-visibility). It is a Factory-class read (§1): I/O-free, no `store()`/`poolAccess`,
 /// truthful in EVERY state — including a not-live / vanished pool the store()-class surface refuses, and a
 /// null pool (before `startup` / after `shutdown`). This is what keeps a disappearing disk VISIBLE to the
@@ -187,7 +187,7 @@ public:
     void runOneGcRoundForTest();
 
     /// Runs one synchronous GC round on the caller's thread and emits Start and Finish rows to
-    /// `system.content_addressed_garbage_collection_log`. Throws `BAD_ARGUMENTS` when GC is disabled
+    /// `system.cas_gc_log`. Throws `BAD_ARGUMENTS` when GC is disabled
     /// by read-only mode or configuration.
     Cas::RoundReport runGarbageCollectionRoundNow();
 
@@ -213,13 +213,13 @@ public:
     /// lifecycle-control verb (FORGET / GC STOP / GC START) cannot race it.
     Cas::FsckReport runFsckNow(bool detail) const;
 
-    /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
+    /// Returns per-disk GC health for `system.cas_mounts`. Returns nullopt when this
     /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.
     /// Holds `gc_scheduler_mutex` for the entire call so a concurrent system-table query cannot
     /// observe a scheduler while `shutdown` destroys it.
     std::optional<Cas::CasGcScheduler::GcHealth> gcHealth() const;
 
-    /// The non-gated lifecycle snapshot for `system.content_addressed_mounts` (spec §7, Factory class):
+    /// The non-gated lifecycle snapshot for `system.cas_mounts` (spec §7, Factory class):
     /// I/O-free, reachable in EVERY state — a live pool (forwards `Pool::lifecycleSnapshot`), a terminal
     /// pool the store()-class surface refuses, and a null pool (before `startup`/after `shutdown`, reported
     /// as `constructing`/`shutdown`). Never calls `store()`/`poolAccess()`, never touches the backend, so
@@ -227,7 +227,7 @@ public:
     /// pointer; the identity fields are read from immutable-after-startup storage members.
     CasLifecycleSnapshot lifecycleSnapshot() const;
 
-    MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
+    MetadataStorageType getType() const override { return MetadataStorageType::CAS; }
     const std::string & getPath() const override { return storage_path_full; }
     bool supportsChmod() const override { return false; }
     bool supportsStat() const override { return false; }
@@ -246,7 +246,7 @@ public:
     ///     `shutdown`) -> throws "not started" for EVERY class, `Probe` included: a storage that has
     ///     never published a pool (or torn one down) has no benign "absent" answer to give.
     ///   - `TransientNotLive` / `IdentityLost` -> throws 668 for every class but `Factory` (uncertain
-    ///     backing; the sub-state distinction is surfaced in `system.content_addressed_mounts`, not the
+    ///     backing; the sub-state distinction is surfaced in `system.cas_mounts`, not the
     ///     op error).
     ///   - `Vanished*` -> `Probe`/`Remove` answer `TruthAbsent` (absent-empty / no-op success);
     ///     `ContentRead`/`Write`/`Admin` throw the typed per-reason [D5] message (via

@@ -32,7 +32,7 @@ enum class MetadataStorageType : uint8_t
     Keeper,
     Plain,
     PlainRewritable,
-    ContentAddressed,
+    CAS,
     StaticWeb,
     Memory,
 };

@@ -431,7 +431,7 @@ public:
     /// truth-absent on removes/enumeration — is `checkOpAdmitted`; this covers only the terminal states.
     void throwIfLifecycleTerminal() const;
 
-    /// A non-gated, I/O-free lifecycle snapshot for `system.content_addressed_mounts` (spec §7,
+    /// A non-gated, I/O-free lifecycle snapshot for `system.cas_mounts` (spec §7,
     /// Factory class). Reads only the runtime's atomics — NO backend op — so it is truthful in EVERY
     /// state, including the terminal ones the store()-class surface refuses. `detail` is the same [D5]
     /// reason text `throwIfLifecycleTerminal` throws (empty while `Live`/`TransientNotLive`), which spec §1
@@ -737,7 +737,7 @@ public:
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytesForTest() const { return manifest_reader.manifestDecodeCacheBytes(); }
 
-    /// ---- event audit (system.content_addressed_log) ----
+    /// ---- event audit (system.cas_log) ----
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
     /// (unit tests, log disabled) makes emitEvent a no-op single branch. PartWriteTxn/Gc reach this via
     /// their owning Pool. `reason`/`detail` on the event carry the decision's full rationale.
@@ -866,7 +866,7 @@ public:
 
     /// Number of ref-append lanes currently wedged (an uncertain PUT exhausted its retry budget and
     /// the lane blocks until the same key resolves durable or is conclusively rejected). Per-disk GC
-    /// health for system.content_addressed_mounts. O(live tables); takes each runtime state lock.
+    /// health for system.cas_mounts. O(live tables); takes each runtime state lock.
     size_t wedgedRefLaneCount();
 
     /// test seam: blocks until every background snapshot-publish attempt dispatched so far for

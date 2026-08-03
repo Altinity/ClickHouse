@@ -148,17 +148,17 @@ namespace
     DECLARE(UInt64, max_format_parsing_thread_pool_size, 100, R"(
     Maximum total number of threads to use for parsing input.
     )", 0) \
-    DECLARE(UInt64, content_addressed_blob_upload_pool_size, 16, R"(
+    DECLARE(UInt64, cas_blob_upload_pool_size, 16, R"(
     ClickHouse uses threads from this dedicated server-wide pool to upload blobs in parallel when
-    committing a content-addressed (CAS) part. `content_addressed_blob_upload_pool_size` limits the
+    committing a content-addressed (CAS) part. `cas_blob_upload_pool_size` limits the
     maximum number of threads in the pool. Zero is rejected: the pool must have at least one thread.
     )", 0) \
-    DECLARE(UInt64, content_addressed_condemned_upload_memory_bytes, 0, R"(
+    DECLARE(UInt64, cas_condemned_upload_memory_bytes, 0, R"(
     Aggregate memory budget, in bytes, for the one content-addressed (CAS) upload branch that
     materializes a whole blob body in memory: resurrecting a condemned incarnation with a local source
     (its `putOverwrite` has no streaming variant). Under the parallel blob-upload fan-out several such
     resurrections can run at once, so this caps the total materialized bytes across them. `0` (the
-    default) derives the budget from `content_addressed_blob_upload_pool_size` times a 64 MiB per-task
+    default) derives the budget from `cas_blob_upload_pool_size` times a 64 MiB per-task
     budget. 64 MiB is the chosen default per-task budget, NOT a size cap on blob bodies: CAS blob bodies
     have no size cap (only `RefLog`/`RefSnapshot` objects are capped at 64 MiB). A resurrected body whose
     size exceeds the whole budget is still admitted -- exclusively (alone), so it never waits forever --

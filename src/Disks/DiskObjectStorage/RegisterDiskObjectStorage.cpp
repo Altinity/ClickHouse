@@ -90,7 +90,7 @@ void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_ch
         /// would write each file independently with no commit point for the manifest/ref publish.
         const auto metadata_type = metadata_storage->getType();
         const bool needs_real_transaction = metadata_type == MetadataStorageType::Keeper
-            || metadata_type == MetadataStorageType::ContentAddressed;
+            || metadata_type == MetadataStorageType::CAS;
         /// An explicit `use_fake_transaction=true` on a metadata type that requires deferred
         /// transactions would silently break the atomic manifest/ref publish (per-file autocommit,
         /// no commit point). Reject it instead of honoring it.

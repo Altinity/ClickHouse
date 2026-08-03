@@ -25,7 +25,7 @@ struct GcRoundLogRecord
     enum class EventType { Start, Finish, Phase };
     /// `Deferred`: the round acquired the lease and took the skip-unchanged fast path (`RoundReport::deferred`)
     /// -- no fold, no pre-CAS deletes, no `gc/state` CAS. Distinct from `Success` so a reader of
-    /// `system.content_addressed_garbage_collection_log` (or this scheduler's own log line) can tell a round
+    /// `system.cas_gc_log` (or this scheduler's own log line) can tell a round
     /// that genuinely folded and found nothing apart from one that never folded at all.
     enum class Outcome { Unknown, Success, NotALeader, Failed, Deferred };
     enum class Trigger { Scheduled, Manual };
@@ -117,7 +117,7 @@ public:
     /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
     Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
 
-    /// Returns per-disk GC health for `system.content_addressed_mounts`. The fields describing
+    /// Returns per-disk GC health for `system.cas_mounts`. The fields describing
     /// rounds snapshot this scheduler's state, while `wedged_namespace_count` is read live from the
     /// store's ref lanes; keeping the state here avoids process-global gauges colliding across disks.
     struct GcHealth

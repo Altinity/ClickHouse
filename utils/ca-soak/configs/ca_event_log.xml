@@ -1,8 +1,8 @@
 <clickhouse>
-    <content_addressed_log>
+    <cas_log>
         <database>system</database>
-        <table>content_addressed_log</table>
+        <table>cas_log</table>
         <flush_interval_milliseconds>2000</flush_interval_milliseconds>
         <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
-    </content_addressed_log>
+    </cas_log>
 </clickhouse>

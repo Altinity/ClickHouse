@@ -11,7 +11,7 @@
             <ca_ro>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <endpoint>https://storage.googleapis.com/content-adressable-test-mfilimonov/ca_live_20260703_g2/soak_pool/</endpoint>
                 <use_environment_credentials>1</use_environment_credentials>
                 <!-- The GCS Generation-token binding (spec 2026-07-03): GOOG4-HMAC signing +

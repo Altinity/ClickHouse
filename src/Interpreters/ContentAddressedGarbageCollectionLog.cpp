@@ -34,7 +34,7 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"event_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Event time with microseconds."},
         {"event_type", type_enum, "Start or Finish of a GC round, or one Phase of it."},
         {"disk_name", lc_string, "Content-addressed disk the round ran on."},
-        {"srid", lc_string, "server_root_id of the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against `system.content_addressed_mounts`."},
+        {"srid", lc_string, "server_root_id of the mount whose GC scheduler ran this round. Distinguishes concurrent mounters of the same shared pool; join on this column when correlating rounds against `system.cas_mounts`."},
         {"gc_id", std::make_shared<DataTypeString>(), "GC scheduler instance id (which mounter)."},
         {"trigger", trigger_enum, "Scheduled (background tick) or Manual (SYSTEM command)."},
         {"round", std::make_shared<DataTypeUInt64>(), "GC round number (0 on Start)."},

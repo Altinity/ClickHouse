@@ -92,7 +92,7 @@ constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_PARTS_PROJECTION = 7;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_METADATA_VERSION = 8;
 constexpr auto REPLICATION_PROTOCOL_VERSION_WITH_COLUMNS_SUBSTREAMS = 9;
 /// CAS replication 2b: fetch-by-relink. The receiver advertises its content-addressed pool identity
-/// (`content_addressed_pool_uuid`) and, if it matches the sender's own pool, the sender sends only the
+/// (`cas_pool_uuid`) and, if it matches the sender's own pool, the sender sends only the
 /// part's content id (`part_id`) + the mutable header — no file bytes — and the receiver "fetches" by
 /// publishing its own ref to the blobs already present in the shared pool (the CA analogue of the
 /// zero-copy metadata-only fetch). Everything is gated behind a matching pool_uuid, so a non-CA fetch
@@ -114,11 +114,11 @@ std::string getEndpointId(const std::string & node_id)
 
 /// CAS replication 2b. The receiver advertises its target pool's identity under this request param so
 /// the sender can decide whether a fetch-by-relink (same pool) is possible.
-constexpr auto CA_POOL_UUID_PARAM = "content_addressed_pool_uuid";
+constexpr auto CA_POOL_UUID_PARAM = "cas_pool_uuid";
 /// Set on the response when the sender chose the relink path; the receiver then reads the relink payload
 /// (the opaque encoded PartManifest body — self-contained, see part_manifest_v2 below) instead of the
 /// byte stream.
-constexpr auto CA_RELINK_COOKIE = "content_addressed_relink";
+constexpr auto CA_RELINK_COOKIE = "cas_relink";
 /// All-tree task 7: the manifest is now self-contained (uuid.txt/metadata_version.txt are ordinary
 /// manifest entries, task 6), so the wire payload dropped its trailing metadata_version field (the
 /// manifest bytes are now the ONLY field). Bumped from `part_manifest_v1` so a mixed-build pair (old
@@ -134,11 +134,11 @@ constexpr auto CA_RELINK_COOKIE_VALUE = "part_manifest_v2";
 /// source token the sender minted for the offer. There is no separate action flag, because an action
 /// without its token is not a question anyone can answer, and a token without the action would have to
 /// be ignored — one name cannot be half-present.
-constexpr auto CA_CONFIRM_ACTION_PARAM = "content_addressed_confirm";
+constexpr auto CA_CONFIRM_ACTION_PARAM = "cas_confirm";
 /// Response cookie on the relink offer: the token, opaque to the receiver, echoed back verbatim.
-constexpr auto CA_CONFIRM_TOKEN_COOKIE = "content_addressed_source_token";
+constexpr auto CA_CONFIRM_TOKEN_COOKIE = "cas_source_token";
 /// Response cookie on the confirm: the answer.
-constexpr auto CA_CONFIRM_ANSWER_COOKIE = "content_addressed_confirm_answer";
+constexpr auto CA_CONFIRM_ANSWER_COOKIE = "cas_confirm_answer";
 /// The ONLY value that authorizes the receiver to promote.
 constexpr auto CA_CONFIRM_ANSWER_PROVEN = "yes";
 /// Everything else: the source did not prove the binding. The wire vocabulary is deliberately BINARY
@@ -389,7 +389,7 @@ void Service::processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuf
         }
 
         /// CAS replication 2b — fetch-by-relink (spec §4). If the part is on a content-addressed disk and
-        /// the receiver advertised a `content_addressed_pool_uuid` equal to THIS server's own pool_uuid
+        /// the receiver advertised a `cas_pool_uuid` equal to THIS server's own pool_uuid
         /// (same shared pool), send only the part's content id + the mutable header — no file bytes — so
         /// the receiver can "fetch" by publishing its own ref to the blobs already in the shared pool.
         /// Strictly gated on a matching pool_uuid: a non-CA part, a CA part on a different pool, or a

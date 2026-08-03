@@ -124,7 +124,7 @@ private:
 };
 
 /// Fail-loud lifecycle mirroring the blob upload pool above. `configured_capacity_bytes` is the raw
-/// `content_addressed_condemned_upload_memory_bytes` server setting; `0` means "derive from the pool
+/// `cas_condemned_upload_memory_bytes` server setting; `0` means "derive from the pool
 /// size": the derived capacity is `pool_size * 64 MiB`. 64 MiB is the CHOSEN default per-task budget,
 /// NOT a cap on blob bodies -- blob bodies have no size cap; only `RefLog`/`RefSnapshot` objects are
 /// capped at 64 MiB (`ref_removal_max_bytes`). Budgeting one per-task budget per pool slot neither

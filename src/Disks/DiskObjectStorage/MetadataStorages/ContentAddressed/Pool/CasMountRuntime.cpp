@@ -109,7 +109,7 @@ void CasMountRuntime::checkFenceOrThrow(uint64_t admitted_generation) const
             "mount fence tripped: the durable write is refused because this node no longer holds the mount "
             "incarnation it was admitted under -- either a lease loss the disk auto-recovers from, or a "
             "FORGET decommission / lost identity that does NOT recover; consult "
-            "system.content_addressed_mounts for the disk's lifecycle before retrying");
+            "system.cas_mounts for the disk's lifecycle before retrying");
 }
 
 bool CasMountRuntime::refAppendFenceOk() const

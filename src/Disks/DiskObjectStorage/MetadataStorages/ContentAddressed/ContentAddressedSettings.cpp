@@ -48,20 +48,13 @@ namespace ErrorCodes
 ///      `04278`-`04300` range turned up no keys beyond what `05002`-`05015` already required.
 /// Any new CAS config FAMILY -- a new XML config directory or a new inline-`disk()` test pattern --
 /// added to the tree needs the same four-way scan repeated against it and this note updated.
-/// `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec`
-/// are legacy keys from the pre-rev.6 single-owner-pool design: the incarnation-token pool is
-/// multi-writer by design (spec section 2) -- the publish gate + fence/recheck handshake make shared
-/// pools safe, and the GC lease dedups leaders -- so the old single-owner claim and its
-/// `allow_shared_pool` opt-in are gone (M-W D-W5/D-W6). The current factory never reads either key,
-/// but several integration-test configs still set them, so they must stay skip-listed rather than
-/// rejected. `skip_access_check` is deliberately NOT in this set: it is registered as a CAS setting
+/// `skip_access_check` is deliberately NOT in this set: it is registered as a CAS setting
 /// below (the same config key also has meaning to `IDisk::startupImpl`, which drops it before
 /// `metadata_storage->startup()` runs, but that does not make it foreign here).
 static const std::set<std::string> non_cas_keys = {
     "type", "object_storage_type", "metadata_type", "path", "name", "use_fake_transaction",
     "endpoint", "access_key_id", "secret_access_key", "region", "use_environment_credentials",
     "readonly", "expect_continue_min_bytes", "http_client", "key_compatibility_prefix",
-    "content_addressed_allow_shared_pool", "content_addressed_gc_grace_sec",
 };
 
 /// Config-key convention: the `content_addressed` block already scopes every key to this disk, so no

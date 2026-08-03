@@ -54,7 +54,7 @@ public:
     bool supportZeroCopyReplication() const override
     {
         return metadata_storage->getType() != MetadataStorageType::Keeper
-            && metadata_storage->getType() != MetadataStorageType::ContentAddressed;
+            && metadata_storage->getType() != MetadataStorageType::CAS;
     }
 
     bool supportParallelWrite() const override { return object_storages->takePointingTo(cluster->getLocalLocation())->supportParallelWrite(); }

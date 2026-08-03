@@ -13,7 +13,7 @@
 #include <string>
 
 /// Task 12 (rev.7 spec §7, [C5]-visibility): the NON-GATED lifecycle snapshot backing
-/// `system.content_addressed_mounts`. A Factory-class read (spec §1): I/O-free, no `store()`/`poolAccess`,
+/// `system.cas_mounts`. A Factory-class read (spec §1): I/O-free, no `store()`/`poolAccess`,
 /// truthful in EVERY state — so a not-live / stopped / vanished / never-started disk stays VISIBLE to the
 /// operator instead of silently missing from the table. These tests exercise the accessor directly (the
 /// SQL-level assertions land in Task 14): `ContentAddressedMetadataStorage::lifecycleSnapshot` at the

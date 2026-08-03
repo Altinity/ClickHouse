@@ -472,7 +472,7 @@ public:
     /// If the disk is plain object storage.
     virtual bool isPlain() const { return false; }
 
-    /// If the disk is a content-addressed object-storage pool (`metadata_type = content_addressed`).
+    /// If the disk is a content-addressed object-storage pool (`metadata_type = cas`).
     /// A clean predicate so callers do not have to reach through `getDataSourceDescription`.
     virtual bool isContentAddressed() const { return false; }
 

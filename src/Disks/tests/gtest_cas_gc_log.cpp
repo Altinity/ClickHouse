@@ -12,7 +12,7 @@
 #include <vector>
 
 /// Unit coverage for the CA GC scheduler's logging sink (the source of
-/// `system.content_addressed_garbage_collection_log`). The scheduler emits a Start + Finish
+/// `system.cas_gc_log`). The scheduler emits a Start + Finish
 /// `GcRoundLogRecord` per round through the injected `GcRoundLogger`; here we capture the records in
 /// a vector and assert their shape over a real (in-memory) Pool driven through a dropped-then-
 /// collectable object — the same Pool/Backend fixture the B140 reclaim test uses.
@@ -455,7 +455,7 @@ TEST(CasGcLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
         EXPECT_EQ(r.round_id, rows.front().round_id);
 }
 
-/// B3: the scheduler exposes per-disk GC health for system.content_addressed_mounts (the process-
+/// B3: the scheduler exposes per-disk GC health for system.cas_mounts (the process-
 /// global CurrentMetrics gauges were clobbered with >= 2 CAS disks). Drive one leader round and
 /// assert the health snapshot reflects leadership, the pending-reclaim backlog and a fresh success.
 TEST(CasGcHealth, ReflectsLeadershipAndPendingReclaim)
