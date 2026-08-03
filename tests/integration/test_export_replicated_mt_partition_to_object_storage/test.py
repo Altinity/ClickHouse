@@ -1815,6 +1815,17 @@ REJECTED_PARTITION_EXPORT_CASES = [
         ),
         id="multi_column_partition_key_more_in_destination",
     ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="id Int64, ts DateTime('UTC')",
+            src_partition_by="ts",
+            dst_columns="id Int64, ts DateTime('Asia/Tokyo')",
+            dst_partition_by="ts",
+            insert_values="(1, '2024-03-05 15:00:00')",
+            error_substrings=("timezone",),
+        ),
+        id="partition_key_timezone_mismatch",
+    ),
 ]
 
 
@@ -1895,42 +1906,6 @@ def test_export_partition_multi_column_partition_key_success(cluster):
 
     result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
     assert result == "1\t2\t3\tx\n1\t2\t3\ty", f"Unexpected exported data:\n{result}"
-
-
-def test_export_partition_partition_key_timezone_mismatch_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["replica1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_mismatch_mt_table_{postfix}"
-    s3_table = f"tz_mismatch_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int64, ts DateTime('UTC'))
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
-        PARTITION BY ts
-        ORDER BY tuple()
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int64, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY ts
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    partition_id = node.query(
-        f"SELECT partition_id FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' TO TABLE {s3_table}")
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "timezone" in error, f"Expected timezone mismatch message, got: {error}"
-
-    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
 
 
 def test_export_partition_multi_column_partition_key_success_all(cluster):
