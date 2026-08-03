@@ -164,8 +164,8 @@ metadata storage / transaction / exchange files go to phase 3 instead).
 Recorded here so the exclusions are deliberate, not accidental: all of `docs/superpowers/`
 (worklogs, models, reports, specs — including this one), `.superpowers/`, `utils/ca-soak/`
 and its scenarios, `utils/cas-gate/` (gate infrastructure, not the feature),
-`utils/cas-carve/` (this script), `tmp/`, `.gitignore` (artifact entries),
-`tests/broken_tests.yaml`.
+`utils/cas-carve/` (this script), `tmp/`, `.claude/` (agent roles and tools),
+`.gitignore` (artifact entries), `tests/broken_tests.yaml`.
 
 ## 7. Verification
 
@@ -183,3 +183,16 @@ and its scenarios, `utils/cas-gate/` (gate infrastructure, not the feature),
   `src/`). The classifier cannot tell; hygiene stays a review concern on the working branch.
 - **File moves between areas** (e.g. a gtest moved into a layer directory) silently change
   which commit carries them. Acceptable: grouping is presentational.
+
+## 9. Maintenance as branches move
+
+**Working branch grows.** Directory globs absorb new files inside known territory; anything
+else trips the unmatched-file hard fail and forces a deliberate manifest decision. Run
+`--check` before every regeneration.
+
+**Base branch advances.** Safe by construction: the new branch starts at
+`git merge-base $BASE $SRC`, never at the tip of `$BASE`, so the script never overwrites
+base-side changes. The procedure is: merge the advanced base into the working branch as
+usual; rerun `--check` (the merge-base moves forward by itself); any group whose fix has
+been absorbed by the base becomes empty — the empty-group warning is the signal to delete
+it from the manifest.

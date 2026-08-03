@@ -478,5 +478,87 @@ if [[ $CHECK -eq 1 ]]; then
     exit 0
 fi
 
-echo "apply phase not implemented yet" >&2
-exit 3
+# ----------------------------------------------------------------------------
+# Engine: apply — build the branch in a temporary worktree.
+# ----------------------------------------------------------------------------
+WT=tmp/carve-worktree
+mkdir -p tmp
+
+if git worktree list --porcelain | grep -qx "worktree $(pwd)/$WT"; then
+    git worktree remove --force "$WT"
+fi
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    if [[ $FORCE -eq 1 ]]; then
+        git branch -D "$BRANCH"
+    else
+        echo "ERROR: branch '$BRANCH' already exists (use --force to recreate)" >&2
+        exit 1
+    fi
+fi
+
+git worktree add -b "$BRANCH" "$WT" "$MB"
+trap 'git worktree remove --force "$WT" 2>/dev/null || true' EXIT
+
+echo
+echo "== building $BRANCH from $MB =="
+declare -a SUMMARY
+pushd "$WT" > /dev/null
+for g in "${GROUP_ORDER[@]}"; do
+    files=()
+    for file in "${DIFF_FILES[@]}"; do
+        [[ ${CLAIM[$file]:-} == "$g" ]] && files+=("$file")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "skipping empty group '$g'"
+        continue
+    fi
+    for file in "${files[@]}"; do
+        if [[ ${FILE_STATUS[$file]} == D ]]; then
+            git rm -q --ignore-unmatch -- "$file"
+        else
+            git checkout -q "$SRC_SHA" -- "$file"
+        fi
+    done
+    git commit -q -F - <<< "${GROUP_MESSAGES[$g]}"
+    SUMMARY+=("$(git rev-parse --short HEAD)  ${#files[@]}  $g")
+done
+
+# ----------------------------------------------------------------------------
+# Engine: completeness invariant — nothing essential may be lost.
+# ----------------------------------------------------------------------------
+LOST=()
+declare -A DISCARD_COUNT
+while IFS= read -r file; do
+    [[ -z $file ]] && continue
+    excluded=0
+    for pat in "${EXCLUDES[@]}"; do
+        # status is irrelevant for excludes; pass M as a dummy
+        if pattern_matches "$file" M "$pat"; then
+            excluded=1
+            DISCARD_COUNT[$pat]=$(( ${DISCARD_COUNT[$pat]:-0} + 1 ))
+            break
+        fi
+    done
+    [[ $excluded -eq 0 ]] && LOST+=("$file")
+done < <(git diff --name-only --no-renames HEAD "$SRC_SHA")
+
+echo
+echo "== summary =="
+printf '%s\n' "${SUMMARY[@]}"
+echo
+echo "== discarded (by exclude) =="
+for pat in "${EXCLUDES[@]}"; do
+    printf '%6d  %s\n' "${DISCARD_COUNT[$pat]:-0}" "$pat"
+done
+
+popd > /dev/null
+
+if [[ ${#LOST[@]} -gt 0 ]]; then
+    echo
+    echo "ERROR: completeness invariant violated — ${#LOST[@]} non-excluded files differ between $BRANCH and src:" >&2
+    printf '  %s\n' "${LOST[@]}" >&2
+    exit 1
+fi
+
+echo
+echo "OK: completeness invariant holds. Branch '$BRANCH' is ready (worktree removed, branch kept)."
