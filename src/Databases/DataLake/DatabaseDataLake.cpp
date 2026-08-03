@@ -168,14 +168,8 @@ void DatabaseDataLake::validateSettings()
 
 void DatabaseDataLake::initialize() const
 {
-<<<<<<< HEAD
     /// Caller holds `catalog_mutex`: this runs either from the constructor (CREATE, eager)
     /// or from `getCatalog` on first access (ATTACH, lazy).
-=======
-    if (catalog_impl)
-        return catalog_impl;
-
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
     if (settings[DatabaseDataLakeSetting::catalog_type].value == DatabaseDataLakeCatalogType::NONE)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unspecified catalog type");
 
@@ -317,7 +311,6 @@ void DatabaseDataLake::initialize() const
             break;
         }
     }
-<<<<<<< HEAD
 }
 
 std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
@@ -326,9 +319,6 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
     /// Lazily build the catalog on first access for databases attached at startup (see ctor).
     if (!catalog_impl)
         initialize();
-=======
-
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
     return catalog_impl;
 }
 

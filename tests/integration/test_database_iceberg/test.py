@@ -129,11 +129,7 @@ def create_clickhouse_iceberg_database(
     node.query(
         f"""
 DROP DATABASE IF EXISTS {name};
-<<<<<<< HEAD
 CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
-=======
-CREATE DATABASE {name} ENGINE = {engine}('{BASE_URL}', 'minio', '{minio_secret_key}')
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
     """,
         settings={
@@ -151,11 +147,7 @@ def create_clickhouse_iceberg_table(
     settings_suffix = "" if len(additional_settings) == 0 else f"SETTINGS {",".join((k+"="+repr(v) for k, v in additional_settings.items()))}"
     node.query(
         f"""
-<<<<<<< HEAD
 CREATE TABLE {CATALOG_NAME}.`{database_name}.{table_name}` {schema} ENGINE = IcebergS3('http://minio1:9001/warehouse-rest/{table_name}/', '{minio_access_key}', '{minio_secret_key}')
-=======
-CREATE TABLE {CATALOG_NAME}.`{database_name}.{table_name}` {schema} ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{table_name}/', '{minio_access_key}', '{minio_secret_key}')
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
 {settings_suffix}
     """,
         settings={
@@ -914,7 +906,6 @@ def test_not_specified_catalog_type(started_cluster):
         "storage_endpoint": "http://minio1:9001/warehouse-rest",
     }
 
-<<<<<<< HEAD
     node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME}")
 
     with pytest.raises(QueryRuntimeException) as exc_info:
@@ -929,20 +920,6 @@ SETTINGS {",".join((k + "=" + repr(v) for k, v in settings.items()))}""",
     message = str(exc_info.value)
     assert "Unspecified catalog type" in message, message
     assert "Code: 36" in message, message
-=======
-    node.query(
-        f"""
-    DROP DATABASE IF EXISTS {CATALOG_NAME};
-    CREATE DATABASE {CATALOG_NAME} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
-    SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """,
-        settings={
-            "allow_database_iceberg": 1,
-            "write_full_path_in_iceberg_metadata": 1,
-        },
-    )
-    assert "" == node.query(f"SHOW TABLES FROM {CATALOG_NAME}")
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
 
 
 def test_system_tables_with_nullptr_table(started_cluster):
