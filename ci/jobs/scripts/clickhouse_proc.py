@@ -191,35 +191,23 @@ class ClickHouseProc:
         return True
 
     def start_rustfs(self):
-        # RustFS backs the CAS-over-S3 pool (M-W D-W8): the incarnation pool needs
-        # ENFORCED conditional operations (a wrong-token DELETE must fail with 412), which MinIO
-        # OSS lacks - the CA disk's fail-closed capability probe rejects it. The static (musl)
-        # binary is downloaded from the RustFS GitHub release into ci/tmp/rustfs when absent
-        # (CI wipes ci/tmp per run); the data dir is wiped per run so no pool state bleeds
-        # between runs. MinIO keeps serving the non-CA s3 disks on its own port.
+        # RustFS backs the CAS-over-S3 pool because the incarnation pool needs enforced
+        # conditional operations (a wrong-token DELETE must fail with 412) that MinIO OSS lacks;
+        # MinIO keeps serving the non-CAS s3 disks on its own port. Binary and data dir live
+        # under ci/tmp, which CI wipes per run, so no pool state bleeds between runs.
         rustfs_bin = f"{temp_dir}/rustfs"
         if not Path(rustfs_bin).is_file() and not self.download_rustfs(rustfs_bin):
             print(f"rustfs binary not found at {rustfs_bin} and download failed")
             return False
         data_dir = f"{temp_dir}/rustfs_data"
         Shell.check(f"rm -rf {data_dir} && mkdir -p {data_dir}", verbose=True)
-        # Disable the background data-scanner and auto-heal manager (B93). On a single-disk
-        # ephemeral test pool they do no useful work (no parity to heal from; data-usage/bitrot
-        # accounting on throwaway data is pointless) but their cost is NOT free: the scanner walks
-        # the whole object tree (CPU grows with object count - observed ~120% sustained after the
-        # pool reached ~177k objects in a full lane) and the heal manager's 10s auto-disk-scan
-        # takes namespace locks, producing periodic multi-minute bursts of 503 ServiceUnavailable
-        # (NamespaceLockQuorumUnavailable) that stalled client I/O and caused ~50 test timeouts.
-        # Client GET/PUT/LIST/DELETE do not depend on either service, so disabling them is safe.
-        # Env names: RUSTFS_SCANNER_ENABLED/RUSTFS_HEAL_ENABLED (the RUSTFS_ENABLE_* forms are
-        # deprecated in 1.0.0-beta.8).
-        # Raise the open-files limit before launching, exactly as start_azurite does and for the
-        # same reason: the server under parallel load holds thousands of S3 connections (observed
-        # 10k+ active Disk-group sessions on the sanitizer CA lanes), and with the default soft
-        # limit (1024) rustfs runs out of fds and refuses new TCP connections in bursts. On the
-        # msan CA-s3 lane those bursts (`Connection refused`, e.code() = 111) recurred for the
-        # whole run, and the one that overlapped the mount-lease renewal window tripped the mount
-        # fence and failed every writing test for minutes.
+        # The background data-scanner and auto-heal manager do no useful work on a single-disk
+        # ephemeral pool, but their namespace locks produced multi-minute bursts of 503
+        # ServiceUnavailable that stalled client I/O. Client GET/PUT/LIST/DELETE do not depend on
+        # either. The RUSTFS_ENABLE_* spellings are deprecated since 1.0.0-beta.8.
+        # Raise the open-files limit for the same reason start_azurite does: under parallel load
+        # the server holds thousands of S3 connections, and at the default soft limit (1024)
+        # rustfs runs out of fds and refuses new TCP connections in bursts.
         command = (
             "(ulimit -n 1048576 2>/dev/null || ulimit -n $(ulimit -Hn)) && "
             f"RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false "
@@ -1298,34 +1286,18 @@ fi
         Shell.check(
             f"sed -i 's|<errorlog>.*</errorlog>|<errorlog>{self.CH_LOCAL_ERR_LOG}</errorlog>|' /etc/clickhouse-server/config.xml"
         )
-        # Open any CAS disk read-only for this scrape. The server is already
-        # stopped, so `clickhouse local` opens the pool under its own (unrelated) identity;
-        # a normal (writable) open claims server-root ownership (`Pool::mountWritable` ->
-        # `claimOwnerOrThrow`) and fails closed with "owned by a different server" against the
-        # real server's persisted owner uuid. A read-only open skips that claim entirely
-        # (`Pool::open`: `if (!config.read_only) mountWritable(...)`), which is all a read-only
-        # dump needs. Keyed on the CAS marker tag, not the disk name, so it covers every
-        # CAS disk regardless of how it's named in this job's config.
-        #
-        # FIND the files by the marker instead of naming them. The original version of this line patched
-        # `config.xml`, where the tag does not live -- the CA storage policy is symlinked into `config.d/`
-        # by `tests/config/install.sh` -- so `sed` matched nothing, `<readonly>` was never inserted, and
-        # the scrape kept failing on ownership while looking handled. Naming `config.d` instead would fix
-        # today and break again the next time the layout moves, so the path is not named at all.
-        # `xargs -r` makes this a clean no-op on a job with no CAS disk.
-        #
-        # `-R`, NOT `-r`: `tests/config/install.sh` SYMLINKS these configs into `config.d` (`ln -sf`), and
-        # `grep -r` skips symlinks it finds while walking a tree — only `-R` follows them. The first
-        # version of this fix used `-r`, was "verified" against a directory of regular files, and would
-        # therefore still have matched nothing in CI. `sed --follow-symlinks` likewise, so the edit lands
-        # in the file rather than replacing the link with a regular copy.
+        # Open any CAS disk read-only: a writable open claims server-root ownership and fails
+        # closed against the real server's persisted owner uuid, while a read-only open skips the
+        # claim and is all a dump needs. Keyed on the `<metadata_type>cas</metadata_type>` marker
+        # rather than on disk names, so it covers every CAS disk however this job names it.
+        # `grep -R` and `sed --follow-symlinks` are required: `tests/config/install.sh` symlinks
+        # these configs into `config.d`, and `-r`/plain `sed` would silently match nothing.
         Shell.check(
             "grep -Rl '<metadata_type>cas</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
             "| xargs -r sed -i --follow-symlinks 's|<metadata_type>cas</metadata_type>|<metadata_type>cas</metadata_type><readonly>true</readonly>|g'"
         )
-        # Fail LOUDLY rather than silently, if the substitution ever stops matching again: a CA disk that
-        # is declared but not marked read-only means this scrape is about to die on ownership, and a
-        # silent no-op is precisely how that went unnoticed before. Reports; does not abort the dump.
+        # Report loudly if the substitution stops matching: a declared but not read-only CAS disk
+        # means this scrape is about to die on ownership. Reports; does not abort the dump.
         if Shell.check(
             "grep -Rlq '<metadata_type>cas</metadata_type>' /etc/clickhouse-server/",
             verbose=False,
