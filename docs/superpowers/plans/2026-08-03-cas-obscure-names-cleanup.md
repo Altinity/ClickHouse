@@ -20,6 +20,7 @@
 - `started_at_ms` / `expires_at_ms` (system.cas_mounts) — verified: already `DateTime64(3)`, only the `_ms` suffix lies about the type → rename to `started_at` / `expires_at` (no type change needed).
 - `duration_ms` (system.cas_gc_log) — verified: `UInt64` count of milliseconds → keep.
 - Clear violations to fix: `srid` → `server_root_id`; `Ckpt` → `Checkpoint`; `gen` → `generation`; `indeg` → `indegree`; `snap` → `snapshot`; `Txns` → `Transactions`; `phase_duration_us` → `phase_duration_microseconds`.
+- Async metric `ReaderExecutorModeledCostMsPerRequestedMiB` — do not publish at all: remove the derived metric (magic-weight model, interval-dependent ratio-of-deltas); keep the two honest ProfileEvents (`ReaderExecutorModeledCostMicroseconds`, `ReaderExecutorRequestedBytes`) so observers can compute the ratio themselves.
 
 ## Global Constraints
 
@@ -227,14 +228,47 @@ git add -A src/ tests/ utils/ docs/en && git commit -m "cas: settings -- dedupli
 
 ---
 
-### Task 6: Final sweep
+### Task 6: Remove the ReaderExecutor modeled-cost async metric
+
+**Files:**
+- Modify: `src/Interpreters/ServerAsynchronousMetrics.cpp` (~:221-244: the whole "Experimental ReaderExecutor read-path efficiency KPI" block), `src/Interpreters/ServerAsynchronousMetrics.h:73-74` (`prev_reader_executor_cost_us`, `prev_reader_executor_requested_bytes` members)
+- Modify + Rename: `tests/queries/0_stateless/04328_reader_executor_kpi_async_metric.{sql,reference}` → `04328_reader_executor_modeled_cost_profile_event.{sql,reference}`
+
+**Interfaces:**
+- Produces: no `ReaderExecutorModeledCostMsPerRequestedMiB` in `system.asynchronous_metrics`; ProfileEvents `ReaderExecutorModeledCostMicroseconds` / `ReaderExecutorRequestedBytes` stay unchanged (their descriptions already tell the user how to compute cost-per-byte).
+
+- [ ] **Step 1: Delete the metric**
+
+Remove the block in `ServerAsynchronousMetrics.cpp` computing `ms_per_mib` and publishing `new_values["ReaderExecutorModeledCostMsPerRequestedMiB"]`, including the delta bookkeeping (`prev_reader_executor_cost_us` / `prev_reader_executor_requested_bytes` updates) and the two member variables in the header. ProfileEvents descriptions in `src/Common/ProfileEvents.cpp:248,253` mentioning the ratio stay (they reference only the two counters, not the async metric name).
+
+- [ ] **Step 2: Reduce the test to the ProfileEvent assertion**
+
+Rewrite `04328_reader_executor_kpi_async_metric.sql`: keep the table setup, the `use_reader_executor` probe query, and assertion (1) — `ProfileEvents['ReaderExecutorModeledCostMicroseconds'] > 0` from `query_log`; drop both `SYSTEM RELOAD ASYNCHRONOUS METRICS` ticks, the `asynchronous_metric_log` flush/assert (2), and the header prose about the async metric. Reference becomes a single `1` line. Then:
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master/tests/queries/0_stateless
+git mv 04328_reader_executor_kpi_async_metric.sql 04328_reader_executor_modeled_cost_profile_event.sql
+git mv 04328_reader_executor_kpi_async_metric.reference 04328_reader_executor_modeled_cost_profile_event.reference
+```
+
+- [ ] **Step 3: Verify, build, commit**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+git ls-files | xargs grep -n 'ReaderExecutorModeledCostMsPerRequestedMiB' 2>/dev/null | grep -v 'docs/superpowers'   # expect empty
+ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
+git add -A src/ tests/ && git commit -m "cas: drop the ReaderExecutor modeled-cost async metric, keep the raw counters"
+```
+
+---
+
+### Task 7: Final sweep
 
 - [ ] **Step 1: Grep gate over the decided renames**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/|^contrib/' \
-  | xargs grep -nE 'CASGc[A-Z]|CASRefCkpt|FoldedTxns|PutDedup\b|DedupCache|indeg_zero|prev_indeg|phase_duration_us|started_at_ms|expires_at_ms|dedup_cache_bytes|gc_snap_generations' 2>/dev/null \
+  | xargs grep -nE 'CASGc[A-Z]|CASRefCkpt|FoldedTxns|PutDedup\b|DedupCache|indeg_zero|prev_indeg|phase_duration_us|started_at_ms|expires_at_ms|dedup_cache_bytes|gc_snap_generations|ModeledCostMsPerRequestedMiB' 2>/dev/null \
   | grep -v 'CasFoldSealFormat'   # expect empty
 git ls-files 'docs/en/*' 'tests/queries/*' | xargs grep -nw 'srid\|gen\|snap' 2>/dev/null | grep -v 'docs/superpowers'
 ```
