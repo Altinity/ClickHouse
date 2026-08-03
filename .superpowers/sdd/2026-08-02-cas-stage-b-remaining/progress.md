@@ -77,7 +77,15 @@ per commit; full CA gate at lane closures.
   read. Nonblocking T2 debts placed in T8's residual row: F1 (reset assertion holds even if
   reset were no-op), F2 (4000ms cap unpinned from below), F4 (`settleSnapshotPublish`
   uncharacterized).
-- T3 (Task 7 closure): NOT STARTED. LANE-G.
+- T3 (Task 7 closure): **COMPLETE** + the fsck-contract slice. Integrated as 8b7926bd66f /
+  4e19cfe08e7 / 70ca84c079c / 719c4d0ed87. Arc: two-phase heal (fence correct, test premise was
+  stale — lane red since 224aacd8eb9 discovered+reconciled); arm-(b) retirement fence now tested;
+  affirmative operator message (user directive); fsck: dead-life residue = janitor_pending soft
+  class, observe-then-cut, writer/parser grammar unified (consult-backed, review REJECT→fix
+  round→APPROVE; genuine red-first on the ambiguity abort; 05020 golden 17→20 run for real).
+  Janitor suppression verified in code (suppress_deletes gates every deleteExact). Reviews:
+  draft APPROVE / closure APPROVE-WITH-NONBLOCKING / fsck+fix APPROVE. Post-integration
+  verification on MAIN green.
 - T4 (Task 8 closure): **COMPLETE** (b17e4d97485 + 4329577bf37; review APPROVE-WITH-NONBLOCKING
   in t4-review.md — reviewer independently reran the full ASan per-suite gate: 296/296 suites,
   1990/1990, 0 sanitizer reports). Q-1 executed as decided; C-1 out of production surface;
