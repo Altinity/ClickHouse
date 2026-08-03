@@ -686,3 +686,10 @@ CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts.
 full gate is green at a later tip → delta is ubsan/tsan/msan/env/build-shape. ci-rca agent
 dispatched (lane-g, no pushes, fix prepared locally per standing order). Rest of CI: 19 OK,
 6 RUNNING, 65 PENDING (cas lanes still queued), no other failures.
+
+### Watchdog 01:44 {#wd-0144}
+- t8-lead: sharded rewrite run #3 failed 01:14 (QueryRuntimeException code 60), agent quiet 30 min —
+  woken with cap reminder (revert+return-item if the 90-min cap lands without green).
+- ci-rca: freshly dispatched on the PR-2073 sanitizer unit-test pair; no output yet (artifact fetch
+  phase). lane-g clean.
+- CI PR 2073: unchanged since :11 tick (the two unit-test lane fails; rest green/queued).
