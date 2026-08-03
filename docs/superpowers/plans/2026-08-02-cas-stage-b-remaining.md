@@ -113,6 +113,12 @@ command and its output; the baseline figures are expectations, not facts to trus
 - C++ style: Allman braces. Never `sleep` to fix a race. `EXPECT_THROW` on a `LOGICAL_ERROR` site
   aborts sanitizer lanes — use the death-test split; prefer `expectThrowsCode` with the exact
   error code everywhere.
+- **Post-task tidy re-run (user directive 2026-08-03):** after every task that changes C++ lands
+  on `cas-gc-rebuild`, re-run clang-tidy incrementally — `ninja -k 0 -C build_amd_tidy
+  unit_tests_dbms` in the MAIN worktree ONLY (that build dir holds the compile database, ninja
+  state and tidy cache; any other lane would pay a cold run). Expect a fast incremental pass;
+  any NEW CAS-scoped diagnostic is resolved before the task closes (fix or NOLINT+reason — CI
+  gate, no noise category).
 - Held-life authority: a `NamespaceLifeId` originates only from a catalog snapshot resolution.
   Nothing may mint one from a `RootNamespace`, a LIST key, or a path.
 - An absent canonical life is inert debris — never a pool-suppressing damage anomaly.
