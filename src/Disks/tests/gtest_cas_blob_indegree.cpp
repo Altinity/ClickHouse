@@ -895,3 +895,106 @@ TEST(CasBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
     EXPECT_EQ(rmr.unmatched_remove_example->ref, bh(1));
     EXPECT_EQ(rmr.unmatched_remove_example->source_id, s(99));
 }
+
+namespace
+{
+/// N distinct condemned rows for blobs b(1)..b(n), same shape `condemnedRowFor` produces, varying
+/// only the token so distinct rows are trivially distinguishable in a failure message.
+std::vector<std::pair<UInt128, CondemnedRow>> condemnedCohort(uint64_t n, uint64_t condemn_round, bool delete_pending)
+{
+    std::vector<std::pair<UInt128, CondemnedRow>> rows;
+    for (uint64_t i = 1; i <= n; ++i)
+        rows.push_back({b(i), condemnedRowFor(condemn_round, "t" + std::to_string(i), delete_pending)});
+    return rows;
+}
+}
+
+/// T6b Slice 1: the redelete cohort is capped at `GcRoundWorkBudget::max_redeletes` per call. Excess
+/// entries stay in `still_retired`, still `delete_pending`, to be redeleted by a later round — the
+/// durable pipeline never loses one to the cap.
+TEST(CasThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true));
+
+    GcRoundWorkBudget budget;
+    budget.max_redeletes = 3;
+
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+        &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
+        /*source_retirements*/{}, &budget);
+
+    EXPECT_EQ(rmr.redelete.size(), 3u);
+    EXPECT_EQ(budget.redeletes_used, 3u);
+    EXPECT_TRUE(rmr.graduated.empty());
+    EXPECT_TRUE(rmr.spared.empty());
+    ASSERT_EQ(rmr.still_retired.size(), 7u);
+    for (const RetiredEntry & e : rmr.still_retired)
+        EXPECT_TRUE(e.delete_pending) << "carried entries stay delete_pending, unexecuted this round";
+}
+
+/// Mirror test for the graduation cap: entries past `max_graduations` carry unchanged (still
+/// condemned, NOT yet delete_pending) rather than being force-graduated; the floor re-evaluates them
+/// next round.
+TEST(CasThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, /*condemn_round*/1, /*delete_pending*/false));
+
+    GcRoundWorkBudget budget;
+    budget.max_graduations = 3;
+
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+        &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
+        /*source_retirements*/{}, &budget);
+
+    EXPECT_EQ(rmr.graduated.size(), 3u);
+    EXPECT_EQ(budget.graduations_used, 3u);
+    ASSERT_EQ(rmr.still_retired.size(), 10u);
+    size_t pending_count = 0;
+    size_t carried_count = 0;
+    for (const RetiredEntry & e : rmr.still_retired)
+        e.delete_pending ? ++pending_count : ++carried_count;
+    EXPECT_EQ(pending_count, 3u)  << "only the graduated 3 are republished delete_pending";
+    EXPECT_EQ(carried_count, 7u) << "the rest carry unchanged, still eligible next round";
+}
+
+/// The mandatory convergence proof: a cohort well past the per-round cap fully drains over
+/// ceil(N / cap) rounds, feeding each round's output run back as the next round's prior — the exact
+/// shape a real GC round repeats every pass.
+TEST(CasThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    std::vector<RunRef> priors{writeSourceEdgeRun(backend, layout, 1, 0, 0, condemnedCohort(10, 1, /*delete_pending*/true))};
+
+    uint64_t total_redeleted = 0;
+    uint64_t rounds = 0;
+    while (rounds < 10)
+    {
+        GcRoundWorkBudget budget;
+        budget.max_redeletes = 3;
+        std::vector<RunRef> out_runs;
+        RetiredMergeResult rmr;
+        foldDeltasIntoGeneration(backend, layout, priors, 2 + rounds, 0, 0, {}, out_runs,
+            /*current_round*/100, /*condemn_round*/100, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{},
+            &rmr, /*suppress_destructive*/false, /*out_applied_by_txn_ordinal*/nullptr,
+            /*source_retirements*/{}, &budget);
+        total_redeleted += rmr.redelete.size();
+        ++rounds;
+        if (rmr.still_retired.empty())
+            break;
+        ASSERT_FALSE(out_runs.empty());
+        priors = out_runs;
+    }
+    EXPECT_EQ(total_redeleted, 10u) << "no entry lost to the cap across the whole drain";
+    EXPECT_EQ(rounds, 4u) << "ceil(10 / 3) rounds to fully drain";
+}

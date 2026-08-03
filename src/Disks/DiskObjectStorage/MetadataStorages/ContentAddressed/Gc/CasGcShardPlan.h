@@ -112,7 +112,10 @@ public:
                                bool suppress_destructive = false,
                                /// PROBE B2: forwarded verbatim to `foldDeltasIntoGeneration` — see its
                                /// declaration and `Cas::TxnApplyLedger`.
-                               std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr) const;
+                               std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr,
+                               /// Forwarded verbatim to `foldDeltasIntoGeneration`; the caller shares
+                               /// one instance across every shard's reduce within a round.
+                               GcRoundWorkBudget * work_budget = nullptr) const;
 
 private:
     uint64_t shard;

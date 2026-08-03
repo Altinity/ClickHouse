@@ -62,6 +62,8 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
+    extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
     extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
@@ -275,6 +277,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
+    , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
+    , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
     , gcs_max_conditional_put_bytes(settings_[ContentAddressedSetting::gcs_max_conditional_put_bytes].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
@@ -747,6 +751,8 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
+    pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
+    pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.event_sink = makeCasEventSink();
 

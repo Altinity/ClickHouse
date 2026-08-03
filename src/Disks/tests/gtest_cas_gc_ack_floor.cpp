@@ -707,6 +707,67 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
     }
 }
 
+/// T6b Slice 1, end-to-end through the real round driver (`Gc::runRegularRound`) rather than
+/// `foldDeltasIntoGeneration` directly: a cohort well past `gc_round_redelete_budget` still drains
+/// completely, but no single round's `redeleted` count exceeds the cap — the same convergence the
+/// merge-level `CasThreeCursorMerge` budget tests pin, proven through the production entry point.
+TEST(CasGcAckFloor, RedeleteBudgetCapsRoundDrainAndConverges)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    constexpr uint64_t kCap = 5;
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_round_redelete_budget = kCap});
+    const RootNamespace ns{"00/aa@cas@"};
+
+    constexpr uint64_t kCohort = 20;
+    std::vector<UInt128> blobs;
+    std::vector<ManifestRef> refs;
+    for (uint64_t i = 1; i <= kCohort; ++i)
+    {
+        const UInt128 blob(i);
+        const ManifestRef r = ref("srv-a:1", i, static_cast<uint32_t>(i));
+        blobs.push_back(blob);
+        refs.push_back(r);
+        writeBlobBody(*backend, store->layout(), blob);
+        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+        publishCommittedTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), std::nullopt, r);
+    }
+
+    Gc gc(store, kGc);
+    runRegularRoundReclaiming(gc);   // round 1: folds every publish, every blob referenced
+
+    for (uint64_t i = 1; i <= kCohort; ++i)
+        dropRefTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), refs[i - 1]);
+
+    {
+        const RoundReport rep = runRegularRoundReclaiming(gc);   // condemning round
+        EXPECT_EQ(rep.condemned, kCohort);
+        EXPECT_EQ(rep.graduated, 0u);
+        EXPECT_EQ(rep.redeleted, 0u);
+    }
+    {
+        // Graduation has no budget configured in this test (default 0 = unbounded) — the whole
+        // cohort graduates together, isolating the redelete cap as the only thing under test.
+        const RoundReport rep = runRegularRoundReclaiming(gc);
+        EXPECT_EQ(rep.graduated, kCohort);
+        EXPECT_EQ(rep.redeleted, 0u);
+    }
+
+    uint64_t total_redeleted = 0;
+    uint64_t rounds = 0;
+    while (total_redeleted < kCohort && rounds < 10)
+    {
+        const RoundReport rep = runRegularRoundReclaiming(gc);
+        EXPECT_LE(rep.redeleted, kCap) << "a round must never redelete past gc_round_redelete_budget";
+        total_redeleted += rep.redeleted;
+        ++rounds;
+    }
+    EXPECT_EQ(total_redeleted, kCohort) << "no entry lost to the cap across the whole drain";
+    EXPECT_EQ(rounds, kCohort / kCap) << "ceil(20 / 5) rounds to fully drain the cohort";
+    for (const UInt128 & blob : blobs)
+        EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
+}
+
 /// A publish re-referencing the condemned blob before graduation is folded and SPARES the entry: the entry
 /// is dropped (recovery wins even past graduation) and the blob survives.
 TEST(CasGcAckFloor, PublishBeforeGraduationSpares)

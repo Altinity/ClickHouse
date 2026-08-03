@@ -232,6 +232,25 @@ struct RetiredMergeResult
     std::optional<UnmatchedRemoveExample> unmatched_remove_example;
 };
 
+/// Cumulative per-round cap on graduation/redelete cohort sizes, shared by reference across every
+/// shard's `foldDeltasIntoGeneration` call within one round (the caller owns one instance per round
+/// and passes the same pointer to each shard in turn). `0` in either bound is unbounded — the same
+/// opt-out convention every other CAS round budget uses, so a default-constructed instance
+/// reproduces today's behavior. Exhausting a bound does not drop work: the entry stays in
+/// `still_retired` exactly as it would have before the cap existed, and a fresh budget next round
+/// picks up where this one left off. Reusable as-is by a future bounded-parallel-walk: give each
+/// worker an atomic increment (or a partitioned share of the bound) instead of a new accounting shape.
+struct GcRoundWorkBudget
+{
+    uint64_t max_graduations = 0;
+    uint64_t max_redeletes = 0;
+    uint64_t graduations_used = 0;
+    uint64_t redeletes_used = 0;
+
+    bool graduationAvailable() const { return max_graduations == 0 || graduations_used < max_graduations; }
+    bool redeleteAvailable() const { return max_redeletes == 0 || redeletes_used < max_redeletes; }
+};
+
 /// Merge the prior generation's source-edge run with new deltas. The prior run's `kCondemned` rows RIDE
 /// the source-edge run itself at the zero-sentinel key (`source_id = 0`), so there is no separate
 /// `prior_retired` cursor — the prior run IS the retired input. `PriorEdgeCursor` decodes each sentinel
@@ -307,7 +326,10 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               /// not free. Never read by the merge; write-only. The caller must size it
                               /// to cover every `txn_ordinal` present in `scattered`.
                               std::vector<uint8_t> * out_applied_by_txn_ordinal = nullptr,
-                              std::vector<BlobSourceRetirement> source_retirements = {});
+                              std::vector<BlobSourceRetirement> source_retirements = {},
+                              /// Shared by reference across every shard's call within one round;
+                              /// `nullptr` (default) is unbounded, matching every existing caller.
+                              GcRoundWorkBudget * work_budget = nullptr);
 
 /// Stream the sealed in-degree runs named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An

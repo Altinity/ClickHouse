@@ -585,6 +585,8 @@ private:
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
+    const uint64_t gc_round_graduation_budget;
+    const uint64_t gc_round_redelete_budget;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
     const uint64_t gcs_max_conditional_put_bytes;

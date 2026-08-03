@@ -91,6 +91,12 @@ struct PoolConfig
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
     uint64_t manifest_sweep_list_budget_keys = 1000;
     uint64_t manifest_sweep_delete_budget_keys = 100;
+    /// Per-round blob-deletion work envelope: caps how many entries the fold's graduation
+    /// (condemned -> delete_pending) and redelete (exact-token delete of a prior delete_pending row)
+    /// arms move out of the durable retired pipeline in one round. Excess entries are carried
+    /// unchanged in `still_retired` and retried next round (never dropped). 0 = unbounded.
+    uint64_t gc_round_graduation_budget = 5000;
+    uint64_t gc_round_redelete_budget = 5000;
     /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
     /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
     /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec

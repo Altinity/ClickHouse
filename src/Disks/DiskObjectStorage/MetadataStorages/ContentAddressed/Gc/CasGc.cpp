@@ -3045,6 +3045,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 nomination.source_retirements.end());
     }
 
+    /// One budget instance for the whole round, shared by reference across every shard's fold call
+    /// below (shards fold sequentially here, so no synchronization is needed) — graduation and
+    /// redelete cohorts are capped cumulatively over the round, not per shard.
+    GcRoundWorkBudget round_work_budget;
+    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
+    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+
     if (state.gc_shards == 1)
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
@@ -3066,7 +3073,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      current_round, condemn_round, head_blob, peek_head,
                                      confirm_condemned_marker,
                                      result.retired_merge.data(), suppress_destructive,
-                                     &ledger.applied, std::move(orphan_source_retirements));
+                                     &ledger.applied, std::move(orphan_source_retirements),
+                                     &round_work_budget);
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -3107,7 +3115,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 current_round, condemn_round, head_blob, peek_head,
                 confirm_condemned_marker,
                 &result.retired_merge[shard], suppress_destructive,
-                &ledger.applied, std::move(retirement_buckets[shard]));
+                &ledger.applied, std::move(retirement_buckets[shard]),
+                &round_work_budget);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);

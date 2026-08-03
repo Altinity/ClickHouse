@@ -363,7 +363,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive,
                               std::vector<uint8_t> * out_applied_by_txn_ordinal,
-                              std::vector<BlobSourceRetirement> source_retirements)
+                              std::vector<BlobSourceRetirement> source_retirements,
+                              GcRoundWorkBudget * work_budget)
 {
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
@@ -464,10 +465,17 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
         else if (e.delete_pending)
         {
-            if (suppress_destructive)
-                rmr.still_retired.push_back(e); /// clamp-suppressed pass: carry pending UNCHANGED
+            /// Excess past the round's redelete budget is carried unchanged (still `delete_pending`) —
+            /// exactly the suppressed-pass shape below — rather than skipped ahead in `scattered`, so a
+            /// budget-exhausted round retries the same entry next round instead of losing it.
+            if (suppress_destructive || (work_budget && !work_budget->redeleteAvailable()))
+                rmr.still_retired.push_back(e); /// clamp-suppressed or budget-exhausted: carry UNCHANGED
             else
+            {
+                if (work_budget)
+                    ++work_budget->redeletes_used;
                 rmr.redelete.push_back(e);      /// published pending by a PRIOR pass — execute + drop
+            }
         }
         else if (!suppress_destructive && e.condemn_round < current_round)
         {
@@ -479,11 +487,21 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// later pass can confirm). This gates a DELETE on missing evidence; it never throws.
             if (e.marker_confirmed || !confirm_condemned_marker || confirm_condemned_marker(e))
             {
-                RetiredEntry pending = e;       /// newly floor-passed: publish pending; delete NEXT pass
-                pending.delete_pending = true;
-                pending.marker_confirmed = true;
-                rmr.graduated.push_back(pending);
-                rmr.still_retired.push_back(std::move(pending));
+                /// Excess past the round's graduation budget carries the floor-passed entry unchanged
+                /// (still condemned, not yet delete_pending) — it re-evaluates the floor next round and
+                /// graduates then; nothing is lost, only delayed.
+                if (work_budget && !work_budget->graduationAvailable())
+                    rmr.still_retired.push_back(e);
+                else
+                {
+                    if (work_budget)
+                        ++work_budget->graduations_used;
+                    RetiredEntry pending = e;       /// newly floor-passed: publish pending; delete NEXT pass
+                    pending.delete_pending = true;
+                    pending.marker_confirmed = true;
+                    rmr.graduated.push_back(pending);
+                    rmr.still_retired.push_back(std::move(pending));
+                }
             }
             else
                 rmr.still_retired.push_back(e); /// no durable condemn-marker evidence yet — carried
