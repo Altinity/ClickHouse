@@ -22,6 +22,7 @@ namespace ProfileEvents
 extern const Event CasGcMetaOps;
 extern const Event CasGcEnumerationPages;
 extern const Event CasMountExclusivityViolation;
+extern const Event CasGcRetiredSpared;
 }
 
 using namespace DB::Cas;
@@ -816,6 +817,96 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load() - pages_before, 1);
 }
 
+/// `gc_round_manifest_cleanup_budget` caps the post-CAS `manifest_deletes` phase. Owner-removed manifest
+/// bodies are NOT durable across rounds (the ref-log intake cursor that discovered each removal is
+/// committed by the SAME round's CAS, before this phase runs), so an entry the budget declines this round
+/// is never retried by this pipeline — the orphan-manifest sweep is the only remaining reclaimer. Five
+/// tables' manifests are all owner-removed in one fold; with a budget of 2, exactly 2 bodies are deleted
+/// THIS round while the other 3 survive it, and only the (unrelated, already-running) orphan sweep
+/// eventually reclaims them over further rounds.
+TEST(CasGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// The GC's own mount root is distinct from the synthetic dead-builder root below (matching
+    /// `OrphanManifestCursorSweepDeletesAndPersistsCursor`'s reasoning): the orphan sweep's deletion
+    /// premise gates on a build being provably dead by watermark, independent of the round's own lease.
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "gc-runner",
+        .gc_round_manifest_cleanup_budget = 2,
+        .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    constexpr int kManifests = 5;
+
+    std::vector<ManifestId> ids;
+    for (int i = 0; i < kManifests; ++i)
+    {
+        const ManifestRef r = ref(1, 0xD0 + i);
+        writeBlobBody(*backend, store->layout(), DB::UInt128(100 + i));
+        writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(100 + i))});
+        publishCommittedTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), std::nullopt, r);
+        ids.push_back(ManifestId{ns, r});
+    }
+    /// All five share build_sequence 1 (differ only by manifest_ordinal); prove the watermark, not the
+    /// round's own lease, provably dead for that build so the orphan sweep may ever delete them.
+    /// `floorForNamespace` resolves the mount root from the namespace's OWN first path segment ("00"),
+    /// not an arbitrary id.
+    setWatermarkMinActive(*backend, store->layout(), "00", /*writer_epoch=*/1, /*min_active=*/2);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(*backend, store, gc);   /// fold all five +1s; no manifest owner-removed yet
+    for (const ManifestId & id : ids)
+        ASSERT_TRUE(manifestExists(*backend, store->layout(), id));
+
+    /// Remove all five owners in one window; the next fold's intake sees all five `-1` edges together.
+    uint64_t last_seq = 0;
+    for (int i = 0; i < kManifests; ++i)
+        last_seq = dropRefTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), ref(1, 0xD0 + i));
+
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(rep.acquired_lease);
+    EXPECT_EQ(rep.manifests_deleted, 2u)
+        << "manifest_deletes must stop at gc_round_manifest_cleanup_budget, not delete all owner-removed bodies";
+
+    int surviving = 0;
+    for (const ManifestId & id : ids)
+        surviving += manifestExists(*backend, store->layout(), id) ? 1 : 0;
+    EXPECT_EQ(surviving, kManifests - 2)
+        << "the budget-declined bodies must survive this round unchanged (leaked to the orphan sweep, not lost)";
+
+    /// The orphan sweep's OWN deletion premise (§6) requires the namespace's fold cursor to have crossed
+    /// STRICTLY above the manifests' epoch before it may delete them (`OrphanManifestCursorSweepDeletesAnd
+    /// PersistsCursor` exercises this same premise in isolation) -- so convergence needs a real epoch
+    /// crossing, not just more idle rounds.
+    writeSealAt(*backend, store->layout(), ns, RefTxnId{1, last_seq + 1});
+    publishAt(*backend, store->layout(), ns, RefTxnId{2, 1}, "cross", /*build_sequence=*/999,
+              DB::UInt128(0xC205), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, last_seq + 1});
+    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    ASSERT_TRUE(life.has_value());
+    const String ckpt_key = store->layout().refCkptKey(*life);
+    const auto old_ckpt = backend->get(ckpt_key);
+    ASSERT_TRUE(old_ckpt.has_value());
+    ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{2, 1},
+        .checkpoint_snapshot_id = std::nullopt,
+        .last_epoch_seal = RefTxnId{1, last_seq + 1},
+    }), old_ckpt->token).outcome, PutOutcome::Done);
+
+    /// Convergence: the orphan-manifest sweep (unrelated to this budget, already running every round with
+    /// its own defaults) must eventually reclaim every surviving body — the remainder is not permanently
+    /// stranded.
+    bool all_gone = false;
+    for (int i = 0; i < 64 && !all_gone; ++i)
+    {
+        store->renewWatermarkOnce();
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+        all_gone = true;
+        for (const ManifestId & id : ids)
+            all_gone = all_gone && !manifestExists(*backend, store->layout(), id);
+    }
+    EXPECT_TRUE(all_gone) << "the manifest-cleanup-budget remainder must eventually be reclaimed by the orphan sweep";
+}
+
 /// §0 introspection follow-up: `CasGcEnumerationPages` must not depend on the orphan-manifest sweep alone
 /// (`manifest_sweep_list_budget_keys` zeroed below disables that pass entirely). The mandatory per-round
 /// `cas/ns/stream/` scan -- `listRefPrefix`'s pre-fold DEFER signal and the fold share its result --
@@ -912,6 +1003,70 @@ TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
     driveToFixpoint(*backend, store, gc);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+}
+
+/// `gc_round_outcome_entry_budget` bounds only the `GcOutcomes` AUDIT row per spared decision, never the
+/// decision itself. Five blobs are condemned (owner dropped, indegree 0, durable retired rows), then --
+/// BEFORE graduation -- a fresh manifest re-references all five (the `CasThreeCursorMerge.RecoverySpares`
+/// shape, scaled up and driven through the real round path): recovery wins unconditionally for every one
+/// of them. `CasGcRetiredSpared` and blob survival prove all five decisions happened regardless of the
+/// budget, but with a budget of 2, only 2 of the 5 get a row in the round's `GcOutcomes` log, so
+/// `RoundReport::spared` (tallied from that log) reports 2, not 5.
+TEST(CasGcRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_round_outcome_entry_budget = 2,
+        .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xC1);
+    const ManifestRef r2 = ref(2, 0xC2);
+    constexpr int kBlobs = 5;
+
+    std::vector<ManifestEntry> entries;
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        writeBlobBody(*backend, store->layout(), DB::UInt128(i + 1));
+        entries.push_back(blobEntryFor("p" + std::to_string(i), DB::UInt128(i + 1)));
+    }
+    writeManifestRaw(*backend, store->layout(), ns, r1, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    driveToFixpoint(*backend, store, gc);
+    for (int i = 0; i < kBlobs; ++i)
+        ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(i + 1)), 1);
+
+    /// Drop the only ref: one round later all five blobs are condemned (indegree 0, durable retired rows).
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    for (int i = 0; i < kBlobs; ++i)
+        ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(i + 1)), 0);
+    store->renewWatermarkOnce();
+
+    /// BEFORE graduation, a fresh manifest re-references all five: the NEXT fold recomputes indegree 1 for
+    /// every one of them -- recovery wins over graduation for every entry, unconditionally.
+    writeManifestRaw(*backend, store->layout(), ns, r2, entries);
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+
+    const auto spared_events_before = ProfileEvents::global_counters[ProfileEvents::CasGcRetiredSpared].load();
+    const RoundReport rep = runRegularRoundReclaiming(gc);
+    ASSERT_TRUE(rep.acquired_lease);
+    const uint64_t total_spared_reported = rep.spared;
+
+    /// THE LOAD-BEARING ASSERTION: the audit log under-reports (capped at the budget) while every
+    /// decision it under-reports still happened correctly.
+    EXPECT_EQ(total_spared_reported, 2u)
+        << "GcOutcomes rows must be capped at gc_round_outcome_entry_budget, not one per spared entry";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRetiredSpared].load() - spared_events_before, kBlobs)
+        << "every spared decision must still happen even when its audit row is capped";
+    for (int i = 0; i < kBlobs; ++i)
+    {
+        EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(i + 1)))
+            << "blob " << i << " must survive -- the cap must never re-condemn a spared entry";
+        EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(i + 1)), 1);
+    }
 }
 
 /// Spare-during-the-pass, multi-blob discrimination: a drop condemns two blobs; in the SAME window
@@ -1453,6 +1608,109 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     /// The now-referenced blob 2 is intact; folding through the fresh run resolves it.
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(2)));
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
+}
+
+/// The post-CAS hand-off draws from its OWN reserve, so a prune that spends its ENTIRE (separate, tiny)
+/// budget in a round can never leave the hand-off with zero. Combines the two existing shapes: a
+/// debris-heavy generation only the ordinary PRUNE ever touches (like
+/// `PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration`, mid-drain over several rounds on
+/// a starvation-small prune budget), running CONCURRENTLY with an idle-carried ref that finally moves off
+/// its generation (like `HandOffDeletesSupersededRef`) in one of those very same mid-drain rounds.
+TEST(CasGcRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// `gc_shards = 2` with the "keep" and "debris" blobs routed to DIFFERENT shards is load-bearing: with
+    /// the default single shard, ANY delta anywhere rewrites the pool's one shared run object every round,
+    /// which would drag the "keep" ref's physical run forward the moment the debris table is touched --
+    /// destroying the idle-carry this test depends on. Two independent shards keep debris activity from
+    /// disturbing the kept ref's generation at all until its ref is explicitly moved.
+    /// `keep=5` (not the more aggressive `keep=1` other hand-off tests use) is ALSO load-bearing: the
+    /// debris generation must still be numerically AHEAD of the cursor at the moment its own drop folds,
+    /// or that fold's post-CAS hand-off phase -- not the ordinary prune -- would claim it (the same
+    /// one-round "parent-seal protects, then hand-off claims" shape `HandOffDeletesSupersededRef` relies
+    /// on, which this test must deliberately avoid for the debris generation).
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_snap_generations_to_keep = 5,
+        .gc_shards = 2,
+        .gc_round_prefix_wholesale_budget = 2,             /// prune: starvation-small, shared by nothing else
+        .gc_round_handoff_prefix_wholesale_budget = 5,      /// hand-off: its own separate reserve
+        .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    Gc gc(store, kGc);
+    /// `blobShard` uses only the digest's high 64 bits, so a small integer's `UInt128` (high bits zero)
+    /// always routes to shard 0 regardless of `gc_shards` -- these two differ in the high half so they
+    /// land in different shards of a 2-shard pool.
+    const DB::UInt128 blob_keep_1 = hexToU128("00000000000000010000000000000000");
+    const DB::UInt128 blob_keep_2 = hexToU128("00000000000000010000000000000001");
+    const DB::UInt128 blob_debris = hexToU128("00000000000000020000000000000000");
+
+    /// The HAND-OFF generation: ns "keep" idle-carries this ref for several rounds until the cursor has
+    /// advanced strictly past it (referenced generations are skipped for free -- no budget spent).
+    const ManifestRef r_keep_1 = ref(1, 0xE1);
+    writeBlobBody(*backend, store->layout(), blob_keep_1);
+    writeManifestRaw(*backend, store->layout(), ns, r_keep_1, {blobEntryFor("a", blob_keep_1)});
+    publishCommittedTransition(*backend, store->layout(), ns, "keep", std::nullopt, r_keep_1);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    const uint64_t handoff_gen = readState(*backend, *store).snap_generation;
+    const String handoff_prefix = store->layout().gcGenPrefix(handoff_gen);
+    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty());
+
+    for (int i = 0; i < 20; ++i)
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    ASSERT_GT(readState(*backend, *store).snap_pruned_through, handoff_gen)
+        << "the hand-off generation must be behind the cursor before this test is meaningful";
+    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty())
+        << "still referenced -- must survive despite the cursor having passed it";
+
+    /// The PRUNE-DEBRIS generation: a second table, on the OTHER shard, unreferenced from the start,
+    /// carrying far more debris than the tiny prune budget can drain in one round. Minted well AHEAD of
+    /// the current cursor (see the `keep=5` note above), so its own drop-fold is NOT immediately
+    /// hand-off-eligible.
+    const ManifestRef r_debris = ref(1, 0xE2);
+    writeBlobBody(*backend, store->layout(), blob_debris);
+    writeManifestRaw(*backend, store->layout(), ns, r_debris, {blobEntryFor("b", blob_debris)});
+    publishCommittedTransition(*backend, store->layout(), ns, "debris", std::nullopt, r_debris);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    const uint64_t debris_gen = readState(*backend, *store).snap_generation;
+    ASSERT_GT(debris_gen, readState(*backend, *store).snap_pruned_through)
+        << "the debris generation must still be ahead of the cursor when its drop folds, or the hand-off "
+           "(not the prune) would claim it";
+    for (int i = 0; i < 10; ++i)
+        backend->putIfAbsent(store->layout().gcGenPrefix(debris_gen) + "debris" + std::to_string(i), "x");
+    dropRefTransition(*backend, store->layout(), ns, "debris", r_debris);
+
+    /// Drive rounds until the debris generation is MID-DRAIN (prune has started but not yet finished it --
+    /// the round-budget of 2 against 10+ objects guarantees several such rounds exist).
+    bool mid_drain = false;
+    for (int i = 0; i < 20 && !mid_drain; ++i)
+    {
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+        const size_t residue = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+        mid_drain = residue > 0 && residue < 10;
+    }
+    ASSERT_TRUE(mid_drain) << "the debris generation never reached a partially-drained state to test against";
+    ASSERT_FALSE(backend->list(handoff_prefix, "", 1000).keys.empty())
+        << "the hand-off generation must still be intact (untouched) going into the contended round";
+
+    /// NOW, in a round where the prune is busy mid-drain on the debris generation (spending its entire
+    /// small budget there), move the kept ref off the hand-off generation -- a fresh manifest replaces it.
+    const ManifestRef r_keep_2 = ref(2, 0xE3);
+    writeBlobBody(*backend, store->layout(), blob_keep_2);
+    writeManifestRaw(*backend, store->layout(), ns, r_keep_2, {blobEntryFor("a", blob_keep_2)});
+    publishCommittedTransition(*backend, store->layout(), ns, "keep", r_keep_1, r_keep_2);
+    const size_t debris_residue_before = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+
+    /// THE LOAD-BEARING ASSERTIONS: the prune spent its whole (separate) budget on the debris generation
+    /// this very round (proving the two really contended for I/O in the same round) ...
+    const size_t debris_residue_after = backend->list(store->layout().gcGenPrefix(debris_gen), "", 1000).keys.size();
+    EXPECT_EQ(debris_residue_before - debris_residue_after, 2u)
+        << "the prune must have spent its entire per-round budget on the debris generation this round";
+    /// ... and the hand-off, drawing from its OWN reserve, still fully reclaimed the generation the ref
+    /// just moved off -- zero, not starved to zero by the prune's consumption.
+    EXPECT_TRUE(backend->list(handoff_prefix, "", 1000).keys.empty())
+        << "the hand-off must not be starved by a prune-heavy round that exhausted a SEPARATE budget";
 }
 
 /// triage #5, driven through the REAL call site (`Gc::runRegularRound`, not a test seam): a losing

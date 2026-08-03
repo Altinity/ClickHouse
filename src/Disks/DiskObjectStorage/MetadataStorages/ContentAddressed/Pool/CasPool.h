@@ -107,11 +107,25 @@ struct PoolConfig
     uint64_t gc_round_sweep_namespace_budget = 20;
     uint64_t gc_round_sweep_recovery_op_budget = 5000;
     /// Ref-object cleanup (covered log/snapshot exact deletes) and generation-prefix wholesale delete
-    /// (superseded-generation prune + the post-CAS hand-off reclaim) caps, cumulative for the round.
-    /// `prefix_wholesale_budget` is the round's shared remainder every `deletePrefixWholesale` call
-    /// draws from, so no single call passes an unbounded `bounded_remaining`.
+    /// (superseded-generation prune) caps, cumulative for the round. `prefix_wholesale_budget` is the
+    /// round's shared remainder every prune `deletePrefixWholesale` call draws from, so no single call
+    /// passes an unbounded `bounded_remaining`.
     uint64_t gc_round_ref_cleanup_budget = 5000;
     uint64_t gc_round_prefix_wholesale_budget = 20000;
+    /// The post-CAS hand-off reclaim draws from its OWN reserve, never from `prefix_wholesale_budget`
+    /// above: the prune safely under-serves and retries next round via its cursor, but the hand-off is a
+    /// one-shot event with no reclaimer besides `fsck`, so a prune-heavy round must never be able to
+    /// starve it to zero.
+    uint64_t gc_round_handoff_prefix_wholesale_budget = 5000;
+    /// Owner-removed manifest body deletes (post-CAS `manifest_deletes` phase), cumulative for the round.
+    /// Not durable across rounds -- an entry the budget declines is never retried by this pipeline (the
+    /// ref-log intake cursor that produced it already advanced) -- so the excess relies on the
+    /// orphan-manifest sweep to reclaim it later. 0 = unbounded.
+    uint64_t gc_round_manifest_cleanup_budget = 5000;
+    /// `GcOutcomes` per-round entry cap across the redelete/spared audit log, cumulative for the round.
+    /// Bounds only the audit-log write -- the settlement decision it records already happened
+    /// unconditionally in the fold. 0 = unbounded.
+    uint64_t gc_round_outcome_entry_budget = 5000;
     /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
     /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
     /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec

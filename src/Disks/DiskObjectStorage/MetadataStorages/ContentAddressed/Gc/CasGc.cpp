@@ -524,12 +524,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
-    /// ONE budget instance for the WHOLE round, threaded into every destructive-work family below:
-    /// `fold` (blob graduation/redelete, the orphan-manifest planner), `pruneSupersededGenerations` and
-    /// the post-CAS hand-off reclaim (`deletePrefixWholesale`'s shared remainder), and
-    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families
-    /// or shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family
-    /// applies on exhaustion.
+    /// ONE budget instance for the WHOLE round, threaded into every destructive-or-observability-write
+    /// family below: `fold` (blob graduation/redelete, the `GcOutcomes` audit rows, the orphan-manifest
+    /// planner), `pruneSupersededGenerations`, the post-CAS hand-off reclaim (its OWN reserve, never
+    /// `pruneSupersededGenerations`' shared remainder), the post-CAS manifest-body cleanup, and
+    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families or
+    /// shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family applies on
+    /// exhaustion.
     GcRoundWorkBudget round_work_budget;
     round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
     round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
@@ -537,6 +538,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
     round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
     round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
+    round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
+    round_work_budget.max_manifest_cleanup_objects = store->poolConfig().gc_round_manifest_cleanup_budget;
+    round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
 
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
     /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
@@ -837,7 +841,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
                             {"key", layout.blobKey(entry.ref)}};
             });
-            outcomes[shard].entries.push_back(std::move(outcome));
+            /// The audit row is observability only -- the delete above already executed regardless of
+            /// this cap. Skipping it here bounds the per-shard `GcOutcomes` body without skipping or
+            /// deferring any destructive work.
+            if (round_work_budget.outcomeEntryAvailable())
+            {
+                outcomes[shard].entries.push_back(std::move(outcome));
+                ++round_work_budget.outcome_entries_used;
+            }
             ++report.redeleted;
             ProfileEvents::increment(ProfileEvents::CasGcRetiredRedeleted);
             /// Drop the per-hash meta only on Deleted/NotFound — a Replaced (TokenMismatch) outcome
@@ -875,8 +886,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.outcome = "spared";
                 e.reason = "in-degree recovered in the pass merge; entry dropped";
             });
-            outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .ref = entry.ref,
-                                                           .token = entry.token, .outcome = OutcomeKind::Spared});
+            /// The audit row is observability only -- `settleEntry` already unconditionally spared this
+            /// entry (INV_NO_LOSS: recovery wins past any budget), so this cap can never re-condemn it;
+            /// it only bounds whether the decision gets a `GcOutcomes` row.
+            if (round_work_budget.outcomeEntryAvailable())
+            {
+                outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .ref = entry.ref,
+                                                               .token = entry.token, .outcome = OutcomeKind::Spared});
+                ++round_work_budget.outcome_entries_used;
+            }
             ProfileEvents::increment(ProfileEvents::CasGcRetiredSpared);
             /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
@@ -1118,20 +1136,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
             if (!handed_off.insert(old_ref.generation).second)
                 continue;   /// already reclaimed this round via another shard's ref
-            /// `bounded_remaining` is the round's SHARED remainder, never `UINT64_MAX` --
-            /// this is the same primitive `pruneSupersededGenerations` draws from, so a round that
-            /// already spent the budget pruning superseded generations reclaims correspondingly less
-            /// here, rather than the two call sites independently unbounded. This hand-off is already a
-            /// ONE-SHOT event (see the PHASE 14/18 comment above): a generation this call reclaims only
-            /// PARTIALLY is left exactly like a crash in this window already is -- to `fsck`, never
-            /// revisited by a later round's hand-off (the parent-seal difference that triggers it does
-            /// not recur once the ref has moved).
-            const uint64_t remaining = round_work_budget.prefixWholesaleRemaining();
+            /// `bounded_remaining` draws from the hand-off's OWN reserve, never `UINT64_MAX` and never
+            /// `pruneSupersededGenerations`' shared remainder: this hand-off is a ONE-SHOT event (see the
+            /// PHASE 14/18 comment above) -- a generation this call reclaims only PARTIALLY is left
+            /// exactly like a crash in this window already is -- to `fsck`, never revisited by a later
+            /// round's hand-off (the parent-seal difference that triggers it does not recur once the ref
+            /// has moved). The prune, by contrast, safely retries an under-served generation next round
+            /// via its cursor, so sharing one pool would let a prune-heavy round strand this one-shot
+            /// reclaim at zero every time; the separate reserve makes that impossible.
+            const uint64_t remaining = round_work_budget.handoffPrefixWholesaleRemaining();
             if (remaining == 0)
                 break;
             const uint64_t reclaimed = deletePrefixWholesale(
                 backend, layout.gcGenPrefix(old_ref.generation), remaining);
-            round_work_budget.prefix_wholesale_objects_used += reclaimed;
+            round_work_budget.handoff_prefix_wholesale_objects_used += reclaimed;
             objects_reclaimed += reclaimed;
             LOG_TRACE(logger,
                 "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
@@ -1144,8 +1162,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
 
     /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
-    /// ADOPTED by the round CAS (delete-after-sealed-decrements). Best-effort: a crash
-    /// here leaks bodies to the orphan sweep, never a dangle.
+    /// ADOPTED by the round CAS (delete-after-sealed-decrements). NOT durable across rounds: the
+    /// ref-log intake cursor that discovered each `-1` edge is committed by THIS round's CAS above,
+    /// so a log already folded is never re-visited and never re-populates `mf_cleanup`. An entry this
+    /// phase does not reach -- whether from a crash or from the budget below -- is therefore left
+    /// exactly like a crash already is: unreachable from any live ref, reclaimed later only by the
+    /// orphan-manifest sweep, never a dangle.
     ///
     /// PHASE 15/18 `manifest_deletes`.
     {
@@ -1154,13 +1176,19 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         /// GATED. A manifest body is content the ref graph still describes until its decrements are both
         /// sealed AND taken on a round that could prove its frontier -- an unprovable round's `-1` may
         /// itself be the observation that is missing an owner elsewhere, so deleting the body on it is
-        /// exactly the irreversible step the gate exists to withhold. The bodies are re-derived from the
-        /// next round's own fold, and the orphan sweep is the backstop for the crash case.
+        /// exactly the irreversible step the gate exists to withhold.
         static const std::map<ManifestId, Token> kNoManifestCleanup;
         const std::map<ManifestId, Token> & mf_cleanup_now =
             suppress_destructive ? kNoManifestCleanup : folded.mf_cleanup;
+        uint64_t attempted = 0;
         for (const auto & [id, token] : mf_cleanup_now)
         {
+            /// Budget-exhausted entries are left un-deleted THIS round; see the phase comment above for
+            /// why the orphan-manifest sweep, not a later round of this pipeline, is what reclaims them.
+            if (!round_work_budget.manifestCleanupAvailable())
+                break;
+            ++round_work_budget.manifest_cleanup_objects_used;
+            ++attempted;
             const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
             const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
             if (mdel_class == DeleteClass::Deleted)
@@ -1178,7 +1206,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
             });
         }
-        t.metric("attempted", mf_cleanup_now.size());
+        t.metric("attempted", attempted);
+        t.metric("skipped_budget", mf_cleanup_now.size() - attempted);
         t.metric("deleted", report.manifests_deleted - manifests_deleted_before);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
@@ -3578,8 +3607,9 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
                     g);
                 continue;
             }
-            /// `bounded_remaining` is the round's SHARED remainder across every
-            /// `deletePrefixWholesale` call this round (never `UINT64_MAX`). A generation whose prefix
+            /// `bounded_remaining` is the round's remainder shared across every PRUNE
+            /// `deletePrefixWholesale` call this round (never `UINT64_MAX`; the post-CAS hand-off draws
+            /// from its own separate reserve, never this one). A generation whose prefix
             /// this call cannot FULLY drain within the remaining budget must not let the cursor advance
             /// past it -- `snap_pruned_through` is a monotone high-water mark this loop never revisits,
             /// so stranding a partially-drained generation behind it would leak the remainder forever.

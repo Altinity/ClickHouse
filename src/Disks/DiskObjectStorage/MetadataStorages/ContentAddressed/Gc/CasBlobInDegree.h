@@ -233,17 +233,20 @@ struct RetiredMergeResult
     std::optional<UnmatchedRemoveExample> unmatched_remove_example;
 };
 
-/// Cumulative per-round cap over EVERY destructive-work family a round touches — blob graduation and
-/// redelete (this file), the orphan-manifest planner's namespace fan-out and recovery walk
-/// (`CasOrphanManifestSweep.cpp`), and ref-object/generation-prefix cleanup (`CasGc.cpp`). One instance
+/// Cumulative per-round cap over EVERY destructive-or-observability-write work family a round touches —
+/// blob graduation and redelete (this file), the orphan-manifest planner's namespace fan-out and recovery
+/// walk (`CasOrphanManifestSweep.cpp`), ref-object/generation-prefix cleanup, the post-CAS hand-off
+/// reclaim, the post-CAS manifest-body cleanup, and the `GcOutcomes` audit log (`CasGc.cpp`). One instance
 /// is owned by `Gc::runRegularRound` per round and passed by reference/pointer into each family's call
 /// in turn, so a cap is cumulative across the WHOLE round, not reset per shard or per namespace. `0` in
 /// any bound is unbounded — the same opt-out convention every other CAS round budget uses, so a
-/// default-constructed instance reproduces pre-budget behavior everywhere. Exhausting a bound never
-/// drops work: each family's caller carries the excess in its own already-durable pipeline (still
+/// default-constructed instance reproduces pre-budget behavior everywhere. Exhausting a bound never drops
+/// WORK: each destructive family's caller carries the excess in its own already-durable pipeline (still
 /// `delete_pending`/condemned rows, a retained sweep candidate, a ref object left for next round) and
-/// retries next round with a fresh budget. Reusable as-is by a future bounded-parallel-walk: give each
-/// worker an atomic increment (or a partitioned share of a bound) instead of inventing a new
+/// retries next round with a fresh budget, or -- where nothing durable is left to carry (manifest cleanup,
+/// the outcome log) -- exhaustion drops only the redundant record of a decision the round already made
+/// safely elsewhere (see each field's own comment). Reusable as-is by a future bounded-parallel-walk: give
+/// each worker an atomic increment (or a partitioned share of a bound) instead of inventing a new
 /// accounting shape.
 struct GcRoundWorkBudget
 {
@@ -269,12 +272,12 @@ struct GcRoundWorkBudget
     bool sweepNamespaceAvailable() const { return max_sweep_namespaces == 0 || sweep_namespaces_used < max_sweep_namespaces; }
     bool sweepRecoveryOpAvailable() const { return max_sweep_recovery_ops == 0 || sweep_recovery_ops_used < max_sweep_recovery_ops; }
 
-    /// Cleanup families (`Gc::cleanupRefObjects`, `deletePrefixWholesale`'s callers in
-    /// `Gc::pruneSupersededGenerations` and the post-CAS hand-off reclaim). `deletePrefixWholesale`
-    /// already takes a `bounded_remaining` count; `prefixWholesaleRemaining` turns the shared round
-    /// budget into that same count (its ONE unbounded sentinel, `0 == max_prefix_wholesale_objects`,
-    /// maps to the function's own "no cap" value, `UINT64_MAX`) so every caller can pass "the round's
-    /// remainder" instead of `UINT64_MAX` outright.
+    /// Cleanup families (`Gc::cleanupRefObjects`, `deletePrefixWholesale`'s caller in
+    /// `Gc::pruneSupersededGenerations`). `deletePrefixWholesale` already takes a `bounded_remaining`
+    /// count; `prefixWholesaleRemaining` turns the shared round budget into that same count (its ONE
+    /// unbounded sentinel, `0 == max_prefix_wholesale_objects`, maps to the function's own "no cap"
+    /// value, `UINT64_MAX`) so every caller can pass "the round's remainder" instead of `UINT64_MAX`
+    /// outright.
     uint64_t max_ref_cleanup_objects = 0;
     uint64_t ref_cleanup_objects_used = 0;
     uint64_t max_prefix_wholesale_objects = 0;
@@ -288,6 +291,48 @@ struct GcRoundWorkBudget
         return prefix_wholesale_objects_used < max_prefix_wholesale_objects
             ? max_prefix_wholesale_objects - prefix_wholesale_objects_used : 0;
     }
+
+    /// The post-CAS hand-off reclaim (`Gc::runRegularRound`) draws from its OWN reserve, never from
+    /// `max_prefix_wholesale_objects` above. The prune is safe to under-serve in any one round -- its
+    /// cursor never regresses, so a partially-drained generation is simply finished next round -- but the
+    /// hand-off is a ONE-SHOT event with no reclaimer behind it besides `fsck`: a generation it cannot
+    /// fully reclaim this round is never revisited (the parent-seal difference that triggers it does not
+    /// recur once the ref has moved). Sharing one pool would let a prune-heavy round starve the hand-off
+    /// to zero every time; a separate reserve makes that impossible regardless of how much the prune
+    /// consumes.
+    uint64_t max_handoff_prefix_wholesale_objects = 0;
+    uint64_t handoff_prefix_wholesale_objects_used = 0;
+
+    uint64_t handoffPrefixWholesaleRemaining() const
+    {
+        if (max_handoff_prefix_wholesale_objects == 0)
+            return std::numeric_limits<uint64_t>::max();
+        return handoff_prefix_wholesale_objects_used < max_handoff_prefix_wholesale_objects
+            ? max_handoff_prefix_wholesale_objects - handoff_prefix_wholesale_objects_used : 0;
+    }
+
+    /// Post-CAS `manifest_deletes` phase (`Gc::runRegularRound`): owner-removed manifest bodies are
+    /// discovered fresh from each round's ref-log intake (`Gc::foldManifestEdges`) and are NOT durable
+    /// across rounds -- the intake cursor advances past the log that produced an entry whether or not its
+    /// body gets deleted this round, so an entry this budget declines to spend on is never retried by this
+    /// same pipeline. The orphan-manifest sweep is the backstop: once the round's cursor has moved past the
+    /// owning log, the body is unreachable from any live ref and the sweep will nominate and reclaim it on
+    /// its own schedule.
+    uint64_t max_manifest_cleanup_objects = 0;
+    uint64_t manifest_cleanup_objects_used = 0;
+
+    bool manifestCleanupAvailable() const { return max_manifest_cleanup_objects == 0 || manifest_cleanup_objects_used < max_manifest_cleanup_objects; }
+
+    /// `GcOutcomes` per-shard body (`Gc::runRegularRound`'s `redelete`/`spared` loops): a pure
+    /// observability record of a settlement decision that has ALREADY happened -- the merge unconditionally
+    /// decides `spared` for any entry whose in-degree recovered (INV_NO_LOSS: a fresh dedup-adopt must
+    /// never be treated as still condemned, past any budget), so this cap governs only whether the decision
+    /// gets an audit-log row, never the decision itself. Nothing is retained or retried on exhaustion --
+    /// there is nothing left to retry, the entry already left the retired pipeline correctly.
+    uint64_t max_outcome_entries = 0;
+    uint64_t outcome_entries_used = 0;
+
+    bool outcomeEntryAvailable() const { return max_outcome_entries == 0 || outcome_entries_used < max_outcome_entries; }
 };
 
 /// Merge the prior generation's source-edge run with new deltas. The prior run's `kCondemned` rows RIDE

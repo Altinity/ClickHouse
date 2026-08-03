@@ -68,6 +68,9 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_manifest_cleanup_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
     extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
@@ -287,6 +290,9 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_round_sweep_recovery_op_budget(settings_[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value)
     , gc_round_ref_cleanup_budget(settings_[ContentAddressedSetting::gc_round_ref_cleanup_budget].value)
     , gc_round_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value)
+    , gc_round_handoff_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value)
+    , gc_round_manifest_cleanup_budget(settings_[ContentAddressedSetting::gc_round_manifest_cleanup_budget].value)
+    , gc_round_outcome_entry_budget(settings_[ContentAddressedSetting::gc_round_outcome_entry_budget].value)
     , gcs_max_conditional_put_bytes(settings_[ContentAddressedSetting::gcs_max_conditional_put_bytes].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
@@ -765,6 +771,9 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.gc_round_sweep_recovery_op_budget = gc_round_sweep_recovery_op_budget;
     pool_config.gc_round_ref_cleanup_budget = gc_round_ref_cleanup_budget;
     pool_config.gc_round_prefix_wholesale_budget = gc_round_prefix_wholesale_budget;
+    pool_config.gc_round_handoff_prefix_wholesale_budget = gc_round_handoff_prefix_wholesale_budget;
+    pool_config.gc_round_manifest_cleanup_budget = gc_round_manifest_cleanup_budget;
+    pool_config.gc_round_outcome_entry_budget = gc_round_outcome_entry_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.event_sink = makeCasEventSink();
 
