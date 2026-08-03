@@ -42,6 +42,11 @@ into one canonical form, in the least invasive way:
    metadata). Decision (2026-08-03): NO compat alias anywhere — `"cas"` is the
    only accepted spelling. Pre-rename data (old ATTACH files, backups, soak
    configs) is expected to need a manual edit or recreation.
+   Also removed outright: the dead legacy disk-config keys
+   `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec`
+   (never read; skip-listed in `ContentAddressedSettings.cpp` only because old
+   integration configs still set them) — dropped from the skip-list and from
+   every config that sets them.
 5. **Tests.** Stateless `*content_addressed*` → `*cas*` (with `.reference`
    files); integration `test_content_addressed_*` → `test_cas_*`; tag
    `no-content-addressed-storage` → `no-cas-storage` (test headers, runner tag

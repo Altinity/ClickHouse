@@ -224,6 +224,7 @@ Files expected to change: `ContentAddressedMetadataStorage.{h,cpp}`, `Pool/CasPo
 - `src/Disks/DiskType.cpp:22` (`metadataTypeFromString`): `"content_addressed"` → `"cas"` (single accepted spelling, per spec — NO compat alias; old ATTACH `.sql` files, backups, and soak configs carrying `metadata_type = content_addressed` will fail to parse and need a manual edit or recreation).
 - `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:219`: `registerMetadataStorageType("cas", …)` — the old registration string is replaced, not kept.
 - Sweep the remaining `"content_addressed"` metadata_type value occurrences in `utils/ca-soak/configs/*.xml` (~30 files, `<metadata_type>` and comments): `grep -rl 'content_addressed' utils/ca-soak/configs/ | xargs sed -i 's/content_addressed/cas/g'`.
+- Remove the dead legacy keys from the skip-list in `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp` (~:64): delete `"content_addressed_allow_shared_pool", "content_addressed_gc_grace_sec",` from `non_cas_keys` and delete the explanatory comment paragraph about them above the set (the one starting "`content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` are legacy keys…"). The integration configs that still set these keys are cleaned in Task 6 — until that task runs, `test_cas_*` integration tests would fail to start the server; that is acceptable because this effort runs no integration tests (spec), and Task 6 lands before any future run.
 
 - [ ] **Step 5: Replication wire-protocol names**
 
@@ -234,7 +235,7 @@ In `src/Storages/MergeTree/DataPartsExchange.cpp:117-141` change the five string
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files 'src/*' 'programs/*' | xargs grep -n 'content_addressed' \
-  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec'
+  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force'
 # expect: no output (only the allowed internal identifiers remain)
 ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 ./build/src/unit_tests_dbms --gtest_filter='Cas*' --gtest_brief=1 2>&1 | tail -5
@@ -420,7 +421,13 @@ touch test_cas_ref_snaplog/__init__.py && git add test_cas_ref_snaplog/__init__.
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master/tests/integration
-# one catch-all sed: table names, metadata_type, disk/policy names, endpoints, AND the
+# FIRST delete the dead legacy keys (removed from the code's skip-list in Task 3) —
+# they must be deleted, not renamed, so this runs BEFORE the catch-all sed:
+grep -rl '<content_addressed_allow_shared_pool>\|<content_addressed_gc_grace_sec>' test_cas_*/configs/ \
+  | xargs sed -i '/<content_addressed_allow_shared_pool>/d; /<content_addressed_gc_grace_sec>/d'
+# one prose comment names the key mid-sentence (test_cas_replicated_relink/configs/storage_conf_other_pool.xml:~5,
+# "…needs neither `content_addressed_allow_shared_pool` nor…") — reword it by hand to drop the key mention.
+# THEN the catch-all sed: table names, metadata_type, disk/policy names, endpoints, AND the
 # wire-protocol assertions in test_cas_replicated_relink/test.py:629-644 (renamed in Task 3 Step 5)
 grep -rl 'content_addressed' test_cas_*/ | xargs sed -i 's/content_addressed/cas/g'
 rm -f test_cas_replicated_relink/configs/storage_conf-preprocessed.xml   # stale artifact, untracked; skip if git-tracked
@@ -502,10 +509,10 @@ git commit -m "cas: docs -- canonical CAS/cas naming, renamed system-table pages
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/' | xargs grep -nE 'content[_ -]addressed|Content[- ]Addressed|CONTENT[_ ]ADDRESSED' 2>/dev/null \
-  | grep -vE 'ContentAddressed[A-Za-z]*|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec' > /tmp/cas-rename/final_sweep.txt
+  | grep -vE 'ContentAddressed[A-Za-z]*' > /tmp/cas-rename/final_sweep.txt
 wc -l /tmp/cas-rename/final_sweep.txt
 ```
-Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), the two dead skip-listed config keys, spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
+Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
 
 ```bash
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/|^contrib/' | xargs grep -nP '\bCas[A-Z]' 2>/dev/null \
