@@ -4,7 +4,6 @@
 #include <Common/FailPoint.h>
 #include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
-#include <Common/typeid_cast.h>
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -17,6 +16,7 @@
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/Utils.h>
+#include <Functions/FunctionHelpers.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -642,9 +642,9 @@ namespace ExportPartitionUtils
     {
         std::optional<String> getDateTimeTimeZoneName(const DataTypePtr & type)
         {
-            if (const auto * datetime_type = typeid_cast<const DataTypeDateTime *>(type.get()))
+            if (const auto * datetime_type = checkAndGetDataType<DataTypeDateTime>(type.get()))
                 return datetime_type->getTimeZone().getTimeZone();
-            if (const auto * datetime64_type = typeid_cast<const DataTypeDateTime64 *>(type.get()))
+            if (const auto * datetime64_type = checkAndGetDataType<DataTypeDateTime64>(type.get()))
                 return datetime64_type->getTimeZone().getTimeZone();
             return {};
         }
