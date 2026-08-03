@@ -110,7 +110,17 @@ per commit; full CA gate at lane closures.
   Integration ahead of review verdict was an explicit USER DIRECTIVE (2026-08-03); heavyweight
   review re-dispatched on Fable (t6-review-fable → t6-review.md) + codex T5+T6 review in flight —
   findings, if any, land as follow-up commits. Soak cards s44/s45 (`laneg/soak-cards`)
-  integrated as `c57b2575356`.
+  integrated as `c57b2575356`. REVIEW VERDICTS (all three in): opus-lane APPROVE
+  (`t6-review-opus.md`, authoritative copy; `t6-review.md` is its earlier identical text) with
+  fix round TEST-1/TEST-2; Fable-lane APPROVE (`t6-review-fable.md`), independently converged
+  (its T-3 == TEST-1), carries T-1 observation (anomaly/carried-hold gate terms structurally
+  redundant on current shapes) to T8/hygiene; codex T5 APPROVE-WITH-FIXES + T6 REJECT on the
+  WORK ENVELOPE only (safety confirmed clean) — answered by the new Task T6b (plan amendment
+  `e497c4a0e6e`, user-approved minimal fail-close caps). IN FLIGHT: fixround-t6rev on MAIN
+  (TEST-1 via option (a) — mutation on exact-key intake, universe-term mutations vacuous by
+  construction on the grounded fixture; TEST-2; codex T5-2 cadence 5→32; T5-3 phase-list sync);
+  t6b-impl on LANE-G (`laneg/t6b` from `e497c4a0e6e`, 3 slices). Prose batches D44/D45 recorded.
+  `[gc-frontier-one-list]` (BACKLOG:136) deferred to a separate focused session AFTER Stage B.
 - T7 (model lane): **COMPLETE**. Lane B: aab2a21d699 + e1599389f93 (10c runners pinned/recorded;
   10f disclosure; shared temporal-smoke regex hardened). Lane A: integrated as afed91f65d2 (A1:
   listedTok RETIRED, 4 configs removed) + e05a62a7b17 (A2: ninth battery — 42/44 immediate, live
