@@ -103,7 +103,14 @@ per commit; full CA gate at lane closures.
   `477fe702a7a` (laneg/t6a) integrated as `096b3611988`; review APPROVE-WITH-NONBLOCKING with the
   corrected enumeration + NEW T6→T8 carry (post-flip healthy rounds also show ZERO
   no-usable-checkpoint anomalies); three dead frontier-walk arms placed with T6 Step 1.
-- T6 (destruction enablement): BLOCKED on T1 + T5 + T6a verdict. MAIN.
+- T6 (destruction enablement): **INTEGRATED, review pending** — full arc from `laneg/t6-finish`
+  (branch point 73755caa6e5, 6 commits) cherry-picked clean into cas-gc-rebuild as
+  `58fd482a800..b7da56d6e25` (flip commit = `ea5506d4d76`); finisher's own gates were green
+  (ASan GATE_EXIT=0, integration 19/19 after the janitor-race drains-not-pending fix).
+  Integration ahead of review verdict was an explicit USER DIRECTIVE (2026-08-03); heavyweight
+  review re-dispatched on Fable (t6-review-fable → t6-review.md) + codex T5+T6 review in flight —
+  findings, if any, land as follow-up commits. Soak cards s44/s45 (`laneg/soak-cards`)
+  integrated as `c57b2575356`.
 - T7 (model lane): **COMPLETE**. Lane B: aab2a21d699 + e1599389f93 (10c runners pinned/recorded;
   10f disclosure; shared temporal-smoke regex hardened). Lane A: integrated as afed91f65d2 (A1:
   listedTok RETIRED, 4 configs removed) + e05a62a7b17 (A2: ninth battery — 42/44 immediate, live
