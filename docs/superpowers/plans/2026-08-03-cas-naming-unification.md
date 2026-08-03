@@ -14,7 +14,7 @@
 
 - **NEVER touch compare-and-swap identifiers.** These contain `Cas`/`cas` meaning *compare-and-swap*, not the feature, and MUST NOT be renamed: `casPut`, `CasOutcome`, `CasResult`, `CasOp::Cas`, `CasOp::CasConflict`, `GcMaintenanceCasOutcome`, `GcMaintenanceCasResult`, `casGcMaintenanceState`, `kMaxCatalogCasAttempts`, `cas_result`, and the whole `CasRequestControl.h` family (`CasWriteOutcome`, `CasUnresolvedReason`, `CasRequestBudget`, `CasRequestController`, `CasCreateOutcome`, `CasCreateResult`, `CasOverwriteOutcome`, `CasOverwriteResult`, `throwCasWriteRetryLater`, `throwCasTransientUnavailable`, `classifyConditionalWriteResult`, `recordConditionalWriteOutcome`, `validateCasRequestBudget`, `cas_request_budget`).
 - **Internal C++ identifiers stay.** Do not rename: namespace `DB::Cas`, production classes (`CasPool`, `CasGc`, `CasLayout`, `CasMountRuntime`, `ContentAddressedLog`, `StorageSystemContentAddressedMounts`, …), source file names (`ContentAddressedLog.cpp`, `gtest_cas_*.cpp`, …), the AST field `content_addressed_gc_rebuild_force`, the string key `"cas_owner"` (already canonical).
-- **Replication wire protocol stays.** `DataPartsExchange.cpp` literals `content_addressed_pool_uuid`, `content_addressed_relink`, `content_addressed_confirm`, `content_addressed_source_token`, `content_addressed_confirm_answer` are internal HTTP protocol names — out of scope. The integration test assertions on them (`test_cas_replicated_relink/test.py:629-644`) also stay.
+- **Replication wire protocol IS renamed** (user decision 2026-08-03): the `DataPartsExchange.cpp` HTTP parameter/cookie literals become `cas_pool_uuid`, `cas_relink`, `cas_confirm`, `cas_source_token`, `cas_confirm_answer` (Task 3), and the integration test assertions follow (Task 6). No compatibility fallback — a mixed-build cluster silently degrades CAS fetches to full copies, so soak clusters must run a single build after this lands. The C++ constant names (`CA_POOL_UUID_PARAM`, …) stay.
 - **`docs/superpowers/**` is out of scope** (internal artifacts). So are `utils/ca-soak` / `utils/cas-gate` *directory names* (contents ARE updated where they reference renamed user-facing names). Untracked run debris (`*.stdout`, `*.stderr`, `_instances-gw*/`, `ci/tmp/`, `logs_archive/`) is ignored.
 - **Per-disk CAS settings stay unprefixed** (`scratch_path`, `gc_enabled`, `server_root_id`, … in `ContentAddressedSettings.cpp`) — they are scoped by the disk block by design.
 - **Verification per task:** `ninja -C build clickhouse unit_tests_dbms` must succeed; unit tests as specified per task; aggressive grep re-check of every remaining suspicious hit. No stateless/integration test runs in this effort (per spec).
@@ -224,22 +224,26 @@ Files expected to change: `ContentAddressedMetadataStorage.{h,cpp}`, `Pool/CasPo
 - `src/Disks/DiskType.cpp:22` (`metadataTypeFromString`): accept BOTH `"cas"` (new canonical) and `"content_addressed"` (compat alias — persisted in table `.sql` ATTACH queries and backup metadata; see spec risk note) → `MetadataStorageType::CAS`.
 - `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:219`: register `"cas"` and additionally register `"content_addressed"` pointing to the same creator (one extra `registerMetadataStorageType` call).
 
-- [ ] **Step 5: Verify + build + unit tests**
+- [ ] **Step 5: Replication wire-protocol names**
+
+In `src/Storages/MergeTree/DataPartsExchange.cpp:117-141` change the five string literals (constant names `CA_POOL_UUID_PARAM` etc. stay): `"content_addressed_pool_uuid"`→`"cas_pool_uuid"`, `"content_addressed_relink"`→`"cas_relink"`, `"content_addressed_confirm"`→`"cas_confirm"`, `"content_addressed_source_token"`→`"cas_source_token"`, `"content_addressed_confirm_answer"`→`"cas_confirm_answer"`. Both sides of the protocol live in this one file, so the rename is atomic within a build. The integration-test assertions on these names are updated by Task 6's sed.
+
+- [ ] **Step 6: Verify + build + unit tests**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files 'src/*' 'programs/*' | xargs grep -n 'content_addressed' \
-  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force|content_addressed_pool_uuid|content_addressed_relink|content_addressed_confirm|content_addressed_source_token|content_addressed_confirm_answer|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType|metadataTypeFromString|check_type'
+  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType|metadataTypeFromString|check_type'
 # expect: no output (only the allowed internal identifiers / compat alias sites remain)
 ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 ./build/src/unit_tests_dbms --gtest_filter='Cas*' --gtest_brief=1 2>&1 | tail -5
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add -A src/ programs/
-git commit -m "cas: tables/settings/config -- cas_log, cas_garbage_collection_log, cas_mounts, cas_* settings, metadata_type=cas (+alias)"
+git commit -m "cas: tables/settings/config/wire -- cas_log, cas_garbage_collection_log, cas_mounts, cas_* settings, metadata_type=cas (+alias), cas_* fetch protocol names"
 ```
 
 ---
@@ -415,21 +419,21 @@ touch test_cas_ref_snaplog/__init__.py && git add test_cas_ref_snaplog/__init__.
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master/tests/integration
-grep -rl 'content_addressed' test_cas_*/ \
-  | xargs sed -i 's/content_addressed_garbage_collection_log/cas_garbage_collection_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g'
-# metadata_type + disk/policy names + endpoints, EXCEPT the wire-protocol literals:
-grep -rl 'content_addressed' test_cas_*/ | xargs sed -i \
-  's/content_addressed_pool_uuid/__KEEP_POOL_UUID__/g; s/content_addressed_relink/__KEEP_RELINK__/g; s/content_addressed_confirm_answer/__KEEP_CONFIRM_ANSWER__/g; s/content_addressed_confirm/__KEEP_CONFIRM__/g; s/content_addressed_source_token/__KEEP_SOURCE_TOKEN__/g; s/content_addressed/cas/g; s/__KEEP_POOL_UUID__/content_addressed_pool_uuid/g; s/__KEEP_RELINK__/content_addressed_relink/g; s/__KEEP_CONFIRM_ANSWER__/content_addressed_confirm_answer/g; s/__KEEP_CONFIRM__/content_addressed_confirm/g; s/__KEEP_SOURCE_TOKEN__/content_addressed_source_token/g'
+# one catch-all sed: table names, metadata_type, disk/policy names, endpoints, AND the
+# wire-protocol assertions in test_cas_replicated_relink/test.py:629-644 (renamed in Task 3 Step 5)
+grep -rl 'content_addressed' test_cas_*/ | xargs sed -i 's/content_addressed/cas/g'
 rm -f test_cas_replicated_relink/configs/storage_conf-preprocessed.xml   # stale artifact, untracked; skip if git-tracked
 ```
-The placeholder dance preserves the `DataPartsExchange` wire-protocol assertions in `test_cas_replicated_relink/test.py:629-644` (Global Constraints).
+Then verify the wire-protocol assertions now expect `cas_pool_uuid`, `cas_relink`, `cas_confirm`, `cas_source_token`, `cas_confirm_answer` — matching the literals set in Task 3 Step 5:
+```bash
+grep -n 'cas_pool_uuid\|cas_relink\|cas_confirm\|cas_source_token' test_cas_replicated_relink/test.py | head
+```
 
 - [ ] **Step 3: Verify + commit**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 grep -rn 'content_addressed' tests/integration/ --include='*.py' --include='*.xml' \
-  | grep -vE 'content_addressed_pool_uuid|content_addressed_relink|content_addressed_confirm|content_addressed_source_token' \
   | grep -v '_instances'   # expect no output
 python3 -m py_compile tests/integration/test_cas_*/test.py && echo PY-OK
 git add -A tests/integration
@@ -497,10 +501,10 @@ git commit -m "cas: docs -- canonical CAS/cas naming, renamed system-table pages
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/' | xargs grep -nE 'content[_ -]addressed|Content[- ]Addressed|CONTENT[_ ]ADDRESSED' 2>/dev/null \
-  | grep -vE 'ContentAddressed[A-Za-z]*|content_addressed_pool_uuid|content_addressed_relink|content_addressed_confirm|content_addressed_source_token|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType\("content_addressed"|"content_addressed"' > /tmp/cas-rename/final_sweep.txt
+  | grep -vE 'ContentAddressed[A-Za-z]*|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType\("content_addressed"|"content_addressed"' > /tmp/cas-rename/final_sweep.txt
 wc -l /tmp/cas-rename/final_sweep.txt
 ```
-Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), the metadata_type compat alias sites, the wire-protocol literals, the two dead skip-listed config keys, spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
+Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), the metadata_type compat alias sites, the two dead skip-listed config keys, spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
 
 ```bash
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/|^contrib/' | xargs grep -nP '\bCas[A-Z]' 2>/dev/null \

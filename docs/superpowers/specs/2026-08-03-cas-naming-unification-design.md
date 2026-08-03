@@ -45,6 +45,13 @@ into one canonical form, in the least invasive way:
    `CAS*` together with the suite-prefix gate generator.
 6. **Documentation.** `docs/en/operations/system-tables/content_addressed_*.md`
    → `cas_*.md`; prose variants `Cas` / `CA` / `content_addressed` → `CAS`.
+7. **Replication wire protocol.** The part-fetch HTTP parameter/cookie names in
+   `DataPartsExchange.cpp` (`content_addressed_pool_uuid`,
+   `content_addressed_relink`, `content_addressed_confirm`,
+   `content_addressed_source_token`, `content_addressed_confirm_answer`) →
+   `cas_*`. This is external API too; the branch is unreleased, so no
+   compatibility fallback. Mixed-build clusters (soak) must be fully rebuilt —
+   a version-skewed fetch silently degrades to the non-CAS full-copy path.
 
 ## Out of scope
 
