@@ -397,7 +397,7 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id)
             /// `committed`/`precommits` empty implies `owned_manifests` empty too -- every entry in
             /// the index is put there by an ownership change to one of those two containers. A
             /// mismatch here means the index has drifted, not that this transaction is invalid.
-            chassert(owned_manifests.size() == 0);
+            chassert(owned_manifests.empty());
             lifecycle = RefLifecycle::Removed;
             remove_txn_id = txn_id;
             return;

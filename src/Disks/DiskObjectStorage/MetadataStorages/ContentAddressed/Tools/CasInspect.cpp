@@ -471,8 +471,8 @@ String sourceEdgeRowKindName(char marker)
         case kEdgeActive: return "edge";
         case kZeroMarker: return "zero";
         case kCondemned:  return "condemned";
+        default: return "unknown";
     }
-    return "unknown";
 }
 
 String renderCondemnedRow(const CondemnedRow & r)

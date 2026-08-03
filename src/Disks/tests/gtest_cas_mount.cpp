@@ -211,7 +211,7 @@ TEST(CasMount, EpochRemintOverExistingMountRefuses)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
-    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*our_epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
               MountClaimResult::Claimed);
     /// The epoch object is ABSENT (never created in this sequence) while the mount exists:
     EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);   /// CORRUPTED_DATA
@@ -250,7 +250,7 @@ TEST(CasMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
-    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/3, /*now_ms=*/1000, /*ttl_ms=*/100).kind,
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*our_epoch=*/3, /*now_ms=*/1000, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
     /// now_ms=5000: the ttl_ms=100 lease above is long expired -> terminal.
     EXPECT_EQ(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/5000, emptyCatalogObservation()), 4u);
@@ -263,7 +263,7 @@ TEST(CasMount, DecommissionRemintOverLiveMountRefuses)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation());
-    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*our_epoch=*/1, /*now_ms=*/1000, /*ttl_ms=*/30000).kind,
               MountClaimResult::Claimed);
     EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::DecommissionRecovery, /*now_ms=*/2000, emptyCatalogObservation()),
                  DB::Exception);   /// ABORTED: live member
@@ -306,7 +306,7 @@ TEST(CasServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreatio
     const Layout layout("p");
     for (const NsState state : {NsState::Creating, NsState::Live, NsState::Removing})
     {
-        const RefCatalog catalog = catalogOwning("root/x/table", state);
+        RefCatalog catalog = catalogOwning("root/x/table", state);
         const ObserveRefCatalog observe = [catalog] { return catalog; };
 
         InMemoryBackend owner_backend;
@@ -430,7 +430,7 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     k.start();
 
     const String mount_key = l.mountKey("r");
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
 
     /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the keeper still
     /// holds a (now stale) token for it.

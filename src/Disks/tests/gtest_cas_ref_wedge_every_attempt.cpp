@@ -1445,8 +1445,8 @@ TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
     ///      reported to the caller and the operator in the same words the collision reported it;
     ///   3. NOTHING is written, so no self-pointer can have been stamped and no request was spent;
     ///   4. a SECOND flush behaves identically instead of looping or degrading.
-    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
-    const size_t puts_before = backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1}));
+    const uint64_t remounts_before = store->scheduleRemountCallCountForTest();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
+    const size_t puts_before = backend->putCount(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), RefTxnId{epoch + 1, 1}));  /// NOLINT(clang-analyzer-deadcode.DeadStores)
     try
     {
         store->dropRef(ns, "x");

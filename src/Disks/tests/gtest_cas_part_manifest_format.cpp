@@ -64,7 +64,7 @@ TEST(CasFormatBattery, PartManifest)
     /// stays self-consistent with whatever sample() produces, now that decode verifies payload_digest.
     const String golden =
         currentFormatHeader("cas_part_manifest") +
-        "{\"me\":\"5\",\"mb\":\"15\",\"mo\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n"
+        "{\"me\":\"5\",\"mb\":\"15\",\"mo\":1,\"ns\":\"00/aa@cas@\",\"pd\":\"" + u128ToHex(m.payload_digest) + "\"}\n" // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
         "{\"p\":\"a/b.bin\",\"pm\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddeeff\",\"sz\":4096}\n"
         "{\"p\":\"c/small.txt\",\"pm\":\"inline\",\"il\":12}\n"
         "{\"n\":2}\n"

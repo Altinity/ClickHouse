@@ -264,8 +264,8 @@ public:
 
     std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
         const DB::StoredObject & object, const DB::ReadSettings & read_settings,
-        std::optional<size_t> read_hint = {}, bool use_external_buffer = false,
-        bool restrict_seek = false) const override
+        std::optional<size_t> read_hint, bool use_external_buffer,
+        bool restrict_seek) const override
     {
         record(object.remote_path, /*is_write*/ false);
         return DB::LocalObjectStorage::readObject(object, read_settings, read_hint, use_external_buffer, restrict_seek);
@@ -273,9 +273,9 @@ public:
 
     std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
         const DB::StoredObject & object, DB::WriteMode mode,
-        std::optional<DB::ObjectAttributes> attributes = {},
-        size_t buf_size = DB::DBMS_DEFAULT_BUFFER_SIZE,
-        const DB::WriteSettings & write_settings = {}) override
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
     {
         record(object.remote_path, /*is_write*/ true);
         return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
@@ -321,7 +321,7 @@ public:
     void copyObject(
         const DB::StoredObject & object_from, const DB::StoredObject & object_to,
         const DB::ReadSettings & read_settings, const DB::WriteSettings & write_settings,
-        std::optional<DB::ObjectAttributes> object_to_attributes = {}) override
+        std::optional<DB::ObjectAttributes> object_to_attributes) override
     {
         record(object_from.remote_path, /*is_write*/ false);
         record(object_to.remote_path, /*is_write*/ true);

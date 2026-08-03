@@ -34,8 +34,8 @@ enum class RefObjectKind : uint8_t
 /// to the immutable catalog cut held by the consumer, never to the key parser.
 struct ParsedRefObjectKey
 {
-    NamespaceLifePhysicalId life_id;
-    RefObjectKind kind;
+    NamespaceLifePhysicalId life_id = 0;
+    RefObjectKind kind = RefObjectKind::Log;
     RefTxnId txn_id;
 
     bool operator==(const ParsedRefObjectKey &) const = default;

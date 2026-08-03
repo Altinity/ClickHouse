@@ -113,7 +113,8 @@ void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
     writeStringValue(line, kind);
     closeObject(line, first);
     writeChar('\n', line);
-    out.write(line.view().data(), line.size());
+    const std::string_view line_view = line.view();
+    out.write(line_view.data(), line_view.size());
 }
 
 void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
@@ -193,7 +194,10 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
     }
     closeObject(scratch, first);
     writeChar('\n', scratch);
-    out.write(scratch.view().data(), scratch.size());
+    {
+        const std::string_view scratch_view = scratch.view();
+        out.write(scratch_view.data(), scratch_view.size());
+    }
     ++count;
 }
 
@@ -203,7 +207,8 @@ void SourceEdgeRunWriter::finish()
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS cas_run: finish called twice");
     scratch.clear();
     writeTrailerLine(scratch, count);
-    out.write(scratch.view().data(), scratch.size());
+    const std::string_view scratch_view = scratch.view();
+    out.write(scratch_view.data(), scratch_view.size());
     finished = true;
 }
 

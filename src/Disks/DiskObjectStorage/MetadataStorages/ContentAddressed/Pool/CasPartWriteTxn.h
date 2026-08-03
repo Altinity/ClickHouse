@@ -253,7 +253,7 @@ public:
     ///
     /// Returns `created`: whether `final_ref_name` had NO committed row before this call. Derived
     /// INSIDE the `appendRefOps` builder (the same in-closure-output pattern the builder already uses
-    /// for `repoint_old`) as `state.getCommitted().find(final_ref_name) == end`, evaluated once at the
+    /// for `repoint_old`) as `!state.getCommitted().contains(final_ref_name)`, evaluated once at the
     /// top of the closure -- so it is correct on every path the closure can take: a first-time bind
     /// (true), a repoint of an existing binding (false), and the idempotent re-promote no-op (false,
     /// since a committed row for this exact manifest already existed). `build_ops` runs at most once,

@@ -18,7 +18,7 @@ struct GcMaintenanceReadResult
 enum class GcMaintenanceCasOutcome : uint8_t { Committed, Conflict };
 struct GcMaintenanceCasResult
 {
-    GcMaintenanceCasOutcome outcome;
+    GcMaintenanceCasOutcome outcome = GcMaintenanceCasOutcome::Conflict;
     Token token;
 };
 

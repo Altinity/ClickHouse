@@ -104,7 +104,7 @@ TEST(CasRefDecodeBounds, PaddedNormalTxnOver20MiBRejected)
     /// and prove nothing about this (much larger) whole-transaction bound.
     constexpr size_t pad_bytes = ref_txn_max_bytes + (1 << 20);
     String padded = text.substr(0, text.size() - 2);
-    padded += ",\"zz\":\"" + String(pad_bytes, 'A') + "\"}\n";
+    padded += ",\"zz\":\"" + String(pad_bytes, 'A') + "\"}\n"; // NOLINT(modernize-raw-string-literal): mixes '\"' quoting with '\n' line endings across this concatenated literal; a raw string can't hold the newline as-is.
     ASSERT_GT(padded.size(), ref_txn_max_bytes);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(padded, txn.ns, txn.txn_id); });

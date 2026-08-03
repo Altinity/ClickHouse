@@ -4,6 +4,7 @@
 #include <Common/thread_local_rng.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <exception>
 
 namespace DB
 {
@@ -141,9 +142,11 @@ RefCatalog casUpdateImpl(
 /// throws straight out, uncaught, which is exactly the behavior these three need. Retrying any of them
 /// against a freshly re-read catalog would just re-decide against an entry that is, by definition, no
 /// longer `observed` -- token-exactness means the FIRST mismatch is final, not a reason to loop.
-struct CatalogFenceMovedMarker {};
-struct CatalogEntryMismatchMarker {};
-struct CatalogCreatorStillLiveMarker {};
+/// Each is caught by its own exact type right where it is thrown; deriving from `std::exception`
+/// is only so the throw itself is well-formed, never so a caller catches these by base class.
+struct CatalogFenceMovedMarker : std::exception {};
+struct CatalogEntryMismatchMarker : std::exception {};
+struct CatalogCreatorStillLiveMarker : std::exception {};
 
 /// Two `thread_local_rng` draws composed into a `UInt128`, the same pattern already used throughout
 /// this tree to mint build ids and incarnation tags (`CasPartWriteTxn.cpp`'s `mintU128`,

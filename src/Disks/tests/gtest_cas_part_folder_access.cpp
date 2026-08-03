@@ -660,7 +660,7 @@ TEST(CasPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
     const Cas::ManifestId id = source.manifestId();
     {
         Cas::PreparedPartWrite moved = std::move(source);
-        /// NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move)
+        /// NOLINTNEXTLINE(bugprone-use-after-move,clang-analyzer-cplusplus.Move,hicpp-invalid-access-moved)
         EXPECT_TRUE(source.isTerminal()) << "a moved-from handle owes nothing";
 #ifndef DEBUG_OR_SANITIZER_BUILD
         expectThrowsCode(ErrorCodes::LOGICAL_ERROR, [&] { source.abort(); });

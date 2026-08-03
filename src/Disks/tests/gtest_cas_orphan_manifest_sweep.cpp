@@ -428,7 +428,7 @@ TEST(CasOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     damaged.entries.push_back(duplicate);
     std::sort(damaged.entries.begin(), damaged.entries.end(),
         [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
-    ASSERT_EQ(backend->casPut(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.token).outcome,
+    ASSERT_EQ(backend->casPut(store->layout().refCatalogKey(), encodeRefCatalog(damaged), before.token).outcome,
               CasOutcome::Committed);
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -553,11 +553,11 @@ TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
         .ops = publishCommittedOps("phantom", phantom),
         .prev_epoch_seal = RefTxnId{6, 1}};
     String malformed_later_link = encodeRefLogTxn(direct_later_link);
-    const String encoded_predecessor{"\"!pse\":\"6\""};
+    const String encoded_predecessor{R"("!pse":"6")"};
     const size_t predecessor_pos = malformed_later_link.find(encoded_predecessor);
     ASSERT_NE(predecessor_pos, String::npos);
     malformed_later_link.replace(
-        predecessor_pos, encoded_predecessor.size(), "\"!pse\":\"2\"");
+        predecessor_pos, encoded_predecessor.size(), R"("!pse":"2")");
     ASSERT_EQ(backend->putIfAbsent(
         store->layout().refLogKey(life, RefTxnId{7, 1}), sealObject(FormatId::RefLog, malformed_later_link)).outcome,
         PutOutcome::Done);

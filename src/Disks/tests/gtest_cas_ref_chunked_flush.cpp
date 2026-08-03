@@ -511,7 +511,7 @@ std::vector<RefLogTxn> listLogTxns(DB::Cas::Backend & backend, const DB::Cas::La
         {
             txns.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
         }
-        catch (...)
+        catch (...) // NOLINT(bugprone-empty-catch): best-effort helper -- an undecodable txn is simply skipped, not asserted on
         {
         }
     }

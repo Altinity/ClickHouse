@@ -208,7 +208,7 @@ TEST(CasRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
     const String needle = ",\"ts\":";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
-    const String tampered = bytes.substr(0, pos) + ",\"pl\":\"deadbeef\"" + bytes.substr(pos);
+    const String tampered = bytes.substr(0, pos) + R"(,"pl":"deadbeef")" + bytes.substr(pos);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }

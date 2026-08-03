@@ -18,7 +18,7 @@ using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::writeMetaClean;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::blobEntryFor;
-using DB::Cas::tests::expectThrowsCode;
+using DB::Cas::tests::expectThrowsCode;  // NOLINT(misc-unused-using-decls): only used inside `#ifndef DEBUG_OR_SANITIZER_BUILD` -- unused in a sanitizer build's TU, used in a release build's
 
 namespace DB::ErrorCodes
 {

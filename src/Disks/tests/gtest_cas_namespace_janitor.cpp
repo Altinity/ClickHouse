@@ -118,7 +118,7 @@ public:
         {
             published = true;
             const String catalog_key = "p/cas/ref_catalog";
-            const auto current = InMemoryBackend::get(catalog_key, {});
+            const auto current = CountingBackend::get(catalog_key, {});
             if (current)
             {
                 RefCatalog catalog;

@@ -224,11 +224,11 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = "\"rs\":\"2\"";
+    const String needle = R"("rs":"2")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), ",\"!pse\":\"1\",\"!pss\":\"1\"");
+    tampered.insert(pos + needle.size(), R"(,"!pse":"1","!pss":"1")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -267,7 +267,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
     txn.ops.push_back(epochSealOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = ",\"!pss\":\"9\"";
+    const String needle = R"(,"!pss":"9")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
@@ -326,11 +326,11 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpli
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = "\"rs\":\"1\"";
+    const String needle = R"("rs":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), ",\"!pse\":\"3\",\"!pss\":\"1\"");
+    tampered.insert(pos + needle.size(), R"(,"!pse":"3","!pss":"1")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -346,11 +346,11 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpoc
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);   /// valid: sequence 1, no prev_epoch_seal
 
-    const String needle = "\"rs\":\"1\"";
+    const String needle = R"("rs":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), ",\"!pse\":\"5\",\"!pss\":\"1\"");   /// self-pointer
+    tampered.insert(pos + needle.size(), R"(,"!pse":"5","!pss":"1")");   /// self-pointer
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
@@ -437,11 +437,11 @@ TEST(CasRefEpochSealFormat, DecodeRejectsUnknownCriticalKeyInMetaLine)
     txn.ops.push_back(namespaceBirthOp());
     const String bytes = encodeRefLogTxn(txn);
 
-    const String needle = "\"rs\":\"1\"";
+    const String needle = R"("rs":"1")";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
     String tampered = bytes;
-    tampered.insert(pos + needle.size(), ",\"!future_critical_field\":\"1\"");
+    tampered.insert(pos + needle.size(), R"(,"!future_critical_field":"1")");
 
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }

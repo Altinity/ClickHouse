@@ -3413,7 +3413,7 @@ void Gc::cleanupRefObjects(
         if (entry_it == folded.catalog_cut->catalog.entries.end() || entry_it->ns != ns
             || (entry_it->state != NsState::Live && entry_it->state != NsState::Removing))
             continue;
-        const CatalogEntry observed_entry = *entry_it;
+        const CatalogEntry & observed_entry = *entry_it;
         const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry_it->ns, entry_it->incarnation);
 
         /// Current-life ref cleanup is not the dead-life janitor: every irreversible key delete must

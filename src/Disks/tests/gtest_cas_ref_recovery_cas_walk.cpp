@@ -203,7 +203,7 @@ public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta) override
     {
-        CasResult result = CountingBackend::casPut(key, bytes, expected, meta);
+        CasResult result = HidingListBackend::casPut(key, bytes, expected, meta);
         fireIfWatched(key);
         return result;
     }
@@ -1404,7 +1404,7 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
     const uint64_t ckpt_before = counterOf(ProfileEvents::CasRefCkptPublished);
     const uint64_t cancelled_before = counterOf(ProfileEvents::CasRefRecoveryCancelled);
 
-    std::thread recovery([&] { try { store->listRefs(ns); } catch (...) {} });
+    std::thread recovery([&] { try { store->listRefs(ns); } catch (...) {} }); // NOLINT(bugprone-empty-catch): the outcome is asserted below via the ProfileEvents counters, not this thread's exception
 
     {
         std::unique_lock lock(m);

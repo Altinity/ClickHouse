@@ -499,7 +499,7 @@ public:
                     "RefWriterTestBackend: catalog CAS committed but its response was lost");
             }
 
-            const CasResult replacement = CountingBackend::casPut(
+            CasResult replacement = CountingBackend::casPut(
                 key, catalog_replacement_bytes, expected, meta);
             if (replacement.outcome != CasOutcome::Committed)
                 return replacement;
@@ -1794,7 +1794,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
         {
             store->dropRef(ns, "y");
         }
-        catch (...)
+        catch (...) // NOLINT(bugprone-empty-catch)
         {
             /// The anomaly is expected here; this future only verifies that the caller does not hang.
         }
@@ -3730,7 +3730,7 @@ TEST(RefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemovingIsP
         [&](const CatalogEntry & entry) { return entry.ns == ns; });
     ASSERT_NE(observed, before.catalog.entries.end());
     ASSERT_EQ(observed->state, NsState::Live);
-    const CatalogEntry exact_live = *observed;
+    const CatalogEntry & exact_live = *observed;
     const auto greatest_before = listGreatestLogIdForTest(*backend, layout, ns);
     ASSERT_TRUE(greatest_before);
 

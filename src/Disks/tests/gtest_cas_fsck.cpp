@@ -642,10 +642,10 @@ TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
     /// intermediate epoch is reported rather than treated as a sparse legal transition.
     String skipped_bytes = encodeRefLogTxn(RefLogTxn{
         .ns = ns.string(), .txn_id = RefTxnId{7, 1}, .ops = {}, .prev_epoch_seal = RefTxnId{6, 1}});
-    const String old_epoch_token = "\"!pse\":\"6\"";
+    const String old_epoch_token = R"("!pse":"6")";
     const auto old_epoch = skipped_bytes.find(old_epoch_token);
     ASSERT_NE(old_epoch, String::npos);
-    skipped_bytes.replace(old_epoch, old_epoch_token.size(), "\"!pse\":\"1\"");
+    skipped_bytes.replace(old_epoch, old_epoch_token.size(), R"("!pse":"1")");
     ASSERT_EQ(backend->putIfAbsent(layout.refLogKey(life, RefTxnId{7, 1}),
         sealObject(FormatId::RefLog, skipped_bytes)).outcome, PutOutcome::Done);
 

@@ -65,7 +65,7 @@ TEST(CasRefSnapshotCodec, DecodeRequiresLifecycleField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String field = ",\"lc\":\"live\"";
+    const String field = R"(,"lc":"live")";
     const size_t at = bytes.find(field);
     ASSERT_NE(at, String::npos);
     bytes.erase(at, field.size());
@@ -78,10 +78,10 @@ TEST(CasRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = "\"lc\":\"live\"";
+    const String live = R"("lc":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), "\"lc\":\"removed\"");
+    bytes.replace(at, live.size(), R"("lc":"removed")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -91,10 +91,10 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = "\"lc\":\"live\"";
+    const String live = R"("lc":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + ",\"rte\":\"7\"");
+    bytes.replace(at, live.size(), live + R"(,"rte":"7")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -104,10 +104,10 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = "\"lc\":\"live\"";
+    const String live = R"("lc":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + ",\"rts\":\"9\"");
+    bytes.replace(at, live.size(), live + R"(,"rts":"9")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -117,10 +117,10 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
-    const String live = "\"lc\":\"live\"";
+    const String live = R"("lc":"live")";
     const size_t at = bytes.find(live);
     ASSERT_NE(at, String::npos);
-    bytes.replace(at, live.size(), live + ",\"rte\":\"7\",\"rts\":\"9\"");
+    bytes.replace(at, live.size(), live + R"(,"rte":"7","rts":"9")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
@@ -146,7 +146,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
     const String needle = ",\"ts\":";
     const auto pos = bytes.find(needle);
     ASSERT_NE(pos, String::npos);
-    const String tampered = bytes.substr(0, pos) + ",\"pl\":\"deadbeef\"" + bytes.substr(pos);
+    const String tampered = bytes.substr(0, pos) + R"(,"pl":"deadbeef")" + bytes.substr(pos);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });

@@ -1105,7 +1105,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         [this, final_ref_name, id, promote_build_id, allow_repoint, body, &repoint_old, &created]
         (const RefTableState & state) -> std::vector<RefOp>
         {
-            created = state.getCommitted().find(final_ref_name) == state.getCommitted().end();
+            created = !state.getCommitted().contains(final_ref_name);
 
             /// Idempotent re-promote: the target ref is ALREADY committed to this EXACT manifest_ref --
             /// a legitimate re-drive (a crash/retry between a prior promote and its caller's own

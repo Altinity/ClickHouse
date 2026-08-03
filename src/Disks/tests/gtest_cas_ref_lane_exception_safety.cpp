@@ -136,7 +136,7 @@ TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
                 RootMutationOrigin::Writer, RootMutationKind::Publish);
             ok.fetch_add(1);
         }
-        catch (const DB::Exception &)
+        catch (const DB::Exception &) // NOLINT(bugprone-empty-catch)
         {
             /// The faulted caller may see the injected error; that is expected.
         }

@@ -64,7 +64,7 @@ struct CaWiringFixture
     /// Stages a fresh build (manifest + precommit) for `key` over `blobs` inline entries, WITHOUT
     /// promoting it -- the caller drives `promoteBuild` itself so it can observe the exact
     /// `CommitOutcome` the promote primitive derives.
-    Staged stageSimplePart(const Cas::PartRefKey & key, int blobs)
+    Staged stageSimplePart(const Cas::PartRefKey & key, int blobs) const
     {
         std::vector<Cas::ManifestEntry> entries;
         for (int i = 0; i < blobs; ++i)
@@ -179,9 +179,9 @@ struct CaTxnRollbackFixture
     }
 
     const Cas::RootNamespace & ns() const { return namespace_; }
-    Cas::CachedPartFolderAccess & partAccess() { return *storage->partAccess(); }
+    Cas::CachedPartFolderAccess & partAccess() const { return *storage->partAccess(); }
 
-    DB::MetadataTransactionPtr beginTxn() { return storage->createTransaction(); }
+    DB::MetadataTransactionPtr beginTxn() const { return storage->createTransaction(); }
 
     /// Stages `blobs` small distinct files for `key` under a tmp build dir and re-keys them to the
     /// final ref name -- the standard MergeTree-insert shape (`gtest_ca_transaction.cpp`'s
@@ -238,10 +238,10 @@ struct CaTxnRollbackFixture
     /// Test-only fault seam (see `ContentAddressedMetadataStorage::armPromoteFailureForTest`): the
     /// NEXT `publishStaging` promote/repoint for `key` (the full `(ns, ref)` routed identity) throws
     /// instead of committing.
-    void armPromoteFailure(const Cas::PartRefKey & key) { storage->armPromoteFailureForTest(key); }
+    void armPromoteFailure(const Cas::PartRefKey & key) const { storage->armPromoteFailureForTest(key); }
     /// Test-only hook (see `ContentAddressedMetadataStorage::setAfterPromoteHookForTest`): runs once,
     /// synchronously, immediately after `key`'s promote/repoint confirms.
-    void armAfterPromoteHook(const Cas::PartRefKey & key, std::function<void()> hook)
+    void armAfterPromoteHook(const Cas::PartRefKey & key, std::function<void()> hook) const
     {
         storage->setAfterPromoteHookForTest(key, std::move(hook));
     }

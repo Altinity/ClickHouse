@@ -561,7 +561,7 @@ std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::acquireReadableRefT
     /// but its exact physical id can never alias successor bytes. A genuinely fresh logical-name
     /// admission is the cold path below and resolves the current catalog life before publishing a
     /// runtime.
-    if (const auto current = lookupRefTableRuntime(ns))
+    if (auto current = lookupRefTableRuntime(ns))
     {
         check_fence_or_throw(current->admitted_fence_generation);
         {
@@ -848,7 +848,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         /// candidate cannot silently inherit that winner's farther frontier. If it moved beyond this
         /// one successor between lookahead and our CAS, restart from the exact newer checkpoint so the
         /// installed state covers every transaction its frontier certifies.
-        const std::optional<CkptSample> exact = readCkpt(backend, layout, life);
+        std::optional<CkptSample> exact = readCkpt(backend, layout, life);
         if (!exact || !exact->ckpt.committed_through || *exact->ckpt.committed_through < txn.txn_id)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': exact checkpoint read after publishing "
@@ -2288,7 +2288,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
             .last_epoch_seal = refLogTxnIsEpochSeal(wedged_txn)
                 ? std::optional<RefTxnId>{wedge.txn_id} : wedged_txn.prev_epoch_seal};
 
-        CkptPublishOutcome frontier_outcome;
+        CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
         try
         {
             frontier_outcome = publishCkptContribution(
@@ -3292,7 +3292,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
     /// by a bug or a test injection after the top-of-flush resolver gate; make that contradiction an
     /// explicit `Faulted` state and route it through the same anomaly policy as foreign interference.
     {
-        RefLaneState lane_state;
+        RefLaneState lane_state = RefLaneState::Faulted;
         std::optional<String> attempt_key;
         {
             std::lock_guard lock(rt->state_mutex);
@@ -3691,7 +3691,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                         "CAS namespace '{}': its captured runtime was retired before committed-frontier publication",
                         rt->life.ns.string()));
             };
-            CkptPublishOutcome frontier_outcome;
+            CkptPublishOutcome frontier_outcome = CkptPublishOutcome::FencedOut;
             try
             {
                 frontier_outcome = publishCkptContribution(
@@ -4778,7 +4778,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
 
     if (initial_it->state == NsState::Creating)
     {
-        const CatalogEntry observed = *initial_it;
+        const CatalogEntry & observed = *initial_it;
         const uint64_t admitted_generation = fence_generation_fn();
         switch (CasRefCatalog::cancelStalledCreating(
             backend, layout, observed,
@@ -4918,7 +4918,7 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
                 rt->cv.notify_all();
             }
         }
-        catch (...)
+        catch (...) // NOLINT(bugprone-empty-catch)
         {
             /// The original failure remains the caller-visible one. Failure to prove an exact fresh
             /// `Live` row deliberately leaves admission closed.

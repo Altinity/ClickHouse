@@ -78,11 +78,11 @@ public:
         if (!got)
             throw std::runtime_error("catalog mutation fixture: second catalog read found absence");
 
-        const PutResult put = InMemoryBackend::putOverwrite(
+        const PutResult put = CountingBackend::putOverwrite(
             key, encodeRefCatalog(RefCatalog{}), got->token, {});
         if (put.outcome != PutOutcome::Done)
             throw std::runtime_error("catalog mutation fixture: catalog rewrite conflicted");
-        return InMemoryBackend::get(key, range);
+        return CountingBackend::get(key, range);
     }
 
 private:

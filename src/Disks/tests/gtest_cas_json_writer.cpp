@@ -86,7 +86,7 @@ TEST(CasJsonWriterEscaping, TargetedCorpusMatchesWriteJSONString)
         String(1, '\0'), String("a") + '\0' + "b",
         String("\x01\x02\x03\x1e\x1f"),
         "\xE2\x80\xA8", "\xE2\x80\xA9",                 /// U+2028 / U+2029 ->   /
-        "x\xE2\x80\xA8" "y",
+        "x\xE2\x80\xA8" "y", // NOLINT(bugprone-suspicious-missing-comma): deliberate adjacent-literal concatenation, testing a U+2028 sequence split across two source literals
         "\xE2",                                          /// truncated lead byte at end
         "\xE2\x80",                                      /// truncated pair at end
         "\xE2\x21\x21",                                  /// 0xE2 + non-continuation bytes
@@ -103,7 +103,7 @@ TEST(CasJsonWriterEscaping, TargetedCorpusMatchesWriteJSONString)
 
 TEST(CasJsonWriterEscaping, FuzzMatchesWriteJSONString)
 {
-    std::mt19937 rng(20260720);
+    std::mt19937 rng(20260720); // NOLINT(cert-msc32-c, cert-msc51-cpp)
     for (int iter = 0; iter < 5000; ++iter)
     {
         const size_t len = rng() % 200;

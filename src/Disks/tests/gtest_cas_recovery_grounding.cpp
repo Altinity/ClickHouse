@@ -269,9 +269,9 @@ TEST(CasRecoveryGrounding, RejectsLifeEpochAboveCommittedFrontierOnDecodeAndGrou
 {
     const RefCkpt invalid = ckpt(2, RefTxnId{1, 5});
     String encoded = encodeRefCkpt(ckpt(1, RefTxnId{1, 5}));
-    const size_t life_epoch = encoded.find("\"le\":\"1\"");
+    const size_t life_epoch = encoded.find(R"("le":"1")");
     ASSERT_NE(life_epoch, String::npos);
-    encoded.replace(life_epoch, String{"\"le\":\"1\""}.size(), "\"le\":\"2\"");
+    encoded.replace(life_epoch, String{R"("le":"1")"}.size(), R"("le":"2")");
 
     expectCode([&] { (void)decodeRefCkpt(encoded); }, DB::ErrorCodes::CORRUPTED_DATA);
     expectCode([&] { (void)chooseRecoveryGrounding(catalog(NsState::Live), invalid); },
@@ -568,9 +568,9 @@ TEST(CasRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
         .committed_through = RefTxnId{1, 2},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = RefTxnId{1, 2}});
-    const size_t frontier_sequence = malformed_ckpt.find("\"cts\":\"2\"");
+    const size_t frontier_sequence = malformed_ckpt.find(R"("cts":"2")");
     ASSERT_NE(frontier_sequence, String::npos);
-    malformed_ckpt.replace(frontier_sequence, String{"\"cts\":\"2\""}.size(), "\"cts\":\"3\"");
+    malformed_ckpt.replace(frontier_sequence, String{R"("cts":"2")"}.size(), R"("cts":"3")");
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
@@ -635,9 +635,9 @@ TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
         .committed_through = RefTxnId{1, 1},
         .checkpoint_snapshot_id = std::nullopt,
         .last_epoch_seal = std::nullopt});
-    const size_t frontier_epoch = malformed_ckpt.find("\"cte\":\"1\"");
+    const size_t frontier_epoch = malformed_ckpt.find(R"("cte":"1")");
     ASSERT_NE(frontier_epoch, String::npos);
-    malformed_ckpt.replace(frontier_epoch, String{"\"cte\":\"1\""}.size(), "\"cte\":\"2\"");
+    malformed_ckpt.replace(frontier_epoch, String{R"("cte":"1")"}.size(), R"("cte":"2")");
     ASSERT_EQ(backend->putIfAbsent(layout.refCkptKey(life), malformed_ckpt).outcome, PutOutcome::Done);
 
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);

@@ -556,7 +556,7 @@ TEST(CasForget, GcRebuildInFlightSerializesForget)
     {
         /// On release the pool may already be Vanished (RED path: FORGET ran unserialized) — `store()` then
         /// throws; swallow it, the assertions below carry the verdict.
-        try { storage->runGcRebuildNow(/*force=*/false); } catch (...) {}
+        try { storage->runGcRebuildNow(/*force=*/false); } catch (...) {} // NOLINT(bugprone-empty-catch)
         rebuild_done_p.set_value();
     });
 

@@ -847,7 +847,9 @@ bool isCreatorFenceTerminal(Backend & backend, const Layout & layout, const Stri
     /// terminal (which would let a reconciler steal a namespace out from under a writer that might
     /// still be alive) or as live (which would block a reconciliation the certificate already proves
     /// is safe).
-    bool terminal;
+    /// The initializer is dead: the exhaustive switch below assigns every enumerator, and a future
+    /// enumerator left unassigned fails the build via `-Wswitch`, not this value.
+    bool terminal = false;
     switch (classifyFenceCertificate(lease, writer_epoch))
     {
         case FenceCertificate::None:

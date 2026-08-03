@@ -260,7 +260,7 @@ TEST(CasRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSea
 TEST(CasRefChunkPreparation, PreparedAttemptIsCompleteBeforeAnyDurableEffect)
 {
     const RefTxnId id{1, 2};
-    const auto prepared = prepare(bornState(), id, std::nullopt, {addPrecommitOp("r1", mref(3))}, /*gen=*/42);
+    const auto prepared = prepare(bornState(), id, std::nullopt, {addPrecommitOp("r1", mref(3))}, /*admitted_generation=*/42);
 
     EXPECT_EQ(prepared.prepared_attempt.txn_id, id);
     EXPECT_FALSE(prepared.prepared_attempt.key.empty());

@@ -456,8 +456,8 @@ TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
                        .retry_count = 3, .next_retry_round = 4};
     fixtureCoverage(seal, "ns/0") = cov;
     const String whole = encodeFoldSeal(seal);
-    for (const String & field : {String("\"hr\":\"body_undecodable\""), String("\"hpe\":\"1\""),
-                                 String("\"hps\":\"2\""), String("\"hrc\":3"), String("\"hnr\":\"4\"")})
+    for (const String & field : {String(R"("hr":"body_undecodable")"), String(R"("hpe":"1")"),
+                                 String(R"("hps":"2")"), String(R"("hrc":3)"), String(R"("hnr":"4")")})
     {
         SCOPED_TRACE("without " + field);
         const size_t at = whole.find(field);
@@ -479,12 +479,12 @@ TEST(CasGcHoldGrammar, DuplicateHoldKeyIsCorruptedData)
     fixtureCoverage(seal, "ns/0") = cov;
 
     const String whole = encodeFoldSeal(seal);
-    const String field = "\"hr\":\"gap_below_witness\"";
+    const String field = R"("hr":"gap_below_witness")";
     const size_t at = whole.find(field);
     ASSERT_NE(at, String::npos);
     /// The same key twice, with a DIFFERENT value: last-wins would silently rewrite the reason.
     String doubled = whole;
-    doubled.insert(at, "\"hr\":\"witness_disappeared\",");
+    doubled.insert(at, R"("hr":"witness_disappeared",)");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(doubled); });
 }
 
@@ -567,13 +567,13 @@ TEST(CasGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedDa
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        decodeFoldSeal(withField(withField(held, "\"hpe\":\"4\"", "\"hpe\":\"0\""),
-                                 "\"hps\":\"6\"", "\"hps\":\"0\""));
+        decodeFoldSeal(withField(withField(held, R"("hpe":"4")", R"("hpe":"0")"),
+                                 R"("hps":"6")", R"("hps":"0")"));
     });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, "\"hpe\":\"4\"", "\"hpe\":\"0\"")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hpe":"4")", R"("hpe":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(held, "\"hps\":\"6\"", "\"hps\":\"0\"")); });
+                     [&] { decodeFoldSeal(withField(held, R"("hps":"6")", R"("hps":"0")")); });
 }
 
 /// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
@@ -647,12 +647,12 @@ TEST(CasGcHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
     const String encoded = encodeFoldSeal(seal);
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, "\"rte\":\"2\"", "\"rte\":\"0\"")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2")", R"("rte":"0")")); });
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, "\"rts\":\"3\"", "\"rts\":\"0\"")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("rts":"3")", R"("rts":"0")")); });
     /// Omitted entirely is the same thing: the fields default to zero.
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { decodeFoldSeal(withField(encoded, "\"rte\":\"2\",", "")); });
+                     [&] { decodeFoldSeal(withField(encoded, R"("rte":"2",)", "")); });
 }
 
 /// The OBJECT cap bounds the whole seal. Nothing on the fold-seal READ path enforces it (the seal
@@ -1330,7 +1330,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
     const HeadResult seal_head = backend->head(newest_seal);
     ASSERT_TRUE(seal_head.exists);
     ASSERT_EQ(backend->deleteExact(newest_seal, seal_head.token).kind, DeleteOutcome::Kind::Deleted);
-    ASSERT_TRUE(backend->list(layout.gcGenPrefix(after_second.snap_generation), "", 1).keys.size() > 0)
+    ASSERT_FALSE(backend->list(layout.gcGenPrefix(after_second.snap_generation), "", 1).keys.empty())
         << "the crashed generation must still hold objects, or it is not the shape being modelled";
     const HeadResult sh = backend->head(layout.gcStateKey());
     ASSERT_EQ(backend->deleteExact(layout.gcStateKey(), sh.token).kind, DeleteOutcome::Kind::Deleted);

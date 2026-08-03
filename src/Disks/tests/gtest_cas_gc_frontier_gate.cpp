@@ -240,7 +240,7 @@ public:
 
     bool existsIgnoringFault(const String & key)
     {
-        return InMemoryBackend::head(key).exists;
+        return CountingBackend::head(key).exists;
     }
 
 private:
@@ -2055,7 +2055,7 @@ TEST(CasGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCa
                 .last_epoch_seal = seal_id});
             validated_base = base_id;
         }
-        catch (const DB::Exception &)
+        catch (const DB::Exception &) // NOLINT(bugprone-empty-catch): failure to validate is the tested case -- `validated_base` deliberately stays nullopt
         {
         }
 
@@ -2777,7 +2777,7 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         CasOutcome::Committed);
 
     backend->clearJournal();
-    const uint64_t plans_before
+    const uint64_t plans_before  /// NOLINT(clang-analyzer-deadcode.DeadStores)
         = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
     backend->releaseBlockedCatalogCas();
     leader_a.join();

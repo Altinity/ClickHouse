@@ -87,7 +87,7 @@ String withRemovalStartedRound(String line, uint64_t round)
 {
     const size_t close = line.rfind('}');
     EXPECT_NE(close, String::npos);
-    line.insert(close, fmt::format(",\"rsr\":\"{}\"", round));
+    line.insert(close, fmt::format(R"(,"rsr":"{}")", round));
     return line;
 }
 
@@ -539,7 +539,7 @@ TEST(CasRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 TEST(CasRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
-    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state");
+    EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
 #endif
 

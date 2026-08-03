@@ -122,12 +122,12 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
     const String valid = encodeFoldSeal(seal);
 
     for (const std::string_view field : {
-        ",\"key\":\"p/gc/gen/7/attempt/1/blob_target/0/0\"",
-        ",\"ck\":\"00000000000000000000000000000001\"",
-        ",\"gen\":\"7\"",
+        R"(,"key":"p/gc/gen/7/attempt/1/blob_target/0/0")",
+        R"(,"ck":"00000000000000000000000000000001")",
+        R"(,"gen":"7")",
         ",\"ct\":0",
         ",\"pt\":0",
-        ",\"ocr\":\"18446744073709551615\""})
+        R"(,"ocr":"18446744073709551615")"})
     {
         String malformed = valid;
         eraseRequiredField(malformed, field);

@@ -304,9 +304,9 @@ TEST(CasRefCkpt, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefCkpt(unsealed_non_genesis); });
 
     String malformed = encodeRefCkpt(valid);
-    const size_t cte = malformed.find("\"cte\":\"8\"");
+    const size_t cte = malformed.find(R"("cte":"8")");
     ASSERT_NE(cte, String::npos);
-    malformed.replace(cte, String{"\"cte\":\"8\""}.size(), "\"cte\":\"10\"");
+    malformed.replace(cte, String{R"("cte":"8")"}.size(), R"("cte":"10")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(malformed); });
 }
 
