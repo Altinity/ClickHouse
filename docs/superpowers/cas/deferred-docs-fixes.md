@@ -743,3 +743,14 @@ history, the plan line is fixed separately); (P2, FALSE) the report's Slice-1 cl
 slice); (P3, IMPRECISE) `GcRoundWorkBudget::max_sweep_namespaces` comments describe a per-PAGE cap
 while the counter is per-round cumulative — equivalent only while the sweep takes one page per
 round; the comment states more than the field guarantees.
+
+### D49 — obscure-names sweep: immutable false claim + undecided short keys {#d49-obscure-names-residue}
+
+1. FALSE-IN-IMMUTABLE-HISTORY: commit `60691b11e7f`'s message (the plan's mandated text) says
+   `prev_indeg` → `prev_indegree`; that rename did not happen — the key has no emitter (it existed
+   only in two description strings, replaced with really-emitted keys). The correction of record is
+   `.superpowers/sdd/2026-08-03-cas-obscure-names/t2-report.md`. Amending is forbidden; this entry
+   is the pointer.
+2. UNDECIDED (user decision pending): `CasEvent::detail` / fsck-report short keys `ns`, `me`, `p`,
+   `ha` in `CasFsck`/`CasGc` maps are user-facing abbreviations outside the Decisions list of the
+   obscure-names plan; deliberately not renamed. Decide spell-out vs keep, then a small follow-up.
