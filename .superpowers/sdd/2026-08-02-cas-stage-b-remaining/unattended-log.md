@@ -658,3 +658,10 @@ systematic debugging from artifacts, fix prepared LOCALLY on lane-g); watchdog e
 debugging, no handwaving; obvious safe fixes done, hard ones consulted with codex; watch
 correctness/guarantees, S3 budget, cpu/mem/disk; nohup+file+monitor for >20min tasks; no
 self-matching pgrep.
+
+### Watchdog 23:44 {#wd-2344}
+- DONE since entry: T8 fresh release build green (NINJA_EXIT=0, incremental — shortkeys had prewarmed).
+- MAIN: t8-lead active (E2-E4 + residual row; its serialized ASan build running in build_asan). No commits from it yet — normal at this stage.
+- LANE-G: idle at b988b289704 on laneg/t8-soaks, awaiting controller's soak-worktree decision.
+- Crons live: CI check :11 hourly (PR 2073), watchdog :04/:24/:44.
+- Next: t8-lead residual-row commits + Step-1 gate TOTALS; then battery orchestration.
