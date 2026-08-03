@@ -678,3 +678,11 @@ sequential: gate release → gate ASan → praktika groups one by one → soaks 
   setup-time), edits uncommitted; t8-lead woken with debugging directions (multi-run log trap named).
 - CI PR 2073 (:11 tick): green, 12 OK / 11 RUNNING / 70 PENDING, no failures.
 - Next: sharded rerun verdict → soak stage (8 runs, strictly serial) → 3c/3d → verdict.
+
+### CI check 02:11 — FAILURES appeared {#ci-0211}
+PR 2073 @ 9ad3e15b688: Unit tests (asan_ubsan / tsan / msan) all FAIL with the SAME two tests:
+CASRefCheckpointJoin.EncodedCkptSizeIsIndependentOfCardinality and
+CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts. Local pure-ASan
+full gate is green at a later tip → delta is ubsan/tsan/msan/env/build-shape. ci-rca agent
+dispatched (lane-g, no pushes, fix prepared locally per standing order). Rest of CI: 19 OK,
+6 RUNNING, 65 PENDING (cas lanes still queued), no other failures.
