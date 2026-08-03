@@ -20,6 +20,7 @@
 - `*.tla` / `*.cfg` files are never modified or deleted.
 - Deletion of ANY old doc happens only in Task 16, only after the user approves the coverage matrix.
 - Every gate task ends by reporting cumulative token/cost so the user can coarsen the next phase.
+- **LIVE FILES (concurrent agent):** another agent working in this same tree actively appends to `docs/superpowers/cas/deferred-docs-fixes.md` (D-batches) and `docs/superpowers/cas/BACKLOG.md`. These two files are NEVER moved, renamed, or merged away mid-pipeline. `BACKLOG.md` stays at its path permanently (by design). `deferred-docs-fixes.md` is extracted for the ledger like any corpus file but is deleted (Task 16) only after the concurrent agent confirms it has stopped appending. The Task 13 BACKLOG regroom is a coordinated stop-the-world edit: announce to the user/other agent, re-read the file immediately before editing, verify `git diff` afterwards contains no dropped foreign appends (foreign interleaved commits in this shared tree are normal — never halt on them).
 
 **Working directory for all pipeline artifacts:** `WORKDIR=docs/superpowers/cas/consolidation-2026-08`
 
@@ -686,7 +687,9 @@ git commit -m "cas-docs: antalya/cas — operations runbooks"
 
 Sections: shipped (from `done` verdicts, grouped by area, NO internal issue IDs), in-progress/planned (from `open` verdicts that are user-visible), known limitations (from `unverifiable`-with-caveat + platform caveats), deliberately-rejected directions (one-line table, links to `design-history.md`). Style-gate applies.
 
-- [ ] **Step 2: Regroom `BACKLOG.md`**
+- [ ] **Step 2: Regroom `BACKLOG.md` (coordinated — see LIVE FILES in Global Constraints)**
+
+Before editing: announce the stop-the-world window to the user (who relays to the concurrent agent), `git pull`-equivalent is N/A (local tree) but re-read the file at that moment; any issue IDs appended after the verdicts snapshot (e.g. `[gc-mf-cleanup-durable-retry]`) are carried into the live section UNTOUCHED with a `post-snapshot, not re-verified` marker rather than groomed. After committing, diff-check that no foreign append was lost.
 
 Mechanical first pass (script or codex): for every issue ID in BACKLOG, join against verdicts by `issue_ids`; `done`/`rejected`/`stale` items move to a terminal "closed by the 2026-08 consolidation" section (one line each, verdict + evidence pointer); `open` items stay, re-verified status line updated. New `open` clusters WITHOUT an existing ID get new IDs continuing each series (never renumber existing ones). Grooming header updated to 2026-08 with a pointer to `$WORKDIR/verdicts/`.
 
@@ -778,6 +781,8 @@ git commit -m "cas-docs: consistency review + coverage matrix (Gate D packet)"
 - Consumes: user-approved `COVERAGE-MATRIX.md`.
 
 - [ ] **Step 1: WAIT for the user's explicit go-ahead on the matrix. Not before.**
+
+Additionally for the LIVE FILES: `deferred-docs-fixes.md` is deleted only if the concurrent agent has confirmed (via the user) that it stopped appending; if not confirmed, it stays with a `KEEP-IN-PLACE: live append target` row in the matrix and gets cleaned up in a later pass. Any D-batch entries appended after the map snapshot are re-extracted (mini map pass over the tail) before deletion so nothing appended late is lost.
 
 - [ ] **Step 2: Grouped deletion commits (surgical revert per spec §8)**
 
