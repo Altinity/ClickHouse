@@ -6,7 +6,7 @@ These five P2 cards are hardening / regression guards (README §"P2 scenario car
 - S23 measures the cost of an idle shared pool: with no user workload, per-"minute" explicit GC
   rounds on a 2-server compose should produce only a tiny budget of S3 operations, no `Failed` GC
   rounds, and flat memory.
-- S24 needs a `storage_conf` disk config with a tiny `<dedup_cache_bytes>`; the current compose
+- S24 needs a `storage_conf` disk config with a tiny `<deduplication_cache_bytes>`; the current compose
   mounts only the default (64 MiB). It is `needs_infra` and runs inconclusive.
 - S25 tries to exercise CA path parsing for a non-`Atomic` (`Ordinary`) database. `Ordinary` is
   deprecated and likely refused in this build; the card attempts it and is honest about what was
@@ -257,7 +257,7 @@ class S24(Scenario):
     priority = "P2"
     # Runs on the "smalldedupcache" compose variant which mounts
     # configs/storage_conf_small_dedup_cache_ch{1,2}.xml — identical to the default storage config
-    # except dedup_cache_bytes=1 MiB (vs 64 MiB default).  The 2-replica harness is unchanged; only
+    # except deduplication_cache_bytes=1 MiB (vs 64 MiB default).  The 2-replica harness is unchanged; only
     # the per-disk cache knob differs.
     compose_variant = "smalldedupcache"
     param_table = {
@@ -290,7 +290,7 @@ class S24(Scenario):
         result.observations["scale"] = {
             "distinct_blobs": distinct, "blob_bytes": blob_b,
             "hot_blobs": hot, "hot_reinserts": hot_reinserts,
-            "dedup_cache_bytes": 1048576,
+            "deduplication_cache_bytes": 1048576,
             "note": ("DEV: 20 distinct 512 KiB blobs (~10 MiB working set >> 1 MiB cache); "
                      "ci/full scale blob count. The dedup-cache eviction is triggered when the "
                      "distinct-blob working set exceeds the configured 1 MiB bound."),
@@ -384,7 +384,7 @@ class S24(Scenario):
             "" if eviction_observed else
             "no cache eviction observed (all re-inserts hit the in-memory cache); the 1 MiB "
             "cache may not be configured correctly or the working set was not large enough to "
-            "trigger eviction at this scale — check dedup_cache_bytes in "
+            "trigger eviction at this scale — check deduplication_cache_bytes in "
             "configs/storage_conf_small_dedup_cache_ch*.xml"))
 
         # --- replica agreement oracle -----------------------------------------------------------

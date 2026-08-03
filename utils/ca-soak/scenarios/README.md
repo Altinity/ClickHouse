@@ -64,7 +64,7 @@ reclaimable.
 Collect these for every run:
 
 - Configuration: ClickHouse binary revision, branch, pool prefix, `gc_shards`,
-  `dedup_cache_bytes`, `dedup_head_first_min_bytes`, `expect_continue_min_bytes`, replica count, object
+  `deduplication_cache_bytes`, `deduplication_head_first_min_bytes`, `expect_continue_min_bytes`, replica count, object
   store version, and seed.
 - Pool shape: object count and bytes by prefix: `blobs`, `roots`, `_manifests`, `_files`, and `gc`.
 - `system.cas_gc_log`: round, outcome, candidates, deleted, absent,
@@ -706,7 +706,7 @@ Purpose: prove the known-present blob cache is a hint only and bounded by config
 
 Workload:
 
-- Configure tiny `dedup_cache_bytes`.
+- Configure tiny `deduplication_cache_bytes`.
 - Insert a working set larger than the cache, then repeatedly insert a hot subset.
 
 Observations:

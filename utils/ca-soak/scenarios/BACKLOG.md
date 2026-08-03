@@ -171,12 +171,12 @@ bottom. Each entry: a short id/title, the run it came from, what was observed, a
 - **Run:** 20260627T214938_S22_seed20
 - **Observed:** NOT RUN — requires a fault-injecting S3 proxy (503/429/slow/connection-close) between ClickHouse and RustFS; not in the current compose (direct rustfs1 endpoint)
 
-## S24-20260627T215022-1: NOT RUN — requires a storage_conf disk config with a tiny dedup_cache_bytes; cur
+## S24-20260627T215022-1: NOT RUN — requires a storage_conf disk config with a tiny deduplication_cache_bytes; cur
 
 - **Logged (UTC):** 2026-06-27T21:50:23
 - **Severity:** finding
 - **Run:** 20260627T215022_S24_seed20
-- **Observed:** NOT RUN — requires a storage_conf disk config with a tiny dedup_cache_bytes; current compose mounts only the default (64 MiB) config — no small-cache variant
+- **Observed:** NOT RUN — requires a storage_conf disk config with a tiny deduplication_cache_bytes; current compose mounts only the default (64 MiB) config — no small-cache variant
 
 ## S25-20260627T215023-1: scenario raised: Node(localhost:8124) HTTP 404: Code: 81. DB::Exception: Databas
 
@@ -2926,7 +2926,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      invariant guard ("a committed ref must never name a missing/mismatched manifest"), NOT pure waste
      — it is load-bearing on the ADOPT (`Occupied`) path.
   4. **Speculative HEAD-before-PUT for blobs ≥ 1 MiB** — `putBlob`
-     (`CasPartWriteTxn.cpp:171-198`), default `dedup_head_first_min_bytes = 1 MiB` (`CasPool.h:73`).
+     (`CasPartWriteTxn.cpp:171-198`), default `deduplication_head_first_min_bytes = 1 MiB` (`CasPool.h:73`).
      On fresh data every large-blob HEAD misses (498/498) and still PUTs: pure tax (~9.5 s serial).
      Break-even hit rate ≈ HEAD/PUT ≈ 19/46 ≈ 41%; below that it loses. The size branch also defends
      against a broken-pipe / retry-storm on stores that early-close a doomed conditional PUT.
@@ -2952,7 +2952,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   4. **Make HEAD-before-PUT adaptive** (low risk, small): track the recent head-first hit rate
      (`CASBlobBodyPutAvoided`/`CASBlobHeadFirst`) and back off speculative HEADs when it is ~0 (fresh
      bulk load), re-enabling when hits reappear — keeps the dedup win for re-inserts, drops the tax on
-     first loads. Cheaper interim: raise/zero `dedup_head_first_min_bytes` on known low-dedup ingest.
+     first loads. Cheaper interim: raise/zero `deduplication_head_first_min_bytes` on known low-dedup ingest.
      Before dropping the size branch entirely, confirm whether the target S3 endpoint actually
      early-closes doomed conditional PUTs (if not, the branch defends against a non-existent problem).
 - **Confirming metrics (per INSERT `query_id`, `system.query_log` ProfileEvents / `system.events`):**

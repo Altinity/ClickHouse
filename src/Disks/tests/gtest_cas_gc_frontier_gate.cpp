@@ -1033,7 +1033,7 @@ TEST(CASGCFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+                   .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 

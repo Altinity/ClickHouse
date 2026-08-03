@@ -482,7 +482,7 @@ Configuration:
     <gc_enabled>true</gc_enabled>
     <gc_interval_sec>60</gc_interval_sec>
     <gc_shards>1</gc_shards>
-    <dedup_cache_bytes>67108864</dedup_cache_bytes>
+    <deduplication_cache_bytes>67108864</deduplication_cache_bytes>
     <part_folder_cache_bytes>67108864</part_folder_cache_bytes>
     <part_folder_validate>always</part_folder_validate>
 </s3_cas>
@@ -520,10 +520,10 @@ disk, none of the keys below carry a redundant `cas_`/`ca_` prefix.
 - `gc_shards` — `1` by default; must be `>= 1`. Number of blob-hash-prefix shards the GC reducer
   splits work across. This is a creation-time-only setting: on reopen the pool's persisted GC state is
   authoritative.
-- `dedup_cache_bytes` — `64` MiB by default. Size of the in-memory dedup lookup cache.
-- `dedup_head_first_min_bytes` — `1` MiB by default. Minimum object size below which dedup reads the
-  whole head of the object first.
-- `gc_snap_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
+- `deduplication_cache_bytes` — `64` MiB by default. Size of the in-memory deduplication lookup cache.
+- `deduplication_head_first_min_bytes` — `1` MiB by default. Minimum blob size at which a `HEAD` is sent
+  before the body, so that an upload of already-present content can be skipped. `0` disables it.
+- `gc_snapshot_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
 - `manifest_sweep_list_budget_keys` — `1000` by default. Per-round key-listing budget for the manifest
   sweep.
 - `manifest_sweep_delete_budget_keys` — `100` by default. Per-round delete budget for the manifest

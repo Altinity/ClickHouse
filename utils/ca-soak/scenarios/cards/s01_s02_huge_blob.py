@@ -210,7 +210,7 @@ class S02(Scenario):
         # byte-identical output across the two inserts (so the dedup test holds — identical content
         # -> identical blobs -> second insert avoids the body PUT), while being random bytes that do
         # NOT LZ4-compress away. `repeat(single_digit)` (the old generator) compressed to ~0, so the
-        # physical blob stayed < dedup_head_first_min_bytes and the big-blob HEAD-before-PUT dedup
+        # physical blob stayed < deduplication_head_first_min_bytes and the big-blob HEAD-before-PUT dedup
         # path was never exercised (campaign finding 2026-07-03). Same seed + same block settings on
         # both tables => identical row sequence => identical parts.
         gen = (f"SELECT rowNumberInAllBlocks() AS id, payload "

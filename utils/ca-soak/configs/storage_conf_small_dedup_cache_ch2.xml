@@ -15,7 +15,7 @@
                 <gc_interval_sec>10</gc_interval_sec>
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <!-- S24: 1 MiB dedup-cache. -->
-                <dedup_cache_bytes>1048576</dedup_cache_bytes>
+                <deduplication_cache_bytes>1048576</deduplication_cache_bytes>
             </ca>
 
         </disks>

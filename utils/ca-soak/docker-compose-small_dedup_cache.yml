@@ -1,6 +1,6 @@
 # CA soak S24 small-dedup-cache variant.
 # Identical to docker-compose.yml except both ch1 and ch2 mount
-# storage_conf_small_dedup_cache_ch{1,2}.xml which sets dedup_cache_bytes=1 MiB
+# storage_conf_small_dedup_cache_ch{1,2}.xml which sets deduplication_cache_bytes=1 MiB
 # (vs the 64 MiB default) to exercise in-memory dedup-hint eviction + remote HEAD fallback.
 # Use via:
 #   docker compose -f docker-compose-small_dedup_cache.yml up -d / down -v

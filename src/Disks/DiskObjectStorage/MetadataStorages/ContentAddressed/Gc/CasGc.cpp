@@ -1056,7 +1056,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
     for (const RunRef & r : parent_seal_runs)
         referenced_generations.insert(r.generation);
-    /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snap_generations_to_keep`
+    /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snapshot_generations_to_keep`
     /// keeps exactly that many generations back from the current one. If this round's `gc/state` CAS
     /// then LOSES, the prune reclaimed one generation deeper than the durably-adopted generation would
     /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
@@ -1552,7 +1552,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
     ///
     /// NAMED RESIDUAL, and the generation-1 probe NARROWS it rather than closing it. On a pool that has
     /// been pruned, generation 1 LEGITIMATELY does not exist -- `pruneSupersededGenerations` deletes
-    /// whole old generation prefixes once they age past `gc_snap_generations_to_keep` -- so an empty
+    /// whole old generation prefixes once they age past `gc_snapshot_generations_to_keep` -- so an empty
     /// generation-1 probe proves nothing there. A total enumeration blackout on a lived-in, pruned pool
     /// therefore still reads virgin here, and grants it a clean slate with no holds. What the probe
     /// does buy is the un-pruned case: a young pool whose seals the wide listing hid is caught.
@@ -3553,7 +3553,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     if (suppress_destructive)
         return;
 
-    const uint64_t keep = store->poolConfig().gc_snap_generations_to_keep;
+    const uint64_t keep = store->poolConfig().gc_snapshot_generations_to_keep;
     if (keep == 0)
         return;   /// keep ALL (debug/forensics — replay GC's in-degree view as-of a past round)
 

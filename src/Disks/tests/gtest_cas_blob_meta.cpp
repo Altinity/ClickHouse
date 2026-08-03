@@ -164,7 +164,7 @@ TEST(CASBlobMeta, WritesUsePoolRequestController)
 TEST(CASBlobMeta, DeduplicationCacheAdmitsWidth32Digest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test", .dedup_cache_bytes = 64ULL << 20};
+    PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test", .deduplication_cache_bytes = 64ULL << 20};
     auto store = Pool::open(backend, cfg);
 
     BlobDigest wide;

@@ -822,7 +822,7 @@ private:
     /// Attempt-scoped generation retention. The sole reclaimer — bounded per round and fail-open on a benign
     /// 404 (never throw during a prune — it would only wedge GC):
     ///   WHOLESALE generation-retention: every generation at or below the retention floor
-    ///   (`adopted_generation - gc_snap_generations_to_keep`) is reclaimed by LISTing its whole
+    ///   (`adopted_generation - gc_snapshot_generations_to_keep`) is reclaimed by LISTing its whole
     ///   `gc/gen/<g>/` prefix and deleting every object — ALL attempts, including the attempt-scoped
     ///   retired/ and outcomes/ sets AND any deposed-leader debris under a non-adopted attempt. Walks
     ///   forward from `next.snap_pruned_through`, advancing it over generations fully reclaimed (persisted

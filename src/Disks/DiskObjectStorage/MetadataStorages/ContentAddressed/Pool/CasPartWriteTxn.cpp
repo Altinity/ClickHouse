@@ -197,7 +197,7 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
     const bool cache_hit = store->dedupCacheContains(logical_ref);
     const bool head_first =
         cache_hit
-        || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes);
+        || (cfg.deduplication_head_first_min_bytes > 0 && source.size >= cfg.deduplication_head_first_min_bytes);
     if (head_first)
     {
         ProfileEvents::increment(ProfileEvents::CASBlobHeadFirst);

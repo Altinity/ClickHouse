@@ -21,7 +21,7 @@ namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
-    extern const ContentAddressedSettingsUInt64 dedup_cache_bytes;
+    extern const ContentAddressedSettingsUInt64 deduplication_cache_bytes;
     extern const ContentAddressedSettingsString scratch_path;
 }
 
@@ -42,7 +42,7 @@ TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
     s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 60u);          /// table default
-    EXPECT_EQ(s[ContentAddressedSetting::dedup_cache_bytes].value, 64ULL << 20); /// table default
+    EXPECT_EQ(s[ContentAddressedSetting::deduplication_cache_bytes].value, 64ULL << 20); /// table default
     /// Absent key -> the verbatim default (never touches the anchor).
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
 }

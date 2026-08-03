@@ -1189,14 +1189,14 @@ TEST(CASGCRound, SplitBrainLeadersOnlyDuplicateWork)
 
 /// B9 snap-generation retention, reimplemented over the run/generation model: after a generation is
 /// adopted the GC prunes the per-generation seal/run/cleanup objects of generations at or below the
-/// retention floor (snap_generation - gc_snap_generations_to_keep), advancing snap_pruned_through. This
+/// retention floor (snap_generation - gc_snapshot_generations_to_keep), advancing snap_pruned_through. This
 /// test drives enough rounds to accumulate several generations, then asserts that everything at or below
 /// the floor is GONE while the last `keep` generations (and the live current one) remain.
 TEST(CASGCSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1247,7 +1247,7 @@ TEST(CASGCSnapRetention, PrunesOldGenerationsKeepingLastThree)
 TEST(CASGCSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1320,7 +1320,7 @@ TEST(CASGCSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAParti
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
-        .gc_snap_generations_to_keep = 3,
+        .gc_snapshot_generations_to_keep = 3,
         .gc_round_prefix_wholesale_budget = 2,
         .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
@@ -1391,7 +1391,7 @@ TEST(CASGCSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -1450,7 +1450,7 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1509,7 +1509,7 @@ TEST(CASGCRetention, PruneRetainsLiveReferencedRun)
 TEST(CASGCRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xAA);
 
@@ -1584,7 +1584,7 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
     /// on, which this test must deliberately avoid for the debris generation).
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
-        .gc_snap_generations_to_keep = 5,
+        .gc_snapshot_generations_to_keep = 5,
         .gc_shards = 2,
         .gc_round_prefix_wholesale_budget = 2,             /// prune: starvation-small, shared by nothing else
         .gc_round_handoff_prefix_wholesale_budget = 5,      /// hand-off: its own separate reserve
@@ -1678,7 +1678,7 @@ TEST(CASGCRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
 TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 {
     auto backend = std::make_shared<GcStateCasFaultBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 1});
     const Layout & layout = store->layout();
     backend->faulted_key = layout.gcStateKey();
     const RootNamespace ns{"00/aa@cas@"};
@@ -1760,7 +1760,7 @@ TEST(CASGCRetention, LosingRoundNeverDestroysParentSealGeneration)
 TEST(CASGCSnapRetention, KeepZeroPrunesNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snapshot_generations_to_keep = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 

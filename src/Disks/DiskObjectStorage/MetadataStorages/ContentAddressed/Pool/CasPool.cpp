@@ -208,10 +208,10 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           config.cas_request_budget,
           [this] { return tryRemountOnce(); })
 {
-    if (config.dedup_cache_bytes > 0)
+    if (config.deduplication_cache_bytes > 0)
         dedup_cache = std::make_unique<DeduplicationCache>(
             "LRU", CurrentMetrics::CASDeduplicationCacheBytes, CurrentMetrics::CASDeduplicationCacheEntries,
-            config.dedup_cache_bytes, DeduplicationCache::NO_MAX_COUNT, DeduplicationCache::DEFAULT_SIZE_RATIO);
+            config.deduplication_cache_bytes, DeduplicationCache::NO_MAX_COUNT, DeduplicationCache::DEFAULT_SIZE_RATIO);
 }
 
 bool Pool::isAlgoAdmitted(BlobHashAlgo algo) const

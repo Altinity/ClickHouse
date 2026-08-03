@@ -20,7 +20,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK="05008_ca_gc_snap_prune"
+DISK="05008_cas_gc_snapshot_prune"
 
 # CA-over-LOCAL object storage emits a one-time <Warning> about emulated conditional operations on
 # mount; the .sh harness fails on ANY client stderr, so send only error+ logs to the client (real
@@ -43,7 +43,7 @@ SETTINGS disk = disk(
     gc_interval_sec = 1),
     old_parts_lifetime = 1"
 
-# Two distinct inserts => distinct blobs (not deduped away); TRUNCATE drops every ref so the
+# Two distinct inserts => distinct blobs (not deduplicated away); TRUNCATE drops every ref so the
 # blobs/trees become unreferenced GC fodder.
 $CLIENT -q "INSERT INTO t_ca_p9 SELECT number, toString(number) FROM numbers(1000)"
 $CLIENT -q "INSERT INTO t_ca_p9 SELECT number, toString(number) FROM numbers(1000, 1000)"

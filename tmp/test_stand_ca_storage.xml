@@ -40,14 +40,14 @@
         <!-- <gc_shards>1</gc_shards> -->
 
         <!-- In-memory dedup cache (hash -> known-present) that skips duplicate uploads. -->
-        <!-- <dedup_cache_bytes>67108864</dedup_cache_bytes> -->
+        <!-- <deduplication_cache_bytes>67108864</deduplication_cache_bytes> -->
 
         <!-- Blobs >= this size do a HEAD before the conditional PUT (cheap dedup probe for
              big objects; small ones just PUT with If-None-Match). -->
-        <!-- <dedup_head_first_min_bytes>1048576</dedup_head_first_min_bytes> -->
+        <!-- <deduplication_head_first_min_bytes>1048576</deduplication_head_first_min_bytes> -->
 
         <!-- How many sealed GC snapshot generations to retain for introspection/debug. -->
-        <!-- <gc_snap_generations_to_keep>3</gc_snap_generations_to_keep> -->
+        <!-- <gc_snapshot_generations_to_keep>3</gc_snapshot_generations_to_keep> -->
 
         <!-- Orphan part-manifest sweep budgets per GC round (LIST keys / DELETE keys). -->
         <!-- <manifest_sweep_list_budget_keys>1000</manifest_sweep_list_budget_keys> -->

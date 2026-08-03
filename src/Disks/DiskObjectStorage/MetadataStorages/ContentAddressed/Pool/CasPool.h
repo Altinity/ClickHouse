@@ -70,10 +70,10 @@ struct PoolConfig
     /// Dedup cache: byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
     /// cache (every create misses → HEAD-before-PUT only). A hint cache; correctness never depends on
     /// it (a stale hit is caught by the mandatory HEAD in putBlob).
-    uint64_t dedup_cache_bytes = 64ULL << 20;        /// 64 MiB
+    uint64_t deduplication_cache_bytes = 64ULL << 20;        /// 64 MiB
     /// HEAD-before-PUT: on a dedup-cache MISS, a blob whose body is >= this many bytes is written
     /// HEAD-first (a cheap HEAD avoids streaming a body that would 412). 0 disables the size trigger.
-    uint64_t dedup_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
+    uint64_t deduplication_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
     /// Part-folder cache: byte bound for the manifest DECODE cache. The old cache
     /// was count-bounded only (16384 entries) — decoded manifests carry inline bytes, so the worst
     /// case was multi-GB. 0 disables decode caching (every read decodes fresh — diagnostic mode).
@@ -83,7 +83,7 @@ struct PoolConfig
     /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
     /// margin covering any in-flight/resuming leader (a leader more than `keep` generations behind
     /// has lost its lease; its round-commit CAS fails).
-    uint64_t gc_snap_generations_to_keep = 3;
+    uint64_t gc_snapshot_generations_to_keep = 3;
     /// Blob target shards for GC. Default 1 (a single shard, i.e. no fan-out). Creation-time only;
     /// the pool is authoritative on reopen. This is the BLOB-HASH-prefix reducer axis.
     uint64_t gc_shards = 1;
@@ -724,7 +724,7 @@ public:
 
     /// Known-present blob-hash cache. A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
-    /// No-ops when disabled (dedup_cache_bytes == 0). Keyed on the full `BlobRef` pair:
+    /// No-ops when disabled (deduplication_cache_bytes == 0). Keyed on the full `BlobRef` pair:
     /// a bare digest is never the blob identity, and the same digest value under two algos is two
     /// different objects.
     bool dedupCacheContains(const BlobRef & ref) const;
@@ -1049,7 +1049,7 @@ private:
 
     /// Known-present cache: a bytes-bounded LRU set of blob hashes confirmed present in the pool.
     /// Value is a 1-byte presence marker; DedupWeight charges a fixed per-entry byte estimate so the
-    /// configured `dedup_cache_bytes` is an honest memory ceiling. nullptr ⇔ disabled.
+    /// configured `deduplication_cache_bytes` is an honest memory ceiling. nullptr ⇔ disabled.
     /// Marker stored for a blob hash known to be present. The value has no payload; the cache key is
     /// the complete `BlobRef`, including its hash algorithm.
     struct DedupPresent {};

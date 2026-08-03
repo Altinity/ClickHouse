@@ -34,7 +34,7 @@ namespace
 PoolPtr openUploadPool(const std::shared_ptr<InMemoryBackend> & b, uint64_t head_first_min_bytes = (1ULL << 20))
 {
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                    .dedup_head_first_min_bytes = head_first_min_bytes});
+                                    .deduplication_head_first_min_bytes = head_first_min_bytes});
 }
 
 /// Stage a one-blob manifest for `payload` and precommit it, so `observeAndAdmit`'s EDGE-BEFORE-OBSERVE

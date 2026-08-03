@@ -53,8 +53,8 @@ private:
 PoolConfig cfg(uint64_t cache_bytes, uint64_t head_first_min_bytes)
 {
     PoolConfig c{.pool_prefix = "p", .server_root_id = "test"};
-    c.dedup_cache_bytes = cache_bytes;
-    c.dedup_head_first_min_bytes = head_first_min_bytes;
+    c.deduplication_cache_bytes = cache_bytes;
+    c.deduplication_head_first_min_bytes = head_first_min_bytes;
     return c;
 }
 
@@ -70,7 +70,7 @@ TEST(CASDeduplicationCache, AddThenContains)
     EXPECT_TRUE(s->dedupCacheContains(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(h)}));
 }
 
-/// Task 2: dedup_cache_bytes == 0 disables the cache — add is a no-op, contains is always false.
+/// Task 2: deduplication_cache_bytes == 0 disables the cache — add is a no-op, contains is always false.
 TEST(CASDeduplicationCache, DisabledNeverContains)
 {
     auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 0, 1ULL << 20));
@@ -186,7 +186,7 @@ TEST(CASDeduplicationCache, StaleHitFallsThroughToPut)
     EXPECT_TRUE(counting->head(s->layout().blobKey(ref.ref)).exists);
 }
 
-/// Task 5 (P2): on a cold cache, a body at/above dedup_head_first_min_bytes still probes HEAD-first
+/// Task 5 (P2): on a cold cache, a body at/above deduplication_head_first_min_bytes still probes HEAD-first
 /// (here the size trigger fires for a tiny body because the threshold is set to 1). The miss falls
 /// through to a real PUT.
 TEST(CASDeduplicationCache, LargeBlobMissTakesHeadFirst)

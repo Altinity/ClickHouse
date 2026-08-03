@@ -41,7 +41,7 @@ _VARIANT_FILE = {
     # S36/S37: local+CA (and local+local+CA) multi-disk storage policies (ca_local / ca_local3)
     # alongside the same shared CA disk, for MOVE PART/PARTITION and policy-driven tiering tests.
     "multidisk": "docker-compose-multidisk.yml",
-    # Soak-matrix config sweeps (opt §2 dedup_cache_bytes, §3 part_folder_validate): render_tuned_config
+    # Soak-matrix config sweeps (opt §2 deduplication_cache_bytes, §3 part_folder_validate): render_tuned_config
     # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
     # fixed per-variant XML the other entries above use.
     "tuned": "docker-compose-tuned.yml",
@@ -68,7 +68,7 @@ def render_tuned_config(overrides: dict) -> None:
     one child element per override inside the <ca> disk block (replacing a same-named child if present).
 
     Each call re-parses the base XML from scratch, so repeated calls are idempotent by construction —
-    there is no way to accumulate stale children across runs. Soak-matrix sweeps (opt §2 dedup_cache_bytes,
+    there is no way to accumulate stale children across runs. Soak-matrix sweeps (opt §2 deduplication_cache_bytes,
     §3 part_folder_validate) feed one variable per run through here instead of hand-authoring a
     storage_conf_<variant>.xml + docker-compose-<variant>.yml pair per value (the S24 smalldedupcache
     variant is the pattern this replaces for ad hoc single-knob sweeps).

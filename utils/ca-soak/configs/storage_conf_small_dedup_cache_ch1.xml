@@ -2,7 +2,7 @@
     <storage_configuration>
         <disks>
             <!-- S24 small-dedup-cache variant: identical to storage_conf_ch1.xml except
-                 dedup_cache_bytes is reduced to 1 MiB (default 64 MiB) to exercise the
+                 deduplication_cache_bytes is reduced to 1 MiB (default 64 MiB) to exercise the
                  in-memory dedup-hint eviction path.  When the working set of distinct
                  blob heads exceeds 1 MiB, the cache evicts entries, forcing remote
                  HEAD-first probes (CASBlobHeadFirst) on re-insert rather than in-memory
@@ -23,7 +23,7 @@
                      remote-HEAD fallback path.  Correctness unchanged: a cache miss still
                      dedups via HEAD before the body PUT (CASBlobBodyPutAvoided stays
                      positive). -->
-                <dedup_cache_bytes>1048576</dedup_cache_bytes>
+                <deduplication_cache_bytes>1048576</deduplication_cache_bytes>
             </ca>
 
             <!-- Read-only fsck alias — same reduced cache, GC disabled. -->

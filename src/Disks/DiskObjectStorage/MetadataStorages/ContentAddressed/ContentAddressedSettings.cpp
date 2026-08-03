@@ -67,9 +67,9 @@ static const std::set<std::string> non_cas_keys = {
     DECLARE(String, blob_hash, "cityhash128", "Pool blob content-hash function (cityhash128 | xxh3-128 | sha256); fixed at pool creation", 0) \
     DECLARE(Bool,   blob_hash_allow_new, false, "Explicit opt-in to admit a NEW hash algo into an existing pool's algos_used", 0) \
     DECLARE(Bool,   skip_access_check, false, "Skip the boot-time capability probe (start now, fix later)", 0) \
-    DECLARE(UInt64, dedup_cache_bytes, 64ULL << 20, "Byte budget of the blob presence cache (0 disables)", 0) \
-    DECLARE(UInt64, dedup_head_first_min_bytes, 1ULL << 20, "Minimum blob size to try a HEAD before uploading the body", 0) \
-    DECLARE(UInt64, gc_snap_generations_to_keep, 3, "GC snapshot generations retained", 0) \
+    DECLARE(UInt64, deduplication_cache_bytes, 64ULL << 20, "Byte budget of the blob presence cache (0 disables)", 0) \
+    DECLARE(UInt64, deduplication_head_first_min_bytes, 1ULL << 20, "Minimum blob size to try a HEAD before uploading the body", 0) \
+    DECLARE(UInt64, gc_snapshot_generations_to_keep, 3, "GC snapshot generations retained", 0) \
     DECLARE(UInt64, gc_shards, 1, "Blob-hash-prefix reducer shards (>= 1); creation-time only", 0) \
     DECLARE(UInt64, manifest_sweep_list_budget_keys, 1000, "Orphan-manifest sweep LIST budget per round", 0) \
     DECLARE(UInt64, manifest_sweep_delete_budget_keys, 100, "Orphan-manifest sweep DELETE budget per round", 0) \
