@@ -80,6 +80,53 @@ private:
     bool added = false;
 };
 
+/// Admits the late catalog entry between the retirement tail's two exact catalog reads
+/// (`retirement_catalog_cut`, then `fresh_retirement_catalog`), never before. The mountpoint drain's
+/// `list("p/roots/victim/", ...)` is the last LIST call in `decommissionPoolMember` before either
+/// read, so it orders the two `get("p/cas/ref_catalog")` calls that follow it: the first is
+/// `retirement_catalog_cut`, the second is `fresh_retirement_catalog`. Mutating on the second call
+/// makes that read observe a catalog the first read did not.
+class MutateCatalogBetweenRetirementReadsBackend final : public InMemoryBackend
+{
+public:
+    void arm() { armed = true; }
+    bool fired() const { return added; }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        if (armed && !past_mountpoint_drain && prefix == "p/roots/victim/" && cursor.empty())
+            past_mountpoint_drain = true;
+        return page;
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (armed && past_mountpoint_drain && !added && key == "p/cas/ref_catalog")
+        {
+            if (!seen_retirement_catalog_cut)
+                seen_retirement_catalog_cut = true;
+            else
+            {
+                added = true;
+                CasRefCatalog::casAdmitEntry(
+                    *this, Layout("p"), 1,
+                    CatalogEntry{
+                        .ns = RootNamespace("victim/db/late"),
+                        .state = NsState::Live,
+                        .incarnation = UInt128{707}});
+            }
+        }
+        return InMemoryBackend::get(key, range);
+    }
+
+private:
+    bool armed = false;
+    bool past_mountpoint_drain = false;
+    bool seen_retirement_catalog_cut = false;
+    bool added = false;
+};
+
 TEST(CasDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeepsSlot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -185,7 +232,7 @@ TEST(CasDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     ASSERT_EQ(progressed_stream.keys.size(), 1u);
 }
 
-TEST(CasDecommissionCatalogDuties, FinalCatalogFenceKeepsSlotWhenVictimEntryAppearsDuringDrain)
+TEST(CasDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot)
 {
     auto backend = std::make_shared<AddVictimEntryDuringRootDrainBackend>();
     { auto victim = openVictim(backend); }
@@ -196,7 +243,27 @@ TEST(CasDecommissionCatalogDuties, FinalCatalogFenceKeepsSlotWhenVictimEntryAppe
 
     EXPECT_TRUE(backend->fired());
     EXPECT_FALSE(report.slot_removed);
-    EXPECT_FALSE(report.warnings.empty());
+    ASSERT_FALSE(report.warnings.empty());
+    EXPECT_NE(report.warnings.front().find("catalog still owns victim namespaces"), String::npos)
+        << report.warnings.front();
+    EXPECT_TRUE(slotObjectExists(*backend, "owner"));
+    EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
+}
+
+TEST(CasDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot)
+{
+    auto backend = std::make_shared<MutateCatalogBetweenRetirementReadsBackend>();
+    { auto victim = openVictim(backend); }
+    backend->arm();
+
+    const DecommissionReport report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(backend->fired());
+    EXPECT_FALSE(report.slot_removed);
+    ASSERT_FALSE(report.warnings.empty());
+    EXPECT_NE(report.warnings.front().find("catalog changed after the victim ownership check"), String::npos)
+        << report.warnings.front();
     EXPECT_TRUE(slotObjectExists(*backend, "owner"));
     EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
