@@ -30,7 +30,7 @@ Plan: `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md` (`{#t8}`). Le
 |---|---|---|---|
 | Full CA gate, release | 1977/1977, 277 suites, exit 0 (`hygiene_gate_release_v2.log`, T1-lane closure) | **2007/2007, 279 suites, exit 0** (`build/t8_full_gate_release.log`, `GATE_RELEASE_EXIT=0`, 2026-08-03, this task's own commit `44db0d3739`) | +30 tests / +2 suites since the T1-lane baseline, from T2 (ordering/poison/backoff suite, net +4 after a tautology-test removal), T3 (fence-arm rename+add, fsck grammar tests), T4 (duty-queue/orphan-nomination tests), T5 (probe-A deletion, net −3), T6/T6b (destruction-enablement + 9 budget-setting tests), the shortkeys/obscure-names/naming-sweep mechanical renames (~0 net), and this task's own item-4/F1/F2 additions (+1 `TEST()`, `CasPutExceptionPropagatesAfterMandatoryResolution`; F1/F2 extend an EXISTING test body, no new `TEST()`). The most recent prior measurement (shortkeys agent, commit `397251114c3`, ~35 min before this run) recorded 2006/2006, 279 suites — this run's +1 is exactly this task's new `CasPutException...` test |
 | Full CA gate, ASan | 1982/1982, 295 suites, exit 0 (`hygiene_gate_v3.log`, T1-lane closure) | **2012/2012, 297 suites, exit 0** (`build_asan/t8_full_gate_asan.log`, `GATE_ASAN_EXIT=0`, 2026-08-03) | same additions as the release row; ASan carries extra `DeathTest` twins over release (death-test split for `LOGICAL_ERROR` sites) — shortkeys' prior ASan measurement was 2011/2011, 297 suites; this run's +1 test is this task's new `CasPutException...` test, same as the release delta, with 0 suite-count change (the test landed in an existing suite) |
-| Integration lanes (CA selector set) | — | *(fill: green/red per group — waits for the controller's battery orchestration)* | — |
+| Integration lanes (`tests/integration/test_cas_*`, 10 dirs, 2 batches of 5) | — | see `{#integration-lane-results}` below | — |
 | Soak (a) churn — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
 | Soak (a) churn — 30m full | — | *(fill)* | — |
 | Soak (b) rebirth adversarial (S44) — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
@@ -46,6 +46,29 @@ suite-naming normalization to a single `Cas` prefix, described in the plan's
 checks the `CAS*` invariant, matching what is actually in the tree today. Whoever runs that sweep
 later must also update the invariant script and re-derive the gate filter). Gates run under
 `flock "$(git rev-parse --git-common-dir)/unit_tests.lock"`, one build at a time.
+
+## Integration lane results {#integration-lane-results}
+
+10 `tests/integration/test_cas_*` dirs, run via `python3 -m ci.praktika run "integration" --test
+<selectors>` from the repo root, `ci/tmp/clickhouse` symlinked to a freshly rebuilt
+`build/programs/clickhouse` (rebuilt at this document's base commit before the batches ran). Two
+batches of 5, strictly sequential (never overlapped with anything else on the box).
+
+| Lane | Verdict | One-liner |
+|---|---|---|
+| `test_cas_drop_pool_member` | PASS | 2/2 (`test_drop_dead_pool_member_heals_the_pool`, `test_drop_pool_member_rejected_on_readonly_disk`) |
+| `test_cas_file_cache` | PASS | 2/2 (`test_cache_over_ca_startup_and_roundtrip`, `test_cache_hits_on_repeated_reads`) |
+| `test_cas_gc_s3` | PASS | 1/1 (`test_gc_reclaims_dropped_blobs`) |
+| `test_cas_gc_sharded` | SKIPPED (pre-existing, infra) | `test_sharded_gc_soak` skips itself: "CA capability probe requires DeleteObject If-Match (ETag-conditional delete, MinIO >= RELEASE.2025-09). The integration-test MinIO image (RELEASE.2024-09-13T20-26-02Z) does not support it; the probe fails fail-closed and the server refuses to start." A pre-existing, self-documented infra gap in the local MinIO image version, not a CAS regression — the test's own skip reason names the fix (update the image) |
+| `test_cas_insert_fault_recovery` | PASS | 1/1 (`test_post_multi_termination_uses_ordinary_lost_part_recovery`) |
+| `test_cas_lazy_load_recovery` | *(fill — batch B in progress)* | |
+| `test_cas_ref_snaplog` | *(fill)* | |
+| `test_cas_replicated_relink` | *(fill)* | |
+| `test_cas_s3` | *(fill)* | |
+| `test_cas_shared_pool` | *(fill)* | |
+
+Batch A: `build/t8_integration/batchA.log`, `PRAKTIKA_EXIT=0`, 6 passed / 1 skipped in 53.90s.
+Batch B: `build/t8_integration/batchB.log`, in progress.
 
 ## The six result criteria, as gate rows {#six-result-criteria}
 
