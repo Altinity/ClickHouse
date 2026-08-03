@@ -3233,3 +3233,10 @@ than to an error.
 - **Run:** 20260729T123126_S43_seed20260729
 - **Observed:** quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table default.w3_recreated (3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b) is not replicated. (BAD_ARGUMENTS) (version 26.6.1.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA w3_recreated
 
+## S45-20260803T112822-1: scenario raised: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table d
+
+- **Logged (UTC):** 2026-08-03T11:28:36
+- **Severity:** suspected-bug
+- **Run:** 20260803T112822_S45_seed3
+- **Observed:** scenario raised: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s45_victim_0 does not exist. (UNKNOWN_TABLE) (version 26.6.1.20000.altinityantalya) | sql=SYSTEM SYNC REPLICA s45_victim_0
+
