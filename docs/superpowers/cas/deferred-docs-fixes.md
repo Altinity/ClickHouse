@@ -695,3 +695,14 @@ default (the seam was deleted) and misquotes the draft pick's subject (already i
 (T6, IMPRECISE) the `planManifestCursorPage` call-site comment in `CasGc.cpp` says the planner
 reuses the round's catalog/checkpoint cut; it takes its own later cut (reviewed conservative —
 no over-delete); correct when the T6-1 budget rework touches this path.
+
+### D45 — Fable T6-review prose batch {#d45-fable-t6-review-prose}
+
+From `t6-review-fable.md`: (P-1, FALSE, pre-existing) a `CasGc.cpp` comment claims a `chassert`
+that does not exist; (P-2, STALE) the `fold_ref_intake` metric comment still defines the universe
+as "hint ∪ sealed cursors ∪ catalog", contradicting the arc's own catalog-authoritative rewrite;
+(P-4, STALE) residual Stage-A framings in untouched files — `CasOrphanManifestSweep.h`,
+`CasGc.cpp` R4-register citation, `CasGc.h` sentinel comment, `CasLayout.h`; (P-5, IMPRECISE)
+`t6-report.md` §7 "No edit was needed" is true of the fix wave only. Observation T-1 (anomaly and
+carried-hold gate terms are structurally redundant with frontier incompleteness on current shapes —
+no test isolates them) is carried to the T8 residual/hygiene row, not a docs item.
