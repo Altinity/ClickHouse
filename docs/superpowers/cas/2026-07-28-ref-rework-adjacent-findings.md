@@ -98,9 +98,10 @@ The reason it goes rather than stays: a sampled store-quality detector whose sig
 be a liar" is obsolete once the catalog is the authoritative universe (Stage B Task 4) and recovery
 is LIST-independent (Task 5b) — correctness no longer rests on LIST fidelity, so paying a second
 full `cas/refs/` enumeration to measure it buys nothing. B1/B2 accounting and the mount-time
-capability probe (#23) are explicitly KEPT. Executes as plan Task 7a of
-`docs/superpowers/plans/2026-07-28-cas-ref-chain-stage-b-catalog.md`; the result criterion is that
-no round performs a second full ref LIST.
+capability probe (#23) are explicitly KEPT. Specified as plan Task 7a of
+`docs/superpowers/plans/2026-07-28-cas-ref-chain-stage-b-catalog.md` and executed as Task T5 of
+`docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md`; the result criterion is that no round
+performs a second full ref LIST.
 
 ## R9. Never-born namespaces have no late-PUT fence — [final review M4, fail-closed retention] {#r9-neverborn-fence}
 

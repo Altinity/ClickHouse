@@ -45,8 +45,8 @@ namespace
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 
 /// The lying store is `HintHoleBackend` from `cas_test_helpers.h`: LIST permanently omits keys that
-/// stay readable by exact key. Permanent (not nth-call) omission keeps GC's probe A quiet by its own
-/// stated limitation, so these tests exercise the intake walk and not the probe.
+/// stay readable by exact key, so these tests exercise the intake's arithmetic walk rather than any
+/// one `list` call.
 
 /// The `RefCoverage` the newest fold seal recorded for `ns`'s opaque catalog life, or nullopt when the
 /// seal has no entry for it. Scans downward from the adopted generation for the most recent fold seal,

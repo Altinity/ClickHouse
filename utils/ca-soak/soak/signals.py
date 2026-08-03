@@ -50,39 +50,15 @@ CAS_SIGNAL_EVENT_NOTES = (
      "made, nothing can be durable). EXPECTED to be nonzero under chaos — this is the availability fix "
      "working, and it is counted apart from CasRefAppendWedged so a falling wedge count cannot be "
      "misread as nothing happening."),
-    ("CasGcProbeAHolePresent",
-     "Probe A holes CONFIRMED to still exist by a HEAD taken at the moment of the disagreement. This is "
-     "the direct observation that a ref-prefix enumeration OMITTED a durable object — the "
-     "LIST-as-journal release blocker, seen rather than inferred. Cannot be reconstructed afterwards: by "
-     "the time a log is read the object has legitimately been deleted either way."),
-    ("CasGcProbeAHoleAbsent",
-     "Probe A holes that were ABSENT when HEADed at firing time. The OPPOSITE defect to "
-     "CasGcProbeAHolePresent and it indicts a different component: the other enumeration returned a key "
-     "that is not there, which points at the listing client or iterator rather than at store "
-     "completeness. Watched separately precisely so the two are never summed into one number."),
     ("CasRefAppendWedged",
      "Ref-log append lanes that exhausted retries after an UNCERTAIN put. Ref-log progress may be "
      "stalled on that lane."),
-    ("CasGcProbeADue",
-     "GC rounds on which the sampled ref-prefix store-quality detector was DUE by its deterministic "
-     "cadence (`gc_probe_a_period`). Watched together with CasGcProbeAPerformed because a "
-     "disagreement count can only be read against how many rounds were actually sampled."),
-    ("CasGcProbeAPerformed",
-     "GC rounds on which that detector actually compared two independent enumerations, at one extra "
-     "full ref-prefix LIST each. Zero here with CasGcProbeADue nonzero means every sample failed."),
     ("CasGcClampSuppressedPasses",
      "GC passes that deferred graduation and deletion because reachability was uncertain — GC held "
      "back. Fail-closed behaviour, but a steady rate means GC is not converging."),
     ("CasGcCondemnMarkerUnconfirmedCarry",
      "Retirements delayed because a durable condemn marker could not be confirmed. Safe (deletion is "
      "postponed) but points at marker write/read failures."),
-    ("CasGcRefScanDisagreements",
-     "Ref-log ids on which a round's two independent enumerations of the ref prefix disagreed below "
-     "the other enumeration's own maximum id. An append cannot produce that shape: it means the store "
-     "answered inconsistently about a durable prefix, or a deposed leader deleted ref objects. A "
-     "STORE-QUALITY READING ONLY since the sampled detector landed: the round's ref intake reads by "
-     "exact key, so a nonzero value no longer aborts the round or suppresses any step. It can only "
-     "move on a round the detector sampled — read it against CasGcProbeAPerformed."),
 )
 
 # The late-PUT-loses invariant, as counters. Two families, and the difference between them is the
@@ -297,12 +273,9 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 # The per-phase GC log
 # ---------------------------------------------------------------------------
 
-# The four values the 2026-07-25 detector work made observable, addressed as (phase, metric). They are
+# The three values the 2026-07-25 detector work made observable, addressed as (phase, metric). They are
 # emitted UNCONDITIONALLY on every folding round precisely so that "healthy" has a printed value and
 # the one round that is not healthy stands out — which only helps if something reads them, hence this.
-#   fold_ref_list.probe_a_holes      — ids missing from one of two independent enumerations of the ref
-#                                      prefix, below the other's own maximum id. An append cannot make
-#                                      that shape.
 #   fold_ref_intake.logs_accounted   — ref-log POSITIONS the round's sealed cut declares covered,
 #                                      counted arithmetically per epoch entered (renamed from
 #                                      `logs_intended` when the fold stopped deriving the cut from the
@@ -312,7 +285,6 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 #   fold_reduce.txns_unapplied       — folded+merged transactions whose blob deltas never reached a
 #                                      shard reducer. The fail-closed twin of CasGcUnappliedFoldedTxns.
 DETECTOR_METRICS = (
-    ("fold_ref_list", "probe_a_holes"),
     ("fold_ref_intake", "logs_accounted"),
     ("fold_ref_intake", "logs_applied"),
     ("fold_reduce", "txns_unapplied"),
@@ -323,7 +295,7 @@ DETECTOR_METRICS = (
 # Scalar columns pulled out of `phase_metrics` by name. `map['absent']` is a DEFINED zero for a
 # ClickHouse Map, so these columns are exact whatever the aggregate does with absent keys — unlike
 # reading them back out of a summed map, whose zero-key behaviour we would be depending on.
-_DETECTOR_COLUMNS = ("probe_a_holes", "logs_accounted", "logs_applied", "txns_unapplied",
+_DETECTOR_COLUMNS = ("logs_accounted", "logs_applied", "txns_unapplied",
                      "ref_folding_aborted")
 
 
@@ -332,7 +304,7 @@ def phase_summary_sql(since_ts: int) -> str:
 
     One row per phase, ordered slowest-first, carrying: how many distinct round attempts touched the
     phase (`round_id`, which exists even for a round that never led or never committed — `round` does
-    not), the wall-clock the phase spent, its worst single occurrence, the five detector values as
+    not), the wall-clock the phase spent, its worst single occurrence, the four detector values as
     exact scalars, and the whole summed `phase_metrics` / `ProfileEvents` maps for the load study.
 
     JSONEachRow rather than TabSeparated because two columns are maps whose values would otherwise
@@ -396,7 +368,7 @@ def summarize_phases(rows, *, top_n: int = 5) -> dict:
       only the phases it reached.
     * `slowest` — the `top_n` phases by total time, each with its worst single occurrence. This is the
       thing that was unanswerable before `d412f85f749`: "where did round 33 spend 39 minutes".
-    * `detector` — the four detector values plus `ref_folding_aborted`, summed over the window, keyed
+    * `detector` — the three detector values plus `ref_folding_aborted`, summed over the window, keyed
       `<phase>.<metric>`. Absent (not zero) when the owning phase never ran in the window: a round
       that never led emits no `fold_*` phase at all, and calling that "0 holes" would be a claim the
       data does not support.

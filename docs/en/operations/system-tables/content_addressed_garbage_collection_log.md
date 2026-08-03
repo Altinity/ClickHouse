@@ -73,7 +73,6 @@ The phases, in execution order:
 | `pre_fold_ref_drain` | Resolve catalog rows whose terminal fold evidence is already adopted before this invocation publishes or defers. | catalog `GET` + exact `CAS` |
 | `heartbeat_floor` | Classify every mount slot and fence out the dead ones. | `LIST` of the mount prefix, one `GET` per mount, one `PUT` per fence |
 | `defer_decision` | The skip-unchanged decision: graduation check plus the round's one enumeration of the ref prefix. | one full ref-prefix `LIST`, two fold-seal `GET`s |
-| `ref_list_probe` | The sampled ref-prefix store-quality detector. Emitted on every folding round; it only enumerates anything on the rounds its cadence makes due, and it aborts and gates nothing. | one full ref-prefix `LIST` on a due round, none otherwise |
 | `parent_seal_read` | Capture the pre-fold seal's run refs for the hand-off reclaim. | one fold-seal `GET` |
 | `fold_ref_group` | Regroup the round's enumeration into per-table listings — what this round will fold. | none |
 | `fold_seal_read` | The adopted fold seal, read twice at the same generation and attempt. | two fold-seal `GET`s |

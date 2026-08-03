@@ -209,11 +209,7 @@ using GcPhaseSink = std::function<void(const GcPhaseRecord &)>;
 ///
 /// It is a HINT, never a census. The fold's intake walks the ref stream ARITHMETICALLY by exact key
 /// (`cursor + 1`, epoch crossings proved through the seal chain), so an id this enumeration omits is
-/// still folded, and the round listing the prefix a second time would buy the intake nothing. The
-/// second enumeration this round used to perform — kept deliberately separate so the two could be
-/// compared — now happens only on the rounds the sampled store-quality detector is due
-/// (`PoolConfig::gc_probe_a_period`, `Gc::sampleRefListQuality`), and its result reaches nothing but
-/// the detector's own report.
+/// still folded, and the round listing the prefix a second time would buy the intake nothing.
 struct RefScanSummary
 {
     size_t changed_shards = 0;                          /// tables with a log above their sealed cursor
@@ -833,20 +829,6 @@ private:
     /// and the validated adopted-parent rows. Its `RoundInput` can only be moved into the authoritative
     /// plan builder; the resulting `RefPlan` owns all three and is the only value that reaches consumers.
     RoundInput listRefPrefix(const GcState & state);
-
-    /// THE STORE-QUALITY DETECTOR (historically "probe A"). SAMPLED on a deterministic cadence
-    /// (`PoolConfig::gc_probe_a_period`): on a due round it performs ONE extra full enumeration of
-    /// `cas/ns/stream/` and compares it against the round's own (`round_scan`).
-    ///
-    ///   an id present in one enumeration, absent from the other, and STRICTLY BELOW the other
-    ///   enumeration's maximum id for that same namespace CANNOT be a concurrent append.
-    ///
-    /// It ABORTS NOTHING AND GATES NOTHING: it records no anomaly (an anomaly would suppress the
-    /// round's destructive steps), holds no namespace, and moves no cursor. The signal it carries is
-    /// about the STORE, and the fold is immune to it by construction — the intake reads by exact key.
-    /// Its whole output is a report: the `ref_list_probe` phase row (`due`/`performed`/`skipped`/
-    /// `holes`), `gc_anomaly` audit rows, `CasGcProbeA*` ProfileEvents, and the text log.
-    void sampleRefListQuality(const RefPlan & walk_plan, uint64_t current_round);
 
     /// (`reclaimDroppedShards` was removed with the snapshot+log ref model: there is no mutable
     /// per-namespace shard object to tombstone and reclaim; the perpetual janitor owns dead-life bytes.)

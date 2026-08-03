@@ -576,8 +576,9 @@ by LIST never substitutes for the adopted parent in the drain.
 Ref coverage is keyed by opaque current `life_id`; a catalog-created unhinted plan row carries its
 matching parent coverage verbatim. An input life row absent from the cut is counted and dropped. B1:
 `logs_accounted == logs_applied` over the cut, `EpochSeal` an applied no-op (B2 `produced=false`).
-Probe A: sampled, deterministic cadence, durable due/performed/skipped observability; aborts
-nothing; the mount-time store gate (#23) is separate. Cleanup: covered logs are contiguous
+Probe A (the sampled store-quality detector) is deleted outright, not merely demoted: the round
+enumerates `cas/ns/stream/` exactly once, on every round, with no second cadence-sampled walk; the
+mount-time store gate (#23) is separate and unaffected. Cleanup: covered logs are contiguous
 computable ranges under `_ckpt.checkpoint` + cursor; crossed dead epochs delete as closed ranges.
 A malformed physical stream key, an ambiguous current `life_id` or a generation-5 current-name mismatch
 may abort ref folding and suppress destruction. A well-formed opaque id returned by the completed hot

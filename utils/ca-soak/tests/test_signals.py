@@ -169,7 +169,6 @@ def _phase_row(phase, **kw):
         "calls": "3",
         "total_us": "1000",
         "max_us": "600",
-        "probe_a_holes": "0",
         "logs_accounted": "0",
         "logs_applied": "0",
         "txns_unapplied": "0",
@@ -194,7 +193,7 @@ def test_phase_summary_sql_scopes_to_phase_rows_and_the_window():
     # round_id, not `round`: `round` is 0 on Start and nonexistent on a non-leader round, i.e. absent
     # from exactly the rounds worth correlating.
     assert "uniqExact(round_id)" in sql
-    for detector in ("probe_a_holes", "logs_accounted", "logs_applied", "txns_unapplied"):
+    for detector in ("logs_accounted", "logs_applied", "txns_unapplied"):
         assert f"phase_metrics['{detector}']" in sql
 
 
@@ -224,18 +223,17 @@ def test_summarize_ranks_the_slowest_phases():
 
 def test_summarize_surfaces_the_detector_values():
     text = "\n".join([
-        _phase_row("fold_ref_list", probe_a_holes="4", ref_folding_aborted="1"),
+        _phase_row("fold_ref_list", ref_folding_aborted="1"),
         _phase_row("fold_ref_intake", logs_accounted="10", logs_applied="7"),
         _phase_row("fold_reduce", txns_unapplied="3"),
     ])
     s = summarize_phases(parse_phase_summary(text))
-    assert s["detector"]["fold_ref_list.probe_a_holes"] == 4
     assert s["detector"]["fold_ref_list.ref_folding_aborted"] == 1
     assert s["detector"]["fold_reduce.txns_unapplied"] == 3
     # The identity the intake pair exists to check: every position the sealed cut covers reached the
     # single cursor-advance site.
     assert s["intake_mismatch"] == 3
-    assert "probe_a_holes=4" in format_phase_summary(s)
+    assert "fold_ref_list.ref_folding_aborted=1" in format_phase_summary(s)
 
 
 def test_a_renamed_phase_metric_fails_closed_instead_of_reading_zero():

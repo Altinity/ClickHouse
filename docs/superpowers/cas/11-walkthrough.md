@@ -1730,29 +1730,28 @@ flowchart TD
     P2 --> P3["3 heartbeat_floor — LIST mounts, fence the provably dead"]
     P3 --> P4{"4 defer_decision — LIST stream and build catalog-keyed plan"}
     P4 -->|"nothing changed and no graduation due"| DEF["<b>DEFER — early return</b><br/>suppressed janitor page, no fold, no gc/state CAS"]
-    P4 --> P5["5 ref_list_probe — sampled quality check"]
-    P5 --> P6["6 parent_seal_read"]
-    P6 --> P7["7 fold_ref_group"]
-    P7 --> P8["8 fold_seal_read — adopted life rows"]
-    P8 --> P9["9 fold_ref_intake — GET each new ref log,<br/>GET each manifest edge → BlobDeltas"]
-    P9 --> P10["10 fold_reduce — the merge: spare / graduate / condemn / redelete"]
-    P10 --> P11["11 fold_seal_write — write-once deterministic seal"]
-    P11 --> P12["12 pending_deletes — <b>THE single content-delete site</b><br/>deleteExact of last round's delete_pending"]
-    P12 --> P13["13 meta_pool_wait — drain condemn-marker writes"]
-    P13 --> P14["14 round_commit — prune, then <b>THE single gc/state CAS</b>"]
-    P14 --> P15["15 handoff_reclaim (post-CAS)"]
-    P15 --> P16["16 manifest_deletes — bodies whose −1 the CAS just adopted"]
-    P16 --> P17["17 namespace_cleanup — one perpetual-janitor page"]
-    P17 --> P18["18 ref_object_cleanup — prune covered current-life logs and snapshots"]
-    P18 --> P19["19 orphan_sweep — one cursor page (never fails the round)"]
+    P4 --> P5["5 parent_seal_read"]
+    P5 --> P6["6 fold_ref_group"]
+    P6 --> P7["7 fold_seal_read — adopted life rows"]
+    P7 --> P8["8 fold_ref_intake — GET each new ref log,<br/>GET each manifest edge → BlobDeltas"]
+    P8 --> P9["9 fold_reduce — the merge: spare / graduate / condemn / redelete"]
+    P9 --> P10["10 fold_seal_write — write-once deterministic seal"]
+    P10 --> P11["11 pending_deletes — <b>THE single content-delete site</b><br/>deleteExact of last round's delete_pending"]
+    P11 --> P12["12 meta_pool_wait — drain condemn-marker writes"]
+    P12 --> P13["13 round_commit — prune, then <b>THE single gc/state CAS</b>"]
+    P13 --> P14["14 handoff_reclaim (post-CAS)"]
+    P14 --> P15["15 manifest_deletes — bodies whose −1 the CAS just adopted"]
+    P15 --> P16["16 namespace_cleanup — one perpetual-janitor page"]
+    P16 --> P17["17 ref_object_cleanup — prune covered current-life logs and snapshots"]
+    P17 --> P18["18 orphan_sweep — one cursor page (never fails the round)"]
 ```
 
 Orderings that are load-bearing and should be checked in review:
 
 - **2 before 4**: a row proved complete by the adopted parent is resolved before DEFER or any
   successor plan/artifact can publish.
-- **16 after 14**: manifest bodies are deleted only after the CAS adopted their decrements.
-- **14's prune before the CAS**: a pre-CAS destructive action may rely only on already-published
+- **15 after 13**: manifest bodies are deleted only after the CAS adopted their decrements.
+- **13's prune before the CAS**: a pre-CAS destructive action may rely only on already-published
   state.
 
 **Clamp suppression.** `suppress_destructive = !anomalies.empty() || !carried_holds.empty() ||
@@ -1889,7 +1888,7 @@ Per **folding** round, with `N` live mounts, `S` ref tables and `S_changed` tabl
 
 | Operation | Count | Note |
 |---|---|---|
-| LIST `cas/ns/stream/` | **1 full enumeration** | performed in `defer_decision` and retained for `fold_ref_group`. The store-quality detector ("probe A") adds a second enumeration, but only on sampled rounds — `gc_probe_a_period`, default every 16th |
+| LIST `cas/ns/stream/` | **1 full enumeration** | performed in `defer_decision` and retained for `fold_ref_group`, on every round with no exception |
 | LIST `gc/server-roots/` | 1 | plus 1 GET per mount |
 | GET the adopted fold seal | **5** | explicitly instrumented, not yet optimised |
 | GET ref logs | 1 per new log | |

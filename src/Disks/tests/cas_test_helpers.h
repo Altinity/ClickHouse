@@ -1659,9 +1659,9 @@ private:
 /// premise of every arithmetic-walk test: a record a listing never mentions is still THERE, so a walk
 /// that computes the id finds it and a walk that enumerates does not.
 ///
-/// PERMANENT (not nth-call) omission is deliberate: GC's probe A compares the round's two independent
-/// enumerations, and a hole reproduced identically in both is invisible to it by the probe's own stated
-/// limitation. That keeps these fixtures about the walk rather than about the probe.
+/// PERMANENT (not nth-call) omission is deliberate: a lying store need not ever recover the key, and the
+/// arithmetic walk that finds it anyway is the property under test -- these fixtures are about the walk,
+/// not about any one `list` call.
 ///
 /// Erasing keys from a page cannot disturb pagination: `ListPage::next_cursor` is computed by the base
 /// backend before the erase, so the next page still resumes strictly after the last key it returned.

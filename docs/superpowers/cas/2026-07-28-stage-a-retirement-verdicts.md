@@ -32,8 +32,8 @@ checked.
 
 | # | Item | Premise it rested on | Verdict | What replaces it | Evidence |
 |---|---|---|---|---|---|
-| 1 | Probe A's whole-round abort (`Gc::fold`) | Two enumerations of `cas/refs/` disagreeing means a record is about to be skipped FOREVER, because the fold iterates the listing and a cursor sealed above a record can never re-fold it | **(b)** | A SAMPLED store-quality detector: deterministic cadence, durable `due`/`performed`/`skipped` observability, aborts nothing, gates nothing (`Gc::sampleRefListQuality`) | `CasRetirementSweep.ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway`, `.TheDetectorsCadenceIsOnEveryFoldingRoundsRow` |
-| 1b | The round's SECOND enumeration of `cas/refs/` (`preFoldRefScan` kept separate from `fold`'s own `LIST`) | Probe A needs two INDEPENDENT walks, and the round happens to pay for both anyway | **(a)** | One enumeration per round, retained and regrouped (`Gc::listRefPrefix` → `RefScanSummary::keys`). The second walk is now the detector's alone, on its sampled rounds | `CasRetirementSweep.TheRoundEnumeratesTheRefPrefixOnceAndTheDetectorAddsTheSecond` |
+| 1 | Probe A's whole-round abort (`Gc::fold`) | Two enumerations of `cas/refs/` disagreeing means a record is about to be skipped FOREVER, because the fold iterates the listing and a cursor sealed above a record can never re-fold it | **(b)**, then **(a)** (Task T5) | Demoted to a SAMPLED store-quality detector (deterministic cadence, durable `due`/`performed`/`skipped` observability, aborts nothing, gates nothing), then deleted outright: `Gc::sampleRefListQuality` no longer exists | Superseded by Task T5's deletion; the two tests once cited here (`ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway`, `.TheDetectorsCadenceIsOnEveryFoldingRoundsRow`) were deleted with the detector |
+| 1b | The round's SECOND enumeration of `cas/refs/` (`preFoldRefScan` kept separate from `fold`'s own `LIST`) | Probe A needs two INDEPENDENT walks, and the round happens to pay for both anyway | **(a)** | One enumeration per round, retained and regrouped (`Gc::listRefPrefix` → `RefScanSummary::keys`). The second walk no longer exists at all, since Task T5 deleted the detector that was its only caller | `CasRetirementSweep.TheRoundEnumeratesTheRefPrefixExactlyOnce` |
 | 2 | `materialization_grace_ms` (`T_mat`), the post-reclaim wait at `Pool::open` and at self-remount | A straggler conditional `PUT` from the dying epoch could land AFTER the successor starts trusting its recovery LISTINGS, so wait for it to land or exhaust its retries | **(a)** | Recovery does not trust listings. It closes every dead epoch with an in-band `EpochSeal` at `{E, T+1}`, written as a conditional create, so the straggler's own create LOSES — whenever it arrives (Task 6, `6f06ba05815`) | `CasRetirementSweep.AStragglerFromTheDyingEpochLosesItsCreateToTheRecoverySeal`, `CasRemountWaits.UnresolvedWedgeRemountPaysNoWaitEither`, `CasMountOpenWaits.*` |
 | 2b | `CasRefLedger::refLanesSettledForRemount` | The remount must know whether a ref lane still holds an undecided `PUT`, in order to decide whether to pay `T_mat` | **(a)** | Nothing needs to know: the answer changed no outcome once the wait was gone. Its only caller was the wait | Removed with the wait; no consumers remain (`git grep`) |
 | 2c | `CasMountRuntime::unclean_epoch_boundary_seen_at` + `setUncleanEpochBoundarySeenAt` | The ref layer gates its recovery seal on "was this epoch boundary unclean?" | **(a)** | The seal is decided by ARITHMETIC — every epoch below the live one is closed, however its mount died. Task 6 deleted the gate; the marker's only remaining readers were tests | Removed; `CasRemountWaits.ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPredecessorsDied` pins the arithmetic rule |
@@ -87,6 +87,12 @@ instead of taking a second one.
 The detector's stated limitations are unchanged and still stated at the call site: a hole that
 reproduces identically in both walks is invisible, and so is a namespace one walk dropped wholesale
 (there is no id left to witness against).
+
+**SUPERSEDED (Task T5): the sampled detector described above is deleted, not merely demoted.**
+`Gc::sampleRefListQuality`, `PoolConfig::gc_probe_a_period`, the `ref_list_probe` phase row and every
+`CasGcProbeA*` counter are gone; the round enumerates `cas/refs/` exactly once, on every round, with no
+second enumeration on any cadence. The reasoning above (why the abort was demoted) stays correct as
+history; it is not the current state of the code.
 
 ## Item 2 — what `T_mat` was actually buying {#t-mat}
 

@@ -28,20 +28,17 @@ namespace DB::Cas::tests
 {
 
 /// This friend-only compile pin is derived from the actual private production member pointers. It
-/// fails if a raw round carrier becomes separately pairable with `fold` or the store-quality probe.
+/// fails if a raw round carrier becomes separately pairable with `fold`.
 class GcRoundPlanSignatureAccess
 {
 public:
     using FoldSignature = decltype(&Gc::fold);
     using ExpectedFoldSignature = Gc::FoldResult (Gc::*)(
         GcState &, Token &, RoundReport &, uint64_t, const RefPlan &, UniversePolicy);
-    using ProbeSignature = decltype(&Gc::sampleRefListQuality);
-    using ExpectedProbeSignature = void (Gc::*)(const RefPlan &, uint64_t);
     using BuilderSignature = decltype(&buildRefWalkPlan);
     using ExpectedBuilderSignature = RefPlan (*)(RoundInput &&);
 
     static_assert(std::is_same_v<FoldSignature, ExpectedFoldSignature>);
-    static_assert(std::is_same_v<ProbeSignature, ExpectedProbeSignature>);
     static_assert(std::is_same_v<BuilderSignature, ExpectedBuilderSignature>);
 };
 

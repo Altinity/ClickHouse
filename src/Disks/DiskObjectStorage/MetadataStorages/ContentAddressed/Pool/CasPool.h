@@ -111,17 +111,6 @@ struct PoolConfig
     /// Diagnostic-only threshold for a `Removing` catalog life whose terminal cleanup evidence has
     /// not appeared. Test/config struct seam only; no user-facing setting is registered.
     uint64_t gc_stuck_removal_rounds = 10;
-    /// Deterministic sampling cadence of the ref-prefix store-quality detector ("probe A",
-    /// `Gc::sampleRefListQuality`): a folding round samples when `round % gc_probe_a_period == 0`.
-    /// 0 disables the detector entirely.
-    ///
-    /// SAMPLED because the comparison is no longer free. The detector's whole method is to enumerate
-    /// `cas/ns/stream/` a second time and compare, and since the round now enumerates that prefix exactly
-    /// once for its own purposes, that second LIST is a cost the detector alone owes. It buys a reading
-    /// about the STORE, never about this round's correctness — the ref intake reads by exact key and is
-    /// immune to what any listing omits — so paying it every round would be paying a full prefix LIST
-    /// for a diagnostic nothing downstream consumes.
-    uint64_t gc_probe_a_period = 16;
     /// gc-rebuild: max in-memory edges per gc-shard batch during rebuildBaseline
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).

@@ -26,15 +26,8 @@
 /// The suspected MECHANISM (a `LIST` page that omits a durable key) is UNCONFIRMED — a holey page was
 /// never directly observed, it survives by elimination, and `CaRelinkConfirmCore.tla` `_sab_holeylist`
 /// proves the mechanism is SUFFICIENT, not that it is what happened. These tests therefore use the
-/// holey listing only as the cheapest way to make the EFFECT executable; nothing here, and nothing in
-/// the detector they gate, may key on how the hole was produced.
-
-namespace ProfileEvents
-{
-    extern const Event CasGcRefScanDisagreements;
-extern const Event CasGcProbeAHolePresent;
-extern const Event CasGcProbeAHoleAbsent;
-}
+/// holey listing only as the cheapest way to make the EFFECT executable; nothing here may key on how
+/// the hole was produced.
 
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
@@ -46,14 +39,13 @@ namespace
 /// A backend that drops ONE chosen key from ONE chosen `list` call, while leaving exact `get`/`head`
 /// of that key working. This is the minimal realisation of "the store returned an incomplete answer":
 /// the record is durable and readable, it is simply absent from one enumeration. The mechanism is
-/// deliberately NOT modelled (no page split, no cursor games) — the detector under test must not
-/// depend on how the hole was produced.
+/// deliberately NOT modelled (no page split, no cursor games) — the arithmetic intake under test must
+/// not depend on how the hole was produced.
 ///
 /// WHICH call is explicit and load-bearing. A GC round enumerates the ref prefix ONCE, in
 /// `Gc::listRefPrefix`, and the fold regroups that same enumeration -- so `nth = 0` is the walk whose
-/// hole the fold would have to survive, and it is the one every test here arms. (On a round the sampled
-/// store-quality detector is due, `nth = 1` is its own extra enumeration.) `nth` counts, from the moment
-/// `omitFromNthListCall` is called, only those `list` calls that WOULD have returned the key — so
+/// hole the fold would have to survive, and it is the one every test here arms. `nth` counts, from the
+/// moment `omitFromNthListCall` is called, only those `list` calls that WOULD have returned the key — so
 /// unrelated prefix enumerations do not shift it.
 /// Arm the sabotage AFTER every seeding write: the writer's own sequence allocation lists the
 /// namespace prefix and would otherwise consume a qualifying call.
@@ -108,14 +100,10 @@ private:
     bool served = false;
 };
 
-/// `probe_a_period` is per-test on purpose: the two tests below whose subject is the WALK leave the
-/// production default (the detector does not sample, and cannot colour the result), while the one whose
-/// subject is the detector's verdict sets 1 so every round samples.
-PoolPtr openHoleyPool(std::shared_ptr<HoleyListBackend> & out_backend, uint64_t probe_a_period = 16)
+PoolPtr openHoleyPool(std::shared_ptr<HoleyListBackend> & out_backend)
 {
     out_backend = std::make_shared<HoleyListBackend>();
-    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                              .gc_probe_a_period = probe_a_period});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A `ManifestEntry` for a Blob leaf at `path` referencing `payload`'s content hash.
@@ -203,24 +191,6 @@ String refLogKeyEmittingEdge(Backend & b, const Layout & layout, const RootNames
     EXPECT_EQ(hits.size(), 1u) << "expected exactly one ref log emitting a " << change
                                << " edge for the manifest, found " << hits.size();
     return hits.empty() ? String{} : hits.front();
-}
-
-/// Probe A's disagreement counter. The PROCESS-GLOBAL counter, not the thread's: a bare gtest thread
-/// has no attached `ThreadStatus`, so `CurrentThread::getProfileEvents()` would read a container
-/// nothing is written to. Every assertion below takes a delta around the rounds it cares about.
-uint64_t probeAHoles()
-{
-    return ProfileEvents::global_counters[ProfileEvents::CasGcRefScanDisagreements].load();
-}
-
-uint64_t probeAHolesPresent()
-{
-    return ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHolePresent].load();
-}
-
-uint64_t probeAHolesAbsent()
-{
-    return ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHoleAbsent].load();
 }
 
 void runRounds(const PoolPtr & s, Gc & gc, int rounds)
@@ -333,60 +303,4 @@ TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
     EXPECT_TRUE(blobPresent(b, layout, payload))
         << "GC deleted a blob that manifest " << manifestRefDebugString(m2.ref)
         << " still references — the skipped-transaction DATA-LOSS class, reproduced";
-}
-
-/// The detector must not merely COUNT a disagreement — it must say WHICH defect it saw, at the moment it
-/// can still be seen. Reconstructing this afterwards is impossible: by the time anyone reads a log the
-/// object has legitimately been deleted either way, so "the listing omitted a durable object" and "the
-/// listing invented a key" are indistinguishable in hindsight. They are opposite defects and point at
-/// different components.
-///
-/// `HoleyListBackend` hides a key from a listing WITHOUT deleting it, which is exactly the first case. So
-/// the HEAD taken at firing time must say `present`, and it must be the `present` counter that moves.
-/// Pinning the direction is the point: a probe that recorded `absent` here would be inverted, and an
-/// inverted verdict is worse than no verdict — it would send the investigation at the listing client
-/// while the store was the culprit.
-TEST(CasHoleyListDetector, TheHoleVerdictDistinguishesAMissedObjectFromAPhantomKey)
-{
-    std::shared_ptr<HoleyListBackend> b;
-    /// This test's subject IS the detector, so every round must sample.
-    auto s = openHoleyPool(b, /*probe_a_period=*/1);
-    const Layout & layout = s->layout();
-    const RootNamespace ns{"test/tbl"};
-    const String payload = "verdict-payload";
-
-    const ManifestId part = publishOneBlobPart(s, ns, "part_a", payload);
-    Gc gc(s, hexToU128("00000000000000000000000000000002"));
-    runRounds(s, gc, 2);
-    ASSERT_TRUE(blobPresent(b, layout, payload));
-
-    const std::set<String> before_drop = listRefKeys(*b, layout, ns);
-    s->dropRef(ns, "part_a");
-    const std::set<String> after_drop = listRefKeys(*b, layout, ns);
-    const String remove_key =
-        refLogKeyEmittingEdge(*b, layout, ns, addedKeys(before_drop, after_drop), part, -1);
-    ASSERT_FALSE(remove_key.empty());
-
-    /// `part_h` is not decoration: the detector's rule needs a WITNESS above the missing id in the other
-    /// enumeration, and a hidden record that is merely the greatest one could always be a concurrent
-    /// append.
-    publishOneBlobPart(s, ns, "part_h", "harmless-payload");
-    s->renewWatermarkOnce();
-    b->omitFromNthListCall(remove_key, /*nth=*/0);
-
-    const uint64_t holes_before = probeAHoles();
-    const uint64_t present_before = probeAHolesPresent();
-    const uint64_t absent_before = probeAHolesAbsent();
-
-    runRounds(s, gc, 1);
-    ASSERT_TRUE(b->holeServed()) << "the sabotage never fired — the omitted key was never listed";
-    ASSERT_GT(probeAHoles() - holes_before, 0u) << "probe A did not fire";
-
-    /// The object was hidden from the listing, never deleted. The verdict must say so.
-    EXPECT_GT(probeAHolesPresent() - present_before, 0u)
-        << "the hole key was omitted from a listing but still exists, so the HEAD taken at firing time "
-           "must have recorded `present`. A zero here means the verdict is not being taken at all.";
-    EXPECT_EQ(probeAHolesAbsent() - absent_before, 0u)
-        << "the verdict is INVERTED: the object demonstrably exists, yet the probe recorded it absent. "
-           "That would point every future investigation at the listing client instead of the store.";
 }

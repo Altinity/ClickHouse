@@ -57,11 +57,11 @@ ColumnsDescription ContentAddressedGarbageCollectionLogElement::getColumnsDescri
         {"round_id", std::make_shared<DataTypeString>(),
             "Correlator for every row of one round attempt (its Start, each Phase, and its Finish). Minted per attempt; unlike `round` it exists even for a round that never committed and for a round that never led. Group by this column to reconstruct one round."},
         {"phase", lc_string,
-            "The GC phase this row describes (empty on Start/Finish), in execution order: lease, heartbeat_floor, defer_decision, ref_list_probe, parent_seal_read, fold_ref_group, fold_seal_read, fold_ref_intake, fold_ns_cleanup_scan, fold_reduce, fold_seal_write, pending_deletes, meta_pool_wait, round_commit, handoff_reclaim, manifest_deletes, namespace_cleanup, ref_object_cleanup, orphan_sweep. A round that defers, or that never acquires the lease, emits only the phases it reached."},
+            "The GC phase this row describes (empty on Start/Finish), in execution order: lease, heartbeat_floor, defer_decision, parent_seal_read, fold_ref_group, fold_seal_read, fold_ref_intake, fold_ns_cleanup_scan, fold_reduce, fold_seal_write, pending_deletes, meta_pool_wait, round_commit, handoff_reclaim, manifest_deletes, namespace_cleanup, ref_object_cleanup, orphan_sweep. A round that defers, or that never acquires the lease, emits only the phases it reached."},
         {"phase_duration_us", std::make_shared<DataTypeUInt64>(),
             "Wall-clock duration of this phase in microseconds (Phase rows only). Microseconds because several phases are routinely sub-millisecond and the point is to see when they are not. Phase durations do not sum to the round's `duration_ms`: the round also does untimed bookkeeping between phases."},
         {"phase_metrics", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeUInt64>()),
-            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `due`/`performed`/`skipped`/`holes` on ref_list_probe, `logs_accounted`/`logs_applied` on fold_ref_intake, `txns_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
+            "Phase-specific semantic counts a phase computes for itself and no ProfileEvent can supply (Phase rows only) — for example `changed_shards` on defer_decision, `logs_accounted`/`logs_applied` on fold_ref_intake, `txns_unapplied` on fold_reduce, `jobs_scheduled`/`jobs_completed` on meta_pool_wait. The verb counts ride the `ProfileEvents` column of the same row."},
     };
 }
 

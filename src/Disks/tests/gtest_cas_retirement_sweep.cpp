@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -29,8 +28,8 @@
 ///      disagreement, aborted ref folding for the whole round -- because the fold ITERATED the listing,
 ///      so a hole in it meant a record was about to be skipped forever. The intake reads by exact key
 ///      now, so a hole folds through; a detector that still aborted would be halting a round that is
-///      provably doing the right thing. It is demoted to a SAMPLED store-quality detector: it reports,
-///      it aborts nothing, it gates nothing, and the round enumerates the prefix once.
+///      provably doing the right thing. It was demoted to a sampled store-quality detector and then
+///      deleted outright: the round enumerates `cas/ns/stream/` exactly once, on every round.
 ///   2. THE MATERIALIZATION GRACE (`T_mat`). A post-reclaim sleep, long enough for a straggler
 ///      conditional `PUT` from a dying epoch to land or exhaust its retries BEFORE the successor
 ///      trusted its recovery LISTINGS. Recovery does not trust listings; it closes every dead epoch
@@ -41,15 +40,6 @@
 /// The companion prose (premise / verdict / replacement / evidence, one row per retired item) is
 /// `docs/superpowers/cas/2026-07-28-stage-a-retirement-verdicts.md`.
 
-namespace ProfileEvents
-{
-    extern const Event CasGcRefScanDisagreements;
-    extern const Event CasGcProbeAHolePresent;
-    extern const Event CasGcProbeADue;
-    extern const Event CasGcProbeAPerformed;
-    extern const Event CasGcProbeASkipped;
-}
-
 namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
@@ -58,15 +48,14 @@ namespace DB::ErrorCodes
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
-using Rec = DB::Cas::GcRoundLogRecord;
 
 namespace
 {
 
 /// A backend that drops ONE chosen key from ONE chosen `list` call while exact `get`/`head` of that key
 /// keep working: the minimal realisation of "the store returned an incomplete answer". WHICH call is
-/// load-bearing here, because the round and the detector each enumerate the ref prefix exactly once and
-/// in that order -- so `nth = 0` is the round's own enumeration and `nth = 1` is the detector's.
+/// load-bearing here, because the round enumerates the ref prefix exactly once -- so `nth = 0` is
+/// always the round's own enumeration, the one the fold regroups.
 ///
 /// `nth` counts only those `list` calls that WOULD have returned the key, so unrelated prefix
 /// enumerations cannot shift it; arm it AFTER every seeding write, since the writer's own namespace
@@ -117,18 +106,25 @@ private:
     bool served = false;
 };
 
-/// Counts full enumerations of the ref prefix -- one increment per `list` call whose prefix is
-/// `cas/ns/stream/`, which is how "the round lists this prefix once" becomes an assertion instead of a claim.
+/// Counts full enumerations of the ref prefix -- one increment per `list` call whose prefix is EXACTLY
+/// `cas/ns/stream/`, which is how "the round lists this prefix once" becomes an assertion instead of a
+/// claim. `janitor_prefix_lists` counts the bounded `cas/ns/` janitor page separately, by the same exact
+/// match: the two prefixes are distinct strings (`cas/ns/stream/` vs `cas/ns/`), so a hot scan and the
+/// janitor's own bounded page can never be conflated by this counter.
 class RefPrefixListCountingBackend : public InMemoryBackend
 {
 public:
     String refs_prefix;
+    String janitor_prefix;
     std::atomic<size_t> ref_prefix_lists{0};
+    std::atomic<size_t> janitor_prefix_lists{0};
 
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {
         if (!refs_prefix.empty() && prefix == refs_prefix)
             ++ref_prefix_lists;
+        if (!janitor_prefix.empty() && prefix == janitor_prefix)
+            ++janitor_prefix_lists;
         return InMemoryBackend::list(prefix, cursor, limit);
     }
 };
@@ -219,121 +215,12 @@ RefTxnId greatestLoggedId(Backend & b, const Layout & l, const RootNamespace & n
     return best;
 }
 
-std::map<String, UInt64> metricsOf(const std::vector<Rec> & rows, const String & phase)
-{
-    for (const Rec & r : rows)
-        if (r.event_type == Rec::EventType::Phase && r.phase == phase)
-            return r.phase_metrics;
-    ADD_FAILURE() << "no phase row named '" << phase << "' in this round";
-    return std::map<String, UInt64>{};
-}
-
 Poco::AutoPtr<Poco::Util::XMLConfiguration> makeDiskConfig(const std::string & inner)
 {
     std::istringstream iss("<clickhouse><disk>" + inner + "</disk></clickhouse>");
     return new Poco::Util::XMLConfiguration(iss);
 }
 
-}
-
-
-/// ==================== item 1: probe A, demoted ====================
-
-/// THE DEMOTION, in one round. A durable removal record is hidden from the ROUND's enumeration and
-/// from that one only, so the two things the retirement claims are both observable at once:
-///
-///   - the fold is UNAFFECTED: it reaches that record by exact key, folds it, and reports no abort;
-///   - the detector still SEES it: its own (later, complete) enumeration disagrees, and it says so.
-///
-/// Before the demotion these were mutually exclusive by construction -- seeing it WAS aborting.
-TEST(CasRetirementSweep, ProbeAReportsAHintHoleAndTheRoundFoldsThroughItAnyway)
-{
-    auto backend = std::make_shared<HoleyListBackend>();
-    auto store = Pool::open(backend, PoolConfig{
-        .pool_prefix = "p", .server_root_id = "test",
-        .gc_fold_max_defer_rounds = 0,     /// fold every round: the detector only samples folding rounds
-        .gc_probe_a_period = 1,            /// sample every round
-    });
-    const Layout & layout = store->layout();
-    const RootNamespace ns{"srv/tbl"};
-    const String payload = "retirement-payload";
-    /// Stage B (Task 4-C): pin to the sentinel before the first real touch -- `listRefLogKeys` below
-    /// lists at that exact prefix. The raw `Live` row also needs the same empty checkpoint authority
-    /// as a completed production birth before `publishOneBlobPart` invokes recovery.
-    DB::Cas::tests::fixture::admitLive(*backend, layout, ns);
-    DB::Cas::tests::writeRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
-        .life_epoch = 1,
-        .committed_through = std::nullopt,
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = std::nullopt,
-    });
-
-    std::vector<Rec> rows;
-    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca",
-                                  [&](const Rec & r) { rows.push_back(r); });
-
-    /// Publish, fold the `+1`, then drop the ref so a REMOVAL record exists to be hidden. Every round
-    /// runs through the ONE scheduler: a second `Gc` would contend for the same GC lease.
-    publishOneBlobPart(store, ns, "part_a", payload);
-    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
-    store->renewWatermarkOnce();
-
-    const std::set<String> before_drop = listRefLogKeys(*backend, layout, ns);
-    store->dropRef(ns, "part_a");
-    const std::set<String> after_drop = listRefLogKeys(*backend, layout, ns);
-    String removal_key;
-    for (const String & k : after_drop)
-        if (!before_drop.contains(k))
-            removal_key = k;
-    ASSERT_FALSE(removal_key.empty()) << "the drop wrote no new ref log";
-
-    /// A LATER, unrelated record. The detector's rule needs a WITNESS above the missing id in the other
-    /// enumeration -- an id that is merely the greatest one either walk saw could always be a concurrent
-    /// append, and the detector says so itself (its stated limitation). Without this publish the hidden
-    /// removal WOULD be the maximum and the disagreement would be invisible by design, not by accident.
-    publishOneBlobPart(store, ns, "part_h", "witness-payload");
-    store->renewWatermarkOnce();
-
-    /// Arm LAST, after every seeding write: `nth = 0` is the round's own enumeration of the ref prefix
-    /// (the one the fold regroups), and the detector's enumeration a moment later is complete.
-    backend->omitFromNthListCall(removal_key, /*nth=*/0);
-
-    const uint64_t holes_before = ProfileEvents::global_counters[ProfileEvents::CasGcRefScanDisagreements].load();
-    const uint64_t present_before = ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHolePresent].load();
-    const uint64_t due_before = ProfileEvents::global_counters[ProfileEvents::CasGcProbeADue].load();
-    const uint64_t performed_before = ProfileEvents::global_counters[ProfileEvents::CasGcProbeAPerformed].load();
-
-    rows.clear();
-    const RoundReport report = sched.runOneRoundNow(Rec::Trigger::Manual);
-    ASSERT_TRUE(report.acquired_lease);
-    ASSERT_FALSE(report.deferred);
-    ASSERT_TRUE(backend->holeServed()) << "the sabotage never fired -- the omitted key was never listed";
-
-    /// THE DETECTOR FIRED, and said which defect it saw: the object is durable, so the HEAD it takes at
-    /// firing time must read `present` (a listing omitted something that exists), never `absent`.
-    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CasGcRefScanDisagreements].load() - holes_before, 0u)
-        << "the two enumerations disagreed about a durable ref log and the detector said nothing";
-    EXPECT_GT(ProfileEvents::global_counters[ProfileEvents::CasGcProbeAHolePresent].load() - present_before, 0u)
-        << "the hole key was hidden from a listing but still exists, so the verdict must be `present`";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcProbeADue].load() - due_before, 1u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcProbeAPerformed].load() - performed_before, 1u);
-
-    /// AND IT ABORTED NOTHING. Three independent readings of the same fact, because "the round was not
-    /// stopped" is exactly what the retirement is:
-    ///   - the fold's own abort flag is clear;
-    ///   - the detector recorded NO anomaly (an anomaly is what suppresses every destructive step);
-    ///   - the phase row shows the hole and the fold row shows no abort, in the SAME round.
-    const auto ref_group = metricsOf(rows, "fold_ref_group");
-    EXPECT_EQ(ref_group.at("ref_folding_aborted"), 0u)
-        << "a hint hole must not abort ref folding -- the intake reads by exact key";
-    const auto probe = metricsOf(rows, "ref_list_probe");
-    EXPECT_EQ(probe.at("due"), 1u);
-    EXPECT_EQ(probe.at("performed"), 1u);
-    EXPECT_EQ(probe.at("skipped"), 0u);
-    EXPECT_GT(probe.at("holes"), 0u) << "the detector's verdict must reach its own phase row";
-    EXPECT_TRUE(report.anomalies.empty())
-        << "the detector recorded an anomaly, which suppresses every destructive step of the round -- "
-           "that is gating, and the demotion says it gates nothing";
 }
 
 /// The blob the hidden removal releases must actually be reclaimed. This is the retention half of the
@@ -346,7 +233,6 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .gc_fold_max_defer_rounds = 0,
-        .gc_probe_a_period = 1,
     });
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/tbl"};
@@ -397,77 +283,38 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
            "skipped-transaction class, which arithmetic intake is supposed to close";
 }
 
-/// THE COST OF THE DEMOTION, made observable. A folding round enumerates `cas/ns/stream/` exactly ONCE; the
-/// second enumeration exists only on the rounds the detector's cadence makes due. Without this
-/// assertion the sampling would be free to quietly become "every round" again -- which is precisely the
-/// shape the retirement removed.
-TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixOnceAndTheDetectorAddsTheSecond)
+/// THE RETIREMENT's whole point, made observable: a folding round enumerates `cas/ns/stream/` exactly
+/// ONCE, on EVERY round of a multi-round run -- not just the first, since a regression that quietly
+/// reintroduced a second enumeration only on a LATER round would pass a one-round check for the wrong
+/// reason. The bounded `cas/ns/` janitor page is a separate exact-string prefix and runs every round
+/// too; it must never be counted as, or mistaken for, a hot scan of the ref prefix.
+TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
 {
-    const auto listsForPeriod = [](uint64_t period)
-    {
-        auto backend = std::make_shared<RefPrefixListCountingBackend>();
-        auto store = Pool::open(backend, PoolConfig{
-            .pool_prefix = "p", .server_root_id = "test",
-            .gc_fold_max_defer_rounds = 0,
-            .gc_probe_a_period = period,
-        });
-        backend->refs_prefix = store->layout().casRefsPrefix();
-        const RootNamespace ns{"srv/tbl"};
-        publishOneBlobPart(store, ns, "part_a", "counted-payload");
-        store->renewWatermarkOnce();
-
-        Gc gc(store, hexToU128("00000000000000000000000000000013"));
-        backend->ref_prefix_lists.store(0);
-        const RoundReport report = gc.runRegularRound();
-        EXPECT_TRUE(report.acquired_lease);
-        EXPECT_FALSE(report.deferred);
-        return backend->ref_prefix_lists.load();
-    };
-
-    /// Round 1 with a period of 2 is not a sampling round (1 % 2 != 0): one enumeration, the round's own.
-    EXPECT_EQ(listsForPeriod(2), 1u)
-        << "a folding round must enumerate the ref prefix exactly once when the detector is not due";
-    /// The same round with a period of 1 is: exactly one more.
-    EXPECT_EQ(listsForPeriod(1), 2u)
-        << "a sampled round pays exactly one extra enumeration -- the detector's, and nothing else";
-    /// Disabled: still one, and no detector work at all.
-    EXPECT_EQ(listsForPeriod(0), 1u)
-        << "gc_probe_a_period = 0 must disable the detector, not merely quieten it";
-}
-
-/// The cadence is REPORTED on every folding round, due or not. A detector that has silently stopped
-/// running must never look the same as a store that has stopped lying, and a `due` column that only
-/// appears on the rounds it fires cannot tell the two apart.
-TEST(CasRetirementSweep, TheDetectorsCadenceIsOnEveryFoldingRoundsRow)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<RefPrefixListCountingBackend>();
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .gc_fold_max_defer_rounds = 0,
-        .gc_probe_a_period = 2,      /// round 1 is not due, round 2 is
     });
+    backend->refs_prefix = store->layout().casRefsPrefix();
+    backend->janitor_prefix = store->layout().namespaceRootPrefix();
     const RootNamespace ns{"srv/tbl"};
-    publishOneBlobPart(store, ns, "part_a", "cadence-payload");
+    publishOneBlobPart(store, ns, "part_a", "counted-payload");
     store->renewWatermarkOnce();
 
-    std::vector<Rec> rows;
-    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca",
-                                  [&](const Rec & r) { rows.push_back(r); });
-
-    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
-    const auto quiet = metricsOf(rows, "ref_list_probe");
-    EXPECT_EQ(quiet.at("due"), 0u) << "round 1 is not a sampling round at period 2";
-    EXPECT_EQ(quiet.at("performed"), 0u);
-    EXPECT_EQ(quiet.at("skipped"), 0u);
-
-    rows.clear();
-    store->renewWatermarkOnce();
-    ASSERT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
-    const auto sampled = metricsOf(rows, "ref_list_probe");
-    EXPECT_EQ(sampled.at("due"), 1u) << "round 2 is a sampling round at period 2";
-    EXPECT_EQ(sampled.at("performed"), 1u);
-    EXPECT_EQ(sampled.at("skipped"), 0u);
-    EXPECT_EQ(sampled.at("holes"), 0u) << "a healthy store must report zero holes, not no row";
+    Gc gc(store, hexToU128("00000000000000000000000000000013"));
+    for (int round = 0; round < 5; ++round)
+    {
+        backend->ref_prefix_lists.store(0);
+        backend->janitor_prefix_lists.store(0);
+        const RoundReport report = gc.runRegularRound();
+        ASSERT_TRUE(report.acquired_lease);
+        ASSERT_FALSE(report.deferred);
+        EXPECT_EQ(backend->ref_prefix_lists.load(), 1u)
+            << "round " << round << " enumerated cas/ns/stream/ a number of times other than once";
+        EXPECT_GT(backend->janitor_prefix_lists.load(), 0u)
+            << "round " << round << " never took the bounded cas/ns/ janitor page";
+        store->renewWatermarkOnce();
+    }
 }
 
 
