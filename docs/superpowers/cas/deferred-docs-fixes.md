@@ -675,3 +675,23 @@ no longer exists (and mislabels 16 as non-sampling); (P3, IMPRECISE) the anti-va
 (P5, IMPRECISE) `pre_fold_ref_drain` and `namespace_cleanup` carry no `PHASE N/18` comment —
 16 of 18 phases annotated. (P4 — the plan's gate-recipe `.*`-suffix trap — fixed directly in the
 plan, it was an executor hazard.)
+
+### D44 — T6-review + codex T5/T6 prose batch {#d44-t6-review-prose}
+
+From `t6-review.md`: (P1, IMPRECISE) `t6-report.md` §9 cites a stateless log whose banner reads
+`@ 30108b5ee642 laneg/t3-finish` — the claim is true (binary fingerprinted to the arc tip; the
+version string is stale cmake configure metadata), but the report should name that trap;
+(P2, IMPRECISE) `test_cas_replicated_relink`'s restored-guard comment says "GC reclaiming them"
+while the assertion is reclaim-at-least-one; (P3, NOTE) `gtest_cas_list_liar_end_to_end.cpp`'s
+header still frames the kill shot as "the one shape arithmetic intake cannot save" — reword
+together with the TEST-1 fix.
+
+From the codex T5+T6 review (`tmp/codex_t5t6_review_answer.md`): (T5-1, FALSE as live safety
+commentary) `CasGc.cpp` B1 comment still says "probe A covers the listing" and the bounded-walk
+discussion still calls the `tail < cursor` class a "sampled store-quality detector" — probe A was
+deleted by T5; rewrite both to state that arithmetic exact-key intake closes LIST omissions;
+`t5-report.md` also claims the retained holey-LIST tests leave `probe_a_period` at its production
+default (the seam was deleted) and misquotes the draft pick's subject (already in D43).
+(T6, IMPRECISE) the `planManifestCursorPage` call-site comment in `CasGc.cpp` says the planner
+reuses the round's catalog/checkpoint cut; it takes its own later cut (reviewed conservative —
+no over-delete); correct when the T6-1 budget rework touches this path.
