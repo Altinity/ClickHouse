@@ -311,3 +311,123 @@ TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
             ++surviving;
     EXPECT_EQ(surviving, 0u);
 }
+
+/// T6b Slice 2 (codex T6-1), MANDATORY liveness proof: a namespace whose committed-tail recovery walk
+/// can never finish within one round's `sweep_recovery_op_budget` must not wedge the cursor page for
+/// every subsequent round. Six eligible candidates share ONE namespace whose tail is ~200 unrelated
+/// committed transactions above the fold cursor -- far more than the tiny per-round recovery-op budget
+/// can traverse -- so `activeManifestKeys` reports `recovery_incomplete` on every attempt, every one of
+/// this namespace's candidates is retained (never nominated, never deleted), yet the page still DECIDES
+/// them (a retained candidate is a decision) and the cursor advances across pages until the whole
+/// keyspace is covered.
+TEST(CasSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgingTheCursor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    /// `casAdmitEntry` (bare, no `_ckpt`) rather than `casAdmitRecoverableEntry` (which pre-seeds an
+    /// EMPTY `_ckpt`, `committed_through = nullopt`): the tail below is built entirely from real
+    /// `publishCommittedTransition` calls, whose first call needs `readCkpt` to see NOTHING yet so it
+    /// takes the fresh-`_ckpt` `putIfAbsent` path instead of `advanceRecoverableCkptForRawFixture`'s
+    /// monotonic-advance-from-existing-value path (which throws on a null `committed_through`).
+    casAdmitEntry(*backend, layout, ns);
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/1000);
+
+    /// Six orphan candidates, all eligible (build_sequence << min_active), none owned by any ref.
+    constexpr int kCandidates = 6;
+    for (int i = 1; i <= kCandidates; ++i)
+        writeManifestRaw(*backend, layout, ns, ref(i, 1),
+                         {blobEntryFor("c" + std::to_string(i), DB::UInt128(static_cast<uint64_t>(i)))});
+
+    /// A committed tail of ~200 UNRELATED transactions above the fold cursor. None of these need a
+    /// manifest body of their own -- the recovery walk only GETs and decodes the ref-log transactions,
+    /// never the bodies they name.
+    constexpr int kTailSize = 200;
+    for (int i = 0; i < kTailSize; ++i)
+        publishCommittedTransition(*backend, layout, ns, "tail" + std::to_string(i), std::nullopt, ref(2000 + i, 1));
+    seedFoldCursorForTest(*backend, layout, ns, RefTxnId{kBuildEpoch, 1});
+
+    uint64_t total_retained_work_budget = 0;
+    uint64_t total_skipped = 0;
+    uint64_t total_deleted = 0;
+    String cursor;
+    bool wrapped = false;
+    int pages = 0;
+    for (; pages < 10 && !wrapped; ++pages)
+    {
+        /// A FRESH budget every page, exactly like production's one-instance-per-round contract --
+        /// the same namespace's recovery walk re-attempts and re-exhausts every time, by design (a
+        /// pathological namespace does not get to starve every OTHER page of budget forever).
+        GcRoundWorkBudget budget;
+        budget.max_sweep_recovery_ops = 5;   /// far below the ~200-record tail
+        const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, cursor, /*list_budget*/3, /*delete_budget*/10, &budget);
+
+        /// LIVENESS: every page decides at least one candidate (a retained one counts) or wraps.
+        EXPECT_TRUE(result.skipped > 0 || result.deleted > 0 || result.wrapped)
+            << "page " << pages << " decided nothing and did not wrap -- a wedge";
+        /// Every namespace this page touches hits the recovery-op-exhausted cause AT LEAST once --
+        /// only the FIRST candidate of an errored namespace on a page carries the specific retain-class
+        /// counter (the SAME pre-existing convention `retained_no_coverage`/`retained_hold` already
+        /// use); every other candidate of that namespace still lands in the generic `skipped` tally.
+        EXPECT_GE(result.retained_work_budget, 1u)
+            << "page " << pages << " never attributed a candidate to the recovery-budget cause";
+
+        total_retained_work_budget += result.retained_work_budget;
+        total_skipped += result.skipped;
+        total_deleted += result.deleted;
+        wrapped = result.wrapped;
+        ASSERT_NE(cursor, result.next_cursor) << "page " << pages << " made no cursor progress";
+        cursor = result.next_cursor;
+    }
+
+    EXPECT_TRUE(wrapped) << "the whole small keyspace must be fully covered well within 10 pages";
+    EXPECT_EQ(total_deleted, 0u) << "the pathological namespace's candidates are never safe to nominate";
+    EXPECT_EQ(total_skipped, static_cast<uint64_t>(kCandidates))
+        << "every one of the six candidates was decided (skipped), none silently dropped from the page";
+    EXPECT_GE(total_retained_work_budget, 1u);
+    for (int i = 1; i <= kCandidates; ++i)
+        EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, ref(i, 1)})).exists)
+            << "candidate " << i << " must survive: it was never proven safe to delete";
+}
+
+/// T6b Slice 2 (codex T6-1): the per-page NAMESPACE cap. Two otherwise-independently-deletable
+/// namespaces share one page; with `max_sweep_namespaces = 1`, only the first namespace this page
+/// touches gets a protection view built at all -- the second is retained under the work-budget cause,
+/// never given a partial or best-effort view.
+TEST(CasSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+
+    const RootNamespace ns_a{"00/aa@cas@"};
+    const RootNamespace ns_b{"00/bb@cas@"};
+    const ManifestRef ref_a = ref(5, 0xA1);
+    const ManifestRef ref_b = ref(5, 0xB1);
+    casAdmitRecoverableEntry(*backend, layout, ns_a);
+    casAdmitRecoverableEntry(*backend, layout, ns_b);
+    writeManifestRaw(*backend, layout, ns_a, ref_a, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns_b, ref_b, {blobEntryFor("b", DB::UInt128(2))});
+    /// Both namespaces satisfy rule (1) (cursor past the build's own epoch) and have no committed tail
+    /// at all (`_ckpt.committed_through` unset), so absent the namespace cap BOTH would delete.
+    seedFoldCursorForTest(*backend, layout, ns_a, RefTxnId{kBuildEpoch + 1, 1});
+    seedFoldCursorForTest(*backend, layout, ns_b, RefTxnId{kBuildEpoch + 1, 1});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/6);
+
+    GcRoundWorkBudget budget;
+    budget.max_sweep_namespaces = 1;
+
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10, &budget);
+
+    EXPECT_EQ(result.deleted, 1u) << "exactly one namespace's view could be built this page";
+    EXPECT_EQ(result.retained_work_budget, 1u)
+        << "the other namespace's candidate is retained, never decided from a missing view";
+    EXPECT_EQ(budget.sweep_namespaces_used, 1u);
+
+    size_t surviving = 0;
+    for (const auto & p : std::vector<std::pair<RootNamespace, ManifestRef>>{{ns_a, ref_a}, {ns_b, ref_b}})
+        if (backend->head(layout.manifestKey(ManifestId{p.first, p.second})).exists)
+            ++surviving;
+    EXPECT_EQ(surviving, 1u) << "exactly one candidate remains -- the one whose namespace had no budget left";
+}

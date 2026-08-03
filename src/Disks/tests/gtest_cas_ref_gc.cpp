@@ -432,6 +432,75 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the checkpoint-named snapshot must be retained";
 }
 
+/// T6b Slice 3 (codex T6-3): `cleanupRefObjects`'s per-round cap. Five deletable logs share one
+/// namespace with a tiny `gc_round_ref_cleanup_budget`; the per-key fail-close validation
+/// (`deleteRefObject`'s catalog/lease revalidation before every exact delete) is untouched -- it is
+/// NOT amortized, only the cohort size per round is capped. `planRefCleanup` recomputes the same
+/// remaining candidates from durable state every round, so the excess needs no cursor of its own.
+TEST(CasRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_round_ref_cleanup_budget = 1,
+        .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+    fixture::admitLive(*backend, layout, ns);
+
+    /// Six sequential replacements of the SAME ref -> six committed logs {1,1}..{1,6}.
+    constexpr int kLogs = 6;
+    std::optional<ManifestRef> prev;
+    ManifestRef latest{};
+    uint64_t last_seq = 0;
+    for (int i = 1; i <= kLogs; ++i)
+    {
+        const ManifestRef r = mref(i);
+        writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a" + std::to_string(i), DB::UInt128(static_cast<uint64_t>(i)))});
+        last_seq = publishCommittedTransition(*backend, layout, ns, "t", prev, r);
+        prev = r;
+        latest = r;
+    }
+
+    /// A snapshot + checkpoint naming the LATEST row: every earlier log is below the checkpoint base.
+    RefTableSnapshot snap = minimalLiveSnapshot(ns.string(), RefTxnId{1, last_seq}, {committedRow("t", latest)});
+    writeRefSnapshotRaw(*backend, layout, snap);
+    replaceRecoverableCkptForRawFixture(*backend, layout, ns, RefCkpt{
+        .life_epoch = 1,
+        .committed_through = RefTxnId{1, last_seq},
+        .checkpoint_snapshot_id = RefTxnId{1, last_seq},
+        .last_epoch_seal = std::nullopt,
+    });
+
+    std::vector<String> deletable_log_keys;
+    for (int i = 1; i < kLogs; ++i)   /// {1,1}..{1,5}: strictly below the checkpoint base, hence deletable
+        deletable_log_keys.push_back(layout.refLogKey(fixture::fixtureLife(ns), RefTxnId{1, static_cast<uint64_t>(i)}));
+
+    Gc gc(store, kGc);
+    auto countSurviving = [&]
+    {
+        size_t n = 0;
+        for (const String & k : deletable_log_keys)
+            if (backend->head(k).exists)
+                ++n;
+        return n;
+    };
+    ASSERT_EQ(countSurviving(), deletable_log_keys.size())
+        << "nothing cleaned before the first round even runs";
+
+    /// The SAME round that folds the whole tail also runs post-CAS cleanup, and with
+    /// `gc_round_ref_cleanup_budget = 1` deletes exactly one of the five deletable candidates.
+    runRegularRoundReclaiming(gc);
+    EXPECT_EQ(countSurviving(), deletable_log_keys.size() - 1)
+        << "a round with gc_round_ref_cleanup_budget=1 must delete exactly one ref object";
+
+    /// Repeated budgeted rounds converge: the whole deletable tail eventually drains, none stranded.
+    for (int i = 0; i < 10 && countSurviving() > 0; ++i)
+        runRegularRoundReclaiming(gc);
+    EXPECT_EQ(countSurviving(), 0u)
+        << "the whole deletable tail must eventually drain under repeated budgeted rounds";
+}
+
 TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
 {
     auto backend = std::make_shared<InMemoryBackend>();

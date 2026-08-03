@@ -97,6 +97,21 @@ struct PoolConfig
     /// unchanged in `still_retired` and retried next round (never dropped). 0 = unbounded.
     uint64_t gc_round_graduation_budget = 5000;
     uint64_t gc_round_redelete_budget = 5000;
+    /// Orphan-manifest sweep: caps on the expensive step the LIST/nomination budgets never covered —
+    /// building a namespace's protection view (catalog-authoritative table recovery + committed-tail
+    /// walk). `sweep_namespace_budget` bounds how many DISTINCT namespaces one page may build a view
+    /// for; `sweep_recovery_op_budget` bounds the total ref-log GET/decode ops the committed-tail walk
+    /// may spend across every namespace, cumulative for the round. Exhausting either retains every
+    /// remaining candidate of the affected namespace on this page (fail-closed; retention is always
+    /// safe) rather than deciding it without a complete protection view.
+    uint64_t gc_round_sweep_namespace_budget = 20;
+    uint64_t gc_round_sweep_recovery_op_budget = 5000;
+    /// Ref-object cleanup (covered log/snapshot exact deletes) and generation-prefix wholesale delete
+    /// (superseded-generation prune + the post-CAS hand-off reclaim) caps, cumulative for the round.
+    /// `prefix_wholesale_budget` is the round's shared remainder every `deletePrefixWholesale` call
+    /// draws from, so no single call passes an unbounded `bounded_remaining`.
+    uint64_t gc_round_ref_cleanup_budget = 5000;
+    uint64_t gc_round_prefix_wholesale_budget = 20000;
     /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
     /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
     /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec

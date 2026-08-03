@@ -1200,6 +1200,77 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
+/// T6b Slice 3 (codex T6-3): `deletePrefixWholesale`'s callers now draw from the round's shared
+/// object-count budget instead of `UINT64_MAX`, and `snap_pruned_through` must advance only past a
+/// FULLY drained generation -- never past one the budget cut short, or its undeleted remainder would
+/// be stranded behind a cursor this loop never revisits. A tiny budget (2 objects/round) against a
+/// generation carrying far more debris than that forces multiple rounds to fully drain it; the
+/// invariant under test is that AT EVERY ROUND, `snap_pruned_through >= old_gen` implies the old
+/// generation's prefix is already empty -- the cursor never claims completion it has not earned.
+TEST(CasGcSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .gc_snap_generations_to_keep = 3,
+        .gc_round_prefix_wholesale_budget = 2,
+        .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    const GcState st1 = readState(*backend, *store);
+    const uint64_t old_gen = st1.snap_generation;
+
+    /// Ten extra debris objects under generation 1's prefix -- far more than the 2-object round budget
+    /// can wholesale-delete in a single pass, regardless of whatever real fold artifacts already live
+    /// there.
+    for (int i = 0; i < 10; ++i)
+        backend->putIfAbsent(store->layout().gcGenPrefix(old_gen) + "debris" + std::to_string(i), "x");
+
+    /// Move the ref off `old_gen`'s run (as `WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes`
+    /// does) so the WHOLESALE RETENTION PRUNE -- not the one-shot post-CAS hand-off -- is what
+    /// eventually processes this generation once the cursor reaches it.
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    size_t previous_residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000).keys.size();
+    std::optional<int> drain_start_round;   /// first round the residue count actually DROPS
+    std::optional<int> drain_done_round;    /// first round the residue reaches zero
+    for (int i = 0; i < 40 && !drain_done_round; ++i)
+    {
+        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+        const GcState st = readState(*backend, *store);
+        const ListPage residue = backend->list(store->layout().gcGenPrefix(old_gen), "", 1000);
+
+        if (st.snap_pruned_through >= old_gen)
+            EXPECT_TRUE(residue.keys.empty())
+                << "round " << i << ": snap_pruned_through (" << st.snap_pruned_through
+                << ") claims generation " << old_gen << " is behind it, but " << residue.keys.size()
+                << " object(s) remain -- the cursor advanced past a partially-drained prefix";
+
+        if (!drain_start_round && residue.keys.size() < previous_residue)
+            drain_start_round = i;
+        if (residue.keys.empty())
+            drain_done_round = i;
+        previous_residue = residue.keys.size();
+    }
+
+    ASSERT_TRUE(drain_start_round.has_value()) << "the round loop never even started draining the debris";
+    ASSERT_TRUE(drain_done_round.has_value())
+        << "the budget-limited generation must eventually fully drain within a generous round bound";
+    /// THE LOAD-BEARING ASSERTION: with a 2-object budget against 10+ debris objects, draining cannot
+    /// finish the SAME round it starts -- it must take several rounds. An unbounded
+    /// `deletePrefixWholesale` call (the mutation this pins) drains everything the round it starts,
+    /// collapsing this gap to zero.
+    EXPECT_GT(*drain_done_round, *drain_start_round)
+        << "draining finished the same round it started -- the per-round budget is not load-bearing";
+}
+
 /// Reclaim-VIA-RETENTION of a non-adopted current-generation attempt orphan (KISS prune model). A
 /// deposed leader can write its fold seal under an attempt that lost CAS #1 to a higher-seq adopter —
 /// debris at the FOLD generation under a NON-adopted attempt. There is NO per-round current-generation

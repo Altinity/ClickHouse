@@ -64,6 +64,10 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
     extern const ContentAddressedSettingsUInt64 gc_round_graduation_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_redelete_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_namespace_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_sweep_recovery_op_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_ref_cleanup_budget;
+    extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
@@ -279,6 +283,10 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
     , gc_round_graduation_budget(settings_[ContentAddressedSetting::gc_round_graduation_budget].value)
     , gc_round_redelete_budget(settings_[ContentAddressedSetting::gc_round_redelete_budget].value)
+    , gc_round_sweep_namespace_budget(settings_[ContentAddressedSetting::gc_round_sweep_namespace_budget].value)
+    , gc_round_sweep_recovery_op_budget(settings_[ContentAddressedSetting::gc_round_sweep_recovery_op_budget].value)
+    , gc_round_ref_cleanup_budget(settings_[ContentAddressedSetting::gc_round_ref_cleanup_budget].value)
+    , gc_round_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value)
     , gcs_max_conditional_put_bytes(settings_[ContentAddressedSetting::gcs_max_conditional_put_bytes].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
@@ -753,6 +761,10 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.gc_round_graduation_budget = gc_round_graduation_budget;
     pool_config.gc_round_redelete_budget = gc_round_redelete_budget;
+    pool_config.gc_round_sweep_namespace_budget = gc_round_sweep_namespace_budget;
+    pool_config.gc_round_sweep_recovery_op_budget = gc_round_sweep_recovery_op_budget;
+    pool_config.gc_round_ref_cleanup_budget = gc_round_ref_cleanup_budget;
+    pool_config.gc_round_prefix_wholesale_budget = gc_round_prefix_wholesale_budget;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.event_sink = makeCasEventSink();
 

@@ -87,7 +87,8 @@ void onGcEnumerationPage()
 
 /// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` can
 /// reach the same wholesale LIST-delete helper the retention prune uses.
-uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining);
+uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining,
+                               bool * out_fully_drained = nullptr);
 
 /// The per-hash freshness-meta operations GC schedules on the bounded pool are
 /// best-effort/idempotent by design. The meta is only a point-read freshness marker for the writer/
@@ -523,6 +524,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
+    /// ONE budget instance for the WHOLE round, threaded into every destructive-work family below:
+    /// `fold` (blob graduation/redelete, the orphan-manifest planner), `pruneSupersededGenerations` and
+    /// the post-CAS hand-off reclaim (`deletePrefixWholesale`'s shared remainder), and
+    /// `cleanupRefObjects`. A cap is therefore cumulative over the round, never reset between families
+    /// or shards. See `GcRoundWorkBudget`'s own comment for the fail-closed contract each family
+    /// applies on exhaustion.
+    GcRoundWorkBudget round_work_budget;
+    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
+    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
+    round_work_budget.max_sweep_namespaces = store->poolConfig().gc_round_sweep_namespace_budget;
+    round_work_budget.max_sweep_recovery_ops = store->poolConfig().gc_round_sweep_recovery_op_budget;
+    round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
+    round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
+
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
     /// artifact. A deferred invocation therefore cannot leave a row the adopted parent already proved
     /// complete, and a folding invocation takes its catalog cut only after the deletion settles.
@@ -717,7 +732,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
 
     /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     /// It emits phases 5..10 of its own.
-    FoldResult folded = fold(state, state_token, report, new_round, *walk_plan, policy);
+    FoldResult folded = fold(state, state_token, report, new_round, *walk_plan, policy, round_work_budget);
 
     /// THE ROUND'S DESTRUCTIVE GATE, read once, here, and consulted at EVERY destructive site below.
     /// It is available this early because `fold` computes it (see `FoldResult::suppress_destructive`),
@@ -1030,7 +1045,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
     /// run/blob is independently protected via `referenced_generations` (captured pre-fold above).
     const uint64_t pruned_through_before = state.snap_pruned_through;
-    pruneSupersededGenerations(generation, attempt, next, referenced_generations, suppress_destructive);
+    pruneSupersededGenerations(generation, attempt, next, referenced_generations, suppress_destructive,
+                               round_work_budget);
     round_commit_timer->metric("generations_visited", next.snap_pruned_through - pruned_through_before);
     round_commit_timer->metric("pruned_through", next.snap_pruned_through);
     round_commit_timer->metric("generations_referenced", referenced_generations.size());
@@ -1102,8 +1118,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
             if (!handed_off.insert(old_ref.generation).second)
                 continue;   /// already reclaimed this round via another shard's ref
+            /// (codex T6-3) `bounded_remaining` is the round's SHARED remainder, never `UINT64_MAX` --
+            /// this is the same primitive `pruneSupersededGenerations` draws from, so a round that
+            /// already spent the budget pruning superseded generations reclaims correspondingly less
+            /// here, rather than the two call sites independently unbounded. This hand-off is already a
+            /// ONE-SHOT event (see the PHASE 14/18 comment above): a generation this call reclaims only
+            /// PARTIALLY is left exactly like a crash in this window already is -- to `fsck`, never
+            /// revisited by a later round's hand-off (the parent-seal difference that triggers it does
+            /// not recur once the ref has moved).
+            const uint64_t remaining = round_work_budget.prefixWholesaleRemaining();
+            if (remaining == 0)
+                break;
             const uint64_t reclaimed = deletePrefixWholesale(
-                backend, layout.gcGenPrefix(old_ref.generation), std::numeric_limits<uint64_t>::max());
+                backend, layout.gcGenPrefix(old_ref.generation), remaining);
+            round_work_budget.prefix_wholesale_objects_used += reclaimed;
             objects_reclaimed += reclaimed;
             LOG_TRACE(logger,
                 "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
@@ -1168,7 +1196,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     {
         GcPhaseTimer t(phase_sink, "ref_object_cleanup");
         if (trim_enabled)
-            cleanupRefObjects(folded, state.lease, suppress_destructive);
+            cleanupRefObjects(folded, state.lease, suppress_destructive, round_work_budget);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
         t.metric("trim_enabled", trim_enabled ? 1 : 0);
         t.metric("namespaces_planned", folded.ref_tables.size());
@@ -1614,7 +1642,8 @@ void Gc::FoldResult::FrontierDeficit::count(FrontierUnproven reason)
 }
 
 Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report,
-                        uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy)
+                        uint64_t current_round, const RefPlan & walk_plan, UniversePolicy policy,
+                        GcRoundWorkBudget & work_budget)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -3037,20 +3066,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// The sweep may recover a catalog-named namespace's debris only from the same frozen catalog
             /// cut and `_ckpt` frontier the round's own universe came from -- which is exactly what an
             /// authoritative universe means, and is why this is the gate's term and not a separate one.
-            universe_authoritative);
+            universe_authoritative,
+            &work_budget);
         for (const ManifestSweepResult::Nomination & nomination : result.orphan_sweep.nominations)
             orphan_source_retirements.insert(
                 orphan_source_retirements.end(),
                 nomination.source_retirements.begin(),
                 nomination.source_retirements.end());
     }
-
-    /// One budget instance for the whole round, shared by reference across every shard's fold call
-    /// below (shards fold sequentially here, so no synchronization is needed) — graduation and
-    /// redelete cohorts are capped cumulatively over the round, not per shard.
-    GcRoundWorkBudget round_work_budget;
-    round_work_budget.max_graduations = store->poolConfig().gc_round_graduation_budget;
-    round_work_budget.max_redeletes = store->poolConfig().gc_round_redelete_budget;
 
     if (state.gc_shards == 1)
     {
@@ -3074,7 +3097,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      confirm_condemned_marker,
                                      result.retired_merge.data(), suppress_destructive,
                                      &ledger.applied, std::move(orphan_source_retirements),
-                                     &round_work_budget);
+                                     &work_budget);
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -3116,7 +3139,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 confirm_condemned_marker,
                 &result.retired_merge[shard], suppress_destructive,
                 &ledger.applied, std::move(retirement_buckets[shard]),
-                &round_work_budget);
+                &work_budget);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
@@ -3286,7 +3309,8 @@ void Gc::reportSweepRetention(const ManifestSweepResult & result)
 }
 
 void Gc::cleanupRefObjects(
-    const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive)
+    const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
+    GcRoundWorkBudget & work_budget)
 {
     /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
     /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
@@ -3408,16 +3432,29 @@ void Gc::cleanupRefObjects(
         const RefCleanupPlan plan = planRefCleanup(
             listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
         for (const RefTxnId & log_id : plan.deletable_logs)
+        {
+            /// (codex T6-3) Cumulative per-round cap, never amortized against the per-key fail-close
+            /// validation `deleteRefObject` performs (HEAD + catalog re-read + gc/state re-read before
+            /// every exact delete stays exactly as expensive per key as before). Exhaustion simply stops
+            /// the round's cleanup pass here; `planRefCleanup` recomputes the SAME remaining candidates
+            /// from durable state next round, so nothing here needs its own cursor.
+            if (!work_budget.refCleanupAvailable())
+                return;
             if (!deleteRefObject(layout.refLogKey(life, log_id)))
                 return;
+            ++work_budget.ref_cleanup_objects_used;
+        }
         for (const RefTxnId & snap_id : plan.deletable_snapshots)
         {
             /// Task 5's rule, asserted where it is acted on rather than only where it is computed: the
             /// snapshot the checkpoint names is the one a recovering reader will sample, so it must
             /// survive every cleanup that the same checkpoint authorized.
             chassert(snap_id < checkpoint_snapshot_id);
+            if (!work_budget.refCleanupAvailable())
+                return;
             if (!deleteRefObject(layout.refSnapshotKey(life, snap_id)))
                 return;
+            ++work_budget.ref_cleanup_objects_used;
         }
     }
 }
@@ -3435,8 +3472,17 @@ namespace
 /// during a prune (it would only wedge GC). A genuine TokenMismatch is
 /// likewise tolerated here: the object was rewritten under us (another attempt is live at this key) — the
 /// safe direction during a best-effort prune is to leave it for a later round, never to force-delete.
-uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining)
+/// `out_fully_drained`, when set, reports whether the WHOLE prefix was exhausted (every listed key
+/// visited) rather than the call stopping early because `bounded_remaining` ran out. (codex T6-3) a
+/// caller advancing a monotone cursor past this prefix must consult this: a `false` here means objects
+/// remain, and the cursor must stay put so a later round's fresh budget can finish the same prefix
+/// instead of stranding the remainder permanently. `bounded_remaining == 0` conservatively reports
+/// `false` (nothing was even examined, so completeness cannot be claimed).
+uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining,
+                               bool * out_fully_drained)
 {
+    if (out_fully_drained)
+        *out_fully_drained = false;
     static constexpr size_t kListPageLimit = 1000;
     uint64_t deleted = 0;
     String cursor;
@@ -3462,7 +3508,11 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
             ++deleted;
         }
         if (page.next_cursor.empty())
+        {
+            if (out_fully_drained)
+                *out_fully_drained = true;
             break;
+        }
         cursor = page.next_cursor;
     }
     return deleted;
@@ -3471,7 +3521,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 
 void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
                                     const std::set<uint64_t> & referenced_generations,
-                                    bool suppress_destructive)
+                                    bool suppress_destructive, GcRoundWorkBudget & work_budget)
 {
     /// GATED, and `snap_pruned_through` stays where it is. The cursor is a monotone high-water mark the
     /// wholesale prune never revisits, so advancing it over a generation this round declined to delete
@@ -3495,10 +3545,13 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     /// attempt before its CAS fails. The old per-key single-attempt prune (keyed on the final
     /// snap_attempt) therefore leaked every non-adopted attempt's debris. Instead, LIST the whole
     /// `gc/gen/<g>/` prefix and delete every listed object — reclaiming ALL attempts of `g`, including
-    /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round;
-    /// fail-open on 404. snap_pruned_through advances over every generation the loop VISITS this round —
-    /// both fully-reclaimed AND ref-retained (skipped) ones (`g - 1` after the loop increments past them,
-    /// below). It is a monotone high-water cursor, NOT a proof that everything below it is gone.
+    /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round
+    /// by generation count (`kMaxPrunePerRound`) AND by the round's shared object-count work budget
+    /// (codex T6-3); fail-open on 404. `snap_pruned_through` advances over every generation the loop
+    /// FULLY processes this round — ref-retained (skipped) generations count as fully processed (there
+    /// is nothing left for THIS loop to do to them), but a generation whose delete the work budget cut
+    /// short does NOT: the loop stops there, so the cursor never strands a partially-drained prefix
+    /// behind it. It is a monotone high-water cursor, NOT a proof that everything below it is gone.
     if (adopted_generation > keep)
     {
         const uint64_t prune_floor = adopted_generation - keep;   /// prune generations <= prune_floor
@@ -3525,9 +3578,24 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
                     g);
                 continue;
             }
-            deletePrefixWholesale(backend, layout.gcGenPrefix(g), std::numeric_limits<uint64_t>::max());
+            /// (codex T6-3) `bounded_remaining` is the round's SHARED remainder across every
+            /// `deletePrefixWholesale` call this round (never `UINT64_MAX`). A generation whose prefix
+            /// this call cannot FULLY drain within the remaining budget must not let the cursor advance
+            /// past it -- `snap_pruned_through` is a monotone high-water mark this loop never revisits,
+            /// so stranding a partially-drained generation behind it would leak the remainder forever.
+            /// Stop the loop here; `g - 1` (the previous, fully-processed generation) is what gets
+            /// persisted below.
+            const uint64_t remaining = work_budget.prefixWholesaleRemaining();
+            if (remaining == 0)
+                break;
+            bool fully_drained = false;
+            const uint64_t reclaimed = deletePrefixWholesale(
+                backend, layout.gcGenPrefix(g), remaining, &fully_drained);
+            work_budget.prefix_wholesale_objects_used += reclaimed;
+            if (!fully_drained)
+                break;
         }
-        next.snap_pruned_through = g - 1;   /// highest generation fully processed this round
+        next.snap_pruned_through = g - 1;   /// highest generation FULLY processed this round
     }
 
     /// (2) NO per-round current-generation attempt-sweep (KISS). A previous revision LISTed the FOLD

@@ -587,6 +587,10 @@ private:
     const uint64_t manifest_sweep_delete_budget_keys;
     const uint64_t gc_round_graduation_budget;
     const uint64_t gc_round_redelete_budget;
+    const uint64_t gc_round_sweep_namespace_budget;
+    const uint64_t gc_round_sweep_recovery_op_budget;
+    const uint64_t gc_round_ref_cleanup_budget;
+    const uint64_t gc_round_prefix_wholesale_budget;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
     const uint64_t gcs_max_conditional_put_bytes;

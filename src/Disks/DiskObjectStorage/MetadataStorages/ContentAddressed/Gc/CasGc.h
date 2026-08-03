@@ -665,7 +665,10 @@ private:
     /// `walk_plan` owns the round's one enumeration of `cas/ns/stream/` (see `RefScanSummary`) and
     /// its catalog cut; the fold regroups those keys strictly rather than listing the prefix again.
     FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round,
-                    const RefPlan & walk_plan, UniversePolicy policy);
+                    const RefPlan & walk_plan, UniversePolicy policy,
+                    /// One instance for the WHOLE round, owned by `runRegularRound` and threaded through
+                    /// every destructive-work family the round touches — see `GcRoundWorkBudget`.
+                    GcRoundWorkBudget & work_budget);
 
     /// The round's `_ckpt.checkpoint` witness per namespace — the SECOND, hint-independent witness the
     /// walk decides its absents against. ONE call site, in the fold, right where the hint is grouped.
@@ -765,7 +768,8 @@ private:
     /// are then deletable only strictly BELOW that checkpoint (and logs also at or below the durable
     /// cursor). A namespace with no checkpoint base, or an invalid triple, is leak-only this pass.
     void cleanupRefObjects(
-        const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive);
+        const FoldResult & folded, const GcLease & adopted_lease, bool suppress_destructive,
+        GcRoundWorkBudget & work_budget);
 
     /// Emit the sweep's per-pass retention rollup, throttled (see `last_retain_rollup`). Separate from
     /// the pass itself so the phase row and the log line read the SAME counters rather than two
@@ -835,7 +839,7 @@ private:
     /// round declined to delete would strand that generation's whole prefix permanently.
     void pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attempt, GcState & next,
                                     const std::set<uint64_t> & referenced_generations,
-                                    bool suppress_destructive);
+                                    bool suppress_destructive, GcRoundWorkBudget & work_budget);
 
     /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
     std::optional<CasFoldSeal> readFoldSeal(uint64_t generation, uint64_t attempt);

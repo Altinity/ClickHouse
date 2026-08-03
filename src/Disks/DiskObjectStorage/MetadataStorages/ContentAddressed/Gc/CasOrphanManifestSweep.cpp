@@ -153,6 +153,12 @@ struct NamespaceProtection
 {
     std::set<String> active;
     std::set<String> tail_removal_targets;
+    /// Set when the committed-tail recovery walk stopped early because `work_budget`'s recovery-op cap
+    /// was spent (see `activeManifestKeys` below), or the walk was never attempted because the cap was
+    /// already spent by an earlier namespace this round. `active`/`tail_removal_targets` are then a
+    /// PARTIAL view — the caller must never use them to authorize a deletion decision, only to retain
+    /// every one of this namespace's candidates on the current page.
+    bool recovery_incomplete = false;
 };
 
 
@@ -164,11 +170,26 @@ struct NamespaceProtection
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
 /// invalid transaction (via the authority-grounded recovery / `decodeRefLogTxn`); the caller SKIPS the
 /// namespace's deletions on such a throw rather than substituting an empty owner set.
+///
+/// `work_budget`, when set, bounds the committed-tail walk below: each ref-log GET the walk issues
+/// consumes one unit of `GcRoundWorkBudget::sweep_recovery_op_budget`, shared with every other
+/// namespace this round touches. Exhaustion sets `NamespaceProtection::recovery_incomplete` and stops
+/// the walk — it is deliberately NOT plumbed into `recoverRefTableDetailedFromAuthority` itself: that
+/// function is a shared recovery primitive also used by `fsck` (which needs a COMPLETE table to audit)
+/// and the GC rebuild path (which needs a complete table to reconstruct in-degree from scratch), so
+/// capping its own internal cost is out of scope here — this file only bounds the walk it owns.
+/// Reaching the budget before even calling `recoverRefTableDetailedFromAuthority` (already spent by an
+/// earlier namespace) skips that call entirely and reports incomplete immediately.
 NamespaceProtection activeManifestKeys(
     Pool & store, const CatalogEntry & catalog_entry, const RefCkpt & ckpt,
-    const std::optional<RefCoverage> & coverage)
+    const std::optional<RefCoverage> & coverage, GcRoundWorkBudget * work_budget = nullptr)
 {
     NamespaceProtection protection;
+    if (work_budget && !work_budget->sweepRecoveryOpAvailable())
+    {
+        protection.recovery_incomplete = true;
+        return protection;
+    }
     std::set<String> & active = protection.active;
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
@@ -180,6 +201,8 @@ NamespaceProtection activeManifestKeys(
     /// a later catalog cut can name a reborn life and turn this old life into an apparent orphan.
     const RecoveredRefTable recovered = recoverRefTableDetailedFromAuthority(
         backend, layout, catalog_entry, ckpt);
+    if (work_budget)
+        ++work_budget->sweep_recovery_ops_used;   /// one coarse unit for the snapshot+tail recovery itself
     const RefTableState & state = recovered.state;
     for (const auto [ref_name, row] : state.getCommitted())
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
@@ -267,7 +290,20 @@ NamespaceProtection activeManifestKeys(
 
     while (id <= *ckpt.committed_through)
     {
+        /// UNCERTAINTY, work-budget arm: the committed-tail walk is a finite but potentially huge range
+        /// (up to `ckpt.committed_through`), and the round shares one recovery-op budget across every
+        /// namespace it touches. Stopping HERE — before the next GET — leaves `active`/
+        /// `tail_removal_targets` genuinely partial, so the caller must treat the whole namespace as
+        /// undecided this page (fail-closed retain), never authorize a deletion from what was collected
+        /// so far.
+        if (work_budget && !work_budget->sweepRecoveryOpAvailable())
+        {
+            protection.recovery_incomplete = true;
+            break;
+        }
         const auto got = backend.get(layout.refLogKey(life, id));
+        if (work_budget)
+            ++work_budget->sweep_recovery_ops_used;
         if (!got)
         {
             /// A known ordinary predecessor cannot cross an epoch. Only an inherited cursor whose body
@@ -333,6 +369,7 @@ std::string_view sweepRetainClassName(SweepRetainClass c)
         case SweepRetainClass::Hold:           return "hold";
         case SweepRetainClass::UnconsumedSeal: return "unconsumed_seal";
         case SweepRetainClass::TailRemoval:    return "tail_removal";
+        case SweepRetainClass::WorkBudgetExhausted: return "work_budget_exhausted";
     }
     return "unknown";
 }
@@ -346,6 +383,7 @@ std::pair<SweepRetainClass, uint64_t> ManifestSweepResult::topRetainReason() con
         {SweepRetainClass::Hold, retained_hold},
         {SweepRetainClass::UnconsumedSeal, retained_unconsumed_seal},
         {SweepRetainClass::TailRemoval, retained_tail_removal},
+        {SweepRetainClass::WorkBudgetExhausted, retained_work_budget},
     };
     std::pair<SweepRetainClass, uint64_t> top{SweepRetainClass::None, 0};
     for (const auto & c : candidates)
@@ -565,7 +603,8 @@ ManifestSweepResult planManifestCursorPage(
     const String & cursor,
     uint64_t list_budget,
     uint64_t nomination_budget,
-    bool catalog_recovery_authoritative)
+    bool catalog_recovery_authoritative,
+    GcRoundWorkBudget * work_budget)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -584,11 +623,27 @@ ManifestSweepResult planManifestCursorPage(
     /// later lifecycle cut is safe only when deletion retains the old exact token, so the replacement
     /// loses `deleteExact`. Do not take a fresh GET after the catalog read: that would splice new-life
     /// bytes into old candidate selection and authorize their deletion with the new token.
+    ///
+    /// (codex T6-1) Bounded to `nomination_budget` well-formed keys — never the whole `list_budget`-sized
+    /// page — since `nomination_budget` is the hard ceiling on how many of them this call can ever
+    /// nominate. A well-formed key beyond this cap has no frozen body; it is retained where its absence
+    /// is discovered below, in the exact same "budget exhausted, cursor does not step over it" shape the
+    /// nomination-count exhaustion already uses.
     std::map<String, std::optional<GetResult>> observed_candidates;
     if (nomination_budget > 0)
+    {
+        uint64_t frozen = 0;
         for (const ListedKey & listed : page.keys)
+        {
+            if (frozen >= nomination_budget)
+                break;
             if (parseListedManifestObject(layout, listed.key))
+            {
                 observed_candidates.emplace(listed.key, backend.get(listed.key));
+                ++frozen;
+            }
+        }
+    }
 
     /// One seal and one later catalog cut for the whole page; every namespace joins through those same
     /// immutable observations.
@@ -663,6 +718,24 @@ ManifestSweepResult planManifestCursorPage(
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
         {
+            /// UNCERTAINTY, work-budget arm (codex T6-1): building a fresh namespace's protection view
+            /// is the expensive step (a catalog-authoritative table recovery plus a committed-tail
+            /// walk) the LIST/nomination budgets never bounded. Once the round's per-page namespace cap
+            /// is spent, a NEW namespace gets no view at all -- retained, exactly like every other
+            /// "cannot confirm emptiness" cause below, never a partial or best-effort one.
+            if (work_budget && !work_budget->sweepNamespaceAvailable())
+            {
+                LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                    "CAS orphan sweep: retaining {} -- round's per-page namespace work budget exhausted",
+                    parsed->key);
+                errored_namespaces.insert(parsed->ns.string());
+                ++result.retained_work_budget;
+                ++result.skipped;
+                decided_through = listed.key;
+                continue;
+            }
+            if (work_budget)
+                ++work_budget->sweep_namespaces_used;
             view_it->second.coverage = coverageOf(adopted_seal, catalog_cut, parsed->ns);
             if (catalog_entry && !catalog_recovery_authoritative)
             {
@@ -705,9 +778,24 @@ ManifestSweepResult planManifestCursorPage(
                     else
                     {
                         NamespaceProtection protection = activeManifestKeys(
-                            store, *catalog_entry, ckpt->ckpt, view_it->second.coverage);
-                        view_it->second.tail_removal_targets = std::move(protection.tail_removal_targets);
-                        active_it->second = std::move(protection.active);
+                            store, *catalog_entry, ckpt->ckpt, view_it->second.coverage, work_budget);
+                        if (protection.recovery_incomplete)
+                        {
+                            /// The committed-tail walk stopped early: `active`/`tail_removal_targets`
+                            /// are a PARTIAL view. Discard them and retain the whole namespace on this
+                            /// page instead of deciding from an incomplete protection set (fail-closed).
+                            LOG_DEBUG(getLogger("CasOrphanManifestSweep"),
+                                "CAS orphan sweep: retaining {} -- committed-tail recovery walk's work "
+                                "budget exhausted before it could confirm the namespace's protection view",
+                                parsed->key);
+                            errored_namespaces.insert(parsed->ns.string());
+                            ++result.retained_work_budget;
+                        }
+                        else
+                        {
+                            view_it->second.tail_removal_targets = std::move(protection.tail_removal_targets);
+                            active_it->second = std::move(protection.active);
+                        }
                     }
                 }
 
@@ -757,6 +845,7 @@ ManifestSweepResult planManifestCursorPage(
                     case SweepRetainClass::Hold:           ++result.retained_hold; break;
                     case SweepRetainClass::UnconsumedSeal: ++result.retained_unconsumed_seal; break;
                     case SweepRetainClass::TailRemoval:    ++result.retained_tail_removal; break;
+                    case SweepRetainClass::WorkBudgetExhausted: ++result.retained_work_budget; break;  /// unreachable: the premise never returns this class itself
                     case SweepRetainClass::None:           break;   /// unreachable: the premise refused
                 }
                 ++result.skipped;
@@ -767,8 +856,18 @@ ManifestSweepResult planManifestCursorPage(
 
         /// This exact token and bytes were captured before the catalog cut (see above). A missing body
         /// has no deletion authority; a later replacement loses the old token at `deleteExact`.
+        ///
+        /// (codex T6-1) A well-formed key can legitimately be ABSENT here: the freeze loop above caps
+        /// fan-out at `nomination_budget` candidates, so a key beyond that cap was never frozen. Treat
+        /// it exactly like nomination-count exhaustion -- retain, and do NOT advance the cursor past
+        /// it, so the very next page/round examines it with a fresh budget instead of losing it.
         const auto observed_it = observed_candidates.find(parsed->key);
-        chassert(observed_it != observed_candidates.end());
+        if (observed_it == observed_candidates.end())
+        {
+            budget_exhausted = true;
+            ++result.skipped;
+            continue;
+        }
         const std::optional<GetResult> & got = observed_it->second;
         if (!got)
         {

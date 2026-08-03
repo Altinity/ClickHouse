@@ -9,6 +9,7 @@
 #include <base/extended_types.h>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -232,14 +233,18 @@ struct RetiredMergeResult
     std::optional<UnmatchedRemoveExample> unmatched_remove_example;
 };
 
-/// Cumulative per-round cap on graduation/redelete cohort sizes, shared by reference across every
-/// shard's `foldDeltasIntoGeneration` call within one round (the caller owns one instance per round
-/// and passes the same pointer to each shard in turn). `0` in either bound is unbounded — the same
-/// opt-out convention every other CAS round budget uses, so a default-constructed instance
-/// reproduces today's behavior. Exhausting a bound does not drop work: the entry stays in
-/// `still_retired` exactly as it would have before the cap existed, and a fresh budget next round
-/// picks up where this one left off. Reusable as-is by a future bounded-parallel-walk: give each
-/// worker an atomic increment (or a partitioned share of the bound) instead of a new accounting shape.
+/// Cumulative per-round cap over EVERY destructive-work family a round touches — blob graduation and
+/// redelete (this file), the orphan-manifest planner's namespace fan-out and recovery walk
+/// (`CasOrphanManifestSweep.cpp`), and ref-object/generation-prefix cleanup (`CasGc.cpp`). One instance
+/// is owned by `Gc::runRegularRound` per round and passed by reference/pointer into each family's call
+/// in turn, so a cap is cumulative across the WHOLE round, not reset per shard or per namespace. `0` in
+/// any bound is unbounded — the same opt-out convention every other CAS round budget uses, so a
+/// default-constructed instance reproduces pre-budget behavior everywhere. Exhausting a bound never
+/// drops work: each family's caller carries the excess in its own already-durable pipeline (still
+/// `delete_pending`/condemned rows, a retained sweep candidate, a ref object left for next round) and
+/// retries next round with a fresh budget. Reusable as-is by a future bounded-parallel-walk: give each
+/// worker an atomic increment (or a partitioned share of a bound) instead of inventing a new
+/// accounting shape.
 struct GcRoundWorkBudget
 {
     uint64_t max_graduations = 0;
@@ -249,6 +254,40 @@ struct GcRoundWorkBudget
 
     bool graduationAvailable() const { return max_graduations == 0 || graduations_used < max_graduations; }
     bool redeleteAvailable() const { return max_redeletes == 0 || redeletes_used < max_redeletes; }
+
+    /// Orphan-manifest planner (`planManifestCursorPage` / `activeManifestKeys`): how many DISTINCT
+    /// namespaces one page may build a fresh protection view for, and how many ref-log GET/decode
+    /// operations the committed-tail recovery walk may spend in total across every namespace this
+    /// round. Both caps exist because building a namespace's protection view (a catalog-authoritative
+    /// table recovery plus a committed-tail walk) is the expensive, potentially-unbounded step the
+    /// nomination/list budgets never covered.
+    uint64_t max_sweep_namespaces = 0;
+    uint64_t max_sweep_recovery_ops = 0;
+    uint64_t sweep_namespaces_used = 0;
+    uint64_t sweep_recovery_ops_used = 0;
+
+    bool sweepNamespaceAvailable() const { return max_sweep_namespaces == 0 || sweep_namespaces_used < max_sweep_namespaces; }
+    bool sweepRecoveryOpAvailable() const { return max_sweep_recovery_ops == 0 || sweep_recovery_ops_used < max_sweep_recovery_ops; }
+
+    /// Cleanup families (`Gc::cleanupRefObjects`, `deletePrefixWholesale`'s callers in
+    /// `Gc::pruneSupersededGenerations` and the post-CAS hand-off reclaim). `deletePrefixWholesale`
+    /// already takes a `bounded_remaining` count; `prefixWholesaleRemaining` turns the shared round
+    /// budget into that same count (its ONE unbounded sentinel, `0 == max_prefix_wholesale_objects`,
+    /// maps to the function's own "no cap" value, `UINT64_MAX`) so every caller can pass "the round's
+    /// remainder" instead of `UINT64_MAX` outright.
+    uint64_t max_ref_cleanup_objects = 0;
+    uint64_t ref_cleanup_objects_used = 0;
+    uint64_t max_prefix_wholesale_objects = 0;
+    uint64_t prefix_wholesale_objects_used = 0;
+
+    bool refCleanupAvailable() const { return max_ref_cleanup_objects == 0 || ref_cleanup_objects_used < max_ref_cleanup_objects; }
+    uint64_t prefixWholesaleRemaining() const
+    {
+        if (max_prefix_wholesale_objects == 0)
+            return std::numeric_limits<uint64_t>::max();
+        return prefix_wholesale_objects_used < max_prefix_wholesale_objects
+            ? max_prefix_wholesale_objects - prefix_wholesale_objects_used : 0;
+    }
 };
 
 /// Merge the prior generation's source-edge run with new deltas. The prior run's `kCondemned` rows RIDE

@@ -43,6 +43,9 @@ enum class SweepRetainClass : uint8_t
     Hold,              /// the namespace is held, or is classified clamped
     UnconsumedSeal,    /// rule (1): the cursor has not consumed the build epoch's closing seal
     TailRemoval,       /// rule (2): an unconsumed tail record names this manifest as a removal target
+    WorkBudgetExhausted, /// the round's per-namespace or recovery-op work budget was spent before this
+                         /// namespace's protection view could be built (or built completely); retained
+                         /// rather than decided without a complete view (fail-closed, never a partial one)
 };
 
 /// The class as a short stable word, for log lines and metric names.
@@ -123,6 +126,7 @@ struct ManifestSweepResult
     uint64_t retained_hold = 0;
     uint64_t retained_unconsumed_seal = 0;
     uint64_t retained_tail_removal = 0;
+    uint64_t retained_work_budget = 0;
 
     /// Exact-GET/decode candidates. The reducer must adopt every `source_retirements` entry before the
     /// caller may exact-token-delete `key` with `token`.
@@ -183,11 +187,20 @@ bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & 
 /// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
 /// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its
 /// frozen catalog cut and the exact `_ckpt` frontier of the life named there.
+///
+/// `work_budget`, when set, bounds the body-GET/retention fan-out to `nomination_budget` well-formed
+/// candidates (never the whole `list_budget`-sized page), caps how many DISTINCT namespaces this page
+/// may build a fresh protection view for, and caps the committed-tail recovery walk's ref-log GET
+/// count cumulatively across the round (shared with every other destructive-work family via the same
+/// `GcRoundWorkBudget` instance). Exhausting either cap retains every remaining candidate belonging to
+/// the affected namespace on THIS page rather than deciding it without a complete protection view;
+/// `nullptr` (the default) reproduces the pre-budget unbounded behavior.
 ManifestSweepResult planManifestCursorPage(
     Pool & store,
     const String & cursor,
     uint64_t list_budget,
     uint64_t nomination_budget,
-    bool catalog_recovery_authoritative);
+    bool catalog_recovery_authoritative,
+    GcRoundWorkBudget * work_budget = nullptr);
 
 }
