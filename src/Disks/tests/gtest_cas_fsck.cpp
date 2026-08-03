@@ -605,6 +605,52 @@ TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
     EXPECT_EQ(report.dangling, 0u);
 }
 
+/// A physical namespace-life key whose life id is ambiguous in the POST-LISTING cut (two catalog rows
+/// share one incarnation) must be recorded as a `lifeless_keys` finding and must NOT abort the scan:
+/// `CatalogLifeIndex::resolve` throws `CORRUPTED_DATA` on a duplicate, and the janitor-pending
+/// classification loop must catch it exactly like every other catalog-authority failure in this scan.
+/// Mirrors `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses`, but that fixture
+/// has no physical object under the duplicated life id, so it never drives a candidate into the new
+/// post-listing loop at all -- this is the case that actually exercises it.
+TEST(CasFsck, AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace unique_ns{"00/unique@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, unique_ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, layout, unique_ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, layout, unique_ns, RefTxnId{1, sequence});
+
+    const NamespaceLifeId duplicated_life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"bad/a"}, UInt128{777});
+    ASSERT_EQ(backend->putIfAbsent(layout.namespaceFilesPrefix(duplicated_life) + "format_version.txt", "1\n").outcome,
+        PutOutcome::Done);
+
+    CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*backend, layout);
+    snapshot.catalog.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{"bad/a"}, .state = NsState::Live, .incarnation = UInt128{777}});
+    snapshot.catalog.entries.push_back(CatalogEntry{
+        .ns = RootNamespace{"bad/b"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{777},
+        .removal_started_round = 1});
+    std::sort(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+        [](const CatalogEntry & lhs, const CatalogEntry & rhs) { return lhs.ns.string() < rhs.ns.string(); });
+    const auto catalog_head = backend->head(layout.refCatalogKey());
+    ASSERT_TRUE(catalog_head.exists);
+    ASSERT_EQ(backend->putOverwrite(layout.refCatalogKey(), encodeRefCatalog(snapshot.catalog), catalog_head.token).outcome,
+        PutOutcome::Done);
+
+    FsckReport report;
+    ASSERT_NO_THROW(report = runFsck(*store, /*detail=*/true))
+        << "an ambiguous life under a physical key must be a recorded finding, never an abort";
+    EXPECT_GE(report.lifeless_keys, 1u);
+    EXPECT_GE(report.reachable, 1u) << "the unrelated unique namespace must still be audited";
+    EXPECT_EQ(report.dangling, 0u);
+}
+
 /// Fsck's namespace universe is catalog-authoritative. Admit `ns`, publish one real ref-log record,
 /// then hide its whole stream prefix from LIST. Fsck must still retain the namespace from the catalog
 /// cut and use the checkpoint-anchored arithmetic walk to read the record.

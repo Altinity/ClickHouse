@@ -1,3 +1,4 @@
+import re
 import shlex
 import time
 
@@ -285,7 +286,9 @@ def test_drop_dead_pool_member_heals_the_pool():
     assert "dangling=0" in fsck, fsck
     assert "unaccounted=0" in fsck, fsck
     assert "lifeless_keys=0" in fsck, fsck
-    assert "janitor_pending=0" not in fsck, (
+    janitor_pending_match = re.search(r"\bjanitor_pending=(\d+)", fsck)
+    assert janitor_pending_match, "ca-fsck summary is missing the janitor_pending field: {}".format(fsck)
+    assert int(janitor_pending_match.group(1)) >= 1, (
         "expected janitor-pending dead-life residue from the healed decommission and the t1 drop: {}".format(fsck)
     )
 

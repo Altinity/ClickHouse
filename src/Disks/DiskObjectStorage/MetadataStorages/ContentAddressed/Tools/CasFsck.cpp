@@ -558,8 +558,23 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         std::unordered_set<UInt128> pending_lives;
         for (const CanonicalNamespaceKey & candidate : canonical_candidates)
         {
-            if (post_listing_cut.life_index.resolve(candidate.life_id))
-                continue;   /// protected by some catalog state as of the later cut -- not residue
+            try
+            {
+                if (post_listing_cut.life_index.resolve(candidate.life_id))
+                    continue;   /// protected by some catalog state as of the later cut -- not residue
+            }
+            catch (const Exception & e)
+            {
+                /// The reverse life index throws `CORRUPTED_DATA` when the post-listing cut carries a
+                /// duplicated life id: a catalog defect, not evidence about THIS key. Record and keep
+                /// walking, same as every other catalog-authority failure in this scan -- an audit that
+                /// aborted on the first bad key would report nothing about the healthy candidates
+                /// still queued behind it.
+                if (e.code() != ErrorCodes::CORRUPTED_DATA)
+                    throw;
+                recordLifelessKeys(NamespaceListing{{}, {{candidate.key, e.message()}}});
+                continue;
+            }
             ++report.namespace_janitor_pending;
             report.namespace_janitor_pending_bytes += candidate.size;
             pending_lives.insert(candidate.life_id);

@@ -4,7 +4,59 @@ Status: **DONE**. Two-phase heal + operator-facing UX message landed; both STOP-
 lane surfaced were escalated, ruled on, and (one of them) closed as its own separate slice
 (`ca: fsck — dead-life residue is janitor-pending, not corruption; observe-then-cut classification`).
 Full release CA gate (278 suites, 1989 tests) and the ASan decommission/fsck/janitor/layout suites
-both green. The integration lane is green: 2/2 in 171s.
+both green. The integration lane is green: 2/2 in 171s. A fix round (below) landed on top after
+review, closing two blocking CODE findings and three non-blocking ones.
+
+## Fix round (post-review)
+
+Review (`t3-review.md`): draft APPROVE; T3 closure APPROVE-WITH-NONBLOCKING; fsck slice REJECT with
+two blocking findings. Fixed on `laneg/t3-finish` as an ordinary follow-up commit:
+
+- **F1 (blocking, CODE)** — the post-listing classification loop's
+  `post_listing_cut.life_index.resolve(candidate.life_id)` call was uncaught: `CatalogLifeIndex::resolve`
+  throws `CORRUPTED_DATA` when the post-listing cut carries a duplicated life id, which aborted the
+  entire scan — contradicting this same commit's own doc comments describing ambiguity as a recorded
+  `lifeless_keys` finding, not an abort. Fixed by restoring the
+  `catch (const Exception & e) { if (code != CORRUPTED_DATA) throw; recordLifelessKeys(...); continue; }`
+  shape the pre-image used around the `resolve` call. Red-first proof: temporarily reverted the fix,
+  added the new test `CasFsck.AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted` (a physical
+  `_files` object under a life id shared by two catalog rows — the case
+  `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` never drove into this
+  loop, since its duplicated id has no physical object), confirmed it aborts with the uncaught
+  `CORRUPTED_DATA` exception (`build/t3fix_red_run.log`), then restored the fix and confirmed green.
+- **F2 (blocking, CODE/TEST)** — `05020_content_addressed_fsck.reference` still had 17 columns; the
+  three new `namespace_janitor_pending`/`_bytes`/`_lives` columns were never added. Regenerated both
+  golden lines (header + zero-valued data row) in the correct position (immediately after
+  `lifeless_keys`, matching `contentAddressedFsckColumns`'s declaration order) and ran the actual
+  stateless test against a freshly rebuilt server binary via
+  `python3 -m ci.praktika run "Stateless tests (amd_binary, content_addressed storage, parallel)"
+  --test "05020_content_addressed_fsck"`: **1 passed, 0 failed**
+  (`build/t3fix_stateless_05020.log`).
+- **F3 (non-blocking, CODE)** — the reworded arm-(a) message claimed all counted namespaces "are
+  marked for removal", but `victim_owned_count` counts entries in ANY `NsState` (including `Live`),
+  and the test `VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot` pins exactly that counterexample
+  (a `Live` entry). Reworded to "N namespace(s) are still owned by this member" — a claim the count
+  actually supports regardless of state. Updated the one gtest assertion that pinned the old wording.
+- **F4 (non-blocking, TEST)** — the integration lane's `assert "janitor_pending=0" not in fsck` was
+  fail-open on an entirely absent field (an older binary, a renamed column) — passing both when the
+  count is nonzero and when the key is missing. Replaced with a regex extraction
+  (`re.search(r"\bjanitor_pending=(\d+)", fsck)`) that fails if the field is absent, then asserts
+  `>= 1` — the dispatch's own originally-intended wording.
+- **F6 (non-blocking, message text)** — `CommandFsck`'s note claimed the janitor "deletes them on a
+  later page — expected, no action needed", stated as present-tense fact; under the current Stage-A
+  posture the janitor's own deletes are suppressed (the closure report's own 6-round non-drain
+  observation proves it), so the residue does not drain today. Reworded to state the janitor as the
+  sole intended reclaimer whose deletes "can be deferred (e.g. a destructive-round suppression
+  policy)", with an investigate-only-if-persistent qualifier, rather than promising imminent cleanup.
+- **F5 (PROSE)** — batched to `docs/superpowers/cas/deferred-docs-fixes.md` (`{#d42-t3-review-prose}`)
+  per the batching policy, along with the review's own PROSE section (the retired arm-(a) string
+  still quoted/instructed in `BACKLOG.md` and the T3 plan; one dated-history imprecision that needs no
+  fix). Not fixed in this round.
+
+Re-verified after the fix round: release suite (`*CasFsck*:*CasDecommission*:*CasLayout*:*CasNamespaceLife*:*CasNamespaceJanitor*:*Fsck*:*Decommission*`)
+**145/145 passed** (`build/t3fix_run_release.log`, up one from the review's 144 for the new F1 test);
+ASan, same filter, **145/145 passed** (`build_asan/t3fix_run_asan.log`); the 05020 stateless test, 1/1
+passed as above.
 
 ## Starting point
 

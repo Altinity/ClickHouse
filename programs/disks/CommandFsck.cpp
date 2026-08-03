@@ -110,9 +110,11 @@ public:
             std::cout << "note: " << report.namespace_janitor_pending
                       << " namespace-life object(s) (" << report.namespace_janitor_pending_bytes
                       << " byte(s) across " << report.namespace_janitor_pending_lives
-                      << " life/lives) are janitor-pending — their catalog row is already gone, the "
-                         "perpetual namespace janitor deletes them on a later page — expected, no action "
-                         "needed (listed as `janitor-pending` rows under --detail)\n";
+                      << " life/lives) are janitor-pending — their catalog row is already gone, and the "
+                         "perpetual namespace janitor is the sole intended reclaimer, but its deletes can "
+                         "be deferred (e.g. a destructive-round suppression policy) — not corruption; "
+                         "investigate only if the same objects persist across many completed janitor "
+                         "cycles (listed as `janitor-pending` rows under --detail)\n";
 
         if (detail)
         {

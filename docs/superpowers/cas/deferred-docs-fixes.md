@@ -635,3 +635,33 @@ From `t4-review.md`: (1) IMPRECISE — the T4 report's delta line says "1985 …
 branch exists there) and a `Durable`-shaped test as its detector; the implementor's disclosure is
 the accurate record. Also PROV-1: `build/t4_asan_gate3.log` is not attributable to a binary
 (relink inside its run window) — cite the review's §0b run instead.
+
+### D42 — T3-review prose batch (fsck dead-life residue arc) {#d42-t3-review-prose}
+
+From `t3-review.md` (F5 plus its own PROSE section, on `laneg/t3-finish`):
+
+1. **F5 — report omission.** The T3 closure report's mutation-demonstration section covers
+   mutations (i)/(ii)/(iii) but never performed the sensitivity check for the NEW arm-(b) test
+   (`CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot`) that plan T3 Step 2 calls for
+   (arm (b)'s token/value comparison commented out; mutation applied, captured, reverted). The
+   review verified the sensitivity analytically instead (with arm (b) removed, `backend->fired()`
+   never becomes true and every assertion in that test fails) and confirmed the test IS
+   load-bearing; only the recorded evidence is missing. Executor: if this arc gets another commit,
+   run the demonstration for real and fold the output into `t3-report.md`; otherwise leave as a
+   known gap in that report.
+2. **FALSE (was true before this arc, now stale):** `docs/superpowers/cas/BACKLOG.md`'s entry
+   ending "*Consequence: `ca-decommission` refuses fail-close and `ca-fsck` posts a hard
+   `lifeless_keys`*" describes the exact behavior the fsck slice (`babea62289b`) removed —
+   `ca-decommission` never actually refused on these keys; the retired `CommandFsck` message
+   claimed it did, and that claim was itself stale.
+3. **FALSE as a live instruction:** `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md`'s
+   T3 Step 1 tells the implementer to assert arm (a)'s warning string "*catalog still owns victim
+   namespaces*", which the T3 closure commit retired for an affirmative, count-bearing message.
+   The landed test correctly asserts the new string; the plan text now instructs the opposite of
+   the landed code.
+4. **IMPRECISE (defensible as dated history):** `docs/superpowers/cas/2026-08-02-stage-b-midpoint-audit.md`
+   quotes the retired arm-(a) string verbatim as if it were the current warning.
+5. **NO FIX OWED, recorded so nobody "fixes" it:** `docs/superpowers/cas/08-testing-and-soak.md`'s
+   exit-code list (`dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`) is still correct
+   after the `janitor_pending` split — `namespace_janitor_pending` is deliberately soft and does not
+   belong in that list.

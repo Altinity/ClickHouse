@@ -259,9 +259,9 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
             });
         if (victim_owned_count > 0)
             report.warnings.push_back(
-                "pool member decommission underway: all " + std::to_string(victim_owned_count)
-                + " namespace(s) owned by this member are marked for removal; upcoming GC rounds "
-                  "perform the final cleanup — re-run this command afterwards to retire the slot");
+                "pool member decommission underway: " + std::to_string(victim_owned_count)
+                + " namespace(s) are still owned by this member; upcoming GC rounds perform the final "
+                  "cleanup — re-run this command afterwards to retire the slot");
     }
 
     /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
