@@ -670,3 +670,11 @@ STANDING ORDER (user, 23:5x): ONE heavy stage at a time box-wide — never two o
 {build, full gate, praktika run, soak} concurrently. T8 battery/soak orchestration is strictly
 sequential: gate release → gate ASan → praktika groups one by one → soaks one by one
 (smoke → its full → next scenario). Relayed to t8-lead.
+
+### Watchdog 01:04 {#wd-0104}
+- Battery COMPLETE: integration 23 pass / 1 skip / 0 fail (batches A+B committed); ex-known-red
+  stateless FOUR: 4/4 PASS under cas-storage param (43aff19ed51) — first green since their birth.
+- Sharded-GC skip fix (minio→rustfs fixture swap) in flight: targeted rerun FAILED fast (13.28s =
+  setup-time), edits uncommitted; t8-lead woken with debugging directions (multi-run log trap named).
+- CI PR 2073 (:11 tick): green, 12 OK / 11 RUNNING / 70 PENDING, no failures.
+- Next: sharded rerun verdict → soak stage (8 runs, strictly serial) → 3c/3d → verdict.
