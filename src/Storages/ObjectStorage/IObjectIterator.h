@@ -5,10 +5,7 @@
 #include <Interpreters/Cache/QueryConditionCache.h>
 #include <Interpreters/StorageID.h>
 #include <Formats/FormatFilterInfo.h>
-<<<<<<< HEAD
 #include <IO/Progress.h>
-=======
->>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 #include <Common/Logger.h>
 #include <Common/Macros.h>
 #include <Formats/FormatSettings.h>
