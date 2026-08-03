@@ -519,7 +519,9 @@ for g in "${GROUP_ORDER[@]}"; do
             git checkout -q "$SRC_SHA" -- "$file"
         fi
     done
-    git commit -q -F - <<< "${GROUP_MESSAGES[$g]}"
+    git commit -q -s -F - <<< "${GROUP_MESSAGES[$g]}
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
     SUMMARY+=("$(git rev-parse --short HEAD)  ${#files[@]}  $g")
 done
 
