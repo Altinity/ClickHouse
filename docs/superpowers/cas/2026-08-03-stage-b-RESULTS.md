@@ -73,6 +73,22 @@ Batch B: `build/t8_integration/batchB.log`, `PRAKTIKA_EXIT=0`, 17 passed / 0 fai
 **Integration battery total: 23 passed, 1 skipped (pre-existing infra gap), 0 failed, across all
 10 `test_cas_*` dirs.**
 
+## Ex-known-red stateless tests {#ex-known-red-stateless}
+
+Run via `python3 -m ci.praktika run "Stateless tests (amd_binary, cas storage, parallel)" --test
+05008_cas_gc_snapshot_prune 04290_cas_no_leftovers 04295_cas_mutation_no_leftovers
+05010_cas_mounts_gc_health` (the CAS-default-disk stateless job, one invocation). Exact current
+filenames verified first (`ls tests/queries/0_stateless/`) — all four match the names above.
+
+| Test | Verdict | Time |
+|---|---|---|
+| `05010_cas_mounts_gc_health` | PASS | 0.65s |
+| `05008_cas_gc_snapshot_prune` | PASS | 1.95s |
+| `04295_cas_mutation_no_leftovers` | PASS | 2.40s |
+| `04290_cas_no_leftovers` | PASS | 2.24s |
+
+`build/t8_stateless/cas_four.log`, `PRAKTIKA_EXIT=0`, `Failed: 0, Passed: 4, Skipped: 0, Broken: 0`.
+
 ## The six result criteria, as gate rows {#six-result-criteria}
 
 Copied verbatim from the plan's `{#t8}` Step 3d table, plus the T6a-review carry (a healthy
