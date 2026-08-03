@@ -445,6 +445,129 @@ TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
+/// A COMPLETE, canonical namespace-life key (a real `_files` write under a real admitted life) whose
+/// catalog row is then removed entirely -- exactly what a fenced GC's exact-CAS row deletion leaves
+/// behind, before the perpetual namespace janitor's next page reaches it -- must classify as
+/// `janitor_pending`, a SOFT finding, never `lifeless_keys`. The report stays clean.
+TEST(CasFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const NamespaceLifeId life = store->namespaceLife(ns);
+    store->putNamespaceFile(life, "format_version.txt", "1\n");
+
+    /// Simulate a fenced GC's exact-CAS catalog-row deletion: the row is gone, the life-owned physical
+    /// object above survives it (the janitor's own job, not GC's own round). `casUpdate` deliberately
+    /// refuses to add or delete rows (there is no generic catalog remove-by-name API -- deletion is
+    /// only `deleteCompletedRemoving`/`cancelStalledCreating`, both requiring the full fenced-GC
+    /// protocol this fixture is not driving), so inject the post-deletion catalog snapshot directly,
+    /// mirroring `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses` below.
+    {
+        CasRefCatalog::Snapshot snapshot = CasRefCatalog::read(*backend, store->layout());
+        const auto it = std::find_if(snapshot.catalog.entries.begin(), snapshot.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        ASSERT_NE(it, snapshot.catalog.entries.end());
+        snapshot.catalog.entries.erase(it);
+        const auto catalog_head = backend->head(store->layout().refCatalogKey());
+        ASSERT_TRUE(catalog_head.exists);
+        ASSERT_EQ(backend->putOverwrite(store->layout().refCatalogKey(), encodeRefCatalog(snapshot.catalog),
+            catalog_head.token).outcome, PutOutcome::Done);
+    }
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true))
+        << "janitor-pending residue must never abort the scan";
+
+    EXPECT_EQ(rep.lifeless_keys, 0u);
+    EXPECT_GE(rep.namespace_janitor_pending, 1u);
+    EXPECT_EQ(rep.namespace_janitor_pending_lives, 1u);
+    EXPECT_TRUE(rep.clean()) << "janitor-pending residue is not a hard finding";
+    bool saw = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::JanitorPending)
+            saw = true;
+    EXPECT_TRUE(saw) << "a counted soft finding with no row is a number nobody can act on";
+}
+
+/// The observe-then-cut race: a life admitted between fsck's namespace-tree LIST and the catalog cut
+/// it takes AFTER that listing must NOT be misread as residue. Mirrors
+/// `CasNamespaceJanitor.PostListCatalogCutProtectsConcurrentCreationWithOneGet` -- the same ordering,
+/// the same reason: creation admits `Creating` before writing any life-owned object, so a life visible
+/// only in the LATER cut cannot have raced this listing.
+namespace
+{
+class AdmitLifeAfterNamespaceListingBackend : public InMemoryBackend
+{
+public:
+    explicit AdmitLifeAfterNamespaceListingBackend(NamespaceLifeId life_) : protected_life(std::move(life_)) {}
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage page = InMemoryBackend::list(prefix, cursor, limit);
+        if (!published && prefix.ends_with("/cas/ns/"))
+        {
+            published = true;
+            CasRefCatalog::casAdmitEntry(*this, Layout("p"), /*gc_shards*/1,
+                CatalogEntry{.ns = protected_life.ns, .state = NsState::Live,
+                    .incarnation = protected_life.incarnation});
+        }
+        return page;
+    }
+
+private:
+    NamespaceLifeId protected_life;
+    bool published = false;
+};
+}
+
+TEST(CasFsck, LifeAdmittedBetweenNamespaceListingAndLaterCutIsNotResidue)
+{
+    const RootNamespace ns{"00/late@cas@"};
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{909});
+    auto backend = std::make_shared<AdmitLifeAfterNamespaceListingBackend>(life);
+    auto store = openPoolForTest(backend);
+    /// The physical object exists before the listing runs, exactly as a legitimate late admission would
+    /// leave it: written only after `casAdmitEntry` above, but here pre-seeded since the injected
+    /// backend admits the CATALOG row, not the physical file, on the list callback.
+    ASSERT_EQ(backend->putIfAbsent(store->layout().namespaceFilesPrefix(life) + "format_version.txt", "1\n").outcome,
+        PutOutcome::Done);
+
+    FsckReport rep;
+    ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true));
+    EXPECT_EQ(rep.namespace_janitor_pending, 0u)
+        << "a life visible in the post-listing cut must not be misclassified as residue";
+    EXPECT_EQ(rep.lifeless_keys, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// Malformed or non-canonical namespace-tree shapes must stay HARD findings even after the
+/// janitor-pending split: a dirty `_files` relative name (the parser-asymmetry fix), a zero life id, an
+/// uppercase life id, and an unrecognized kind directory all name no current writer's grammar.
+TEST(CasFsck, MalformedNamespaceTreeShapesStayHardFindings)
+{
+    const Layout layout("p");
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"00/bb@cas@"}, UInt128{909});
+    const struct { String key; String description; } cases[] = {
+        {layout.namespaceFilesPrefix(life) + "../escape", "dirty _files relative name"},
+        {"p/cas/ns/state/" + String(32, '0') + "/_files/format_version.txt", "zero life id"},
+        {"p/cas/ns/state/112233445566778899AABBCCDDEEFF01/_files/format_version.txt", "uppercase life id"},
+        {"p/cas/ns/stream/" + renderIncarnation(UInt128{909}) + "/_unknown_kind/x.zst", "unknown kind directory"},
+    };
+    for (const auto & c : cases)
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = openPoolForTest(backend);
+        ASSERT_EQ(backend->putIfAbsent(c.key, "garbage").outcome, PutOutcome::Done) << c.description;
+
+        FsckReport rep;
+        ASSERT_NO_THROW(rep = runFsck(*store, /*detail*/true)) << c.description;
+        EXPECT_GE(rep.lifeless_keys, 1u) << c.description;
+        EXPECT_EQ(rep.namespace_janitor_pending, 0u) << c.description;
+        EXPECT_FALSE(rep.clean()) << c.description;
+    }
+}
+
 /// Mutation caught: calling the destructive consumer's global `throwIfAmbiguous` from fsck aborts
 /// before the unique row is audited. The read-only tool reports the ambiguous physical id and
 /// continues through an unrelated unique namespace.

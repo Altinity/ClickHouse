@@ -56,9 +56,18 @@ enum class FsckClass : uint8_t
                    /// crossing, an undecodable body, or unstable authority/transport). Not a finding and
                    /// not a clean bill of health: the honest third answer, reported so nobody reads a
                    /// silence as a proof.
-    LifelessKey,   /// an opaque id under `cas/ns/stream/` or `cas/ns/state/` that the catalog does not name
-                   /// LIFE -- the un-incarnated (Stage A) shape the `Layout` parsers refuse. It belongs
-                   /// to no namespace, so no per-namespace verdict can carry it. ERROR
+    LifelessKey,   /// a namespace-tree key the `Layout` parsers refuse (a malformed/non-canonical shape,
+                   /// including the un-incarnated Stage A layout), OR a catalog incarnation that is
+                   /// ambiguous or otherwise unreadable. Neither a current writer nor the catalog's own
+                   /// reverse life index can produce this key's meaning, so it belongs to no namespace
+                   /// and no per-namespace verdict can carry it. ERROR
+    JanitorPending,/// a COMPLETE, canonical namespace-life key (parses via the exact writer grammar,
+                   /// nonzero 32-hex life id) whose life is simply absent from a catalog cut taken AFTER
+                   /// the physical listing. This is the protocol-produced interval between a fenced GC
+                   /// exact-deleting a `Removing` catalog row and the perpetual `NamespaceJanitor`
+                   /// reaching this key on a later bounded page -- inert debris, not damage (see
+                   /// `docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md`). Reported
+                   /// as a soft finding: NOT in `kFsckHardFindings`, does not fail the report.
 };
 
 /// One object or integrity finding emitted in detailed mode, or emitted for every missing reachable
@@ -130,12 +139,23 @@ struct FsckReport
     uint64_t unchecked = 0;
     uint64_t ref_records_walked = 0;
 
-    /// Keys the namespace enumeration could not attribute to any namespace (see `FsckClass::LifelessKey`
-    /// and `Cas::NamespaceListing`). Counted DISTINCT by key: the scan enumerates namespaces several
-    /// times and every sweep sees the same offending key, so a per-sweep count would multiply one
-    /// defect. A hard finding -- behind Stage B's format bump such a key is corruption, and an audit is
-    /// where an operator finds out about it.
+    /// Keys the namespace enumeration could not attribute to any namespace, OR a catalog incarnation
+    /// that is ambiguous or unreadable (see `FsckClass::LifelessKey` and `Cas::NamespaceListing`). Does
+    /// NOT include a complete, canonical namespace-life key whose life is simply absent from the catalog
+    /// -- that is `namespace_janitor_pending`, counted separately and not a hard finding. Counted
+    /// DISTINCT by key: the scan enumerates namespaces several times and every sweep sees the same
+    /// offending key, so a per-sweep count would multiply one defect. A hard finding: no current writer
+    /// can produce this key's meaning, and an audit is where an operator finds out about it.
     uint64_t lifeless_keys = 0;
+
+    /// Canonical namespace-life keys whose life is absent from a catalog cut taken AFTER the physical
+    /// listing (see `FsckClass::JanitorPending`). SOFT: never in `kFsckHardFindings`, never fails the
+    /// report. Persistent non-convergence across authorized janitor cycles is an operational leak
+    /// question (`CasGcNamespaceCleanupLeaks`, the `namespace_cleanup` GC-log phase), not an integrity
+    /// finding this counter can answer on its own -- one snapshot cannot prove an unbounded leak.
+    uint64_t namespace_janitor_pending = 0;
+    uint64_t namespace_janitor_pending_bytes = 0;
+    uint64_t namespace_janitor_pending_lives = 0;   /// distinct life ids counted above
 
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;

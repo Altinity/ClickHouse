@@ -183,6 +183,14 @@ std::optional<ParsedNamespaceFileKey> Layout::parseNamespaceFileKey(std::string_
 
     if (life_id.empty() || life_id.find('/') != std::string_view::npos)
         return std::nullopt;
+    /// Mirror `namespaceFileKey`'s writer-side grammar: a relative name no current writer could have
+    /// produced (a dirty path, `..` segment, doubled slash, ...) is not one of ours, even though the
+    /// `_files/` segment and life id both parse. `namespaceLifePhysicalIdOf` below throws
+    /// `CORRUPTED_DATA` for the sibling life-id case; this mirrors that severity for symmetry.
+    if (!isCleanRelativeNamespaceFileName(relative_name))
+        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
+            "CasLayout: object '{}' names no clean namespace file: '{}' is not a relative path any "
+            "current writer could have produced", key, relative_name);
     return ParsedNamespaceFileKey{namespaceLifePhysicalIdOf(key, life_id), String(relative_name)};
 }
 

@@ -507,11 +507,24 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// Physical life-owned keys carry no logical name. On an unscoped audit, classify each key with
-    /// the same catalog cut that preceded the listing. An id absent from this older cut is reported
-    /// and deferred; it may have been published after the cut and must not mint a phantom namespace.
+    /// Physical life-owned keys carry no logical name. Classify each COMPLETE, canonical key against a
+    /// catalog cut taken AFTER this physical listing finishes (observe-then-cut), not the earlier
+    /// `catalog_cut` above: `NamespaceJanitor::runOnePage` (the only real deleter of this debris) uses
+    /// the identical ordering, and it is what makes "life absent from a LATER cut" sound -- creation
+    /// always admits a `Creating` catalog row before writing any life-owned object (spec §2), so a life
+    /// that is absent from a cut taken after the listing cannot be a concurrent birth this listing raced.
+    /// A malformed shape (the parser refuses, or the reserved segment names no clean relative file) is
+    /// classified immediately as it cannot become residue no matter which cut resolves it.
     if (namespace_prefix.empty())
     {
+        struct CanonicalNamespaceKey
+        {
+            String key;
+            uint64_t size;
+            NamespaceLifePhysicalId life_id;
+        };
+        std::vector<CanonicalNamespaceKey> canonical_candidates;
+
         forEachListedKey(backend, layout.namespaceRootPrefix(), [&](const ListedKey & listed)
         {
             std::optional<NamespaceLifePhysicalId> physical_id;
@@ -528,21 +541,38 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                     recordLifelessKeys(NamespaceListing{{}, {{listed.key, "unrecognized key under the namespace ownership tree"}}});
                     return;
                 }
-
-                const auto resolved = catalog_cut.life_index.resolve(*physical_id);
-                if (!resolved)
-                {
-                    recordLifelessKeys(NamespaceListing{{}, {{
-                        listed.key, "physical life id is absent from the catalog cut; deferred"}}});
-                }
             }
             catch (const Exception & e)
             {
                 if (e.code() != ErrorCodes::CORRUPTED_DATA)
                     throw;
                 recordLifelessKeys(NamespaceListing{{}, {{listed.key, e.message()}}});
+                return;
             }
+            canonical_candidates.push_back(CanonicalNamespaceKey{listed.key, listed.size, *physical_id});
         });
+
+        /// The post-observation cut. All three catalog states -- `Creating`, `Live`, `Removing` --
+        /// protect a life for this purpose; only a life absent from every one of them is residue.
+        const CasRefCatalog::Snapshot post_listing_cut = CasRefCatalog::read(backend, layout);
+        std::unordered_set<UInt128> pending_lives;
+        for (const CanonicalNamespaceKey & candidate : canonical_candidates)
+        {
+            if (post_listing_cut.life_index.resolve(candidate.life_id))
+                continue;   /// protected by some catalog state as of the later cut -- not residue
+            ++report.namespace_janitor_pending;
+            report.namespace_janitor_pending_bytes += candidate.size;
+            pending_lives.insert(candidate.life_id);
+            FsckObject o;
+            o.key = candidate.key;
+            o.kind = ObjectKind::Blob;   /// no ObjectKind names namespace-life debris; reuse Blob as the generic kind
+            o.cls = FsckClass::JanitorPending;
+            o.size = candidate.size;
+            o.reachable_from = {"physical life id is absent from a catalog cut taken after this listing; "
+                                 "janitor-pending, not corruption"};
+            report.objects.push_back(std::move(o));
+        }
+        report.namespace_janitor_pending_lives = pending_lives.size();
     }
 
     /// Every replay and late recheck below reuses the same exact catalog row and physical life. The
@@ -1117,6 +1147,9 @@ String formatFsckSummary(const FsckReport & report)
         << " corrupted_runs=" << report.corrupted_runs
         << " chain_broken=" << report.chain_broken
         << " lifeless_keys=" << report.lifeless_keys
+        << " janitor_pending=" << report.namespace_janitor_pending
+        << " janitor_pending_bytes=" << report.namespace_janitor_pending_bytes
+        << " janitor_pending_lives=" << report.namespace_janitor_pending_lives
         << " unchecked=" << report.unchecked
         << " ref_records_walked=" << report.ref_records_walked
         << " physical_bytes=" << report.physical_bytes

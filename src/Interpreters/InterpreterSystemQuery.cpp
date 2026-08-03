@@ -2462,9 +2462,14 @@ ColumnsDescription contentAddressedFsckColumns()
         /// could not prove either way, so a zero here is what makes the other zeros mean something.
         {"chain_broken", std::make_shared<DataTypeUInt64>()},
         {"unchecked", std::make_shared<DataTypeUInt64>()},
-        /// A key naming no namespace LIFE — corruption behind the Stage B format bump, and a
-        /// term of `clean`.
+        /// A malformed/non-canonical namespace-tree key, or an ambiguous/unreadable catalog
+        /// incarnation — a term of `clean`.
         {"lifeless_keys", std::make_shared<DataTypeUInt64>()},
+        /// A COMPLETE, canonical namespace-life key whose life is absent from a catalog cut taken after
+        /// the listing: janitor-pending debris, NOT a term of `clean` (see `FsckClass::JanitorPending`).
+        {"namespace_janitor_pending", std::make_shared<DataTypeUInt64>()},
+        {"namespace_janitor_pending_bytes", std::make_shared<DataTypeUInt64>()},
+        {"namespace_janitor_pending_lives", std::make_shared<DataTypeUInt64>()},
         {"ref_records_walked", std::make_shared<DataTypeUInt64>()},
         {"physical_bytes", std::make_shared<DataTypeUInt64>()},
         {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
@@ -2488,6 +2493,9 @@ void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & 
     res_columns[i++]->insert(rep.chain_broken);
     res_columns[i++]->insert(rep.unchecked);
     res_columns[i++]->insert(rep.lifeless_keys);
+    res_columns[i++]->insert(rep.namespace_janitor_pending);
+    res_columns[i++]->insert(rep.namespace_janitor_pending_bytes);
+    res_columns[i++]->insert(rep.namespace_janitor_pending_lives);
     res_columns[i++]->insert(rep.ref_records_walked);
     res_columns[i++]->insert(rep.physical_bytes);
     res_columns[i++]->insert(rep.referenced_logical_bytes);

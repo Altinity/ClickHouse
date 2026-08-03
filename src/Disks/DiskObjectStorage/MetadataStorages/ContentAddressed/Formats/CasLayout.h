@@ -22,6 +22,17 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+/// Shared writer/parser grammar for a namespace file's relative name (the part after `_files/`):
+/// no empty name, no leading or trailing `/`, no `//`, and no `..` path segment anywhere in it.
+/// `Layout::namespaceFileKey` (the writer) and `Layout::parseNamespaceFileKey` (the reader) both
+/// call this so their definition of "clean" cannot drift apart.
+inline bool isCleanRelativeNamespaceFileName(std::string_view name)
+{
+    return !(name.empty() || name.front() == '/' || name.back() == '/'
+        || name.find("//") != std::string_view::npos || name == ".." || name.starts_with("../")
+        || name.ends_with("/..") || name.find("/../") != std::string_view::npos);
+}
+
 /// Which immutable ref-object kind a `_log` or `_snap` key names.
 enum class RefObjectKind : uint8_t
 {
@@ -219,10 +230,7 @@ public:
     /// become visible under a reborn namespace of the same name.
     String namespaceFileKey(const NamespaceLifeId & life, const String & file_name) const
     {
-        const bool bad_shape = file_name.empty() || file_name.front() == '/' || file_name.back() == '/'
-            || file_name.find("//") != String::npos || file_name == ".." || file_name.starts_with("../")
-            || file_name.ends_with("/..") || file_name.find("/../") != String::npos;
-        if (bad_shape)
+        if (!isCleanRelativeNamespaceFileName(file_name))
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                 "CasLayout: namespace file name must be a clean relative path, got '{}'", file_name);
         return namespaceFilesPrefix(life) + file_name;

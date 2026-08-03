@@ -101,6 +101,18 @@ public:
                       << " object(s) are outside the current GC view — normal only as a transient "
                          "(created+dropped between GC rounds); re-run ca-fsck after the next round and "
                          "investigate any that persist\n";
+        /// Not a finding: a canonical namespace-life key whose life is absent from the catalog is the
+        /// protocol-produced interval between a fenced GC exact-deleting a `Removing` row and the
+        /// perpetual namespace janitor reaching it on a later bounded page (its own deletes are
+        /// suppressed for the whole of Stage A). Persistent non-convergence is a leak/liveness question
+        /// for `CasGcNamespaceCleanupLeaks` and the `namespace_cleanup` GC-log phase, not this scan.
+        if (report.namespace_janitor_pending > 0)
+            std::cout << "note: " << report.namespace_janitor_pending
+                      << " namespace-life object(s) (" << report.namespace_janitor_pending_bytes
+                      << " byte(s) across " << report.namespace_janitor_pending_lives
+                      << " life/lives) are janitor-pending — their catalog row is already gone, the "
+                         "perpetual namespace janitor deletes them on a later page — expected, no action "
+                         "needed (listed as `janitor-pending` rows under --detail)\n";
 
         if (detail)
         {
@@ -120,6 +132,7 @@ public:
                     case Cas::FsckClass::ChainBroken: c = "chain-broken"; break;
                     case Cas::FsckClass::Unchecked:   c = "unchecked"; break;
                     case Cas::FsckClass::LifelessKey: c = "lifeless-key"; break;
+                    case Cas::FsckClass::JanitorPending: c = "janitor-pending"; break;
                 }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)
@@ -152,16 +165,17 @@ public:
                 "ca-fsck: {} GC source-edge run(s) failed their whole-file seal checksum — the deletion-"
                 "deriving consumers fail closed on these, so GC cannot advance past them (run keys are "
                 "listed as `corrupted-run` rows under --detail)", report.corrupted_runs);
-        /// Behind the format bump a key that names no namespace life is corruption, and it is corruption
-        /// nothing clears on its own: the namespace enumeration now reports it instead of aborting, which
-        /// is what makes an exit code the only signal automation can act on.
+        /// A key the `Layout` parsers refuse (no current writer can produce it), or a catalog
+        /// incarnation that is ambiguous or unreadable, is corruption nothing clears on its own: the
+        /// namespace enumeration now reports it instead of aborting, which is what makes an exit code
+        /// the only signal automation can act on. A COMPLETE, canonical namespace-life key whose life is
+        /// simply absent from the catalog is NOT counted here — see the `janitor-pending` note above.
         if (report.lifeless_keys > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "ca-fsck: {} key(s) under this pool name no namespace LIFE — the un-incarnated key shape, "
-                "which is corruption rather than a compatibility case; `ca-decommission` refuses "
-                "fail-close while any of them exists (the keys are listed as `lifeless-key` rows under "
-                "--detail)", report.lifeless_keys);
+                "ca-fsck: {} key(s) under this pool name are malformed or unresolvable — no current "
+                "writer could have produced them, or their catalog incarnation is ambiguous/unreadable "
+                "(the keys are listed as `lifeless-key` rows under --detail)", report.lifeless_keys);
     }
 };
 
