@@ -92,12 +92,10 @@ struct ParseFromDiskResult
 
 ParseFromDiskResult parseFromDisk(ASTs args, bool with_structure, ContextPtr context, const fs::path & prefix);
 
-<<<<<<< HEAD
 void expandPaimonKeeperMacrosIfNeeded(
     const StorageFactory::Arguments & args,
     const DataLakeStorageSettingsPtr & storage_settings);
 
-=======
 #if USE_AVRO
 namespace Iceberg { class IcebergPathResolver; }
 
@@ -121,6 +119,5 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     const DB::ContextPtr & context,
     const Iceberg::IcebergPathResolver & path_resolver);
 #endif
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 
 }

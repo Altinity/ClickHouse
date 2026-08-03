@@ -395,13 +395,7 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         return nullptr;
     }
 
-<<<<<<< HEAD
-    /// Compute inherited/resolved fields
-
     Int64 resolved_snapshot_id = 0;
-=======
-    Int64 resolved_snapshot_id;
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
     if (parsed_entry->parsed_snapshot_id.has_value())
     {
         resolved_snapshot_id = *parsed_entry->parsed_snapshot_id;

@@ -1,15 +1,8 @@
 #pragma once
 
-<<<<<<< HEAD
-#include "config.h"
-
-#if USE_AVRO
-
-=======
 #include <optional>
 #include <Interpreters/Context_fwd.h>
 #include "config.h"
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #include <string>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
@@ -22,8 +15,6 @@
 #include <Poco/JSON/Parser.h>
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-<<<<<<< HEAD
-=======
 
 namespace DB
 {
@@ -37,7 +28,6 @@ std::optional<String> getMetadataPathFromObjectInfo([[maybe_unused]] const Objec
 
 #if USE_AVRO
 
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #include <IO/CompressedReadBufferWrapper.h>
 #include <IO/CompressionMethod.h>
 #include <Storages/ColumnsDescription.h>

@@ -74,10 +74,6 @@ void IcebergPositionDeleteTransform::initializeDeleteSources()
         {
             continue;
         }
-<<<<<<< HEAD
-
-=======
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 
         auto [delete_storage_to_use, resolved_key] = resolveObjectStorageForPath(
             path_resolver.getTableLocation(), position_deletes_object.file_path, object_storage, *secondary_storages, context,

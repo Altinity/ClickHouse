@@ -203,12 +203,8 @@ private:
 
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
-<<<<<<< HEAD
-    const DB::Iceberg::PersistentTableComponents persistent_components;
-=======
     mutable std::shared_ptr<SecondaryStorages> secondary_storages;
-    DB::Iceberg::PersistentTableComponents persistent_components;
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+    const DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;

@@ -17,11 +17,7 @@ namespace DB
 
 struct URIConverter
 {
-<<<<<<< HEAD
-    static void modifyURI(Poco::URI & uri, NameToNameMap mapper)
-=======
-    static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper, bool enable_url_encoding = true)
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+    static void modifyURI(Poco::URI & uri, NameToNameMap mapper, bool enable_url_encoding = true)
     {
         Macros macros({{"bucket", uri.getHost()}});
         uri = macros.expand(mapper[uri.getScheme()]).empty()
@@ -38,11 +34,7 @@ namespace ErrorCodes
 namespace S3
 {
 
-<<<<<<< HEAD
-URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, S3UriStyle uri_style)
-=======
-URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, bool enable_url_encoding)
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, S3UriStyle uri_style, bool enable_url_encoding)
 {
     /// Case when AWS Private Link Interface is being used
     /// E.g. (bucket.vpce-07a1cd78f1bd55c5f-j3a3vg6w.s3.us-east-1.vpce.amazonaws.com/bucket-name/key)

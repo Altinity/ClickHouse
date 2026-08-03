@@ -21,19 +21,13 @@ String computePartitionId(const Row & partition_key_value);
 struct IcebergObjectSerializableInfo
 {
     IcebergPathFromMetadata data_object_file_path_key;
-<<<<<<< HEAD
-    Int32 underlying_format_read_schema_id{};
-    Int32 schema_id_relevant_to_iterator{};
-    Int64 sequence_number{};
-=======
     /// Raw path string as written in the Iceberg manifest, preserved as-is (may be a full URI like
     /// `s3://bucket/...` or a relative path). Used for the `_path` virtual column and as a stable
     /// task identifier. Not a canonicalised storage key — see `IcebergPathResolver::resolve` for that.
     String data_object_file_metadata_path;
-    Int32 underlying_format_read_schema_id;
-    Int32 schema_id_relevant_to_iterator;
-    Int64 sequence_number;
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+    Int32 underlying_format_read_schema_id{};
+    Int32 schema_id_relevant_to_iterator{};
+    Int64 sequence_number{};
     String file_format;
     String manifest_file;
     String partition_id;

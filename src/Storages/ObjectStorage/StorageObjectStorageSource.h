@@ -11,11 +11,7 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
-<<<<<<< HEAD
-=======
 #include <Storages/ObjectStorage/Utils.h>
-#include <Formats/FormatParserSharedResources.h>
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #include <Formats/FormatFilterInfo.h>
 
 namespace DB

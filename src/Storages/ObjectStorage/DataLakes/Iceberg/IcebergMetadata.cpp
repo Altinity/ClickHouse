@@ -226,12 +226,8 @@ IcebergMetadata::IcebergMetadata(
     ContextPtr context_)
     : log(getLogger("IcebergMetadata"))
     , object_storage(std::move(object_storage_))
-<<<<<<< HEAD
-    , persistent_components(std::move(persistent_components_))
-=======
     , secondary_storages(std::make_shared<SecondaryStorages>())
-    , persistent_components(initializePersistentTableComponents(configuration_, cache_ptr, context_))
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+    , persistent_components(std::move(persistent_components_))
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->format)
 {
@@ -288,16 +284,8 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
             for (const auto & entry : actual_data_snapshot->manifest_list_entries)
             {
                 /// second, we fetch, parse and cache each manifest file
-<<<<<<< HEAD
                 auto manifest_file_ptr = getManifestFileEntriesHandle(
-                    object_storage, persistent_components, ctx, log, entry, actual_table_state_snapshot.schema_id);
-=======
-                auto manifest_file_ptr = Iceberg::getManifestFile(
-                    object_storage, persistent_components, ctx, log,
-                    entry.manifest_file_path,
-                    entry.manifest_file_byte_size,
-                    *secondary_storages);
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+                    object_storage, persistent_components, ctx, log, entry, actual_table_state_snapshot.schema_id, *secondary_storages);
             }
         }
 
@@ -1006,7 +994,7 @@ IcebergMetadata::IcebergFiles IcebergMetadata::getFilesForManifest(
 
     const auto & manifest_list_entry = data_snapshot->manifest_list_entries[manifest_index];
     auto handle = getManifestFileEntriesHandle(
-        object_storage, persistent_components, local_context, log, manifest_list_entry, table_state.schema_id);
+        object_storage, persistent_components, local_context, log, manifest_list_entry, table_state.schema_id, *secondary_storages);
 
     IcebergFiles result;
     for (auto content_type : {FileContentType::DATA, FileContentType::POSITION_DELETE, FileContentType::EQUALITY_DELETE})

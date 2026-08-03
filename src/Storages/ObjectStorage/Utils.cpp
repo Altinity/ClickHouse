@@ -568,6 +568,7 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
         /// percent-decoding so that keys like `col=12%3A00%3A00` are preserved as-is.
         S3::URI s3_uri(normalized_path, /*allow_archive_path_syntax*/ false,
                        /*keep_presigned_query_parameters*/ true,
+                       /*uri_style*/ S3UriStyle::AUTO,
                        /*enable_url_encoding*/ false);
 
         std::string key_to_use = s3_uri.key;
@@ -598,6 +599,7 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
             }
             S3::URI base_s3_uri(normalized_table_location, /*allow_archive_path_syntax*/ false,
                                 /*keep_presigned_query_parameters*/ true,
+                                /*uri_style*/ S3UriStyle::AUTO,
                                 /*enable_url_encoding*/ false);
 
             if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_scheme_normalized))

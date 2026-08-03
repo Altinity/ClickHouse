@@ -626,19 +626,15 @@ static void writeMetadataFiles(
     }
 }
 
-<<<<<<< HEAD
-static std::vector<String> getOldFiles(ObjectStoragePtr object_storage, const String & table_path)
-=======
 /// Files to delete after compaction: a base-storage directory listing under `metadata/` and
 /// `data/` (covers historical metadata.json and any orphan files on the base storage), plus
 /// any paths from the compacted snapshots that resolve to a secondary storage.
-std::vector<std::pair<ObjectStoragePtr, String>> getOldFiles(
+static std::vector<std::pair<ObjectStoragePtr, String>> getOldFiles(
     ObjectStoragePtr object_storage,
     SecondaryStorages & secondary_storages,
     ContextPtr context,
     const PersistentTableComponents & persistent_table_components,
     const Plan & plan)
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 {
     std::vector<std::pair<ObjectStoragePtr, String>> result;
 
@@ -664,11 +660,7 @@ std::vector<std::pair<ObjectStoragePtr, String>> getOldFiles(
     return result;
 }
 
-<<<<<<< HEAD
-static void clearOldFiles(ObjectStoragePtr object_storage, const std::vector<String> & old_files)
-=======
-void clearOldFiles(const std::vector<std::pair<ObjectStoragePtr, String>> & old_files)
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
+static void clearOldFiles(const std::vector<std::pair<ObjectStoragePtr, String>> & old_files)
 {
     auto log = getLogger("IcebergCompaction");
     for (const auto & [storage, key] : old_files)

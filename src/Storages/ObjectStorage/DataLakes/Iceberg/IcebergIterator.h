@@ -79,12 +79,8 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::TableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-<<<<<<< HEAD
-        Iceberg::PersistentTableComponents persistent_components);
-=======
-        Iceberg::PersistentTableComponents persistent_components_,
+        Iceberg::PersistentTableComponents persistent_components,
         std::shared_ptr<SecondaryStorages> secondary_storages_);
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 
     ObjectInfoPtr next(size_t) override;
 
@@ -107,11 +103,7 @@ private:
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> equality_deletes_files;
     std::exception_ptr exception;
     std::mutex exception_mutex;
-<<<<<<< HEAD
-=======
-    Int32 table_schema_id;
     std::shared_ptr<SecondaryStorages> secondary_storages;  // Sometimes data or manifests can be located on another storage
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 };
 }
 

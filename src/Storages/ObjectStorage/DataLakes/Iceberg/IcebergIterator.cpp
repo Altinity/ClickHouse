@@ -278,11 +278,7 @@ IcebergIterator::IcebergIterator(
           secondary_storages_)
     , blocking_queue(100)
     , callback(std::move(callback_))
-<<<<<<< HEAD
-=======
-    , table_schema_id(table_snapshot_->schema_id)
     , secondary_storages(secondary_storages_)
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 {
     auto delete_file = deletes_iterator.next();
     while (delete_file.has_value())
@@ -416,15 +412,6 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 object_info->info.data_object_file_path_key);
         }
 
-<<<<<<< HEAD
-=======
-        object_info->relative_path_with_metadata.setFileMetaInfo(std::make_shared<DataFileMetaInfo>(
-                                    *persistent_components.schema_processor,
-                                    table_schema_id, /// current schema id to use current column names
-                                    manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
-                                    manifest_file_entry->parsed_entry->columns_infos,
-                                    manifest_file_entry->parsed_entry->value_bounds));
-
         if (!object_info->info.requires_external_storage)
         {
             auto resolves_to_external_storage = [&](const String & file_path)
@@ -447,7 +434,6 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 || any_external(object_info->info.equality_deletes_objects);
         }
 
->>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
 
         if (callback)

@@ -25,6 +25,7 @@ SnapshotReferencedFiles collectSnapshotReferencedFiles(
     Int32 current_schema_id)
 {
     SnapshotReferencedFiles files;
+    SecondaryStorages secondary_storages;
 
     for (UInt32 i = 0; i < snapshots->size(); ++i)
     {
@@ -36,14 +37,14 @@ SnapshotReferencedFiles collectSnapshotReferencedFiles(
         files.manifest_list_paths.insert(manifest_list_path);
 
         auto manifest_keys = getManifestList(
-            object_storage, persistent_table_components, context, manifest_list_path, log);
+            object_storage, persistent_table_components, context, manifest_list_path, log, secondary_storages);
 
         for (const auto & manifest_entry : manifest_keys)
         {
             files.manifest_paths.insert(manifest_entry.manifest_file_path);
 
             auto entries_handle = getManifestFileEntriesHandle(
-                object_storage, persistent_table_components, context, log, manifest_entry, current_schema_id);
+                object_storage, persistent_table_components, context, log, manifest_entry, current_schema_id, secondary_storages);
 
             for (const auto & entry : entries_handle.getFilesWithoutDeleted(FileContentType::DATA))
                 files.data_file_paths.insert(entry->parsed_entry->file_path_key);
