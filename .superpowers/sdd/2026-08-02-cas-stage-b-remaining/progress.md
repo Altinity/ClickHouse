@@ -99,7 +99,13 @@ per commit; full CA gate at lane closures.
   sharding-arm KNOWN (UnchangedCompositeVars) + stage5_lazytrim UNPROVEN-BY-TIMEOUT (4h, 233M
   distinct states). MAIN's uncommitted runner copy reconciled (checkout --, equivalence verified
   by the review).
-- T8 (Stage B gates): early pieces may start anytime; battery/soaks BLOCKED on T1–T7. MAIN.
+- T8 (Stage B gates): early pieces IN PROGRESS — E1 tidy DONE end-to-end: full AMD-tidy build
+  collected 119 unique CAS diagnostics; ALL resolved (fix or NOLINT+reason; 3 real defects found
+  incl. a fault-injection-disabling grandparent call and an optional-deref UB risk); verified by
+  per-TU re-tidy + per-suite gates release 278/278 / ASan 296/296, zero aborts (draft
+  b0f87e8aaf1 + closure c0d2cad0dfd). E2-E4 + residual tests drafted on draft/t8. Battery/soaks
+  still blocked on T1–T7. SCHEDULED ADDITIONS (user directives): Cas-prefix suite normalization
+  post-T6; ONE final incremental tidy re-run after all C++ tasks; staged 20-min smoke soaks.
 - T9 (perf research): BLOCKED on T8. Stage B is COMPLETE only when T9's commit lands; T8 issues
   the technical verdict.
 - F1/F2: follow-ups after T9, outside the Stage-B verdict.
