@@ -69,14 +69,21 @@ per commit; full CA gate at lane closures.
     recurrence #6 of the abort class), a046ad621a1 (3-site heap-use-after-free: dangling pointer
     into the destroyed CasRefCatalog::read temporary). All three defects were pre-existing and
     previously INVISIBLE (prefix-filter gap, no full ASan gate since the tests' birth).
-- T2 (Task 6b remainder): NOT STARTED. LANE-G after T1 integration.
+- T2 (Task 6b remainder): IN PROGRESS on MAIN (t2-impl; 4 ordering/poison/backoff tests;
+  vocabulary ruling: plan's "Poisoned" = code's `RefLaneState::NeedsRecovery`, production is
+  recover-then-proceed — test pins the recover-before-publish invariant).
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
 - T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
 - T5 (probe A deletion): NOT STARTED. MAIN after T3 integration.
-- T6a (frontier-attribution spike): NOT STARTED. LANE-G, immediately after T0.
+- T6a: **COMPLETE** — verdict BENIGN-TRANSIENT, structurally closed by `357cf7b963f`; commit
+  `477fe702a7a` (laneg/t6a) integrated as `096b3611988`; review APPROVE-WITH-NONBLOCKING with the
+  corrected enumeration + NEW T6→T8 carry (post-flip healthy rounds also show ZERO
+  no-usable-checkpoint anomalies); three dead frontier-walk arms placed with T6 Step 1.
 - T6 (destruction enablement): BLOCKED on T1 + T5 + T6a verdict. MAIN.
-- T7 (model lane): NOT STARTED. LANE-G. Lane A (10a → 10b ninth) strictly sequential; lane B
-  (10c) independent.
+- T7 (model lane): IN PROGRESS on LANE-G (laneg/t7). A1 COMMITTED `a19066a7893` — verdict:
+  `listedTok` skip premise RETIRED (model/configs reworked). A2 ninth-family battery running
+  (nohup; runner rewrite taken from MAIN's preserved uncommitted copy with controller approval).
+  Lane B (10c) not started.
 - T8 (Stage B gates): early pieces may start anytime; battery/soaks BLOCKED on T1–T7. MAIN.
 - T9 (perf research): BLOCKED on T8. Stage B is COMPLETE only when T9's commit lands; T8 issues
   the technical verdict.
