@@ -287,7 +287,9 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
 /// ONCE, on EVERY round of a multi-round run -- not just the first, since a regression that quietly
 /// reintroduced a second enumeration only on a LATER round would pass a one-round check for the wrong
 /// reason. The bounded `cas/ns/` janitor page is a separate exact-string prefix and runs every round
-/// too; it must never be counted as, or mistaken for, a hot scan of the ref prefix.
+/// too; it must never be counted as, or mistaken for, a hot scan of the ref prefix. 32 rounds exercises
+/// the deleted detector's own cadence (every 16th folding round) twice over, so a regression that only
+/// reintroduces the second enumeration on that cadence cannot hide inside a shorter run.
 TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
 {
     auto backend = std::make_shared<RefPrefixListCountingBackend>();
@@ -302,7 +304,7 @@ TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
     store->renewWatermarkOnce();
 
     Gc gc(store, hexToU128("00000000000000000000000000000013"));
-    for (int round = 0; round < 5; ++round)
+    for (int round = 0; round < 32; ++round)
     {
         backend->ref_prefix_lists.store(0);
         backend->janitor_prefix_lists.store(0);
