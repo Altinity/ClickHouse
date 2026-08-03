@@ -879,6 +879,11 @@ public:
     /// what an abandoned/aborted build must leave empty.
     std::set<std::pair<String, ManifestRef>> livePrecommitsForTest(const RootNamespace & ns);
 
+    /// test seam: whether any writer cleanup duty is still owed (see `writerCleanupDutiesPending`) --
+    /// the direct signal that a settlement failure retained its duty for retry, independent of any
+    /// build-floor side effect that could have the same shape for an unrelated reason.
+    bool writerCleanupDutiesPendingForTest() const { return writerCleanupDutiesPending(); }
+
     /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
     /// untestable timing window `BlockingGetBackend`-style backend tricks cannot reach, since a warm

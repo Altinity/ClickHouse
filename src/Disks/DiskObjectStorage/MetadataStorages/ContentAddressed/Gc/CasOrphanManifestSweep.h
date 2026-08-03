@@ -179,16 +179,6 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
 /// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
-/// Cursor-paced bounded orphan part-manifest sweep over `cas/manifests/`. It evaluates each namespace's
-/// durable protection view before deleting and uses exact-token deletion, so a concurrent owner or a
-/// changed object token is spared. The cursor is a best-effort cleanup cursor, never reachability
-/// authority. The page lists at most `list_budget` keys and deletes at most `delete_budget` of them.
-ManifestSweepResult sweepManifestCursorPage(
-    Pool & store,
-    const String & cursor,
-    uint64_t list_budget,
-    uint64_t delete_budget);
-
 /// Plan one cursor page without deleting. Every candidate is exact-GET, decoded and identity-validated;
 /// its exact manifest-source edges are returned for accounting-neutral retirement in the next fold.
 /// Catalog-named namespaces are retain-only unless the caller explicitly authorizes recovery from its

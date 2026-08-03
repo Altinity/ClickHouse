@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <chrono>
@@ -180,6 +181,54 @@ TEST(CasWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
 }
 
+/// The model gate recorded both wedge-resolution witnesses (adopt and reject); the C++ suite drove
+/// only the adopt arm above. This drives an uncertain grant into an ACTUAL wedged lane -- unlike
+/// `ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation`'s controller pre-attempt refusal, which never
+/// wedges at all -- and resolves it as REJECT: `Mode::Unresolved` lands nothing, so the next attempt's
+/// resolve-before-reissue GET proves the key absent. The duty must then drain as a no-op: no
+/// `OwnerTransition` removal is owed for an absent precommit, the wedge clears, and `minActive` advances
+/// past the rejected build exactly as the no-wedge reject arm does.
+TEST(CasWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_wedge_reject"};
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
+
+    ManifestId rejected_id;
+    auto rejected = stageEmptyManifest(store, ns, "rejected", rejected_id);
+    const uint64_t rejected_seq = rejected->buildSeq();
+
+    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::NETWORK_ERROR,
+        [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
+
+    rejected.reset();
+    EXPECT_EQ(store->minActive(), rejected_seq)
+        << "an unresolved owner grant must keep its build active after the transaction object is gone";
+
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
+    ManifestId successor_id;
+    auto successor = stageEmptyManifest(store, ns, "successor", successor_id);
+    const uint64_t successor_seq = successor->buildSeq();
+    successor->precommitAdd(ns, "successor", successor_id);
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns));
+    EXPECT_EQ(store->minActive(), successor_seq)
+        << "the rejected build retires only after its exact cleanup duty settles as a no-op";
+    EXPECT_EQ(
+        store->livePrecommitsForTest(ns),
+        (std::set<std::pair<String, ManifestRef>>{{"successor", successor_id.ref}}));
+
+    successor->abandon();
+    EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
+}
+
 /// Removing `mutateRefsAfterWriterCleanup` from the `dropRef` delegate leaves the rejected build at
 /// `minActive` even though the ref removal succeeds. The observable floor proves the direct API
 /// serviced the inherited cleanup duty before performing its own mutation.
@@ -336,4 +385,161 @@ TEST(CasWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
     EXPECT_EQ(seal->writer_epoch, predecessor_epoch);
 
     successor->abandon();
+}
+
+/// The duty queue above only ever resolves the ref
+/// table's precommit BINDING -- a rejected grant's manifest BODY is orphan from birth (no owner ever
+/// named it, so the edge-before-observe `+1` a durable precommit would have folded never landed
+/// either) and its reclaim is entirely the orphan sweep's job, gated on the one thing the duty queue
+/// cannot give it: the build's own epoch durably closed. This drives that closure (the same crash
+/// pattern as `PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRemnant`, but the predecessor's
+/// build is REJECTED rather than adopted) and then runs real GC rounds until the body is gone.
+TEST(CasWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    DB::Cas::tests::seedPoolMetaForRestart(*backend);
+    const CasRequestBudget budget{
+        .attempt_timeout_ms = 50,
+        .operation_deadline_ms = 500,
+        .max_attempts = 1,
+        .lease_safety_margin_ms = 50,
+    };
+    /// Rooted under the POOL's OWN `server_root_id` ("test", unlike this file's other fixtures, which
+    /// stay under "srv1" precisely because they never drive the orphan sweep): `prefixEligible`'s
+    /// watermark floor is looked up by walking the NAMESPACE's own prefix segments for a live mount
+    /// lease, so a namespace rooted under any other server-root would find no floor and retain forever
+    /// regardless of epoch/coverage.
+    const RootNamespace ns{"test/writer_duty_rejected_sweep"};
+
+    auto predecessor = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_id = UInt128(1),
+        .server_root_id = "test",
+        .manifest_sweep_list_budget_keys = 100,
+        .manifest_sweep_delete_budget_keys = 100,
+        .gc_fold_max_defer_rounds = 0,
+        .background_watermark = false,
+        .mount_lease_ttl_ms = std::chrono::milliseconds(500),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = budget,
+    });
+
+    /// A real, fully-promoted ref through the ordinary production write path (no seeded catalog/ckpt)
+    /// gives the namespace genuine epoch-1 content, so the successor's recovery below has something
+    /// real to close -- unlike a pre-attempt-refused grant, which never touches the backend at all and
+    /// so leaves the namespace's fold coverage exactly where it started.
+    publishEmptyRef(predecessor, ns, "anchor");
+
+    ManifestId rejected_id;
+    auto rejected = stageEmptyManifest(predecessor, ns, "rejected", rejected_id);
+    const String rejected_manifest_key = predecessor->layout().manifestKey(rejected_id);
+    ASSERT_TRUE(backend->head(rejected_manifest_key).exists)
+        << "stageManifest's body write is unconditional; only the owner grant is refused below";
+
+    /// `Unresolved` lands nothing, so the wedge it leaves resolves as a conclusive REJECT once the
+    /// successor's own recovery walks past it -- unlike the ADOPT-arm crash-remnant test, this
+    /// manifest never becomes a live owner in any epoch. `anchor`'s real birth just above minted a
+    /// genuine (random) incarnation, so the fault key is computed from the namespace's ACTUAL life,
+    /// not the deterministic `fixtureLife` fallback a raw, never-touched fixture would use.
+    backend->fault_substr = predecessor->layout().namespaceStreamPrefix(predecessor->namespaceLife(ns)) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::NETWORK_ERROR,
+        [&] { rejected->precommitAdd(ns, "rejected", rejected_id); });
+    ASSERT_TRUE(predecessor->refLaneWedgedForTest(ns));
+    ASSERT_EQ(rejected->precommitState(), PartWriteTxn::PrecommitState::Uncertain);
+    const uint64_t predecessor_epoch = predecessor->writerEpoch();
+
+    rejected.reset();
+    predecessor.reset();
+
+    uint64_t fake_boot = 0;
+    std::vector<uint64_t> waits;
+    auto successor_store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "p",
+        .server_id = UInt128(1),
+        .server_root_id = "test",
+        .manifest_sweep_list_budget_keys = 100,
+        .manifest_sweep_delete_budget_keys = 100,
+        .gc_fold_max_defer_rounds = 0,
+        .background_watermark = false,
+        .mount_lease_ttl_ms = std::chrono::milliseconds(500),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = budget,
+        .boot_ms_fn = [&] { return fake_boot; },
+        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+    });
+    ASSERT_GT(successor_store->writerEpoch(), predecessor_epoch);
+    ASSERT_FALSE(waits.empty()) << "the predecessor supplied no clean-death certificate";
+
+    /// An ordinary successor mutation both drains the inherited duty as a no-op (the rejected grant
+    /// was never durable) and forces the predecessor's dead epoch to close with an arithmetic seal --
+    /// the fact rule (1) of the sweep's deletion premise reads.
+    ManifestId successor_id;
+    auto successor = stageEmptyManifest(successor_store, ns, "successor", successor_id);
+    successor->precommitAdd(ns, "successor", successor_id);
+
+    EXPECT_EQ(
+        successor_store->livePrecommitsForTest(ns),
+        (std::set<std::pair<String, ManifestRef>>{{"successor", successor_id.ref}}));
+    const auto seal = successor_store->lastEpochSealForTest(ns);
+    ASSERT_TRUE(seal.has_value());
+    EXPECT_EQ(seal->writer_epoch, predecessor_epoch);
+
+    Gc gc(successor_store, hexToU128("000000000000000000000000000000e1"));
+    for (int round = 0; round < 16 && backend->head(rejected_manifest_key).exists; ++round)
+        DB::Cas::tests::runRegularRoundReclaiming(gc);
+
+    EXPECT_FALSE(backend->head(rejected_manifest_key).exists)
+        << "the rejected attempt's orphan manifest must eventually be nominated and swept once its "
+           "build epoch is durably closed";
+
+    successor->abandon();
+}
+
+/// The settlement's own ordering is load-bearing: append the exact `OwnerTransition` removal (or
+/// observe conclusive absence), only then retire the build seq, only then drop the duty -- a throw
+/// between those steps must leave the duty owned by nobody but the queue. Faulting the SETTLEMENT's
+/// append (not the original grant, which is a plain pre-attempt refusal here) proves the retry path
+/// directly: the duty survives the throw and the mutation it was blocking aborts with it, then the
+/// very next drain -- once the fault clears -- settles the duty and lets that mutation proceed.
+TEST(CasWriterDuties, DutySurvivesSettlementFailureForRetry)
+{
+    auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
+    auto store = openFrozenSingleAttemptPool(backend);
+    const RootNamespace ns{"srv1/writer_duty_settlement_retry"};
+    DB::Cas::tests::casAdmitRecoverableEntry(*backend, store->layout(), ns, store->liveWriterEpoch());
+    publishEmptyRef(store, ns, "target");
+
+    /// A plain, unfaulted precommit that is simply destroyed without promote/abandon: Durable, never
+    /// settled, and (unlike a proven-absent grant) its duty's own settlement owes a REAL
+    /// `OwnerTransition` removal -- exactly the append this test needs to fault.
+    ManifestId durable_id;
+    auto durable = stageEmptyManifest(store, ns, "durable", durable_id);
+    const uint64_t durable_seq = durable->buildSeq();
+    durable->precommitAdd(ns, "durable", durable_id);
+    durable.reset();
+    ASSERT_TRUE(store->writerCleanupDutiesPendingForTest());
+
+    backend->fault_substr = store->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::Unresolved;
+    backend->fault_count = 1;
+    DB::Cas::tests::expectThrowsCode(
+        DB::ErrorCodes::NETWORK_ERROR,
+        [&] { store->dropRef(ns, "target"); });
+
+    EXPECT_TRUE(store->writerCleanupDutiesPendingForTest())
+        << "a settlement that throws must retain the duty for retry, never lose it";
+    EXPECT_TRUE(store->resolveRef(ns, "target").has_value())
+        << "the settlement's failure must abort the mutation it was blocking too, not just its own append";
+    EXPECT_EQ(store->minActive(), durable_seq);
+
+    backend->mode = DB::Cas::tests::ChunkFaultBackend::Mode::None;
+    store->dropRef(ns, "target");
+
+    EXPECT_FALSE(store->writerCleanupDutiesPendingForTest());
+    EXPECT_FALSE(store->resolveRef(ns, "target").has_value());
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq())
+        << "the retried drain settles the retained duty and lets the mutation proceed";
 }

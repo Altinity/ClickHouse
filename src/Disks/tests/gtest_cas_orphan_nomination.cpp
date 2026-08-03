@@ -7,6 +7,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+}
+
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
@@ -210,6 +215,13 @@ TEST(CasOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
 {
     ReadyFixture f = makeReadyFixture();
 
+    /// The nominating round's own `fold_reduce` phase carries probe B1/B2's per-round verdict; capture
+    /// it so the orphan-sourced retirement can be proven accounting-neutral on the real end-to-end path,
+    /// not only on the synthetic `foldDeltasIntoGeneration` call `SourceRetirementIsAccountingNeutral`
+    /// drives below.
+    std::optional<GcPhaseRecord> fold_reduce;
+    f.gc->setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "fold_reduce") fold_reduce = rec; });
+
     ASSERT_TRUE(runRegularRoundReclaiming(*f.gc).acquired_lease);
 
     EXPECT_FALSE(manifestExists(*f.backend, f.store->layout(), f.candidate));
@@ -223,6 +235,13 @@ TEST(CasOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
                   i < 4 ? 1 : 0);
     }
     EXPECT_EQ(condemnedCount(*f.backend, f.store->layout()), 2u);
+
+    ASSERT_TRUE(fold_reduce.has_value());
+    EXPECT_EQ(fold_reduce->metrics.at("unmatched_removes"), 0u)
+        << "the orphan source retirements are exact removes against a present edge, never an unmatched one";
+    EXPECT_EQ(fold_reduce->metrics.at("txns_unapplied"), 0u)
+        << "the retirement input rides the reducer alongside ordinary deltas without stranding a "
+           "committed+produced ref transaction unapplied";
 }
 
 /// A nomination must exact-GET and decode the manifest before it can derive any source-edge identity.
@@ -233,7 +252,7 @@ TEST(CasOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
     ASSERT_TRUE(got.has_value());
     f.backend->putOverwrite(f.backend->watched_manifest_key, "not a sealed manifest", got->token);
 
-    EXPECT_THROW(runRegularRoundReclaiming(*f.gc), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { runRegularRoundReclaiming(*f.gc); });
     EXPECT_TRUE(f.backend->head(f.backend->watched_manifest_key).exists);
 }
 
@@ -244,8 +263,30 @@ TEST(CasOrphanNomination, TokenAbaIsRetainedAndSurfaced)
     ReadyFixture f = makeReadyFixture();
     f.backend->replace_manifest_before_delete = true;
 
-    EXPECT_THROW(runRegularRoundReclaiming(*f.gc), DB::Exception);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { runRegularRoundReclaiming(*f.gc); });
     EXPECT_TRUE(f.backend->head(f.backend->watched_manifest_key).exists);
+}
+
+/// Nomination PLANNING itself is gated on `!suppress_destructive`
+/// (`Gc::fold`'s orphan_sweep call site), not merely its eventual delete -- a suppressed pass must
+/// never even LIST candidates. `gc.runRegularRound()` with no third argument is the production
+/// default (`UniversePolicy::kDefault`), which is exactly this suppressed universe.
+TEST(CasOrphanNomination, SuppressedRoundNominatesNothing)
+{
+    ReadyFixture f = makeReadyFixture();
+
+    std::optional<GcPhaseRecord> orphan_sweep;
+    f.gc->setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "orphan_sweep") orphan_sweep = rec; });
+
+    ASSERT_TRUE(f.gc->runRegularRound().acquired_lease);
+
+    ASSERT_TRUE(orphan_sweep.has_value());
+    EXPECT_EQ(orphan_sweep->metrics.at("suppressed"), 1u);
+    EXPECT_EQ(orphan_sweep->metrics.at("listed"), 0u)
+        << "planning is gated on !suppress_destructive; a suppressed pass must not even LIST candidates";
+    EXPECT_EQ(orphan_sweep->metrics.at("deleted"), 0u);
+    EXPECT_TRUE(manifestExists(*f.backend, f.store->layout(), f.candidate))
+        << "the orphan body must survive a suppressed round";
 }
 
 /// The retirement input is deliberately outside both ref-transaction accounting mechanisms: a

@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Common/Exception.h>
+#include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 #include <algorithm>
 #include <limits>
@@ -300,12 +301,12 @@ TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
     writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);
 
-    const ManifestSweepResult first = sweepManifestCursorPage(*store, "", /*list_budget*/1, /*delete_budget*/0);
+    const ManifestSweepResult first = sweepManifestCursorPageForTest(*store, "", /*list_budget*/1, /*delete_budget*/0);
     EXPECT_EQ(first.listed, 1u);
     EXPECT_FALSE(first.wrapped);
     EXPECT_FALSE(first.next_cursor.empty());
 
-    const ManifestSweepResult second = sweepManifestCursorPage(*store, first.next_cursor, /*list_budget*/100, /*delete_budget*/0);
+    const ManifestSweepResult second = sweepManifestCursorPageForTest(*store, first.next_cursor, /*list_budget*/100, /*delete_budget*/0);
     EXPECT_GE(second.listed, 1u);
     EXPECT_TRUE(second.wrapped);
     EXPECT_TRUE(second.next_cursor.empty());
@@ -336,7 +337,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_GE(result.listed, 1u);
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
@@ -356,7 +357,7 @@ TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
     seedConsumedSealCursor(*backend, store->layout(), ns);
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/1);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(result.deleted, 1u);
     const bool first_exists = backend->head(store->layout().manifestKey(ManifestId{ns, r1})).exists;
     const bool second_exists = backend->head(store->layout().manifestKey(ManifestId{ns, r2})).exists;
@@ -376,7 +377,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamesp
     /// No mount lease/watermark exists: after legal catalog-row deletion there may be no server-root
     /// state left to supply one. The post-observation absent row is the complete dead-life proof.
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
@@ -398,7 +399,7 @@ TEST(CasOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservat
     seedEmptyRecoveryAuthority(*backend, store->layout(), ns);
     backend->arm(store->layout(), key);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_TRUE(backend->didReplace());
     EXPECT_EQ(result.deleted, 0u);
@@ -430,7 +431,7 @@ TEST(CasOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     ASSERT_EQ(backend->casPut(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.token).outcome,
               CasOutcome::Committed);
 
-    EXPECT_THROW(sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10), DB::Exception);
+    EXPECT_THROW(sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10), DB::Exception);
     EXPECT_TRUE(backend->head(key).exists);
 }
 
@@ -444,7 +445,7 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
@@ -514,7 +515,7 @@ TEST(CasOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
     seedFoldCursorForTest(*backend, store->layout(), ns, RefTxnId{2, 2});
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, removed})).exists)
@@ -575,7 +576,7 @@ TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);
     seedFoldCursorForTest(*backend, store->layout(), ns, cursor);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, victim})).exists);
@@ -622,7 +623,7 @@ TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 7);
     seedFoldCursorForTest(*backend, store->layout(), ns, cursor);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10);
 
     EXPECT_EQ(result.deleted, 1u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, removed})).exists);

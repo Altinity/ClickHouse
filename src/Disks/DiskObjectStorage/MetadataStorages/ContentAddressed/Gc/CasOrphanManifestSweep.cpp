@@ -813,23 +813,4 @@ ManifestSweepResult planManifestCursorPage(
     return result;
 }
 
-ManifestSweepResult sweepManifestCursorPage(
-    Pool & store,
-    const String & cursor,
-    uint64_t list_budget,
-    uint64_t delete_budget)
-{
-    ManifestSweepResult result = planManifestCursorPage(
-        store, cursor, list_budget, delete_budget, /*catalog_recovery_authoritative=*/true);
-    for (const ManifestSweepResult::Nomination & nomination : result.nominations)
-    {
-        const DeleteOutcome outcome = store.backend().deleteExact(nomination.key, nomination.token);
-        if (classifyDeleteOutcome(outcome) == DeleteClass::Deleted)
-            ++result.deleted;
-        else
-            ++result.skipped;
-    }
-    return result;
-}
-
 }

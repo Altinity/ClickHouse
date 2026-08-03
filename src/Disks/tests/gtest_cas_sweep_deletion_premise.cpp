@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include "cas_sweep_test_support.h"
 #include "cas_test_helpers.h"
 
 #include <vector>
@@ -182,14 +183,14 @@ TEST(CasSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
     OrphanFixture f;
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
 
-    const ManifestSweepResult held = sweepManifestCursorPage(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    const ManifestSweepResult held = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(held.deleted, 0u);
     EXPECT_GE(held.skipped, 1u);
     EXPECT_TRUE(f.orphanExists());
 
     /// Consume the seal and the very same page deletes it.
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
-    const ManifestSweepResult freed = sweepManifestCursorPage(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
+    const ManifestSweepResult freed = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(freed.deleted, 1u);
     EXPECT_FALSE(f.orphanExists());
 }
@@ -214,7 +215,7 @@ TEST(CasSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIn
     EXPECT_EQ(warnings.size(), 3u) << "every pass reports the retention rather than going quiet";
 }
 
-/// RETENTION IS VISIBLE ON THE PATH THAT ACTUALLY SWEEPS. `sweepManifestCursorPage` has no `warnings`
+/// RETENTION IS VISIBLE ON THE PATH THAT ACTUALLY SWEEPS. `planManifestCursorPage` has no `warnings`
 /// out-param -- the background sweep answers to nobody but its phase row -- so the premise's refusals
 /// have to leave the process as COUNTERS or not at all. In Stage A that is nearly the whole story of
 /// the sweep, because rule (1) is satisfiable only for a closed-and-folded epoch.
@@ -248,7 +249,7 @@ TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
 
     setWatermarkMinActive(*backend, layout, kServerRoot, kBuildEpoch, /*min_active*/6);
 
-    const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
+    const ManifestSweepResult result = sweepManifestCursorPageForTest(*store, "", /*list_budget*/100, /*delete_budget*/10);
 
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_EQ(result.retained_unconsumed_seal, 1u) << "namespace A's cursor is inside its build's epoch";
@@ -269,7 +270,7 @@ TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
     auto empty_backend = std::make_shared<InMemoryBackend>();
     auto empty_store = openPoolForTest(empty_backend);
     const ManifestSweepResult nothing =
-        sweepManifestCursorPage(*empty_store, "", /*list_budget*/100, /*delete_budget*/10);
+        sweepManifestCursorPageForTest(*empty_store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(nothing.topRetainReason().first, SweepRetainClass::None);
     EXPECT_EQ(nothing.topRetainReason().second, 0u);
 }
@@ -292,7 +293,7 @@ TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
     writeManifestRaw(*f.backend, f.store->layout(), f.ns, third, {blobEntryFor("c", DB::UInt128(3))});
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch + 1, 1});
 
-    const ManifestSweepResult first = sweepManifestCursorPage(*f.store, "", /*list_budget*/100, /*delete_budget*/1);
+    const ManifestSweepResult first = sweepManifestCursorPageForTest(*f.store, "", /*list_budget*/100, /*delete_budget*/1);
     EXPECT_EQ(first.deleted, 1u);
     EXPECT_FALSE(first.wrapped)
         << "the page stopped on an exhausted budget with candidates left, so it did not reach the end";
@@ -300,7 +301,7 @@ TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
 
     /// Resume: the two survivors are still ahead of the cursor, so a budgeted continuation reaches them.
     const ManifestSweepResult second_page =
-        sweepManifestCursorPage(*f.store, first.next_cursor, /*list_budget*/100, /*delete_budget*/10);
+        sweepManifestCursorPageForTest(*f.store, first.next_cursor, /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(second_page.deleted, 2u)
         << "the cursor must not have stepped over the candidates the exhausted budget left undecided";
 
