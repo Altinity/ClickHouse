@@ -24,6 +24,7 @@ path	tracked	lines	last_commit	group
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/hygiene-report.md	Y	183	2026-08-03	.superpowers
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/progress.md	Y	165	2026-08-03	.superpowers
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/rca-fence-race.md	Y	165	2026-08-03	.superpowers
+.superpowers/sdd/2026-08-02-cas-stage-b-remaining/shortkeys-report.md	Y	45	2026-08-03	.superpowers
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/soak-cards-validation.md	Y	131	2026-08-03	.superpowers
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/soak-t6b-report.md	Y	197	2026-08-03	.superpowers
 .superpowers/sdd/2026-08-02-cas-stage-b-remaining/t1a-classification.md	Y	124	2026-08-03	.superpowers
@@ -86,7 +87,7 @@ path	tracked	lines	last_commit	group
 .superpowers/sdd/tla-rev7-report.md	Y	130	2026-07-23	.superpowers
 cas_disks_architecture_analysis.md	N	445	untracked	other
 cas_disks_consistency_review.md	N	138	untracked	other
-diff_25_8_26_3.md	Y	2522		other
+diff_25_8_26_3.md	N	2522	untracked	other
 docs/en/operations/storing-data.md	Y	1177	2026-08-03	docs/en
 docs/en/operations/system-tables/cas_gc_log.md	Y	156	2026-08-03	docs/en
 docs/en/operations/system-tables/cas_log.md	Y	62	2026-08-03	docs/en
@@ -122,7 +123,7 @@ docs/superpowers/cas/codecs.md	Y	823	2026-08-02	docs/superpowers/cas
 docs/superpowers/cas/codecs_proposal_v2.md	Y	494	2026-07-16	docs/superpowers/cas
 docs/superpowers/cas/codecs_proposal_v3.md	Y	625	2026-07-16	docs/superpowers/cas
 docs/superpowers/cas/concurrency_checks_improvements_proposal.md	Y	152	2026-07-17	docs/superpowers/cas
-docs/superpowers/cas/consolidation-2026-08/non-doc-debris.md	Y	10	2026-08-03	docs/superpowers/cas
+docs/superpowers/cas/consolidation-2026-08/non-doc-debris.md	Y	12	2026-08-03	docs/superpowers/cas
 docs/superpowers/cas/datapartstorage-content-addressed-design-concern.md	N	372	untracked	docs/superpowers/cas
 docs/superpowers/cas/deferred-docs-classification.md	Y	89	2026-07-31	docs/superpowers/cas
 docs/superpowers/cas/deferred-docs-fixes.md	Y	756	2026-08-03	docs/superpowers/cas

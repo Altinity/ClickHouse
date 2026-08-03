@@ -1,0 +1,31 @@
+You are extracting durable claims from ClickHouse CAS (content-addressed storage)
+project documents. Read EVERY file listed below completely.
+
+Files ({BATCH_ID}):
+{FILE_LIST}
+
+For each file, emit extraction records to {OUT_PATH} as JSON Lines. One record per
+self-contained claim — NOT a summary of the document. Schema (all fields required,
+issue_ids may be []):
+
+{"id": "{BATCH_ID}-NNN",
+ "kind": "contract|design-decision|rejected-alternative|bug|todo|runbook-fact|user-fact|metric|setting|history",
+ "claim": "one self-contained statement understandable without the source document",
+ "sources": ["<path>#<nearest heading anchor or line range>"],
+ "issue_ids": ["B140"],
+ "suggested_target": "architecture/<page>|operations/<page>|configuration|bucket-requirements|quick-start|index|roadmap|BACKLOG|keep-in-place|none"}
+
+Rules:
+- One claim per record. Split compound statements.
+- Copy exact identifiers (setting names, table names, SQL, S3 key shapes) verbatim
+  into the claim — these will be verified against code by someone who cannot see
+  the source document.
+- Play-by-play narration (run statuses, task checkboxes, night-log chronology,
+  review sign-offs) produces NO records.
+- Preserve issue IDs (B/T/S/D-numbers, rev.N) whenever mentioned.
+- A file whose entire content is play-by-play gets zero records — that is fine.
+
+After the JSONL, write {OUT_PATH}.manifest — one line per input file:
+<path>\trecords:<N>        (N > 0)
+<path>\tephemeral:<one-line reason>   (N == 0)
+Every input file MUST appear exactly once.

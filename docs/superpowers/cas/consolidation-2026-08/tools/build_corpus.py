@@ -53,7 +53,13 @@ def group_of(p):
             return prefix
     return "other"
 
-for p, tracked in [(f, "Y") for f in diff_files + explicit] + [(f, "N") for f in untracked_cas]:
+def is_tracked(p):
+    return subprocess.run(["git", "ls-files", "--error-unmatch", p],
+                           capture_output=True).returncode == 0
+
+explicit_rows = [(f, "Y" if is_tracked(f) else "N") for f in explicit]
+
+for p, tracked in [(f, "Y") for f in diff_files] + explicit_rows + [(f, "N") for f in untracked_cas]:
     if p in seen or not os.path.exists(p):
         continue
     if p.endswith((".tla", ".cfg")):
