@@ -192,15 +192,15 @@ git commit -m "cas: sql -- SYSTEM CONTENT ADDRESSED ... -> SYSTEM CAS ..., grant
 - Modify: stateless/integration/soak files referencing the table names and setting names (Task 5/6 rename the files themselves; here only src/ + `programs/`)
 
 **Interfaces:**
-- Produces: tables `system.cas_log`, `system.cas_garbage_collection_log`, `system.cas_mounts`; config sections `<cas_log>`, `<cas_garbage_collection_log>`; server settings `cas_blob_upload_pool_size`, `cas_condemned_upload_memory_bytes`; `metadata_type` value `cas` (sole accepted spelling, no alias); `system.disks.metadata_type` shows `CAS`.
+- Produces: tables `system.cas_log`, `system.cas_gc_log`, `system.cas_mounts`; config sections `<cas_log>`, `<cas_gc_log>`; server settings `cas_blob_upload_pool_size`, `cas_condemned_upload_memory_bytes`; `metadata_type` value `cas` (sole accepted spelling, no alias); `system.disks.metadata_type` shows `CAS`.
 
 - [ ] **Step 1: SystemLog member rename (renames table name + config section together)**
 
-In `src/Interpreters/SystemLog.h:20-21` change the macro rows' second argument: `content_addressed_garbage_collection_log` → `cas_garbage_collection_log`, `content_addressed_log` → `cas_log` (class names `ContentAddressedGarbageCollectionLog` / `ContentAddressedLog` stay). Update the member accesses:
+In `src/Interpreters/SystemLog.h:20-21` change the macro rows' second argument: `content_addressed_garbage_collection_log` → `cas_gc_log`, `content_addressed_log` → `cas_log` (class names `ContentAddressedGarbageCollectionLog` / `ContentAddressedLog` stay). Update the member accesses:
 ```bash
-sed -i 's/->content_addressed_garbage_collection_log/->cas_garbage_collection_log/; s/->content_addressed_log/->cas_log/' src/Interpreters/Context.cpp
+sed -i 's/->content_addressed_garbage_collection_log/->cas_gc_log/; s/->content_addressed_log/->cas_log/' src/Interpreters/Context.cpp
 ```
-Update `programs/server/config.xml`: section tags and `<table>` values `content_addressed_log`→`cas_log`, `content_addressed_garbage_collection_log`→`cas_garbage_collection_log`.
+Update `programs/server/config.xml`: section tags and `<table>` values `content_addressed_log`→`cas_log`, `content_addressed_garbage_collection_log`→`cas_gc_log`.
 
 - [ ] **Step 2: system.cas_mounts + server settings**
 
@@ -215,10 +215,10 @@ git ls-files 'src/*' 'programs/*' | xargs grep -l 'content_addressed_blob_upload
 
 - [ ] **Step 3: Fix user-visible texts naming the tables in src/**
 
-Replace `system.content_addressed_mounts`→`system.cas_mounts`, `system.content_addressed_log`→`system.cas_log`, `system.content_addressed_garbage_collection_log`→`system.cas_garbage_collection_log` and bare-name mentions in comments/messages:
+Replace `system.content_addressed_mounts`→`system.cas_mounts`, `system.content_addressed_log`→`system.cas_log`, `system.content_addressed_garbage_collection_log`→`system.cas_gc_log` and bare-name mentions in comments/messages:
 ```bash
 git ls-files 'src/*' | xargs grep -l 'content_addressed_mounts\|content_addressed_log\|content_addressed_garbage_collection_log' \
-  | xargs sed -i 's/content_addressed_garbage_collection_log/cas_garbage_collection_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g'
+  | xargs sed -i 's/content_addressed_garbage_collection_log/cas_gc_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g'
 ```
 Files expected to change: `ContentAddressedMetadataStorage.{h,cpp}`, `Pool/CasPool.h`, `Pool/CasServerRoot.{h,cpp}`, `Pool/CasMountRuntime.{h,cpp}`, `Pool/CasRefLedger.cpp`, `Parts/PartFolderAccess.cpp`, `Gc/CasGc.{h,cpp}`, `Gc/CasGcScheduler.h`, `src/Common/ProfileEvents.cpp:900`, `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:37`, `src/Storages/System/StorageSystemContentAddressedMounts.h:11`, gtests `gtest_cas_lifecycle_snapshot.cpp`, `gtest_cas_gc_log.cpp`, `gtest_cas_ref_writer.cpp`.
 
@@ -249,7 +249,7 @@ ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 
 ```bash
 git add -A src/ programs/
-git commit -m "cas: tables/settings/config/wire -- cas_log, cas_garbage_collection_log, cas_mounts, cas_* settings, metadata_type=cas, cas_* fetch protocol names"
+git commit -m "cas: tables/settings/config/wire -- cas_log, cas_gc_log, cas_mounts, cas_* settings, metadata_type=cas, cas_* fetch protocol names"
 ```
 
 ---
@@ -350,7 +350,7 @@ git status -s | grep '^R' | wc -l   # expect ~74 renames (36 bases x2 + 05008 pa
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master/tests/queries/0_stateless
 grep -l 'content_addressed' *.sql *.sh *.reference 2>/dev/null \
-  | xargs sed -i 's/content_addressed_garbage_collection_log/cas_garbage_collection_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g; s/content_addressed/cas/g'
+  | xargs sed -i 's/content_addressed_garbage_collection_log/cas_gc_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g; s/content_addressed/cas/g'
 ```
 The final catch-all `s/content_addressed/cas/g` intentionally rewrites test-local pool/disk identifiers (`04278_content_addressed_pool`→`04278_cas_pool`), `metadata_type = content_addressed`→`= cas`, and `content_addressed_s3` policy references. Then re-check nothing unrelated changed:
 ```bash
@@ -431,9 +431,10 @@ grep -rl '<content_addressed_allow_shared_pool>\|<content_addressed_gc_grace_sec
   | xargs sed -i '/<content_addressed_allow_shared_pool>/d; /<content_addressed_gc_grace_sec>/d'
 # one prose comment names the key mid-sentence (test_cas_replicated_relink/configs/storage_conf_other_pool.xml:~5,
 # "…needs neither `content_addressed_allow_shared_pool` nor…") — reword it by hand to drop the key mention.
-# THEN the catch-all sed: table names, metadata_type, disk/policy names, endpoints, AND the
+# THEN the seds: the gc-log table first (its short name is NOT the mechanical rename),
+# then the catch-all for table names, metadata_type, disk/policy names, endpoints, AND the
 # wire-protocol assertions in test_cas_replicated_relink/test.py:629-644 (renamed in Task 3 Step 5)
-grep -rl 'content_addressed' test_cas_*/ | xargs sed -i 's/content_addressed/cas/g'
+grep -rl 'content_addressed' test_cas_*/ | xargs sed -i 's/content_addressed_garbage_collection_log/cas_gc_log/g; s/content_addressed/cas/g'
 rm -f test_cas_replicated_relink/configs/storage_conf-preprocessed.xml   # stale artifact, untracked; skip if git-tracked
 ```
 Then verify the wire-protocol assertions now expect `cas_pool_uuid`, `cas_relink`, `cas_confirm`, `cas_source_token`, `cas_confirm_answer` — matching the literals set in Task 3 Step 5:
@@ -457,7 +458,7 @@ git commit -m "cas: integration tests -- test_content_addressed_* -> test_cas_*"
 ### Task 7: Documentation
 
 **Files:**
-- Rename: `docs/en/operations/system-tables/content_addressed_log.md`→`cas_log.md`, `content_addressed_garbage_collection_log.md`→`cas_garbage_collection_log.md`, `content_addressed_mounts.md`→`cas_mounts.md`
+- Rename: `docs/en/operations/system-tables/content_addressed_log.md`→`cas_log.md`, `content_addressed_garbage_collection_log.md`→`cas_gc_log.md`, `content_addressed_mounts.md`→`cas_mounts.md`
 - Modify: those three + `docs/en/operations/storing-data.md` + `docs/en/sql-reference/statements/system.md`
 
 **Interfaces:**
@@ -468,9 +469,11 @@ git commit -m "cas: integration tests -- test_content_addressed_* -> test_cas_*"
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master/docs/en/operations/system-tables
-for f in content_addressed_*.md; do git mv "$f" "${f/content_addressed/cas}"; done
+git mv content_addressed_garbage_collection_log.md cas_gc_log.md
+git mv content_addressed_log.md cas_log.md
+git mv content_addressed_mounts.md cas_mounts.md
 cd /home/mfilimonov/workspace/ClickHouse/master
-grep -rln 'content_addressed' docs/en/ | xargs sed -i 's/content_addressed_garbage_collection_log/cas_garbage_collection_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g; s/content_addressed_s3/cas_s3/g; s/content_addressed/cas/g'
+grep -rln 'content_addressed' docs/en/ | xargs sed -i 's/content_addressed_garbage_collection_log/cas_gc_log/g; s/content_addressed_mounts/cas_mounts/g; s/content_addressed_log/cas_log/g; s/content_addressed_s3/cas_s3/g; s/content_addressed/cas/g'
 ```
 This fixes frontmatter (`slug`, `title`, `sidebar_label`), the inbound links in `storing-data.md:464-466` and `system.md:470`, the XML examples (`metadata_type` value → `cas`, example disk `s3_cas`), and the two server settings names.
 
@@ -479,14 +482,14 @@ This fixes frontmatter (`slug`, `title`, `sidebar_label`), the inbound links in 
 In `docs/en/sql-reference/statements/system.md`:
 - `:460` heading → `### SYSTEM CAS GC RUN {#system-cas-gc-run}` (also fixes the previously inconsistent `#content-addressed-garbage-collection` anchor), `:474` → `{#system-cas-gc-rebuild}`, `:503` → `{#system-cas-drop-pool-member}`; syntax blocks `:465,486,518` → `SYSTEM CAS …`.
 - Update the three anchor links in `docs/en/operations/storing-data.md:461-463` to the new anchors.
-- `sed -i 's/CONTENT ADDRESSED/CAS/g' docs/en/operations/storing-data.md docs/en/operations/system-tables/cas_garbage_collection_log.md docs/en/operations/system-tables/cas_mounts.md docs/en/sql-reference/statements/system.md` for any remaining command mentions.
+- `sed -i 's/CONTENT ADDRESSED/CAS/g' docs/en/operations/storing-data.md docs/en/operations/system-tables/cas_gc_log.md docs/en/operations/system-tables/cas_mounts.md docs/en/sql-reference/statements/system.md` for any remaining command mentions.
 
 - [ ] **Step 3: Prose — abbreviation `CA` → `CAS`, compare-and-swap disambiguation, `Cas*` → `CAS*`**
 
 Manual edits (grep-guided, these are prose, not sed-able blindly):
-- All 14 `CA`-as-feature occurrences → `CAS`; first mention per page stays spelled out: "content-addressed storage (CAS)". Files/lines: `cas_log.md:2,13,25`, `cas_garbage_collection_log.md:2,13,155`, `cas_mounts.md:2,13,18,68`, `storing-data.md:457`, `system.md:462,476,477`.
-- `cas_garbage_collection_log.md:72,73,84`: the four `CAS` occurrences meaning S3 compare-and-swap → reword as "compare-and-swap" (e.g. "`gc/state` `GET` + compare-and-swap write").
-- `cas_garbage_collection_log.md:55`: "`Cas*` counters" → "`CAS*` counters".
+- All 14 `CA`-as-feature occurrences → `CAS`; first mention per page stays spelled out: "content-addressed storage (CAS)". Files/lines: `cas_log.md:2,13,25`, `cas_gc_log.md:2,13,155`, `cas_mounts.md:2,13,18,68`, `storing-data.md:457`, `system.md:462,476,477`.
+- `cas_gc_log.md:72,73,84`: the four `CAS` occurrences meaning S3 compare-and-swap → reword as "compare-and-swap" (e.g. "`gc/state` `GET` + compare-and-swap write").
+- `cas_gc_log.md:55`: "`Cas*` counters" → "`CAS*` counters".
 - `storing-data.md:478-495`: the documented nested `<content_addressed>` settings block does not exist in code (keys are read flat off the disk block) — rewrite the example/prose to flat keys under the disk element while renaming; keep the line-496 sentence about unprefixed per-disk keys (still true).
 - Headings: "### Using Content-Addressed Storage" and the `#…-content-addressed` parameter anchors in `storing-data.md` may keep the spelled-out form (first-mention rule); do not invent `#…-cas` anchors unless links break.
 

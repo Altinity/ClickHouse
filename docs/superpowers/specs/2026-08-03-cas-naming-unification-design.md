@@ -30,7 +30,7 @@ into one canonical form, in the least invasive way:
    No parser aliases for the old syntax — the branch is unreleased.
 3. **System tables.** Registered names only (C++ classes stay):
    `content_addressed_log` → `cas_log`,
-   `content_addressed_garbage_collection_log` → `cas_garbage_collection_log`,
+   `content_addressed_garbage_collection_log` → `cas_gc_log`,
    `content_addressed_mounts` → `cas_mounts`.
 4. **Settings and config.** `content_addressed_blob_upload_pool_size` →
    `cas_blob_upload_pool_size`, `content_addressed_condemned_upload_memory_bytes`
