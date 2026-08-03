@@ -592,7 +592,6 @@ private:
     const uint64_t gc_round_ref_cleanup_budget;
     const uint64_t gc_round_prefix_wholesale_budget;
     const uint64_t gc_round_handoff_prefix_wholesale_budget;
-    const uint64_t gc_round_manifest_cleanup_budget;
     const uint64_t gc_round_outcome_entry_budget;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).

@@ -117,11 +117,6 @@ struct PoolConfig
     /// one-shot event with no reclaimer besides `fsck`, so a prune-heavy round must never be able to
     /// starve it to zero.
     uint64_t gc_round_handoff_prefix_wholesale_budget = 5000;
-    /// Owner-removed manifest body deletes (post-CAS `manifest_deletes` phase), cumulative for the round.
-    /// Not durable across rounds -- an entry the budget declines is never retried by this pipeline (the
-    /// ref-log intake cursor that produced it already advanced) -- so the excess relies on the
-    /// orphan-manifest sweep to reclaim it later. 0 = unbounded.
-    uint64_t gc_round_manifest_cleanup_budget = 5000;
     /// `GcOutcomes` per-round entry cap across the redelete/spared audit log, cumulative for the round.
     /// Bounds only the audit-log write -- the settlement decision it records already happened
     /// unconditionally in the fold. 0 = unbounded.

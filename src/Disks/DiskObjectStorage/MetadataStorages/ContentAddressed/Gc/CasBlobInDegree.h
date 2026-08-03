@@ -311,18 +311,6 @@ struct GcRoundWorkBudget
             ? max_handoff_prefix_wholesale_objects - handoff_prefix_wholesale_objects_used : 0;
     }
 
-    /// Post-CAS `manifest_deletes` phase (`Gc::runRegularRound`): owner-removed manifest bodies are
-    /// discovered fresh from each round's ref-log intake (`Gc::foldManifestEdges`) and are NOT durable
-    /// across rounds -- the intake cursor advances past the log that produced an entry whether or not its
-    /// body gets deleted this round, so an entry this budget declines to spend on is never retried by this
-    /// same pipeline. The orphan-manifest sweep is the backstop: once the round's cursor has moved past the
-    /// owning log, the body is unreachable from any live ref and the sweep will nominate and reclaim it on
-    /// its own schedule.
-    uint64_t max_manifest_cleanup_objects = 0;
-    uint64_t manifest_cleanup_objects_used = 0;
-
-    bool manifestCleanupAvailable() const { return max_manifest_cleanup_objects == 0 || manifest_cleanup_objects_used < max_manifest_cleanup_objects; }
-
     /// `GcOutcomes` per-shard body (`Gc::runRegularRound`'s `redelete`/`spared` loops): a pure
     /// observability record of a settlement decision that has ALREADY happened -- the merge unconditionally
     /// decides `spared` for any entry whose in-degree recovered (INV_NO_LOSS: a fresh dedup-adopt must

@@ -817,22 +817,16 @@ TEST(CASGcRound, RoundSummaryCountsManifestBodyDeletes)
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGcEnumerationPages].load() - pages_before, 1);
 }
 
-/// `gc_round_manifest_cleanup_budget` caps the post-CAS `manifest_deletes` phase. Owner-removed manifest
-/// bodies are NOT durable across rounds (the ref-log intake cursor that discovered each removal is
-/// committed by the SAME round's CAS, before this phase runs), so an entry the budget declines this round
-/// is never retried by this pipeline — the orphan-manifest sweep is the only remaining reclaimer. Five
-/// tables' manifests are all owner-removed in one fold; with a budget of 2, exactly 2 bodies are deleted
-/// THIS round while the other 3 survive it, and only the (unrelated, already-running) orphan sweep
-/// eventually reclaims them over further rounds.
-TEST(CASGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
+/// Manifest-body cleanup (post-CAS `manifest_deletes` phase) has no cap: the ref-log intake cursor that
+/// discovers each owner-removed manifest commits in the SAME round's CAS that produces `mf_cleanup`, so an
+/// entry a cap declined would never be re-derived by this pipeline -- a bounded burst would become a
+/// permanent leak. Five tables' manifests are all owner-removed in one fold; the round must delete all
+/// five bodies in the same round, with nothing left un-deleted.
+TEST(CASGcRound, ManifestCleanupDrainsEntireRoundWithNoSkips)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// The GC's own mount root is distinct from the synthetic dead-builder root below (matching
-    /// `OrphanManifestCursorSweepDeletesAndPersistsCursor`'s reasoning): the orphan sweep's deletion
-    /// premise gates on a build being provably dead by watermark, independent of the round's own lease.
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "gc-runner",
-        .gc_round_manifest_cleanup_budget = 2,
         .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     constexpr int kManifests = 5;
@@ -846,11 +840,6 @@ TEST(CASGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
         publishCommittedTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), std::nullopt, r);
         ids.push_back(ManifestId{ns, r});
     }
-    /// All five share build_sequence 1 (differ only by manifest_ordinal); prove the watermark, not the
-    /// round's own lease, provably dead for that build so the orphan sweep may ever delete them.
-    /// `floorForNamespace` resolves the mount root from the namespace's OWN first path segment ("00"),
-    /// not an arbitrary id.
-    setWatermarkMinActive(*backend, store->layout(), "00", /*writer_epoch=*/1, /*min_active=*/2);
 
     Gc gc(store, kGc);
     driveToFixpoint(*backend, store, gc);   /// fold all five +1s; no manifest owner-removed yet
@@ -858,53 +847,17 @@ TEST(CASGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
         ASSERT_TRUE(manifestExists(*backend, store->layout(), id));
 
     /// Remove all five owners in one window; the next fold's intake sees all five `-1` edges together.
-    uint64_t last_seq = 0;
     for (int i = 0; i < kManifests; ++i)
-        last_seq = dropRefTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), ref(1, 0xD0 + i));
+        dropRefTransition(*backend, store->layout(), ns, "tbl" + std::to_string(i), ref(1, 0xD0 + i));
 
     const RoundReport rep = runRegularRoundReclaiming(gc);
     ASSERT_TRUE(rep.acquired_lease);
-    EXPECT_EQ(rep.manifests_deleted, 2u)
-        << "manifest_deletes must stop at gc_round_manifest_cleanup_budget, not delete all owner-removed bodies";
+    EXPECT_EQ(rep.manifests_deleted, kManifests)
+        << "manifest_deletes must drain the entire mf_cleanup vector in one round, not cap it";
 
-    int surviving = 0;
     for (const ManifestId & id : ids)
-        surviving += manifestExists(*backend, store->layout(), id) ? 1 : 0;
-    EXPECT_EQ(surviving, kManifests - 2)
-        << "the budget-declined bodies must survive this round unchanged (leaked to the orphan sweep, not lost)";
-
-    /// The orphan sweep's OWN deletion premise (§6) requires the namespace's fold cursor to have crossed
-    /// STRICTLY above the manifests' epoch before it may delete them (`OrphanManifestCursorSweepDeletesAnd
-    /// PersistsCursor` exercises this same premise in isolation) -- so convergence needs a real epoch
-    /// crossing, not just more idle rounds.
-    writeSealAt(*backend, store->layout(), ns, RefTxnId{1, last_seq + 1});
-    publishAt(*backend, store->layout(), ns, RefTxnId{2, 1}, "cross", /*build_sequence=*/999,
-              DB::UInt128(0xC205), /*birth=*/false, /*prev_epoch_seal=*/RefTxnId{1, last_seq + 1});
-    const std::optional<NamespaceLifeId> life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
-    ASSERT_TRUE(life.has_value());
-    const String ckpt_key = store->layout().refCkptKey(*life);
-    const auto old_ckpt = backend->get(ckpt_key);
-    ASSERT_TRUE(old_ckpt.has_value());
-    ASSERT_EQ(backend->putOverwrite(ckpt_key, encodeRefCkpt(RefCkpt{
-        .life_epoch = 1,
-        .committed_through = RefTxnId{2, 1},
-        .checkpoint_snapshot_id = std::nullopt,
-        .last_epoch_seal = RefTxnId{1, last_seq + 1},
-    }), old_ckpt->token).outcome, PutOutcome::Done);
-
-    /// Convergence: the orphan-manifest sweep (unrelated to this budget, already running every round with
-    /// its own defaults) must eventually reclaim every surviving body — the remainder is not permanently
-    /// stranded.
-    bool all_gone = false;
-    for (int i = 0; i < 64 && !all_gone; ++i)
-    {
-        store->renewWatermarkOnce();
-        ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
-        all_gone = true;
-        for (const ManifestId & id : ids)
-            all_gone = all_gone && !manifestExists(*backend, store->layout(), id);
-    }
-    EXPECT_TRUE(all_gone) << "the manifest-cleanup-budget remainder must eventually be reclaimed by the orphan sweep";
+        EXPECT_FALSE(manifestExists(*backend, store->layout(), id))
+            << "an unbudgeted cleanup must leave nothing surviving the round it was discovered in";
 }
 
 /// §0 introspection follow-up: `CASGcEnumerationPages` must not depend on the orphan-manifest sweep alone

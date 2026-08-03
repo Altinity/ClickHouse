@@ -539,7 +539,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     round_work_budget.max_ref_cleanup_objects = store->poolConfig().gc_round_ref_cleanup_budget;
     round_work_budget.max_prefix_wholesale_objects = store->poolConfig().gc_round_prefix_wholesale_budget;
     round_work_budget.max_handoff_prefix_wholesale_objects = store->poolConfig().gc_round_handoff_prefix_wholesale_budget;
-    round_work_budget.max_manifest_cleanup_objects = store->poolConfig().gc_round_manifest_cleanup_budget;
     round_work_budget.max_outcome_entries = store->poolConfig().gc_round_outcome_entry_budget;
 
     /// The helping barrier precedes heartbeat work, DEFER, the hot stream LIST, and every successor
@@ -1164,10 +1163,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
     /// ADOPTED by the round CAS (delete-after-sealed-decrements). NOT durable across rounds: the
     /// ref-log intake cursor that discovered each `-1` edge is committed by THIS round's CAS above,
-    /// so a log already folded is never re-visited and never re-populates `mf_cleanup`. An entry this
-    /// phase does not reach -- whether from a crash or from the budget below -- is therefore left
-    /// exactly like a crash already is: unreachable from any live ref, reclaimed later only by the
-    /// orphan-manifest sweep, never a dangle.
+    /// so a log already folded is never re-visited and never re-populates `mf_cleanup`. This phase is
+    /// deliberately unbudgeted: a cap would leave a declined entry unreachable from any live ref AND
+    /// never re-derived by this pipeline, converting a bounded burst into a permanent leak. It drains
+    /// the whole of `folded.mf_cleanup` every round it runs; only a crash (or the destructive-suppression
+    /// gate below) leaves an entry for the orphan-manifest sweep to reclaim later.
     ///
     /// PHASE 15/18 `manifest_deletes`.
     {
@@ -1183,11 +1183,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         uint64_t attempted = 0;
         for (const auto & [id, token] : mf_cleanup_now)
         {
-            /// Budget-exhausted entries are left un-deleted THIS round; see the phase comment above for
-            /// why the orphan-manifest sweep, not a later round of this pipeline, is what reclaims them.
-            if (!round_work_budget.manifestCleanupAvailable())
-                break;
-            ++round_work_budget.manifest_cleanup_objects_used;
             ++attempted;
             const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
             const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
@@ -1207,7 +1202,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             });
         }
         t.metric("attempted", attempted);
-        t.metric("skipped_budget", mf_cleanup_now.size() - attempted);
         t.metric("deleted", report.manifests_deleted - manifests_deleted_before);
         t.metric("suppressed", suppress_destructive ? 1 : 0);
     }
