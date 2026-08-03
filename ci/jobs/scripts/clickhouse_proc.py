@@ -191,7 +191,7 @@ class ClickHouseProc:
         return True
 
     def start_rustfs(self):
-        # RustFS backs the content-addressed-over-S3 pool (M-W D-W8): the incarnation pool needs
+        # RustFS backs the CAS-over-S3 pool (M-W D-W8): the incarnation pool needs
         # ENFORCED conditional operations (a wrong-token DELETE must fail with 412), which MinIO
         # OSS lacks - the CA disk's fail-closed capability probe rejects it. The static (musl)
         # binary is downloaded from the RustFS GitHub release into ci/tmp/rustfs when absent
@@ -1298,21 +1298,21 @@ fi
         Shell.check(
             f"sed -i 's|<errorlog>.*</errorlog>|<errorlog>{self.CH_LOCAL_ERR_LOG}</errorlog>|' /etc/clickhouse-server/config.xml"
         )
-        # Open any content-addressed disk read-only for this scrape. The server is already
+        # Open any CAS disk read-only for this scrape. The server is already
         # stopped, so `clickhouse local` opens the pool under its own (unrelated) identity;
         # a normal (writable) open claims server-root ownership (`Pool::mountWritable` ->
         # `claimOwnerOrThrow`) and fails closed with "owned by a different server" against the
         # real server's persisted owner uuid. A read-only open skips that claim entirely
         # (`Pool::open`: `if (!config.read_only) mountWritable(...)`), which is all a read-only
         # dump needs. Keyed on the CAS marker tag, not the disk name, so it covers every
-        # content-addressed disk regardless of how it's named in this job's config.
+        # CAS disk regardless of how it's named in this job's config.
         #
         # FIND the files by the marker instead of naming them. The original version of this line patched
         # `config.xml`, where the tag does not live -- the CA storage policy is symlinked into `config.d/`
         # by `tests/config/install.sh` -- so `sed` matched nothing, `<readonly>` was never inserted, and
         # the scrape kept failing on ownership while looking handled. Naming `config.d` instead would fix
         # today and break again the next time the layout moves, so the path is not named at all.
-        # `xargs -r` makes this a clean no-op on a job with no content-addressed disk.
+        # `xargs -r` makes this a clean no-op on a job with no CAS disk.
         #
         # `-R`, NOT `-r`: `tests/config/install.sh` SYMLINKS these configs into `config.d` (`ln -sf`), and
         # `grep -r` skips symlinks it finds while walking a tree — only `-R` follows them. The first
@@ -1320,21 +1320,21 @@ fi
         # therefore still have matched nothing in CI. `sed --follow-symlinks` likewise, so the edit lands
         # in the file rather than replacing the link with a regular copy.
         Shell.check(
-            "grep -Rl '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
-            "| xargs -r sed -i --follow-symlinks 's|<metadata_type>content_addressed</metadata_type>|<metadata_type>content_addressed</metadata_type><readonly>true</readonly>|g'"
+            "grep -Rl '<metadata_type>cas</metadata_type>' /etc/clickhouse-server/ 2>/dev/null "
+            "| xargs -r sed -i --follow-symlinks 's|<metadata_type>cas</metadata_type>|<metadata_type>cas</metadata_type><readonly>true</readonly>|g'"
         )
         # Fail LOUDLY rather than silently, if the substitution ever stops matching again: a CA disk that
         # is declared but not marked read-only means this scrape is about to die on ownership, and a
         # silent no-op is precisely how that went unnoticed before. Reports; does not abort the dump.
         if Shell.check(
-            "grep -Rlq '<metadata_type>content_addressed</metadata_type>' /etc/clickhouse-server/",
+            "grep -Rlq '<metadata_type>cas</metadata_type>' /etc/clickhouse-server/",
             verbose=False,
         ) and not Shell.check(
-            "grep -Rlq '<metadata_type>content_addressed</metadata_type><readonly>true</readonly>' /etc/clickhouse-server/",
+            "grep -Rlq '<metadata_type>cas</metadata_type><readonly>true</readonly>' /etc/clickhouse-server/",
             verbose=False,
         ):
             print(
-                "WARNING: a content-addressed disk is declared but the read-only marker was not inserted "
+                "WARNING: a CAS disk is declared but the read-only marker was not inserted "
                 "-- `clickhouse local` will claim server-root ownership and this scrape will fail"
             )
         # FIXME: Hack for s3_with_keeper (note, that we don't need the disk,

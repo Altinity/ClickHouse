@@ -1,4 +1,4 @@
--- Tags: no-distributed-cache, no-encrypted-storage, no-content-addressed-storage
+-- Tags: no-distributed-cache, no-encrypted-storage, no-cas-storage
 -- The executor does not implement the distributed cache or decryption, so it
 -- falls back on those storage configs and the activation check below would not
 -- hold. Those stages can't be turned off from the test (unlike async prefetch

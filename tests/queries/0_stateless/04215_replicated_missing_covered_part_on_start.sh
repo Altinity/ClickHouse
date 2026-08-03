@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
+# Tags: long, zookeeper, no-shared-merge-tree, no-cas-storage
 # no-shared-merge-tree: depends on local fs
-# no-content-addressed-storage: test asserts system.parts.path is an absolute local FS path; on a content_addressed disk the path is a relative object-storage key (orthogonal part-file path-shape)
+# no-cas-storage: test asserts system.parts.path is an absolute local FS path; on a cas disk the path is a relative object-storage key (orthogonal part-file path-shape)
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

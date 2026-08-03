@@ -1,4 +1,4 @@
--- Tags: no-distributed-cache, no-encrypted-storage, no-content-addressed-storage
+-- Tags: no-distributed-cache, no-encrypted-storage, no-cas-storage
 -- The executor falls back on the distributed cache and decryption (which can't be
 -- disabled from the test), so its metrics would not be emitted there; skip those
 -- configs (as in 04316 / 04327). Content-addressed storage always adds a

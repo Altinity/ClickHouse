@@ -1,4 +1,4 @@
--- Tags: no-distributed-cache, no-encrypted-storage, no-content-addressed-storage
+-- Tags: no-distributed-cache, no-encrypted-storage, no-cas-storage
 -- Like 04316, the executor falls back on the distributed cache and decryption
 -- (which can't be disabled from the test), so its metrics would not be emitted on
 -- those storage configs. Skip them; the test still runs on local disk and plain

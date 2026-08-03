@@ -62,7 +62,7 @@ TEST(CASContentAddressedSettings, ObjectStorageKeysSkipped)
         "<access_key_id>k</access_key_id><secret_access_key>s</secret_access_key>"
         "<server_root_id>srv1</server_root_id>"
         /// Regression pin (stateless-lane startup fix): the local-object-storage CAS disk config
-        /// (`tests/config/config.d/content_addressed_storage_policy_for_merge_tree_by_default.xml`)
+        /// (`tests/config/config.d/cas_storage_policy_for_merge_tree_by_default.xml`)
         /// sets `path` -- the generic local-object-storage pool root, consumed by
         /// `ObjectStorageFactory`/`IDisk`, same class as `endpoint`/`access_key_id` above -- and it
         /// was missing from `non_cas_keys`, which threw `UNKNOWN_SETTING` at server startup.

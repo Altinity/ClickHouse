@@ -1352,7 +1352,7 @@ class FailureReason(enum.Enum):
     OBJECT_STORAGE = "object-storage"
     COVERAGE = "coverage"
     S3_STORAGE = "s3-storage"
-    CONTENT_ADDRESSED_STORAGE = "content-addressed-storage"
+    CAS_STORAGE = "cas-storage"
     AZURE_BLOB_STORAGE = "azure-blob-storage"
     BUILD = "not running for current build"
     NO_PARALLEL_REPLICAS = "smth is not supported with parallel replicas"
@@ -2880,10 +2880,10 @@ class TestCase:
             return FailureReason.S3_STORAGE
         if (
             tags
-            and ("no-content-addressed-storage" in tags)
-            and args.content_addressed_storage
+            and ("no-cas-storage" in tags)
+            and args.cas_storage
         ):
-            return FailureReason.CONTENT_ADDRESSED_STORAGE
+            return FailureReason.CAS_STORAGE
         if tags and ("no-azure-blob-storage" in tags) and args.azure_blob_storage:
             return FailureReason.AZURE_BLOB_STORAGE
         if (
@@ -2892,7 +2892,7 @@ class TestCase:
             and (
                 args.azure_blob_storage
                 or args.s3_storage
-                or args.content_addressed_storage
+                or args.cas_storage
             )
         ):
             return FailureReason.OBJECT_STORAGE
@@ -2902,7 +2902,7 @@ class TestCase:
             and (
                 args.s3_storage
                 or args.azure_blob_storage
-                or args.content_addressed_storage
+                or args.cas_storage
             )
             and BuildFlags.RELEASE not in args.build_flags
         ):
@@ -5639,14 +5639,14 @@ def main(args):
     if args.s3_storage and (BuildFlags.RELEASE not in args.build_flags):
         args.no_random_settings = True
 
-    if args.content_addressed_s3_storage:
-        # CA-over-S3 is a content-addressed disk AND it is backed by S3 (minio).
-        # Mirror the local-CA gating (no-content-addressed-storage + no-object-storage)
+    if args.cas_s3_storage:
+        # CA-over-S3 is a CAS disk AND it is backed by S3 (minio).
+        # Mirror the local-CA gating (no-cas-storage + no-object-storage)
         # and additionally honour no-s3-storage, since this disk IS s3-backed.
         # Done AFTER the no_random_settings block above on purpose: like the local-CA
         # job we keep random (merge-tree) settings; we only want the s3/object-storage
         # *gating*, not the s3 stateful-data / no-random-settings machinery.
-        args.content_addressed_storage = True
+        args.cas_storage = True
         args.s3_storage = True
 
     if args.skip:
@@ -6364,17 +6364,17 @@ def parse_args():
         help="Run tests over s3 storage",
     )
     parser.add_argument(
-        "--content-addressed-storage",
+        "--cas-storage",
         action="store_true",
         default=False,
-        help="Run tests with a content_addressed disk as the default MergeTree storage",
+        help="Run tests with a CAS disk as the default MergeTree storage",
     )
     parser.add_argument(
-        "--content-addressed-s3-storage",
+        "--cas-s3-storage",
         action="store_true",
         default=False,
-        help="Run tests with a content_addressed disk backed by S3 (minio) as the default MergeTree storage. "
-        "Implies --content-addressed-storage (object-storage gating) and --s3-storage (s3-storage gating).",
+        help="Run tests with a CAS disk backed by S3 (minio) as the default MergeTree storage. "
+        "Implies --cas-storage (object-storage gating) and --s3-storage (s3-storage gating).",
     )
     parser.add_argument(
         "--distributed-cache",

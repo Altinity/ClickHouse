@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Tags: no-fasttest
-# ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
+# ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# An explicit `use_fake_transaction=1` on a `content_addressed` disk would silently break the
+# An explicit `use_fake_transaction=1` on a `cas` disk would silently break the
 # atomic manifest/ref publish (per-file autocommit, no commit point for the transaction). The disk
 # factory must reject it at CREATE TABLE time with BAD_ARGUMENTS instead of silently corrupting
 # writes later -- mirrors the existing missing-`server_root_id` fail-close handling.
@@ -18,7 +18,7 @@ ENGINE = MergeTree ORDER BY a
 SETTINGS disk = disk(
     type = object_storage,
     object_storage_type = local,
-    metadata_type = content_addressed,
+    metadata_type = cas,
     server_root_id = '05015',
     name = '05015_cas_reject_fake_transaction',
     path = '05015_cas_reject_fake_transaction_pool/',

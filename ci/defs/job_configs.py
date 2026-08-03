@@ -780,10 +780,10 @@ class JobConfigs:
         # Content-addressed disk over S3 (RustFS) as the default MergeTree storage — the real-S3
         # (north star) MergeTree default. RustFS is started by the stateless job itself because the
         # incarnation pool needs enforced conditional deletes that MinIO OSS lacks; installs only
-        # content_addressed_s3_storage_policy_for_merge_tree_by_default.xml. Covered on amd across
+        # cas_s3_storage_policy_for_merge_tree_by_default.xml. Covered on amd across
         # the plain binary and all three sanitizer builds, plus an arm binary run for cross-arch.
         Job.ParamSet(
-            parameter="amd_binary, content_addressed s3 storage, parallel",
+            parameter="amd_binary, cas s3 storage, parallel",
             runs_on=RunnerLabels.AMD_MEDIUM_CPU,
             requires=[ArtifactNames.CH_AMD_BINARY_GH],
         ),
@@ -793,7 +793,7 @@ class JobConfigs:
         # after the test loop but before result upload, so such a lane reports no artifacts at all.
         *[
             Job.ParamSet(
-                parameter=f"amd_asan_ubsan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                parameter=f"amd_asan_ubsan, cas s3 storage, parallel, {batch}/{total_batches}",
                 runs_on=RunnerLabels.AMD_MEDIUM_CPU,
                 requires=[ArtifactNames.CH_AMD_ASAN_UBSAN_GH],
             )
@@ -802,7 +802,7 @@ class JobConfigs:
         ],
         *[
             Job.ParamSet(
-                parameter=f"amd_tsan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                parameter=f"amd_tsan, cas s3 storage, parallel, {batch}/{total_batches}",
                 runs_on=RunnerLabels.AMD_MEDIUM,
                 requires=[ArtifactNames.CH_AMD_TSAN_GH],
             )
@@ -811,7 +811,7 @@ class JobConfigs:
         ],
         *[
             Job.ParamSet(
-                parameter=f"amd_msan, content_addressed s3 storage, parallel, {batch}/{total_batches}",
+                parameter=f"amd_msan, cas s3 storage, parallel, {batch}/{total_batches}",
                 runs_on=RunnerLabels.FUNC_TESTER_AMD,
                 requires=[ArtifactNames.CH_AMD_MSAN_GH],
             )
@@ -819,15 +819,15 @@ class JobConfigs:
             for batch in range(1, total_batches + 1)
         ],
         Job.ParamSet(
-            parameter="arm_binary, content_addressed s3 storage, parallel",
+            parameter="arm_binary, cas s3 storage, parallel",
             runs_on=RunnerLabels.ARM_MEDIUM_CPU,
             requires=[ArtifactNames.CH_ARM_BINARY_GH],
         ),
         # Content-addressed disk as the default MergeTree storage, local object storage (CAS M6
         # drop-in). Mirrors the "s3 storage" variant but installs only
-        # content_addressed_storage_policy_for_merge_tree_by_default.xml.
+        # cas_storage_policy_for_merge_tree_by_default.xml.
         Job.ParamSet(
-            parameter="amd_binary, content_addressed storage, parallel",
+            parameter="amd_binary, cas storage, parallel",
             runs_on=RunnerLabels.AMD_MEDIUM_CPU,
             requires=[ArtifactNames.CH_AMD_BINARY_GH],
         ),

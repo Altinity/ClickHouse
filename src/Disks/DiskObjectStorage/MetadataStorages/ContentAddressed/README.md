@@ -182,7 +182,7 @@ GC sharding, hash algorithm, request budgets) is parsed in
 - **Stateless lanes**: the functional-test jobs "`content_addressed storage`"
   (local object storage) and "`content_addressed s3 storage`" run the whole
   stateless suite with `MergeTree` defaulting to a CAS disk. Tests that
-  legitimately cannot run there carry the `no-content-addressed-storage` tag.
+  legitimately cannot run there carry the `no-cas-storage` tag.
 - **Soak / chaos**: `utils/ca-soak/` — multi-replica docker-compose
   harnesses (fault proxies, GC sharding variants, AWS S3/GCS backends) and
   adversarial scenarios.
