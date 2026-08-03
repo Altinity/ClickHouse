@@ -148,10 +148,17 @@ uint64_t lifeEpochOrFail(Backend & backend, const Layout & layout, const Namespa
     return *sample->ckpt.life_epoch;
 }
 
-PoolPtr openPool(const BackendPtr & backend)
+/// `boot_ms_fn` defaults to the real clock. A caller whose test body does enough CPU-bound work
+/// against ONE open pool to risk outrunning `mount_lease_ttl_ms` on a slow sanitizer build should
+/// pass a frozen one instead of widening the TTL: the mount fence and the ref-log request controller
+/// both read time through this same seam (see `CasRefLedger`'s `controller_boot_ms_fn`), so freezing
+/// it removes the wall-clock race rather than merely giving it more room.
+PoolPtr openPool(const BackendPtr & backend, std::function<uint64_t()> boot_ms_fn = {})
 {
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
-    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    config.boot_ms_fn = std::move(boot_ms_fn);
+    return Pool::open(backend, std::move(config));
 }
 
 /// The incarnation the production birth wiring minted for `ns`, learned back from the catalog the way a
@@ -476,7 +483,11 @@ TEST(CASRefCheckpointJoin, CheckpointAndSealStillMergeBySemanticMaximum)
 TEST(CASRefCheckpointJoin, EncodedCkptSizeIsIndependentOfCardinality)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openPool(backend);
+    /// `MANY_REFS` committed through ONE `appendRefOps` call is CPU-bound encoding, not I/O -- on a
+    /// slow sanitizer build (msan in particular) it can outrun the real-clock `mount_lease_ttl_ms`
+    /// this pool was opened under and trip the mount fence mid-publish. Freeze the pool's clock
+    /// instead of racing it (see `openPool`'s doc comment).
+    auto store = openPool(backend, [] { return uint64_t{0}; });
     Layout layout("p");
 
     const String one = encodedCkptOfNamespaceWithRefs(store, *backend, layout, RootNamespace{"srv1/one"}, 1);

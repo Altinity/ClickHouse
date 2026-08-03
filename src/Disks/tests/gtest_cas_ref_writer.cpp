@@ -3167,10 +3167,14 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     });
 
     /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
-    /// transparently retries away. This test is where `kSingleAttemptDeadlineMs` was first needed and
-    /// it remains the worst case for it — it burns the capture-to-gate window encoding the ~1700-op
-    /// removal chunk, which is why it, and not its siblings, failed 5 of 6 sanitizer-lane runs across
-    /// two CI rounds (reproduced locally 14/14 under full CPU load) before `8f9e63c7a19`.
+    /// transparently retries away. `8f9e63c7a19` widened `kSingleAttemptDeadlineMs` off a zero-width
+    /// race (equal attempt/operation deadlines), but it still measures the capture-to-gate window --
+    /// encoding the removal chunk (up to `ref_txn_max_ops` ops) -- against the REAL wall clock, so it
+    /// recurred (3 of 3 sanitizer lanes) once that encode step got slow enough on its own, independent
+    /// of scheduler contention: msan in particular. `ref_request_controller` reads its clock through
+    /// the same injectable seam as the mount fence (`CasRefLedger`'s `controller_boot_ms_fn` is the
+    /// pool's `boot_ms_fn`), so freeze it here instead of racing it -- the fault-injecting PUT below
+    /// still reaches the backend synchronously; only the deadline arithmetic stops moving.
     CasRequestBudget budget;
     budget.max_attempts = 1;
     budget.attempt_timeout_ms = 100;
@@ -3178,6 +3182,7 @@ TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     budget.lease_safety_margin_ms = 100;
     PoolConfig config;
     config.cas_request_budget = budget;
+    config.boot_ms_fn = [] { return uint64_t{0}; };
     auto successor = openPoolWithConfig(backend, config);
 
     backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
