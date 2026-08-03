@@ -243,7 +243,11 @@ for b in "${batches[@]}"; do
 done
 ```
 
-- [ ] **Step 2: Pilot on 2 batches, inspect quality**
+- [ ] **Step 2a: Single-file prompt probe (USER-REQUESTED, before any batch)**
+
+Build a one-file "batch" (id `PROBE`) from a content-rich mid-size source, e.g. `docs/superpowers/cas/2026-08-03-list-trust-verdict.md`: run codex with the template on just that file, then the CONTROLLER reads the file AND the extracted records side by side and judges: single-claim granularity, verbatim identifiers, no summarization, correct `ephemeral` restraint, sane `suggested_target`. Iterate the template until the probe output is good; record each template change and the final probe verdict in the task report. Only then proceed to the 2-batch pilot.
+
+- [ ] **Step 2b: Pilot on 2 batches, inspect quality**
 
 Run: `bash $WORKDIR/tools/run_map.sh B001 B002`
 Inspect `extracted/B001.jsonl`: records must be single claims with verbatim identifiers, not summaries. If quality is off, fix the template (Task 2) and re-run the pilot before the full run.
