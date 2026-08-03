@@ -61,14 +61,17 @@ batches of 5, strictly sequential (never overlapped with anything else on the bo
 | `test_cas_gc_s3` | PASS | 1/1 (`test_gc_reclaims_dropped_blobs`) |
 | `test_cas_gc_sharded` | SKIPPED (pre-existing, infra) | `test_sharded_gc_soak` skips itself: "CA capability probe requires DeleteObject If-Match (ETag-conditional delete, MinIO >= RELEASE.2025-09). The integration-test MinIO image (RELEASE.2024-09-13T20-26-02Z) does not support it; the probe fails fail-closed and the server refuses to start." A pre-existing, self-documented infra gap in the local MinIO image version, not a CAS regression — the test's own skip reason names the fix (update the image) |
 | `test_cas_insert_fault_recovery` | PASS | 1/1 (`test_post_multi_termination_uses_ordinary_lost_part_recovery`) |
-| `test_cas_lazy_load_recovery` | *(fill — batch B in progress)* | |
-| `test_cas_ref_snaplog` | *(fill)* | |
-| `test_cas_replicated_relink` | *(fill)* | |
-| `test_cas_s3` | *(fill)* | |
-| `test_cas_shared_pool` | *(fill)* | |
+| `test_cas_lazy_load_recovery` | PASS | 1/1 (`test_lazy_cas_table_self_heals_after_s3_recovery`) |
+| `test_cas_ref_snaplog` | PASS | 1/1 (`test_ref_snaplog_lifecycle_reclaims_and_fsck_clean`) |
+| `test_cas_replicated_relink` | PASS | 11/11 |
+| `test_cas_s3` | PASS | 2/2 (`test_mutations_and_patch_parts_survive_restart` + one more) |
+| `test_cas_shared_pool` | PASS | 2/2 (`test_two_servers_share_one_pool`, `test_pool_survives_node_crash`) |
 
 Batch A: `build/t8_integration/batchA.log`, `PRAKTIKA_EXIT=0`, 6 passed / 1 skipped in 53.90s.
-Batch B: `build/t8_integration/batchB.log`, in progress.
+Batch B: `build/t8_integration/batchB.log`, `PRAKTIKA_EXIT=0`, 17 passed / 0 failed in 77.05s.
+
+**Integration battery total: 23 passed, 1 skipped (pre-existing infra gap), 0 failed, across all
+10 `test_cas_*` dirs.**
 
 ## The six result criteria, as gate rows {#six-result-criteria}
 
