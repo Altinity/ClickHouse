@@ -34,10 +34,14 @@ into one canonical form, in the least invasive way:
    `content_addressed_mounts` → `cas_mounts`.
 4. **Settings and config.** `content_addressed_blob_upload_pool_size` →
    `cas_blob_upload_pool_size`, `content_addressed_condemned_upload_memory_bytes`
-   → `cas_condemned_upload_memory_bytes`; config key `<content_addressed>` →
-   `<cas>`; metadata storage type string `"content_addressed"` → `"cas"`.
-   During implementation, verify the type string is not persisted in on-disk
-   metadata or backups; if it is, stop and re-discuss that item.
+   → `cas_condemned_upload_memory_bytes`; metadata storage type string
+   `"content_addressed"` → `"cas"`. (There is no `<content_addressed>` settings
+   block in the code — per-disk keys are read flat off the disk element; the
+   XML occurrences are disk/policy *names*, renamed with the tests.)
+   The old type string IS persisted (table `.sql` ATTACH queries, backup
+   metadata). Decision (2026-08-03): NO compat alias anywhere — `"cas"` is the
+   only accepted spelling. Pre-rename data (old ATTACH files, backups, soak
+   configs) is expected to need a manual edit or recreation.
 5. **Tests.** Stateless `*content_addressed*` → `*cas*` (with `.reference`
    files); integration `test_content_addressed_*` → `test_cas_*`; tag
    `no-content-addressed-storage` → `no-cas-storage` (test headers, runner tag

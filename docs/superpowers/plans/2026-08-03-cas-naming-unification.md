@@ -188,7 +188,7 @@ git commit -m "cas: sql -- SYSTEM CONTENT ADDRESSED ... -> SYSTEM CAS ..., grant
 - Modify: stateless/integration/soak files referencing the table names and setting names (Task 5/6 rename the files themselves; here only src/ + `programs/`)
 
 **Interfaces:**
-- Produces: tables `system.cas_log`, `system.cas_garbage_collection_log`, `system.cas_mounts`; config sections `<cas_log>`, `<cas_garbage_collection_log>`; server settings `cas_blob_upload_pool_size`, `cas_condemned_upload_memory_bytes`; `metadata_type` canonical value `cas` with `content_addressed` kept as a compat alias; `system.disks.metadata_type` shows `CAS`.
+- Produces: tables `system.cas_log`, `system.cas_garbage_collection_log`, `system.cas_mounts`; config sections `<cas_log>`, `<cas_garbage_collection_log>`; server settings `cas_blob_upload_pool_size`, `cas_condemned_upload_memory_bytes`; `metadata_type` value `cas` (sole accepted spelling, no alias); `system.disks.metadata_type` shows `CAS`.
 
 - [ ] **Step 1: SystemLog member rename (renames table name + config section together)**
 
@@ -218,11 +218,12 @@ git ls-files 'src/*' | xargs grep -l 'content_addressed_mounts\|content_addresse
 ```
 Files expected to change: `ContentAddressedMetadataStorage.{h,cpp}`, `Pool/CasPool.h`, `Pool/CasServerRoot.{h,cpp}`, `Pool/CasMountRuntime.{h,cpp}`, `Pool/CasRefLedger.cpp`, `Parts/PartFolderAccess.cpp`, `Gc/CasGc.{h,cpp}`, `Gc/CasGcScheduler.h`, `src/Common/ProfileEvents.cpp:900`, `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:37`, `src/Storages/System/StorageSystemContentAddressedMounts.h:11`, gtests `gtest_cas_lifecycle_snapshot.cpp`, `gtest_cas_gc_log.cpp`, `gtest_cas_ref_writer.cpp`.
 
-- [ ] **Step 4: metadata_type — canonical `cas`, alias `content_addressed`, enum → `CAS`**
+- [ ] **Step 4: metadata_type — canonical `cas`, no alias, enum → `CAS`**
 
 - `src/Disks/DiskType.h:35`: rename enum constant `ContentAddressed` → `CAS`; update all 8 `MetadataStorageType::ContentAddressed` users (`DiskType.cpp`, `RegisterDiskObjectStorage.cpp`, `DiskObjectStorage.{h,cpp}`, `MergeTreeData.cpp`, `MergeTreeDeduplicationLog.cpp`, `ContentAddressedMetadataStorage.h`, `gtest_cas_operation_gate.cpp`). `system.disks.metadata_type` will now render `CAS` via magic_enum.
-- `src/Disks/DiskType.cpp:22` (`metadataTypeFromString`): accept BOTH `"cas"` (new canonical) and `"content_addressed"` (compat alias — persisted in table `.sql` ATTACH queries and backup metadata; see spec risk note) → `MetadataStorageType::CAS`.
-- `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:219`: register `"cas"` and additionally register `"content_addressed"` pointing to the same creator (one extra `registerMetadataStorageType` call).
+- `src/Disks/DiskType.cpp:22` (`metadataTypeFromString`): `"content_addressed"` → `"cas"` (single accepted spelling, per spec — NO compat alias; old ATTACH `.sql` files, backups, and soak configs carrying `metadata_type = content_addressed` will fail to parse and need a manual edit or recreation).
+- `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:219`: `registerMetadataStorageType("cas", …)` — the old registration string is replaced, not kept.
+- Sweep the remaining `"content_addressed"` metadata_type value occurrences in `utils/ca-soak/configs/*.xml` (~30 files, `<metadata_type>` and comments): `grep -rl 'content_addressed' utils/ca-soak/configs/ | xargs sed -i 's/content_addressed/cas/g'`.
 
 - [ ] **Step 5: Replication wire-protocol names**
 
@@ -233,8 +234,8 @@ In `src/Storages/MergeTree/DataPartsExchange.cpp:117-141` change the five string
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files 'src/*' 'programs/*' | xargs grep -n 'content_addressed' \
-  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType|metadataTypeFromString|check_type'
-# expect: no output (only the allowed internal identifiers / compat alias sites remain)
+  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec'
+# expect: no output (only the allowed internal identifiers remain)
 ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 ./build/src/unit_tests_dbms --gtest_filter='Cas*' --gtest_brief=1 2>&1 | tail -5
 ```
@@ -243,7 +244,7 @@ ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 
 ```bash
 git add -A src/ programs/
-git commit -m "cas: tables/settings/config/wire -- cas_log, cas_garbage_collection_log, cas_mounts, cas_* settings, metadata_type=cas (+alias), cas_* fetch protocol names"
+git commit -m "cas: tables/settings/config/wire -- cas_log, cas_garbage_collection_log, cas_mounts, cas_* settings, metadata_type=cas, cas_* fetch protocol names"
 ```
 
 ---
@@ -501,10 +502,10 @@ git commit -m "cas: docs -- canonical CAS/cas naming, renamed system-table pages
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/' | xargs grep -nE 'content[_ -]addressed|Content[- ]Addressed|CONTENT[_ ]ADDRESSED' 2>/dev/null \
-  | grep -vE 'ContentAddressed[A-Za-z]*|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec|registerMetadataStorageType\("content_addressed"|"content_addressed"' > /tmp/cas-rename/final_sweep.txt
+  | grep -vE 'ContentAddressed[A-Za-z]*|content_addressed_allow_shared_pool|content_addressed_gc_grace_sec' > /tmp/cas-rename/final_sweep.txt
 wc -l /tmp/cas-rename/final_sweep.txt
 ```
-Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), the metadata_type compat alias sites, the two dead skip-listed config keys, spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
+Manually review EVERY line in `final_sweep.txt`. Legitimate survivors: C++ class/file names (`ContentAddressed*`), the two dead skip-listed config keys, spelled-out English prose "content-addressed storage (CAS)" at first mentions and headings, and `contrib/`. Anything else gets fixed and folded into a follow-up commit.
 
 ```bash
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/|^contrib/' | xargs grep -nP '\bCas[A-Z]' 2>/dev/null \
