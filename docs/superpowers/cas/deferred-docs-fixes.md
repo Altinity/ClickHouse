@@ -624,3 +624,14 @@ fix the invariant claim).
 Dead-arm REMOVAL (three unreachable arms in the frontier walk, confirmed by the T6a review) is
 CODE, not prose: placed with plan task T6 Step 1 (same file/region, mechanical, under that
 review).
+
+### D41 — T4-review prose batch {#d41-t4-review-prose}
+
+From `t4-review.md`: (1) IMPRECISE — the T4 report's delta line says "1985 … 4 more than 1980"
+(1980+4=1984; the 1985 count itself is verified correct — the delta arithmetic is what fails);
+(2) FALSE — report Step 4 claims the two real-round numbers are "the same two"
+`SourceRetirementIsAccountingNeutral` proves (that test never observes `txns_unapplied`);
+(3) FALSE — plan T4 Step 6's second mutation names `enqueueWriterCleanupDuty` (no `Uncertain`
+branch exists there) and a `Durable`-shaped test as its detector; the implementor's disclosure is
+the accurate record. Also PROV-1: `build/t4_asan_gate3.log` is not attributable to a binary
+(relink inside its run window) — cite the review's §0b run instead.

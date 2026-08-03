@@ -28,8 +28,11 @@ total_fail=0
 total_abort=0
 while IFS= read -r suite; do
     [ -z "$suite" ] && continue
-    logf="$LOG_DIR/${suite}.log"
-    timeout 60 "$BIN" --gtest_filter="${suite}.*" > "$logf" 2>&1
+    # Parameterized suites contain '/' (Inst/Suite): flatten it or the redirect target's directory
+    # does not exist and the suite silently never executes (exit 1 read as a test failure).
+    logf="$LOG_DIR/${suite//\//_}.log"
+    # Sanitizer builds run slower; a fixed 60 s budget sat below two real suites' ASan runtime.
+    timeout "${SUITE_TIMEOUT:-300}" "$BIN" --gtest_filter="${suite}.*" > "$logf" 2>&1
     code=$?
     if [ $code -eq 0 ]; then
         result="PASS"

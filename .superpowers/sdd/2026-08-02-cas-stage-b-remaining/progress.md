@@ -78,7 +78,12 @@ per commit; full CA gate at lane closures.
   reset were no-op), F2 (4000ms cap unpinned from below), F4 (`settleSnapshotPublish`
   uncharacterized).
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
-- T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
+- T4 (Task 8 closure): **COMPLETE** (b17e4d97485 + 4329577bf37; review APPROVE-WITH-NONBLOCKING
+  in t4-review.md — reviewer independently reran the full ASan per-suite gate: 296/296 suites,
+  1990/1990, 0 sanitizer reports). Q-1 executed as decided; C-1 out of production surface;
+  settlement ordering pinned (already correct). T4 debts placed in T8 residual row: TEST-1
+  (real-round applied-byte-stability needs a seam). Gate-tooling defects found by the review
+  fixed by controller (runner: parameterized-name log path; SUITE_TIMEOUT).
 - T5 (probe A deletion): NOT STARTED. MAIN after T3 integration.
 - T6a: **COMPLETE** — verdict BENIGN-TRANSIENT, structurally closed by `357cf7b963f`; commit
   `477fe702a7a` (laneg/t6a) integrated as `096b3611988`; review APPROVE-WITH-NONBLOCKING with the

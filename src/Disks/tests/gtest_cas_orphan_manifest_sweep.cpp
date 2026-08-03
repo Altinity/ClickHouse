@@ -431,7 +431,8 @@ TEST(CasOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     ASSERT_EQ(backend->casPut(store->layout().refCatalogKey(), encodeRefCatalog(damaged), *before.token).outcome,
               CasOutcome::Committed);
 
-    EXPECT_THROW(sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10), DB::Exception);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { sweepManifestCursorPageForTest(*store, "", /*list_budget=*/100, /*delete_budget=*/10); });
     EXPECT_TRUE(backend->head(key).exists);
 }
 
