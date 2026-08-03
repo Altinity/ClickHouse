@@ -17,7 +17,7 @@ using DB::Cas::tests::u128Of;
 /// Round-B opt §6: `reason` is templated rationale (a handful of distinct strings repeated across
 /// every row), unlike `object_hash`/`token` which are genuinely per-row varied -- it belongs alongside
 /// the log's other LowCardinality columns (event_type/object_kind/outcome), not as a full String.
-TEST(ContentAddressedLog, ReasonColumnIsLowCardinality)
+TEST(CasContentAddressedLog, ReasonColumnIsLowCardinality)
 {
     const auto columns = DB::ContentAddressedLogElement::getColumnsDescription();
     const auto & reason_col = columns.get("reason");

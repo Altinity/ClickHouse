@@ -2463,7 +2463,7 @@ TEST(CasGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
     EXPECT_FALSE(successor.ref_lives.contains(unmatched_life));
 }
 
-TEST(CatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
+TEST(CasCatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2490,7 +2490,7 @@ TEST(CatalogLifecycleReconciler, EmptyCatalogReturnsAuthoritativeCompleteCut)
     EXPECT_EQ(result.deleted, 0);
 }
 
-TEST(CatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
+TEST(CasCatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2525,7 +2525,7 @@ TEST(CatalogLifecycleReconciler, DeletesEligibleRowsFromReturnedResolutionCuts)
     EXPECT_EQ(std::count(journal.begin(), journal.end(), catalog_get), deletes + 1);
 }
 
-TEST(CatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
+TEST(CasCatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolution)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2559,7 +2559,7 @@ TEST(CatalogLifecycleReconciler, ReturnsRetiredLifeWhenAuthorityMovesAfterResolu
     EXPECT_FALSE(result.final_catalog_cut);
 }
 
-TEST(CatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
+TEST(CasCatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2593,7 +2593,7 @@ TEST(CatalogLifecycleReconciler, InitialFenceLossReportsEligibleRowStillPresent)
         NamespaceLifeId::fromCatalogEntry(fixture.ns, fixture.life_id));
 }
 
-TEST(CatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut)
+TEST(CasCatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2626,7 +2626,7 @@ TEST(CatalogLifecycleReconciler, RetriesFromTheMandatoryConflictResolutionCut)
         << "the token-conflict retry must reuse its mandatory resolution cut";
 }
 
-TEST(CatalogLifecycleReconciler, PropagatesAuthorityFailureBeforeEraseCas)
+TEST(CasCatalogLifecycleReconciler, PropagatesAuthorityFailureBeforeEraseCas)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2659,7 +2659,7 @@ TEST(CatalogLifecycleReconciler, PropagatesAuthorityFailureBeforeEraseCas)
     }
 }
 
-TEST(CatalogLifecycleReconciler, PropagatesAuthorityFailureAfterMandatoryResolution)
+TEST(CasCatalogLifecycleReconciler, PropagatesAuthorityFailureAfterMandatoryResolution)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -3000,7 +3000,7 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 }
 
 INSTANTIATE_TEST_SUITE_P(
-    WinnerShape,
+    CasWinnerShape,
     CasGcCompletedRemovalFenceRace,
     testing::Values(CompetingCatalogOutcome::Absent, CompetingCatalogOutcome::Replacement),
     [](const testing::TestParamInfo<CompetingCatalogOutcome> & parameter)

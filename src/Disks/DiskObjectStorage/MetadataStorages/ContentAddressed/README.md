@@ -172,10 +172,13 @@ GC sharding, hash algorithm, request budgets) is parsed in
 
 ## Testing
 
-- **Unit tests** (`unit_tests_dbms`): suite names do **not** share one prefix;
-  use the comprehensive filter
-  `--gtest_filter='Cas*:CA*:ContentAddressedLog*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*'`.
-  A bare `Cas*:CA*` filter silently skips the `RefWriter*` ref-ledger tests.
+- **Unit tests** (`unit_tests_dbms`): every CAS suite name starts with `Cas`, so
+  `--gtest_filter='Cas*'` runs the whole set — including parameterized suites,
+  whose instantiation prefixes are `Cas`-prefixed too so the `<Inst>/<Suite>`
+  spelling still matches. `utils/cas-gate/generate_cas_suites.sh` fails loud on a
+  CAS suite that does not match, so a new suite cannot silently sit outside the
+  filter; `utils/cas-gate/run_cas_gate_per_suite.sh` runs them one process per
+  suite, so an abort cannot hide the suites after it.
 - **Stateless lanes**: the functional-test jobs "`content_addressed storage`"
   (local object storage) and "`content_addressed s3 storage`" run the whole
   stateless suite with `MergeTree` defaulting to a CAS disk. Tests that

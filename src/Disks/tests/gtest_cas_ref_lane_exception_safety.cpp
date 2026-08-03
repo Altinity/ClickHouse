@@ -41,7 +41,7 @@ PoolPtr openPoolForRefLane(const BackendPtr & backend)
 /// leader's `appendRefOps` catch reset `leader_active` and rethrew but never completed / de-pended the
 /// leader's own item, so it was stranded in `rt->pending` with `done == false` forever (nothing left to
 /// carve it) -- the deterministic, sanitizer-independent shape of the stranded-item defect.
-TEST(RefWriterLaneExceptionSafety, SoloLeaderThrowBeforeCarveDrainsOwnItem)
+TEST(CasRefWriterLaneExceptionSafety, SoloLeaderThrowBeforeCarveDrainsOwnItem)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForRefLane(backend);
@@ -77,7 +77,7 @@ TEST(RefWriterLaneExceptionSafety, SoloLeaderThrowBeforeCarveDrainsOwnItem)
 /// ran its `build_ops` closure -- the use-after-free window. This asserts, sanitizer-independently, that
 /// the follower never invokes the faulted caller's closure, that the queue drains, and that the
 /// non-faulted caller still completes.
-TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
+TEST(CasRefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForRefLane(backend);
@@ -183,7 +183,7 @@ TEST(RefWriterLaneExceptionSafety, FollowerNeverRunsStrandedLeaderClosure)
 /// forever at the leader-election cv, and shutdown draining could only time out. This drives the fault
 /// through the dedicated pre-tenure seam and asserts, deterministically (no hang), that the lane is left
 /// idle: the item is un-enqueued and the baton is un-taken.
-TEST(RefWriterLaneExceptionSafety, PreTenureAllocFailureReleasesBaton)
+TEST(CasRefWriterLaneExceptionSafety, PreTenureAllocFailureReleasesBaton)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForRefLane(backend);

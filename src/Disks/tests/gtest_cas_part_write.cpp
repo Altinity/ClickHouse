@@ -1763,7 +1763,7 @@ namespace
 /// instead WEDGE the whole table's append lane (`rt->append_attempt`) until the SAME key resolves durable -- a
 /// state a one-shot fault can never itself clear, since wedge resolution only re-GETs the intended key
 /// and never re-PUTs it (proven by
-/// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict leaves the cached
+/// `CasRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict leaves the cached
 /// ref-table state untouched, so the SAME logical retry reaches its append again -- and under INV-1 that
 /// retry re-derives the SAME id from that unchanged state, so it meets the same occupant rather than
 /// carving a fresh id around it.

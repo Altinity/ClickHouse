@@ -324,7 +324,7 @@ commit>` and hand finished ordinary commits back to MAIN for integration. No pus
 - Modify: ~39 test files currently naming `stageATransition` (slice c, mechanical; re-derive the
   list with the slice-c grep)
 - Modify (only if the T1a classification finds class-4/5 sites there): the ref table-cache layer
-  marked by the `RefTableCacheEviction*` test family
+  marked by the `CasRefTableCacheEviction*` test family
 
 **Interfaces:**
 - Consumes: `CasRefCatalog::Snapshot` (the one-read-per-operation seam Task 5 established);
@@ -419,7 +419,7 @@ TEST(CasRefReadContract, HotRefReadThroughHeldLifeIssuesZeroCatalogRequests)
   from `RootNamespace`/LIST key/path). Class 2/3 sites are untouched.
 - [ ] **Step 5: green + no-regression**:
   `ninja -C build unit_tests_dbms > build/t1a_green_build.log 2>&1 && build/src/unit_tests_dbms
-  --gtest_filter='CasRefReadContract.*:CasRefGcCleanupAuthority.*:RefTableCacheEviction*' >
+  --gtest_filter='CasRefReadContract.*:CasRefGcCleanupAuthority.*:CasRefTableCacheEviction*' >
   build/t1a_green_test.log 2>&1`; expected: PASS. The `CasRefGcCleanupAuthority` suite green
   proves the class-3 revalidation reads survived.
 - [ ] **Step 6: Commit** `ca: ref — held-life ref reads; catalog reads classified, hot path catalog-free`

@@ -246,10 +246,10 @@ TEST_P(CasBackendContract, StreamPutLargeBody)
     EXPECT_EQ(got->token, tok);
 }
 
-INSTANTIATE_TEST_SUITE_P(InMemory, CasBackendContract,
+INSTANTIATE_TEST_SUITE_P(CasInMemory, CasBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
 
-INSTANTIATE_TEST_SUITE_P(Local, CasBackendContract,
+INSTANTIATE_TEST_SUITE_P(CasLocal, CasBackendContract,
     ::testing::Values(+[]() -> BackendPtr
     {
         return std::make_shared<ObjectStorageBackend>(

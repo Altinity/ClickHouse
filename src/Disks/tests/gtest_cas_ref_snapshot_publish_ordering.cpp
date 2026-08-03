@@ -279,7 +279,7 @@ TEST(CasRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 /// pinned behavior precisely (recovery precedes publication, rather than an outright refusal).
 ///
 /// It is reached here the same way `gtest_cas_ref_writer.cpp`'s
-/// `RefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
+/// `CasRefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
 /// mutation's ref-log body commits durably while its OWN checkpoint-frontier CAS (`commitRefChunk`'s
 /// `commit_contribution`, not the snapshot publisher's) conflicts persistently.
 ///

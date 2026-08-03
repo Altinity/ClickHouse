@@ -706,7 +706,7 @@ TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
 /// behavior change from the previous `LOGICAL_ERROR "accessed before startup"`, which would abort a
 /// debug/sanitizer build on a mis-sequenced access instead of surfacing a catchable, operator-actionable
 /// error.
-TEST(CaWiring, OperationsRefuseWithoutPublishedPool)
+TEST(CasTransactionWiring, OperationsRefuseWithoutPublishedPool)
 {
     auto storage = openTxStorage();
     storage->shutdown();   /// terminal path resets cas_store to null (the ShutDown storage lifecycle)
@@ -731,7 +731,7 @@ TEST(CaWiring, OperationsRefuseWithoutPublishedPool)
 /// state that answers truth-absent, and a null pool is not that. (Behavior change documented in the
 /// Task 15 report: generic all-disk existence sweeps during server shutdown now see a throw here, not a
 /// benign absent; the shutdown window is the deliberate cost of never lying about a not-started disk.)
-TEST(CaLifecycle, ShutdownDiskProbesFailLoud)
+TEST(CasLifecycle, ShutdownDiskProbesFailLoud)
 {
     auto storage = openTxStorage();
     storage->shutdown();   /// null pool -- the ShutDown storage lifecycle

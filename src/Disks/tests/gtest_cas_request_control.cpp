@@ -395,7 +395,7 @@ TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMax
 /// point is to show the behaviour the validator now forbids. Three tests were flaky on exactly this
 /// before it was forbidden: `8f9e63c7a19`'s sweep-interruption test,
 /// `CasRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`, and
-/// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`.
+/// `CasRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`.
 TEST(CasRequestController, EqualAttemptTimeoutAndDeadlineWouldRefuseAfterASingleTick)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();

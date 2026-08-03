@@ -35,7 +35,7 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfig(const std::string & inner
 const auto identity_macros = [](const std::string & s) { return s; };
 }
 
-TEST(ContentAddressedSettings, DefaultsAndOverridesLand)
+TEST(CasContentAddressedSettings, DefaultsAndOverridesLand)
 {
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>4</gc_shards>");
     ContentAddressedSettings s;
@@ -47,14 +47,14 @@ TEST(ContentAddressedSettings, DefaultsAndOverridesLand)
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/default_scratch");
 }
 
-TEST(ContentAddressedSettings, UnknownKeyRejected)
+TEST(CasContentAddressedSettings, UnknownKeyRejected)
 {
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shardz>4</gc_shardz>");
     ContentAddressedSettings s;
     EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
 }
 
-TEST(ContentAddressedSettings, ObjectStorageKeysSkipped)
+TEST(CasContentAddressedSettings, ObjectStorageKeysSkipped)
 {
     auto cfg = makeConfig(
         "<metadata_type>content_addressed</metadata_type><type>object_storage</type>"
@@ -81,7 +81,7 @@ TEST(ContentAddressedSettings, ObjectStorageKeysSkipped)
     EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
 }
 
-TEST(ContentAddressedSettings, ValidateFailsClosed)
+TEST(CasContentAddressedSettings, ValidateFailsClosed)
 {
     {   /// missing server_root_id: ABSENT key -> typed NO_ELEMENTS_IN_CONFIG (distinct from a
         /// present-but-invalid value, checked below), mirroring the pre-F4b factory behavior.
@@ -123,7 +123,7 @@ TEST(ContentAddressedSettings, ValidateFailsClosed)
     }
 }
 
-TEST(ContentAddressedSettings, RelativeScratchPathAnchored)
+TEST(CasContentAddressedSettings, RelativeScratchPathAnchored)
 {
     /// Reproduces the pre-F4b factory's anchor behavior (review finding, Critical): a relative
     /// `scratch_path` override is anchored to the SERVER DATA PATH (`scratch_path_anchor_if_relative`)
@@ -135,7 +135,7 @@ TEST(ContentAddressedSettings, RelativeScratchPathAnchored)
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/rel/dir");
 }
 
-TEST(ContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
+TEST(CasContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
 {
     /// Absent key -> `default_scratch_path` verbatim, unaffected by the anchor (the per-disk default
     /// already lives under the server data path; only an explicit relative OVERRIDE needs anchoring).

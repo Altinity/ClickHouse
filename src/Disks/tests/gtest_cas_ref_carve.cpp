@@ -272,7 +272,7 @@ bool runPlanPointCase(Phase target_phase, int target_ordinal, const char * label
 /// Test 7: a throw at any plan-phase point of the carve must leave the queue intact and hang no waiter.
 /// RED on the pre-fix interleaved carve (a plan-point throw after the first pop strands followers whose
 /// waiters then hang, tripping the 5s bounded wait); GREEN on the two-phase carve.
-TEST(RefWriterCarve, CarveThrowLeavesQueueIntact)
+TEST(CasRefWriterCarve, CarveThrowLeavesQueueIntact)
 {
     /// `PlanSeenRefs`/`PlanBatchGrow` fire once per scanned item; injecting on the third firing strands a
     /// popped follower under the old carve. `PlanReserveOwned` fires once, after the whole selection is
@@ -287,7 +287,7 @@ TEST(RefWriterCarve, CarveThrowLeavesQueueIntact)
 /// out of BOTH `working` (the in-memory committed state) and the durable transaction. RED on the pre-fix
 /// loop (which moved `working` and appended `final_ops` before the throwing point, so the failed drop
 /// committed while its caller was told it failed); GREEN on the reserve-before-publish loop.
-TEST(RefWriterCarve, ValidationAllocFailureLeavesWorkingClean)
+TEST(CasRefWriterCarve, ValidationAllocFailureLeavesWorkingClean)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);

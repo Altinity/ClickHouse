@@ -110,7 +110,7 @@ NamespaceLifeId admitReplacementLife(
 TEST(CasRefReadContract, HeldRuntimeAfterSameNameRebirthReadsStaleOrNotFoundNeverSuccessorRefs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// A 1-byte whole-table cache budget is the production knob (`RefTableCacheEviction`) that lets a
+    /// A 1-byte whole-table cache budget is the production knob (`CasRefTableCacheEviction`) that lets a
     /// single store instance both HOLD a table's runtime and, later, genuinely forget it by touching a
     /// different table -- so the "fresh resolution" positive control below is a real re-recovery, not
     /// a second mount.
@@ -247,7 +247,7 @@ TEST(CasRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccesso
     EXPECT_EQ(catalog_get_after->bytes, catalog_get_before->bytes);
 
     /// Life 2's ref data is untouched: a fresh resolution (a separate mount over the same backend,
-    /// exactly like `RefWriterRuntimeIdentity.ColdReadRejectsReplacementByExternalPoolActor`'s
+    /// exactly like `CasRefWriterRuntimeIdentity.ColdReadRejectsReplacementByExternalPoolActor`'s
     /// `external_store`) still sees exactly the value published above.
     auto verify_store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "verify"});
     const auto resolved = verify_store->resolveRef(ns, ref_name);

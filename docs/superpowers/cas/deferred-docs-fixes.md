@@ -589,7 +589,7 @@ Three findings from `t1a-review.md`, all in slice documents under
 `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/` (F3's source-comment half was fixed directly):
 
 - F1 (FALSE): `t1a-classification.md` claims `readable_catalog_after_observation_hook_for_test`
-  has zero test users; three `RefWriterRuntimeIdentity` tests in `gtest_cas_ref_writer.cpp` use it
+  has zero test users; three `CasRefWriterRuntimeIdentity` tests in `gtest_cas_ref_writer.cpp` use it
   and pin exactly the between-observations race. Site-2 disposition unaffected.
 - F2 (IMPRECISE): "a live table reader … issues zero catalog GETs today" is unqualified — an armed
   `needs_stale_precommit_sweep` piggybacks a mutation (`commitRefChunk`, class-2 read) onto a read
