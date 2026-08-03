@@ -59,8 +59,16 @@ per commit; full CA gate at lane closures.
     elsewhere. Commits: `ed76b256a50` (tests + classification + report), `ec0cfbc1007` (review
     APPROVE-WITH-NONBLOCKING; prose → D39). Sensitivity checks preserved in
     `build/t1a_sensitivity_test{1,2,3}.log`; reviewer re-verification 15/15 + 4/4.
-  - T1b: IN PROGRESS (list-arm zero-catalog pin + Task 9 claim re-check).
-  - T1c: NOT STARTED (fixture seam → migration → sentinel retirement; full CA gate at lane close).
+  - T1b: COMPLETE (be3394a1528 list-arm pin; strengthened to exact touched-set form in
+    fd7af51a992 after review; review APPROVE-WITH-NONBLOCKING).
+  - T1c: COMPLETE (b5c812ba56a seam; 2d508a38b09 migration by codex, controller-committed;
+    b7053eeb70c retirement — zero-greps 0/0).
+  - LANE GATES (post-hygiene): release 1977/1977/277 exit 0 (hygiene_gate_release_v2.log);
+    ASan FULL gate 1982/1982/295 exit 0 (hygiene_gate_v3.log). T1 LANE FULLY CLOSED.
+  - Gate-hygiene follow-ups landed: 6c992f3561f (fence-race fixture + LOGICAL_ERROR death-split,
+    recurrence #6 of the abort class), a046ad621a1 (3-site heap-use-after-free: dangling pointer
+    into the destroyed CasRefCatalog::read temporary). All three defects were pre-existing and
+    previously INVISIBLE (prefix-filter gap, no full ASan gate since the tests' birth).
 - T2 (Task 6b remainder): NOT STARTED. LANE-G after T1 integration.
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
 - T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
