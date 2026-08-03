@@ -1091,7 +1091,10 @@ fixed / no-longer-applicable / accepted (one line of why):**
   plus any CA lane the suite inventory (E3) lists beyond it; one praktika run per group, logs
   summarized by subagent.
 - [ ] **Step 3: the four REQUIRED soaks**, each run with its E4-pinned command into the E4
-  specimen directory:
+  specimen directory. **Staged execution (user directive 2026-08-03): each scenario first runs a
+  20-minute smoke variant; the full-length run starts only if its smoke survived** (any smoke
+  failure → RCA before burning the long slot). The smoke runs are pre-qualification, not
+  substitutes: PASS criteria and the specimen come from the full-length runs only.
   (a) **churn** — create/drop namespaces ≥1/s for ≥30 min under load: catalog entry count returns
   to baseline (flatness: O(Creating+Live+Removing)), zero alias reads, fsck clean;
   (b) **rebirth adversarial** — drop/recreate under concurrent readers + stale cleanup resume,
