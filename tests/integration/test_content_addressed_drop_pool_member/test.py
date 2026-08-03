@@ -159,27 +159,56 @@ def test_drop_dead_pool_member_heals_the_pool():
         sleep_time=1.0,
     )
 
-    # (6) Decommission the dead member from node1. SYSTEM queries do not accept a FORMAT clause
-    #     (ParserSystemQuery is not part of ParserQueryWithOutput), so parse the default TSV row.
-    #     Column order matches the interpreter's ColumnsDescription: server_root_id, namespaces_removed,
-    #     namespaces_already_removed, committed_refs_removed, precommits_removed,
-    #     manifest_debris_removed, staging_objects_removed, mountpoint_objects_removed,
-    #     slot_removed, warnings.
+    # (6) Decommission the dead member from node1 -- PHASE 1 of a two-phase heal. SYSTEM queries do
+    #     not accept a FORMAT clause (ParserSystemQuery is not part of ParserQueryWithOutput), so parse
+    #     the default TSV row. Column order matches the interpreter's ColumnsDescription:
+    #     server_root_id, namespaces_removed, namespaces_already_removed, committed_refs_removed,
+    #     precommits_removed, manifest_debris_removed, staging_objects_removed,
+    #     mountpoint_objects_removed, slot_removed, warnings.
+    #
+    #     t2 is still `Live` at this point, so THIS call's normal drop path is what appends its
+    #     removal terminal and moves its catalog row to `Removing` -- catalog deletion stays GC's job
+    #     (`224aacd8eb9`), never the decommission command's, so a row this same call just legitimately
+    #     transitioned still counts as "owned" and the retirement fence correctly refuses the slot.
+    #     This is a success with GC completion pending, not a failure.
     report_tsv = node1.query(
         "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
     ).rstrip("\n")
     fields = report_tsv.split("\t")
     assert len(fields) == 10, report_tsv
     assert fields[0] == SRID2, report_tsv
-    assert int(fields[1]) >= 1, report_tsv  # namespaces_removed
-    assert int(fields[8]) == 1, report_tsv  # slot_removed
-    assert fields[9] == "", report_tsv  # warnings
+    assert int(fields[1]) >= 1, report_tsv  # namespaces_removed: the drop half did its work
+    assert int(fields[8]) == 0, report_tsv  # slot_removed: not yet -- GC owns the row now
+    assert "pool member decommission underway" in fields[9], report_tsv
+
+    # (6b) PHASE 2: drive GC and re-run the decommission until the slot retires. Folding a fresh
+    #      terminal and pruning its catalog row are two separate GC rounds by design (a fold-then-prune
+    #      handoff -- see `CasDecommissionCatalogDuties.FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound`),
+    #      so poll rather than assume one round suffices. The explicit `GC RUN` is the same idiom
+    #      `test_cas_replicated_relink` uses; it runs a synchronous round regardless of the background
+    #      cadence. Catalog-row pruning is Task 5's catalog-only pre-fold drain and does not consult
+    #      Stage A's destructive-reclaim suppression, so this heals under the current Stage-A posture.
+    for _ in range(30):
+        node1.query("SYSTEM CONTENT ADDRESSED GC RUN '{}'".format(CA_DISK))
+        report_tsv = node1.query(
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+        ).rstrip("\n")
+        fields = report_tsv.split("\t")
+        assert len(fields) == 10, report_tsv
+        if int(fields[8]) == 1:
+            break
+        assert "pool member decommission underway" in fields[9], report_tsv
+    else:
+        pytest.fail("pool never healed after driving GC: {}".format(report_tsv))
+
+    assert fields[9] == "", report_tsv  # warnings: the pool healed cleanly
 
     # (7) node1's own data survives the whole flow untouched.
     assert int(node1.query("SELECT count() FROM t1")) == n1_count
     assert int(node1.query("SELECT sum(id) FROM t1")) == n1_sum
 
-    # (8) node2's server_root_id is gone from the mounts table.
+    # (8) node2's server_root_id is gone from the mounts table (only true once the slot above actually
+    #     retired -- checked after PHASE 2, not right after the first, still-pending call).
     assert (
         node1.query(
             "SELECT count() FROM system.content_addressed_mounts WHERE server_root_id = '{}'".format(SRID2)
@@ -245,9 +274,20 @@ def test_drop_dead_pool_member_heals_the_pool():
         )
     )
 
+    # node2's decommissioned-and-healed namespace (t2) left canonical dead-life residue behind: its
+    # catalog row is gone (that is what let the slot retire above), but its `_ckpt`/`_files`/`_log`
+    # objects are the perpetual namespace janitor's job, not decommission's or GC's own destructive
+    # round -- and that janitor's own deletes are suppressed for the whole of Stage A, same as blob/
+    # manifest GC. t1's row is pruned the same way once dropped, so the pool-wide count here is not
+    # pinned to a single namespace's key count -- only that residue exists and is NOT hard corruption
+    # (`lifeless_keys=0`).
     fsck = _disks(node1, "ca-fsck")
     assert "dangling=0" in fsck, fsck
     assert "unaccounted=0" in fsck, fsck
+    assert "lifeless_keys=0" in fsck, fsck
+    assert "janitor_pending=0" not in fsck, (
+        "expected janitor-pending dead-life residue from the healed decommission and the t1 drop: {}".format(fsck)
+    )
 
     # (10) Re-run the same command: decommission tombstones the owner anchor in place rather than
     # deleting it, so the slot is not "unknown" -- the tombstone is found and the re-run is refused

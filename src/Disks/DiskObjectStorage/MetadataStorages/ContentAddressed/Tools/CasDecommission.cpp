@@ -250,17 +250,18 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     if (report.warnings.empty())
     {
         retirement_catalog_cut = CasRefCatalog::read(admin->backend(), admin->layout());
-        const bool victim_still_owned = std::any_of(
+        const uint64_t victim_owned_count = std::count_if(
             retirement_catalog_cut->catalog.entries.begin(), retirement_catalog_cut->catalog.entries.end(),
             [&](const CatalogEntry & entry)
             {
                 return entry.ns.string() == victim_srid
                     || entry.ns.string().starts_with(victim_namespace_prefix);
             });
-        if (victim_still_owned)
+        if (victim_owned_count > 0)
             report.warnings.push_back(
-                "catalog still owns victim namespaces in Removing/Creating state; GC completion is required "
-                "before slot retirement");
+                "pool member decommission underway: all " + std::to_string(victim_owned_count)
+                + " namespace(s) owned by this member are marked for removal; upcoming GC rounds "
+                  "perform the final cleanup — re-run this command afterwards to retire the slot");
     }
 
     /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
