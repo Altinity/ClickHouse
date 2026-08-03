@@ -706,3 +706,18 @@ as "hint ∪ sealed cursors ∪ catalog", contradicting the arc's own catalog-au
 `t6-report.md` §7 "No edit was needed" is true of the fix wave only. Observation T-1 (anomaly and
 carried-hold gate terms are structurally redundant with frontier incompleteness on current shapes —
 no test isolates them) is carried to the T8 residual/hygiene row, not a docs item.
+
+### D46 — stale suite spellings after the Cas-prefix normalization {#d46-stale-suite-spellings}
+
+The Cas-prefix sweep (`3d959928e06`, `c7a9b2c17bc`) renamed 22 suites and 3 `TEST_P` instantiation
+prefixes. Two live `BACKLOG.md` items still name `CaWiringGc.*` — stale from an EARLIER rename, so
+the correct spelling is now `CasWiringGc`; they are findings text in a history-bearing file, hence a
+docs item rather than part of the sweep. Also: the `## Testing` bullet in
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md` should be re-read once the
+invariant landed — it now claims `Cas*` runs the whole set, which became TRUE with this sweep;
+confirm the surrounding text does not still describe the curated-list era.
+
+Carried, not a docs fix: `CasRefInstallSafetyDeathTest` is executed by NEITHER gate lane, because
+both release and sanitizer builds define `NDEBUG` while the suite is gated on
+`MEMORY_TRACKER_DEBUG_CHECKS` (needs `!NDEBUG`). Covering it requires a plain debug build in the
+gate. Pre-existing; belongs to the T8 residual row.
