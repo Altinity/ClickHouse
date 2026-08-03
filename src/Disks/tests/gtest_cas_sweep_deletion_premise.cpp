@@ -312,7 +312,7 @@ TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
     EXPECT_EQ(surviving, 0u);
 }
 
-/// T6b Slice 2 (codex T6-1), MANDATORY liveness proof: a namespace whose committed-tail recovery walk
+/// MANDATORY liveness proof: a namespace whose committed-tail recovery walk
 /// can never finish within one round's `sweep_recovery_op_budget` must not wedge the cursor page for
 /// every subsequent round. Six eligible candidates share ONE namespace whose tail is ~200 unrelated
 /// committed transactions above the fold cursor -- far more than the tiny per-round recovery-op budget
@@ -391,7 +391,7 @@ TEST(CasSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgin
             << "candidate " << i << " must survive: it was never proven safe to delete";
 }
 
-/// T6b Slice 2 (codex T6-1): the per-page NAMESPACE cap. Two otherwise-independently-deletable
+/// The per-page NAMESPACE cap. Two otherwise-independently-deletable
 /// namespaces share one page; with `max_sweep_namespaces = 1`, only the first namespace this page
 /// touches gets a protection view built at all -- the second is retained under the work-budget cause,
 /// never given a partial or best-effort view.

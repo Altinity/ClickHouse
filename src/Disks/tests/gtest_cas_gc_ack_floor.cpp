@@ -707,7 +707,7 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
     }
 }
 
-/// T6b Slice 1, end-to-end through the real round driver (`Gc::runRegularRound`) rather than
+/// End-to-end through the real round driver (`Gc::runRegularRound`) rather than
 /// `foldDeltasIntoGeneration` directly: a cohort well past `gc_round_redelete_budget` still drains
 /// completely, but no single round's `redeleted` count exceeds the cap — the same convergence the
 /// merge-level `CasThreeCursorMerge` budget tests pin, proven through the production entry point.
@@ -1110,7 +1110,7 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
         << ".meta cleanup (gated on Deleted/NotFound) must still run on the disambiguated Absent outcome";
 }
 
-/// ---- condemn-marker gate suite (codex-review triage 2026-07-17 §3.4, №4) ----
+/// ---- condemn-marker gate suite ----
 ///
 /// The per-hash condemn marker is LOAD-BEARING for the delete edge: the writer's adopt gate point-reads
 /// the meta and an ABSENT meta reads as Clean, so a blob whose condemn-marker write was swallowed can be

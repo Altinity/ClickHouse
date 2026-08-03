@@ -909,7 +909,7 @@ std::vector<std::pair<UInt128, CondemnedRow>> condemnedCohort(uint64_t n, uint64
 }
 }
 
-/// T6b Slice 1: the redelete cohort is capped at `GcRoundWorkBudget::max_redeletes` per call. Excess
+/// The redelete cohort is capped at `GcRoundWorkBudget::max_redeletes` per call. Excess
 /// entries stay in `still_retired`, still `delete_pending`, to be redeleted by a later round — the
 /// durable pipeline never loses one to the cap.
 TEST(CasThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)

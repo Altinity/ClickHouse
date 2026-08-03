@@ -624,7 +624,7 @@ ManifestSweepResult planManifestCursorPage(
     /// loses `deleteExact`. Do not take a fresh GET after the catalog read: that would splice new-life
     /// bytes into old candidate selection and authorize their deletion with the new token.
     ///
-    /// (codex T6-1) Bounded to `nomination_budget` well-formed keys — never the whole `list_budget`-sized
+    /// Bounded to `nomination_budget` well-formed keys — never the whole `list_budget`-sized
     /// page — since `nomination_budget` is the hard ceiling on how many of them this call can ever
     /// nominate. A well-formed key beyond this cap has no frozen body; it is retained where its absence
     /// is discovered below, in the exact same "budget exhausted, cursor does not step over it" shape the
@@ -718,7 +718,7 @@ ManifestSweepResult planManifestCursorPage(
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
         {
-            /// UNCERTAINTY, work-budget arm (codex T6-1): building a fresh namespace's protection view
+            /// UNCERTAINTY, work-budget arm: building a fresh namespace's protection view
             /// is the expensive step (a catalog-authoritative table recovery plus a committed-tail
             /// walk) the LIST/nomination budgets never bounded. Once the round's per-page namespace cap
             /// is spent, a NEW namespace gets no view at all -- retained, exactly like every other
@@ -857,7 +857,7 @@ ManifestSweepResult planManifestCursorPage(
         /// This exact token and bytes were captured before the catalog cut (see above). A missing body
         /// has no deletion authority; a later replacement loses the old token at `deleteExact`.
         ///
-        /// (codex T6-1) A well-formed key can legitimately be ABSENT here: the freeze loop above caps
+        /// A well-formed key can legitimately be ABSENT here: the freeze loop above caps
         /// fan-out at `nomination_budget` candidates, so a key beyond that cap was never frozen. Treat
         /// it exactly like nomination-count exhaustion -- retain, and do NOT advance the cursor past
         /// it, so the very next page/round examines it with a fresh budget instead of losing it.

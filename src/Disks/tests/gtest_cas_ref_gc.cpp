@@ -432,7 +432,7 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the checkpoint-named snapshot must be retained";
 }
 
-/// T6b Slice 3 (codex T6-3): `cleanupRefObjects`'s per-round cap. Five deletable logs share one
+/// `cleanupRefObjects`'s per-round cap. Five deletable logs share one
 /// namespace with a tiny `gc_round_ref_cleanup_budget`; the per-key fail-close validation
 /// (`deleteRefObject`'s catalog/lease revalidation before every exact delete) is untouched -- it is
 /// NOT amortized, only the cohort size per round is capped. `planRefCleanup` recomputes the same

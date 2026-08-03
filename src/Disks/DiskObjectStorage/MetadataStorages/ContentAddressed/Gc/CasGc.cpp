@@ -1118,7 +1118,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
             if (!handed_off.insert(old_ref.generation).second)
                 continue;   /// already reclaimed this round via another shard's ref
-            /// (codex T6-3) `bounded_remaining` is the round's SHARED remainder, never `UINT64_MAX` --
+            /// `bounded_remaining` is the round's SHARED remainder, never `UINT64_MAX` --
             /// this is the same primitive `pruneSupersededGenerations` draws from, so a round that
             /// already spent the budget pruning superseded generations reclaims correspondingly less
             /// here, rather than the two call sites independently unbounded. This hand-off is already a
@@ -3433,7 +3433,7 @@ void Gc::cleanupRefObjects(
             listing, durable_cursor, checkpoint_snapshot_id, retained_log_proof);
         for (const RefTxnId & log_id : plan.deletable_logs)
         {
-            /// (codex T6-3) Cumulative per-round cap, never amortized against the per-key fail-close
+            /// Cumulative per-round cap, never amortized against the per-key fail-close
             /// validation `deleteRefObject` performs (HEAD + catalog re-read + gc/state re-read before
             /// every exact delete stays exactly as expensive per key as before). Exhaustion simply stops
             /// the round's cleanup pass here; `planRefCleanup` recomputes the SAME remaining candidates
@@ -3473,7 +3473,7 @@ namespace
 /// likewise tolerated here: the object was rewritten under us (another attempt is live at this key) — the
 /// safe direction during a best-effort prune is to leave it for a later round, never to force-delete.
 /// `out_fully_drained`, when set, reports whether the WHOLE prefix was exhausted (every listed key
-/// visited) rather than the call stopping early because `bounded_remaining` ran out. (codex T6-3) a
+/// visited) rather than the call stopping early because `bounded_remaining` ran out. A
 /// caller advancing a monotone cursor past this prefix must consult this: a `false` here means objects
 /// remain, and the cursor must stay put so a later round's fresh budget can finish the same prefix
 /// instead of stranding the remainder permanently. `bounded_remaining == 0` conservatively reports
@@ -3546,8 +3546,8 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
     /// snap_attempt) therefore leaked every non-adopted attempt's debris. Instead, LIST the whole
     /// `gc/gen/<g>/` prefix and delete every listed object — reclaiming ALL attempts of `g`, including
     /// the retired/ and outcomes/ sets that now live under `gc/gen/<g>/attempt/<a>/`. Bounded per round
-    /// by generation count (`kMaxPrunePerRound`) AND by the round's shared object-count work budget
-    /// (codex T6-3); fail-open on 404. `snap_pruned_through` advances over every generation the loop
+    /// by generation count (`kMaxPrunePerRound`) AND by the round's shared object-count work budget;
+    /// fail-open on 404. `snap_pruned_through` advances over every generation the loop
     /// FULLY processes this round — ref-retained (skipped) generations count as fully processed (there
     /// is nothing left for THIS loop to do to them), but a generation whose delete the work budget cut
     /// short does NOT: the loop stops there, so the cursor never strands a partially-drained prefix
@@ -3578,7 +3578,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
                     g);
                 continue;
             }
-            /// (codex T6-3) `bounded_remaining` is the round's SHARED remainder across every
+            /// `bounded_remaining` is the round's SHARED remainder across every
             /// `deletePrefixWholesale` call this round (never `UINT64_MAX`). A generation whose prefix
             /// this call cannot FULLY drain within the remaining budget must not let the cursor advance
             /// past it -- `snap_pruned_through` is a monotone high-water mark this loop never revisits,

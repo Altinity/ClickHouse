@@ -1200,7 +1200,7 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }
 
-/// T6b Slice 3 (codex T6-3): `deletePrefixWholesale`'s callers now draw from the round's shared
+/// `deletePrefixWholesale`'s callers now draw from the round's shared
 /// object-count budget instead of `UINT64_MAX`, and `snap_pruned_through` must advance only past a
 /// FULLY drained generation -- never past one the budget cut short, or its undeleted remainder would
 /// be stranded behind a cursor this loop never revisits. A tiny budget (2 objects/round) against a
