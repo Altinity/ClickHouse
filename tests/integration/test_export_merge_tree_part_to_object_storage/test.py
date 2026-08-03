@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+from typing import NamedTuple
 
 import pytest
 
@@ -314,29 +315,98 @@ def test_pending_patch_parts_skip_before_export(cluster):
     node.query(f"DROP TABLE {mt_table}")
 
 
-def test_export_part_same_partition_key_different_column_order_single_column(cluster):
+class RejectedPartExportCase(NamedTuple):
+    src_columns: str
+    src_partition_by: str
+    dst_columns: str
+    dst_partition_by: str
+    insert_values: str
+    error_substrings: tuple = ()
+
+
+REJECTED_PART_EXPORT_CASES = [
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns="a Int32, b Int32",
+            src_partition_by="a",
+            dst_columns="b Int32, a Int32",
+            dst_partition_by="a",
+            insert_values="(1, 1), (1, 2)",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_single_column",
+    ),
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="c Int32, b Int32, a Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 1, 1, 'x'), (1, 1, 1, 'y')",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_multi_column",
+    ),
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(c, b, a)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=("different `PARTITION BY` expressions",),
+        ),
+        id="multi_column_partition_key_order_mismatch",
+    ),
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(a, b)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=("different `PARTITION BY` expressions",),
+        ),
+        id="multi_column_partition_key_fewer_in_destination",
+    ),
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=("different `PARTITION BY` expressions",),
+        ),
+        id="multi_column_partition_key_more_in_destination",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", REJECTED_PART_EXPORT_CASES)
+def test_export_part_partition_key_mismatch_variants_are_rejected(cluster, case):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"reordered_part_mt_table_{postfix}"
-    s3_table = f"reordered_part_s3_table_{postfix}"
+    mt_table = f"rejected_mt_table_{postfix}"
+    s3_table = f"rejected_s3_table_{postfix}"
 
     node.query(f"""
-        CREATE TABLE {mt_table} (a Int32, b Int32)
+        CREATE TABLE {mt_table} ({case.src_columns})
         ENGINE = MergeTree()
-        PARTITION BY a
+        PARTITION BY {case.src_partition_by}
         ORDER BY tuple()
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
 
     node.query(f"""
-        CREATE TABLE {s3_table} (b Int32, a Int32)
+        CREATE TABLE {s3_table} ({case.dst_columns})
         ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY a
+        PARTITION BY {case.dst_partition_by}
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
+    node.query(f"INSERT INTO {mt_table} VALUES {case.insert_values}")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
@@ -345,44 +415,8 @@ def test_export_part_same_partition_key_different_column_order_single_column(clu
 
     error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
-
-    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
-
-
-def test_export_part_same_partition_key_different_column_order_multi_column(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"multi_reordered_part_mt_table_{postfix}"
-    s3_table = f"multi_reordered_part_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
-        ENGINE = MergeTree()
-        PARTITION BY (a, b, c)
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (c Int32, b Int32, a Int32, val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (a, b, c)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
+    for substring in case.error_substrings:
+        assert substring in error, f"Expected {substring!r} in error, got: {error}"
 
     count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
     assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
@@ -410,7 +444,7 @@ def test_export_part_multi_column_partition_key_success(cluster):
         PARTITION BY (a, b, c)
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (1, 2, 3, 'y')")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
@@ -425,32 +459,32 @@ def test_export_part_multi_column_partition_key_success(cluster):
     assert count == 2, f"Expected 2 rows in destination after export, got {count}"
 
     result = node.query(f"SELECT a, b, c, val FROM {s3_table} ORDER BY val").strip()
-    assert result == "1\t1\t1\tx\n1\t1\t1\ty", f"Unexpected exported data:\n{result}"
+    assert result == "1\t2\t3\tx\n1\t2\t3\ty", f"Unexpected exported data:\n{result}"
 
 
-def test_export_part_multi_column_partition_key_order_mismatch_is_rejected(cluster):
+def test_export_part_partition_key_timezone_mismatch_is_rejected(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"multi_order_mt_table_{postfix}"
-    s3_table = f"multi_order_s3_table_{postfix}"
+    mt_table = f"tz_mismatch_mt_table_{postfix}"
+    s3_table = f"tz_mismatch_s3_table_{postfix}"
 
     node.query(f"""
-        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        CREATE TABLE {mt_table} (id Int64, ts DateTime('UTC'))
         ENGINE = MergeTree()
-        PARTITION BY (a, b, c)
+        PARTITION BY ts
         ORDER BY tuple()
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
 
     node.query(f"""
-        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        CREATE TABLE {s3_table} (id Int64, ts DateTime('Asia/Tokyo'))
         ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (c, b, a)
+        PARTITION BY ts
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
@@ -459,78 +493,62 @@ def test_export_part_multi_column_partition_key_order_mismatch_is_rejected(clust
 
     error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    assert "timezone" in error, f"Expected timezone mismatch message, got: {error}"
 
     count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
     assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
 
 
-def test_export_part_multi_column_partition_key_fewer_in_destination_is_rejected(cluster):
+def test_export_part_non_partition_key_timezone_mismatch_is_allowed(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"multi_fewer_mt_table_{postfix}"
-    s3_table = f"multi_fewer_s3_table_{postfix}"
+    mt_table = f"tz_ok_mt_table_{postfix}"
+    s3_table = f"tz_ok_s3_table_{postfix}"
 
     node.query(f"""
-        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
+        CREATE TABLE {mt_table} (id Int64, ts DateTime('UTC'))
         ENGINE = MergeTree()
-        PARTITION BY (a, b, c)
+        PARTITION BY id
         ORDER BY tuple()
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
 
     node.query(f"""
-        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
+        CREATE TABLE {s3_table} (id Int64, ts DateTime('Asia/Tokyo'))
         ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (a, b)
+        PARTITION BY id
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
         f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
     ).strip()
 
-    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+
+    time.sleep(5)
 
     count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+    assert count == 1, f"Expected 1 row in destination after export, got {count}"
+
+    source_ts = node.query(f"SELECT ts FROM {mt_table}").strip()
+    assert source_ts == "2024-03-05 15:00:00", f"Unexpected source value: {source_ts}"
+
+    dest_ts = node.query(f"SELECT ts FROM {s3_table}").strip()
+    assert dest_ts == "2024-03-06 00:00:00", (
+        f"Expected the exported value to be the same instant displayed in the "
+        f"destination's Asia/Tokyo timezone ('2024-03-06 00:00:00'), got: {dest_ts}"
+    )
+
+    source_unix_ts = int(node.query(f"SELECT toUnixTimestamp(ts) FROM {mt_table}").strip())
+    dest_unix_ts = int(node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_table}").strip())
+    assert source_unix_ts == dest_unix_ts, (
+        f"Expected exported DateTime value to be preserved regardless of the "
+        f"destination column's timezone, got source={source_unix_ts}, dest={dest_unix_ts}"
+    )
 
 
-def test_export_part_multi_column_partition_key_more_in_destination_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"multi_more_mt_table_{postfix}"
-    s3_table = f"multi_more_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (a Int32, b Int32, c Int32, val String)
-        ENGINE = MergeTree()
-        PARTITION BY (a, b)
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (a, b, c)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-
-    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"

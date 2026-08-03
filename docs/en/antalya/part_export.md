@@ -51,6 +51,9 @@ Source and destination tables must be 100% compatible:
 
 1. **Identical schemas** - same columns, types, and order
 2. **Matching partition keys** - partition expressions must be identical
+3. **Partition key columns at the same position** - columns are matched by position, similar to `INSERT INTO dest SELECT * FROM src`. It is not enough for the `PARTITION BY` expressions to be textually identical: every column that is part of the source table's partition key must also sit at the same position in the destination table's schema. For example, `CREATE TABLE src (a Int32, b Int32) ... PARTITION BY a` and `CREATE TABLE dst (b Int32, a Int32) ... PARTITION BY a` both have the expression `PARTITION BY a`, but `a` is at position 0 in `src` and position 1 in `dst`, so the export is rejected with `BAD_ARGUMENTS: partition key column 'a' is at position 0 in the source table, but the destination's column at that position is named 'b'`.
+
+  This explicit check only applies to partition key columns. A mismatch in the position of a non-partition-key column is **not** rejected by name - it is only caught if the source and destination types are not castable. If two non-partition-key columns happen to have swapped positions but compatible types, the export succeeds and silently writes values into the wrong destination column, so keep the full column order identical (per point 1) rather than relying on this check alone.
 
 In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
 

@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+from typing import NamedTuple
 
 import pytest
 from avro.datafile import DataFileReader
@@ -1334,47 +1335,75 @@ def test_export_partition_with_renamed_destination_column(cluster):
     )
 
 
-def test_export_partition_same_partition_key_different_column_order_single_column(cluster):
+class RejectedPartitionExportCase(NamedTuple):
+    src_columns: str
+    src_partition_by: str
+    dst_columns: str
+    dst_partition_by: str
+    insert_values: str
+    error_substrings: tuple = ()
+
+
+REJECTED_PARTITION_EXPORT_CASES = [
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32",
+            src_partition_by="a",
+            dst_columns="b Int32, a Int32",
+            dst_partition_by="a",
+            insert_values="(1, 1), (1, 2)",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_single_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b, c)",
+            dst_columns="c Int32, b Int32, a Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 1, 1, 'x'), (1, 1, 1, 'y')",
+            error_substrings=("partition key column",),
+        ),
+        id="same_partition_key_different_column_order_multi_column",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="a Int32, b Int32, c Int32, val String",
+            src_partition_by="(a, b)",
+            dst_columns="a Int32, b Int32, c Int32, val String",
+            dst_partition_by="(a, b, c)",
+            insert_values="(1, 2, 3, 'x')",
+            error_substrings=("partition scheme mismatch",),
+        ),
+        id="multi_column_partition_key_more_in_destination",
+    ),
+    pytest.param(
+        RejectedPartitionExportCase(
+            src_columns="other_id Int64, user_id Int64",
+            src_partition_by="icebergBucket(8, user_id)",
+            dst_columns="user_id Int64, other_id Int64",
+            dst_partition_by="icebergBucket(8, user_id)",
+            insert_values="(1, 42)",
+            error_substrings=("partition key column",),
+        ),
+        id="transform_partition_key_different_column_order",
+    ),
+]
+
+
+@pytest.mark.parametrize("case", REJECTED_PARTITION_EXPORT_CASES)
+def test_export_partition_partition_key_mismatch_variants_are_rejected(cluster, case):
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
-    mt_table = f"mt_reordered_{uid}"
-    iceberg_table = f"iceberg_reordered_{uid}"
+    mt_table = f"mt_rejected_{uid}"
+    iceberg_table = f"iceberg_rejected_{uid}"
 
-    make_rmt(node, mt_table, "a Int32, b Int32", "a", replica_name="replica1")
-    make_iceberg_s3(node, iceberg_table, "b Int32, a Int32", partition_by="a")
+    make_rmt(node, mt_table, case.src_columns, case.src_partition_by, replica_name="replica1")
+    make_iceberg_s3(node, iceberg_table, case.dst_columns, partition_by=case.dst_partition_by)
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1), (1, 2)")
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
-
-    error_all = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
-
-
-def test_export_partition_same_partition_key_different_column_order_multi_column(cluster):
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_multi_reordered_{uid}"
-    iceberg_table = f"iceberg_multi_reordered_{uid}"
-
-    cols = "a Int32, b Int32, c Int32, val String"
-    make_rmt(node, mt_table, cols, "(a, b, c)", replica_name="replica1")
-    make_iceberg_s3(node, iceberg_table, "c Int32, b Int32, a Int32, val String", partition_by="(a, b, c)")
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (1, 1, 1, 'y')")
+    node.query(f"INSERT INTO {mt_table} VALUES {case.insert_values}")
 
     pid = first_partition_id(node, mt_table)
     error = node.query_and_get_error(
@@ -1382,37 +1411,8 @@ def test_export_partition_same_partition_key_different_column_order_multi_column
         settings={"allow_insert_into_iceberg": 1},
     )
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
-
-    error_all = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
-
-
-def test_export_partition_multi_column_partition_key_more_in_destination_is_rejected(cluster):
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_multi_more_{uid}"
-    iceberg_table = f"iceberg_multi_more_{uid}"
-
-    cols = "a Int32, b Int32, c Int32, val String"
-    make_rmt(node, mt_table, cols, "(a, b)", replica_name="replica1")
-    make_iceberg_s3(node, iceberg_table, cols, partition_by="(a, b, c)")
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x')")
-
-    pid = first_partition_id(node, mt_table)
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
+    for substring in case.error_substrings:
+        assert substring in error, f"Expected {substring!r} in error, got: {error}"
 
     error_all = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
@@ -1435,7 +1435,7 @@ def test_export_partition_multi_column_partition_key_success_all(cluster):
     make_rmt(node, mt_table, cols, "(a, b, c)", replica_name="replica1")
     make_iceberg_s3(node, iceberg_table, cols, partition_by="(a, b, c)")
 
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 1, 1, 'x'), (2, 2, 2, 'y')")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (4, 5, 6, 'y')")
 
     partition_ids = node.query(
         f"SELECT DISTINCT partition_id FROM system.parts WHERE database = currentDatabase() "
@@ -1454,37 +1454,7 @@ def test_export_partition_multi_column_partition_key_success_all(cluster):
     assert count == 2, f"Expected 2 rows in destination after export, got {count}"
 
     result = node.query(f"SELECT a, b, c, val FROM {iceberg_table} ORDER BY val").strip()
-    assert result == "1\t1\t1\tx\n2\t2\t2\ty", f"Unexpected exported data:\n{result}"
-
-
-def test_export_partition_transform_partition_key_different_column_order_is_rejected(cluster):
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_transform_reordered_{uid}"
-    iceberg_table = f"iceberg_transform_reordered_{uid}"
-
-    make_rmt(node, mt_table, "other_id Int64, user_id Int64", "icebergBucket(8, user_id)", replica_name="replica1")
-    make_iceberg_s3(node, iceberg_table, "user_id Int64, other_id Int64", partition_by="icebergBucket(8, user_id)")
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, 42)")
-
-    pid = first_partition_id(node, mt_table)
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error}"
-    assert "partition key column" in error, f"Expected partition key column mismatch message, got: {error}"
-
-    error_all = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    assert "BAD_ARGUMENTS" in error_all, f"Expected BAD_ARGUMENTS, got: {error_all}"
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+    assert result == "1\t2\t3\tx\n4\t5\t6\ty", f"Unexpected exported data:\n{result}"
 
 
 def test_export_partition_with_castable_widening(cluster):

@@ -4,6 +4,7 @@
 #include <Common/FailPoint.h>
 #include <Common/escapeForFileName.h>
 #include <Common/logger_useful.h>
+#include <Common/typeid_cast.h>
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -13,6 +14,8 @@
 #include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/Utils.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
@@ -635,6 +638,18 @@ namespace ExportPartitionUtils
     }
 #endif
 
+    namespace
+    {
+        std::optional<String> getDateTimeTimeZoneName(const DataTypePtr & type)
+        {
+            if (const auto * datetime_type = typeid_cast<const DataTypeDateTime *>(type.get()))
+                return datetime_type->getTimeZone().getTimeZone();
+            if (const auto * datetime64_type = typeid_cast<const DataTypeDateTime64 *>(type.get()))
+                return datetime64_type->getTimeZone().getTimeZone();
+            return {};
+        }
+    }
+
     void verifyMergeTreePartitionCompatibility(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata)
@@ -695,6 +710,23 @@ namespace ExportPartitionUtils
                     source_column.name,
                     i,
                     destination_column.name);
+
+            if (partition_key_column_set.contains(source_column.name))
+            {
+                const auto source_time_zone = getDateTimeTimeZoneName(source_column.type);
+                const auto destination_time_zone = getDateTimeTimeZoneName(destination_column.type);
+                if (source_time_zone && destination_time_zone && *source_time_zone != *destination_time_zone)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot export to {}: partition key column '{}' is {} in the source table "
+                        "but {} in the destination. The destination's hive-style partition path is "
+                        "rendered from the source value without converting the timezone, so this "
+                        "would silently shift the exported value by the timezone offset. Use the "
+                        "same timezone in both tables' partition key column.",
+                        destination_storage_id.getFullTableName(),
+                        destination_column.name,
+                        source_column.type->getName(),
+                        destination_column.type->getName());
+            }
 
             /// Lossy casts may silently change values, so reject them unless the user opts in.
             if (allow_lossy_cast)

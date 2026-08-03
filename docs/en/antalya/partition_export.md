@@ -43,6 +43,14 @@ TO TABLE [destination_database.]destination_table
 - **`partition_id`**: The partition identifier to export (e.g., `'2020'`, `'2021'`)
 - **`destination_table`**: The target table for the export (typically an S3, Azure, or other object storage table)
 
+## Requirements
+
+`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/engines/table-engines/mergetree-family/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements, in particular:
+
+1. **Identical schemas** - same columns, types, and order
+2. **Matching partition keys** - partition expressions must be identical
+3. **Partition key columns at the same position** - columns are matched by position, so every column that is part of the source table's partition key must also sit at the same position in the destination table's schema, even if both tables' `PARTITION BY` expressions are textually identical. See [`EXPORT PART` requirements](/docs/en/engines/table-engines/mergetree-family/part_export.md#requirements) for a worked example and the exact error message.
+
 ## Settings
 
 ### Server Settings
