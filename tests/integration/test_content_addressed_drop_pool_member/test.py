@@ -266,18 +266,23 @@ def test_drop_dead_pool_member_heals_the_pool():
     # node2's decommissioned-and-healed namespace (t2) left canonical dead-life residue behind: its
     # catalog row is gone (that is what let the slot retire above), but its `_ckpt`/`_files`/`_log`
     # objects are the perpetual namespace janitor's job, not decommission's or GC's own destructive
-    # round -- and that janitor's own deletes are suppressed for the whole of Stage A, same as blob/
-    # manifest GC. t1's row is pruned the same way once dropped, so the pool-wide count here is not
-    # pinned to a single namespace's key count -- only that residue exists and is NOT hard corruption
-    # (`lifeless_keys=0`).
-    fsck = _disks(node1, "ca-fsck")
+    # round. t1's row is pruned the same way once dropped. That residue must DRAIN to zero -- the
+    # janitor deletes one bounded page per round, so this is polled rather than read once -- and it
+    # must never be hard corruption on the way there, which is why `lifeless_keys` is checked on every
+    # poll and not only at the end.
+    for _ in range(RECLAIM_RETRIES):
+        fsck = _disks(node1, "ca-fsck")
+        assert "lifeless_keys=0" in fsck, fsck
+        janitor_pending_match = re.search(r"\bjanitor_pending=(\d+)", fsck)
+        assert janitor_pending_match, "ca-fsck summary is missing the janitor_pending field: {}".format(fsck)
+        if int(janitor_pending_match.group(1)) == 0:
+            break
+        time.sleep(RECLAIM_SLEEP)
+
     assert "dangling=0" in fsck, fsck
     assert "unaccounted=0" in fsck, fsck
-    assert "lifeless_keys=0" in fsck, fsck
-    janitor_pending_match = re.search(r"\bjanitor_pending=(\d+)", fsck)
-    assert janitor_pending_match, "ca-fsck summary is missing the janitor_pending field: {}".format(fsck)
-    assert int(janitor_pending_match.group(1)) >= 1, (
-        "expected janitor-pending dead-life residue from the healed decommission and the t1 drop: {}".format(fsck)
+    assert int(janitor_pending_match.group(1)) == 0, (
+        "the dead-life residue from the healed decommission and the t1 drop never drained: {}".format(fsck)
     )
 
     # (10) Re-run the same command: decommission tombstones the owner anchor in place rather than
