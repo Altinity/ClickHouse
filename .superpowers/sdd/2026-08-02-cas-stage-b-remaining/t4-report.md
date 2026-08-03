@@ -152,11 +152,15 @@ against a `build_asan` rebuilt strictly after all three mutations were reverted.
   1980 (the four new tests this task adds: `WedgeResolvedAsRejectDrainsTheDutyAsNoOp`,
   `RejectedAttemptBodyIsEventuallyNominatedAndSwept`, `DutySurvivesSettlementFailureForRetry`,
   `SuppressedRoundNominatesNothing`); no unexplained delta.
-- **Full ASan CA gate**: `build_asan/src/unit_tests_dbms` with the same filter: **1957 ran / 1957
-  passed / 0 failed**, 278 suites, 0 sanitizer reports, 0 aborts (the `ABORTED` string hits in the log
-  are pre-existing `ErrorCodes::ABORTED` scenario text from unrelated tests, not process aborts).
-  1957 vs 1985 under release reflects existing sanitizer-conditional test gating elsewhere in the
-  suite (not introduced by this task). Log: `build/t4_asan_gate2.log`.
+- **Full ASan CA gate.** The first attempt (`build/t4_asan_gate2.log`, 1957/1957, 278 suites) reused
+  the RELEASE suite list and so silently skipped every `*DeathTest` suite the ASan binary compiles in
+  (guarded by sanitizer build detection) — kept only as evidence of the non-death-test set, not as the
+  gate. The actual gate regenerates the suite list from the ASan binary itself:
+  `utils/cas-gate/generate_cas_suites.sh build_asan` → **296 suites** (18 more than release's 278,
+  exactly the 18 `*DeathTest` suites; 0 unclaimed). `build_asan/src/unit_tests_dbms` with that filter:
+  **1990 ran / 1990 passed / 0 failed**, 296 suites, 0 sanitizer reports, 0 aborts (the `ABORTED`
+  string hits in the log are pre-existing `ErrorCodes::ABORTED` scenario text from unrelated tests,
+  not process aborts). Log: `build/t4_asan_gate3.log`.
 - **S3 integration lanes**:
   `python3 -m ci.praktika run "integration" --test "test_content_addressed_s3 test_content_addressed_gc_s3"`
   → **3 passed** (`test_content_addressed_s3::test_content_addressed_s3`,
