@@ -46,7 +46,7 @@ It requires specifying:
 
 <br/>
 
-Optionally, `metadata_type` can be specified (it is equal to `local` by default), but it can also be set to `plain`, `web`, `plain_rewritable` (starting from `24.4`) and `content_addressed`.
+Optionally, `metadata_type` can be specified (it is equal to `local` by default), but it can also be set to `plain`, `web`, `plain_rewritable` (starting from `24.4`) and `cas`.
 Usage of `plain` metadata type is described in [plain storage section](/operations/storing-data#plain-storage), `web` metadata type can be used only with `web` object storage type, `local` metadata type stores metadata files locally (each metadata files contains mapping to files in object storage and some additional meta information about them).
 
 For example:
@@ -454,45 +454,43 @@ Starting from `24.5` it is possible to configure any object storage disk
 
 ### Using Content-Addressed Storage {#content-addressed-storage}
 
-Setting `metadata_type` to `content_addressed` turns a disk into a content-addressed (CA) disk: every
+Setting `metadata_type` to `cas` turns a disk into a content-addressed (CAS) disk: every
 object is addressed by the hash of its content rather than by a randomly generated blob name, so
 identical content written by different parts (or different tables) is stored once and shared. A
 background garbage collector reclaims objects once no part references them anymore; see
-[`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection),
-[`SYSTEM CONTENT ADDRESSED GC REBUILD`](/sql-reference/statements/system#system-content-addressed-gc-rebuild),
-[`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member),
-and the [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log),
-[`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts), and
-[`system.content_addressed_log`](/operations/system-tables/content_addressed_log) system tables.
+[`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run),
+[`SYSTEM CAS GC REBUILD`](/sql-reference/statements/system#system-cas-gc-rebuild),
+[`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member),
+and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
+[`system.cas_mounts`](/operations/system-tables/cas_mounts), and
+[`system.cas_log`](/operations/system-tables/cas_log) system tables.
 
 Configuration:
 
 ```xml
-<s3_content_addressed>
+<s3_cas>
     <type>object_storage</type>
     <object_storage_type>s3</object_storage_type>
-    <metadata_type>content_addressed</metadata_type>
+    <metadata_type>cas</metadata_type>
     <endpoint>https://s3.eu-west-1.amazonaws.com/clickhouse-eu-west-1.clickhouse.com/data/</endpoint>
     <use_environment_credentials>1</use_environment_credentials>
 
-    <content_addressed>
-        <server_root_id>server-{replica}</server_root_id>
-        <scratch_path>disks/s3_content_addressed/cas_scratch/</scratch_path>
-        <staging_backend>local</staging_backend>
-        <blob_hash>cityhash128</blob_hash>
-        <gc_enabled>true</gc_enabled>
-        <gc_interval_sec>60</gc_interval_sec>
-        <gc_shards>1</gc_shards>
-        <dedup_cache_bytes>67108864</dedup_cache_bytes>
-        <part_folder_cache_bytes>67108864</part_folder_cache_bytes>
-        <part_folder_validate>always</part_folder_validate>
-    </content_addressed>
-</s3_content_addressed>
+    <server_root_id>server-{replica}</server_root_id>
+    <scratch_path>disks/s3_cas/cas_scratch/</scratch_path>
+    <staging_backend>local</staging_backend>
+    <blob_hash>cityhash128</blob_hash>
+    <gc_enabled>true</gc_enabled>
+    <gc_interval_sec>60</gc_interval_sec>
+    <gc_shards>1</gc_shards>
+    <dedup_cache_bytes>67108864</dedup_cache_bytes>
+    <part_folder_cache_bytes>67108864</part_folder_cache_bytes>
+    <part_folder_validate>always</part_folder_validate>
+</s3_cas>
 ```
 
-All content-addressed-specific settings live under the `<content_addressed>` block; the surrounding
-`<type>object_storage</type>` / `<object_storage_type>` / connection settings are the same as for any
-other `object_storage` disk. Since the `<content_addressed>` block already scopes every key to this
+The CAS-specific settings are written directly inside the disk element, alongside
+`<type>object_storage</type>` / `<object_storage_type>` and the connection settings, which are the
+same as for any other `object_storage` disk. Since the disk element already scopes every key to this
 disk, none of the keys below carry a redundant `cas_`/`ca_` prefix.
 
 #### Required parameters {#required-parameters-content-addressed}

@@ -457,24 +457,24 @@ Wait until all asynchronously loading data parts of a table (outdated data parts
 SYSTEM WAIT LOADING PARTS [ON CLUSTER cluster_name] [db.]merge_tree_family_table_name
 ```
 
-### SYSTEM CONTENT ADDRESSED GC RUN {#content-addressed-garbage-collection}
+### SYSTEM CAS GC RUN {#system-cas-gc-run}
 
-Runs one garbage-collection round of the content-addressed (CA) MergeTree garbage collector synchronously and node-local: it reclaims content-addressed objects that are no longer referenced by any part. This is the on-demand counterpart of the background GC scheduler; it is useful for tests and diagnostics.
+Runs one garbage-collection round of the content-addressed (CAS) MergeTree garbage collector synchronously and node-local: it reclaims content-addressed objects that are no longer referenced by any part. This is the on-demand counterpart of the background GC scheduler; it is useful for tests and diagnostics.
 
 ```sql
-SYSTEM CONTENT ADDRESSED GC RUN [ON CLUSTER cluster_name] [disk_name]
+SYSTEM CAS GC RUN [ON CLUSTER cluster_name] [disk_name]
 ```
 
 When `disk_name` is given, the round runs on that content-addressed disk only; targeting a non-content-addressed disk raises an exception. When `disk_name` is omitted, one round runs on every content-addressed disk configured on the node; if none are configured, the command raises an exception.
 
-Each round is recorded in [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
+Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
 The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, and `anomalies`, describing the outcome of that round.
 
-### SYSTEM CONTENT ADDRESSED GC REBUILD {#system-content-addressed-gc-rebuild}
+### SYSTEM CAS GC REBUILD {#system-cas-gc-rebuild}
 
-Disaster-recovery command for the content-addressed (CA) MergeTree garbage collector. It rebuilds a
-CA disk's `gc/state` baseline from scratch, by re-discovering the whole ref universe and re-folding
+Disaster-recovery command for the content-addressed (CAS) MergeTree garbage collector. It rebuilds a
+CAS disk's `gc/state` baseline from scratch, by re-discovering the whole ref universe and re-folding
 manifest edges into a fresh generation. It writes only the GC plane (`gc/state` and the `gc/gen/*`
 artifacts) and never touches ref shards, manifests, or blobs, and it never deletes anything itself —
 but the rebuilt baseline drives every subsequent GC round's retire decisions, so this is a
@@ -483,10 +483,10 @@ a state that was not actually corrupted discards live bookkeeping, and an incorr
 a later round delete objects that are still referenced.
 
 ```sql
-SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [ON CLUSTER cluster_name] disk_name
+SYSTEM CAS GC REBUILD [FORCE] [ON CLUSTER cluster_name] disk_name
 ```
 
-Unlike `SYSTEM CONTENT ADDRESSED GC RUN`, `disk_name` is **required**: the destructive
+Unlike `SYSTEM CAS GC RUN`, `disk_name` is **required**: the destructive
 baseline rebuild must never fan out across every content-addressed disk on the node from a bare
 command; targeting a non-content-addressed disk raises an exception.
 
@@ -500,7 +500,7 @@ On success it returns one row with columns `disk`, `performed`, `round`, `genera
 `shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`, and
 `clamped_shards`, describing the freshly rebuilt baseline.
 
-### SYSTEM CONTENT ADDRESSED DROP POOL MEMBER {#system-content-addressed-drop-pool-member}
+### SYSTEM CAS DROP POOL MEMBER {#system-cas-drop-pool-member}
 
 Permanently decommissions a dead member (`server_root_id`, or `srid`) of a content-addressed disk
 pool. It claims the member's mount slot as an administrative writer — fencing that `srid` from ever
@@ -515,7 +515,7 @@ transitions, and it does not synchronously reclaim shared blob content — remov
 makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.
 
 ```sql
-SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srid' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
+SYSTEM CAS DROP POOL MEMBER 'srid' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
 ```
 
 Both `srid` and `disk_name` are required string literals (an `srid` is an opaque server-root path

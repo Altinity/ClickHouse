@@ -1,21 +1,21 @@
 ---
-description: 'System table containing the live mount and GC-health state of every server mounted onto a content-addressed (CA) disk pool.'
-sidebar_label: 'content_addressed_mounts'
+description: 'System table containing the live mount and GC-health state of every server mounted onto a content-addressed (CAS) disk pool.'
+sidebar_label: 'cas_mounts'
 sidebar_position: 31
-slug: /operations/system-tables/content_addressed_mounts
-title: 'system.content_addressed_mounts'
+slug: /operations/system-tables/cas_mounts
+title: 'system.cas_mounts'
 doc_type: 'reference'
 ---
 
 ## Description {#description}
 
-The `system.content_addressed_mounts` table contains one row per mount slot discovered on every
-content-addressed (CA) disk configured on the node. A pool may be shared by several servers (or
+The `system.cas_mounts` table contains one row per mount slot discovered on every
+content-addressed (CAS) disk configured on the node. A pool may be shared by several servers (or
 several `server_root_id` mounts on the same server), and this table lists every mount visible in
 the pool's backend at query time, not only the querying server's own mount — it exists for
 incident-time diagnosis of leases, epochs, and GC leadership across a shared pool.
 
-The table is read directly from the CA disk's backend on every query (there is no persisted log
+The table is read directly from the CAS disk's backend on every query (there is no persisted log
 behind it); a transient backend error on one disk is skipped and does not blind the rest of the
 rows.
 
@@ -43,7 +43,7 @@ rows.
 facts about *this* server's own GC scheduler. They are populated **only** on the row whose `server_root_id` matches
 this server's own mount, and are `NULL` on every row describing another server's mount — stamping a local
 health fact onto a peer's row would misread as "the peer is the GC leader" during an incident. To see the
-peer's own view of these columns, query `system.content_addressed_mounts` on that server.
+peer's own view of these columns, query `system.cas_mounts` on that server.
 :::
 
 ## Example {#example}
@@ -57,14 +57,14 @@ SELECT
     is_leader,
     pending_reclaim,
     last_success_age_seconds
-FROM system.content_addressed_mounts
+FROM system.cas_mounts
 ORDER BY disk, server_root_id
 FORMAT Vertical;
 ```
 
 ## See Also {#see-also}
 
-- [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) — per-round GC event log.
-- [`system.content_addressed_log`](/operations/system-tables/content_addressed_log) — per-decision event log for the CA garbage collector and writer.
-- [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
-- [`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member) — permanently decommission a dead pool member's `server_root_id`.
+- [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) — per-round GC event log.
+- [`system.cas_log`](/operations/system-tables/cas_log) — per-decision event log for the CAS garbage collector and writer.
+- [`SYSTEM CAS GC RUN`](/sql-reference/statements/system#system-cas-gc-run) — run one GC round synchronously.
+- [`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member) — permanently decommission a dead pool member's `server_root_id`.

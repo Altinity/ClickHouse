@@ -1,19 +1,19 @@
 ---
-description: 'System table containing a per-decision event log for the content-addressed (CA) MergeTree writer and garbage collector.'
-sidebar_label: 'content_addressed_log'
+description: 'System table containing a per-decision event log for the content-addressed (CAS) MergeTree writer and garbage collector.'
+sidebar_label: 'cas_log'
 sidebar_position: 32
-slug: /operations/system-tables/content_addressed_log
-title: 'system.content_addressed_log'
+slug: /operations/system-tables/cas_log
+title: 'system.cas_log'
 doc_type: 'reference'
 ---
 
 ## Description {#description}
 
-The `system.content_addressed_log` table contains a per-decision event log for the content-addressed
-(CA) MergeTree storage engine: blob puts and dedup adoptions, root/ref transitions, in-degree changes,
+The `system.cas_log` table contains a per-decision event log for the content-addressed
+(CAS) MergeTree storage engine: blob puts and dedup adoptions, root/ref transitions, in-degree changes,
 garbage-collector retire decisions and recheck verdicts, blob deletes, and dangling-access/corruption
 findings. It is a much finer-grained, per-event complement to
-[`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log),
+[`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
 which only records one `Start`/`Finish` row per GC round.
 
 ## Columns {#columns}
@@ -22,7 +22,7 @@ which only records one `Start`/`Finish` row per GC round.
 - `event_date` ([Date](/sql-reference/data-types/date)) — Event date.
 - `event_time` ([DateTime](/sql-reference/data-types/datetime)) — Event time.
 - `event_time_microseconds` ([DateTime64(6)](/sql-reference/data-types/datetime64)) — Event time with microseconds precision.
-- `event_type` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The CA decision/event, e.g. `blob_put`, `blob_reuse_adopt`, `root_remove`, `indeg_zero`, `gc_retire_decision`, `gc_recheck_verdict`, `blob_delete`, `dangling_access`, `corrupt_dangle`.
+- `event_type` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The CAS decision/event, e.g. `blob_put`, `blob_reuse_adopt`, `root_remove`, `indeg_zero`, `gc_retire_decision`, `gc_recheck_verdict`, `blob_delete`, `dangling_access`, `corrupt_dangle`.
 - `disk_name` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The content-addressed disk / pool the event belongs to.
 - `namespace` ([String](/sql-reference/data-types/string)) — `roots/<namespace>` (server/table); empty if not applicable.
 - `ref_name` ([String](/sql-reference/data-types/string)) — Part name / ref the event concerns; empty if not applicable.
@@ -49,7 +49,7 @@ SELECT
     object_kind,
     outcome,
     reason
-FROM system.content_addressed_log
+FROM system.cas_log
 ORDER BY event_time_microseconds DESC
 LIMIT 10
 FORMAT Vertical;
@@ -57,6 +57,6 @@ FORMAT Vertical;
 
 ## See Also {#see-also}
 
-- [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) — per-round GC event log.
-- [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`server_root_id` mount and GC-health state.
+- [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) — per-round GC event log.
+- [`system.cas_mounts`](/operations/system-tables/cas_mounts) — live per-`server_root_id` mount and GC-health state.
 - [`system.query_log`](/operations/system-tables/query_log) — correlate via `query_id`.
