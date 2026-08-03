@@ -3324,3 +3324,26 @@ Two consequences that are worth naming:
 **Fix, when someone takes it:** anchor Native keys through `DB::Cas::tests::nativeKeyUnder`, which now
 exists in `cas_test_helpers.h` for exactly this and states the hazard where a new Native-mode test will
 look. Mechanical, one line per site.
+
+## `[gc-mf-cleanup-durable-retry]` Manifest-cleanup GC phase needs durable retry, not a cap {#gc-mf-cleanup-durable-retry}
+
+**Found by a 24h soak (`soak-t6b-report.md`) after `gc_round_manifest_cleanup_budget` landed as one of
+T6b's per-round work-envelope caps; the setting was removed entirely rather than tuned.**
+
+The post-CAS `manifest_deletes` phase (`Gc::runRegularRound`, `Gc/CasGc.cpp`) is a **one-shot pipeline**:
+the ref-log intake cursor that discovers each owner-removed manifest's `-1` edge commits in the SAME
+round's CAS that produces the `mf_cleanup` set, before the deletes run. A cap on this phase does not defer
+the excess to a later round of the same pipeline — a cap-declined entry is never re-derived, because the
+cursor that would re-derive it has already moved past the log that produced it. The only remaining
+reclaimer is the (much slower) orphan-manifest sweep backstop, which drains roughly 100 objects per round
+and cannot keep pace with a real burst.
+
+Soak evidence: run-1 (cap=5000) left 112,518 entries skipped, of which 110,218 were still unreachable at
+checkpoint time (checkpoint FAIL). Run-2 (cap disabled) fully drained all 223,714 entries in-round with
+zero left unreachable (PASS). The user decision was that the knob must not exist at all — a cap here
+converts a bounded burst into a permanent leak, which is worse than no cap.
+
+**Fix direction, when someone takes it:** real bounding needs the edge-consumption point moved to AFTER
+the delete succeeds (durable retry), not before it, so a cap-declined entry stays discoverable by the next
+round's intake instead of being silently dropped. This is a natural fit for a future
+`gc-frontier-one-list` focused session (post-Stage-B), since it touches the same intake/cursor machinery.

@@ -125,7 +125,16 @@ per commit; full CA gate at lane closures.
   through `ae11315badb`) cherry-picked clean into cas-gc-rebuild ending `e8b0d0220b0`. Nine
   per-round budget settings (six from the slices + three C-fixes), all fail-close, mutation-proven,
   full CA gate green both builds (278/296, 0 fail 0 abort). Review APPROVE-WITH-NONBLOCKING
-  (t6b-review.md); C1/C2/C4 closed by `0255a67f419`. The codex T6 REJECT is ANSWERED with honest
+  (t6b-review.md); C1/C4 closed by `0255a67f419`. C2 (`gc_round_manifest_cleanup_budget`) was
+  REVERTED after `soak-t6b-report.md` showed it leaks: the ref-log intake cursor that discovers
+  each owner-removed manifest commits in the SAME round's CAS as the cap-declined entry, so a
+  cap-declined entry is never re-derived by this one-shot pipeline (run-1, cap=5000: 112,518
+  skipped, 110,218 permanently unreachable, checkpoint FAIL; run-2, cap disabled: full drain of
+  223,714, unreachable=0, PASS). codex T6-2 bullet-4 answered WON'T-CAP with this evidence pair;
+  the setting, `GcRoundWorkBudget`'s `max_manifest_cleanup_objects`/`manifestCleanupAvailable`, and
+  the C2 gtest were removed entirely; real bounding needs durable retry (moving the edge-consumption
+  point past the delete), tracked as `[gc-mf-cleanup-durable-retry]` in BACKLOG. The codex T6 REJECT
+  on the remaining caps is ANSWERED with honest
   residuals: T6-1 count axes bounded, retained-BYTE axis reduced (1000→100 bodies) NOT bounded;
   `recoverRefTableDetailedFromAuthority` internal cost = one coarse unit, NOT bounded (correct seam:
   fsck/rebuild need the complete table); capped spared entries lose their audit outcome record
