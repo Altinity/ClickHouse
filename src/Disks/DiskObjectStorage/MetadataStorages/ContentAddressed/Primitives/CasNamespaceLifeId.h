@@ -53,9 +53,9 @@ inline std::optional<UInt128> parseIncarnation(std::string_view s)
             return std::nullopt;
     }
 
-    // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage): `unhexUInt` reads exactly
-    // sizeof(UInt128)*2 == kHexLen bytes from the pointer, already validated above; it needs
-    // no NUL terminator.
+    /// `unhexUInt` reads exactly sizeof(UInt128)*2 == kHexLen bytes from the pointer, already
+    /// validated above; it needs no NUL terminator.
+    // NOLINTNEXTLINE(bugprone-suspicious-stringview-data-usage)
     const UInt128 value = unhexUInt<UInt128>(s.data());
     if (value == 0)
         return std::nullopt;

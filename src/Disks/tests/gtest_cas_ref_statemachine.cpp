@@ -1069,9 +1069,9 @@ TEST(CasRefStateMachine, E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentic
 TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
-    // NOLINTNEXTLINE(performance-unnecessary-copy-initialization): must be an independent snapshot --
-    // `state` is queried and potentially mutated below, and comparing against a reference would make
-    // the check vacuous.
+    /// Must be an independent snapshot -- `state` is queried and potentially mutated below, and
+    /// comparing against a reference would make the check vacuous.
+    // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
     const RefTableState before = state;
     const String before_bytes = encodeRefTableSnapshot(snapshotOf(state, kNs));
 

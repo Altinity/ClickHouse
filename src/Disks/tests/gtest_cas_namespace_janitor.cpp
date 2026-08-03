@@ -118,7 +118,10 @@ public:
         {
             published = true;
             const String catalog_key = "p/cas/ref_catalog";
-            const auto current = CountingBackend::get(catalog_key, {});
+            /// This models a CONCURRENT actor's read, not the janitor's own -- counting it here would
+            /// make `PostListCatalogCutProtectsConcurrentCreationWithOneGet`'s "exactly one get" assertion
+            /// count this simulated actor's read as the janitor's, defeating the point of that assertion.
+            const auto current = InMemoryBackend::get(catalog_key, {}); // NOLINT(bugprone-parent-virtual-call)
             if (current)
             {
                 RefCatalog catalog;

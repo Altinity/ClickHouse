@@ -227,7 +227,7 @@ struct CaTxnRollbackFixture
 
     /// The manifest CURRENTLY bound to `key`, or a default-constructed (zero) `ManifestRef` when `key`
     /// has no committed ref at all.
-    Cas::ManifestRef currentManifest(const Cas::PartRefKey & key)
+    Cas::ManifestRef currentManifest(const Cas::PartRefKey & key) const
     {
         auto view = partAccess().getView(key, Cas::Freshness::ForceFresh);
         return view ? view->manifestId().ref : Cas::ManifestRef{};
