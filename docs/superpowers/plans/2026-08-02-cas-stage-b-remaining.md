@@ -113,6 +113,19 @@ command and its output; the baseline figures are expectations, not facts to trus
 - C++ style: Allman braces. Never `sleep` to fix a race. `EXPECT_THROW` on a `LOGICAL_ERROR` site
   aborts sanitizer lanes — use the death-test split; prefer `expectThrowsCode` with the exact
   error code everywhere.
+- **Suite-naming normalization (user directive 2026-08-03):** after T6 lands (and before the
+  final tidy re-run and T8's battery), one mechanical sweep renames every CAS test suite to the
+  mandatory `Cas` prefix — 23 violators at the time of the directive: the 16 `RefWriter*`
+  suites, `CaLifecycle`, `CaWiring`, `CatalogLifecycleReconciler`, `ContentAddressedLog`,
+  `RefTableCacheEviction`, and the three parameterized instantiation prefixes
+  (`InMemory/`→`CasInMemory/`, `Local/`→`CasLocal/`, `WinnerShape/`→`CasWinnerShape/`). After
+  the sweep the routine gate filter is the literal `--gtest_filter='Cas*'`, and
+  `utils/cas-gate/generate_cas_suites.sh` is repurposed into the INVARIANT VERIFIER (it fails
+  loud if any source-derived CAS suite does not match `Cas*` — the naming convention becomes an
+  executing check instead of a hand-maintained list). Abort isolation needs no per-suite runner:
+  every `LOGICAL_ERROR` expectation sits behind the death-test split (gtest death tests fork, so
+  sanitizer aborts are child-isolated), enforced by the hygiene sweep; the per-suite runner
+  remains a diagnostic tool only.
 - **Final tidy re-run (user directive 2026-08-03):** after ALL C++-changing tasks are complete
   (i.e. once T5/T6/the fsck slice and any fix waves have landed, before T8's battery), run ONE
   incremental clang-tidy pass — `ninja -k 0 -C build_amd_tidy unit_tests_dbms` in the MAIN
