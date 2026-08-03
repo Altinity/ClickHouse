@@ -221,7 +221,7 @@ RefCleanupFixture seedTwoCoveredLogs(
 
 /// (1) A >1000-key ref scan folds every pre-existing log exactly once: the cursor advances to the greatest
 /// id and every referenced blob has in-degree exactly 1 (folded once, not skipped, not doubled).
-TEST(CasRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
+TEST(CASRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -255,7 +255,7 @@ TEST(CasRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
 
 /// (2) A concurrent log appended AFTER the round's scan has passed its table is NOT skipped: the sealed
 /// cursor stays below it, and the next round folds it.
-TEST(CasRefGc, ConcurrentLogAfterScanIsFoldedNextRound)
+TEST(CASRefGc, ConcurrentLogAfterScanIsFoldedNextRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -289,7 +289,7 @@ TEST(CasRefGc, ConcurrentLogAfterScanIsFoldedNextRound)
 
 /// (3) Fold barrier: a live precommit whose manifest body is absent clamps the table cursor below its
 /// log (an anomaly is recorded), then folds once the body appears.
-TEST(CasRefGc, FoldBarrierClampsBelowMissingBodyThenFoldsOnAppear)
+TEST(CASRefGc, FoldBarrierClampsBelowMissingBodyThenFoldsOnAppear)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -317,7 +317,7 @@ TEST(CasRefGc, FoldBarrierClampsBelowMissingBodyThenFoldsOnAppear)
 
 /// (4) Edge cancellation: a manifest added then removed across a batch nets to zero in-degree and the
 /// exclusively-owned blob is reclaimed.
-TEST(CasRefGc, EdgeCancellationAddThenRemoveReclaimsBlob)
+TEST(CASRefGc, EdgeCancellationAddThenRemoveReclaimsBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -343,7 +343,7 @@ TEST(CasRefGc, EdgeCancellationAddThenRemoveReclaimsBlob)
 /// `gc/state` CAS is denied (deposed mid-round) must NOT advance the adopted (snap_generation, snap_attempt)
 /// and must NOT delete the condemned-but-unadopted blob. Its fold seal is durable only under its OWN
 /// never-adopted attempt (harmless debris).
-TEST(CasRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
+TEST(CASRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
 {
     auto backend = std::make_shared<DeposeRoundCommitBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -379,7 +379,7 @@ TEST(CasRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
 
 /// (6) Ref-object cleanup trusts only a checkpoint-named recovery triple: an older `_log` and `_snap`
 /// are deleted after the durable cursor reaches them, while that triple remains intact.
-TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
+TEST(CASRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -437,7 +437,7 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointNamedTriple)
 /// (`deleteRefObject`'s catalog/lease revalidation before every exact delete) is untouched -- it is
 /// NOT amortized, only the cohort size per round is capped. `planRefCleanup` recomputes the same
 /// remaining candidates from durable state every round, so the excess needs no cursor of its own.
-TEST(CasRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
+TEST(CASRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -501,7 +501,7 @@ TEST(CasRefGc, RefObjectCleanupRespectsRoundBudgetAndConvergesAcrossRounds)
         << "the whole deletable tail must eventually drain under repeated budgeted rounds";
 }
 
-TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
+TEST(CASRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -560,7 +560,7 @@ TEST(CasRefGc, RefObjectCleanupRetainsCheckpointPredecessorSealProof)
     EXPECT_NO_THROW((void)recoverRefTableDetailedFromAuthority(*backend, layout, *entry, checkpoint->ckpt));
 }
 
-TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -579,7 +579,7 @@ TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefO
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+TEST(CASRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -598,7 +598,7 @@ TEST(CasRefGcCleanupAuthority, CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesS
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CasRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
+TEST(CASRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObjectDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -617,7 +617,7 @@ TEST(CasRefGcCleanupAuthority, GcFenceMoveBeforeFirstDeleteRefusesEveryRefObject
     EXPECT_EQ(backend->deleteCount(keys.second_log_key), 0u);
 }
 
-TEST(CasRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
+TEST(CASRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecondDelete)
 {
     auto backend = std::make_shared<RefCleanupAuthorityRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -639,7 +639,7 @@ TEST(CasRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecond
 /// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake
 /// observability counter -- global LIST pages (Q), log-body GETs (K), manifest-body fold GETs (H), emitted
 /// manifest edges, and cleaned old ref objects (D). Before/after deltas prove each site actually fires.
-TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
+TEST(CASRefGc, RefIntakeIncrementsObservabilityCounters)
 {
     using ProfileEvents::global_counters;
     const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages].load();
@@ -686,7 +686,7 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
 /// assert the fold + ref-object cleanup + snapshot lifecycle plus the two read-only consumers:
 /// `runFsck(*store).clean()` (the fsck CLI's verdict, oracle included) and `gc.previewDeletes().empty()`
 /// (what `ca-gc-dryrun` reports). This is the deterministic permanent twin the unit sweep keeps running.
-TEST(CasRefGc, RefSnaplogLifecycleE2E)
+TEST(CASRefGc, RefSnaplogLifecycleE2E)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -746,7 +746,7 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
 
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor
 /// advance. The malformed key is a real object under `cas/ns/stream/` whose `RefTxnId` render is invalid.
-TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
+TEST(CASRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -786,7 +786,7 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 /// The enumeration must therefore absorb the refusal per key and leave the key unindexed in
 /// `scan.keys`, exactly as it already does for every other malformed shape, and let `groupRefKeys`
 /// raise it once where the round is ready to catch it.
-TEST(CasRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
+TEST(CASRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -834,7 +834,7 @@ TEST(CasRefGc, NonCanonicalLifeKeyAbortsRefFoldingWithoutWedgingTheRound)
 /// atomically -- there is no partial delta either way), the cursor never moves past it, and the recorded
 /// anomaly suppresses every destructive step of the round, so nothing the unfolded tail might still
 /// reference can be reclaimed.
-TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
+TEST(CASRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -919,13 +919,13 @@ TEST(CasRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 }
 
 /// Coverage gap (Task 13a): the per-table baseline guard (spec §Offline Recovery) has no positive-trip
-/// test at HEAD -- the adapted successor of the retired CasGcBaselineGuard.FreshStateOverTrimmedJournals
+/// test at HEAD -- the adapted successor of the retired CASGcBaselineGuard.FreshStateOverTrimmedJournals
 /// contract. A table whose logs at/below its newest snapshot are gone and that has no sealed fold cursor
 /// is the "a prior fold advanced+cleaned covered logs, then gc/state was lost" signature: folding it from
 /// {0,0} would emit no edges and mass-condemn its still-referenced blob. GC must refuse the round before
-/// any delete. The existing CasGcBaselineGuard tests cover only the genuinely-fresh pass case and the
+/// any delete. The existing CASGcBaselineGuard tests cover only the genuinely-fresh pass case and the
 /// adopted-seal-missing guard, not this branch.
-TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
+TEST(CASRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -965,7 +965,7 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
 /// A catalog-admitted life without a parent cursor is a valid fresh fold target when it has no
 /// snapshot or logs. The fold must seed its successor seal from every plan row, not only the
 /// parent-cursor subset used by the baseline guard.
-TEST(CasRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
+TEST(CASRefGc, CatalogAdmittedFreshLifeWithoutParentSeedsSuccessorSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);

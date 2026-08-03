@@ -29,7 +29,7 @@ ManifestRef mref(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 /// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md "E2 owned-manifest index").
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, EmptySetHasNoMembers)
+TEST(CASRefCowManifestSet, EmptySetHasNoMembers)
 {
     RefCowManifestSet s;
     EXPECT_TRUE(s.empty());
@@ -37,7 +37,7 @@ TEST(CasRefCowManifestSet, EmptySetHasNoMembers)
     EXPECT_FALSE(s.contains(mref(1, 1, 1)));
 }
 
-TEST(CasRefCowManifestSet, InsertThenContains)
+TEST(CASRefCowManifestSet, InsertThenContains)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -46,7 +46,7 @@ TEST(CasRefCowManifestSet, InsertThenContains)
     EXPECT_FALSE(s.contains(mref(2, 2, 2)));
 }
 
-TEST(CasRefCowManifestSet, InsertMultipleThenContainsEachIndependently)
+TEST(CASRefCowManifestSet, InsertMultipleThenContainsEachIndependently)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -59,7 +59,7 @@ TEST(CasRefCowManifestSet, InsertMultipleThenContainsEachIndependently)
     EXPECT_FALSE(s.contains(mref(3, 3, 3)));
 }
 
-TEST(CasRefCowManifestSet, EraseRemovesAnOverlayOnlyMember)
+TEST(CASRefCowManifestSet, EraseRemovesAnOverlayOnlyMember)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -70,7 +70,7 @@ TEST(CasRefCowManifestSet, EraseRemovesAnOverlayOnlyMember)
     EXPECT_EQ(s.overlayEntriesForTest(), 0u);   /// pure-overlay member: erase removes it outright
 }
 
-TEST(CasRefCowManifestSet, TombstoneThenReinsertWhilePurelyInOverlay)
+TEST(CASRefCowManifestSet, TombstoneThenReinsertWhilePurelyInOverlay)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -84,7 +84,7 @@ TEST(CasRefCowManifestSet, TombstoneThenReinsertWhilePurelyInOverlay)
 /// materialize()
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, MaterializeFoldsOverlayIntoBaseAndEmptiesOverlay)
+TEST(CASRefCowManifestSet, MaterializeFoldsOverlayIntoBaseAndEmptiesOverlay)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -98,7 +98,7 @@ TEST(CasRefCowManifestSet, MaterializeFoldsOverlayIntoBaseAndEmptiesOverlay)
     EXPECT_EQ(s.size(), 2u);
 }
 
-TEST(CasRefCowManifestSet, MaterializeOnAnEmptyOverlayIsANoOp)
+TEST(CASRefCowManifestSet, MaterializeOnAnEmptyOverlayIsANoOp)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -109,7 +109,7 @@ TEST(CasRefCowManifestSet, MaterializeOnAnEmptyOverlayIsANoOp)
     EXPECT_TRUE(s.contains(mref(1, 1, 1)));
 }
 
-TEST(CasRefCowManifestSet, EraseAfterMaterializeTombstonesABaseMember)
+TEST(CASRefCowManifestSet, EraseAfterMaterializeTombstonesABaseMember)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -126,7 +126,7 @@ TEST(CasRefCowManifestSet, EraseAfterMaterializeTombstonesABaseMember)
     EXPECT_EQ(s.size(), 1u);
 }
 
-TEST(CasRefCowManifestSet, TombstoneThenReinsertAcrossMaterializedBase)
+TEST(CASRefCowManifestSet, TombstoneThenReinsertAcrossMaterializedBase)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -146,7 +146,7 @@ TEST(CasRefCowManifestSet, TombstoneThenReinsertAcrossMaterializedBase)
 /// materialize() fast path: fold into a uniquely-owned base IN PLACE, no O(N) copy (E5).
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, MaterializeReusesBaseWhenUniquelyOwned)
+TEST(CASRefCowManifestSet, MaterializeReusesBaseWhenUniquelyOwned)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -165,7 +165,7 @@ TEST(CasRefCowManifestSet, MaterializeReusesBaseWhenUniquelyOwned)
     EXPECT_EQ(s.size(), 1u);                            /// net_delta reset, size still exact
 }
 
-TEST(CasRefCowManifestSet, MaterializeBuildsFreshBaseWhenBaseIsShared)
+TEST(CASRefCowManifestSet, MaterializeBuildsFreshBaseWhenBaseIsShared)
 {
     RefCowManifestSet original;
     original.insert(mref(1, 1, 1));
@@ -191,7 +191,7 @@ TEST(CasRefCowManifestSet, MaterializeBuildsFreshBaseWhenBaseIsShared)
     EXPECT_EQ(writer.size(), 1u);
 }
 
-TEST(CasRefCowManifestSet, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
+TEST(CASRefCowManifestSet, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -207,7 +207,7 @@ TEST(CasRefCowManifestSet, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
 /// Copy-on-write isolation + O(1)-copy assertion.
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, CopyIsIsolatedFromOriginal)
+TEST(CASRefCowManifestSet, CopyIsIsolatedFromOriginal)
 {
     RefCowManifestSet original;
     original.insert(mref(1, 1, 1));
@@ -224,7 +224,7 @@ TEST(CasRefCowManifestSet, CopyIsIsolatedFromOriginal)
     EXPECT_TRUE(copy.contains(mref(9, 9, 9)));
 }
 
-TEST(CasRefCowManifestSet, CopySharesBaseUntilEitherSideMaterializesANewOne)
+TEST(CASRefCowManifestSet, CopySharesBaseUntilEitherSideMaterializesANewOne)
 {
     RefCowManifestSet original;
     original.insert(mref(1, 1, 1));
@@ -250,7 +250,7 @@ TEST(CasRefCowManifestSet, CopySharesBaseUntilEitherSideMaterializesANewOne)
 /// size()/net_delta correctness across a longer op sequence, mixing base and overlay changes.
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, SizeTracksNetDeltaAcrossMixedOps)
+TEST(CASRefCowManifestSet, SizeTracksNetDeltaAcrossMixedOps)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -286,14 +286,14 @@ TEST(CasRefCowManifestSet, SizeTracksNetDeltaAcrossMixedOps)
 /// owner.
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, InsertThrowsWhenAlreadyPresentInOverlay)
+TEST(CASRefCowManifestSet, InsertThrowsWhenAlreadyPresentInOverlay)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.insert(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSet, InsertThrowsWhenAlreadyPresentInBase)
+TEST(CASRefCowManifestSet, InsertThrowsWhenAlreadyPresentInBase)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -301,13 +301,13 @@ TEST(CasRefCowManifestSet, InsertThrowsWhenAlreadyPresentInBase)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.insert(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSet, EraseThrowsWhenAbsent)
+TEST(CASRefCowManifestSet, EraseThrowsWhenAbsent)
 {
     RefCowManifestSet s;
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { s.erase(mref(1, 1, 1)); });
 }
 
-TEST(CasRefCowManifestSet, EraseThrowsWhenAlreadyTombstoned)
+TEST(CASRefCowManifestSet, EraseThrowsWhenAlreadyTombstoned)
 {
     RefCowManifestSet s;
     s.insert(mref(1, 1, 1));
@@ -324,7 +324,7 @@ TEST(CasRefCowManifestSet, EraseThrowsWhenAlreadyTombstoned)
 /// sets never drift and never trip the fail-closed CORRUPTED_DATA guards.
 /// ===================================================================================
 
-TEST(CasRefCowManifestSet, FastAndForcedSlowMaterializeAgreeOverRandomOps)
+TEST(CASRefCowManifestSet, FastAndForcedSlowMaterializeAgreeOverRandomOps)
 {
     std::mt19937 rng(20260722); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducible coverage.
 

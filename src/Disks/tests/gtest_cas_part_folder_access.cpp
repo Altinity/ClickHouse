@@ -196,7 +196,7 @@ public:
 
 }
 
-TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
+TEST(CASPartFolderAccess, RetainedHitSkipsManifestHead)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -220,7 +220,7 @@ TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
               Cas::CachedPartFolderAccess::LastDecision::Hit);
 }
 
-TEST(CasPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
+TEST(CASPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -250,7 +250,7 @@ TEST(CasPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
               Cas::CachedPartFolderAccess::LastDecision::Miss);
 }
 
-TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
+TEST(CASPartFolderAccess, GetViewServesCommittedFolder)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -273,7 +273,7 @@ TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
     ASSERT_TRUE(access.resolve(key, Cas::Freshness::ForceFresh).has_value());
 }
 
-TEST(CasPartFolderAccess, GetViewFailsClosedOnMissingBody)
+TEST(CASPartFolderAccess, GetViewFailsClosedOnMissingBody)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -296,7 +296,7 @@ TEST(CasPartFolderAccess, GetViewFailsClosedOnMissingBody)
         expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST, [&] { access.getView(key, freshness); });
 }
 
-TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
+TEST(CASPartFolderAccess, WritePrimitivesRoundTrip)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -324,7 +324,7 @@ TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
     EXPECT_FALSE(access.existsRef({ns, "part_2"}, Cas::Freshness::ForceFresh));
 }
 
-TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
+TEST(CASPartFolderAccess, RepublishRefMovesCommittedRef)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -342,7 +342,7 @@ TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
     EXPECT_EQ(view->inlineBytes("txn_version.txt"), std::optional<String>("v1"));   /// carried over
 }
 
-TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
+TEST(CASPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -373,7 +373,7 @@ TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
 /// destructor merely retires the build seq; GC never touches a live precommit). Drives the failure
 /// through `republishRef` -> `publishEntries`, with the fault isolated to promote's own ref-log
 /// append (precommitAdd's own append is let through first via `skip`).
-TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
+TEST(CASPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
 {
     auto backend = std::make_shared<PromoteConflictOnceBackend>();
     auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -464,7 +464,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
 /// rather than a shape check. `livePrecommitsForTest` is the direct statement of the property --
 /// `publishEntries` must not walk away from a live precommit binding -- and the count is what pins
 /// WHERE the cleanup came from.
-TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
+TEST(CASPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
 {
     auto backend = std::make_shared<PromoteDefiniteFailureBackend>();
     auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -502,7 +502,7 @@ TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnARetryablePromoteFailure)
 
 /// Prepare-then-promote must be indistinguishable from today's atomic `publishEntries`, and the state
 /// BETWEEN the two halves must be exactly one live precommit and no committed ref.
-TEST(CasPartFolderAccess, PrepareThenPromoteMatchesPublishEntries)
+TEST(CASPartFolderAccess, PrepareThenPromoteMatchesPublishEntries)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -539,7 +539,7 @@ TEST(CasPartFolderAccess, PrepareThenPromoteMatchesPublishEntries)
 /// that keeps its `+1` is the retention-leak class (`BACKLOG {#unmatched-minus-one-retention-leak}`),
 /// and the stale-precommit sweep is prior-epoch-scoped, so a same-epoch leak is never reclaimed.
 /// Asserted through the ledger's own precommit view rather than inferred from a later `precommitAdd`.
-TEST(CasPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
+TEST(CASPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -559,13 +559,13 @@ TEST(CasPartFolderAccess, PrepareThenAbortAppendsThePrecommitRemoval)
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
     /// The precommit BODY survives (delete-after-sealed-decrements) -- the removal queues GC's `-1`,
     /// it does not writer-delete the manifest. Mirrors
-    /// `CasPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody`.
+    /// `CASPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody`.
     EXPECT_TRUE(backend->head(store->layout().manifestKey(id)).exists);
 }
 
 /// A forgotten terminal must be impossible, not merely discouraged: `~PartWriteTxn` only retires the
 /// build sequence, so the handle's own destructor is the last-resort owner of the precommit removal.
-TEST(CasPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
+TEST(CASPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -591,9 +591,9 @@ TEST(CasPartFolderAccess, DestroyingAnUnfinishedPreparedPartWriteAborts)
 /// (Exception.cpp's handle_error_code) instead of behaving like a catchable exception -- so the
 /// expectThrowsCode form only makes sense in a plain release build, and the DeathTest variant below
 /// proves the SAME rejections positively abort under debug/sanitizer builds instead (same pattern as
-/// CasWiringOpsDeathTest in gtest_ca_wiring.cpp).
+/// CASWiringOpsDeathTest in gtest_ca_wiring.cpp).
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
+TEST(CASPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -618,7 +618,7 @@ TEST(CasPartFolderAccess, PreparedPartWriteRejectsASecondTerminal)
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
 }
 #else
-TEST(CasPartFolderAccessDeathTest, PreparedPartWriteRejectsASecondTerminalAborts)
+TEST(CASPartFolderAccessDeathTest, PreparedPartWriteRejectsASecondTerminalAborts)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -646,7 +646,7 @@ TEST(CasPartFolderAccessDeathTest, PreparedPartWriteRejectsASecondTerminalAborts
 /// Move-only, and the move transfers the terminal duty in full: the moved-from handle is already
 /// terminal (its destructor must not re-abort a transaction the destination now owns), while the
 /// destination still owes exactly one terminal.
-TEST(CasPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
+TEST(CASPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
 {
     static_assert(!std::is_copy_constructible_v<Cas::PreparedPartWrite>);
     static_assert(!std::is_copy_assignable_v<Cas::PreparedPartWrite>);
@@ -679,7 +679,7 @@ TEST(CasPartFolderAccess, PreparedPartWriteMoveTransfersTheTerminalDuty)
     EXPECT_TRUE(store->livePrecommitsForTest(ns).empty());
 }
 
-TEST(CasPartFolderAccess, ExplainRecordsDecisions)
+TEST(CASPartFolderAccess, ExplainRecordsDecisions)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -707,7 +707,7 @@ TEST(CasPartFolderAccess, ExplainRecordsDecisions)
     EXPECT_GT(access.explain(key).estimated_bytes, 0u);
 }
 
-TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
+TEST(CASPartFolderAccess, BaselineRequestCountsWithoutRetention)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -743,7 +743,7 @@ TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
 /// valid: `MismatchRebuildAfterRepublish` below proves the cache correctly rebuilds when the manifest
 /// id changes under a retained view (the one case the deleted tests' "erase => cold rebuild" half also
 /// exercised); `gtest_cas_repoint.cpp` (Task 3) proves `repointRef` erases the affected view on success.
-TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
+TEST(CASPartFolderAccess, MismatchRebuildAfterRepublish)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -773,7 +773,7 @@ TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
     EXPECT_TRUE(access.explain(key).retained);
 }
 
-TEST(CasPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
+TEST(CASPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -799,7 +799,7 @@ TEST(CasPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
 
 /// ==== §3 (part_folder_validate): the ForceFresh body re-proof HEAD is configurable ====
 
-TEST(CasPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
+TEST(CASPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -822,7 +822,7 @@ TEST(CasPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASPartFolderValidateSkipped].load() - skips_before, 1);
 }
 
-TEST(CasPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
+TEST(CASPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -839,7 +839,7 @@ TEST(CasPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
         [&] { access.getView(key, Cas::Freshness::ForceFresh); });
 }
 
-TEST(CasPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
+TEST(CASPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -872,12 +872,12 @@ TEST(CasPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
     EXPECT_GT(backend->headCount(manifest_key), heads_after_prime);
 }
 
-/// ==== §3: `parsePartFolderValidate` config parsing, standalone (mirrors CasS3Staging's
+/// ==== §3: `parsePartFolderValidate` config parsing, standalone (mirrors CASS3Staging's
 /// parseStagingBackend coverage) -- review finding: std::stoull silently accepted a leading '-'
 /// (unsigned wraparound), so a malformed `age -5` never hit the parser's own fail-closed throw.
 /// These pin the fixed `std::from_chars`-based parsing directly, with no disk/store needed. ====
 
-TEST(CasPartFolderValidateParse, DefaultConfigParsesToAlways)
+TEST(CASPartFolderValidateParse, DefaultConfigParsesToAlways)
 {
     /// No `part_folder_validate` key at all -- the byte-for-byte-pre-§3-behavior default.
     auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
@@ -885,21 +885,21 @@ TEST(CasPartFolderValidateParse, DefaultConfigParsesToAlways)
     EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Always);
 }
 
-TEST(CasPartFolderValidateParse, ParsesAlways)
+TEST(CASPartFolderValidateParse, ParsesAlways)
 {
     auto config = configWithDiskSection("<part_folder_validate>always</part_folder_validate>");
     const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
     EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Always);
 }
 
-TEST(CasPartFolderValidateParse, ParsesNever)
+TEST(CASPartFolderValidateParse, ParsesNever)
 {
     auto config = configWithDiskSection("<part_folder_validate>never</part_folder_validate>");
     const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
     EXPECT_EQ(v.mode, Cas::PartFolderValidate::Mode::Never);
 }
 
-TEST(CasPartFolderValidateParse, ParsesPositiveAge)
+TEST(CASPartFolderValidateParse, ParsesPositiveAge)
 {
     auto config = configWithDiskSection("<part_folder_validate>age 5</part_folder_validate>");
     const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
@@ -907,7 +907,7 @@ TEST(CasPartFolderValidateParse, ParsesPositiveAge)
     EXPECT_EQ(v.age_seconds, 5u);
 }
 
-TEST(CasPartFolderValidateParse, AcceptsAgeZeroAsADegenerateButValidWindow)
+TEST(CASPartFolderValidateParse, AcceptsAgeZeroAsADegenerateButValidWindow)
 {
     /// `age 0` is accepted, not rejected: it is a well-formed (if degenerate -- effectively an
     /// almost-always-expired window) configuration, not malformed input. Only genuinely malformed
@@ -918,7 +918,7 @@ TEST(CasPartFolderValidateParse, AcceptsAgeZeroAsADegenerateButValidWindow)
     EXPECT_EQ(v.age_seconds, 0u);
 }
 
-TEST(CasPartFolderValidateParse, NegativeAgeThrows)
+TEST(CASPartFolderValidateParse, NegativeAgeThrows)
 {
     /// The bug this regression-guards: std::stoull("-5") used to return 18446744073709551611
     /// (unsigned wraparound) instead of rejecting the leading '-'.
@@ -927,28 +927,28 @@ TEST(CasPartFolderValidateParse, NegativeAgeThrows)
         [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
-TEST(CasPartFolderValidateParse, NonDigitAgeThrows)
+TEST(CASPartFolderValidateParse, NonDigitAgeThrows)
 {
     auto config = configWithDiskSection("<part_folder_validate>age abc</part_folder_validate>");
     expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
         [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
-TEST(CasPartFolderValidateParse, TrailingGarbageAfterAgeThrows)
+TEST(CASPartFolderValidateParse, TrailingGarbageAfterAgeThrows)
 {
     auto config = configWithDiskSection("<part_folder_validate>age 5abc</part_folder_validate>");
     expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
         [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
-TEST(CasPartFolderValidateParse, EmptyAgeSuffixThrows)
+TEST(CASPartFolderValidateParse, EmptyAgeSuffixThrows)
 {
     auto config = configWithDiskSection("<part_folder_validate>age </part_folder_validate>");
     expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
         [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
-TEST(CasPartFolderValidateParse, UnknownValueThrows)
+TEST(CASPartFolderValidateParse, UnknownValueThrows)
 {
     /// Fail-closed: an unrecognized value must NEVER silently become `never`/`always`.
     auto config = configWithDiskSection("<part_folder_validate>sometimes</part_folder_validate>");
@@ -956,7 +956,7 @@ TEST(CasPartFolderValidateParse, UnknownValueThrows)
         [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
-TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
+TEST(CASPartFolderAccess, AbsenceIsNeverRetained)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -981,7 +981,7 @@ TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
 /// resolve serves the call with no new information, so it must add no row. `resolveRef` itself defers
 /// the emit on this call path (`ResolveAudit::Deferred`, `CachedPartFolderAccess::resolve`), and
 /// `getView` re-emits the identical event on every OTHER path -- cold builds and `ForceFresh`.
-TEST(CasPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
+TEST(CASPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1017,7 +1017,7 @@ TEST(CasPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
     store->setEventSink(nullptr);
 }
 
-TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
+TEST(CASPartFolderAccess, OversizedViewServedNotRetained)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1045,7 +1045,7 @@ TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
     EXPECT_FALSE(access.explain(key).retained);
 }
 
-TEST(CasPartFolderAccess, DisabledModeKeepsBaseline)
+TEST(CASPartFolderAccess, DisabledModeKeepsBaseline)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1068,7 +1068,7 @@ TEST(CasPartFolderAccess, DisabledModeKeepsBaseline)
     EXPECT_FALSE(access.explain(key).retained);
 }
 
-TEST(CasPartFolderAccess, SingleFlightColdBuild)
+TEST(CASPartFolderAccess, SingleFlightColdBuild)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1098,7 +1098,7 @@ TEST(CasPartFolderAccess, SingleFlightColdBuild)
     EXPECT_EQ(backend->getCount(manifest_key), 1u);   /// single-flight: ONE body GET for the burst
 }
 
-TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
+TEST(CASPartFolderAccess, DropNamespaceErasesAllViews)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1135,7 +1135,7 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 
 }
 
-TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
+TEST(CASPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
 {
     auto backend = std::make_shared<RollbackFaultBackend>();
     auto store = openPoolForTest(backend);
@@ -1194,7 +1194,7 @@ Cas::PoolPtr openPoolSingleAttempt(const std::shared_ptr<Cas::InMemoryBackend> &
 /// rather than leaving it to be guessed from an error code, which cannot carry it: the SAME
 /// `NETWORK_ERROR` is raised by a promote rejected before the append (proof of the negative) and by one
 /// whose append never resolved.
-TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted)
+TEST(CASPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitted)
 {
     auto backend = std::make_shared<Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -1233,7 +1233,7 @@ TEST(CasPartFolderAccess, AnUnresolvedPromoteIsNotReportedAsDefinitelyNotCommitt
 /// committed, where the handle abandons its build and reports the promote as failed. The outcome's
 /// strings are now copied BEFORE the append and the commit is recorded in an allocation-free region
 /// immediately after it, so the window is empty by construction; the probe below fires just past it.
-TEST(CasPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
+TEST(CASPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -1283,7 +1283,7 @@ TEST(CasPartFolderAccess, APostCommitFailureLeavesTheHandleTerminal)
 /// `abandonBuildBestEffort` returned false, permanently dropping a cleanup owner: a live-epoch precommit
 /// that no sweep and no GC ever reclaims. Nothing needs the operator (the interserver relink's handle is
 /// move CONSTRUCTED into place), and a contract that cannot be relied on is worse than none.
-TEST(CasPartFolderAccess, PreparedPartWriteIsNotMoveAssignable)
+TEST(CASPartFolderAccess, PreparedPartWriteIsNotMoveAssignable)
 {
     EXPECT_FALSE(std::is_move_assignable_v<Cas::PreparedPartWrite>)
         << "a move assignment cannot discharge a terminal duty that may fail to be discharged";

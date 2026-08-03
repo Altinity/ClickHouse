@@ -29,7 +29,7 @@ void eraseRequiredField(String & encoded, std::string_view field)
 }
 }
 
-TEST(CasFormatBattery, FoldSeal)
+TEST(CASFormatBattery, FoldSeal)
 {
     CasFoldSeal seal;
     seal.generation = 5;
@@ -49,7 +49,7 @@ TEST(CasFormatBattery, FoldSeal)
         "{\"n\":3}\n"});
 }
 
-TEST(CasFoldSealFormat, RoundTripsAllFields)
+TEST(CASFoldSealFormat, RoundTripsAllFields)
 {
     const CasFoldSeal in = sampleFoldSeal();
     const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(in));
@@ -65,7 +65,7 @@ TEST(CasFoldSealFormat, RoundTripsAllFields)
     EXPECT_EQ(out, in);
 }
 
-TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
+TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -83,7 +83,7 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsTwoBlobTargetRunsForOneShard)
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut)
+TEST(CASFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -94,7 +94,7 @@ TEST(CasFoldSealFormatDeathTest, ProducerValidationRejectsMalformedSealBeforePut
     EXPECT_DEATH({ validateFoldSealForWrite(seal, layout, 1); }, "duplicate blob-target shard");
 }
 #else
-TEST(CasFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)
+TEST(CASFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -107,7 +107,7 @@ TEST(CasFoldSealFormat, ProducerValidationRejectsMalformedSealBeforePut)
 }
 #endif
 
-TEST(CasFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryField)
+TEST(CASFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryField)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -151,7 +151,7 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRequiresEveryBlobTargetAndSummaryFiel
         [&] { decodeFoldSeal(missing_cnd_shard, layout, 1); }, "missing");
 }
 
-TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteSummaryDomain)
+TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteSummaryDomain)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -182,7 +182,7 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsNoncanonicalRowsAndIncompleteS
         [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "exactly 1");
 }
 
-TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsContradictorySummaryCounts)
+TEST(CASFoldSealFormat, AuthoritativeDecodeRejectsContradictorySummaryCounts)
 {
     const Layout layout("p");
     CasFoldSeal seal;
@@ -201,7 +201,7 @@ TEST(CasFoldSealFormat, AuthoritativeDecodeRejectsContradictorySummaryCounts)
         [&] { decodeFoldSeal(encodeFoldSeal(seal), layout, 1); }, "real oldest");
 }
 
-TEST(CasFoldSealFormat, RejectsUnexpectedGeneration)
+TEST(CASFoldSealFormat, RejectsUnexpectedGeneration)
 {
     CasFoldSeal seal;
     seal.generation = 5;
@@ -213,13 +213,13 @@ TEST(CasFoldSealFormat, RejectsUnexpectedGeneration)
     EXPECT_EQ(decodeFoldSeal(encoded).generation, 5);
 }
 
-TEST(CasFoldSeal, EncodingIsByteDeterministic)
+TEST(CASFoldSeal, EncodingIsByteDeterministic)
 {
     const CasFoldSeal in = sampleFoldSeal();
     EXPECT_EQ(encodeFoldSeal(in), encodeFoldSeal(in));
 }
 
-TEST(CasFoldSealFormat, TextIsByteDeterministic)
+TEST(CASFoldSealFormat, TextIsByteDeterministic)
 {
     CasFoldSeal a;
     a.generation = 5;
@@ -230,13 +230,13 @@ TEST(CasFoldSealFormat, TextIsByteDeterministic)
     EXPECT_EQ(encodeFoldSeal(a), encodeFoldSeal(b));   /// encoder must sort runs by key
 }
 
-TEST(CasFoldSeal, RejectsEmptyAndBadMagic)
+TEST(CASFoldSeal, RejectsEmptyAndBadMagic)
 {
     EXPECT_ANY_THROW(decodeFoldSeal(""));
     EXPECT_ANY_THROW(decodeFoldSeal("not-a-seal"));
 }
 
-TEST(CasFoldSeal, CoverageRecordsEveryCatalogLife)
+TEST(CASFoldSeal, CoverageRecordsEveryCatalogLife)
 {
     CasFoldSeal in = sampleFoldSeal();
     in.ref_lives[UInt128{3}].coverage = RefCoverage{.classification = 0};
@@ -245,7 +245,7 @@ TEST(CasFoldSeal, CoverageRecordsEveryCatalogLife)
     EXPECT_EQ(out.ref_lives.size(), 3u);
 }
 
-TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
+TEST(CASFoldSeal, FoldSealCondemnedSummaryRoundTrips)
 {
     /// A seal carrying a non-empty condemned_summary over 2 shards (one a zero entry) round-trips and
     /// compares equal, and the UINT64_MAX "none" sentinel survives.
@@ -273,7 +273,7 @@ TEST(CasFoldSeal, FoldSealCondemnedSummaryRoundTrips)
 
 /// Mutation caught: restoring separate `cov` and `nsc` rows, dropping the cleanup evidence, or
 /// serializing the row under a logical namespace changes these literal generation-8 bytes.
-TEST(CasFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidence)
+TEST(CASFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidence)
 {
     CasFoldSeal seal;
     seal.generation = 8;
@@ -303,7 +303,7 @@ TEST(CasFoldSealFormat, UnifiedRefLifeRowRoundTripsCoverageHoldAndCleanupEvidenc
 
 /// Mutation caught: accepting the generation-6 split coverage collection would leave a second
 /// namespace-keyed source of lifecycle work in a generation-7 process.
-TEST(CasFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
+TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 {
     const String old =
         "{\"type\":\"cas_fold_seal\",\"v\":7}\n"
@@ -315,7 +315,7 @@ TEST(CasFoldSealFormat, UnifiedCodecRejectsLegacyCoverageRecord)
 
 /// Mutation caught: accepting the generation-6 cleanup-item state would restore the independent
 /// marker-driven `Pending`/`Completed` handshake.
-TEST(CasFoldSealFormat, UnifiedCodecRejectsLegacyNamespaceCleanupRecord)
+TEST(CASFoldSealFormat, UnifiedCodecRejectsLegacyNamespaceCleanupRecord)
 {
     const String old =
         "{\"type\":\"cas_fold_seal\",\"v\":7}\n"

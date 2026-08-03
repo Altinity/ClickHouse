@@ -123,7 +123,7 @@ void dropSeededRef(Pool & store, Backend & backend, const RootNamespace & ns, ui
 
 }
 
-TEST(CasPluggableHash, PoolMetaRoundTripsAlgosUsed)
+TEST(CASPluggableHash, PoolMetaRoundTripsAlgosUsed)
 {
     PoolMeta pm;
     pm.pool_id = u128Of("pool-a");
@@ -135,7 +135,7 @@ TEST(CasPluggableHash, PoolMetaRoundTripsAlgosUsed)
     EXPECT_EQ(back.blob_header_len, 256u);
 }
 
-TEST(CasPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
+TEST(CASPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -149,7 +149,7 @@ TEST(CasPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
     EXPECT_EQ(reopened.pool_id, pm.pool_id);
 }
 
-TEST(CasPluggableHash, CreateOrValidateDefaultsToCityHash128)
+TEST(CASPluggableHash, CreateOrValidateDefaultsToCityHash128)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -162,7 +162,7 @@ TEST(CasPluggableHash, CreateOrValidateDefaultsToCityHash128)
 /// admission of a NEW algo is EXPLICIT OPT-IN -- the default reopen with a non-member algo still
 /// fails closed (BAD_ARGUMENTS), but the message now names `<blob_hash_allow_new>` and the pool
 /// is truly extensible with the flag set. See `AdmissionIsFlagGated` below for the full flow.
-TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
+TEST(CASPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -182,7 +182,7 @@ TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
 
 /// spec §9.1 at the unit level: admission of a new algo requires the flag; once admitted, membership
 /// alone is the steady-state check (the flag is not needed again for the same algo).
-TEST(CasPluggableHash, AdmissionIsFlagGated)
+TEST(CASPluggableHash, AdmissionIsFlagGated)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -201,7 +201,7 @@ TEST(CasPluggableHash, AdmissionIsFlagGated)
     EXPECT_EQ(steady.algos_used, (std::vector<uint8_t>{1, 3}));
 }
 
-TEST(CasPluggableHash, ConcurrentAdmissionUnions)
+TEST(CASPluggableHash, ConcurrentAdmissionUnions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -218,7 +218,7 @@ TEST(CasPluggableHash, ConcurrentAdmissionUnions)
 /// mode `ContentAddressedTransaction::writeFile` uses), built with `BlobHashAlgo::XXH3_128`, must hash
 /// the streamed payload with xxh3 -- agreeing with the standalone `blobHashHexOneShot` one-shot helper
 /// (the same convention `poolContentHash`'s re-hash uses).
-TEST(CasPluggableHash, ContentWriteBufferLocalModeHashesWithSelectedAlgoXxh3)
+TEST(CASPluggableHash, ContentWriteBufferLocalModeHashesWithSelectedAlgoXxh3)
 {
     const std::string payload = makeMultiBlockPayload();
     const auto temp_dir = (std::filesystem::temp_directory_path() / "cas_pluggable_hash_xxh3_local").string();
@@ -255,7 +255,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeHashesWithSelectedAlgoXxh3)
 /// the CAS pluggable-blob-hash invariant (spec §8). Compares against `blobHashHexOneShot`, which
 /// `gtest_cas_blob_hasher.cpp`'s `CityHash128ByteIdenticalToHashingWriteBuffer` already proves is
 /// byte-identical to the pre-existing plain `HashingWriteBuffer` convention.
-TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
+TEST(CASPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
 {
     const std::string payload = makeMultiBlockPayload();
     const auto temp_dir = (std::filesystem::temp_directory_path() / "cas_pluggable_hash_ch128_local").string();
@@ -290,7 +290,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
 /// that key, and `runFsck`'s LIST-based discovery (`Layout::blobsPrefix`, deliberately algo-agnostic)
 /// finds it reachable and clean -- proving the GC/fsck key-parse (which takes only the LAST path
 /// component as the hex digest, `CasGc.cpp`/`CasFsck.cpp`) still works with the extra segment.
-TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
+TEST(CASPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -362,7 +362,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 /// MUST GO RED if either port is reverted to `hexToU128`: reverting `CasGc.cpp`'s fold leaves
 /// `condemned_total == 0` (never condemned) and `previewDeletes()` empty; reverting `CasFsck.cpp`'s
 /// sites either throws out of `runFsck` or leaves the blob unclassified/absent from `unreachable`.
-TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
+TEST(CASPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -454,7 +454,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 ///      Core level, since exercising the wiring itself is Task 7's job;
 ///   3. `runFsck` on the pool is clean (no dangling, no foreign) -- the whole write -> GC -> fsck loop
 ///      agrees on the 64-hex key.
-TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
+TEST(CASPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -547,7 +547,7 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 /// once the fresh read proves the algo genuinely admitted. Node B is opened BEFORE node A performs the
 /// admission on purpose: constructing B afterward would seed its cache already-fresh and never
 /// exercise the race the fix targets.
-TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
+TEST(CASPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 {
     auto backend = std::make_shared<InMemoryBackend>();
 
@@ -604,7 +604,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 /// In the SAME pass, a 2-algo pool's OWN blobs under `blobs/ch128/` and `blobs/sha256/` must both
 /// still be classified normally -- the foreign segment must not make the fold/fsck narrow to one
 /// algo or blind them to the others.
-TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
+TEST(CASPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -686,7 +686,7 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 /// floors, subsumes `kContiguousRefStreamsGeneration` -- see `CasPoolMetaFormat.cpp`).
 /// ============================================================================================
 
-TEST(CasPluggableHash, ReaderGenerationIsRaisedToGBuild)
+TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
 {
     EXPECT_GE(G_BUILD, kNamespaceLifeKeyedGeneration)
         << "the reader-generation gate must be at least the namespace-life-keyed floor it enforces";
@@ -762,7 +762,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToGBuild)
 /// that only accounts `blobs/ch128/`, a graduation/delete loop that iterates a digest-only set and
 /// coalesces the two algos' entries, or an fsck reachability check that stops after the first algo it
 /// sees.
-TEST(CasPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
+TEST(CASPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -837,7 +837,7 @@ TEST(CasPluggableHash, TwoAlgoBlobsBothFullyReclaimed)
 /// MUST GO RED if anything upstream of `BlobRef` ever collapses identity to the bare digest (e.g. a
 /// settlement/meta/condemn site keyed on `BlobDigest` alone) -- the two blobs would alias into one row
 /// and dropping one ref would (wrongly) reclaim or corrupt the other.
-TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
+TEST(CASPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,

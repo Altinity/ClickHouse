@@ -174,7 +174,7 @@ constexpr std::chrono::milliseconds kStayStoppedWindow{3000};
 /// so the pacing loop stops spamming Failed rounds (the G2 zombie) and the steal-capable loop can never
 /// fold/condemn a foreign pool's prefix. Drive it while RUNNING, then vanish it, then prove BOTH loops
 /// self-exit (bounded cv wait, no sleep) and that no further round-log rows appear.
-TEST(CasGcStopStart, SchedulerSelfExitsOnNaturalVanished)
+TEST(CASGcStopStart, SchedulerSelfExitsOnNaturalVanished)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -207,7 +207,7 @@ TEST(CasGcStopStart, SchedulerSelfExitsOnNaturalVanished)
 /// there exactly as it does on `Vanished` — a scheduler ticking against a half-erased pool is a pure zombie
 /// (eternal `CORRUPTED_DATA` retries against the vanished `gc/state`). Prove BOTH loops self-exit and that no
 /// further round-log rows appear, and that leadership is cleared.
-TEST(CasGcStopStart, SchedulerSelfExitsOnIdentityLost)
+TEST(CASGcStopStart, SchedulerSelfExitsOnIdentityLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -233,7 +233,7 @@ TEST(CasGcStopStart, SchedulerSelfExitsOnIdentityLost)
 /// the already-finished (joinable) threads, a second `stop()` is a safe no-op, and destruction (scope exit
 /// → ~CasGcScheduler → stop()) runs clean — the ThreadFromGlobalPool join/reset contract holds for a
 /// self-exited thread exactly as for a stop()-signalled one.
-TEST(CasGcStopStart, StopAndDestroyCleanAfterSelfExit)
+TEST(CASGcStopStart, StopAndDestroyCleanAfterSelfExit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -256,7 +256,7 @@ TEST(CasGcStopStart, StopAndDestroyCleanAfterSelfExit)
 /// (a + e) STOP joins the worker + heartbeat threads and clears the in-process leadership hint. The T10
 /// lesson: make the assertion REAL -- acquire leadership via a manual round FIRST, so `is_leader` is
 /// genuinely true before STOP for the clear to prove anything (otherwise `EXPECT_FALSE` would be vacuous).
-TEST(CasGcStopStart, StopJoinsWorkersAndClearsLeadershipHint)
+TEST(CASGcStopStart, StopJoinsWorkersAndClearsLeadershipHint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -283,7 +283,7 @@ TEST(CasGcStopStart, StopJoinsWorkersAndClearsLeadershipHint)
 /// acquisition (is_leader becomes true only after the restarted background round re-acquires the lease).
 /// Deterministic and sleep-free: a condition variable fed by the round logger waits for each background
 /// Finish. This also exercises `start()`'s post-join re-entrancy -- a bug there would hang the wait.
-TEST(CasGcStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
+TEST(CASGcStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -320,7 +320,7 @@ TEST(CasGcStopStart, StartAfterStopResumesBackgroundRoundsWithSameGcId)
 
 /// (c) STOP and START are both idempotent: a second STOP on an already-stopped scheduler is a safe no-op,
 /// and a second START on a running one is a no-op that leaves it running (a manual round still works).
-TEST(CasGcStopStart, StopAndStartAreIdempotent)
+TEST(CASGcStopStart, StopAndStartAreIdempotent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -345,7 +345,7 @@ TEST(CasGcStopStart, StopAndStartAreIdempotent)
 /// decommissioned pool is meaningless and would only spin failing rounds -- while STOP on the SAME
 /// Vanished disk (with a live scheduler present) SUCCEEDS: stopping the reclaimer on a sick disk is a
 /// legitimate operator action, so STOP never consults the operation gate.
-TEST(CasGcStopStart, StartRefusesOnVanishedButStopSucceeds)
+TEST(CASGcStopStart, StartRefusesOnVanishedButStopSucceeds)
 {
     /// START on a Vanished disk -> typed 668. No scheduler needed: the gate refuses before touching it.
     {
@@ -370,7 +370,7 @@ TEST(CasGcStopStart, StartRefusesOnVanishedButStopSucceeds)
 
 /// (f) The disk stays fully usable while its GC scheduler is stopped: a store()-path write + read succeed
 /// after `gcStop`. STOP controls ONLY the GC pacer, not the disk's data plane.
-TEST(CasGcStopStart, DiskReadsWritesUnaffectedWhileGcStopped)
+TEST(CASGcStopStart, DiskReadsWritesUnaffectedWhileGcStopped)
 {
     auto storage = openGcStorage();
     storage->gcStart();   /// create + start the scheduler
@@ -394,7 +394,7 @@ TEST(CasGcStopStart, DiskReadsWritesUnaffectedWhileGcStopped)
 /// and — since the final serialized call determines the resting state — a single quiet STOP then START at
 /// the end lands the object in a well-defined, usable state (last call wins). ASan/TSan running this proves
 /// the racing start()/stop() thread spawns+joins never race the shared members.
-TEST(CasGcStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
+TEST(CASGcStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
 {
     auto storage = openGcStorage();
 
@@ -446,7 +446,7 @@ TEST(CasGcStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
 /// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
 /// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the
 /// SAME instance (`gc_id` preserved). The positive control makes the negative meaningful: the sink IS live.
-TEST(CasGcStopStart, OperatorStopPersistsAcrossTransientRecovery)
+TEST(CASGcStopStart, OperatorStopPersistsAcrossTransientRecovery)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

@@ -95,7 +95,7 @@ struct CaWiringFixture
 
 }
 
-TEST(CasCommitOutcome, PromoteReportsCreatedAndManifest)
+TEST(CASCommitOutcome, PromoteReportsCreatedAndManifest)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_1_1_0"};
@@ -109,7 +109,7 @@ TEST(CasCommitOutcome, PromoteReportsCreatedAndManifest)
     EXPECT_EQ(oc.manifest_ref, staged.id.ref);
 }
 
-TEST(CasCommitOutcome, DropRefIfMatchesRemovesOnlyExact)
+TEST(CASCommitOutcome, DropRefIfMatchesRemovesOnlyExact)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_2_2_0"};
@@ -130,7 +130,7 @@ TEST(CasCommitOutcome, DropRefIfMatchesRemovesOnlyExact)
     EXPECT_FALSE(fx.partAccess().existsRef(key, Cas::Freshness::ForceFresh));
 }
 
-TEST(CasCommitOutcome, DropRefIfMatchesOnAbsentRefIsANoOp)
+TEST(CASCommitOutcome, DropRefIfMatchesOnAbsentRefIsANoOp)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_3_3_0"};
@@ -142,7 +142,7 @@ TEST(CasCommitOutcome, DropRefIfMatchesOnAbsentRefIsANoOp)
 /// `repointRef`'s byte-equal candidate is a documented ZERO-pool-mutation no-op (it must not mint a
 /// fresh manifest just to compare it). The returned `CommitOutcome` must still describe reality: the
 /// CURRENTLY committed manifest, unchanged, `created=false`.
-TEST(CasCommitOutcome, RepointRefByteEqualNoOpReportsCurrentManifestNotCreated)
+TEST(CASCommitOutcome, RepointRefByteEqualNoOpReportsCurrentManifestNotCreated)
 {
     CaWiringFixture fx;
     const Cas::PartRefKey key{fx.ns(), "20260101_4_4_0"};
@@ -268,7 +268,7 @@ CaTxnRollbackFixture makeCaWiringFixture()
 /// [TXN-ONE-PIPELINE] Task 3: `commit()` publishes `new_a` (created=true) then fails on `new_b`'s
 /// promote. The rollback must drop the just-created `new_a` (absent afterward) but never touch the
 /// unrelated `pre_existing` ref committed by an EARLIER, already-finished transaction.
-TEST(CasCommitRollback, AbsentBeforeDroppedPreExistingUntouched)
+TEST(CASCommitRollback, AbsentBeforeDroppedPreExistingUntouched)
 {
     auto fx = makeCaWiringFixture();
     const Cas::PartRefKey pre{fx.ns(), "pre_existing_1_1_0"};
@@ -292,7 +292,7 @@ TEST(CasCommitRollback, AbsentBeforeDroppedPreExistingUntouched)
 /// `a_shared_...` and the "poison" part `z_poison_...` here purely so `'a' < 'z'` makes "shared"
 /// publish (and get repointed by the hook) deterministically BEFORE "poison" fails; this is a test
 /// naming choice, not a production ordering guarantee.
-TEST(CasCommitRollback, RepointByOtherWriterSurvivesRollback)
+TEST(CASCommitRollback, RepointByOtherWriterSurvivesRollback)
 {
     auto fx = makeCaWiringFixture();
     const Cas::PartRefKey key{fx.ns(), "a_shared_1_1_0"};

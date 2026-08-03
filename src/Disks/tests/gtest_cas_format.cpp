@@ -10,7 +10,7 @@ namespace DB::ErrorCodes
 
 using namespace DB::Cas;
 
-TEST(CasFormat, ChangePointsExistForEveryClass)
+TEST(CASFormat, ChangePointsExistForEveryClass)
 {
     /// Every class that existed from the start has a non-empty, gen-1 baseline.
     for (auto id : {FormatId::Blob,
@@ -36,7 +36,7 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
 /// invisible otherwise — nothing consults `changePoints` at decode time yet, so a wrong entry here
 /// would sit unnoticed until the day a per-class reader floor is wired and starts admitting objects it
 /// should refuse.
-TEST(CasFormat, ChangePointsOfAClassBornAfterGenerationOneStartAtItsBirth)
+TEST(CASFormat, ChangePointsOfAClassBornAfterGenerationOneStartAtItsBirth)
 {
     const auto cps = changePoints(FormatId::RefCkpt);
     ASSERT_EQ(cps.size(), 4u);
@@ -51,7 +51,7 @@ TEST(CasFormat, ChangePointsOfAClassBornAfterGenerationOneStartAtItsBirth)
     EXPECT_EQ(cps.back().min_reader, kCommittedRefFrontierGeneration);
 }
 
-TEST(CasFormat, PoolMetaTracksTheRecreateOnlyRecoveryFrontierGeneration)
+TEST(CASFormat, PoolMetaTracksTheRecreateOnlyRecoveryFrontierGeneration)
 {
     const auto cps = changePoints(FormatId::PoolMeta);
     ASSERT_EQ(cps.size(), 3u);
@@ -59,19 +59,19 @@ TEST(CasFormat, PoolMetaTracksTheRecreateOnlyRecoveryFrontierGeneration)
     EXPECT_EQ(cps.back().min_reader, kCommittedRefFrontierGeneration);
 }
 
-TEST(CasFormat, CurrentVersionsAreGBuild)
+TEST(CASFormat, CurrentVersionsAreGBuild)
 {
     EXPECT_EQ(currentWriterVersion(), G_BUILD);
     EXPECT_EQ(currentCompatibilityVersion(), G_BUILD);
 }
 
-TEST(CasFormat, CheckCompatibilityPassesWhenKnown)
+TEST(CASFormat, CheckCompatibilityPassesWhenKnown)
 {
     EXPECT_NO_THROW(checkCompatibility(1u, "manifest"));
     EXPECT_NO_THROW(checkCompatibility(G_BUILD, "manifest"));
 }
 
-TEST(CasFormat, CheckCompatibilityFailsClosedOnFuture)
+TEST(CASFormat, CheckCompatibilityFailsClosedOnFuture)
 {
     try
     {

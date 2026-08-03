@@ -22,7 +22,7 @@ ManifestId id(const char * ns, uint64_t w, uint64_t seq, uint64_t m)
 
 }
 
-TEST(CasManifestId, RefEqualityAndOrdering)
+TEST(CASManifestId, RefEqualityAndOrdering)
 {
     EXPECT_EQ(ref(1, 2, 3), ref(1, 2, 3));
     EXPECT_NE(ref(1, 2, 3), ref(1, 2, 4));
@@ -33,7 +33,7 @@ TEST(CasManifestId, RefEqualityAndOrdering)
     EXPECT_FALSE(ref(1, 2, 3) < ref(1, 2, 3));
 }
 
-TEST(CasManifestId, IdIsNamespaceQualified)
+TEST(CASManifestId, IdIsNamespaceQualified)
 {
     /// Same ref tuple, different namespace => DIFFERENT ids (the SabotageKeyByRefNotId guard).
     EXPECT_NE(id("nsA", 1, 1, 1), id("nsB", 1, 1, 1));
@@ -42,7 +42,7 @@ TEST(CasManifestId, IdIsNamespaceQualified)
     EXPECT_LT(id("nsA", 9, 9, 9), id("nsB", 0, 0, 0));
 }
 
-TEST(CasManifestId, UsableAsMapAndSetKey)
+TEST(CASManifestId, UsableAsMapAndSetKey)
 {
     std::set<ManifestId> s;
     s.insert(id("nsA", 1, 1, 1));
@@ -57,7 +57,7 @@ TEST(CasManifestId, UsableAsMapAndSetKey)
     EXPECT_EQ(m[ref(1, 1, 1)], 10);
 }
 
-TEST(CasManifestId, UsableInUnorderedContainers)
+TEST(CASManifestId, UsableInUnorderedContainers)
 {
     /// std::hash<ManifestRef> / std::hash<ManifestId> let the read-path cache (Phase 1c) and GC use
     /// unordered_map/set. Equal values => equal hash; distinct values => (overwhelmingly) distinct.
@@ -77,7 +77,7 @@ TEST(CasManifestId, UsableInUnorderedContainers)
     EXPECT_EQ(std::hash<ManifestId>{}(id("nsA", 1, 1, 1)), std::hash<ManifestId>{}(id("nsA", 1, 1, 1)));
 }
 
-TEST(CasManifestId, ManifestOrdinalFileName)
+TEST(CASManifestId, ManifestOrdinalFileName)
 {
     EXPECT_EQ(manifestOrdinalFileName(1), "000001.zst");
     EXPECT_EQ(manifestOrdinalFileName(999999), "999999.zst");

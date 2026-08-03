@@ -90,7 +90,7 @@ void writeFileTx(DB::IMetadataTransaction & tx, const std::string & path, const 
 /// BUG 1a: promoting a DIFFERENT manifest onto an already-committed ref must fail closed (ABORTED),
 /// not silently overwrite (which orphans the old manifest, PROMOTE-OVER-COMMITTED-LEAK).
 /// PRE-FIX: promote() does not throw -- this test FAILS (RED), which IS the leak reproducing.
-TEST(CasPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
+TEST(CASPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -118,7 +118,7 @@ TEST(CasPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
 /// Re-promoting the SAME manifest_ref onto its own committed ref must NOT throw (idempotent
 /// re-promote): the fix's guard keys on a DIFFERENT manifest_ref, not merely "ref already committed".
 /// This is expected to pass BOTH pre- and post-fix (it is not part of the bug).
-TEST(CasPromoteRepublish, PromoteSameManifestIsIdempotent)
+TEST(CASPromoteRepublish, PromoteSameManifestIsIdempotent)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -134,7 +134,7 @@ TEST(CasPromoteRepublish, PromoteSameManifestIsIdempotent)
 
 /// Sanity companion to BUG 1a: promote over an ABSENT ref (the normal insert path) must succeed
 /// unconditionally -- the fail-close guard must only fire for an EXISTING different committed ref.
-TEST(CasPromoteRepublish, PromoteOverAbsentRefSucceeds)
+TEST(CASPromoteRepublish, PromoteOverAbsentRefSucceeds)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -155,7 +155,7 @@ TEST(CasPromoteRepublish, PromoteOverAbsentRefSucceeds)
 /// unconditionally, minting a FRESH manifest id at dst even though the content is identical, orphaning
 /// the first attempt's manifest. This test asserts dst's ManifestId is UNCHANGED across the re-drive --
 /// PRE-FIX this FAILS (RED: the id changes, proving the orphaning leak).
-TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
+TEST(CASPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
 {
     auto storage = openTxStorage();
     const auto ns = storage->liveNamespace("b09b09b0-0909-4909-8909-090909090909");
@@ -235,7 +235,7 @@ TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
 /// (ABORTED), never silently drop src (which would lose src's content) nor silently overwrite dst.
 /// This scenario reaches the SAME `promote`-over-different-committed-ref guard as BUG 1a, so pre-fix it
 /// behaves the same way BUG 1a does: no throw (silent overwrite), which is also a leak/data-loss risk.
-TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
+TEST(CASPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 {
     auto storage = openTxStorage();
     const auto ns = storage->liveNamespace("b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a");
@@ -291,10 +291,10 @@ TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 /// below is the dedicated A3 regression pin.
 ///
 /// `rebuild->precommitAdd(ns, ref, id)` below throws `LOGICAL_ERROR`, which aborts the whole process in
-/// debug/sanitizer builds instead of behaving like a catchable exception -- `CasPromoteRepublishDeathTest.
+/// debug/sanitizer builds instead of behaving like a catchable exception -- `CASPromoteRepublishDeathTest.
 /// AbandonEmitsRemovalBeforeRetireAborts` below proves the abort positively in those builds instead.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
+TEST(CASPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -322,7 +322,7 @@ TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
+TEST(CASPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -346,12 +346,12 @@ TEST(CasPromoteRepublishDeathTest, AbandonEmitsRemovalBeforeRetireAborts)
 /// (`ContentAddressedTransaction.cpp:358,412`, `PartFolderAccess.cpp:352`).
 ///
 /// `txn2->precommitAdd(ns, ref, id)` below throws `LOGICAL_ERROR`, which aborts the whole process in
-/// debug/sanitizer builds instead of behaving like a catchable exception -- `CasPromoteRepublishDeathTest.
+/// debug/sanitizer builds instead of behaving like a catchable exception -- `CASPromoteRepublishDeathTest.
 /// PrecommitAddRejectsAnIdThisTxnDidNotStageAborts` below proves the abort positively in those builds
 /// instead (it cannot also re-check the post-throw ref-log-tail/resolveRef state this test verifies,
 /// since there IS no post-abort state in a real debug/sanitizer build).
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
+TEST(CASPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -385,7 +385,7 @@ TEST(CasPromoteRepublish, PrecommitAddRejectsAnIdThisTxnDidNotStage)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasPromoteRepublishDeathTest, PrecommitAddRejectsAnIdThisTxnDidNotStageAborts)
+TEST(CASPromoteRepublishDeathTest, PrecommitAddRejectsAnIdThisTxnDidNotStageAborts)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);

@@ -177,7 +177,7 @@ BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
     return source;
 }
 
-TEST(CasFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
+TEST(CASFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openTestPool(backend);
@@ -218,7 +218,7 @@ TEST(CasFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
 
 /// (a) `casPutObject` (reached via `Pool::putNamespaceFile`) with the fence tripped BETWEEN admission
 /// and the durable PUT: the typed transient refusal, and the object is never actually written.
-TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
+TEST(CASFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadBackend>();
     auto store = openTestPool(backend);
@@ -238,7 +238,7 @@ TEST(CasFenceGeneration, PlainObjectPutAbortsWhenFenceTripsBetweenAdmissionAndDu
 
 /// `casRemoveObject`'s delete sibling, same shape: the fence trips between admission and the durable
 /// delete, so the victim object survives untouched.
-TEST(CasFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
+TEST(CASFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAndDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadBackend>();
     auto store = openTestPool(backend);
@@ -265,7 +265,7 @@ TEST(CasFenceGeneration, PlainObjectRemoveAbortsWhenFenceTripsBetweenAdmissionAn
 /// (spec wording, verbatim): a synthetic `PreconditionFailed` forces a second loop iteration, and the
 /// fence trips on the SECOND `head()` call. If the check ran only once, at admission, this write would
 /// incorrectly succeed on the retry.
-TEST(CasFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJustFirst)
+TEST(CASFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJustFirst)
 {
     auto backend = std::make_shared<TripOnSecondHeadBackend>();
     auto store = openTestPool(backend);
@@ -289,7 +289,7 @@ TEST(CasFenceGeneration, PlainObjectPutRechecksFenceOnEveryRetryIterationNotJust
 /// (admission) but BEFORE `finalize()` reaches the durable `sink->finalize()` call -- same typed abort,
 /// and the sink is never actually finalized (`on_finalized` never fires either, so the transaction
 /// never learns of a promote-worthy hash/size for bytes that were never durable).
-TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
+TEST(CASFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openTestPool(backend);
@@ -328,7 +328,7 @@ TEST(CasFenceGeneration, S3StagingFinalizeAbortsWhenFenceTripsBeforeDurableCall)
 
 /// (d) Happy path unchanged: an ordinary plain-object write/read/remove, and an ordinary S3-staging
 /// finalize, both succeed exactly as before when the fence stays live throughout.
-TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
+TEST(CASFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openTestPool(backend);
@@ -343,7 +343,7 @@ TEST(CasFenceGeneration, HappyPathPlainObjectWriteReadRemoveUnaffected)
     EXPECT_FALSE(store->getNamespaceFile(DB::Cas::tests::fixture::fixtureLife(ns), "a").has_value());
 }
 
-TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
+TEST(CASFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openTestPool(backend);
@@ -380,7 +380,7 @@ TEST(CasFenceGeneration, HappyPathS3StagingFinalizeUnaffected)
 /// the head() that precedes the displacement decision: the [C2] `checkFenceOrThrow` must abort with the
 /// typed transient refusal BEFORE `putOverwrite`, leaving the condemned incarnation untouched (no
 /// stale-incarnation displacement).
-TEST(CasFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableCall)
+TEST(CASFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadDisplacementBackend>();
     auto store = openTestPool(backend);
@@ -428,7 +428,7 @@ TEST(CasFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableC
 /// controller-uncoupled backend write. Same setup + fence trip -> the [C2] `checkFenceOrThrow` aborts with
 /// the typed transient refusal BEFORE `resurrectStaged`, so no unconditional server-side copy displaces
 /// the condemned incarnation.
-TEST(CasFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall)
+TEST(CASFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall)
 {
     auto backend = std::make_shared<TripOnHeadDisplacementBackend>();
     auto store = openTestPool(backend);

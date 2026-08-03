@@ -4,7 +4,7 @@
 
 using namespace DB::Cas;
 
-TEST(CasIds, StrongTypingAndContainers)
+TEST(CASIds, StrongTypingAndContainers)
 {
     /// Test the strong-typed-string class `RootNamespace`.
     /// (`BlobId` was deleted in the mixed-algo-pools refactor; `TreeId` was part of the
@@ -18,7 +18,7 @@ TEST(CasIds, StrongTypingAndContainers)
     EXPECT_EQ(s.size(), 2u);
 }
 
-TEST(CasIds, HexU128RoundTrip)
+TEST(CASIds, HexU128RoundTrip)
 {
     // UInt128 is a global typedef (wide::integer<128,unsigned>), not in DB:: namespace.
     const UInt128 v = (UInt128(0x0123456789abcdefULL) << 64) | 0xfedcba9876543210ULL;
@@ -29,7 +29,7 @@ TEST(CasIds, HexU128RoundTrip)
     EXPECT_THROW(hexToU128("0123"), DB::Exception);        // wrong length
 }
 
-TEST(CasToken, Basics)
+TEST(CASToken, Basics)
 {
     Token a{"etag-1", TokenType::ETag};
     Token b{"etag-1", TokenType::ETag};

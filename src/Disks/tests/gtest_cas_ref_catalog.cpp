@@ -180,7 +180,7 @@ private:
 
 /// ---------- format-battery registration ----------
 
-TEST(CasFormatBattery, RefCatalog)
+TEST(CASFormatBattery, RefCatalog)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating,
@@ -199,7 +199,7 @@ TEST(CasFormatBattery, RefCatalog)
 
 /// ---------- codec round-trip ----------
 
-TEST(CasRefCatalogFormat, RoundTripsAllThreeStates)
+TEST(CASRefCatalogFormat, RoundTripsAllThreeStates)
 {
     RefCatalog in;
     in.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating,
@@ -221,7 +221,7 @@ TEST(CasRefCatalogFormat, RoundTripsAllThreeStates)
 
 /// Mutation caught: making removal age caller-local or optional would let an adopted `Removing` row
 /// lose the immutable round from which stuck-removal diagnostics measure.
-TEST(CasRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
+TEST(CASRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
 {
     CatalogEntry removing{
         .ns = RootNamespace{"removing"},
@@ -242,7 +242,7 @@ TEST(CasRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
     });
 }
 
-TEST(CasRefCatalogFormat, EmptyCatalogRoundTrips)
+TEST(CASRefCatalogFormat, EmptyCatalogRoundTrips)
 {
     EXPECT_EQ(decodeRefCatalog(encodeRefCatalog(RefCatalog{})), RefCatalog{});
 }
@@ -250,7 +250,7 @@ TEST(CasRefCatalogFormat, EmptyCatalogRoundTrips)
 /// Mutation caught: replacing the reverse index with `emplace`-and-ignore would make the first row
 /// win. Every lifecycle state participates, both duplicate ids are unresolvable, and an unrelated
 /// unique row remains usable by point resolution.
-TEST(CasRefCatalogLifeIndex, DuplicatePhysicalIdsAreAmbiguousWithoutPoisoningUniquePointResolution)
+TEST(CASRefCatalogLifeIndex, DuplicatePhysicalIdsAreAmbiguousWithoutPoisoningUniquePointResolution)
 {
     RefCatalog catalog;
     catalog.entries = {
@@ -273,7 +273,7 @@ TEST(CasRefCatalogLifeIndex, DuplicatePhysicalIdsAreAmbiguousWithoutPoisoningUni
 
 /// Catalog mutation is destructive authority: any ambiguous current id stops the mutation before a
 /// candidate can be written. An unrelated unique point lookup remains available from the same cut.
-TEST(CasRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLookup)
+TEST(CASRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLookup)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -298,7 +298,7 @@ TEST(CasRefCatalogLifeIndex, AmbiguityStopsCatalogMutationButNotUnrelatedPointLo
     EXPECT_EQ(unique->incarnation, UInt128{9});
 }
 
-TEST(CasRefCatalogFormat, NamespaceAtExactByteBoundRoundTrips)
+TEST(CASRefCatalogFormat, NamespaceAtExactByteBoundRoundTrips)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry(String(kMaxNamespaceBytes, 'a'), 1));
@@ -315,7 +315,7 @@ TEST(CasRefCatalogFormat, NamespaceAtExactByteBoundRoundTrips)
 /// positively on debug/sanitizer builds instead.
 #ifndef DEBUG_OR_SANITIZER_BUILD
 
-TEST(CasRefCatalogFormat, EncodeRejectsDuplicateNamespace)
+TEST(CASRefCatalogFormat, EncodeRejectsDuplicateNamespace)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 1));
@@ -323,7 +323,7 @@ TEST(CasRefCatalogFormat, EncodeRejectsDuplicateNamespace)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsNonCanonicalOrder)
+TEST(CASRefCatalogFormat, EncodeRejectsNonCanonicalOrder)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("b", 1));
@@ -331,7 +331,7 @@ TEST(CasRefCatalogFormat, EncodeRejectsNonCanonicalOrder)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsCreatorPresentOnLive)
+TEST(CASRefCatalogFormat, EncodeRejectsCreatorPresentOnLive)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1),
@@ -339,28 +339,28 @@ TEST(CasRefCatalogFormat, EncodeRejectsCreatorPresentOnLive)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsCreatorAbsentOnCreating)
+TEST(CASRefCatalogFormat, EncodeRejectsCreatorAbsentOnCreating)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1)});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsZeroIncarnation)
+TEST(CASRefCatalogFormat, EncodeRejectsZeroIncarnation)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 0));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsNameOverByteBound)
+TEST(CASRefCatalogFormat, EncodeRejectsNameOverByteBound)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry(String(kMaxNamespaceBytes + 1, 'a'), 1));
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
-TEST(CasRefCatalogFormat, EncodeRejectsEmptyNamespace)
+TEST(CASRefCatalogFormat, EncodeRejectsEmptyNamespace)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("", 1));
@@ -369,7 +369,7 @@ TEST(CasRefCatalogFormat, EncodeRejectsEmptyNamespace)
 
 /// Mutation caught: making removal age caller-local or optional would let an adopted `Removing` row
 /// lose the immutable round from which stuck-removal diagnostics measure.
-TEST(CasRefCatalogFormat, EncodeRejectsLiveWithRemovalStartedRound)
+TEST(CASRefCatalogFormat, EncodeRejectsLiveWithRemovalStartedRound)
 {
     CatalogEntry live_with_round = liveEntry("live", 8);
     live_with_round.removal_started_round = 20;
@@ -381,7 +381,7 @@ TEST(CasRefCatalogFormat, EncodeRejectsLiveWithRemovalStartedRound)
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 1));
@@ -389,7 +389,7 @@ TEST(CasRefCatalogFormatDeathTest, EncodeRejectsDuplicateNamespaceAborts)
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("b", 1));
@@ -397,7 +397,7 @@ TEST(CasRefCatalogFormatDeathTest, EncodeRejectsNonCanonicalOrderAborts)
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "not canonically ordered");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Live, .incarnation = UInt128(1),
@@ -405,35 +405,35 @@ TEST(CasRefCatalogFormatDeathTest, EncodeRejectsCreatorPresentOnLiveAborts)
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "carries a creator fence");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsCreatorAbsentOnCreatingAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsCreatorAbsentOnCreatingAborts)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating, .incarnation = UInt128(1)});
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "lacks a creator fence");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsZeroIncarnationAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsZeroIncarnationAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("a", 0));
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "zero incarnation");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsNameOverByteBoundAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsNameOverByteBoundAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry(String(kMaxNamespaceBytes + 1, 'a'), 1));
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "admission bound");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
 {
     RefCatalog c;
     c.entries.push_back(liveEntry("", 1));
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
 }
 
-TEST(CasRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAborts)
+TEST(CASRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAborts)
 {
     CatalogEntry live_with_round = liveEntry("live", 8);
     live_with_round.removal_started_round = 20;
@@ -448,7 +448,7 @@ TEST(CasRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAbort
 /// because neither this codec nor `validateServerRootId` restricts the charset, only the length.
 /// The refusal must be `LIMIT_EXCEEDED` (a capacity refusal), not `LOGICAL_ERROR` (a bug report) --
 /// `encodeFoldSeal`'s own `checkLineBytes` raises `LIMIT_EXCEEDED` for the identical shape of gate.
-TEST(CasRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
+TEST(CASRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
 {
     RefCatalog c;
     c.entries.push_back(CatalogEntry{
@@ -461,59 +461,59 @@ TEST(CasRefCatalogFormat, EncodeLineOverCapRaisesLimitExceeded)
 
 /// ---------- strict rejections: decode side (CORRUPTED_DATA -- bytes may have come from anywhere) ----------
 
-TEST(CasRefCatalogFormat, DecodeRejectsDuplicateNamespace)
+TEST(CASRefCatalogFormat, DecodeRejectsDuplicateNamespace)
 {
     const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1))),
                                     rawEntLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsNonCanonicalOrder)
+TEST(CASRefCatalogFormat, DecodeRejectsNonCanonicalOrder)
 {
     const String bad = rawCatalog({rawEntLine("b", "live", u128ToHex(UInt128(1))),
                                     rawEntLine("a", "live", u128ToHex(UInt128(2)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsCreatorPresentOnLive)
+TEST(CASRefCatalogFormat, DecodeRejectsCreatorPresentOnLive)
 {
     const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(1)),
                                                std::make_tuple(String("srv"), uint64_t(1), uint64_t(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsCreatorAbsentOnCreating)
+TEST(CASRefCatalogFormat, DecodeRejectsCreatorAbsentOnCreating)
 {
     const String bad = rawCatalog({rawEntLine("a", "creating", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsZeroIncarnation)
+TEST(CASRefCatalogFormat, DecodeRejectsZeroIncarnation)
 {
     const String bad = rawCatalog({rawEntLine("a", "live", u128ToHex(UInt128(0)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsNameOverByteBound)
+TEST(CASRefCatalogFormat, DecodeRejectsNameOverByteBound)
 {
     const String too_long_ns(kMaxNamespaceBytes + 1, 'a');
     const String bad = rawCatalog({rawEntLine(too_long_ns, "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsUnknownState)
+TEST(CASRefCatalogFormat, DecodeRejectsUnknownState)
 {
     const String bad = rawCatalog({rawEntLine("a", "bogus", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsEmptyNamespace)
+TEST(CASRefCatalogFormat, DecodeRejectsEmptyNamespace)
 {
     const String bad = rawCatalog({rawEntLine("", "live", u128ToHex(UInt128(1)))});
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCatalog(bad); });
 }
 
-TEST(CasRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
+TEST(CASRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 {
     /// No "ns" key at all -- must be refused exactly like an explicit empty one, not read as "".
     const String bad = rawCatalog({R"({"k":"ent","st":"live","inc":")" + u128ToHex(UInt128(1)) + "\"}"});
@@ -524,9 +524,9 @@ TEST(CasRefCatalogFormat, DecodeRejectsMissingNamespaceKey)
 /// validated on decode, so an unrecognized value is a bug in THIS process -- `LOGICAL_ERROR`, matching
 /// this file's own stated taxonomy for the encode-side helper it (indirectly, via `creatorPairingOk`'s
 /// error message) serves. Aborts under debug/sanitizer builds -- split like the block above;
-/// `CasRefCatalogFormatDeathTest.NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts` covers it there.
+/// `CASRefCatalogFormatDeathTest.NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts` covers it there.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
+TEST(CASRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 {
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { nsStateToWord(static_cast<NsState>(99)); });
@@ -534,7 +534,7 @@ TEST(CasRefCatalogFormat, NsStateToWordRaisesLogicalErrorOnImpossibleValue)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
+TEST(CASRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleValueAborts)
 {
     EXPECT_DEATH({ (void)nsStateToWord(static_cast<NsState>(99)); }, "unknown ns state"); // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): the whole point of this test is an impossible enum value
 }
@@ -545,7 +545,7 @@ TEST(CasRefCatalogFormatDeathTest, NsStateToWordRaisesLogicalErrorOnImpossibleVa
 /// The registry row is part of the contract, mirroring `gtest_cas_ref_ckpt.cpp`'s
 /// `RegistryRowIsControlStrictWithTightCaps`: Control/Strict decides how the decoder treats unknown
 /// keys, and the caps are the first thing that fires if a foreign object ever lands at the key.
-TEST(CasRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
+TEST(CASRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
 {
     const FormatTraits & traits = traitsFor(FormatId::RefCatalog);
     EXPECT_EQ(traits.type, "cas_ref_catalog");
@@ -565,7 +565,7 @@ TEST(CasRefCatalogFormat, RegistryRowIsControlStrictWithRawStorage)
 
 /// ---------- capacity admission: per-predicate boundary tests [codex r2/r3 finding 9] ----------
 
-TEST(CasRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
+TEST(CASRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
 {
     const uint64_t cap = traitsFor(FormatId::RefCatalog).object_cap;
     const RootNamespace ns{"admitted"};
@@ -583,7 +583,7 @@ TEST(CasRefCatalogAdmission, Predicate1AcceptsEqualityRefusesCapPlusOne)
     }
 }
 
-TEST(CasRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
+TEST(CASRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
 {
     const Layout layout("p");
     constexpr uint64_t gc_shards = 1;
@@ -618,7 +618,7 @@ TEST(CasRefCatalogAdmission, Predicate2AcceptsEqualityRefusesOneEntryOver)
 /// itself (a few KiB) -- which reads as trivially "fits" a 256 MiB cap even though the real
 /// reservation this many entries demands is astronomically larger. A saturating multiply refuses it
 /// regardless of the wraparound arithmetic underneath.
-TEST(CasRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWrapping)
+TEST(CASRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWrapping)
 {
     const Layout layout("p");
     const uint64_t reservation = worstCaseEntryFoldReservationBytes();
@@ -627,7 +627,7 @@ TEST(CasRefCatalogAdmission, Predicate2SaturatesEntryCountReservationInsteadOfWr
         [&] { checkFoldSealReservation(entry_count, 1, layout, RootNamespace{"huge"}); });
 }
 
-TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
+TEST(CASRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
 {
     /// `checkCatalogAdmission` runs predicate (1) then predicate (2) against the SAME candidate; for
     /// an ordinary small catalog both hold slack and it returns the exact bytes `encodeRefCatalog`
@@ -640,7 +640,7 @@ TEST(CasRefCatalogAdmission, CombinedAdmissionPropagatesCandidateEntryCount)
     EXPECT_EQ(encoded, encodeRefCatalog(candidate));
 }
 
-TEST(CasRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimalTransitions)
+TEST(CASRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimalTransitions)
 {
     const Layout layout("p/quoted-\"prefix");
     constexpr uint64_t gc_shards = 100;
@@ -693,7 +693,7 @@ TEST(CasRefCatalogAdmission, ReservationCoversActualWidestLegalRowsAcrossDecimal
 
 /// ---------- Constraint 13: removal is never refused, even at the admission boundary ----------
 
-TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
+TEST(CASRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
 {
     const Layout layout("p");
     constexpr uint64_t gc_shards = 1;
@@ -734,7 +734,7 @@ TEST(CasRefCatalogAdmission, RemovalNeverRefusedEvenAtCapacity)
 
 /// ---------- Pool/CasRefCatalog: token-CAS read / create / update / conflict-retry ----------
 
-TEST(CasRefCatalog, ReadAbsentFailsClosed)
+TEST(CASRefCatalog, ReadAbsentFailsClosed)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -742,7 +742,7 @@ TEST(CasRefCatalog, ReadAbsentFailsClosed)
         DB::ErrorCodes::CORRUPTED_DATA, [&] { (void)CasRefCatalog::read(backend, layout); });
 }
 
-TEST(CasRefCatalog, CasUpdateRefusesWhenAbsent)
+TEST(CASRefCatalog, CasUpdateRefusesWhenAbsent)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -754,7 +754,7 @@ TEST(CasRefCatalog, CasUpdateRefusesWhenAbsent)
     EXPECT_FALSE(backend.head(layout.refCatalogKey()).exists);
 }
 
-TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
+TEST(CASRefCatalog, CasUpdateAppliesOnTopOfExistingState)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -776,10 +776,10 @@ TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
 /// `CasRefCatalog::casUpdate`'s identity-preserving refusal throws `LOGICAL_ERROR`, which aborts the
 /// whole process in debug/sanitizer builds (`Common/Exception.cpp`'s `handle_error_code`) instead of
 /// behaving like a catchable exception -- so the throw-and-catch form below runs only on a plain
-/// release build, and `CasRefCatalogDeathTest.GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts`
+/// release build, and `CASRefCatalogDeathTest.GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts`
 /// proves the abort positively on debug/sanitizer builds instead.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
+TEST(CASRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
 {
     const Layout layout("p");
     {
@@ -810,7 +810,7 @@ TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts)
+TEST(CASRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts)
 {
     const Layout layout("p");
     {
@@ -840,7 +840,7 @@ TEST(CasRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentit
 }
 #endif
 
-TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
+TEST(CASRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -867,7 +867,7 @@ TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
     EXPECT_EQ(snap.catalog, result);
 }
 
-TEST(CasRefCatalog, BeginRemovingRechecksFenceAfterCatalogCasConflict)
+TEST(CASRefCatalog, BeginRemovingRechecksFenceAfterCatalogCasConflict)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -909,7 +909,7 @@ TEST(CasRefCatalog, BeginRemovingRechecksFenceAfterCatalogCasConflict)
 /// Missing mandatory authority raises `CORRUPTED_DATA`; the split remains only because the debug
 /// variant historically lived in the death-test suite.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
+TEST(CASRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -937,7 +937,7 @@ TEST(CasRefCatalog, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalog)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalogAborts)
+TEST(CASRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTheCatalogAborts)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -963,7 +963,7 @@ TEST(CasRefCatalogDeathTest, CasUpdateThrowsOnVanishMidRetryInsteadOfReplacingTh
 /// The retry loop is bounded (the same live-lock brake `publishCkpt`/`allocateWriterEpoch` use on
 /// their own contended token-CAS singletons) and ends in the typed retryable error, not an infinite
 /// spin. `mutate` re-arms the one-shot conflict injection on every call, so every attempt fails.
-TEST(CasRefCatalog, CasUpdateGivesUpAfterBoundedAttemptsWithRetryLaterError)
+TEST(CASRefCatalog, CasUpdateGivesUpAfterBoundedAttemptsWithRetryLaterError)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -983,7 +983,7 @@ TEST(CasRefCatalog, CasUpdateGivesUpAfterBoundedAttemptsWithRetryLaterError)
     EXPECT_GT(mutate_calls, 1);   /// genuinely retried, not a single-shot failure
 }
 
-TEST(CasRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
+TEST(CASRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -996,7 +996,7 @@ TEST(CasRefCatalog, CasAdmitEntryAcceptsAnOrdinaryCreation)
     EXPECT_EQ(created.entries[0].state, NsState::Creating);
 }
 
-TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
+TEST(CASRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -1013,7 +1013,7 @@ TEST(CasRefCatalog, CasAdmitEntryInsertsAtCanonicalPosition)
 /// `checkCatalogAdmission` -- no separate duplicate check needed here. That `LOGICAL_ERROR` aborts
 /// under debug/sanitizer builds -- split like the blocks above.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
+TEST(CASRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -1025,7 +1025,7 @@ TEST(CasRefCatalog, CasAdmitEntryRejectsADuplicateNamespace)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
+TEST(CASRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -1035,7 +1035,7 @@ TEST(CasRefCatalogDeathTest, CasAdmitEntryRejectsADuplicateNamespaceAborts)
 }
 #endif
 
-TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
+TEST(CASRefCatalog, CasAdmitEntryRefusesOverCapacity)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -1065,7 +1065,7 @@ TEST(CasRefCatalog, CasAdmitEntryRefusesOverCapacity)
     EXPECT_EQ(snap.catalog.entries.size(), max_entries);
 }
 
-TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLeaderFence)
+TEST(CASRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLeaderFence)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1137,7 +1137,7 @@ TEST(CasRefCatalogRemoval, DeleteCompletedRemovingRequiresExactAdoptedProofAndLe
     EXPECT_EQ(backend.deleteTotal(), 0);
 }
 
-TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCarryRemoval)
+TEST(CASRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCarryRemoval)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1173,7 +1173,7 @@ TEST(CasRefCatalogRemoval, ExactDeletionRefusesChangedEntryAndAdmissionCannotCar
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
+TEST(CASRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1193,7 +1193,7 @@ TEST(CasRefCatalogRemovalDeathTest, AdmissionCannotCarryRemovalAborts)
 /// Mutation caught: deriving the control outcome from the resolution snapshot would turn a stale
 /// leader's `FencedOut` into `Deleted` or `EntryChanged`. Resolution may prove the old life dead and
 /// carry its invalidation, but it cannot restore the caller's authority to continue the GC round.
-TEST(CasRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrReplacesLife)
+TEST(CASRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrReplacesLife)
 {
     for (const bool replace : {false, true})
     {
@@ -1243,7 +1243,7 @@ TEST(CasRefCatalogRemoval, FenceLossRemainsControlOutcomeWhenWinnerRemovesOrRepl
 
 /// Mutation caught: treating every authority-check exception as a moved fence hides corruption and
 /// backend/decode failures. Before any CAS, inability to evaluate authority must propagate unchanged.
-TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
+TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("pre-cas-authority-error");
@@ -1275,7 +1275,7 @@ TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesBeforeEraseCas)
 /// The post-CAS authority check is distinct: the erase may already be durable and its mandatory
 /// resolution complete, but inability to evaluate authority is still the original error, not
 /// `FencedOut`.
-TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
+TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolution)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("post-cas-authority-error");
@@ -1308,7 +1308,7 @@ TEST(CasRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolut
     EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
 }
 
-TEST(CasRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
+TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1341,7 +1341,7 @@ TEST(CasRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     EXPECT_EQ(backend.deleteTotal(), 0);
 }
 
-TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
+TEST(CASGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
 {
     RefCatalog catalog;
     catalog.entries = {
@@ -1425,7 +1425,7 @@ TEST(CasGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
 }
 
-TEST(CasGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
+TEST(CASGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
 {
     const Layout layout("p");
     RefWalkPlanRow row{
@@ -1452,7 +1452,7 @@ TEST(CasGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
     EXPECT_FALSE(stuckRemovalWarning(row, 100, 3, layout));
 }
 
-TEST(CasGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
+TEST(CASGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
 {
     const Layout layout("p");
     RefWalkPlanRow row{
@@ -1485,7 +1485,7 @@ TEST(CasGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
         << "the diagnostic must not promise a command that cannot recover this exact object";
 }
 
-TEST(CasGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
+TEST(CASGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1505,7 +1505,7 @@ TEST(CasGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
-TEST(CasGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
+TEST(CASGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1568,7 +1568,7 @@ TEST(CasGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     EXPECT_NE(captured.find("is unreadable"), String::npos);
 }
 
-TEST(CasGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
+TEST(CASGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1579,7 +1579,7 @@ TEST(CasGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
         [&] { Gc gc(store, UInt128{1}); });
 }
 
-TEST(CasGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)
+TEST(CASGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)
 {
     const NamespaceLifePhysicalId current_life{2};
     const NamespaceLifePhysicalId unmatched_life =
@@ -1612,7 +1612,7 @@ TEST(CasGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
     EXPECT_EQ(std::count(captured.begin(), captured.end(), '\n'), 1u);
 }
 
-TEST(CasGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
+TEST(CASGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
 {
     /// This catches a plan that borrows the post-LIST observations or lets its successor state alias a
     /// row. Replacing the owning `RoundInput`/`RefPlan` boundary with the former loose inputs, or

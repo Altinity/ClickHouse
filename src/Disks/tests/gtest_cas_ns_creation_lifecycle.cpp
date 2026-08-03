@@ -79,7 +79,7 @@ public:
 /// Happy path: all three writes land
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncarnation)
+TEST(CASNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncarnation)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -112,7 +112,7 @@ TEST(CasNsCreationLifecycle, HappyPathReachesLiveWithADurableCkptAndAStableIncar
 /// ---------------------------------------------------------------------------------------------
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
+TEST(CASNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -129,7 +129,7 @@ TEST(CasNsCreationLifecycle, CreateNamespaceRejectsAnAlreadyExistingEntry)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEntryAborts)
+TEST(CASNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEntryAborts)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -150,7 +150,7 @@ TEST(CasNsCreationLifecycleDeathTest, CreateNamespaceRejectsAnAlreadyExistingEnt
 /// `Creating` forbids publication
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasNsCreationLifecycle, CreatingForbidsPublication)
+TEST(CASNsCreationLifecycle, CreatingForbidsPublication)
 {
     RefCatalog catalog;
     catalog.entries.push_back(CatalogEntry{.ns = RootNamespace{"a"}, .state = NsState::Creating,
@@ -159,7 +159,7 @@ TEST(CasNsCreationLifecycle, CreatingForbidsPublication)
         [&] { CasRefCatalog::checkPublicationAdmittedOrThrow(catalog, RootNamespace{"a"}); });
 }
 
-TEST(CasNsCreationLifecycle, LiveAndRemovingAndAbsentAllAdmitPublication)
+TEST(CASNsCreationLifecycle, LiveAndRemovingAndAbsentAllAdmitPublication)
 {
     RefCatalog catalog;
     catalog.entries.push_back(CatalogEntry{.ns = RootNamespace{"live"}, .state = NsState::Live, .incarnation = UInt128(1)});
@@ -189,7 +189,7 @@ std::function<void(uint64_t)> admittedOnceThenFenced()
 }
 }
 
-TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLeavesEntryCreating)
+TEST(CASNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLeavesEntryCreating)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -217,7 +217,7 @@ TEST(CasNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
 /// Token-stale: the observed entry no longer matches at the `Creating -> Live` CAS
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndLeavesTheStolenEntryAlone)
+TEST(CASNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndLeavesTheStolenEntryAlone)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -265,7 +265,7 @@ TEST(CasNsCreationLifecycle, EntryStolenByAConcurrentReconcilerRefusesGoLiveAndL
 /// Both stale at once: fence moved AND the entry was stolen -- refused (fence checked first).
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheckWhichRunsFirst)
+TEST(CASNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheckWhichRunsFirst)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -308,7 +308,7 @@ TEST(CasNsCreationLifecycle, BothFenceAndEntryStaleRefusesGoLiveViaTheFenceCheck
 /// Stale-`Creating` reconciliation
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStillLive)
+TEST(CASNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStillLive)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -327,7 +327,7 @@ TEST(CasNsCreationLifecycle, ReconcileRefusedWhileTheOriginalCreatorFenceIsStill
     EXPECT_EQ(*after, entry) << "refused -- nothing written";
 }
 
-TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreatorFenceIsTerminalThenResumesToLive)
+TEST(CASNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreatorFenceIsTerminalThenResumesToLive)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -364,7 +364,7 @@ TEST(CasNsCreationLifecycle, ReconcileSucceedsTokenExactlyAfterTheOriginalCreato
 
 /// "Stale token at reconciliation -> fail closed": a SECOND reconciler racing the first, both reading
 /// the SAME stale `observed` before either writes.
-TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
+TEST(CASNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -398,7 +398,7 @@ TEST(CasNsCreationLifecycle, ReconcileFailsClosedWhenTheEntryAlreadyChanged)
 /// ---------------------------------------------------------------------------------------------
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasNsCreationLifecycle, CompleteCreationRejectsANonCreatingEntry)
+TEST(CASNsCreationLifecycle, CompleteCreationRejectsANonCreatingEntry)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -409,7 +409,7 @@ TEST(CasNsCreationLifecycle, CompleteCreationRejectsANonCreatingEntry)
     });
 }
 
-TEST(CasNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
+TEST(CASNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -422,7 +422,7 @@ TEST(CasNsCreationLifecycle, ReconcileStaleCreatorRejectsANonCreatingEntry)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAborts)
+TEST(CASNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAborts)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");
@@ -432,7 +432,7 @@ TEST(CasNsCreationLifecycleDeathTest, CompleteCreationRejectsANonCreatingEntryAb
         "not a Creating entry");
 }
 
-TEST(CasNsCreationLifecycleDeathTest, ReconcileStaleCreatorRejectsANonCreatingEntryAborts)
+TEST(CASNsCreationLifecycleDeathTest, ReconcileStaleCreatorRejectsANonCreatingEntryAborts)
 {
     InitializedCatalogBackend backend;
     Layout layout("p");

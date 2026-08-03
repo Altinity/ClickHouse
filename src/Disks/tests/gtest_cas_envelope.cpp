@@ -11,7 +11,7 @@ using namespace DB::Cas;
 /// cases that file does not exercise: a header with NO provenance/ref, and the incarnation-zone
 /// independence of the payload.
 
-TEST(CasEnvelope, BlobRoundTripNoExtensions)
+TEST(CASEnvelope, BlobRoundTripNoExtensions)
 {
     const std::string payload = "hello payload";
     EnvelopeHeader h;
@@ -30,7 +30,7 @@ TEST(CasEnvelope, BlobRoundTripNoExtensions)
     EXPECT_EQ(obj.substr(payloadOffset(d)), payload);
 }
 
-TEST(CasEnvelope, IncarnationZoneDoesNotAffectPayload)
+TEST(CASEnvelope, IncarnationZoneDoesNotAffectPayload)
 {
     /// Two objects with the SAME payload but DIFFERENT incarnation_tag/build_id encode to different
     /// header bytes, yet both carry the same payload at the same fixed offset — the incarnation zone

@@ -91,7 +91,7 @@ public:
 
 }
 
-TEST(CasServerRootId, ValidationAcceptsCleanPathsRejectsBad)
+TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
 {
     EXPECT_NO_THROW(validateServerRootId("replica-a"));
     EXPECT_NO_THROW(validateServerRootId("shard-01/replica-a"));
@@ -103,7 +103,7 @@ TEST(CasServerRootId, ValidationAcceptsCleanPathsRejectsBad)
     EXPECT_THROW(validateServerRootId("a/_files/b"), DB::Exception);
 }
 
-TEST(CasServerRoot, KeysAndCodecsRoundTrip)
+TEST(CASServerRoot, KeysAndCodecsRoundTrip)
 {
     Layout layout("p");
 
@@ -155,7 +155,7 @@ TEST(CasServerRoot, KeysAndCodecsRoundTrip)
     EXPECT_THROW(decodeMountLease(""), DB::Exception);
 }
 
-TEST(CasServerRootClaim, OwnerStickyAndForeignFailsClosed)
+TEST(CASServerRootClaim, OwnerStickyAndForeignFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -164,7 +164,7 @@ TEST(CasServerRootClaim, OwnerStickyAndForeignFailsClosed)
     EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(2), emptyCatalogObservation()), DB::Exception);  // foreign → fail closed
 }
 
-TEST(CasServerRootClaim, TombstonedSameOwnerFailsClosed)
+TEST(CASServerRootClaim, TombstonedSameOwnerFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -186,7 +186,7 @@ TEST(CasServerRootClaim, TombstonedSameOwnerFailsClosed)
     }
 }
 
-TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
+TEST(CASServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("r");
@@ -206,7 +206,7 @@ TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)
 /// Phase C (spec rev.4): an ABSENT epoch object over a PRESENT mount object means durable epoch
 /// state was lost while a mount is live/recent — re-minting epoch 1 there is how a same-(uuid,
 /// epoch) twin is born. Refuse.
-TEST(CasMount, EpochRemintOverExistingMountRefuses)
+TEST(CASMount, EpochRemintOverExistingMountRefuses)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -217,7 +217,7 @@ TEST(CasMount, EpochRemintOverExistingMountRefuses)
     EXPECT_THROW(allocateWriterEpoch(*b, l, "r", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), DB::Exception);   /// CORRUPTED_DATA
 }
 
-TEST(CasMount, EpochRemintAuthoritativeAbsenceMints)
+TEST(CASMount, EpochRemintAuthoritativeAbsenceMints)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -227,7 +227,7 @@ TEST(CasMount, EpochRemintAuthoritativeAbsenceMints)
 }
 
 /// The probe outcome gates the mint: anything short of authoritative KeyAbsent fails closed.
-TEST(CasMount, EpochRemintIndeterminateProbeFailsClosed)
+TEST(CASMount, EpochRemintIndeterminateProbeFailsClosed)
 {
     class IndeterminateProbeBackend final : public InMemoryBackend
     {
@@ -245,7 +245,7 @@ TEST(CasMount, EpochRemintIndeterminateProbeFailsClosed)
 
 /// Decommission over a TERMINAL (expired/fenced) mount with a lost epoch object proceeds and mints
 /// an epoch DISTINCT from the surviving mount's — the same-pair state is unrepresentable.
-TEST(CasMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
+TEST(CASMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -257,8 +257,8 @@ TEST(CasMount, DecommissionRemintOverTerminalMountMintsDistinctEpoch)
 }
 
 /// Decommission over a LIVE mount with a lost epoch refuses — the blind bypass would recreate the
-/// forbidden pair (codex round-3 finding 1) and defeat CasDecommission.RefusesLiveMember.
-TEST(CasMount, DecommissionRemintOverLiveMountRefuses)
+/// forbidden pair (codex round-3 finding 1) and defeat CASDecommission.RefusesLiveMember.
+TEST(CASMount, DecommissionRemintOverLiveMountRefuses)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -271,7 +271,7 @@ TEST(CasMount, DecommissionRemintOverLiveMountRefuses)
 
 /// The steady-state path (epoch object PRESENT) must never pay the probe — pins the zero
 /// normal-path cost the spec claims.
-TEST(CasMount, EpochBumpWithPresentEpochIssuesNoProbe)
+TEST(CASMount, EpochBumpWithPresentEpochIssuesNoProbe)
 {
     class ProbeCountingBackend final : public InMemoryBackend
     {
@@ -292,7 +292,7 @@ TEST(CasMount, EpochBumpWithPresentEpochIssuesNoProbe)
     EXPECT_EQ(b->probes, probes_after_bootstrap) << "...must not probe the mount key";
 }
 
-TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
+TEST(CASServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -301,7 +301,7 @@ TEST(CasServerRootClaim, MissingOwnerOverNonEmptyRootIsCorrupted)
     EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1), emptyCatalogObservation()), DB::Exception);
 }
 
-TEST(CasServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreation)
+TEST(CASServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreation)
 {
     const Layout layout("p");
     for (const NsState state : {NsState::Creating, NsState::Live, NsState::Removing})
@@ -320,7 +320,7 @@ TEST(CasServerRootSafety, EveryCatalogLifecycleStateBlocksOwnerAndEpochRecreatio
     }
 }
 
-TEST(CasServerRootSafety, OwnershipUsesAPathComponentBoundary)
+TEST(CASServerRootSafety, OwnershipUsesAPathComponentBoundary)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -330,7 +330,7 @@ TEST(CasServerRootSafety, OwnershipUsesAPathComponentBoundary)
         backend, layout, "root/x", catalogOwning("root/x/table", NsState::Live)));
 }
 
-TEST(CasServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
+TEST(CASServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -344,7 +344,7 @@ TEST(CasServerRootSafety, OpaqueStreamAndStateDebrisAloneDoesNotBlockRecreation)
         backend, layout, "root/x", EpochMintPolicy::NormalMount, 0, emptyCatalogObservation()), 1u);
 }
 
-TEST(CasServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
+TEST(CASServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
 {
     const Layout layout("p");
     for (const String & key : {
@@ -360,7 +360,7 @@ TEST(CasServerRootSafety, ManifestAndLooseRootDebrisStillBlockRecreation)
     }
 }
 
-TEST(CasServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
+TEST(CASServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -375,7 +375,7 @@ TEST(CasServerRootSafety, UnreadableCatalogNeverFallsBackToPhysicalGuesses)
     EXPECT_FALSE(backend.head(layout.epochKey("root/x")).exists);
 }
 
-TEST(CasServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
+TEST(CASServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
 {
     OwnerConflictRevealsManifestBackend backend;
     const Layout layout("p");
@@ -385,7 +385,7 @@ TEST(CasServerRootSafety, OwnerConflictRecomputesTheWholeEmptinessBundle)
     EXPECT_FALSE(backend.head(layout.ownerKey("root/x")).exists);
 }
 
-TEST(CasServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
+TEST(CASServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
 {
     EpochConflictRevealsManifestBackend backend;
     const Layout layout("p");
@@ -399,7 +399,7 @@ TEST(CasServerRootSafety, EpochConflictRecomputesTheWholeEmptinessBundle)
         << "the rejected allocator must not consume an epoch from the conflict winner";
 }
 
-TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
+TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -419,7 +419,7 @@ TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
 /// write fence to lost) WITHOUT constructing a `LOGICAL_ERROR` -- that aborts debug/ASan builds at
 /// exception construction, and there is no foreign writer here to fail closed against, only an
 /// environmental condition.
-TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
+TEST(CASMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -459,7 +459,7 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
 /// Driven WITHOUT a prior failed renew, so the count is deterministic: this is the only place along
 /// this path that increments `CASMountLeaseLost`, so we expect exactly +1 (not +2, since renewal was
 /// never invoked here).
-TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
+TEST(CASMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -484,7 +484,7 @@ TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
 /// rev.6: a bare `claimMount` (no `proven_dead_token`) NEVER reclaims a same-uuid, different-epoch
 /// lease off a wall-clock-looking-expired stamp — only `claimMountAwaitingExpiry`'s observation loop
 /// can turn that into a reclaim. Renamed from `...ExpiredReclaims` to describe the corrected behavior.
-TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredStillLiveDoubleStart)
+TEST(CASMountLease, SameUuidLiveFailsForeignFailsExpiredStillLiveDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -498,7 +498,7 @@ TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredStillLiveDoubleStart)
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::LiveDoubleStart);
 }
 
-TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
+TEST(CASMountMessage, DoubleStartTextHasIdentityAndRemediation)
 {
     MountLease m;
     m.server_uuid = (UInt128(0xdeadbeefcafef00dULL) << 64) | UInt128(0x0011223344556677ULL);
@@ -533,7 +533,7 @@ TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
 /// the observation wait — the old "instant, zero-sleep" reclaim this test name described was exactly
 /// the cross-node wall-clock trust rev.6 removes. Renamed to describe the CORRECTED behavior: the
 /// wall-clock-looking-expired stamp buys nothing, the full threshold is still observed.
-TEST(CasMountAwaitExpiry, PastExpiryStillPaysTheFullObservationThreshold)
+TEST(CASMountAwaitExpiry, PastExpiryStillPaysTheFullObservationThreshold)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -555,7 +555,7 @@ TEST(CasMountAwaitExpiry, PastExpiryStillPaysTheFullObservationThreshold)
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 8u);   // reclaimed as us
 }
 
-TEST(CasMountAwaitExpiry, FutureExpiryReclaimsAfterClockAdvances)
+TEST(CASMountAwaitExpiry, FutureExpiryReclaimsAfterClockAdvances)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -577,7 +577,7 @@ TEST(CasMountAwaitExpiry, FutureExpiryReclaimsAfterClockAdvances)
 
 /// rev.6: a genuinely live twin now times out via BOUNDED OBSERVATION RESTARTS (its every renewal
 /// bumps the write-token, forcing a restart each poll), never via a wall-clock deadline.
-TEST(CasMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
+TEST(CASMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -643,7 +643,7 @@ private:
 /// backend that makes the mount slot look vanished to every GET must still terminate (bounded restarts,
 /// not an infinite loop) AND must pace itself (the injected `sleep_fn` must actually fire) rather than
 /// busy-spin.
-TEST(CasMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpinning)
+TEST(CASMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpinning)
 {
     auto inner = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -670,7 +670,7 @@ TEST(CasMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpi
     EXPECT_EQ(decodeMountLease(inner->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
 }
 
-TEST(CasMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
+TEST(CASMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -694,7 +694,7 @@ TEST(CasMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
 /// prior incarnation minted with an absurdly large `ttl` (so its own stamp claims aliveness for
 /// ~100000ms) still reclaims within the SAME small threshold as any other case, because that stamp is
 /// never read for timing.
-TEST(CasMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold)
+TEST(CASMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -713,7 +713,7 @@ TEST(CasMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 8u);   // reclaimed
 }
 
-TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
+TEST(CASMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -736,7 +736,7 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
         "held by a different writer_epoch");
 }
 
-TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
+TEST(CASMountFence, SupersededWriterRefusedNoS3Read)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r"});
@@ -754,7 +754,7 @@ TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
     EXPECT_THROW(store->dropRef(ns, "any_ref"), DB::Exception);
 }
 
-TEST(CasMountStartup, SecondServerSameRootFailsClosed)
+TEST(CASMountStartup, SecondServerSameRootFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s1 = Pool::open(b, PoolConfig{
@@ -767,7 +767,7 @@ TEST(CasMountStartup, SecondServerSameRootFailsClosed)
         DB::Exception);
 }
 
-TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
+TEST(CASMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s1 = Pool::open(b, PoolConfig{
@@ -786,7 +786,7 @@ TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
     EXPECT_GT(e2, e1);
 }
 
-TEST(CasMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
+TEST(CASMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -800,7 +800,7 @@ TEST(CasMountStartup, FreshWritablePoolBootstrapsAnExplicitEmptyCatalog)
     EXPECT_TRUE(decodeRefCatalog(catalog->bytes).entries.empty());
 }
 
-TEST(CasMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
+TEST(CASMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -845,7 +845,7 @@ TEST(CasMountStartup, ExistingPoolWithoutCatalogFailsBeforeSlotMutation)
     EXPECT_EQ(mount_after->token, mount_before->token);
 }
 
-TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
+TEST(CASMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -893,7 +893,7 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
 /// see gtest_cas_request_control.cpp for that): an inconsistent cas_request_budget must refuse a
 /// writable mount end-to-end (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount
 /// silently with a budget that could let a controlled attempt outlive the lease it is fenced under.
-TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
+TEST(CASMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
@@ -910,7 +910,7 @@ TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
     });
 }
 
-TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
+TEST(CASMountStartup, StaleSelfMountReclaimedAfterWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
@@ -946,7 +946,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. The replayed live
     /// body hides A's clean farewell, so the reclaim is `MountPriorState::UncleanObserved`. Inject a
     /// fake `boot_ms_fn` + `wait_sleep_fn` (mirroring
-    /// `CasMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so the observation window resolves
+    /// `CASMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so the observation window resolves
     /// instantly instead of blocking this test on real time.
     uint64_t a2_fake_boot = 0;
     PoolPtr a2;
@@ -1001,7 +1001,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     EXPECT_TRUE(replacement->mayMutate()) << "and must not disturb the live reclaimer";
 }
 
-TEST(CasMountLease, BodyCarriesFloorAndFence)
+TEST(CASMountLease, BodyCarriesFloorAndFence)
 {
     MountLease m;
     m.server_uuid = UInt128(0xAB);
@@ -1019,7 +1019,7 @@ TEST(CasMountLease, BodyCarriesFloorAndFence)
     EXPECT_EQ(d.writer_epoch, 7u);
 }
 
-TEST(CasMountLease, RetiredSentinelRoundTrips)
+TEST(CASMountLease, RetiredSentinelRoundTrips)
 {
     MountLease m;
     m.min_active = std::numeric_limits<uint64_t>::max();
@@ -1074,7 +1074,7 @@ void renewMount(Backend & b, const Layout & l, const String & srid)
 }
 }
 
-TEST(CasHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
+TEST(CASHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1093,7 +1093,7 @@ TEST(CasHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
 }
 
-TEST(CasHeartbeatFloor, StableTokenPastThresholdIsFenced)
+TEST(CASHeartbeatFloor, StableTokenPastThresholdIsFenced)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1117,7 +1117,7 @@ TEST(CasHeartbeatFloor, StableTokenPastThresholdIsFenced)
     EXPECT_EQ(fenced.seq, before.seq + 1);
 }
 
-TEST(CasHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
+TEST(CASHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1146,7 +1146,7 @@ TEST(CasHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
 /// removed ENTIRELY (not merely fenced/terminated -- those already `obs.erase` themselves mid-loop) is
 /// never visited by a later LIST pass again, so its observation entry must be pruned at end-of-round,
 /// not linger in `obs` forever.
-TEST(CasHeartbeatFloor, UnseenSridPrunedFromObservationMap)
+TEST(CASHeartbeatFloor, UnseenSridPrunedFromObservationMap)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1175,7 +1175,7 @@ TEST(CasHeartbeatFloor, UnseenSridPrunedFromObservationMap)
         << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
 }
 
-TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
+TEST(CASHeartbeatFloor, ClassifiesAndFencesOut)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1277,7 +1277,7 @@ private:
 };
 }
 
-TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
+TEST(CASHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
 {
     Layout l("p");
     auto b = std::make_shared<RenewOnFenceBackend>(
@@ -1306,7 +1306,7 @@ TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
     EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
 }
 
-TEST(CasHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
+TEST(CASHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -1322,7 +1322,7 @@ TEST(CasHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 
 /// ---- Task 1 (Phase 2): `listMounts` — read-only mount-slot enumeration for introspection ----
 
-TEST(CasListMounts, ClassifiesEveryStateReadOnly)
+TEST(CASListMounts, ClassifiesEveryStateReadOnly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -1359,9 +1359,9 @@ TEST(CasListMounts, ClassifiesEveryStateReadOnly)
 }
 
 /// A `srid` may itself contain `/` (e.g. `shard-01/replica-a` — legal per
-/// `CasServerRootId.ValidationAcceptsCleanPathsRejectsBad`). Slicing the key by the last `/` before
+/// `CASServerRootId.ValidationAcceptsCleanPathsRejectsBad`). Slicing the key by the last `/` before
 /// the `/mount` suffix (as opposed to by `serverRootsPrefix()` length) truncates it to `replica-a`.
-TEST(CasListMounts, NestedSridIsNotTruncated)
+TEST(CASListMounts, NestedSridIsNotTruncated)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -1380,7 +1380,7 @@ TEST(CasListMounts, NestedSridIsNotTruncated)
 /// "A fence costs an epoch": a same-(uuid, epoch) re-claim must NOT refresh a `gc_fenced` body in
 /// place — that would resurrect a fenced incarnation. It is terminal for THIS epoch; only a
 /// DIFFERENT (fresh) epoch may reclaim the slot.
-TEST(CasClaimMount, SameEpochFencedIsNotRefreshable)
+TEST(CASClaimMount, SameEpochFencedIsNotRefreshable)
 {
     using namespace DB::Cas;
     auto backend = std::make_shared<InMemoryBackend>();
@@ -1414,7 +1414,7 @@ TEST(CasClaimMount, SameEpochFencedIsNotRefreshable)
 /// `proven_dead_token`) always reports `LiveDoubleStart` for this branch now; only the observation
 /// loop (`claimMountAwaitingExpiry`) may turn it into a reclaim, and only after proving death on ITS
 /// OWN clock.
-TEST(CasMountObservation, ExpiredLookingLeaseIsNotReclaimedByWallClock)
+TEST(CASMountObservation, ExpiredLookingLeaseIsNotReclaimedByWallClock)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1428,7 +1428,7 @@ TEST(CasMountObservation, ExpiredLookingLeaseIsNotReclaimedByWallClock)
 /// The observation loop reclaims once the write-token has held stable for the FULL rate-bound
 /// threshold (`ttl_ms + ttl_ms/20 + poll_interval_ms`) on its OWN (injected, fake) clock — never
 /// short-circuiting on the wall clock, which this test drives to an irrelevant, already-expired value.
-TEST(CasMountObservation, TokenStableForThresholdThenReclaimed)
+TEST(CASMountObservation, TokenStableForThresholdThenReclaimed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1448,7 +1448,7 @@ TEST(CasMountObservation, TokenStableForThresholdThenReclaimed)
 /// A renewal DURING the observation window (the real holder is still alive) bumps the write-token —
 /// the loop must detect the mismatch and RESTART the observation from the new token, never reclaiming
 /// off a window that started watching a now-superseded token.
-TEST(CasMountObservation, RenewalDuringObservationRestartsIt)
+TEST(CASMountObservation, RenewalDuringObservationRestartsIt)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1493,7 +1493,7 @@ TEST(CasMountObservation, RenewalDuringObservationRestartsIt)
 /// A GC-fenced lease is a terminal, already-threshold-gated certificate of death (the fence-out
 /// itself cost the predecessor an epoch) — the observation loop must reclaim it on the FIRST attempt,
 /// with zero polling/sleeping.
-TEST(CasMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
+TEST(CASMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l{"p"};
@@ -1528,7 +1528,7 @@ TEST(CasMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
 /// clock-free certificates `probeNonTerminalMountSlots`/`computeHeartbeatFloor` already use, PLUS a
 /// third certificate available only here: a currently-live DIFFERENT `writer_epoch` at the slot. ----
 
-TEST(CasFenceTerminal, AbsentMountSlotIsNotTerminal)
+TEST(CASFenceTerminal, AbsentMountSlotIsNotTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};
@@ -1536,7 +1536,7 @@ TEST(CasFenceTerminal, AbsentMountSlotIsNotTerminal)
         << "absence proves nothing about liveness -- never waved through";
 }
 
-TEST(CasFenceTerminal, UndecodableMountBodyIsNotTerminal)
+TEST(CASFenceTerminal, UndecodableMountBodyIsNotTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};
@@ -1545,7 +1545,7 @@ TEST(CasFenceTerminal, UndecodableMountBodyIsNotTerminal)
         << "an unreadable lease of some other format generation must block, never wave through";
 }
 
-TEST(CasFenceTerminal, GcFencedIsTerminal)
+TEST(CASFenceTerminal, GcFencedIsTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};
@@ -1559,7 +1559,7 @@ TEST(CasFenceTerminal, GcFencedIsTerminal)
     EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7));
 }
 
-TEST(CasFenceTerminal, CleanFarewellIsTerminal)
+TEST(CASFenceTerminal, CleanFarewellIsTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};
@@ -1573,7 +1573,7 @@ TEST(CasFenceTerminal, CleanFarewellIsTerminal)
     EXPECT_TRUE(isCreatorFenceTerminal(b, l, "r", 7));
 }
 
-TEST(CasFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
+TEST(CASFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
 {
     InMemoryBackend b;
     Layout l{"p"};
@@ -1589,7 +1589,7 @@ TEST(CasFenceTerminal, ADifferentLiveWriterEpochIsTerminalForTheOldOne)
 
 /// A merely EXPIRED lease (wall-clock past `expires_at_ms`, same epoch, no certificate) must NOT be
 /// treated as terminal -- mirrors `claimMount`'s own refusal to trust a bare timestamp comparison.
-TEST(CasFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
+TEST(CASFenceTerminal, ExpiredButSameEpochAndUncertifiedIsNotTerminal)
 {
     InMemoryBackend b;
     Layout l{"p"};

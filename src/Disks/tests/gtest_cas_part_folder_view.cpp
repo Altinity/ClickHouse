@@ -3,7 +3,7 @@
 
 using namespace DB;
 
-TEST(CasPartRefKey, CacheKeyIsUnambiguous)
+TEST(CASPartRefKey, CacheKeyIsUnambiguous)
 {
     /// Refs may contain '/' (the `detached/<part>` fold, B181); the '\0' join keeps
     /// (ns="a", ref="b/c") distinct from (ns="a/b", ref="c").
@@ -55,7 +55,7 @@ std::vector<String> sorted(std::vector<String> v) { std::sort(v.begin(), v.end()
 
 }
 
-TEST(CasPartFolderView, FindFileAndHasFile)
+TEST(CASPartFolderView, FindFileAndHasFile)
 {
     auto v = makeView();
     ASSERT_NE(v->findFile("data.bin"), nullptr);
@@ -66,7 +66,7 @@ TEST(CasPartFolderView, FindFileAndHasFile)
     EXPECT_FALSE(v->hasFile("p.proj"));              /// a directory, not a file
 }
 
-TEST(CasPartFolderView, ListChildrenCollapsesFirstComponent)
+TEST(CASPartFolderView, ListChildrenCollapsesFirstComponent)
 {
     auto v = makeView();
     EXPECT_EQ(sorted(v->listChildren("")),
@@ -75,14 +75,14 @@ TEST(CasPartFolderView, ListChildrenCollapsesFirstComponent)
     EXPECT_TRUE(v->listChildren("q.proj/").empty());
 }
 
-TEST(CasPartFolderView, HasDirectory)
+TEST(CASPartFolderView, HasDirectory)
 {
     auto v = makeView();
     EXPECT_TRUE(v->hasDirectory("p.proj/"));
     EXPECT_FALSE(v->hasDirectory("q.proj/"));
 }
 
-TEST(CasPartFolderView, SizesAndBytes)
+TEST(CASPartFolderView, SizesAndBytes)
 {
     auto v = makeView();
     EXPECT_EQ(v->fileSize("checksums.txt"), std::optional<uint64_t>(2));   /// inline: bytes size
@@ -95,7 +95,7 @@ TEST(CasPartFolderView, SizesAndBytes)
     EXPECT_GE(v->estimatedBytes(), 1000u);                                 /// >= manifest_size
 }
 
-TEST(CasPartFolderView, ProjectionDirPrefixRecognizer)
+TEST(CASPartFolderView, ProjectionDirPrefixRecognizer)
 {
     using V = Cas::PartFolderView;
     EXPECT_EQ(V::projectionDirPrefix("p.proj"), std::optional<std::string>("p.proj/"));

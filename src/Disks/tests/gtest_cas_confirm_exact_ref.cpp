@@ -261,7 +261,7 @@ void armOneShotInstallFailure(const PoolPtr & store)
 /// because they are the same rule read the other way: a different `ManifestRef` under the right name,
 /// and a name that has no committed row at all, are both `No` -- a PROOF of the negative, not an
 /// ambiguity.
-TEST(CasConfirmExactRef, QuiescentExactMatchIsYes)
+TEST(CASConfirmExactRef, QuiescentExactMatchIsYes)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -284,7 +284,7 @@ TEST(CasConfirmExactRef, QuiescentExactMatchIsYes)
 /// Rule 5, the repoint case (spec §testing "repointed live part"): the part is still live and the ref
 /// name still resolves, but it now names a DIFFERENT manifest. The old token must be `No` -- this is
 /// the case gate 0 cannot see at all, because the part object is `Active` throughout.
-TEST(CasConfirmExactRef, RepointedRefIsNo)
+TEST(CASConfirmExactRef, RepointedRefIsNo)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -304,7 +304,7 @@ TEST(CasConfirmExactRef, RepointedRefIsNo)
 /// Rule 5, the drop-and-recreate case: the ref name is removed and then published again. The name
 /// resolves again, so only EXACT `ManifestRef` equality separates the new binding from the old one --
 /// mint-tightening (spec §A3) is what guarantees the two can never collide.
-TEST(CasConfirmExactRef, DroppedAndRecreatedRefIsNo)
+TEST(CASConfirmExactRef, DroppedAndRecreatedRefIsNo)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -328,7 +328,7 @@ TEST(CasConfirmExactRef, DroppedAndRecreatedRefIsNo)
 /// answer is `Unknown` -- and producing it must cost ZERO object-store requests AND must not create a
 /// runtime. Materializing one here would let a remote caller populate this writer's table cache with
 /// unrecovered entries by asking about namespaces that do not exist.
-TEST(CasConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
+TEST(CASConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -352,7 +352,7 @@ TEST(CasConfirmExactRef, ColdTableIsUnknownWithZeroBackendRequests)
 /// Rule 2, the evicted case: a table that WAS warm and was dropped by the whole-table cache budget is
 /// indistinguishable from a cold one here -- the runtime is gone, so the committed view is gone with
 /// it, and re-reading it would be object-store I/O.
-TEST(CasConfirmExactRef, EvictedTableIsUnknownWithZeroBackendRequests)
+TEST(CASConfirmExactRef, EvictedTableIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolWithConfig(backend,
@@ -379,7 +379,7 @@ TEST(CasConfirmExactRef, EvictedTableIsUnknownWithZeroBackendRequests)
 /// Rule 2, the resident-but-unrecovered case: recovery failed closed, so a runtime EXISTS in the cache
 /// with an empty, meaningless `state`. A naive lookup reads that empty state and answers `No`; the
 /// correct answer is `Unknown`, because nothing about the durable table is known here.
-TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequests)
+TEST(CASConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
@@ -407,7 +407,7 @@ TEST(CasConfirmExactRef, UnrecoveredResidentTableIsUnknownWithZeroBackendRequest
 /// exact `_ckpt` GET. The runtime is resident, `recovery_in_progress` is set, and the state is still
 /// empty. Waiting for that recovery would be exactly the "recover from storage to answer" this
 /// primitive refuses.
-TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
+TEST(CASConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
 {
     auto backend = std::make_shared<RecoveryLatchBackend>();
     auto store = openPool(backend);
@@ -470,7 +470,7 @@ TEST(CasConfirmExactRef, RecoveryInProgressIsUnknownWithZeroBackendRequests)
 /// naive implementation answers `Yes` here, and precisely why that is the TOCTOU this design closes.
 /// The apply-state is still `Clean` at this point, so rule 3 is what produces the `Unknown`, not
 /// rule 4.
-TEST(CasConfirmExactRef, InFlightAppendIsUnknown)
+TEST(CASConfirmExactRef, InFlightAppendIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -510,7 +510,7 @@ TEST(CasConfirmExactRef, InFlightAppendIsUnknown)
 /// PARTIALLY durable. `leader_active` covers the whole tenure, so this is already `Unknown` -- a wider
 /// unknown window under load, never a hole. The confirm is issued on the leader's own thread, which is
 /// safe because the boundary holds neither lane mutex.
-TEST(CasConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
+TEST(CASConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -587,7 +587,7 @@ TEST(CasConfirmExactRef, MidTenureChunkBoundaryIsUnknown)
 /// Rule 3, the wedge case: the lane holds one conditional `PUT` whose outcome is unknown, so the table
 /// may be MISSING a durable transaction -- possibly the very removal being asked about. The committed
 /// row still matches exactly, so only the wedge can produce the refusal.
-TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
+TEST(CASConfirmExactRef, WedgedLaneIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -609,7 +609,7 @@ TEST(CasConfirmExactRef, WedgedLaneIsUnknown)
 
 
 /// `NeedsRecovery` is table-scoped, so confirmation refuses even a row that still looks perfect.
-TEST(CasConfirmExactRef, NeedsRecoveryIsUnknown)
+TEST(CASConfirmExactRef, NeedsRecoveryIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -634,7 +634,7 @@ TEST(CasConfirmExactRef, NeedsRecoveryIsUnknown)
 /// Rule 6, checked LAST: the committed row matches exactly, the lane is quiescent and clean -- but this
 /// node no longer holds the mount incarnation, so it is no longer the namespace's single writer and
 /// cannot speak for the durable table at all. Another writer may already have repointed the ref.
-TEST(CasConfirmExactRef, LostMountFenceIsUnknown)
+TEST(CASConfirmExactRef, LostMountFenceIsUnknown)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -670,7 +670,7 @@ TEST(CasConfirmExactRef, LostMountFenceIsUnknown)
 /// The three phases are driven deterministically rather than hammered: before admission -> `Yes`;
 /// from admission until the transaction is durable -> `Unknown`; after -> `No`. `Yes` is never
 /// observable once the removal has been admitted.
-TEST(CasConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
+TEST(CASConfirmExactRef, ConcurrentAppendIsOrderedAfterTheSnapshot)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -772,7 +772,7 @@ DB::CasRelinkSourceToken readSourceToken(const DB::ContentAddressedMetadataStora
 /// exactly three decimal fields, nothing consumed partially, no sign, no padding -- and the parser is
 /// pinned as the exact inverse of the renderer, because a mismatch between the two would silently turn
 /// every confirm into an `Unknown` (or, far worse, make two different manifests compare equal).
-TEST(CasConfirmExactRef, ManifestRefTextRoundTripsAndRejectsMalformedTokens)
+TEST(CASConfirmExactRef, ManifestRefTextRoundTripsAndRejectsMalformedTokens)
 {
     for (const ManifestRef & ref : {ManifestRef{1, 1, 1}, ManifestRef{7, 42, 999999},
                                     ManifestRef{18446744073709551615ULL, 18446744073709551615ULL, 123}})
@@ -805,7 +805,7 @@ TEST(CasConfirmExactRef, ManifestRefTextRoundTripsAndRejectsMalformedTokens)
 /// decode is the exact inverse of encode: the fields the sender meant are the fields that route and
 /// compare. A codec that merged two fields, or that let a separator through unescaped, would let a
 /// peer aim a confirm at a namespace the sender never named.
-TEST(CasConfirmExactRef, SourceTokenRoundTripsThroughItsWireForm)
+TEST(CASConfirmExactRef, SourceTokenRoundTripsThroughItsWireForm)
 {
     const auto round_trip = [](const DB::CasRelinkSourceToken & token, const char * what)
     {
@@ -843,7 +843,7 @@ TEST(CasConfirmExactRef, SourceTokenRoundTripsThroughItsWireForm)
 /// Everything a peer can hand back that is not a token this sender minted. None of these may decode:
 /// a decoded-but-wrong token routes a confirm somewhere, and "somewhere" is exactly what routing exists
 /// to prevent. Refusing costs a byte fetch and nothing else.
-TEST(CasConfirmExactRef, SourceTokenRejectsMalformedAndOverlongInput)
+TEST(CASConfirmExactRef, SourceTokenRejectsMalformedAndOverlongInput)
 {
     const DB::CasRelinkSourceToken good{"pool", "srv1", "srv1/store/abc/abcdef@cas@", "all_1_1_0", "all_1_1_0", "1:1:1"};
     const String text = DB::encodeCasRelinkSourceToken(good).value();
@@ -903,7 +903,7 @@ TEST(CasConfirmExactRef, SourceTokenRejectsMalformedAndOverlongInput)
 /// pure string question about the mount's own identity: no pool, no I/O, no lifecycle -- asserted here
 /// by answering the same before `startup`, while live, and after `shutdown`. A routing predicate that
 /// could throw would turn a misrouted question into an error instead of an unproven answer.
-TEST(CasConfirmExactRef, OwnsNamespaceSelectsTheMountByServerRootInEveryLifecycleState)
+TEST(CASConfirmExactRef, OwnsNamespaceSelectsTheMountByServerRootInEveryLifecycleState)
 {
     auto storage = makeExchangeStorage("srv1");
 
@@ -945,7 +945,7 @@ TEST(CasConfirmExactRef, OwnsNamespaceSelectsTheMountByServerRootInEveryLifecycl
 /// path, and a token read out of the very manifest body the sender puts on the wire. The three
 /// non-`Yes` cases pin the two halves this layer adds on top of the ledger -- the token text is decoded
 /// here, and a namespace this mount holds no resident runtime for is an ambiguity, not a `No`.
-TEST(CasConfirmExactRef, StorageConfirmAnswersForTheCommittedBinding)
+TEST(CASConfirmExactRef, StorageConfirmAnswersForTheCommittedBinding)
 {
     auto storage = makeExchangeStorage("test");
     storage->startup();
@@ -989,7 +989,7 @@ TEST(CasConfirmExactRef, StorageConfirmAnswersForTheCommittedBinding)
 /// request, and the caller has a durable precommit waiting on it: a thrown `INVALID_STATE` would have
 /// to be classified by the HTTP layer, whereas `Unknown` is already the taxonomy's "not proven". Only
 /// `Yes` authorizes, and no lifecycle state can produce one.
-TEST(CasConfirmExactRef, StorageConfirmIsUnknownWhenTheDiskCannotSpeakForItsView)
+TEST(CASConfirmExactRef, StorageConfirmIsUnknownWhenTheDiskCannotSpeakForItsView)
 {
     auto storage = makeExchangeStorage("test");
 

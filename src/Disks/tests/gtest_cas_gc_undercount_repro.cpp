@@ -87,7 +87,7 @@ RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 ///
 /// Correct post-fix behaviour: GC must NOT throw, and both blobs -- owned only by r1, which has no
 /// live owner after the (idempotent) drop -- become collectible (in-degree 0, keys gone).
-TEST(CasGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
+TEST(CASGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -177,7 +177,7 @@ public:
     String gc_state_key = "p/gc/state";
 };
 
-TEST(CasGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
+TEST(CASGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>();
     auto store = openPoolForTest(backend);
@@ -280,7 +280,7 @@ public:
     std::function<void()> on_commit;
 };
 
-TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
+TEST(CASGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
 {
     auto backend = std::make_shared<DropAtCommitBackend>();
     /// gc_fold_max_defer_rounds=0 forces fold-every-round: the injected drop fires from `on_commit`,
@@ -344,7 +344,7 @@ TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
 /// one), no ref delta lands, and the recorded anomaly drives `suppress_destructive`, which gates OFF
 /// every graduated/pending blob delete for the WHOLE round -- including a blob in a namespace the
 /// corrupt log never touched.
-TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
+TEST(CASGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

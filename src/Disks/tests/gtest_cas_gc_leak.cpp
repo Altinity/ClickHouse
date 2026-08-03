@@ -212,7 +212,7 @@ FsckReport displaceAndGc(
 /// removal-fold; only GC deletes the owner-removed body, after the -1 is sealed). GC must reclaim partA's
 /// blobs to a fixpoint: no blob/manifest object remains for partA and the in-degree generation holds no
 /// stranded positive counter for partA's blobs.
-TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
+TEST(CASGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -250,7 +250,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 /// repointed to partB before ANY GC fold runs. The single fold therefore folds partA's activation (+1)
 /// and its removal (-1, read from partA's still-present body) in one pass; the retire reclaims partA's
 /// blobs and recheck cleanup deletes partA's owner-removed body. No debris may remain.
-TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
+TEST(CASGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -277,7 +277,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 /// NO-LEAK (drop): a fully-committed part is published, folded (+1 per blob), then its ref is dropped.
 /// GC must reclaim the WHOLE closure — both blobs and the manifest body — leaving no debris and no
 /// stranded positive in-degree.
-TEST(CasGcLeak, DroppedPartFullyReclaimed)
+TEST(CASGcLeak, DroppedPartFullyReclaimed)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -323,7 +323,7 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
 /// the (hash, token) incarnation identity, it may treat the hash as "already handled" from A's retire
 /// cycle and never open a fresh condemn cycle for B once B's in-degree drops to zero — B then orphans
 /// forever (unreachable > 0, its body never deleted).
-TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
+TEST(CASGcLeak, ResurrectReplacedIncarnationReclaimed)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -377,7 +377,7 @@ TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
 /// regular round PAST the fixpoint. The re-condemn that reclaims the resurrect-replaced incarnation B
 /// must fire exactly once: extra rounds on an already-reclaimed content hash must be no-ops (no
 /// re-condemn churn, no duplicate retired entry) and must never manufacture fresh fsck debris.
-TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
+TEST(CASGcLeak, ResurrectReplacedReclaimIsIdempotent)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -431,7 +431,7 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
 /// condemned, or (b) already physically deleted by the delete pipeline (meta dropped alongside it) — BOTH
 /// outcomes prove B is never adoptable. The assertion only fails on the pre-fix shape: B present and NOT
 /// condemned.
-TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
+TEST(CASGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -464,7 +464,7 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
            "dedup-hitting writer resurrects, not adopts";
 }
 
-/// (The NO-LEAK-on-abandon test `CasGcLeak.AbandonedPrecommitReclaimsOwnBlobs` was removed with the
+/// (The NO-LEAK-on-abandon test `CASGcLeak.AbandonedPrecommitReclaimsOwnBlobs` was removed with the
 /// snapshot+log ref model: it asserted GC AUTOMATICALLY reclaims a crashed build's abandoned precommit and
 /// collects its own unique blob. Per spec §Responsibility Boundary that reclaim is now the WRITER's job
 /// (it appends the exact `owner_transition` removal on recovery); GC never scans for or removes precommit
@@ -478,7 +478,7 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
 /// throwing a retryable ABORTED) — it must NEVER silently commit a dangling ref. The assertion is the
 /// no-LOSS guarantee: `dangling==0`. (A tokenless adopt has no body to re-upload, so a real caller would
 /// re-derive B from source on retry; here we only confirm the gate fails closed.)
-TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
+TEST(CASReuseGcRace, ReuseOfBlobDeletedBeforePublish)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);

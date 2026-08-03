@@ -202,7 +202,7 @@ void expectThrowsCodeContaining(int expected_code, const String & needle, F && f
 /// (a) Empty prefix → open succeeds, `_pool_meta` is created, AND the op-log proves the residual LIST of
 /// the pool prefix happened BEFORE any write (the ordering [D2] mandates: no probe write may precede the
 /// emptiness proof).
-TEST(CasBootstrapOrdering, EmptyPrefixOpensAndListsBeforeAnyWrite)
+TEST(CASBootstrapOrdering, EmptyPrefixOpensAndListsBeforeAnyWrite)
 {
     auto backend = std::make_shared<RecordingBackend>();
     backend->clearLog();
@@ -236,7 +236,7 @@ String residualRefLogKey()
 /// (b) A prefix holding `cas/ns/stream/…` residue but NO `_pool_meta` → open fails typed (INVALID_STATE),
 /// and ZERO writes hit the backend (the mutating battery must NOT have run — the residual check throws
 /// first).
-TEST(CasBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
+TEST(CASBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
 {
     auto backend = std::make_shared<RecordingBackend>();
     /// Seed residue an incomplete erase would have left behind (a ref-log object), with no `_pool_meta`.
@@ -254,7 +254,7 @@ TEST(CasBootstrapOrdering, ResidualWithoutMetaFailsTypedWithZeroWrites)
 /// (c) A prefix containing ONLY stale, structurally-valid `_probe/<hex>/…` debris (a crash-mid-battery
 /// leftover) → treated as empty → open succeeds and bootstraps a fresh pool. The debris-skip is what makes
 /// a normal restart-after-crash recover instead of wedging.
-TEST(CasBootstrapOrdering, StaleProbeDebrisOnlyIsTreatedAsEmpty)
+TEST(CASBootstrapOrdering, StaleProbeDebrisOnlyIsTreatedAsEmpty)
 {
     auto backend = std::make_shared<RecordingBackend>();
     ASSERT_EQ(backend->putIfAbsent("p/_probe/" + kProbeUid + "/token", "probe-v1").outcome, PutOutcome::Done);
@@ -267,7 +267,7 @@ TEST(CasBootstrapOrdering, StaleProbeDebrisOnlyIsTreatedAsEmpty)
     EXPECT_TRUE(backend->get(kPoolMetaKey).has_value()) << "_pool_meta must be created over a probe-only prefix";
 }
 
-TEST(CasBootstrapOrdering, CanonicalEmptyCatalogOnlyIsTheSoleRetryablePreMetaResidue)
+TEST(CASBootstrapOrdering, CanonicalEmptyCatalogOnlyIsTheSoleRetryablePreMetaResidue)
 {
     auto backend = std::make_shared<RecordingBackend>();
     const Layout layout{kPrefix};
@@ -280,12 +280,12 @@ TEST(CasBootstrapOrdering, CanonicalEmptyCatalogOnlyIsTheSoleRetryablePreMetaRes
     EXPECT_TRUE(backend->head(layout.poolMetaKey()).exists);
 }
 
-TEST(CasBootstrapOrdering, MalformedCatalogOnlyResidueRefusesWithoutPoolMeta)
+TEST(CASBootstrapOrdering, MalformedCatalogOnlyResidueRefusesWithoutPoolMeta)
 {
     expectCatalogResidueRefusesWithoutPoolMeta("not a catalog");
 }
 
-TEST(CasBootstrapOrdering, NoncanonicalCatalogOnlyResidueRefusesWithoutPoolMeta)
+TEST(CASBootstrapOrdering, NoncanonicalCatalogOnlyResidueRefusesWithoutPoolMeta)
 {
     String noncanonical = encodeRefCatalog(RefCatalog{});
     noncanonical.insert(noncanonical.find('\n') - 1, ",\"noncanonical\":0");
@@ -293,14 +293,14 @@ TEST(CasBootstrapOrdering, NoncanonicalCatalogOnlyResidueRefusesWithoutPoolMeta)
     expectCatalogResidueRefusesWithoutPoolMeta(noncanonical);
 }
 
-TEST(CasBootstrapOrdering, NonemptyCatalogOnlyResidueRefusesWithoutPoolMeta)
+TEST(CASBootstrapOrdering, NonemptyCatalogOnlyResidueRefusesWithoutPoolMeta)
 {
     const RefCatalog nonempty{.entries = {CatalogEntry{
         .ns = RootNamespace{"test/nonempty"}, .state = NsState::Live, .incarnation = UInt128{1}, .creator = std::nullopt}}};
     expectCatalogResidueRefusesWithoutPoolMeta(encodeRefCatalog(nonempty));
 }
 
-TEST(CasBootstrapOrdering, CatalogWithAnyOtherCasResidueRefusesWithoutPoolMeta)
+TEST(CASBootstrapOrdering, CatalogWithAnyOtherCasResidueRefusesWithoutPoolMeta)
 {
     const String canonical_empty = encodeRefCatalog(RefCatalog{});
     const Layout layout{kPrefix};
@@ -313,7 +313,7 @@ TEST(CasBootstrapOrdering, CatalogWithAnyOtherCasResidueRefusesWithoutPoolMeta)
         expectCatalogResidueRefusesWithoutPoolMeta(canonical_empty, residual);
 }
 
-TEST(CasBootstrapOrdering, ListedCatalogMissingAtExactGetRefusesWithoutPoolMeta)
+TEST(CASBootstrapOrdering, ListedCatalogMissingAtExactGetRefusesWithoutPoolMeta)
 {
     auto backend = std::make_shared<CatalogMissingAfterListBackend>();
     const Layout layout{kPrefix};
@@ -327,7 +327,7 @@ TEST(CasBootstrapOrdering, ListedCatalogMissingAtExactGetRefusesWithoutPoolMeta)
 /// (d) An existing healthy pool (meta present + data) → reopen is unchanged: the pool identity is
 /// PRESERVED (the residual check sees `_pool_meta` present → the normal validate path; `_pool_meta` is
 /// never re-minted).
-TEST(CasBootstrapOrdering, HealthyPoolReopenPreservesIdentity)
+TEST(CASBootstrapOrdering, HealthyPoolReopenPreservesIdentity)
 {
     auto backend = std::make_shared<RecordingBackend>();
 
@@ -346,7 +346,7 @@ TEST(CasBootstrapOrdering, HealthyPoolReopenPreservesIdentity)
 /// (e) [D2] concurrent-opener case: debris from a SECOND concurrent fresh opener's in-flight battery (a
 /// distinct probe uid) is skipped by the SAME structural rule as (c). Two openers racing over one shared
 /// pool prefix must not make each other's zero-write residual check fail.
-TEST(CasBootstrapOrdering, ConcurrentOpenerProbeDebrisIsAlsoSkipped)
+TEST(CASBootstrapOrdering, ConcurrentOpenerProbeDebrisIsAlsoSkipped)
 {
     auto backend = std::make_shared<RecordingBackend>();
     /// This mount's own crashed battery AND a concurrent opener's in-flight battery.
@@ -365,7 +365,7 @@ TEST(CasBootstrapOrdering, ConcurrentOpenerProbeDebrisIsAlsoSkipped)
 /// (here `_probelike/…`) is genuine residual — the trailing `/` in the reserved prefix keeps it out — so
 /// bootstrap fails closed over it. (Any object literally under `_probe/`, whatever its leaf shape, is
 /// ephemeral capability-probe scratch a content-addressed pool never uses for durable state.)
-TEST(CasBootstrapOrdering, ProbeSiblingLookalikeIsResidualNotDebris)
+TEST(CASBootstrapOrdering, ProbeSiblingLookalikeIsResidualNotDebris)
 {
     auto backend = std::make_shared<RecordingBackend>();
     ASSERT_EQ(backend->putIfAbsent("p/_probelike/token", "x").outcome, PutOutcome::Done);
@@ -382,7 +382,7 @@ TEST(CasBootstrapOrdering, ProbeSiblingLookalikeIsResidualNotDebris)
 /// write that would poison the next writable mount's residual check. It fails closed (typed INVALID_STATE)
 /// with ZERO writes. The read-only path skips the residual check, so the fail-closed gate lives in
 /// `createOrValidate` (`allow_mint=false`).
-TEST(CasBootstrapOrdering, ReadOnlyOverResidualWithoutMetaFailsClosedNoMint)
+TEST(CASBootstrapOrdering, ReadOnlyOverResidualWithoutMetaFailsClosedNoMint)
 {
     auto backend = std::make_shared<RecordingBackend>();
     ASSERT_EQ(backend->putIfAbsent(residualRefLogKey(), "x").outcome,
@@ -401,7 +401,7 @@ TEST(CasBootstrapOrdering, ReadOnlyOverResidualWithoutMetaFailsClosedNoMint)
 /// (h) An observe / read-only open over a HEALTHY pool (meta present) is unchanged: it validates the
 /// existing `_pool_meta` and succeeds, preserving the pool identity. `allow_mint=false` is never consulted
 /// on the validate path.
-TEST(CasBootstrapOrdering, ReadOnlyOverHealthyPoolSucceedsUnchanged)
+TEST(CASBootstrapOrdering, ReadOnlyOverHealthyPoolSucceedsUnchanged)
 {
     auto backend = std::make_shared<RecordingBackend>();
     UInt128 pool_id_first;
@@ -421,7 +421,7 @@ TEST(CasBootstrapOrdering, ReadOnlyOverHealthyPoolSucceedsUnchanged)
 /// (i) `openForDecommission` over a pool whose `_pool_meta` is absent but whose owner anchor survives (a
 /// partial erase) must NOT bootstrap a fresh identity — it fails closed (typed INVALID_STATE) with no
 /// mint. Decommission operates on an existing member; a missing meta is a broken state, not a bootstrap.
-TEST(CasBootstrapOrdering, DecommissionWithAbsentMetaFailsClosedNoMint)
+TEST(CASBootstrapOrdering, DecommissionWithAbsentMetaFailsClosedNoMint)
 {
     auto backend = std::make_shared<RecordingBackend>();
     {

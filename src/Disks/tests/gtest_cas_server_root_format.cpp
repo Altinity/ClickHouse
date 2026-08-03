@@ -11,7 +11,7 @@ namespace DB::ErrorCodes
     extern const int CORRUPTED_DATA;
 }
 
-TEST(CasFormatBattery, Owner)
+TEST(CASFormatBattery, Owner)
 {
     OwnerObject o;
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
@@ -25,7 +25,7 @@ TEST(CasFormatBattery, Owner)
         golden});
 }
 
-TEST(CasOwnerFormat, RetiredAtRoundTrip)
+TEST(CASOwnerFormat, RetiredAtRoundTrip)
 {
     OwnerObject o;
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
@@ -36,7 +36,7 @@ TEST(CasOwnerFormat, RetiredAtRoundTrip)
     EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
 }
 
-TEST(CasFormatBattery, ServerEpoch)
+TEST(CASFormatBattery, ServerEpoch)
 {
     ServerEpoch e;
     e.next_writer_epoch = 7;
@@ -46,7 +46,7 @@ TEST(CasFormatBattery, ServerEpoch)
         currentFormatHeader("cas_epoch") + "{\"nwe\":\"7\"}\n"});
 }
 
-TEST(CasFormatBattery, MountLease)
+TEST(CASFormatBattery, MountLease)
 {
     MountLease m{hexToU128("0123456789abcdeffedcba9876543210"), 7, "host-1", 4242,
                  1752537600000ULL, 5, 1752537630000ULL, 9, false};
@@ -58,7 +58,7 @@ TEST(CasFormatBattery, MountLease)
         "\"sat\":1752537600000,\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false}\n"});
 }
 
-TEST(CasMountLeaseFormat, FarewellSentinelAndFencedSurvive)
+TEST(CASMountLeaseFormat, FarewellSentinelAndFencedSurvive)
 {
     MountLease m{hexToU128("0123456789abcdeffedcba9876543210"), 7, "h", 1,
                  1, 5, 2, std::numeric_limits<uint64_t>::max(), true};
@@ -70,7 +70,7 @@ TEST(CasMountLeaseFormat, FarewellSentinelAndFencedSurvive)
     EXPECT_EQ(back.seq, 5u);
 }
 
-TEST(CasMountLeaseFormat, RejectsMissingIdentityFields)
+TEST(CASMountLeaseFormat, RejectsMissingIdentityFields)
 {
     const String header = "{\"type\":\"cas_mount_lease\",\"v\":3}\n";
     const String fields = "\"hn\":\"host-1\",\"pid\":4242,\"sat\":1752537600000,"

@@ -238,14 +238,14 @@ DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64
 
 }
 
-TEST(CasS3Staging, ParsesS3BackendFromConfig)
+TEST(CASS3Staging, ParsesS3BackendFromConfig)
 {
     auto config = configWithDiskSection("<staging_backend>s3</staging_backend>");
 
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Cas::StagingBackend::S3);
 }
 
-TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
+TEST(CASS3Staging, DefaultConfigParsesToLocalBackend)
 {
     /// No `staging_backend` key at all — the OFF BY DEFAULT arm.
     auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
@@ -253,13 +253,13 @@ TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Cas::StagingBackend::Local);
 }
 
-TEST(CasS3Staging, UnknownBackendValueThrows)
+TEST(CASS3Staging, UnknownBackendValueThrows)
 {
     auto config = configWithDiskSection("<staging_backend>nfs</staging_backend>");
     EXPECT_THROW(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Exception);
 }
 
-TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
+TEST(CASS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
 {
     /// Constructed with no staging-related args at all (mirrors the existing gtest call sites, e.g.
     /// gtest_ca_wiring.cpp, which stop at `context_`): the accessors must reflect the same
@@ -281,7 +281,7 @@ TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
 /// `makeLocalObjectStorageForTest`) does not override `copyObjectConditional`, so it exercises the
 /// base-class default directly. Live 412-vs-created S3 semantics are covered by the Task 7
 /// integration test (with_rustfs); this is deliberately just the fail-closed contract test.
-TEST(CasS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
+TEST(CASS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
 {
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
 
@@ -299,7 +299,7 @@ TEST(CasS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
 /// battery). These three tests cover the fail-close SELECTION logic with fakes — live 412-vs-created
 /// enforcement against a real backend is Task 7 (with_rustfs integration test).
 
-TEST(CasS3Staging, ProbeConditionalCopyReturnsTrueForEnforcingBackend)
+TEST(CASS3Staging, ProbeConditionalCopyReturnsTrueForEnforcingBackend)
 {
     auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
 
@@ -308,7 +308,7 @@ TEST(CasS3Staging, ProbeConditionalCopyReturnsTrueForEnforcingBackend)
     EXPECT_EQ(storage->callCount(), 2);
 }
 
-TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseForNonEnforcingBackend)
+TEST(CASS3Staging, ProbeConditionalCopyReturnsFalseForNonEnforcingBackend)
 {
     auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::NonEnforcing);
 
@@ -317,7 +317,7 @@ TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseForNonEnforcingBackend)
     EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
 }
 
-TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThrows)
+TEST(CASS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThrows)
 {
     /// A plain `LocalObjectStorage` does not override `copyObjectConditional` at all — it falls
     /// through to the base-class default, which throws NOT_IMPLEMENTED (exactly what a real backend
@@ -334,7 +334,7 @@ TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThro
 /// `ContentAddressedTransaction` needed; `writeFile` choosing this mode is exercised together with the
 /// promote path in later tasks (S3 mode is off by default and not enabled by any existing test).
 
-TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
+TEST(CASS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
 {
     const std::string staging_key = "staging/mount1/abc123.tmp";
     auto * sink_ptr = new FakeStagingSink(staging_key);
@@ -400,7 +400,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
     EXPECT_EQ(buf->getFileName(), staging_key);
 }
 
-TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
+TEST(CASS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
 {
     const std::string staging_key = "staging/mount1/cancelled.tmp";
     auto * sink_ptr = new FakeStagingSink(staging_key);
@@ -446,7 +446,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
 
 /// (a) Fresh blob key ⇒ the write-once conditional copy CREATES it; the tokened Blob dep is recorded at
 /// the copy's destination token (the new incarnation token). No unconditional copy is ever issued.
-TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
+TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingPool(backend);
@@ -486,7 +486,7 @@ TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
 /// (b) Blob key already exists and is CLEAN ⇒ the conditional copy 412s and the writer ADOPTS the
 /// existing incarnation. No copy of any kind lands over the live blob. Also covers invariant (d): NO
 /// unconditional copy is ever issued over a live (non-condemned) blob.
-TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
+TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingPool(backend);
@@ -526,7 +526,7 @@ TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 /// (`feedback_ca_resurrect_invariant`) — and the resurrected body DIFFERS from the condemned incarnation
 /// (INV-NO-RETURN: a verbatim copy would reproduce identical bytes ⇒ identical ETag ⇒ the queued
 /// exact-token delete of the condemned incarnation would kill the live resurrection = data loss).
-TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
+TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingPool(backend);
@@ -602,7 +602,7 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 
 /// ===========================================================================================
 /// Task 6 of the S3-native staging plan: staging cleanup after commit, read-your-writes over an S3
-/// pending blob, and the mount-lease-scoped sweeper (`CasStagingSweeper.h`).
+/// pending blob, and the mount-lease-scoped sweeper (`CASStagingSweeper.h`).
 ///
 /// The wiring-level tests below (cleanup-after-commit, read-your-writes) drive the REAL
 /// `ContentAddressedMetadataStorage` + `ContentAddressedTransaction` over `FakeConditionalCopyObjectStorage`
@@ -654,7 +654,7 @@ void writeThroughS3Transaction(DB::ContentAddressedTransaction & tx, const std::
 /// orphan shape (the pending blob's entry is unlinked before commit) so `publishStaging` never calls
 /// `putBlob` for it — only `cleanupPendingTempFiles`'s Task 6 branch ever touches this staging object,
 /// which is exactly the seam this test targets.
-TEST(CasS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
+TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 {
     auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountA");
@@ -688,7 +688,7 @@ TEST(CasS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 
 /// (b) Read-your-writes over an S3 pending blob (before commit) returns the staged bytes from the S3
 /// staging object, not a local temp file.
-TEST(CasS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
+TEST(CASS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
 {
     auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountB");
@@ -710,8 +710,8 @@ TEST(CasS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
 }
 
 /// (c) `sweepOwnMountStaging` removes only objects under the given mount prefix and leaves a DIFFERENT
-/// mount's staging objects untouched (the lease-fence — `CasStagingSweeper.h`).
-TEST(CasStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
+/// mount's staging objects untouched (the lease-fence — `CASStagingSweeper.h`).
+TEST(CASStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
 {
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     const std::string root = storage->getCommonKeyPrefix();
@@ -740,7 +740,7 @@ TEST(CasStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
 /// This is a prefix-separation assertion (the GC fold itself is not unit-testable in isolation from a
 /// full round — see `gtest_cas_gc_fold.cpp` for that machinery); it pins the invariant a refactor that
 /// nested `staging/` under `blobs/` (or vice versa) would violate.
-TEST(CasS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
+TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
 {
     const DB::Cas::Layout layout("p");
     const std::string blobs_prefix = layout.blobsPrefix();

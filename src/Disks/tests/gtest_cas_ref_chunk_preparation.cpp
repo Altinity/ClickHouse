@@ -119,7 +119,7 @@ CasRefLedger::PreparedRefChunk prepare(const RefTableState & state, const RefTxn
 /// The two things that actually become durable -- the key and the sealed body -- are both derivable
 /// before any request, and both round-trip: the key parses back to the life and id it names, and the
 /// bytes decode back to the very transaction that was prepared.
-TEST(CasRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
+TEST(CASRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
 {
     const RefTxnId id{1, 2};   /// the contiguous successor of the born state's `1-1`
     const auto prepared = prepare(bornState(), id, std::nullopt, {addPrecommitOp("r1", mref(3))});
@@ -143,7 +143,7 @@ TEST(CasRefChunkPreparation, PreparedKeyAndSealedBytesAreCanonical)
 /// The base id a later install re-presents is the greatest-applied of the state preparation STARTED
 /// from -- not of the candidate it produced. Getting this backwards would let an install adopt a
 /// candidate over a state that had moved on.
-TEST(CasRefChunkPreparation, CandidateBaseIdIsGreatestApplied)
+TEST(CASRefChunkPreparation, CandidateBaseIdIsGreatestApplied)
 {
     const RefTableState state = bornState();
     const RefTxnId base = state.getGreatestApplied();
@@ -173,7 +173,7 @@ TEST(CasRefChunkPreparation, CandidateBaseIdIsGreatestApplied)
 /// the candidate apply; the forbidden-off-sequence-1 half is `validateEpochSealGrammarStructural`, run
 /// by `encodeRefLogTxn` during the seal. Both are inside preparation, which is the point -- a chunk that
 /// passes one and fails the other still fails before any durable effect.
-TEST(CasRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEpoch)
+TEST(CASRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEpoch)
 {
     const std::vector<RefOp> ops{addPrecommitOp("r1", mref(3))};
     const RefTxnId epoch1_seal{1, 5};   /// the seal that closed epoch 1
@@ -211,7 +211,7 @@ TEST(CasRefChunkPreparation, ChainLinkRequiredExactlyOnSequenceOneOfNonGenesisEp
 /// The birth `_ckpt` contribution is PREPARED here and published by `commitRefChunk`, because
 /// publishing it is a birth chunk's first durable effect. Preparation therefore owes two things: the
 /// value only for a birth, and the one fact no later writer can recover -- `life_epoch`.
-TEST(CasRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
+TEST(CASRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
 {
     /// A birth chunk at epoch 3: the contribution exists and names THIS transaction's writer epoch.
     const RefTxnId birth_id{3, 1};
@@ -235,7 +235,7 @@ TEST(CasRefChunkPreparation, BirthContributionSetOnlyForNamespaceBirth)
     EXPECT_EQ(*mixed.birth_contribution->life_epoch, 5u);
 }
 
-TEST(CasRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSeal)
+TEST(CASRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSeal)
 {
     const RefTxnId ordinary_id{1, 2};
     const auto ordinary = prepare(bornState(), ordinary_id, std::nullopt,
@@ -257,7 +257,7 @@ TEST(CasRefChunkPreparation, CommitContributionCarriesFrontierAndOnlyMatchingSea
 /// The attempt exists so that an `Unresolved` PUT -- an object that may be durable -- can be recorded by
 /// a MOVE and nothing else. That only holds if every field is already populated before the request goes
 /// out, so this asserts the whole struct is complete at the end of preparation.
-TEST(CasRefChunkPreparation, PreparedAttemptIsCompleteBeforeAnyDurableEffect)
+TEST(CASRefChunkPreparation, PreparedAttemptIsCompleteBeforeAnyDurableEffect)
 {
     const RefTxnId id{1, 2};
     const auto prepared = prepare(bornState(), id, std::nullopt, {addPrecommitOp("r1", mref(3))}, /*admitted_generation=*/42);

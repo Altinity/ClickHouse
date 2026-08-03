@@ -209,7 +209,7 @@ void runRounds(const PoolPtr & s, Gc & gc, int rounds)
 /// never folded and the blob was retained permanently. Under arithmetic intake the omitted record is
 /// reached by exact key on the very round that was lied to, so the removal folds and the blob dies on
 /// the normal schedule — no abort, and no waiting for the store to become honest again.
-TEST(CasHoleyListDetector, OmittedRemoveRecordIsSkippedForever)
+TEST(CASHoleyListDetector, OmittedRemoveRecordIsSkippedForever)
 {
     std::shared_ptr<HoleyListBackend> b;
     auto s = openHoleyPool(b);
@@ -258,7 +258,7 @@ TEST(CasHoleyListDetector, OmittedRemoveRecordIsSkippedForever)
 /// DELETION DIRECTION (the mirror safety test from the RCA). Two owners share ONE deduplicated blob.
 /// The SECOND owner's `+1` is omitted from one listing while the FIRST owner's `-1` folds normally,
 /// so GC sees zero edges for a blob a live manifest still references. THIS MUST NEVER DELETE THE BLOB.
-TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
+TEST(CASHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
 {
     std::shared_ptr<HoleyListBackend> b;
     auto s = openHoleyPool(b);
@@ -297,7 +297,7 @@ TEST(CasHoleyListDetector, OmittedActivationNeverPermitsDeletingALiveBlob)
     /// blob must not pass for the wrong reason, and what makes this run non-trivial is that the hole was
     /// actually SERVED to the enumeration the fold works from. (It used to be "and the detector fired",
     /// which was only ever a proxy for that — and is now a property of a different, sampled mechanism,
-    /// pinned in `CasRetirementSweep`.)
+    /// pinned in `CASRetirementSweep`.)
     ASSERT_TRUE(b->holeServed()) << "the sabotage never fired — the omitted key was never listed";
 
     EXPECT_TRUE(blobPresent(b, layout, payload))

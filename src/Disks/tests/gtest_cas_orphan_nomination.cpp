@@ -211,7 +211,7 @@ ReadyFixture makeReadyFixture()
 
 /// S42: sweeping an aborted precommit must retire that manifest's exact source edges before deleting
 /// the body. Other sources stay intact, and only the two uniquely-owned blobs enter retirement.
-TEST(CasOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
+TEST(CASOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
 {
     ReadyFixture f = makeReadyFixture();
 
@@ -245,7 +245,7 @@ TEST(CasOrphanNomination, RetiresExactManifestSourcesBeforeDelete)
 }
 
 /// A nomination must exact-GET and decode the manifest before it can derive any source-edge identity.
-TEST(CasOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
+TEST(CASOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
 {
     ReadyFixture f = makeReadyFixture();
     const auto got = f.backend->get(f.backend->watched_manifest_key);
@@ -258,7 +258,7 @@ TEST(CasOrphanNomination, CorruptManifestIsRetainedAndSurfaced)
 
 /// Manifest identities are immutable. A changed token at the same key is illegal ABA, not an ordinary
 /// exact-delete race that may be silently treated as spared.
-TEST(CasOrphanNomination, TokenAbaIsRetainedAndSurfaced)
+TEST(CASOrphanNomination, TokenAbaIsRetainedAndSurfaced)
 {
     ReadyFixture f = makeReadyFixture();
     f.backend->replace_manifest_before_delete = true;
@@ -271,7 +271,7 @@ TEST(CasOrphanNomination, TokenAbaIsRetainedAndSurfaced)
 /// (`Gc::fold`'s orphan_sweep call site), not merely its eventual delete -- a suppressed pass must
 /// never even LIST candidates. The suppressed universe is selected explicitly, because that is the
 /// subject: a round on the production default would open the gate and sweep.
-TEST(CasOrphanNomination, SuppressedRoundNominatesNothing)
+TEST(CASOrphanNomination, SuppressedRoundNominatesNothing)
 {
     ReadyFixture f = makeReadyFixture();
 
@@ -292,7 +292,7 @@ TEST(CasOrphanNomination, SuppressedRoundNominatesNothing)
 
 /// The retirement input is deliberately outside both ref-transaction accounting mechanisms: a
 /// matching edge disappears, an already-absent one stays an idempotent no-op, and neither can alter B2.
-TEST(CasOrphanNomination, SourceRetirementIsAccountingNeutral)
+TEST(CASOrphanNomination, SourceRetirementIsAccountingNeutral)
 {
     InMemoryBackend backend;
     const Layout layout{"p"};

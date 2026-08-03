@@ -464,7 +464,7 @@ ManifestId seedOrphanManifestBody(Pool & victim, const String & ns_str)
 
 }
 
-TEST(CasDecommission, RefusesLiveMember)
+TEST(CASDecommission, RefusesLiveMember)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto victim = openVictim(backend);   /// keeps its mount lease unexpired — the member is alive
@@ -475,7 +475,7 @@ TEST(CasDecommission, RefusesLiveMember)
     });
 }
 
-TEST(CasDecommission, ClaimsDeadMemberAndBumpsEpoch)
+TEST(CASDecommission, ClaimsDeadMemberAndBumpsEpoch)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t victim_epoch = 0;
@@ -491,7 +491,7 @@ TEST(CasDecommission, ClaimsDeadMemberAndBumpsEpoch)
     EXPECT_EQ(admin->poolConfig().server_root_id, "victim");
 }
 
-TEST(CasDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
+TEST(CASDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -508,7 +508,7 @@ TEST(CasDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
     EXPECT_TRUE(admin->poolConfig().background_watermark);
 }
 
-TEST(CasDecommission, RefusesUnknownMember)
+TEST(CASDecommission, RefusesUnknownMember)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
@@ -517,7 +517,7 @@ TEST(CasDecommission, RefusesUnknownMember)
     });
 }
 
-TEST(CasDecommission, SecondConcurrentDecommissionRefused)
+TEST(CASDecommission, SecondConcurrentDecommissionRefused)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -529,7 +529,7 @@ TEST(CasDecommission, SecondConcurrentDecommissionRefused)
     });
 }
 
-TEST(CasDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
+TEST(CASDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -570,7 +570,7 @@ TEST(CasDecommission, DuplicateLifeIdRefusesBeforeAnyNamespaceOrSlotMutation)
     EXPECT_EQ(mount_after->token, mount_before->token);
 }
 
-TEST(CasDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelection)
+TEST(CASDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelection)
 {
     auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
     { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
@@ -612,7 +612,7 @@ TEST(CasDecommission, CatalogCutIsValidatedBeforeImpersonationAndReusedForSelect
     EXPECT_EQ(mount_after->token, mount_before->token);
 }
 
-TEST(CasDecommission, NamespaceSelectionUsesThePreImpersonationCut)
+TEST(CASDecommission, NamespaceSelectionUsesThePreImpersonationCut)
 {
     auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
     { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
@@ -632,7 +632,7 @@ TEST(CasDecommission, NamespaceSelectionUsesThePreImpersonationCut)
     EXPECT_EQ(report.namespaces_already_removed, 0u);
 }
 
-TEST(CasDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLife)
+TEST(CASDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLife)
 {
     auto backend = std::make_shared<CatalogChangesAfterFirstReadBackend>();
     { auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"}); }
@@ -696,7 +696,7 @@ TEST(CasDecommission, SameNameRebirthAfterTheCutIsRefusedWithoutTouchingTheNewLi
         << "decommission must not append a removal transaction to the post-cut incarnation";
 }
 
-TEST(CasDecommission, VictimNameMatchesOneCanonicalPathComponent)
+TEST(CASDecommission, VictimNameMatchesOneCanonicalPathComponent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -716,7 +716,7 @@ TEST(CasDecommission, VictimNameMatchesOneCanonicalPathComponent)
         << "decommissioning victim must not select victim2 by raw string prefix";
 }
 
-TEST(CasDecommission, ErasesAllVictimNamespaces)
+TEST(CASDecommission, ErasesAllVictimNamespaces)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -759,7 +759,7 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
 /// `skip_stale_precommit_sweep` fix that sweep would reclaim this realistic-epoch precommit in its
 /// OWN transaction before `dropNamespace`'s removal transaction ever counts it, leaving
 /// `precommits_removed` at 0 for exactly the case that matters.
-TEST(CasDecommission, CountsRealisticEpochPrecommit)
+TEST(CASDecommission, CountsRealisticEpochPrecommit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t victim_epoch = 0;
@@ -789,7 +789,7 @@ TEST(CasDecommission, CountsRealisticEpochPrecommit)
 /// Task 2 review finding 2: the `member_decommission` begin/namespace_removed/end events
 /// (CasDecommission.cpp) had no assertion at all. Wire a capturing sink (the `gtest_cas_event_log.cpp`
 /// idiom) into `decommissionPoolMember` and check the emitted sequence and its per-namespace detail.
-TEST(CasDecommission, EmitsMemberDecommissionEvents)
+TEST(CASDecommission, EmitsMemberDecommissionEvents)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -818,7 +818,7 @@ TEST(CasDecommission, EmitsMemberDecommissionEvents)
 
 /// Task 3: the manifest-debris / staging / roots drain phases fill their three `DecommissionReport`
 /// counters and leave nothing of the victim behind under `staging/` or `roots/`.
-TEST(CasDecommission, DrainsDebrisStagingAndRoots)
+TEST(CASDecommission, DrainsDebrisStagingAndRoots)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -862,7 +862,7 @@ TEST(CasDecommission, DrainsDebrisStagingAndRoots)
 /// ever appended for it — has no cursor to consume any seal, so the premise retains it indefinitely.
 /// Reclaiming it needs the sweep's own rework (registers R2/R3, Stage B), which is why the premise ships
 /// as the safety floor and not as the reclaim policy.
-TEST(CasDecommission, RetainsDebrisWhoseEpochSealIsUnconsumed)
+TEST(CASDecommission, RetainsDebrisWhoseEpochSealIsUnconsumed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     String debris_key;
@@ -897,7 +897,7 @@ TEST(CasDecommission, RetainsDebrisWhoseEpochSealIsUnconsumed)
 /// -- must record a warning and let the rest of the sweep proceed, never abort the whole phase or the
 /// whole command. One staging object throws, the roots object comes back `TokenMismatch`; the OTHER
 /// staging object must still be deleted and counted.
-TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
+TEST(CASDecommission, PerObjectFailureWarnsAndContinuesDrain)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     {
@@ -929,7 +929,7 @@ TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
 
 /// Opaque physical debris carries no logical owner and therefore cannot widen or redirect
 /// decommission's catalog-derived victim set. Task 5's ownership-tree janitor owns that debris.
-TEST(CasDecommission, LifelessPhysicalKeyCannotRedirectCatalogOwnedDecommission)
+TEST(CASDecommission, LifelessPhysicalKeyCannotRedirectCatalogOwnedDecommission)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     String lifeless;
@@ -953,7 +953,7 @@ TEST(CasDecommission, LifelessPhysicalKeyCannotRedirectCatalogOwnedDecommission)
 /// `deleteListedPrefix`: a per-key `deleteExact` failure becomes a warning, while the namespace
 /// erasure and subsequent staging drain continue. Protection reads now use opaque physical life
 /// prefixes, so a logical-name substring can no longer target an otherwise unlisted namespace.
-TEST(CasDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
+TEST(CASDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     String debris_key;
@@ -984,7 +984,7 @@ TEST(CasDecommission, ManifestDebrisDeleteFailureWarnsAndContinues)
 
 /// GC owns the completed catalog-row deletion. Once it drains the row, a clean decommission retry
 /// removes the mutable slot objects and tombstones the owner anchor.
-TEST(CasDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
+TEST(CASDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -1016,7 +1016,7 @@ TEST(CasDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
 /// its farewell. The retirement tail must use the farewell/claimed-epoch tokens captured around that
 /// release, delete `mount` first, and stop on its `TokenMismatch`; re-reading current tokens would
 /// delete the live successor's control objects and falsely report the slot removed.
-TEST(CasDecommission, SuccessorReclaimFencesSlotRetirementTail)
+TEST(CASDecommission, SuccessorReclaimFencesSlotRetirementTail)
 {
     auto backend = std::make_shared<SuccessorReclaimAfterFarewellBackend>();
     { auto victim = openVictim(backend); }
@@ -1051,7 +1051,7 @@ TEST(CasDecommission, SuccessorReclaimFencesSlotRetirementTail)
 
 /// A successor can also restart after both stale mutable objects were deleted but before `owner` is
 /// retired. Mere presence of either freshly recreated mutable object must stop owner retirement.
-TEST(CasDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
+TEST(CASDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
 {
     auto backend = std::make_shared<SuccessorReclaimAfterEpochDeleteBackend>();
     { auto victim = openVictim(backend); }
@@ -1087,7 +1087,7 @@ TEST(CasDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
 
 /// Triage #9 control: absent a successor interleaving, the fenced tail removes both mutable control
 /// objects, tombstones the owner anchor, and preserves the existing successful `slot_removed=1` result.
-TEST(CasDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
+TEST(CASDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -1104,7 +1104,7 @@ TEST(CasDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
     EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
-TEST(CasDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
+TEST(CASDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -1126,7 +1126,7 @@ TEST(CasDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
     EXPECT_TRUE(decodeOwner(after->bytes).retired_at_ms.has_value());
 }
 
-TEST(CasDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
+TEST(CASDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
 {
     auto backend = std::make_shared<SuccessorOwnerRewriteBeforeTombstoneBackend>();
     { auto victim = openVictim(backend); }
@@ -1151,7 +1151,7 @@ TEST(CasDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
 /// a transient exception on the owner tombstone write must not be reported as a hard failure when the
 /// write actually landed -- the controlled overwrite resolves this via GET (current bytes already
 /// match the intended tombstone) instead of the old bare putOverwrite's "any exception = failure".
-TEST(CasDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
+TEST(CASDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
 {
     auto backend = std::make_shared<AmbiguousOwnerTombstoneBackend>();
     { auto victim = openVictim(backend); }
@@ -1228,7 +1228,7 @@ private:
 /// (`report.slot_removed == false`, the mount object survives as the resume anchor). Once the fault is
 /// cleared, a re-run finishes the job: the already-erased namespace is counted as
 /// `namespaces_already_removed`, the leftover roots object is finally swept, and the slot is removed.
-TEST(CasDecommission, FailedDrainKeepsSlotThenResumes)
+TEST(CASDecommission, FailedDrainKeepsSlotThenResumes)
 {
     auto inner = std::make_shared<InMemoryBackend>();
     {
@@ -1264,7 +1264,7 @@ TEST(CasDecommission, FailedDrainKeepsSlotThenResumes)
 /// a roots-phase failure). A per-key `deleteExact` throw inside the manifest-debris drain must ALSO
 /// keep the slot: `report.slot_removed == false`, the mount object survives, and once the injected
 /// failure is cleared a re-run drains the leftover debris and removes the slot.
-TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
+TEST(CASDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 {
     auto backend = std::make_shared<FailingDeleteBackend>();
     String debris_key;
@@ -1322,7 +1322,7 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 /// farewell stamp, same as a real `admin.reset()`), then manually strike `epochKey`+`ownerKey`, leaving
 /// `mountKey`. A `decommissionPoolMember` re-run must resolve identity via the mount-lease fallback and
 /// finish retiring the slot; a further re-run then sees the tombstone and refuses to resume it.
-TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
+TEST(CASDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }   /// identity only -- no namespace, so the subtree stays empty

@@ -11,11 +11,11 @@ using namespace DB::Cas;
 /// Parameterized contract suite: every case creates a fresh backend from the factory,
 /// then exercises the Backend seam generically (no InMemoryBackend-specific calls).
 /// Fault-injection-only features are excluded — those are InMemory-specific tests.
-class CasBackendContract : public ::testing::TestWithParam<std::function<BackendPtr()>>
+class CASBackendContract : public ::testing::TestWithParam<std::function<BackendPtr()>>
 {
 };
 
-TEST_P(CasBackendContract, PutIfAbsentAndGet)
+TEST_P(CASBackendContract, PutIfAbsentAndGet)
 {
     auto b = GetParam()();
     const auto put = b->putIfAbsent("k", "v1");
@@ -30,7 +30,7 @@ TEST_P(CasBackendContract, PutIfAbsentAndGet)
     EXPECT_FALSE(b->get("absent").has_value());
 }
 
-TEST_P(CasBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
+TEST_P(CASBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
@@ -42,7 +42,7 @@ TEST_P(CasBackendContract, OverwriteIsTokenExactAndMintsFreshToken)
     EXPECT_EQ(b->get("k")->bytes, "v2");
 }
 
-TEST_P(CasBackendContract, CasPutCreateAndSwap)
+TEST_P(CASBackendContract, CasPutCreateAndSwap)
 {
     auto b = GetParam()();
     const auto create = b->casPut("m", "s1", std::nullopt);
@@ -55,7 +55,7 @@ TEST_P(CasBackendContract, CasPutCreateAndSwap)
     EXPECT_EQ(b->get("m")->bytes, "s2");
 }
 
-TEST_P(CasBackendContract, DeleteExactnessAndSurvival)
+TEST_P(CASBackendContract, DeleteExactnessAndSurvival)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
@@ -68,7 +68,7 @@ TEST_P(CasBackendContract, DeleteExactnessAndSurvival)
     EXPECT_FALSE(b->get("k").has_value());
 }
 
-TEST_P(CasBackendContract, DeleteNotFound)
+TEST_P(CASBackendContract, DeleteNotFound)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
@@ -76,7 +76,7 @@ TEST_P(CasBackendContract, DeleteNotFound)
     EXPECT_EQ(b->deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
 }
 
-TEST_P(CasBackendContract, RangeGet)
+TEST_P(CASBackendContract, RangeGet)
 {
     auto b = GetParam()();
     b->putIfAbsent("k", "0123456789");
@@ -86,7 +86,7 @@ TEST_P(CasBackendContract, RangeGet)
     EXPECT_EQ(b->get("k", r)->bytes, "234");
 }
 
-TEST_P(CasBackendContract, Head)
+TEST_P(CASBackendContract, Head)
 {
     auto b = GetParam()();
     b->putIfAbsent("k", "hello");
@@ -98,7 +98,7 @@ TEST_P(CasBackendContract, Head)
     EXPECT_FALSE(h2.exists);
 }
 
-TEST_P(CasBackendContract, ListPagination)
+TEST_P(CASBackendContract, ListPagination)
 {
     auto b = GetParam()();
     b->putIfAbsent("p/a", "0123456789");
@@ -118,7 +118,7 @@ TEST_P(CasBackendContract, ListPagination)
     EXPECT_EQ(page2.keys[0].key, "p/b");
 }
 
-TEST_P(CasBackendContract, ReadAfterWrite)
+TEST_P(CASBackendContract, ReadAfterWrite)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("rw", "payload").token;
@@ -135,7 +135,7 @@ TEST_P(CasBackendContract, ReadAfterWrite)
 /// token must be rejected with the object still absent — a token-conditional update can never resurrect a
 /// missing key. For the Native S3 adapter this pins the 404-on-If-Match -> PreconditionFailed/Conflict
 /// mapping; for every backend it pins that absence is not a write opportunity for a stale token.
-TEST_P(CasBackendContract, OverwriteAndCasOnMissingKey)
+TEST_P(CASBackendContract, OverwriteAndCasOnMissingKey)
 {
     auto b = GetParam()();
     const Token t1 = b->putIfAbsent("k", "v1").token;
@@ -149,7 +149,7 @@ TEST_P(CasBackendContract, OverwriteAndCasOnMissingKey)
     EXPECT_FALSE(b->get("k").has_value());                     // still absent
 }
 
-TEST_P(CasBackendContract, StreamPutRoundTrip)
+TEST_P(CASBackendContract, StreamPutRoundTrip)
 {
     auto b = GetParam()();
     auto sink = b->putIfAbsentStream("k/stream1");
@@ -165,7 +165,7 @@ TEST_P(CasBackendContract, StreamPutRoundTrip)
     EXPECT_EQ(got->token, tok);
 }
 
-TEST_P(CasBackendContract, StreamPutPreconditionAtFinalize)
+TEST_P(CASBackendContract, StreamPutPreconditionAtFinalize)
 {
     auto b = GetParam()();
     const auto first_put = b->putIfAbsent("k/stream2", "original");
@@ -180,7 +180,7 @@ TEST_P(CasBackendContract, StreamPutPreconditionAtFinalize)
     EXPECT_EQ(got->token, first);
 }
 
-TEST_P(CasBackendContract, StreamPutCancelLeavesNothing)
+TEST_P(CASBackendContract, StreamPutCancelLeavesNothing)
 {
     auto b = GetParam()();
     {
@@ -191,7 +191,7 @@ TEST_P(CasBackendContract, StreamPutCancelLeavesNothing)
     EXPECT_FALSE(b->head("k/stream3").exists);
 }
 
-TEST_P(CasBackendContract, StreamPutDestructionWithoutFinalizeLeavesNothing)
+TEST_P(CASBackendContract, StreamPutDestructionWithoutFinalizeLeavesNothing)
 {
     auto b = GetParam()();
     {
@@ -202,7 +202,7 @@ TEST_P(CasBackendContract, StreamPutDestructionWithoutFinalizeLeavesNothing)
     EXPECT_FALSE(b->head("k/stream4").exists);
 }
 
-TEST_P(CasBackendContract, StreamPutEmptyBody)
+TEST_P(CASBackendContract, StreamPutEmptyBody)
 {
     auto b = GetParam()();
     auto sink = b->putIfAbsentStream("k/stream_empty");
@@ -221,7 +221,7 @@ TEST_P(CasBackendContract, StreamPutEmptyBody)
 
 /// ~1 MB written in chunks: exercises buffer growth in the memory-buffered sinks and, for the
 /// future Native sink, the real streaming path.
-TEST_P(CasBackendContract, StreamPutLargeBody)
+TEST_P(CASBackendContract, StreamPutLargeBody)
 {
     auto b = GetParam()();
     String chunk(4096, '\0');
@@ -246,10 +246,10 @@ TEST_P(CasBackendContract, StreamPutLargeBody)
     EXPECT_EQ(got->token, tok);
 }
 
-INSTANTIATE_TEST_SUITE_P(CasInMemory, CasBackendContract,
+INSTANTIATE_TEST_SUITE_P(CASInMemory, CASBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
 
-INSTANTIATE_TEST_SUITE_P(CasLocal, CasBackendContract,
+INSTANTIATE_TEST_SUITE_P(CASLocal, CASBackendContract,
     ::testing::Values(+[]() -> BackendPtr
     {
         return std::make_shared<ObjectStorageBackend>(

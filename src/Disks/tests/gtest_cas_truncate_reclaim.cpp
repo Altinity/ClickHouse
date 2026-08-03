@@ -106,7 +106,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 /// The faithful soak repro: many parts sharing blobs, GC interleaved with the publishes, then a
 /// per-ref drop of EVERY ref (Replicated TRUNCATE), then GC to a fixpoint. fsck.unreachable must
 /// reach 0 — no orphaned blob may survive.
-TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
+TEST(CASTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -172,7 +172,7 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
 /// fixpoint. The post-truncate inserts must not stall reclamation of the pre-truncate orphans.
 /// Also asserts a TIGHT bound on the number of rounds reclamation needs (the soak's 180s budget at
 /// gc_interval=30s only buys ~6 rounds, so the core must reach a fixpoint well inside that).
-TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
+TEST(CASTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -230,7 +230,7 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
 
 /// The DROP TABLE path: removeRecursive of a table dir calls dropNamespace, which journals one
 /// Remove per former ref. Same reclamation invariant.
-TEST(CasTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
+TEST(CASTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);

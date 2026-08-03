@@ -6,7 +6,7 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 
-TEST(CasFormatBattery, BlobMeta)
+TEST(CASFormatBattery, BlobMeta)
 {
     BlobMeta m;
     m.state = MetaState::Clean;
@@ -20,7 +20,7 @@ TEST(CasFormatBattery, BlobMeta)
                   "{\"st\":\"clean\",\"cr\":\"0\",\"sz\":\"12345\"}\n"});
 }
 
-TEST(CasBlobMetaFormat, CondemnedRoundTripAllFields)
+TEST(CASBlobMetaFormat, CondemnedRoundTripAllFields)
 {
     BlobMeta m;
     m.state = MetaState::Condemned;
@@ -34,7 +34,7 @@ TEST(CasBlobMetaFormat, CondemnedRoundTripAllFields)
         "{\"type\":\"cas_blob_meta\",\"v\":9}\n{\"st\":\"condemned\",\"cr\":\"7\",\"sz\":\"4096\"}\n");
 }
 
-TEST(CasBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
+TEST(CASBlobMetaFormat, FailsClosedOnUnknownStateAndTruncation)
 {
     /// Unknown state word -> CORRUPTED_DATA (mirrors the old `state > Condemned` reject).
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes

@@ -191,7 +191,7 @@ RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const Strin
 /// 1. Snapshot body durable strictly before `_ckpt` advances
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvances)
+TEST(CASRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvances)
 {
     auto backend = std::make_shared<OrderedFaultBackend>();
     auto store = openPool(backend);
@@ -232,7 +232,7 @@ TEST(CasRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvance
 /// 2. Adoption happens last, and only once both durable effects landed
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEffects)
+TEST(CASRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEffects)
 {
     auto backend = std::make_shared<OrderedFaultBackend>();
     auto store = openPool(backend);
@@ -279,7 +279,7 @@ TEST(CasRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 /// pinned behavior precisely (recovery precedes publication, rather than an outright refusal).
 ///
 /// It is reached here the same way `gtest_cas_ref_writer.cpp`'s
-/// `CasRefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
+/// `CASRefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
 /// mutation's ref-log body commits durably while its OWN checkpoint-frontier CAS (`commitRefChunk`'s
 /// `commit_contribution`, not the snapshot publisher's) conflicts persistently.
 ///
@@ -298,7 +298,7 @@ TEST(CasRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 /// re-recovery is an observable state transition, never a silent skip; (c) if a snapshot IS published, it
 /// reflects the RECOVERED frontier -- the durable transaction the stale cache was missing is actually
 /// covered by it, not merely "some snapshot, from whichever view".
-TEST(CasRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication)
+TEST(CASRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication)
 {
     auto backend = std::make_shared<OrderedFaultBackend>();
     auto store = openPool(backend);
@@ -370,14 +370,14 @@ TEST(CasRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
 /// to `CasRefLedger`, so they can only be characterized through the public dispatch surface
 /// (`appendRefOps`/`resolveRef` triggering `maybeScheduleSnapshotPublish`, and
 /// `waitForSnapshotPublishSettleForTest`/`ProfileEvents::CASRefSnapshotPublishDispatched` as the
-/// observables). `CasRequestControllerBackoff` is a DIFFERENT mechanism (the request controller's
+/// observables). `CASRequestControllerBackoff` is a DIFFERENT mechanism (the request controller's
 /// per-attempt retry backoff); this characterizes ONLY the per-table snapshot-publish dispatch backoff.
 ///
 /// A controlled clock (`PoolConfig::boot_ms_fn`) DOES exist for this seam (`gtest_cas_ref_writer.cpp`'s
 /// `C4BackoffDefersThenRetriesAndPublishes` already relies on it) -- so unlike the plan's anticipated
 /// fallback, this pins literal accept/refuse decisions against exact clock offsets rather than only
 /// attempt counts.
-TEST(CasRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
+TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<OrderedFaultBackend>();

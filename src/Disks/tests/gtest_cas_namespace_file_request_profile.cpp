@@ -48,7 +48,7 @@ namespace DB::ContentAddressedSetting
 /// them proves nothing. The layer where they can be violated is the DISK operation above, where
 /// `ContentAddressedTransaction::writeFile` resolves the namespace's life; that is exactly where Task 4b
 /// put a life resolution, so that is where a per-operation catalog GET would appear. The two
-/// `CasNamespaceFileDiskProfile` cases at the bottom of this file fence it there, through a recording
+/// `CASNamespaceFileDiskProfile` cases at the bottom of this file fence it there, through a recording
 /// `IObjectStorage` (the metadata storage builds its own `Backend` from an `ObjectStoragePtr`, so the
 /// object storage is the injectable seam -- no production surface is widened for the test's benefit).
 
@@ -88,7 +88,7 @@ PoolPtr openCountedPool(std::shared_ptr<CountingBackend> & out_backend)
 /// CREATE (the key is absent) and REWRITE (the key is present) are different request shapes on the
 /// same call, and the profile pins both: one HEAD to learn the token, then the create-if-absent or the
 /// token-conditioned replacement that HEAD selected.
-TEST(CasNamespaceFileRequestProfile, CreateThenRewrite)
+TEST(CASNamespaceFileRequestProfile, CreateThenRewrite)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
@@ -120,7 +120,7 @@ TEST(CasNamespaceFileRequestProfile, CreateThenRewrite)
 }
 
 /// A plain read is one whole-object GET and nothing else.
-TEST(CasNamespaceFileRequestProfile, Read)
+TEST(CASNamespaceFileRequestProfile, Read)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
@@ -143,7 +143,7 @@ TEST(CasNamespaceFileRequestProfile, Read)
 /// APPEND on a CA disk is serviced by read-modify-rewrite, and its request shape is the composition of
 /// the two calls that implement it: a GET of the current body, then a whole-body PUT of base+delta.
 /// Driven here as that composition against the same key, which is the shape whose count must not move.
-TEST(CasNamespaceFileRequestProfile, ReadModifyRewriteAppend)
+TEST(CASNamespaceFileRequestProfile, ReadModifyRewriteAppend)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
@@ -168,7 +168,7 @@ TEST(CasNamespaceFileRequestProfile, ReadModifyRewriteAppend)
 }
 
 /// REMOVE is exact-token deletion, so it is one HEAD for the token plus one delete against it.
-TEST(CasNamespaceFileRequestProfile, Remove)
+TEST(CASNamespaceFileRequestProfile, Remove)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
@@ -193,7 +193,7 @@ TEST(CasNamespaceFileRequestProfile, Remove)
 /// ROTATION is the sequence the constraint names: the retiring segment is enumerated, the new segment
 /// is created, and the retired one is removed. One LIST of the files prefix serves the enumeration (a
 /// single page here), and each segment carries its own create or remove shape.
-TEST(CasNamespaceFileRequestProfile, DedupLogRotation)
+TEST(CASNamespaceFileRequestProfile, DedupLogRotation)
 {
     std::shared_ptr<CountingBackend> backend;
     PoolPtr store = openCountedPool(backend);
@@ -439,7 +439,7 @@ void writeVerbatimThroughDisk(   /// ASSERT_* inside -> must return void
 
 /// The steady state: with the table open and its life already resolved, no namespace-file operation --
 /// rewrite, append, read, rotation, remove -- touches a catalog, ref, blob or manifest key.
-TEST(CasNamespaceFileDiskProfile, SteadyStateFileOperationsTouchNoCatalogRefBlobOrManifestKey)
+TEST(CASNamespaceFileDiskProfile, SteadyStateFileOperationsTouchNoCatalogRefBlobOrManifestKey)
 {
     std::shared_ptr<RecordingObjectStorage> object_storage;
     auto storage = openRecordingStorage(object_storage);
@@ -476,7 +476,7 @@ TEST(CasNamespaceFileDiskProfile, SteadyStateFileOperationsTouchNoCatalogRefBlob
 
 /// The other half: the life resolution is real and is paid ONCE per table-open. Without this, the zeros
 /// above could be produced by a fixture in which no resolution ever happened.
-TEST(CasNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
+TEST(CASNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
 {
     std::shared_ptr<RecordingObjectStorage> object_storage;
     auto storage = openRecordingStorage(object_storage);
@@ -509,7 +509,7 @@ TEST(CasNamespaceFileDiskProfile, TheLifeResolutionIsPaidOncePerTableOpen)
 /// matters twice over: `unlinkFile(..., if_exists = true)` is called from cleanup paths whose contract is
 /// to be a no-op, and the catalog is ONE pool-wide object under a capacity-admission predicate — a
 /// removal that admits an entry per never-created table grows it without bound.
-TEST(CasNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUntouched)
+TEST(CASNamespaceFileDiskProfile, RemovalOnANeverOpenedTableLeavesTheCatalogUntouched)
 {
     std::shared_ptr<RecordingObjectStorage> object_storage;
     auto storage = openRecordingStorage(object_storage);

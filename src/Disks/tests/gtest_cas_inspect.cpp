@@ -31,7 +31,7 @@ BlobRef bh(uint64_t n)
 /// op kind, and neither the ref-log nor the ref-snapshot rendering carries a `payload_size` key --
 /// `RefOp`/`RefCommittedRow` no longer have a `payload` field to size.
 
-TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
+TEST(CASInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/tbl"};
@@ -57,7 +57,7 @@ TEST(CasInspect, RendersSetPublishedAtOpWithNoPayloadSizeKey)
 
 /// Task-1 review finding M5: `cas inspect` renders the new `EpochSeal` op kind and the txn-level
 /// `prev_epoch_seal` chain field, needed to debug INV-2 seal chains without a raw byte dump.
-TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
+TEST(CASInspect, RendersEpochSealTxnWithPrevEpochSeal)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/tbl"};
@@ -79,7 +79,7 @@ TEST(CasInspect, RendersEpochSealTxnWithPrevEpochSeal)
     EXPECT_NE(json.find(R"("prev_epoch_seal":{"writer_epoch":2,"ref_sequence":9})"), String::npos) << json;
 }
 
-TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
+TEST(CASInspect, RendersCommittedRowWithNoPayloadSizeKey)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/tbl"};
@@ -107,7 +107,7 @@ TEST(CasInspect, RendersCommittedRowWithNoPayloadSizeKey)
 /// A blob-target source-edge run segment (`Layout::blobTargetRunKey`) is the ground truth for every
 /// in-degree question; `ca-inspect` decodes it with the typed `SourceEdgeRunView` reader (not by hand)
 /// and must distinguish an active edge from a condemned sentinel row, decoding the latter's fields.
-TEST(CasInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
+TEST(CASInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
 {
     const Layout layout("p");
 
@@ -159,7 +159,7 @@ TEST(CasInspect, RendersBlobTargetRunEdgeAndCondemnedRows)
 /// fell through to
 /// `BAD_ARGUMENTS` for it -- and it is precisely the object an operator reaches for when asking "what
 /// is recovery's base" or "why is cleanup not reclaiming anything".
-TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
+TEST(CASInspect, RendersRefCkptWithEveryFieldPresent)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/tbl"};
@@ -184,7 +184,7 @@ TEST(CasInspect, RendersRefCkptWithEveryFieldPresent)
 /// The absences are the interesting readings, so they render as explicit `null`s rather than missing
 /// keys: no checkpoint means recovery has no base AND nothing is deletable, which is a very different
 /// report from "the key is there and I could not tell you what is in it".
-TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
+TEST(CASInspect, RendersRefCkptAbsencesAsExplicitNulls)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/fresh"};
@@ -200,7 +200,7 @@ TEST(CasInspect, RendersRefCkptAbsencesAsExplicitNulls)
 
 /// A listed physical id cannot supply a namespace. Inspect must receive the unique catalog join, and
 /// a different logical spelling at the same id is rejected by the decoded object's own namespace.
-TEST(CasInspect, RefObjectRequiresTheExactCatalogResolution)
+TEST(CASInspect, RefObjectRequiresTheExactCatalogResolution)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/db/tbl"};

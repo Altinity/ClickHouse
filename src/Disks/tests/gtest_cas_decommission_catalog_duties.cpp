@@ -127,7 +127,7 @@ private:
     bool added = false;
 };
 
-TEST(CasDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeepsSlot)
+TEST(CASDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeepsSlot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -155,7 +155,7 @@ TEST(CasDecommissionCatalogDuties, RemovingWithoutCheckpointIsCorruptionAndKeeps
         NsState::Removing);
 }
 
-TEST(CasDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeepsSlotForGc)
+TEST(CASDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeepsSlotForGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace ns("victim/db/pending_terminal");
@@ -193,7 +193,7 @@ TEST(CasDecommissionCatalogDuties, RemovingWithCheckpointResumesTerminalAndKeeps
     EXPECT_EQ(terminal.ops.back().kind, RefOpKind::RemoveNamespace);
 }
 
-TEST(CasDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNamespaceFails)
+TEST(CASDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNamespaceFails)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace progressed_ns("victim/db/a_progressed");
@@ -232,7 +232,7 @@ TEST(CasDecommissionCatalogDuties, PartialRemovalProgressStillWakesGcWhenLaterNa
     ASSERT_EQ(progressed_stream.keys.size(), 1u);
 }
 
-TEST(CasDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot)
+TEST(CASDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeepsSlot)
 {
     auto backend = std::make_shared<AddVictimEntryDuringRootDrainBackend>();
     { auto victim = openVictim(backend); }
@@ -250,7 +250,7 @@ TEST(CasDecommissionCatalogDuties, VictimEntryAppearingBeforeTheOwnershipCutKeep
     EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
 
-TEST(CasDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot)
+TEST(CASDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetirementKeepsSlot)
 {
     auto backend = std::make_shared<MutateCatalogBetweenRetirementReadsBackend>();
     { auto victim = openVictim(backend); }
@@ -268,7 +268,7 @@ TEST(CasDecommissionCatalogDuties, CatalogTokenMovedBetweenOwnershipCutAndRetire
     EXPECT_EQ(catalogEntry(*backend, Layout("p"), RootNamespace("victim/db/late")).state, NsState::Live);
 }
 
-TEST(CasDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound)
+TEST(CASDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAnotherRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace ns("victim/db/folded_terminal");
@@ -309,7 +309,7 @@ TEST(CasDecommissionCatalogDuties, FoldedTerminalRemainsGcOwnedAndOnlyRequestsAn
         << "decommission must not append a second terminal or become a catalog deletion driver";
 }
 
-TEST(CasDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNotBlockRetirement)
+TEST(CASDecommissionCatalogDuties, OpaqueLifeDebrisWithoutCatalogOwnershipDoesNotBlockRetirement)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }

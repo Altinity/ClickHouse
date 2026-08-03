@@ -26,7 +26,7 @@ ManifestRef ref(const String &, uint64_t seq, uint64_t inst)
 /// Committed new_manifest => +1 per blob entry (BlobInDegreeMatchesActiveManifests).
 /// After a fold, gc/state records snap_attempt == the folding leader's lease.seq, and the fold seal
 /// lives under (snap_generation, snap_attempt).
-TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
+TEST(CASGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -46,7 +46,7 @@ TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
     EXPECT_TRUE(backend->head(store->layout().foldSealKey(st.snap_generation, st.snap_attempt)).exists);
 }
 
-TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)
+TEST(CASGcFold, CommittedAddEmitsPlusOnePerBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -64,7 +64,7 @@ TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)
 }
 
 /// Owner removal => -1 per blob entry; in-degree returns to 0.
-TEST(CasGcFold, RemovalEmitsMinusOne)
+TEST(CASGcFold, RemovalEmitsMinusOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -81,7 +81,7 @@ TEST(CasGcFold, RemovalEmitsMinusOne)
 }
 
 /// Precommit with a PRESENT, valid body => +1.
-TEST(CasGcFold, PrecommitBodyPresentEmitsPlusOne)
+TEST(CASGcFold, PrecommitBodyPresentEmitsPlusOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -95,7 +95,7 @@ TEST(CasGcFold, PrecommitBodyPresentEmitsPlusOne)
 }
 
 /// Precommit whose body is ABSENT => NO delta (control #4); the 404 must NOT throw.
-TEST(CasGcFold, PrecommitMissingBodyEmitsNoDelta)
+TEST(CASGcFold, PrecommitMissingBodyEmitsNoDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -109,7 +109,7 @@ TEST(CasGcFold, PrecommitMissingBodyEmitsNoDelta)
 
 /// FOLD BARRIER (control #23): a LIVE precommit binding whose body is missing does NOT advance the
 /// durable fold cursor past its activation event; when the body appears the cursor advances.
-TEST(CasGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
+TEST(CASGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -127,7 +127,7 @@ TEST(CasGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
 }
 
 /// Promote of an already-activated precommit is a PURE OWNER MOVE: NO delta, body not condemned.
-TEST(CasGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
+TEST(CASGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -146,7 +146,7 @@ TEST(CasGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
 }
 
 /// Committed add naming a MISSING body (404) => clamp + anomaly, never a guessed +1, never a throw.
-TEST(CasGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
+TEST(CASGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -162,7 +162,7 @@ TEST(CasGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
 }
 
 /// A body whose self-ref disagrees (PRESENT but INVALID) => hard fail closed (controls #19/#20).
-TEST(CasGcFold, RefMismatchFailsClosed)
+TEST(CASGcFold, RefMismatchFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -180,7 +180,7 @@ TEST(CasGcFold, RefMismatchFailsClosed)
 }
 
 /// Owner-removal whose OLD committed body is gone at removal-fold => clamp + anomaly, no partial -1.
-TEST(CasGcFold, RemovalWithMissingOldBodyClampsAndRecordsAnomaly)
+TEST(CASGcFold, RemovalWithMissingOldBodyClampsAndRecordsAnomaly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -201,7 +201,7 @@ TEST(CasGcFold, RemovalWithMissingOldBodyClampsAndRecordsAnomaly)
     EXPECT_LT(foldCursorOf(*backend, store->layout(), ns, 0), removal_version);
 }
 
-/// (The two `CasGcFold.IncarnationMismatchRestartsFoldAtZero*` tests were removed with the snapshot+log
+/// (The two `CASGcFold.IncarnationMismatchRestartsFoldAtZero*` tests were removed with the snapshot+log
 /// ref model: they injected a stale per-shard fold cursor beyond the live mutable shard's version and
 /// asserted the fold RESET the cursor to 0 on an incarnation mismatch. There is no mutable per-shard
 /// cursor to stale-reset anymore -- the durable cursor is a strictly-increasing `RefTxnId`, and a
@@ -213,7 +213,7 @@ TEST(CasGcFold, RemovalWithMissingOldBodyClampsAndRecordsAnomaly)
 /// ZERO run objects. After one populated round, reset the counters and run a no-op round; the fold must
 /// carry the parent generation's `RunRef` verbatim into the new fold_seal (same key, same checksum, same
 /// generation) and NOT read or write any `.../blob_target/...` object.
-TEST(CasGcFold, EmptyDeltaShardCarriesParentRunRef)
+TEST(CASGcFold, EmptyDeltaShardCarriesParentRunRef)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     /// gc_fold_max_defer_rounds=0 forces fold-every-round: this test exercises the pure-ref-carry FOLD
@@ -256,7 +256,7 @@ TEST(CasGcFold, EmptyDeltaShardCarriesParentRunRef)
 /// The round AFTER a ref-carry, with a real delta, folds THROUGH the carried ref: the new generation's
 /// run is produced from the OLD-generation run (resolved via the carried ref, not by key construction)
 /// merged with the delta, and the resulting in-degree is correct.
-TEST(CasGcFold, FoldResolvesThroughCarriedRef)
+TEST(CASGcFold, FoldResolvesThroughCarriedRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -290,7 +290,7 @@ TEST(CasGcFold, FoldResolvesThroughCarriedRef)
 /// still referenced, so its carried-ref-resolved in-degree is 1 and it is NOT surfaced as a candidate.
 /// (A carried ref that the preview failed to resolve would mis-open the run and either throw or spuriously
 /// surface the still-referenced blob.)
-TEST(CasGcFold, PreviewResolvesCarriedRef)
+TEST(CASGcFold, PreviewResolvesCarriedRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// gc_fold_max_defer_rounds=0 forces the idle second round to FOLD (pure ref-carry) rather than
@@ -346,7 +346,7 @@ String corruptSealedRunChecksum(InMemoryBackend & backend, const Layout & layout
 }
 }
 
-TEST(CasGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
+TEST(CASGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -367,7 +367,7 @@ TEST(CasGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
     EXPECT_THROW(gc2.previewDeletes(), DB::Exception);
 }
 
-TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
+TEST(CASGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -412,7 +412,7 @@ TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
 /// behind the clamp; the next re-fold of that same log would then find A's body missing and clamp forever
 /// (a permanent pool-wide destructive freeze). With per-log staging, A's body survives the clamp round and
 /// the log folds cleanly once B's body reappears.
-TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
+TEST(CASGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -458,7 +458,7 @@ TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
 /// the fold barrier forever. Without a terminal rule this table clamps every round with no resolution (a
 /// late-predecessor precommit whose body was already reclaimed). The watermark is seeded so the precommit's
 /// build is dead; the fold must advance the cursor past the log and record no clamp anomaly.
-TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
+TEST(CASGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -487,7 +487,7 @@ TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
 /// deletes AND the post-CAS ref/namespace cleanup — from ONE decision, not two independent recomputes
 /// of !report.anomalies.empty() that a future edit could desync (over-delete class). This pins that a
 /// clamped round reclaims nothing.
-TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
+TEST(CASGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -529,7 +529,7 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
 /// swept, and an unrelated live
 /// table's snapshot-covered ref-log must not be deleted, in the SAME clamped round. A clean round
 /// afterward proves the setup really was cleanup-eligible, not vacuously untouched.
-TEST(CasGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJanitorWork)
+TEST(CASGcFold, RoundSideAnomalySuppressesRefLogCleanupWhileRemovalDebrisStaysJanitorWork)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);

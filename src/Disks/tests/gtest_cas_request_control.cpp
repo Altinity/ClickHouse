@@ -44,7 +44,7 @@ namespace DB::ErrorCodes
 
 /// The success path (buf.finalize() returned without throwing) is always Committed. No exception
 /// object is needed — the caller distinguishes success from failure before calling either overload.
-TEST(CasRequestControl, SuccessIsAlwaysCommitted)
+TEST(CASRequestControl, SuccessIsAlwaysCommitted)
 {
     EXPECT_EQ(classifyConditionalWriteResult(), CasWriteOutcome::Committed);
 }
@@ -52,7 +52,7 @@ TEST(CasRequestControl, SuccessIsAlwaysCommitted)
 /// Fix #37 phase 2: the retry-later throw must be NETWORK_ERROR, never ABORTED -- ABORTED is silently
 /// swallowed by ReplicatedMergeMutateTaskBase (no backoff, no last_exception), which is exactly the
 /// defect this fix closes.
-TEST(CasWriteRetryLater, ThrowsNetworkErrorNotAborted)
+TEST(CASWriteRetryLater, ThrowsNetworkErrorNotAborted)
 {
     bool threw = false;
     try
@@ -73,7 +73,7 @@ TEST(CasWriteRetryLater, ThrowsNetworkErrorNotAborted)
 
 /// The exception_ptr twin (for call sites that fail a pending future/promise rather than throw
 /// directly, e.g. CasRefLedger's queued-append completion paths) must carry the SAME classification.
-TEST(CasWriteRetryLater, ExceptionPtrVariantCarriesSameClassification)
+TEST(CASWriteRetryLater, ExceptionPtrVariantCarriesSameClassification)
 {
     const std::exception_ptr eptr = makeCasWriteRetryLaterExceptionPtr("another cause");
     bool threw = false;
@@ -96,25 +96,25 @@ TEST(CasWriteRetryLater, ExceptionPtrVariantCarriesSameClassification)
 /// One row per RFC cas-s3-timeout-retry-control §operation-classes classification. PreconditionFailed
 /// is NEVER DefiniteFailure — it means the key exists, not that the request was rejected — and every
 /// unrecognized/ambiguous error also falls to Unresolved, never to a false DefiniteFailure.
-TEST(CasRequestControl, ClassifiesPreconditionFailedAsUnresolved)
+TEST(CASRequestControl, ClassifiesPreconditionFailedAsUnresolved)
 {
     DB::S3Exception e("412 from backend", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::Unresolved);
 }
 
-TEST(CasRequestControl, ClassifiesTimeoutAsUnresolved)
+TEST(CASRequestControl, ClassifiesTimeoutAsUnresolved)
 {
     Poco::TimeoutException e("simulated client-side receive timeout");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::Unresolved);
 }
 
-TEST(CasRequestControl, ClassifiesConnectionResetAsUnresolved)
+TEST(CASRequestControl, ClassifiesConnectionResetAsUnresolved)
 {
     Poco::Net::ConnectionResetException e("simulated connection reset");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::Unresolved);
 }
 
-TEST(CasRequestControl, Classifies5xxAsUnresolved)
+TEST(CASRequestControl, Classifies5xxAsUnresolved)
 {
     DB::S3Exception e("simulated internal error", Aws::S3::S3Errors::INTERNAL_FAILURE, "InternalError");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::Unresolved);
@@ -123,7 +123,7 @@ TEST(CasRequestControl, Classifies5xxAsUnresolved)
     EXPECT_EQ(classifyConditionalWriteResult(slow_down), CasWriteOutcome::Unresolved);
 }
 
-TEST(CasRequestControl, ClassifiesMalformedRequestAsDefiniteFailure)
+TEST(CASRequestControl, ClassifiesMalformedRequestAsDefiniteFailure)
 {
     DB::S3Exception e("bad xml", Aws::S3::S3Errors::UNKNOWN, "MalformedXML");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::DefiniteFailure);
@@ -132,13 +132,13 @@ TEST(CasRequestControl, ClassifiesMalformedRequestAsDefiniteFailure)
     EXPECT_EQ(classifyConditionalWriteResult(by_code), CasWriteOutcome::DefiniteFailure);
 }
 
-TEST(CasRequestControl, ClassifiesEntityTooLargeAsDefiniteFailure)
+TEST(CASRequestControl, ClassifiesEntityTooLargeAsDefiniteFailure)
 {
     DB::S3Exception e("body exceeds the maximum object size", Aws::S3::S3Errors::UNKNOWN, "EntityTooLarge");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::DefiniteFailure);
 }
 
-TEST(CasRequestControl, ClassifiesAccessDeniedAsDefiniteFailure)
+TEST(CASRequestControl, ClassifiesAccessDeniedAsDefiniteFailure)
 {
     DB::S3Exception e("simulated 403", Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied");
     EXPECT_EQ(classifyConditionalWriteResult(e), CasWriteOutcome::DefiniteFailure);
@@ -151,7 +151,7 @@ TEST(CasRequestControl, ClassifiesAccessDeniedAsDefiniteFailure)
 /// unrelated exception type) must fail toward Unresolved — never toward a false DefiniteFailure or a
 /// false Committed (RFC §resolve-before-reissuing: ambiguity always resolves toward "resolve before
 /// reissuing").
-TEST(CasRequestControl, UnrecognizedErrorsFailSafeToUnresolved)
+TEST(CASRequestControl, UnrecognizedErrorsFailSafeToUnresolved)
 {
     DB::S3Exception unknown_named("weird service error", Aws::S3::S3Errors::UNKNOWN, "SomeFutureErrorCode");
     EXPECT_EQ(classifyConditionalWriteResult(unknown_named), CasWriteOutcome::Unresolved);
@@ -166,7 +166,7 @@ TEST(CasRequestControl, UnrecognizedErrorsFailSafeToUnresolved)
 
 /// recordConditionalWriteAttemptStarted / recordConditionalWriteOutcome bump the per-class counters
 /// (RFC §observability): attempts, and exactly one of Committed/DefiniteFailure/Unresolved per call.
-TEST(CasRequestControl, CountersHookupIncrementsPerClass)
+TEST(CASRequestControl, CountersHookupIncrementsPerClass)
 {
     using ProfileEvents::global_counters;
     const auto attempts_before = global_counters[ProfileEvents::CASConditionalWriteAttempts].load();
@@ -194,7 +194,7 @@ TEST(CasRequestControl, CountersHookupIncrementsPerClass)
 /// Wiring smoke test: a real conditional write through ObjectStorageBackend (Native mode) counts one
 /// attempt and one Committed outcome via the SAME instrumented call site nativeConditionalPut uses —
 /// see finalizeConditionalWriteInstrumented in CasObjectStorageBackend.cpp.
-TEST(CasRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
+TEST(CASRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
 {
     using ProfileEvents::global_counters;
     const auto attempts_before = global_counters[ProfileEvents::CASConditionalWriteAttempts].load();
@@ -220,7 +220,7 @@ TEST(CasRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
 /// selects the SingleAttempt object-storage retry profile, and a non-S3 backend such as
 /// LocalObjectStorage reports it as UNSUPPORTED via IObjectStorage::supportsRetryProfile — the property
 /// checkConditionalWriteSingleAttemptSupport's fail-closed mount-time gate relies on.
-TEST(CasRequestControl, SingleAttemptProfileRequestedAndLocalBackendRejected)
+TEST(CASRequestControl, SingleAttemptProfileRequestedAndLocalBackendRejected)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -239,7 +239,7 @@ TEST(CasRequestControl, SingleAttemptProfileRequestedAndLocalBackendRejected)
 /// plumbing conditionalWriteSettings() -> WriteSettings produces the override value that
 /// S3ObjectStorage::writeObject then applies to request_settings — NOT a real single-attempt
 /// assertion against a live wire attempt.
-TEST(CasRequestControl, ConditionalWriteSettingsForceSingleUnexpectedWriteErrorRetry)
+TEST(CASRequestControl, ConditionalWriteSettingsForceSingleUnexpectedWriteErrorRetry)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -316,7 +316,7 @@ GetResult resultWithBytes(const String & bytes)
 
 }
 
-TEST(CasRequestController, UncertainResolvesIdenticalAsCommitted)
+TEST(CASRequestController, UncertainResolvesIdenticalAsCommitted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -328,7 +328,7 @@ TEST(CasRequestController, UncertainResolvesIdenticalAsCommitted)
     EXPECT_EQ(backend->put_attempts.load(), 1u);
 }
 
-TEST(CasRequestController, UncertainResolvesDifferentThrowsCorruption)
+TEST(CASRequestController, UncertainResolvesDifferentThrowsCorruption)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -343,7 +343,7 @@ TEST(CasRequestController, UncertainResolvesDifferentThrowsCorruption)
 
 /// GET-absent NEVER yields DefiniteFailure (spec §writer-side-linearization): the SAME (key, bytes) is
 /// retried up to `max_attempts`, and only THEN does the call give up with Unresolved.
-TEST(CasRequestController, UncertainResolvesAbsentRetriesSameKeyWithinBudget)
+TEST(CASRequestController, UncertainResolvesAbsentRetriesSameKeyWithinBudget)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -361,7 +361,7 @@ TEST(CasRequestController, UncertainResolvesAbsentRetriesSameKeyWithinBudget)
 /// The operation deadline — not just the attempt-count budget — cuts a retry loop short: a fake clock
 /// advances by a fixed step per now_ms() call (no sleeps), and max_attempts is generous enough that only
 /// the deadline check can be what stops the loop.
-TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
+TEST(CASRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -394,9 +394,9 @@ TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMax
 /// The controller is constructed DIRECTLY here, bypassing `validateCasRequestBudget`, because the
 /// point is to show the behaviour the validator now forbids. Three tests were flaky on exactly this
 /// before it was forbidden: `8f9e63c7a19`'s sweep-interruption test,
-/// `CasRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`, and
-/// `CasRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`.
-TEST(CasRequestController, EqualAttemptTimeoutAndDeadlineWouldRefuseAfterASingleTick)
+/// `CASRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`, and
+/// `CASRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`.
+TEST(CASRequestController, EqualAttemptTimeoutAndDeadlineWouldRefuseAfterASingleTick)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
 
@@ -424,7 +424,7 @@ TEST(CasRequestController, EqualAttemptTimeoutAndDeadlineWouldRefuseAfterASingle
 
 /// And the same equality is refused at startup, so no budget can reach the controller in that shape.
 /// The boundary is asserted from BOTH sides: equality throws, one millisecond more is accepted.
-TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutEqualToOperationDeadline)
+TEST(CASRequestController, ValidateBudgetRejectsAttemptTimeoutEqualToOperationDeadline)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 5000;
@@ -440,7 +440,7 @@ TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutEqualToOperationDe
         << "one millisecond of headroom is the whole requirement -- the rule is strictness, not size";
 }
 
-TEST(CasRequestController, OverwriteAmbiguousResolvesIntendedBytesAsCommitted)
+TEST(CASRequestController, OverwriteAmbiguousResolvesIntendedBytesAsCommitted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     bool first_attempt = true;
@@ -462,7 +462,7 @@ TEST(CasRequestController, OverwriteAmbiguousResolvesIntendedBytesAsCommitted)
     EXPECT_EQ(result.token, (Token{"t", TokenType::Emulated}));
 }
 
-TEST(CasRequestController, OverwriteAmbiguousResolvesExpectedTokenAndRetriesWithinBudget)
+TEST(CASRequestController, OverwriteAmbiguousResolvesExpectedTokenAndRetriesWithinBudget)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_overwrite_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -478,7 +478,7 @@ TEST(CasRequestController, OverwriteAmbiguousResolvesExpectedTokenAndRetriesWith
     EXPECT_EQ(backend->put_overwrite_attempts.load(), 3u);
 }
 
-TEST(CasRequestController, OverwriteAmbiguousResolvesDifferentTokenAndBytesAsConflict)
+TEST(CASRequestController, OverwriteAmbiguousResolvesDifferentTokenAndBytesAsConflict)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     bool first_attempt = true;
@@ -500,7 +500,7 @@ TEST(CasRequestController, OverwriteAmbiguousResolvesDifferentTokenAndBytesAsCon
     EXPECT_EQ(backend->put_overwrite_attempts.load(), 1u);
 }
 
-TEST(CasRequestController, OverwriteOperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
+TEST(CASRequestController, OverwriteOperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_overwrite_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -521,7 +521,7 @@ TEST(CasRequestController, OverwriteOperationDeadlineExhaustionReturnsUnresolved
     EXPECT_EQ(backend->put_overwrite_attempts.load(), 2u);
 }
 
-TEST(CasRequestController, FenceLostBeforeAttemptSendsNoAttempt)
+TEST(CASRequestController, FenceLostBeforeAttemptSendsNoAttempt)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     CasRequestController controller(backend, CasRequestBudget{});
@@ -533,7 +533,7 @@ TEST(CasRequestController, FenceLostBeforeAttemptSendsNoAttempt)
 /// The write itself may have landed, but a fence lost between the write and this call's own final
 /// check must never surface as Committed (RFC §ack-and-cache-rules: no ACK, no cache update on that
 /// path) — the caller sees Unresolved and must not treat the operation as acknowledged.
-TEST(CasRequestController, FenceLostAfterWriteNeverReturnsCommitted)
+TEST(CASRequestController, FenceLostAfterWriteNeverReturnsCommitted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();   /// real in-memory commit path
     int fence_calls = 0;
@@ -546,7 +546,7 @@ TEST(CasRequestController, FenceLostAfterWriteNeverReturnsCommitted)
     EXPECT_TRUE(backend->head("k").exists);        /// ...it is durable; never claimed as Committed here
 }
 
-TEST(CasRequestController, DefiniteFailurePropagatesImmediatelyWithoutResolve)
+TEST(CASRequestController, DefiniteFailurePropagatesImmediatelyWithoutResolve)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw DB::S3Exception("scripted: malformed", Aws::S3::S3Errors::UNKNOWN, "MalformedXML"); };
@@ -567,7 +567,7 @@ TEST(CasRequestController, DefiniteFailurePropagatesImmediatelyWithoutResolve)
 /// strictly between attempts, capped exponential (initial 100ms, cap 200ms), no sleep after the final
 /// attempt. The exact interleaving is the contract — a sleep served before its fence check would keep
 /// a fenced writer dozing past its lease.
-TEST(CasRequestControllerBackoff, CappedExponentialSleepsAreFenceCheckedAndOrdered)
+TEST(CASRequestControllerBackoff, CappedExponentialSleepsAreFenceCheckedAndOrdered)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     std::vector<String> events;
@@ -602,7 +602,7 @@ TEST(CasRequestControllerBackoff, CappedExponentialSleepsAreFenceCheckedAndOrder
 /// A fence lost between an ambiguous attempt's resolve and its backoff sleep aborts INSTANTLY: no
 /// sleep is served, no further attempt is sent, and the outcome is Unresolved (never a false
 /// Committed, never a retry under a lost lease).
-TEST(CasRequestControllerBackoff, FenceLostBeforeSleepAbortsWithoutSleeping)
+TEST(CASRequestControllerBackoff, FenceLostBeforeSleepAbortsWithoutSleeping)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -630,7 +630,7 @@ TEST(CasRequestControllerBackoff, FenceLostBeforeSleepAbortsWithoutSleeping)
 /// A backoff sleep the operation deadline cannot afford is never served: when sleep + one more
 /// attempt would cross the deadline, the loop gives up immediately (Unresolved) instead of sleeping
 /// into a guaranteed exhaustion.
-TEST(CasRequestControllerBackoff, SleepThatWouldCrossOperationDeadlineIsSkipped)
+TEST(CASRequestControllerBackoff, SleepThatWouldCrossOperationDeadlineIsSkipped)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
@@ -660,7 +660,7 @@ TEST(CasRequestControllerBackoff, SleepThatWouldCrossOperationDeadlineIsSkipped)
 /// attempt commits, all inside the default 90s operation deadline and 16-attempt budget. The fake
 /// clock advances 3s per failed attempt and by each backoff sleep, so this test pins the arithmetic
 /// documented on CasRequestBudget without any wall-clock waiting.
-TEST(CasRequestControllerBackoff, DefaultBudgetRidesSixtySecondOutage)
+TEST(CASRequestControllerBackoff, DefaultBudgetRidesSixtySecondOutage)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     uint64_t clock = 0;
@@ -695,11 +695,11 @@ TEST(CasRequestControllerBackoff, DefaultBudgetRidesSixtySecondOutage)
 /// attempt, no occupancy resolve, no backoff sleep. Retrying a deterministic failure only replays it
 /// (~12 minutes at the default budget through putBlob's outer loop) and buries the root cause behind a
 /// retryable ABORTED — the exact class the `PutBlobWrongSizeFailsClosed` sweep regression exposed.
-TEST(CasRequestControllerCreate, DeterministicLocalFailuresPropagateInstantly)
+TEST(CASRequestControllerCreate, DeterministicLocalFailuresPropagateInstantly)
 {
     /// LOGICAL_ERROR aborts the whole process in debug/sanitizer builds instead of behaving like a
     /// catchable exception, so it's excluded from this loop there --
-    /// CasRequestControllerCreateDeathTest below proves the same instant-propagate contract for it
+    /// CASRequestControllerCreateDeathTest below proves the same instant-propagate contract for it
     /// positively via EXPECT_DEATH instead.
 #ifdef DEBUG_OR_SANITIZER_BUILD
     const std::vector<int> codes = {DB::ErrorCodes::NOT_IMPLEMENTED, DB::ErrorCodes::BAD_ARGUMENTS, DB::ErrorCodes::CORRUPTED_DATA};
@@ -742,9 +742,9 @@ TEST(CasRequestControllerCreate, DeterministicLocalFailuresPropagateInstantly)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 /// Debug/sanitizer-build counterpart to DeterministicLocalFailuresPropagateInstantly's LOGICAL_ERROR
 /// case, excluded from that loop above: LOGICAL_ERROR aborts the process here instead of throwing a
-/// catchable exception, so the check must be a death test (same pattern as CasBlobDigestDeathTest in
+/// catchable exception, so the check must be a death test (same pattern as CASBlobDigestDeathTest in
 /// gtest_cas_blob_digest.cpp).
-TEST(CasRequestControllerCreateDeathTest, LogicalErrorPropagatesInstantlyAborts)
+TEST(CASRequestControllerCreateDeathTest, LogicalErrorPropagatesInstantlyAborts)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
     CasRequestController controller(
@@ -761,12 +761,12 @@ TEST(CasRequestControllerCreateDeathTest, LogicalErrorPropagatesInstantlyAborts)
 
 /// Startup validation (RFC §required-timeout-model): a consistent default budget is accepted silently;
 /// either inequality violated on its own is rejected with BAD_ARGUMENTS.
-TEST(CasRequestController, ValidateBudgetAcceptsConsistentDefaults)
+TEST(CASRequestController, ValidateBudgetAcceptsConsistentDefaults)
 {
     EXPECT_NO_THROW(validateCasRequestBudget(CasRequestBudget{}, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000));
 }
 
-TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutPlusMarginAtOrAboveLeaseTtl)
+TEST(CASRequestController, ValidateBudgetRejectsAttemptTimeoutPlusMarginAtOrAboveLeaseTtl)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 25000;
@@ -777,7 +777,7 @@ TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutPlusMarginAtOrAbov
     });
 }
 
-TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutAboveOperationDeadline)
+TEST(CASRequestController, ValidateBudgetRejectsAttemptTimeoutAboveOperationDeadline)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = 6000;
@@ -791,7 +791,7 @@ TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutAboveOperationDead
 
 /// max_attempts == 0 would let putIfAbsentControlled return Unresolved without ever sending an
 /// attempt — reject at startup rather than silently accepting a no-op budget.
-TEST(CasRequestController, ValidateBudgetRejectsZeroMaxAttempts)
+TEST(CASRequestController, ValidateBudgetRejectsZeroMaxAttempts)
 {
     CasRequestBudget budget;
     budget.max_attempts = 0;
@@ -804,7 +804,7 @@ TEST(CasRequestController, ValidateBudgetRejectsZeroMaxAttempts)
 /// A capped-exponential backoff whose cap sits below its own starting value is inconsistent — reject
 /// at startup (0/0 disables backoff and stays accepted, covered by the defaults test above since the
 /// defaults are nonzero and consistent).
-TEST(CasRequestController, ValidateBudgetRejectsInitialBackoffAboveMaxBackoff)
+TEST(CASRequestController, ValidateBudgetRejectsInitialBackoffAboveMaxBackoff)
 {
     CasRequestBudget budget;
     budget.retry_initial_backoff_ms = 500;
@@ -818,7 +818,7 @@ TEST(CasRequestController, ValidateBudgetRejectsInitialBackoffAboveMaxBackoff)
 /// attempt_timeout_ms + lease_safety_margin_ms must not be computed by a wrapping uint64 sum: absurd
 /// config values near UINT64_MAX must fail validation (correctly, as inconsistent), never wrap around
 /// to a spuriously small sum that would pass the "< lease TTL" check.
-TEST(CasRequestController, ValidateBudgetRejectsOverflowingSumRatherThanWrapping)
+TEST(CASRequestController, ValidateBudgetRejectsOverflowingSumRatherThanWrapping)
 {
     CasRequestBudget budget;
     budget.attempt_timeout_ms = std::numeric_limits<uint64_t>::max() - 10;

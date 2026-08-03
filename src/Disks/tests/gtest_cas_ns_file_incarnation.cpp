@@ -64,7 +64,7 @@ void publishWithProductionBirth(const PoolPtr & store, const RootNamespace & ns,
 /// THE COUPLED HEADLINE. A real removal reaches a catalog-absent cut even when LIST permanently omits
 /// an old-life file. A cold reader follows that catalog cut rather than the physical residue, while an
 /// already-held exact life remains stale-or-NotFound and can never cross into the successor life.
-TEST(CasNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
+TEST(CASNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
 {
     auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
     PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -127,7 +127,7 @@ TEST(CasNsFileIncarnation, ColdReaderUsesCatalogCutWhileOldFileSurvivesRemoval)
 
 /// The non-minting reader assignment site accepts exactly a catalog `Live` row. `Creating`,
 /// `Removing`, and absence neither install a runtime life nor mutate durable catalog/stream state.
-TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
+TEST(CASNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr store = openPoolForTest(backend);
@@ -189,7 +189,7 @@ TEST(CasNsFileIncarnation, FreshReaderAssignsOnlyLiveCatalogLifeWithoutMutation)
 /// A real GC fold records terminal evidence for the previous life while its namespace-file debris
 /// remains physically present. Lifecycle completion is therefore independent of `_files` enumeration;
 /// the perpetual janitor may reclaim the bytes later without participating in the removal proof.
-TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
+TEST(CASNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -238,7 +238,7 @@ TEST(CasNsFileIncarnation, RebirthDoesNotWaitForFilesToBeEmpty)
 /// at all (a compile-time concept check in `gtest_cas_namespace_life_id.cpp` pins that, and
 /// `parseNamespaceFileKey`'s refusal of a legacy key is pinned there too), so the only reachable
 /// question left is whether a pool that CONTAINS such keys can be opened. It cannot.
-TEST(CasNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
+TEST(CASNsFileIncarnation, LegacyUnqualifiedFileKeyIsRefusedAtOpen)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");

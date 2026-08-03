@@ -8,7 +8,7 @@ using namespace DB::Cas;
 /// TokenType::ETag (Task 5). Mode::Native over a LocalObjectStorage has no write-time ETag, so
 /// putIfAbsent's PutResult falls back to a HEAD internally — that HEAD is also a stamping site,
 /// so the assertion below exercises both the direct-etag and the HEAD-fallback mint paths.
-TEST(CasBackendGeneration, StampedTokenTypeFollowsNativeKind)
+TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -26,7 +26,7 @@ TEST(CasBackendGeneration, StampedTokenTypeFollowsNativeKind)
 /// isBucketVersioningEnabled. LocalObjectStorage does not override that method, so it inherits the
 /// IObjectStorage base default, which returns nullopt (the check is inconclusive). Per the hook's
 /// documented behaviour, an inconclusive check must NOT fail closed — only a CONFIRMED `true` throws.
-TEST(CasBackendGeneration, CheckPoolPreconditionsProceedsOnUnknownVersioning)
+TEST(CASBackendGeneration, CheckPoolPreconditionsProceedsOnUnknownVersioning)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -37,7 +37,7 @@ TEST(CasBackendGeneration, CheckPoolPreconditionsProceedsOnUnknownVersioning)
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
 /// a silent no-op for any backend that is not Native + TokenType::Generation.
-TEST(CasBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
+TEST(CASBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -50,7 +50,7 @@ TEST(CasBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 /// write on a generation-token store must never take the multipart path. conditionalWriteSettings
 /// must force the single-PUT path (and raise the single-part cap to conditional_single_put_cap) when
 /// the backend's native token kind is Generation, and stay a no-op otherwise (ETag dialect).
-TEST(CasBackendGeneration, ListTokensDisabledOnGenerationStores)
+TEST(CASBackendGeneration, ListTokensDisabledOnGenerationStores)
 {
     /// XML LIST bodies carry MD5-style ETags that the dialect cannot rewrite to generations; a
     /// list-derived token on a generation store is a poisoned If-Match (live GC on GCS died there).
@@ -63,7 +63,7 @@ TEST(CasBackendGeneration, ListTokensDisabledOnGenerationStores)
     EXPECT_TRUE(b->supportsListTokens());
 }
 
-TEST(CasBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationStores)
+TEST(CASBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationStores)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
@@ -82,7 +82,7 @@ TEST(CasBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
 /// C1: the three token-policy helpers are the single source of truth for how a Native-mode backend
 /// mints a HEAD/PUT token, gates a LIST token, and compares tokens. Characterizes the behavior the
 /// scattered call sites have today so the consolidation stays byte-for-byte behavior-preserving.
-TEST(CasBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
+TEST(CASBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);

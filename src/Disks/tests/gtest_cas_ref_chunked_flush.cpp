@@ -79,7 +79,7 @@ PoolPtr openPool(const BackendPtr & backend)
     /// refs) takes 43-65s under a sanitizer and failed deterministically on all three sanitizer CI
     /// builds with `txn is UNCERTAIN (retry budget exhausted)` — the pre-attempt fence reject, not a
     /// real retry exhaustion. Same artifact, same fix as
-    /// `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` (2026-07-18): decouple the
+    /// `CASPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` (2026-07-18): decouple the
     /// fence from execution speed. The waits in this file are `steady_clock` timeouts on futures and
     /// condvars, which are unaffected by this injection.
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -235,7 +235,7 @@ void expectFailedWithCode(const std::exception_ptr & err, int expected_code, con
 /// Test 10 (spec §3 "Oversized item / oversized op fail alone"): an item whose OWN op count exceeds
 /// `ref_txn_max_ops` fails alone -- its ops never enter the batch's transaction -- and a co-batched
 /// neighbor still commits.
-TEST(CasRefWriterChunkedFlush, OversizedItemFailsAlone)
+TEST(CASRefWriterChunkedFlush, OversizedItemFailsAlone)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -269,7 +269,7 @@ TEST(CasRefWriterChunkedFlush, OversizedItemFailsAlone)
 /// Test 10, second leg: one op whose OWN encoded size exceeds `ref_op_max_bytes` (a maximum-length
 /// ref name -- `checkCanonicalRefName` imposes no length limit) fails only its item; a co-batched
 /// neighbor still commits.
-TEST(CasRefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
+TEST(CASRefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -309,7 +309,7 @@ TEST(CasRefWriterChunkedFlush, OversizedOpFailsItsItemAlone)
 /// 20,480,000 bytes, with framing headroom to spare). Pure codec-level: proves the two counts-only
 /// caps compose without ever approaching the byte cap the encode-side estimation machinery used to
 /// police.
-TEST(CasRefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
+TEST(CASRefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -340,7 +340,7 @@ TEST(CasRefWriterChunkedFlush, CanonicalMaxTransactionRoundTrips)
 /// and has no op-count cap. Seeded via a raw snapshot (not `kTotalRefs` individual writer round-trips
 /// through `publishEmptyPart`) so the fixture stays fast; the writer never touches these rows until
 /// `dropNamespace` itself builds the one removal transaction.
-TEST(CasRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
+TEST(CASRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const Layout layout("p");
@@ -403,7 +403,7 @@ TEST(CasRefWriterChunkedFlush, DropNamespaceOverOpCapSucceeds)
 /// `RemoveNamespace` op -- if classification were keyed on scope instead of op inspection, this would
 /// be wrongly treated as removal-class and admitted; op-inspection correctly rejects it under the
 /// ordinary normal-class op-count cap, exactly like `OversizedItemFailsAlone` above.
-TEST(CasRefWriterChunkedFlush, SyntheticWholeShardNonRemovalRejected)
+TEST(CASRefWriterChunkedFlush, SyntheticWholeShardNonRemovalRejected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -565,7 +565,7 @@ AppendCaller launchAppendOps(const PoolPtr & store, const RootNamespace & ns, Mu
 /// survivors per chunk), follower wakeups (both followers return their correct real id -> completed +
 /// woken at their chunk's commit), `build_ops` at-most-once (invocation counters == 1), and folded state
 /// == the sequential result (the two durable transactions carry exactly item_a++item_b, then item_c).
-TEST(CasRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
+TEST(CASRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// Default thresholds: this handful of transactions never crosses the snapshot-publish threshold, so
@@ -727,7 +727,7 @@ ChunkFailureOutcome runChunkFailureCase(const String & ns_suffix, ChunkFaultBack
 /// (`CasWriteOutcome::DefiniteFailure`). Chunk 1's caller (the leader's own item) observes SUCCESS with
 /// chunk 1's real id; chunk 2's caller fails; the lane does NOT wedge (a definite rejection is a safe
 /// gap, not an uncertain PUT).
-TEST(CasRefWriterChunkedFlush, ChunkFailureDefinite)
+TEST(CASRefWriterChunkedFlush, ChunkFailureDefinite)
 {
 #if !USE_AWS_S3
     GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
@@ -749,7 +749,7 @@ TEST(CasRefWriterChunkedFlush, ChunkFailureDefinite)
 /// Test 9 (chunk-failure variant b -- unresolved wedge): chunk 2's PUT is ambiguous and exhausts the
 /// budget, wedging the lane. Chunk 1's caller observes SUCCESS; chunk 2's caller fails; the wedge holds
 /// ONLY chunk 2's key (chunk 1 + 1), and chunk 1's object is durable while chunk 2's was never written.
-TEST(CasRefWriterChunkedFlush, ChunkFailureWedge)
+TEST(CASRefWriterChunkedFlush, ChunkFailureWedge)
 {
     const RootNamespace ns{"srv1/chunk_fail_wedge"};
     ChunkFailureOutcome out = runChunkFailureCase("chunk_fail_wedge", ChunkFaultBackend::Mode::Unresolved);
@@ -779,7 +779,7 @@ TEST(CasRefWriterChunkedFlush, ChunkFailureWedge)
 /// Test 9 (chunk-failure variant c -- a throw): chunk 2's PUT surfaces a proven conflict (CORRUPTED_DATA
 /// thrown by the controller). Chunk 1's caller observes SUCCESS; chunk 2's caller fails with
 /// CORRUPTED_DATA; the lane does NOT wedge (a conclusive rejection).
-TEST(CasRefWriterChunkedFlush, ChunkFailureThrow)
+TEST(CASRefWriterChunkedFlush, ChunkFailureThrow)
 {
     const RootNamespace ns{"srv1/chunk_fail_throw"};
     ChunkFailureOutcome out = runChunkFailureCase("chunk_fail_throw", ChunkFaultBackend::Mode::ForeignConflict);
@@ -801,7 +801,7 @@ TEST(CasRefWriterChunkedFlush, ChunkFailureThrow)
 /// (spec §3): the leader's own `appendRefOps` returns chunk 1's real id -- NOT the later exception --
 /// while the unattempted remainder (item_b) fails. This exercises the reworked outer catch, which no
 /// longer rethrows unconditionally over a durable own item.
-TEST(CasRefWriterChunkedFlush, LeaderOwnItemCommittedBeforeThrow)
+TEST(CASRefWriterChunkedFlush, LeaderOwnItemCommittedBeforeThrow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -862,7 +862,7 @@ TEST(CasRefWriterChunkedFlush, LeaderOwnItemCommittedBeforeThrow)
 /// the dropped trigger so a FOLLOW-UP publication covers chunk 2 -- otherwise chunk 2 would stay
 /// unsnapshotted until an unrelated later mutation. The chunk boundary is gated until the publisher has
 /// parked, so its captured candidate is provably chunk 1's prefix only.
-TEST(CasRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
+TEST(CASRefWriterChunkedFlush, SnapshotPublisherLatchedAcrossChunks)
 {
     auto backend = std::make_shared<ChunkFaultBackend>();
     PoolConfig cfg;

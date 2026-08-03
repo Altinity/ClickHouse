@@ -161,7 +161,7 @@ RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const Strin
 /// INV-1, first half: each namespace has its OWN stream. Two tables are written strictly alternately,
 /// so a pool-wide counter would hand them 1,3,5 and 2,4 -- every id unique across the pool and dense
 /// nowhere. Per-namespace derivation gives each table 1,2,3.. of its own.
-TEST(CasRefContiguousAlloc, TwoNamespacesAllocateIndependently)
+TEST(CASRefContiguousAlloc, TwoNamespacesAllocateIndependently)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -189,7 +189,7 @@ TEST(CasRefContiguousAlloc, TwoNamespacesAllocateIndependently)
 /// nothing reaches the backend -- and the very next append on that table commits under the SAME id the
 /// refused one would have used. Under the pool-wide counter that id was burned as a "safe gap", which is
 /// precisely what makes a durable stream unreadable as a contiguous chain.
-TEST(CasRefContiguousAlloc, PreAttemptRefusalConsumesNoId)
+TEST(CASRefContiguousAlloc, PreAttemptRefusalConsumesNoId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolFenceControlled(backend);
@@ -220,7 +220,7 @@ TEST(CasRefContiguousAlloc, PreAttemptRefusalConsumesNoId)
 /// The epoch component is the second half of the id, and the sequence is dense WITHIN an epoch: a new
 /// mount incarnation restarts its table's sequence at 1 rather than continuing the dead incarnation's
 /// numbering. `{E1, 2}` -> `{E2, 1}` is therefore not a gap, and the apply-side check must admit it.
-TEST(CasRefContiguousAlloc, EpochChangeRestartsTheSequenceAtOne)
+TEST(CASRefContiguousAlloc, EpochChangeRestartsTheSequenceAtOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/contig_epoch_reset"};
@@ -245,7 +245,7 @@ TEST(CasRefContiguousAlloc, EpochChangeRestartsTheSequenceAtOne)
 /// not the successor of `greatest_applied` is CORRUPTED_DATA, naming both ids. Before this task the
 /// state machine checked strict increase only, so a stream with a hole applied cleanly and no reader
 /// could tell a complete chain from a truncated one.
-TEST(CasRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
+TEST(CASRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
 {
     const String ns = "srv1/contig_density";
     constexpr uint64_t kEpoch = 7;
@@ -292,7 +292,7 @@ TEST(CasRefContiguousAlloc, NonSuccessorIdIsRejectedOnApply)
 /// The format floor. A pool written before contiguous ref streams holds ref logs whose ids this build
 /// would read as a corrupt (holed) chain, so opening it must fail closed at the pool metadata, naming
 /// recreation as the migration -- CAS is pre-release and has no in-place migration path.
-TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
+TEST(CASRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
@@ -329,7 +329,7 @@ TEST(CasRefContiguousAlloc, OldPoolFormatIsRefusedNamingRecreation)
 /// Generation 6 is a recreate-only physical-layout cut. A generation-5 pool has contiguous,
 /// incarnation-qualified streams but still repeats the logical namespace in every key; accepting it
 /// would silently run the generation-6 parsers over a different grammar.
-TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRecreation)
+TEST(CASRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRecreation)
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
@@ -368,7 +368,7 @@ TEST(CasRefContiguousAlloc, GenerationFiveNamespaceBearingPoolIsRefusedNamingRec
 /// Mutation caught: leaving the pool floor at generation 6 would admit a seal whose independent
 /// name-keyed coverage and cleanup collections this build no longer has. Generation 7 is a
 /// recreate-only grammar cut, so the immediately preceding generation must fail at pool open.
-TEST(CasRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreation)
+TEST(CASRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreation)
 {
     PoolMeta pm;
     pm.pool_id = UInt128{1, 2};
@@ -397,7 +397,7 @@ TEST(CasRefContiguousAlloc, GenerationSixSplitFoldSealPoolIsRefusedNamingRecreat
     }
 }
 
-TEST(CasPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
+TEST(CASPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -416,7 +416,7 @@ TEST(CasPoolMeta, GcShardsIsPersistedAndOverridesMismatchedReopenConfig)
 /// The one path where "an attempt that provably sent nothing consumes nothing" does not hold, and the
 /// A known-durable install failure must replay before the next id is derived. Replay installs the
 /// stranded transaction, so the next append derives its real contiguous successor.
-TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
+TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -463,7 +463,7 @@ TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeAllocatingTheNextId)
 }
 
 /// Snapshot publication also recovers a `NeedsRecovery` lane before it captures state.
-TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
+TEST(CASRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -509,7 +509,7 @@ TEST(CasRefContiguousAlloc, NeedsRecoveryReplaysBeforeSnapshotPublication)
 /// writer's next flush lands its old-format transactions inside the NEW pool. So a recreation over a
 /// prefix whose mount slots are not terminal must fail closed, and must say why, BEFORE the operator
 /// clears anything.
-TEST(CasRefContiguousAlloc, RecreationRefusedWhileAMountSlotIsStillHeld)
+TEST(CASRefContiguousAlloc, RecreationRefusedWhileAMountSlotIsStillHeld)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto holder = openPool(backend);
@@ -535,7 +535,7 @@ TEST(CasRefContiguousAlloc, RecreationRefusedWhileAMountSlotIsStillHeld)
 /// marker -- one of the two clock-free certificates of death the mount protocol already recognises --
 /// so the quiesce gate stops firing and the ordinary bootstrap rules take over: clear the prefix, and
 /// the recreation mints a fresh pool.
-TEST(CasRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
+TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/contig_quiesce_ok"};
@@ -573,7 +573,7 @@ TEST(CasRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
 /// renewal as its own keeper adopting a refreshed body. That is precisely why the refusal above is the
 /// primary defence and this fence is only the backstop: quiescing the holder BEFORE the prefix is
 /// cleared is what keeps the ambiguous case from arising at all.
-TEST(CasRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
+TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// The survivor renews on its own thread, as a real mount does: the renewal loop is what latches the

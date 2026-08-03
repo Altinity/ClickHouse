@@ -175,7 +175,7 @@ void expectCode(const std::function<void()> & f, int code)
     }
 }
 
-TEST(CasRecoveryGrounding, CreatingAndAbsentCatalogEntriesAreNotRecovered)
+TEST(CASRecoveryGrounding, CreatingAndAbsentCatalogEntriesAreNotRecovered)
 {
     expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Creating), ckpt(7, RefTxnId{7, 3})); },
                DB::ErrorCodes::INVALID_STATE);
@@ -183,7 +183,7 @@ TEST(CasRecoveryGrounding, CreatingAndAbsentCatalogEntriesAreNotRecovered)
                DB::ErrorCodes::INVALID_STATE);
 }
 
-TEST(CasRecoveryGrounding, LiveAndRemovingRequireCheckpointAndLifeEpoch)
+TEST(CASRecoveryGrounding, LiveAndRemovingRequireCheckpointAndLifeEpoch)
 {
     expectCode([&] { chooseRecoveryGrounding(catalog(NsState::Live), std::nullopt); },
                DB::ErrorCodes::CORRUPTED_DATA);
@@ -191,14 +191,14 @@ TEST(CasRecoveryGrounding, LiveAndRemovingRequireCheckpointAndLifeEpoch)
                DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, MissingFrontierMeansNoCommittedTransaction)
+TEST(CASRecoveryGrounding, MissingFrontierMeansNoCommittedTransaction)
 {
     const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Live), ckpt(7, std::nullopt));
     EXPECT_FALSE(grounding.base);
     EXPECT_FALSE(grounding.committed_through);
 }
 
-TEST(CasRecoveryGrounding, ChoosesCheckpointBaseAndArithmeticWalkStart)
+TEST(CASRecoveryGrounding, ChoosesCheckpointBaseAndArithmeticWalkStart)
 {
     const RecoveryGrounding grounding = chooseRecoveryGrounding(
         catalog(NsState::Live), ckpt(7, RefTxnId{7, 8}, RefTxnId{7, 4}));
@@ -207,7 +207,7 @@ TEST(CasRecoveryGrounding, ChoosesCheckpointBaseAndArithmeticWalkStart)
     EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
 }
 
-TEST(CasRecoveryGrounding, BaseAtFrontierStillStartsAtItsExactSuccessor)
+TEST(CASRecoveryGrounding, BaseAtFrontierStillStartsAtItsExactSuccessor)
 {
     /// A writer recovery probes exactly this slot for its sole possible unfrontiered successor. The
     /// grounding contract must supply the arithmetic start even when the committed replay tail is empty.
@@ -219,13 +219,13 @@ TEST(CasRecoveryGrounding, BaseAtFrontierStillStartsAtItsExactSuccessor)
     EXPECT_EQ(grounding.committed_through, (RefTxnId{7, 8}));
 }
 
-TEST(CasRecoveryGrounding, WalksFromLifeEpochWithoutCheckpointBase)
+TEST(CASRecoveryGrounding, WalksFromLifeEpochWithoutCheckpointBase)
 {
     const RecoveryGrounding grounding = chooseRecoveryGrounding(catalog(NsState::Removing), ckpt(9, RefTxnId{9, 3}));
     EXPECT_EQ(grounding.walk_from, (RefTxnId{9, 1}));
 }
 
-TEST(CasRecoveryGrounding, RejectsBaseWithoutARepresentableSuccessor)
+TEST(CASRecoveryGrounding, RejectsBaseWithoutARepresentableSuccessor)
 {
     expectCode([&]
     {
@@ -234,7 +234,7 @@ TEST(CasRecoveryGrounding, RejectsBaseWithoutARepresentableSuccessor)
     }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, RejectsCheckpointFieldsAboveCommittedFrontier)
+TEST(CASRecoveryGrounding, RejectsCheckpointFieldsAboveCommittedFrontier)
 {
     expectCode([&]
     {
@@ -246,7 +246,7 @@ TEST(CasRecoveryGrounding, RejectsCheckpointFieldsAboveCommittedFrontier)
     }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, RejectsIncoherentEpochBoundaryInCheckpointAuthority)
+TEST(CASRecoveryGrounding, RejectsIncoherentEpochBoundaryInCheckpointAuthority)
 {
     expectCode([&]
     {
@@ -265,7 +265,7 @@ TEST(CasRecoveryGrounding, RejectsIncoherentEpochBoundaryInCheckpointAuthority)
 /// A life starts in its own writer epoch. Letting it start after the checkpoint's writer epoch makes
 /// `walk_from > committed_through`, so recovery silently returns an empty table instead of refusing the
 /// impossible authority. The codec and pure grounding entry point must reject the same sabotage.
-TEST(CasRecoveryGrounding, RejectsLifeEpochAboveCommittedFrontierOnDecodeAndGrounding)
+TEST(CASRecoveryGrounding, RejectsLifeEpochAboveCommittedFrontierOnDecodeAndGrounding)
 {
     const RefCkpt invalid = ckpt(2, RefTxnId{1, 5});
     String encoded = encodeRefCkpt(ckpt(1, RefTxnId{1, 5}));
@@ -278,7 +278,7 @@ TEST(CasRecoveryGrounding, RejectsLifeEpochAboveCommittedFrontierOnDecodeAndGrou
                DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReorderedList)
+TEST(CASRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReorderedList)
 {
     struct Observation
     {
@@ -337,7 +337,7 @@ TEST(CasRecoveryGrounding, RecoveryIsEquivalentUnderFullEmptyPartialAndReordered
             << "recovery must not enumerate a stream whose exact checkpoint already supplies its base and frontier";
 }
 
-TEST(CasRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyRecovery)
+TEST(CASRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyRecovery)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/mandatory_authority"};
@@ -381,7 +381,7 @@ TEST(CasRecoveryGrounding, CatalogLifecycleAndCheckpointAreMandatoryForReadOnlyR
     }
 }
 
-TEST(CasRecoveryGrounding, NonrecoverableAuthorityPerformsNoBackendRecoveryIo)
+TEST(CASRecoveryGrounding, NonrecoverableAuthorityPerformsNoBackendRecoveryIo)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/nonrecoverable_authority"};
@@ -423,7 +423,7 @@ TEST(CasRecoveryGrounding, NonrecoverableAuthorityPerformsNoBackendRecoveryIo)
     }
 }
 
-TEST(CasRecoveryGrounding, ReadOnlyRecoveryNeverAdoptsFPlusOne)
+TEST(CASRecoveryGrounding, ReadOnlyRecoveryNeverAdoptsFPlusOne)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
@@ -439,7 +439,7 @@ TEST(CasRecoveryGrounding, ReadOnlyRecoveryNeverAdoptsFPlusOne)
 /// A well-formed snapshot can describe a real but uncommitted transaction. If recovery merely treated
 /// `LIST` as a performance hint, it could still select this false base and skip the exact first log.
 /// The checkpoint names no snapshot, so every listing behaviour must leave the forged object unread.
-TEST(CasRecoveryGrounding, ForgedWellFormedListedSnapshotIsUnobservedAndRecoveryDoesNotList)
+TEST(CASRecoveryGrounding, ForgedWellFormedListedSnapshotIsUnobservedAndRecoveryDoesNotList)
 {
     for (const ListingMode mode : {ListingMode::Full, ListingMode::Empty, ListingMode::Partial, ListingMode::Reordered})
     {
@@ -472,7 +472,7 @@ TEST(CasRecoveryGrounding, ForgedWellFormedListedSnapshotIsUnobservedAndRecovery
 
 /// A checkpoint-named snapshot is immutable lifecycle authority, not a list candidate. Its exact GET
 /// and semantic decode must therefore fail closed rather than falling back to replaying the same log.
-TEST(CasRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAfterExactRead)
+TEST(CASRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAfterExactRead)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Empty);
     const Layout layout("p");
@@ -511,7 +511,7 @@ TEST(CasRecoveryGrounding, SemanticallyMalformedCheckpointSnapshotIsCorruptionAf
         << "the corruption must come from the checkpoint snapshot's exact decode";
 }
 
-TEST(CasRecoveryGrounding, CheckpointSnapshotEqualToLastEpochSealIsRejectedBeforeReadingItsLog)
+TEST(CASRecoveryGrounding, CheckpointSnapshotEqualToLastEpochSealIsRejectedBeforeReadingItsLog)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
@@ -551,7 +551,7 @@ TEST(CasRecoveryGrounding, CheckpointSnapshotEqualToLastEpochSealIsRejectedBefor
 /// same epoch is not an empty tail: no record can occupy that slot.  Recovery must diagnose the
 /// malformed authority instead of advancing to `{E+1,1}` and terminating because that id sorts above
 /// the bogus same-epoch frontier.
-TEST(CasRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
+TEST(CASRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
@@ -576,7 +576,7 @@ TEST(CasRecoveryGrounding, SameEpochFrontierAfterDecodedEpochSealIsCorruption)
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
+TEST(CASRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
@@ -617,7 +617,7 @@ TEST(CasRecoveryGrounding, OlderCheckpointSnapshotAtSealIsCorruption)
         << "the old seal must be rejected before the forged same-id snapshot is read";
 }
 
-TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
+TEST(CASRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");
@@ -643,7 +643,7 @@ TEST(CasRecoveryGrounding, TerminalGapBelowFrontierIsCorruptionNotARebirth)
     expectCode([&] { (void)recoverFromCurrentCatalogCut(*backend, layout, ns); }, DB::ErrorCodes::CORRUPTED_DATA);
 }
 
-TEST(CasRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink)
+TEST(CASRecoveryGrounding, LaterEpochCheckpointBaseRequiresItsContextualBacklink)
 {
     auto backend = std::make_shared<RecoveryListingBackend>(ListingMode::Full);
     const Layout layout("p");

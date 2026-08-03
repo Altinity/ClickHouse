@@ -94,7 +94,7 @@ uint64_t leaveRejectedCleanupDuty(const PoolPtr & store, const RootNamespace & n
 /// `minActive` assertion: the old unconditional destructor retirement advances the build floor while
 /// the owner-grant outcome is still unknown. The later assertions pin the other half of the duty: the
 /// next mutation resolves the durable wedge, removes the exact old precommit, and only then retires it.
-TEST(CasWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemovesIt)
+TEST(CASWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemovesIt)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
@@ -141,7 +141,7 @@ TEST(CasWriterDuties, UncertainAdoptedGrantStaysActiveUntilTheNextMutationRemove
 /// Removing the absent-owner arm makes the deferred duty either stay forever or try to remove an owner
 /// that was never transmitted. A controller pre-attempt refusal proves the grant absent; the next
 /// healthy mutation must drain that duty as a no-op and retire the old build before publishing itself.
-TEST(CasWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
+TEST(CASWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -188,7 +188,7 @@ TEST(CasWriterDuties, ProvenAbsentGrantDrainsAsNoOpBeforeTheNextMutation)
 /// resolve-before-reissue GET proves the key absent. The duty must then drain as a no-op: no
 /// `OwnerTransition` removal is owed for an absent precommit, the wedge clears, and `minActive` advances
 /// past the rejected build exactly as the no-wedge reject arm does.
-TEST(CasWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
+TEST(CASWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openSingleAttemptPool(backend);
@@ -232,7 +232,7 @@ TEST(CasWriterDuties, WedgeResolvedAsRejectDrainsTheDutyAsNoOp)
 /// Removing `mutateRefsAfterWriterCleanup` from the `dropRef` delegate leaves the rejected build at
 /// `minActive` even though the ref removal succeeds. The observable floor proves the direct API
 /// serviced the inherited cleanup duty before performing its own mutation.
-TEST(CasWriterDuties, DropRefServicesPendingDutyBeforeRemovingTheRef)
+TEST(CASWriterDuties, DropRefServicesPendingDutyBeforeRemovingTheRef)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = openFrozenSingleAttemptPool(backend);
@@ -249,7 +249,7 @@ TEST(CasWriterDuties, DropRefServicesPendingDutyBeforeRemovingTheRef)
 /// Removing the shared drain seam from `updateRefPublishedAt` lets the timestamp mutation overtake a
 /// pending writer duty. The update remains observable, while the independent watermark assertion
 /// catches that bypass.
-TEST(CasWriterDuties, UpdateRefPublishedAtServicesPendingDutyBeforeUpdatingTheRef)
+TEST(CASWriterDuties, UpdateRefPublishedAtServicesPendingDutyBeforeUpdatingTheRef)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = openFrozenSingleAttemptPool(backend);
@@ -268,7 +268,7 @@ TEST(CasWriterDuties, UpdateRefPublishedAtServicesPendingDutyBeforeUpdatingTheRe
 /// Each public namespace-removal overload has its own Pool delegate. Omitting the shared seam from
 /// either one still removes the namespace but strands the rejected build at the active floor, so the
 /// two independent cases protect both forwarding paths.
-TEST(CasWriterDuties, DropNamespaceOverloadsServicePendingDutyBeforeRemoval)
+TEST(CASWriterDuties, DropNamespaceOverloadsServicePendingDutyBeforeRemoval)
 {
     {
         auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
@@ -301,7 +301,7 @@ TEST(CasWriterDuties, DropNamespaceOverloadsServicePendingDutyBeforeRemoval)
 /// The explicit snapshot/checkpoint attempt is the audited sibling mutation: without the common seam
 /// it may publish ledger state while leaving the older writer duty pinned. Its return value is allowed
 /// to be false; advancing the active floor is the cleanup contract under test.
-TEST(CasWriterDuties, SnapshotAttemptServicesPendingDutyBeforePublishingLedgerState)
+TEST(CASWriterDuties, SnapshotAttemptServicesPendingDutyBeforePublishingLedgerState)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = openFrozenSingleAttemptPool(backend);
@@ -318,7 +318,7 @@ TEST(CasWriterDuties, SnapshotAttemptServicesPendingDutyBeforePublishingLedgerSt
 /// assertion: a clean marker would falsely certify that the durable precommit below has no remaining
 /// writer work. The unclean handoff forces a fresh writer epoch; its arithmetic recovery seal then
 /// makes the ordinary stale-precommit sweep the crash-remnant cleanup path.
-TEST(CasWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRemnant)
+TEST(CASWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRemnant)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -394,7 +394,7 @@ TEST(CasWriterDuties, PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRem
 /// cannot give it: the build's own epoch durably closed. This drives that closure (the same crash
 /// pattern as `PendingDutySkipsCleanFarewellAndSuccessorSweepsTheCrashRemnant`, but the predecessor's
 /// build is REJECTED rather than adopted) and then runs real GC rounds until the body is gone.
-TEST(CasWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
+TEST(CASWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     DB::Cas::tests::seedPoolMetaForRestart(*backend);
@@ -504,7 +504,7 @@ TEST(CasWriterDuties, RejectedAttemptBodyIsEventuallyNominatedAndSwept)
 /// append (not the original grant, which is a plain pre-attempt refusal here) proves the retry path
 /// directly: the duty survives the throw and the mutation it was blocking aborts with it, then the
 /// very next drain -- once the fault clears -- settles the duty and lets that mutation proceed.
-TEST(CasWriterDuties, DutySurvivesSettlementFailureForRetry)
+TEST(CASWriterDuties, DutySurvivesSettlementFailureForRetry)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openFrozenSingleAttemptPool(backend);

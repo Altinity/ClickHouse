@@ -1,21 +1,21 @@
 #!/bin/bash
 # Regenerates <build_dir>/cas_suites.txt for the CAS gate, and VERIFIES the invariant that makes the
 # gate's coverage self-evident: every suite defined in a CAS test source is reachable by the plain name
-# filter `Cas*`, in the spelling the binary exposes.
+# filter `CAS*`, in the spelling the binary exposes.
 #
 # The invariant exists because a curated suite list cannot be distinguished from a covering one by
 # reading it -- a suite missing from the list looks exactly like a suite that has no tests, and a real
 # defect once stayed red for over a day behind that ambiguity. With the invariant enforced here, the
-# emitted list is a convenience for the per-suite runner, not the coverage mechanism: `Cas*` is.
+# emitted list is a convenience for the per-suite runner, not the coverage mechanism: `CAS*` is.
 #
 # Three things are checked, and each one fails loud:
-#   1. a non-excluded CAS suite whose name does not start with `Cas` -- rename it;
-#   2. a parameterized suite whose `<Inst>/<Suite>` spelling does not start with `Cas`, i.e. a
-#      non-`Cas` INSTANTIATE_TEST_SUITE_P prefix, which `Cas*` does not match even when the suite
-#      itself is `Cas`-prefixed;
+#   1. a non-excluded CAS suite whose name does not start with `CAS` -- rename it;
+#   2. a parameterized suite whose `<Inst>/<Suite>` spelling does not start with `CAS`, i.e. a
+#      non-`CAS` INSTANTIATE_TEST_SUITE_P prefix, which `CAS*` does not match even when the suite
+#      itself is `CAS`-prefixed;
 #   3. a CAS test file outside the CAS source glob, which means the glob no longer finds every CAS
 #      test file and this script's own enumeration has a hole. CAS-ness is decided by what the file
-#      includes, not by its suite names, because a file that is both misnamed and has non-`Cas` suites
+#      includes, not by its suite names, because a file that is both misnamed and has non-`CAS` suites
 #      is invisible to every name-based check -- that combination is how a suite once escaped the gate
 #      entirely.
 set -euo pipefail
@@ -41,12 +41,13 @@ fi
 
 # Explicit exclude list: suites defined in a CAS-named source file that are generic backend/infra
 # tests, not CAS ref/incarnation/catalog logic. Every entry needs a reason; an entry with no reason is
-# not a valid exclusion. An excluded name must also not start with `Cas`, or `Cas*` would run it and
+# not a valid exclusion. An excluded name must also not start with `CAS`, or `CAS*` would run it and
 # the exclusion would be a fiction -- checked below.
 declare -A EXCLUDE_REASONS=(
     [CountingBackendShape]="generic backend-wrapper shape test (gtest_cas_backend.cpp), no ref/incarnation logic"
     [MemoryWriteBuffer]="generic write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS"
     [TestCascadeWriteBufferWithDisk]="generic cascade write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS"
+    [CascadeWriteBuffer]="generic cascade write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS -- its leading 'Cas' is accidental and no longer matches CAS*"
 )
 
 for s in "${!EXCLUDE_REASONS[@]}"; do
@@ -54,8 +55,8 @@ for s in "${!EXCLUDE_REASONS[@]}"; do
         echo "error: exclude entry '$s' has an empty reason, which is not a valid exclusion" >&2
         exit 1
     fi
-    if [[ "$s" == Cas* ]]; then
-        echo "error: excluded suite '$s' starts with 'Cas', so the plain 'Cas*' filter runs it anyway." >&2
+    if [[ "$s" == CAS* ]]; then
+        echo "error: excluded suite '$s' starts with 'CAS', so the plain 'CAS*' filter runs it anyway." >&2
         echo "Either drop the exclusion or rename the suite so its name does not claim to be CAS." >&2
         exit 1
     fi
@@ -73,12 +74,12 @@ fi
 
 # Check 3: a CAS test file the glob does not reach is never verified at all, so the hole has to be
 # reported from the file side. Including a CAS header is the signal that survives both a misnamed file
-# and non-`Cas` suite names; a `Cas`-prefixed suite is taken as CAS-ness too, for a test that reaches
+# and non-`CAS` suite names; a `CAS`-prefixed suite is taken as CAS-ness too, for a test that reaches
 # CAS code without including its headers directly.
 CAS_INCLUDE_RE='#include.*(MetadataStorages/ContentAddressed/|cas_test_helpers\.h)'
 stray_files=()
 while IFS= read -r f; do
-    if grep -qE "$CAS_INCLUDE_RE" "$f" || grep -qE '^TEST(_F|_P)?\(\s*Cas' "$f"; then
+    if grep -qE "$CAS_INCLUDE_RE" "$f" || grep -qE '^TEST(_F|_P)?\(\s*CAS' "$f"; then
         stray_files+=("$f")
     fi
 done < <(find "$SRC_ROOT" -name 'gtest_*.cpp' -not -path "$SRC_ROOT/Disks/tests/gtest_ca*")
@@ -103,13 +104,13 @@ for s in "${binary_suites[@]}"; do in_binary["$s"]=1; done
 # an EXPLICIT list on purpose -- a name-pattern skip would silently drop the next new suite; a new
 # guarded suite must be added here deliberately, with the build that contains it verified once.
 KNOWN_COMPILE_GUARDED=(
-    CasBlobDigestDeathTest CasBlobUploadPoolDeathTest CasFoldSealFormatDeathTest
-    CasFormatTraitsDeathTest CasGcHoldGrammarDeathTest CasGcStateFormatDeathTest
-    CasNamespaceLifeIdDeathTest CasNsCreationLifecycleDeathTest CasPartFolderAccessDeathTest
-    CasPromoteRepublishDeathTest CasRefCatalogDeathTest CasRefCatalogFormatDeathTest
-    CasRefCatalogRemovalDeathTest CasRefInstallSafetyDeathTest CasRequestControllerCreateDeathTest
-    CasUploadDetachedDeathTest CasUploadFanoutDeathTest CasWiringExchangeDeathTest
-    CasWiringOpsDeathTest
+    CASBlobDigestDeathTest CASBlobUploadPoolDeathTest CASFoldSealFormatDeathTest
+    CASFormatTraitsDeathTest CASGcHoldGrammarDeathTest CASGcStateFormatDeathTest
+    CASNamespaceLifeIdDeathTest CASNsCreationLifecycleDeathTest CASPartFolderAccessDeathTest
+    CASPromoteRepublishDeathTest CASRefCatalogDeathTest CASRefCatalogFormatDeathTest
+    CASRefCatalogRemovalDeathTest CASRefInstallSafetyDeathTest CASRequestControllerCreateDeathTest
+    CASUploadDetachedDeathTest CASUploadFanoutDeathTest CASWiringExchangeDeathTest
+    CASWiringOpsDeathTest
 )
 declare -A known_guarded
 for s in "${KNOWN_COMPILE_GUARDED[@]}"; do known_guarded["$s"]=1; done
@@ -123,8 +124,8 @@ for s in "${source_suites[@]}"; do
     fi
     # Check 1: the suite's own name. Applied before the binary lookup so a compile-guarded suite that
     # this build does not contain is still held to the invariant.
-    if [[ "$s" != Cas* ]]; then
-        unprefixed+=("$s (suite name does not start with 'Cas')")
+    if [[ "$s" != CAS* ]]; then
+        unprefixed+=("$s (suite name does not start with 'CAS')")
         continue
     fi
     if [ -n "${in_binary[$s]+x}" ]; then
@@ -140,12 +141,12 @@ for s in "${source_suites[@]}"; do
         fi
     done
     if [ "${#param_spellings[@]}" -gt 0 ]; then
-        # Check 2: `Cas*` matches the whole exposed spelling, so the instantiation prefix decides.
+        # Check 2: `CAS*` matches the whole exposed spelling, so the instantiation prefix decides.
         for b in "${param_spellings[@]}"; do
-            if [[ "$b" == Cas* ]]; then
+            if [[ "$b" == CAS* ]]; then
                 included+=("$b")
             else
-                unprefixed+=("$b (INSTANTIATE_TEST_SUITE_P prefix does not start with 'Cas')")
+                unprefixed+=("$b (INSTANTIATE_TEST_SUITE_P prefix does not start with 'CAS')")
             fi
         done
         continue
@@ -160,9 +161,9 @@ for s in "${source_suites[@]}"; do
 done
 
 if [ "${#unprefixed[@]}" -gt 0 ]; then
-    echo "error: ${#unprefixed[@]} CAS suite spelling(s) are not reachable by the plain 'Cas*' filter:" >&2
+    echo "error: ${#unprefixed[@]} CAS suite spelling(s) are not reachable by the plain 'CAS*' filter:" >&2
     printf '  %s\n' "${unprefixed[@]}" >&2
-    echo "Rename each so the spelling the binary exposes starts with 'Cas' -- that filter is the gate." >&2
+    echo "Rename each so the spelling the binary exposes starts with 'CAS' -- that filter is the gate." >&2
     exit 1
 fi
 
@@ -175,15 +176,15 @@ fi
 
 printf '%s\n' "${included[@]}" | sort -u > "$OUT"
 
-# The payoff, asserted rather than assumed: what `Cas*` selects in this binary must be exactly what
+# The payoff, asserted rather than assumed: what `CAS*` selects in this binary must be exactly what
 # was emitted. A difference means a CAS suite is being gated but not covered by the simple filter, or
-# a non-CAS suite has taken a `Cas` name.
-mapfile -t cas_filtered < <(printf '%s\n' "${binary_suites[@]}" | grep '^Cas' | sort -u)
+# a non-CAS suite has taken a `CAS` name.
+mapfile -t cas_filtered < <(printf '%s\n' "${binary_suites[@]}" | grep '^CAS' | sort -u)
 if ! diff -q <(printf '%s\n' "${cas_filtered[@]}") "$OUT" > /dev/null; then
-    echo "error: the emitted suite list and the plain 'Cas*' filter disagree in this binary:" >&2
+    echo "error: the emitted suite list and the plain 'CAS*' filter disagree in this binary:" >&2
     diff <(printf '%s\n' "${cas_filtered[@]}") "$OUT" | sed 's/^/  /' >&2
-    echo "'<' is selected by Cas* only; '>' is emitted only. The gate and the filter must be the same set." >&2
+    echo "'<' is selected by CAS* only; '>' is emitted only. The gate and the filter must be the same set." >&2
     exit 1
 fi
 
-echo "wrote $(wc -l < "$OUT") suites to $OUT (equals the 'Cas*' filter set; ${#EXCLUDE_REASONS[@]} excluded, 0 unclaimed)"
+echo "wrote $(wc -l < "$OUT") suites to $OUT (equals the 'CAS*' filter set; ${#EXCLUDE_REASONS[@]} excluded, 0 unclaimed)"

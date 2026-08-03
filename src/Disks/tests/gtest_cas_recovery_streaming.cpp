@@ -234,7 +234,7 @@ public:
 /// from the fixture's own footprints and the whole-tail total is asserted to exceed it, so the bound is
 /// a property of the fixture, not a lucky constant. Its materialising counterpart,
 /// `MaterializingControlExceedsMemoryBound`, trips this same bound.
-TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
+TEST(CASRecoveryStreaming, LongTailReplaysUnderMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -279,7 +279,7 @@ TEST(CasRecoveryStreaming, LongTailReplaysUnderMemoryBound)
 /// now accounts the caller's whole resident set (each decoded transaction for the span it is held), not
 /// one apply in isolation. Under the retired stored-byte-in-`applyOne` probe this control's peak stayed
 /// at one transaction (see the RED capture in the round-2 fix report); it now correctly trips.
-TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
+TEST(CASRecoveryStreaming, MaterializingControlExceedsMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -334,7 +334,7 @@ TEST(CasRecoveryStreaming, MaterializingControlExceedsMemoryBound)
 /// record inside it is not something a fresh LIST may reinterpret as a shorter stream. With the same
 /// checkpoint token still durable, recovery fails closed immediately instead of accepting incomplete
 /// state or spinning on an advisory enumeration.
-TEST(CasRecoveryStreaming, MidTailVanishedObjectFailsClosedAgainstStableAuthority)
+TEST(CASRecoveryStreaming, MidTailVanishedObjectFailsClosedAgainstStableAuthority)
 {
     auto backend = std::make_shared<VanishMidTailOnceBackend>();
     seedPoolMetaForRestart(*backend);
@@ -362,7 +362,7 @@ TEST(CasRecoveryStreaming, MidTailVanishedObjectFailsClosedAgainstStableAuthorit
 /// Test 14 (durable-corruption leg): a `_log/` object whose body decodes to a foreign namespace is
 /// durable corruption, not a transient vanish -- recovery discards the candidate and fails fast with
 /// no re-LIST loop. Asserts the throw, zero restarts, and a single LIST.
-TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
+TEST(CASRecoveryStreaming, CorruptObjectFailsFast)
 {
     auto backend = std::make_shared<CorruptLogOnGetBackend>();
     seedPoolMetaForRestart(*backend);
@@ -396,7 +396,7 @@ TEST(CasRecoveryStreaming, CorruptObjectFailsFast)
 /// Test 14 (concurrent-waiter leg): while one caller is blocked in recovery's unlocked exact-log GET,
 /// a second caller for the same table parks on `recovery_cv` and is woken exactly once when recovery
 /// completes. Neither caller may race an independent stream LIST.
-TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
+TEST(CASRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
 {
     auto backend = std::make_shared<BlockingFirstLogGetBackend>();
     seedPoolMetaForRestart(*backend);
@@ -446,7 +446,7 @@ TEST(CasRecoveryStreaming, ConcurrentWaiterUnblockedOnce)
 /// Test 14 (other materializers leg): the orphan-sweep recovery (`recoverRefTableDetailedFromAuthority`)
 /// and fsck's exact-authority recovery stream through the SAME builder and hold under the SAME
 /// per-transaction bound as primary recovery.
-TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
+TEST(CASRecoveryStreaming, OrphanSweepAndFsckSameBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     seedPoolMetaForRestart(*backend);
@@ -507,7 +507,7 @@ TEST(CasRecoveryStreaming, OrphanSweepAndFsckSameBound)
 /// which does NOT dispatch the stale-precommit sweep `listRefs` would (that sweep
 /// would append removals over the seeded epoch-1 precommit bindings and perturb both the count and the
 /// probe). The whole tail sits above a never-born base, so the retained tail count equals the whole tail.
-TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
+TEST(CASRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     seedPoolMetaForRestart(*backend);
@@ -552,7 +552,7 @@ TEST(CasRecoveryStreaming, LedgerRecoveryReplaysUnderMemoryBound)
 /// base, precommit bindings, and a tail of committed transactions, EVERY field the
 /// recovery publication seeds is asserted -- not just the two a prose inventory would keep. This is a
 /// regression guard: streaming recovery must install exactly what the whole-tail recovery installed.
-TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
+TEST(CASRecoveryStreaming, RecoveryResultInventoryComplete)
 {
     auto backend = std::make_shared<CountingBackend>();
     seedPoolMetaForRestart(*backend);
@@ -617,7 +617,7 @@ TEST(CasRecoveryStreaming, RecoveryResultInventoryComplete)
     /// last_epoch_seal: this mount's live epoch is the one the seeded stream was written in, so the
     /// CAS-walk crossed no epoch transition and installed no chain link. Pins that the field IS part of
     /// the published inventory (its non-empty counterpart lives in
-    /// `CasRefRecoveryCasWalk.DeadEpochIsClosedByOurOwnSealAtTPlusOne`).
+    /// `CASRefRecoveryCasWalk.DeadEpochIsClosedByOurOwnSealAtTPlusOne`).
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
 
     /// stale-precommit sweep: recovery always arms it (asserted BEFORE any read-side sweep runs).

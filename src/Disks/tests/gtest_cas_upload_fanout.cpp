@@ -306,7 +306,7 @@ WorldA arrangeWorldA()
 
 }
 
-TEST(CasUploadFanout, DepsEquivalenceAcrossBranches)
+TEST(CASUploadFanout, DepsEquivalenceAcrossBranches)
 {
     /// Serial reference: pool size 1.
     WorldA serial = arrangeWorldA();
@@ -369,7 +369,7 @@ TEST(CasUploadFanout, DepsEquivalenceAcrossBranches)
 /// Test 1, GET-observability (routed from T3 review (a)): the resurrect invariant is that a condemned
 /// object is NEVER GET (revival is a fresh re-upload from the writer's own source). With a
 /// CountingBackend, assert ZERO get/getStream against the condemned blob keys through the whole fan-out.
-TEST(CasUploadFanout, CondemnedBranchesNeverGet)
+TEST(CASUploadFanout, CondemnedBranchesNeverGet)
 {
     auto counting = std::make_shared<CountingBackend>();
     auto s = openPool(counting);
@@ -418,7 +418,7 @@ TEST(CasUploadFanout, CondemnedBranchesNeverGet)
 
 /// Test 2: duplicate refs (staged-hardlink copies push a duplicate PendingBlob record) collapse to ONE
 /// task, and the merged build records exactly one dep for the ref.
-TEST(CasUploadFanout, DuplicateRefsLaunchOneTask)
+TEST(CASUploadFanout, DuplicateRefsLaunchOneTask)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -453,7 +453,7 @@ TEST(CasUploadFanout, DuplicateRefsLaunchOneTask)
 /// debug/sanitizer builds, so the abort is proven positively there (DeathTest) and the exception +
 /// build-untouched postcondition in a release build.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasUploadFanout, ConflictingDuplicateSizesRejected)
+TEST(CASUploadFanout, ConflictingDuplicateSizesRejected)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -477,7 +477,7 @@ TEST(CasUploadFanout, ConflictingDuplicateSizesRejected)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasUploadFanoutDeathTest, ConflictingDuplicateSizesAbort)
+TEST(CASUploadFanoutDeathTest, ConflictingDuplicateSizesAbort)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -499,7 +499,7 @@ TEST(CasUploadFanoutDeathTest, ConflictingDuplicateSizesAbort)
 /// key (declared_size) disagrees with its streaming authority (source.size) is a wiring bug -- rejected
 /// with LOGICAL_ERROR before dispatch (DeathTest split for debug/sanitizer builds).
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasUploadFanout, DeclaredSizeMustMatchSourceSize)
+TEST(CASUploadFanout, DeclaredSizeMustMatchSourceSize)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -518,7 +518,7 @@ TEST(CasUploadFanout, DeclaredSizeMustMatchSourceSize)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
+TEST(CASUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -536,7 +536,7 @@ TEST(CasUploadFanoutDeathTest, DeclaredSizeMismatchAborts)
 /// Test 2, condemned-S3 duplicate pair resurrects content-correctly: two duplicate S3-staging records
 /// for one condemned ref collapse to ONE resurrect task; the fresh incarnation displaces the condemned
 /// one (token changes, meta returns to Clean) and the content is the staging object's payload.
-TEST(CasUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
+TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -575,7 +575,7 @@ TEST(CasUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
 /// Test 3: one task fails (a poisoned source), one sibling succeeds. Merge-nothing means the build stays
 /// at its pre-fan-out state; the abandoned precommit turns the successful sibling's uploaded body into
 /// ORDINARY GC-reclaimable debris (NOT a new orphan class) -- a GC round reclaims it.
-TEST(CasUploadFanout, MergeNothingOnFailure)
+TEST(CASUploadFanout, MergeNothingOnFailure)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -626,7 +626,7 @@ TEST(CasUploadFanout, MergeNothingOnFailure)
 /// Test 4: two DISTINCT-ref fresh uploads, latch-crossed so both are inside `uploadBlobDetached` (hence
 /// both touching the ONE shared dedup cache) at once. The cache's internal locking makes the concurrent
 /// insertion correct; on the TSan lane this pins that there is no data race on the shared cache.
-TEST(CasUploadFanout, ConcurrentDedupCacheInsertion)
+TEST(CASUploadFanout, ConcurrentDedupCacheInsertion)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -656,7 +656,7 @@ TEST(CasUploadFanout, ConcurrentDedupCacheInsertion)
 /// observed) and a pool of 1 (peak concurrency 1 -- the single worker cannot self-wait for a second
 /// concurrent task, so it FAILS FAST via the bounded wait). Both configurations complete every upload:
 /// pool size 1 correctly degenerates to serial without deadlock.
-TEST(CasUploadFanout, PoolSaturationBounded)
+TEST(CASUploadFanout, PoolSaturationBounded)
 {
     constexpr int kBlobs = 8;
     /// Bounds are DECOUPLED by pool size. Pool 2 will reach the 2-task rendezvous in microseconds under
@@ -706,7 +706,7 @@ TEST(CasUploadFanout, PoolSaturationBounded)
 /// A failing task counts down an event and throws; a sibling waits for that event, then uploads. The
 /// fan-out rethrows only after the join, so the sibling's body is present in the backend by the time the
 /// caller observes the failure.
-TEST(CasUploadFanout, DrainPrecedesUnwind)
+TEST(CASUploadFanout, DrainPrecedesUnwind)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -755,7 +755,7 @@ TEST(CasUploadFanout, DrainPrecedesUnwind)
 /// before the first task's body ran could cancel it and leave its body ABSENT -- a real flakiness the
 /// gate removes. Once the first task's `in_task` hook has fired, that task is past SCHEDULED (RUNNING),
 /// so it can no longer be cancelled and the drain deterministically waits for its upload.
-TEST(CasUploadFanout, DispatchThrowStillDrains)
+TEST(CASUploadFanout, DispatchThrowStillDrains)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -828,7 +828,7 @@ void seedCondemnedLocal(InMemoryBackend & b, const PoolPtr & s, const String & p
 /// exceeds the cap. A held-hook rendezvous pins two co-admitted bodies together so the peak is genuinely
 /// reached (the assertion is not vacuously satisfied by tasks that happened to serialize), and the cap
 /// provably holds some tasks back. Every resurrection still completes to Clean.
-TEST(CasUploadFanout, CondemnedCapLimitsPeakBytes)
+TEST(CASUploadFanout, CondemnedCapLimitsPeakBytes)
 {
     auto & admission = condemnedUploadAdmission();
     admission.resetStatsForTest();
@@ -892,7 +892,7 @@ TEST(CasUploadFanout, CondemnedCapLimitsPeakBytes)
 /// on the wait queue (its wait hook fires before it sleeps), and the semaphore's exclusivity witness
 /// (`co_hold_violation`) stays false. Once the overweight releases, the probe admits and the
 /// resurrection has completed to Clean.
-TEST(CasUploadFanout, OverweightBlobRunsExclusively)
+TEST(CASUploadFanout, OverweightBlobRunsExclusively)
 {
     auto & admission = condemnedUploadAdmission();
     admission.resetStatsForTest();
@@ -980,7 +980,7 @@ TEST(CasUploadFanout, OverweightBlobRunsExclusively)
 /// drains it. The throw is gated on the first task RUNNING (same reason as `DispatchThrowStillDrains`) so
 /// its drain is deterministic; under ASan this run is UAF-clean -- the regression signature of a
 /// scheduled-but-untracked task is a heap-use-after-free on `results` here.
-TEST(CasUploadFanout, TrackingSeamThrowStillDrains)
+TEST(CASUploadFanout, TrackingSeamThrowStillDrains)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);

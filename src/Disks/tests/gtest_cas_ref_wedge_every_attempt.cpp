@@ -407,7 +407,7 @@ void armOneShotInstallFailure(const PoolPtr & store)
 /// the lane never recovered without a remount. One conditional create of the SAME bytes settles it:
 /// the object becomes durable and the wedged transaction is adopted -- applied EXACTLY once, before
 /// the flush that resolved it allocates any new id.
-TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdoptsItExactlyOnce)
+TEST(CASRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdoptsItExactlyOnce)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -442,7 +442,7 @@ TEST(CasRefWedgeEveryAttempt, AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdo
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 }
 
-TEST(CasRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCannotBePublished)
+TEST(CASRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCannotBePublished)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -475,7 +475,7 @@ TEST(CasRefWedgeEveryAttempt, DurableCreatedWedgeNeedsRecoveryWhenItsFrontierCan
     EXPECT_EQ(decodeRefCkpt(backend->get(ckpt_key)->bytes), ckpt_before);
 }
 
-TEST(CasRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)
+TEST(CASRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdoption)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -555,7 +555,7 @@ TEST(CasRefWedgeEveryAttempt, RetiredLifeRefusesWedgeRetryBeforeAnyRequestOrAdop
 /// earlier attempt DID land (only its ack, and the controller's own resolve read, were lost). The
 /// retry's create conflicts with our own object, the follow-up read returns bytes equal to the
 /// wedge's, and the transaction is adopted -- ONCE, not once per attempt.
-TEST(CasRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDoubleApply)
+TEST(CASRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDoubleApply)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     /// Disarmed while the fixture is built: the one-shot fault matches ANY key until a substring is
@@ -594,7 +594,7 @@ TEST(CasRefWedgeEveryAttempt, OwnLandedAttemptIsAdoptedFromOccupiedWithoutDouble
 /// `ambiguous-then-definite`, the control the phase-0 model singles out: a definite refusal of a LATER
 /// attempt says nothing about the EARLIER ambiguous one, which may still be in flight. The lane must
 /// stay wedged -- unwedging here is how an acked-then-lost transaction gets written around.
-TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
+TEST(CASRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -643,7 +643,7 @@ TEST(CasRefWedgeEveryAttempt, DefiniteRefusalOfARetryAttemptKeepsTheLaneWedged)
 /// how the wedge would silently stop happening.
 static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::DefiniteFailureAfterAmbiguity));
 
-TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAttemptOfTheSameCall)
+TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAttemptOfTheSameCall)
 {
 #if !USE_AWS_S3
     GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
@@ -686,7 +686,7 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalCannotSpeakForAnEarlierAmbiguousAt
 /// so the next append re-derives that id -- which, with an earlier attempt still possibly in flight, is
 /// how an acked-then-lost transaction gets written around. The lane must wedge instead and stay pending
 /// until the key itself resolves.
-TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCallStillWedgesTheLane)
+TEST(CASRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCallStillWedgesTheLane)
 {
 #if !USE_AWS_S3
     GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
@@ -739,7 +739,7 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
 /// write-once and a successor put its epoch-closing record there. The operation was never acked, so
 /// its callers get a permanent error; the wedge is cleared; and the seal becomes this namespace's
 /// `prev_epoch_seal`, which the first append of the NEXT epoch carries on the wire.
-TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndSourcesPrevEpochSeal)
+TEST(CASRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndSourcesPrevEpochSeal)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -804,7 +804,7 @@ TEST(CasRefWedgeEveryAttempt, SuccessorSealAtTheWedgedKeyRejectsConclusivelyAndS
 /// The wire round trip of the same rule, driven from the OTHER producer of `last_epoch_seal`:
 /// recovery's CAS-walk (Task 6), stood in for here by its test seam. The point is the encode call
 /// site, which is this task's.
-TEST(CasRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTheExactPrevEpochSeal)
+TEST(CASRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTheExactPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -838,7 +838,7 @@ TEST(CasRefWedgeEveryAttempt, OrdinaryFirstAppendAfterASealedTransitionCarriesTh
 /// GENESIS: `last_epoch_seal` is `nullopt` exactly for a namespace whose stream starts here, and a
 /// genesis birth carries NO `prev_epoch_seal` even though its epoch is far above 1. Nothing about the
 /// global epoch number makes a namespace non-genesis -- only a transition of its OWN stream does.
-TEST(CasRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
+TEST(CASRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -867,7 +867,7 @@ TEST(CasRefWedgeEveryAttempt, GenesisBirthAtAHighEpochCarriesNoPrevEpochSeal)
 /// it is corruption or a protocol breach. Fail closed with `CORRUPTED_DATA`, KEEP the wedge for
 /// inspection, and route the anomaly so the mount remounts itself rather than staying stuck until
 /// someone notices.
-TEST(CasRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesARemount)
+TEST(CASRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesARemount)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -900,7 +900,7 @@ TEST(CasRefWedgeEveryAttempt, ForeignNonSealOccupantIsCorruptedDataAndSchedulesA
 /// different object sits at the id it derived. Task 3 made that fail closed -- correctly -- but it
 /// left the mount stuck there until a manual remount, unlike the wedge-resolution site. Both are the
 /// same impossibility and both must self-heal by remount.
-TEST(CasRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemount)
+TEST(CASRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemount)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -930,7 +930,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteProvenDifferentObjectAlsoSchedulesARemou
 /// The old-generation-retry-inert rule. A wedge admitted under one mount incarnation may not send an
 /// attempt under another: the retry is refused BEFORE anything reaches the store, so the key is
 /// provably untouched and the wedge is intact for whoever recovers the lane properly.
-TEST(CasRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
+TEST(CASRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -968,7 +968,7 @@ TEST(CasRefWedgeEveryAttempt, RetryUnderAnOlderAdmissionGenerationSendsNothing)
 /// perfectly real `Occupied`(seal) -- but it belongs to an incarnation that no longer exists, so this
 /// runtime must act on NOTHING: no acknowledgement, no unwedge, no install, and no adoption of the
 /// seal it just read.
-TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsInert)
+TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsInert)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -1021,7 +1021,7 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterAFenceBumpAndSuccessorSealIsIne
 /// bug the phase-0 model found, which is why identity is (generation, id, bytes) and not any one of
 /// them. Production cannot reach this (one leader per table mutates a lane), so this is a white-box
 /// guard on the rule, driven through the force-wedge seam.
-TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
+TEST(CASRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -1063,7 +1063,7 @@ TEST(CasRefWedgeEveryAttempt, ResultReleasedAfterTheWedgeIdentityChangedIsInert)
 
 /// A resolution that proves the exact attempt durable but cannot install it has one successor:
 /// `NeedsRecovery`. It drops the attempt and forbids another write until replay catches the cache up.
-TEST(CasRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
+TEST(CASRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     backend->fired = true;   /// disarmed while the fixture is built (see the adoption test above)
@@ -1110,7 +1110,7 @@ TEST(CasRefWedgeEveryAttempt, KnownDurableInstallFailureMovesDirectlyToRecovery)
 /// has been deposed without being told, and the lane will keep re-deriving that same id forever. So it
 /// must be adjudicated as the conclusive rejection it is: a permanent error for the callers, the seal
 /// recorded as this namespace's epoch-closing record, and NO fence and NO remount.
-TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference)
+TEST(CASRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveRejectionNotInterference)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1160,7 +1160,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
 /// decommission (`claimOwnerOrThrow` -> `CORRUPTED_DATA`) until `{#ckpt-neverborn-gc-backstop}` lands --
 /// which is the right side of the trade against an unrecoverable delete of a live successor's only
 /// genesis record.
-TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejection)
+TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejection)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1195,7 +1195,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesAConclusiveFirstRefLogRejectio
 /// creation `_ckpt` must survive it byte-for-byte. `_ckpt` has no repair
 /// path (BACKLOG `{#ckpt-damage-no-repair-path}`), so this is the row that would catch a future
 /// reintroduction of the removed cleanup landing back on an already-Live namespace's `_ckpt`.
-TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
+TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1235,7 +1235,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesALaterConclusiveRejection)
 /// (`prepared->birth_contribution` set) writes NOTHING (the response is lost, the key
 /// stays absent) and wedges the lane -- `AmbiguousPutWedgesTheLaneAndTheNextFlushsCreateAdoptsItExactlyOnce`
 /// is the precedent this mirrors, adapted to a namespace's FIRST-ever transaction instead of its third.
-TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAmbiguous)
+TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAmbiguous)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend, singleAttemptBudget());
@@ -1270,7 +1270,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthIsAm
 /// catch it. Mirrors `WellFormedNonSealOccupantIsStillForeign`'s occupant shape (a decodable, well-formed
 /// NON-seal transaction at the derived key), moved to sequence 1 of a namespace with no prior ref-log
 /// transaction, so this attempt's own PUT is its first.
-TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthOccupantCannotBeRead)
+TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthOccupantCannotBeRead)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1303,7 +1303,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesWhenTheFirstNamespaceBirthOccu
 
 /// The other former call site: a genuine breach of write-exclusivity at the first `NamespaceBirth`
 /// id, mirroring `WellFormedNonSealOccupantIsStillForeign`'s occupant shape but with no prior ref-log publish.
-TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInterference)
+TEST(CASRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInterference)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1337,7 +1337,7 @@ TEST(CasRefWedgeEveryAttempt, CreationCkptSurvivesFirstNamespaceBirthForeignInte
 /// NEITHER: fencing the mount would be a guess, and reporting a conclusive rejection would acknowledge
 /// a deposition nobody observed. The id is not consumed, so the next attempt re-derives it and
 /// classifies again — deferring costs one round trip and decides nothing wrongly.
-TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
+TEST(CASRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1375,7 +1375,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
 /// adjudicated `Foreign` on CONTENT — not because it failed to decode. The sibling test above reaches
 /// the same verdict through an undecodable body, so without this one the classifier could be deciding
 /// "foreign" purely from decode failures and nothing would notice.
-TEST(CasRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
+TEST(CASRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
 {
     auto backend = std::make_shared<WedgeTestBackend>();
     auto store = openPool(backend);
@@ -1408,7 +1408,7 @@ TEST(CasRefWedgeEveryAttempt, WellFormedNonSealOccupantIsStillForeign)
 /// construction) refuses at ENCODE — so the lane would fail with a self-inflicted `CORRUPTED_DATA` on
 /// every attempt and never reach the seal collision that is supposed to fence it. The stamp is
 /// therefore conditioned on the seal's epoch being strictly BELOW the id's.
-TEST(CasRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
+TEST(CASRefWedgeEveryAttempt, ALiveEpochSealIsNeverStampedAsItsOwnPrevEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);

@@ -121,7 +121,7 @@ RefTxnId publishBirth(const PoolPtr & store, const RootNamespace & ns, const Str
 
 /// The happy path: nothing to reconcile, no pre-existing entry. The first append mints a fresh `Live`
 /// catalog entry and keys the birth transaction at it -- not at the Stage-A sentinel.
-TEST(CasRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtIt)
+TEST(CASRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtIt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -144,7 +144,7 @@ TEST(CasRefCatalogBirthWiring, FirstOpenMintsALiveCatalogEntryAndKeysTheBirthAtI
         << "and must NOT be keyed at the sentinel any more";
 }
 
-TEST(CasRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthority)
+TEST(CASRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthority)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -166,7 +166,7 @@ TEST(CasRefCatalogBirthWiring, CatalogLossAfterMountCannotRecreateAOneRowAuthori
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
 }
 
-TEST(CasRefCatalogBirthWiring, FailedCatalogBootstrapDoesNotPublishPoolMetaAndRetryConverges)
+TEST(CASRefCatalogBirthWiring, FailedCatalogBootstrapDoesNotPublishPoolMetaAndRetryConverges)
 {
     auto backend = std::make_shared<CatalogBootstrapPutFailsOnceBackend>();
     const Layout layout{"p"};
@@ -182,7 +182,7 @@ TEST(CasRefCatalogBirthWiring, FailedCatalogBootstrapDoesNotPublishPoolMetaAndRe
     EXPECT_TRUE(backend->head(layout.refCatalogKey()).exists);
 }
 
-TEST(CasRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetryableCatalogResidue)
+TEST(CASRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetryableCatalogResidue)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     const Layout layout{"p"};
@@ -198,7 +198,7 @@ TEST(CasRefCatalogBirthWiring, LostCatalogBootstrapAcknowledgementLeavesOnlyRetr
     EXPECT_TRUE(backend->head(layout.poolMetaKey()).exists);
 }
 
-TEST(CasRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatalog)
+TEST(CASRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatalog)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -213,7 +213,7 @@ TEST(CasRefCatalogBirthWiring, BootstrapConflictExactReadsTheCanonicalEmptyCatal
         << "a concurrent bootstrap winner must be exact-read before acceptance";
 }
 
-TEST(CasRefCatalogBirthWiring, BootstrapConflictRefusesANonemptyCatalog)
+TEST(CASRefCatalogBirthWiring, BootstrapConflictRefusesANonemptyCatalog)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -227,7 +227,7 @@ TEST(CasRefCatalogBirthWiring, BootstrapConflictRefusesANonemptyCatalog)
     EXPECT_EQ(backend->getCount(layout.refCatalogKey()), 1u);
 }
 
-TEST(CasRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClosed)
+TEST(CASRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClosed)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr first = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -240,7 +240,7 @@ TEST(CasRefCatalogBirthWiring, ExistingPoolMetaWithMissingCatalogStillFailsClose
         [&] { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
 }
 
-TEST(CasRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog)
+TEST(CASRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -266,7 +266,7 @@ TEST(CasRefCatalogBirthWiring, RestartFixturePreservesItsExistingNonemptyCatalog
 /// runtime never cached) must be ADOPTED, never re-minted: `CasRefCatalog::createNamespace` refuses
 /// outright once any entry exists, so `resolveNamespaceLife` has no create branch left to take here --
 /// only the adopt branch can succeed.
-TEST(CasRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
+TEST(CASRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -300,7 +300,7 @@ TEST(CasRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
 /// OBLIGATION 3, pinned through the PRODUCTION path: a `Creating` entry left by a DIFFERENT, still-live
 /// (or at least not provably dead) actor refuses every append -- no test-only seam, no direct call to
 /// `resolveNamespaceLife`/`reconcileStaleCreator`, just an ordinary `appendRefOps`.
-TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefusesProductionPublicationByConstruction)
+TEST(CASRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefusesProductionPublicationByConstruction)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -333,7 +333,7 @@ TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
 /// with a test that drives reconciliation through the discovery path rather than by calling the
 /// primitive directly"): a dead predecessor's `Creating` entry is reconciled onto THIS mount and
 /// completed to `Live`, over the SAME incarnation -- resumption, not rebirth.
-TEST(CasRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsReconciledThroughTheProductionPath)
+TEST(CASRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsReconciledThroughTheProductionPath)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForBirthTest(backend, "this-server");
@@ -366,7 +366,7 @@ TEST(CasRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
     EXPECT_TRUE(backend->head(layout.refLogKey(life, id)).exists);
 }
 
-TEST(CasRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutation)
+TEST(CASRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutation)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -388,7 +388,7 @@ TEST(CasRefCatalogBirthWiring, DropRefusesLiveCreatingFenceWithZeroCatalogMutati
     EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries, std::vector<CatalogEntry>{creating});
 }
 
-TEST(CasRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptForJanitor)
+TEST(CASRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptForJanitor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -417,7 +417,7 @@ TEST(CasRefCatalogBirthWiring, DropDeletesTerminalCreatingExactlyAndLeavesCkptFo
     EXPECT_NE(reborn.incarnation, old_life.incarnation);
 }
 
-TEST(CasRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithoutDeletingCkpt)
+TEST(CASRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithoutDeletingCkpt)
 {
     auto backend = std::make_shared<CatalogCancellationRaceBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -455,7 +455,7 @@ TEST(CasRefCatalogBirthWiring, DropLosesExactCreatingRaceToReconciliationWithout
     EXPECT_EQ(after.catalog.entries.front().creator->server_root_id, "replacement");
 }
 
-TEST(CasRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
+TEST(CASRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
 {
     auto backend = std::make_shared<CatalogCancellationRaceBackend>();
     auto store = openPoolForBirthTest(backend);
@@ -486,7 +486,7 @@ TEST(CasRefCatalogBirthWiring, FencedDropCannotCancelTerminalCreating)
     EXPECT_EQ(CasRefCatalog::read(*backend, layout).catalog.entries, std::vector<CatalogEntry>{creating});
 }
 
-TEST(CasRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreating)
+TEST(CASRefCatalogBirthWiring, ExactOldLifeCannotCancelReplacementTerminalCreating)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForBirthTest(backend);

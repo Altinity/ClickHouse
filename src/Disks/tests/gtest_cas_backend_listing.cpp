@@ -8,7 +8,7 @@
 
 using namespace DB::Cas;
 
-TEST(CasBackendListing, ForEachWalksEveryPageOnce)
+TEST(CASBackendListing, ForEachWalksEveryPageOnce)
 {
     InMemoryBackend b;
     for (int i = 0; i < 2500; ++i)
@@ -21,7 +21,7 @@ TEST(CasBackendListing, ForEachWalksEveryPageOnce)
     EXPECT_TRUE(std::is_sorted(seen.begin(), seen.end()));
 }
 
-TEST(CasBackendListing, ForEachEmptyPrefixVisitsNothing)
+TEST(CASBackendListing, ForEachEmptyPrefixVisitsNothing)
 {
     InMemoryBackend b;
     b.putIfAbsent("q/other", "v");
@@ -31,7 +31,7 @@ TEST(CasBackendListing, ForEachEmptyPrefixVisitsNothing)
     EXPECT_EQ(visits, 0u);
 }
 
-TEST(CasBackendListing, ClassifyMapsEveryDeleteKind)
+TEST(CASBackendListing, ClassifyMapsEveryDeleteKind)
 {
     EXPECT_EQ(classifyDeleteOutcome({DeleteOutcome::Kind::Deleted, false}),       DeleteClass::Deleted);
     EXPECT_EQ(classifyDeleteOutcome({DeleteOutcome::Kind::NotFound, false}),      DeleteClass::Absent);

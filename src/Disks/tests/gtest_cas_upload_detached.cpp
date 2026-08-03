@@ -84,7 +84,7 @@ std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout,
 /// dedup-cache hit: the ref is known-present in the dedup cache ⇒ HEAD-first ⇒ present ⇒ adopt.
 /// The returned result is a complete tokened adopt dep with the `DedupCacheHit` outcome; the build's
 /// dep set stays untouched; the backend body/meta match the serial `putBlob` for the same input.
-TEST(CasUploadDetached, DedupCacheHitAdoptsBuildUntouched)
+TEST(CASUploadDetached, DedupCacheHitAdoptsBuildUntouched)
 {
     const RootNamespace ns{"srv1/nsDedup"};
     const String ref_name = "part";
@@ -140,7 +140,7 @@ TEST(CasUploadDetached, DedupCacheHitAdoptsBuildUntouched)
 
 /// HEAD-first hit (size-triggered, not cached): a present body under the size trigger is adopted with
 /// the `HeadHit` outcome. Distinct from the dedup-cache leg by NOT being in the dedup cache.
-TEST(CasUploadDetached, HeadFirstHitAdopts)
+TEST(CASUploadDetached, HeadFirstHitAdopts)
 {
     const RootNamespace ns{"srv1/nsHead"};
     const String ref_name = "part";
@@ -188,7 +188,7 @@ TEST(CasUploadDetached, HeadFirstHitAdopts)
 
 /// HEAD-first miss, then a live adopt via the conditional-create 412 path, with the meta point-read
 /// finding no meta and backfilling `Clean`. Outcome `HeadMissAdopted`.
-TEST(CasUploadDetached, HeadMissLiveAdoptBackfills)
+TEST(CASUploadDetached, HeadMissLiveAdoptBackfills)
 {
     const RootNamespace ns{"srv1/nsAdopt"};
     const String ref_name = "part";
@@ -238,7 +238,7 @@ TEST(CasUploadDetached, HeadMissLiveAdoptBackfills)
 
 /// Fresh local streaming: nothing present ⇒ the write-once conditional create streams the body and
 /// creates the Clean meta. Outcome `FreshUpload`, a tokened dep sized to the source.
-TEST(CasUploadDetached, FreshLocalStreaming)
+TEST(CASUploadDetached, FreshLocalStreaming)
 {
     const RootNamespace ns{"srv1/nsFresh"};
     const String ref_name = "part";
@@ -292,7 +292,7 @@ TEST(CasUploadDetached, FreshLocalStreaming)
 
 /// S3-native staging promotion: the source carries a server-side-copy descriptor and the blob key is
 /// absent ⇒ a write-once conditional server-side copy creates the blob. Outcome `StagingPromoted`.
-TEST(CasUploadDetached, S3StagingPromotion)
+TEST(CASUploadDetached, S3StagingPromotion)
 {
     const RootNamespace ns{"srv1/nsStaging"};
     const String ref_name = "part";
@@ -363,7 +363,7 @@ TEST(CasUploadDetached, S3StagingPromotion)
 /// Condemned-local resurrection: a present body observed condemned via the meta point-read is displaced
 /// by a fresh incarnation streamed from the writer's OWN source (`putOverwrite`), never a read of the
 /// dying object. Outcome `ResurrectedLocal`; the token is refreshed and the meta returns to Clean.
-TEST(CasUploadDetached, CondemnedLocalResurrection)
+TEST(CASUploadDetached, CondemnedLocalResurrection)
 {
     const RootNamespace ns{"srv1/nsResLocal"};
     const String ref_name = "part";
@@ -420,7 +420,7 @@ TEST(CasUploadDetached, CondemnedLocalResurrection)
 /// Condemned-S3 resurrection: a present body observed condemned with an S3 staging source is displaced
 /// by an unconditional server-side copy from the SAME staging object under a fresh-tagged header, never
 /// a read/copy of the condemned blob key. Outcome `ResurrectedS3`.
-TEST(CasUploadDetached, CondemnedS3Resurrection)
+TEST(CASUploadDetached, CondemnedS3Resurrection)
 {
     const RootNamespace ns{"srv1/nsResS3"};
     const String ref_name = "part";
@@ -491,7 +491,7 @@ TEST(CasUploadDetached, CondemnedS3Resurrection)
 /// precommit, same blobs in the same order), so their independently-minted tokens line up too -- the
 /// merge path adds no backend calls of its own, only in-memory bookkeeping, so a DEEP dep-map
 /// comparison (tokens included) is exact, not just per-ref.
-TEST(CasUploadDetached, MergeAppliesAllDeps)
+TEST(CASUploadDetached, MergeAppliesAllDeps)
 {
     const RootNamespace ns{"srv1/nsMergeAll"};
     const String ref_name = "part";
@@ -540,7 +540,7 @@ TEST(CasUploadDetached, MergeAppliesAllDeps)
 /// after the FIRST result would have applied; the SECOND result must never reach `deps`, and neither
 /// may a PRE-EXISTING unrelated dep be disturbed -- a DEEP snapshot (the whole map, not one ref probed
 /// at a time) proves the build is byte-for-byte at its pre-merge state, all-or-nothing observed.
-TEST(CasUploadDetached, MergeFailureLeavesBuildUntouched)
+TEST(CASUploadDetached, MergeFailureLeavesBuildUntouched)
 {
     const RootNamespace ns{"srv1/nsMergeFail"};
     const String ref_name = "part";
@@ -582,11 +582,11 @@ TEST(CasUploadDetached, MergeFailureLeavesBuildUntouched)
 /// as a staging bug (LOGICAL_ERROR) BEFORE any result applies -- the fan-out's one-task-per-unique-ref
 /// invariant means this should never happen upstream, so merge itself is the backstop. LOGICAL_ERROR
 /// aborts the whole process in debug/sanitizer builds instead of behaving like a catchable exception
-/// (`Common/Exception.cpp`'s `handle_error_code`) -- `CasUploadDetachedDeathTest` below proves the
+/// (`Common/Exception.cpp`'s `handle_error_code`) -- `CASUploadDetachedDeathTest` below proves the
 /// abort positively in those builds instead (it cannot also verify the build-untouched postcondition,
 /// since there is no continuation after a real abort).
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasUploadDetached, MergeValidatesSizes)
+TEST(CASUploadDetached, MergeValidatesSizes)
 {
     const RootNamespace ns{"srv1/nsMergeSizes"};
     const String ref_name = "part";
@@ -617,7 +617,7 @@ TEST(CasUploadDetached, MergeValidatesSizes)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasUploadDetachedDeathTest, MergeValidatesSizesAborts)
+TEST(CASUploadDetachedDeathTest, MergeValidatesSizesAborts)
 {
     const RootNamespace ns{"srv1/nsMergeSizes"};
     const String ref_name = "part";

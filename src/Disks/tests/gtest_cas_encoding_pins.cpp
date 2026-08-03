@@ -15,7 +15,7 @@ using namespace DB::Cas;
 /// and the incremental ref budget counters assume these exact sizes. Never edit an expected
 /// string here to make a test pass — that means the encoder's bytes drifted, which is the bug.
 
-TEST(CasEncodingPins, RefLogTxnAllOpKinds)
+TEST(CASEncodingPins, RefLogTxnAllOpKinds)
 {
     RefLogTxn txn;
     txn.ns = "roots/pin";
@@ -38,7 +38,7 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     /// not quote/newline/control bytes/U+2028, so `ref_name` -- the only free-form string `RefOp`
     /// still carries now that `payload` is gone -- exercises quote, newline, a bare control byte,
     /// and the three-byte U+2028 sequence. Backslash escaping is pinned separately, over an
-    /// unrestricted string, by `gtest_cas_json_writer.cpp`'s `CasJsonWriterEscaping` suite.
+    /// unrestricted string, by `gtest_cas_json_writer.cpp`'s `CASJsonWriterEscaping` suite.
     set_published_at.ref_name = String("20260101_0_1_1_1\"c\nd") + "\x01" "e" + "\xE2\x80\xA8" "f";
     set_published_at.expected_manifest_ref = ManifestRef{1, 2, 3};
     set_published_at.published_at_ms = 1234;
@@ -61,7 +61,7 @@ TEST(CasEncodingPins, RefLogTxnAllOpKinds)
     EXPECT_EQ(encodeRefLogTxn(txn), expected);
 }
 
-TEST(CasEncodingPins, RefSnapshotLive)
+TEST(CASEncodingPins, RefSnapshotLive)
 {
     RefTableSnapshot snap;
     snap.ns = "roots/pin";
@@ -83,7 +83,7 @@ TEST(CasEncodingPins, RefSnapshotLive)
     EXPECT_EQ(encodeRefTableSnapshot(snap), expected);
 }
 
-TEST(CasEncodingPins, SourceEdgeRunLines)
+TEST(CASEncodingPins, SourceEdgeRunLines)
 {
     WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);

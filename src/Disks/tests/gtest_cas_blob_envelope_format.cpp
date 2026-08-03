@@ -45,7 +45,7 @@ String blobEnvelopeWithFutureVersion(std::string_view text)
 }
 }
 
-TEST(CasBlobEnvelopeFormat, FixedLengthAndPadZone)
+TEST(CASBlobEnvelopeFormat, FixedLengthAndPadZone)
 {
     EnvelopeHeader h = sampleHeader("t-abc/all_1_2_0");
     const String head = encodeEnvelopeHeader(h, L);
@@ -73,7 +73,7 @@ TEST(CasBlobEnvelopeFormat, FixedLengthAndPadZone)
     EXPECT_EQ(payloadOffset(back), L);
 }
 
-TEST(CasBlobEnvelopeFormat, RefTruncatedToExactBudget)
+TEST(CASBlobEnvelopeFormat, RefTruncatedToExactBudget)
 {
     /// A 200-char ref cannot fit; it is truncated so the header is EXACTLY 256 bytes and the pad holds.
     EnvelopeHeader h = sampleHeader(String(200, 'a'));
@@ -93,7 +93,7 @@ TEST(CasBlobEnvelopeFormat, RefTruncatedToExactBudget)
         EXPECT_EQ(c, 'a');
 }
 
-TEST(CasBlobEnvelopeFormat, PadZoneSmugglingFailsClosed)
+TEST(CASBlobEnvelopeFormat, PadZoneSmugglingFailsClosed)
 {
     EnvelopeHeader h = sampleHeader("r");
     const String head = encodeEnvelopeHeader(h, L);
@@ -109,7 +109,7 @@ TEST(CasBlobEnvelopeFormat, PadZoneSmugglingFailsClosed)
     EXPECT_THROW(decodeEnvelopeHeader(no_nl, no_nl.size(), ObjectKind::Blob), DB::Exception);
 }
 
-TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
+TEST(CASBlobEnvelopeFormat, GatesAndCriticalKey)
 {
     /// wrong type -> CORRUPTED_DATA; future v -> UNKNOWN_FORMAT_VERSION.
     EnvelopeHeader h = sampleHeader("r");
@@ -142,7 +142,7 @@ TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
     EXPECT_THROW(decodeEnvelopeHeader(crit, crit.size(), ObjectKind::Blob), DB::Exception);
 }
 
-TEST(CasBlobEnvelopeFormat, RefEscaperAlphabetPinned)
+TEST(CASBlobEnvelopeFormat, RefEscaperAlphabetPinned)
 {
     /// Pins the LOCAL escaper's alphabet (§ref-escaper): " and \ escape, control chars -> \uXXXX,
     /// '/' passes VERBATIM. Goes RED if anyone "unifies" this with writeStringValue/FormatSettings —
@@ -154,7 +154,7 @@ TEST(CasBlobEnvelopeFormat, RefEscaperAlphabetPinned)
         << "escaper alphabet drifted: '/' must be verbatim, quote/backslash escaped, control -> \\uXXXX";
 }
 
-TEST(CasFormatBattery, BlobEnvelope)
+TEST(CASFormatBattery, BlobEnvelope)
 {
     /// The golden is CONSTRUCTED from the hand-pinned json literal (same one FixedLengthAndPadZone
     /// asserts) + the derived pad — NOT self-computed via encodeEnvelopeHeader, which would compare

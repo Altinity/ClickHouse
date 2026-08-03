@@ -111,7 +111,7 @@ void assertPartReads(
 
 }
 
-TEST(CasProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
+TEST(CASProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
 {
     /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification, Phase A): a blob leaf whose
     /// CURRENT token is condemned at the promote gate, but which THIS build putBlob'd (tokened dep under
@@ -144,7 +144,7 @@ TEST(CasProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
-TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
+TEST(CASProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 {
     /// A blob dedup-adopted (tokened dep) under the precommit closure; an EMPTY retire set at round 1.
     /// Under EDGE-BEFORE-OBSERVE the tokened leaf is NOT re-observed at the promote gate at all — it is
@@ -176,7 +176,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
-TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
+TEST(CASProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
 {
     /// A blob displaced out-of-band to a fresh live token t1 before promote. Phase-A contract: the leaf is
     /// TOKENED (putBlob-adopted), so promote SKIPS it entirely (edge-protected — EDGE-BEFORE-OBSERVE); no
@@ -219,7 +219,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
-TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
+TEST(CASProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentToken)
 {
     /// A blob whose OWN current token t0 is LIVE, but a DIFFERENT phantom token t_other for the same
     /// hash IS condemned. The build putBlob-adopts t0 (tokened dep), so promote does not re-observe it
@@ -264,7 +264,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 /// leaf under a durable precommit closure cannot be GC-deleted in the putBlob→promote window, and promote
 /// no longer re-validates tokened leaves). Out-of-band body deletion is `ca-fsck`'s domain.
 
-TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
+TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {
     /// W-EVIDENCE (tokenless adopted dep) on a blob X whose hash is condemned-but-PRESENT. §4 manifest-trust
     /// (test name is legacy — there is no copy-forward any more): a committed-source adopted leaf is TRUSTED
@@ -309,7 +309,7 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     EXPECT_EQ(lm_after->meta.state, MetaState::Condemned) << "trust must not flip the meta";
 }
 
-TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
+TEST(CASProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
 {
     /// A build whose watermark never renews finds its OWN putBlob'd upload condemned by full GC while its
     /// precommit is STILL the live owner (this setup injects only the retire set + fence, no owner-removal
@@ -341,7 +341,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
-TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
+TEST(CASProtocol, AbandonLeavesDebrisAndDisables)
 {
     /// abandon leaves the uploaded blob + staged manifest body as debris (reaped by the orphan sweep);
     /// no owner transition is touched, and further build ops fail LOGICAL_ERROR (requireAlive).
@@ -369,7 +369,7 @@ TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
         "PartWriteTxn has been abandoned");
 }
 
-TEST(CasProtocol, DropReattachThroughDetachedNamespace)
+TEST(CASProtocol, DropReattachThroughDetachedNamespace)
 {
     /// ATTACH choreography (design §4): publish part_1 in ns; re-publish into ns/detached + drop part_1
     /// from ns; then re-publish part_1 back in ns + drop from detached. The BLOB is never re-uploaded
@@ -407,7 +407,7 @@ TEST(CasProtocol, DropReattachThroughDetachedNamespace)
     EXPECT_EQ(b->head(blob_key).token, blob_tok);
 }
 
-TEST(CasProtocol, FreezeIntoShadowNamespace)
+TEST(CASProtocol, FreezeIntoShadowNamespace)
 {
     /// FREEZE survives the table's part lifecycle (design §4): a shadow ref is a reachability root that
     /// outlives the dropped live ref.
@@ -427,7 +427,7 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
     assertPartReads(b, s, shadow, "part_1", "data.bin", "payload-X");
 }
 
-TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
+TEST(CASProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 {
     /// (Ported from the former ResurrectLosesRace scenario.) A blob displaced to a LIVE t1 (while its old
     /// t0 is condemned for a now-defunct incarnation) is SAFE to commit: the committed manifest names a
@@ -469,7 +469,7 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
 }
 
-TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
+TEST(CASProtocol, NewNamespacePublishGatedByShardFenceFloor)
 {
     /// Regression test (test name is legacy — the fence machinery is gone): build B adopts a blob, the
     /// ack-floor GC pipeline retires + deletes it, then B publishes into a fresh namespace. §4 manifest-
@@ -526,7 +526,7 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
                                    "report it dangling (dangling=" << rep.dangling << ")";
 }
 
-TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
+TEST(CASProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
     /// §4 manifest-trust (test name is legacy — the gate no longer "resolves" a tokenless leaf by observing
     /// it): a committed-source adopted leaf whose blob is condemned-but-PRESENT is TRUSTED at the promote
@@ -565,7 +565,7 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
+TEST(CASProtocol, AdoptedLeafCarriesRealBlobSize)
 {
     /// B92 round-trip (re-expressed on the manifest model): an adopted leaf must carry its real
     /// blob_size, NOT 0. PartWriteTxn A publishes a blob; build B adopts that leaf into a second ref. The
@@ -602,7 +602,7 @@ TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
 
 /// ---- Genuinely-obsolete pure-tree-model scenarios (no manifest analog) ----
 
-TEST(CasProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
+TEST(CASProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
 {
     GTEST_SKIP() << "Obsolete (tree model). The gate's 'absent tree dep recreated from retained "
                     "payload' behavior has no manifest analog: a part manifest body is staged ONCE by "
@@ -611,7 +611,7 @@ TEST(CasProtocol, DISABLED_RevalidateAbsentTreeDepRecreates)
                     "INV-1 re-upload-from-source path, not by the publish gate.";
 }
 
-TEST(CasProtocol, DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
+TEST(CASProtocol, DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime)
 {
     GTEST_SKIP() << "Obsolete (tree model). adoptTree's fail-closed observe-at-adopt-time (one HEAD, "
                     "FILE_DOESNT_EXIST on an absent detached tree) has no manifest analog: the manifest "

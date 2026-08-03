@@ -227,7 +227,7 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeDiskConfig(const std::string & i
 /// skipped-transaction class, and it is the outcome the abort used to buy at the price of a lost round:
 /// under arithmetic intake the very round that was served the hole folds the removal, so the blob dies
 /// on the normal schedule rather than waiting for a listing to become honest again.
-TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
+TEST(CASRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
 {
     auto backend = std::make_shared<HoleyListBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -290,7 +290,7 @@ TEST(CasRetirementSweep, AHiddenRemovalStillReclaimsItsBlob)
 /// too; it must never be counted as, or mistaken for, a hot scan of the ref prefix. 32 rounds exercises
 /// the deleted detector's own cadence (every 16th folding round) twice over, so a regression that only
 /// reintroduces the second enumeration on that cadence cannot hide inside a shorter run.
-TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
+TEST(CASRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
 {
     auto backend = std::make_shared<RefPrefixListCountingBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -330,7 +330,7 @@ TEST(CasRetirementSweep, TheRoundEnumeratesTheRefPrefixExactlyOnce)
 ///
 /// The assertion is the conflict itself, not the absence of damage: "nothing bad happened" would also
 /// be true of a run where the straggler simply never arrived.
-TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoverySeal)
+TEST(CASRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoverySeal)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -408,7 +408,7 @@ TEST(CasRetirementSweep, AStragglerFromTheDyingEpochLosesItsCreateToTheRecoveryS
 /// asks for the wait is refused at disk open by the generic unknown-key path, loudly, instead of being
 /// silently ignored by a server that no longer honours it. The feature never shipped, so there is no
 /// deployed config this can break.
-TEST(CasRetirementSweep, AConfigStillAskingForTheMaterializationGraceIsRejected)
+TEST(CASRetirementSweep, AConfigStillAskingForTheMaterializationGraceIsRejected)
 {
     auto cfg = makeDiskConfig(
         "<server_root_id>srv1</server_root_id><materialization_grace_ms>30000</materialization_grace_ms>");

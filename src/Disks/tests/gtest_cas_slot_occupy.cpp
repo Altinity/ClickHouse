@@ -94,7 +94,7 @@ public:
 
 /// ---- Step 1 required scenarios ----
 
-TEST(CasSlotOccupy, AbsentKeyCreatesWithOneOp)
+TEST(CASSlotOccupy, AbsentKeyCreatesWithOneOp)
 {
     auto backend = std::make_shared<CountingBackend>();
     CasRequestController controller(backend, CasRequestBudget{});
@@ -114,7 +114,7 @@ TEST(CasSlotOccupy, AbsentKeyCreatesWithOneOp)
     EXPECT_EQ(landed->bytes, "payload");
 }
 
-TEST(CasSlotOccupy, PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps)
+TEST(CASSlotOccupy, PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps)
 {
     auto backend = std::make_shared<CountingBackend>();
     const PutResult seeded = backend->putIfAbsent("k", "occupant-bytes");
@@ -137,7 +137,7 @@ TEST(CasSlotOccupy, PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps)
     EXPECT_EQ(current->bytes, "occupant-bytes");
 }
 
-TEST(CasSlotOccupy, InjectedAmbiguousPutResolvesUnresolvedWhenGetFindsNothing)
+TEST(CASSlotOccupy, InjectedAmbiguousPutResolvesUnresolvedWhenGetFindsNothing)
 {
     auto backend = std::make_shared<CountingBackend>();
     backend->injectAmbiguousPutIfAbsent("k");
@@ -157,7 +157,7 @@ TEST(CasSlotOccupy, InjectedAmbiguousPutResolvesUnresolvedWhenGetFindsNothing)
     EXPECT_FALSE(backend->head("k").exists) << "the injected fault must not actually create anything";
 }
 
-TEST(CasSlotOccupy, ConflictThenVanishResolvesUnresolved)
+TEST(CASSlotOccupy, ConflictThenVanishResolvesUnresolved)
 {
     auto backend = std::make_shared<VanishOnConflictBackend>();
     const auto seeded = backend->putIfAbsent("k", "occupant-bytes");
@@ -178,7 +178,7 @@ TEST(CasSlotOccupy, ConflictThenVanishResolvesUnresolved)
     EXPECT_FALSE(backend->head("k").exists) << "the occupant vanished between the conflict and the resolve GET";
 }
 
-TEST(CasSlotOccupy, FenceFlipMidCallRefusesPreAttemptNeverLiesCreated)
+TEST(CASSlotOccupy, FenceFlipMidCallRefusesPreAttemptNeverLiesCreated)
 {
     auto backend = std::make_shared<CountingBackend>();
     CasRequestController controller(backend, CasRequestBudget{});
@@ -199,7 +199,7 @@ TEST(CasSlotOccupy, FenceFlipMidCallRefusesPreAttemptNeverLiesCreated)
 
 /// The deadline gate is the SAME pre-attempt refusal as the fence gate above -- a fake clock proves it
 /// fires from elapsed time alone, with a fence that always says yes.
-TEST(CasSlotOccupy, OperationDeadlineExhaustedRefusesPreAttempt)
+TEST(CASSlotOccupy, OperationDeadlineExhaustedRefusesPreAttempt)
 {
     auto backend = std::make_shared<CountingBackend>();
     uint64_t clock = 0;
@@ -228,7 +228,7 @@ TEST(CasSlotOccupy, OperationDeadlineExhaustedRefusesPreAttempt)
 /// below rather than the DefiniteFailure branch it claims to cover. Better a visibly-absent test on that
 /// config than a passing one that isn't testing what its name says.
 #if USE_AWS_S3
-TEST(CasSlotOccupy, DefiniteFailurePropagatesWithoutResolve)
+TEST(CASSlotOccupy, DefiniteFailurePropagatesWithoutResolve)
 {
     auto backend = std::make_shared<ChunkFaultBackend>();
     backend->fault_substr = "k";
@@ -248,7 +248,7 @@ TEST(CasSlotOccupy, DefiniteFailurePropagatesWithoutResolve)
 /// A deterministic LOCAL failure (isDeterministicLocalFailure's set) is the OTHER rethrow path --
 /// distinct from DefiniteFailure above, and checked first in the implementation, so it needs its own
 /// backend-level fault to prove both branches are wired, not just one masking the other.
-TEST(CasSlotOccupy, DeterministicLocalFailurePropagatesWithoutResolve)
+TEST(CASSlotOccupy, DeterministicLocalFailurePropagatesWithoutResolve)
 {
     auto backend = std::make_shared<LocalFailureOnceBackend>();
     CasRequestController controller(backend, CasRequestBudget{});
@@ -284,7 +284,7 @@ TEST(CasSlotOccupy, DeterministicLocalFailurePropagatesWithoutResolve)
 /// write landed, this test would see Unresolved instead of Created, OR (if the outcome happened to
 /// still read Created some other way) the call-count assertion below would catch the extra invocation
 /// either way.
-TEST(CasSlotOccupy, CreatedNeverRechecksFenceAfterTheWrite)
+TEST(CASSlotOccupy, CreatedNeverRechecksFenceAfterTheWrite)
 {
     auto backend = std::make_shared<CountingBackend>();
     CasRequestController controller(backend, CasRequestBudget{});
@@ -307,7 +307,7 @@ TEST(CasSlotOccupy, CreatedNeverRechecksFenceAfterTheWrite)
 /// for a foreign pre-seeded one (PreExistingKeyOccupiedWithExactBytesAndTokenTwoOps above always seeds
 /// via a plain, unambiguous putIfAbsent). This is the exact input shape Task 4's resolveWedgeOnce
 /// adjudicates: "Occupied + bytes == wedge.bytes -> an earlier attempt landed -> adopt" (plan :329).
-TEST(CasSlotOccupy, OwnLandedAmbiguousWriteObservedAsOccupiedOnRetry)
+TEST(CASSlotOccupy, OwnLandedAmbiguousWriteObservedAsOccupiedOnRetry)
 {
     auto backend = std::make_shared<LandedButAckLostOnceBackend>();
     CasRequestController controller(backend, CasRequestBudget{});

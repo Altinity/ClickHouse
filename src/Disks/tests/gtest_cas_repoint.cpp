@@ -51,7 +51,7 @@ ManifestId publishPart(const PoolPtr & store, const RootNamespace & ns, const St
 /// (CasPartWriteTxn.cpp), so this can only hold if the no-op check compares candidate `entries` directly
 /// against the currently-committed manifest's DECODED entries -- never by staging first (the same
 /// structural comparison `republishRef`'s BUG 1c fix uses).
-TEST(CasRepoint, ByteEqualIsNoOp)
+TEST(CASRepoint, ByteEqualIsNoOp)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -76,7 +76,7 @@ TEST(CasRepoint, ByteEqualIsNoOp)
 /// `CommitOutcome` names a FRESH manifest (`created` still false -- the ref was already committed),
 /// the new content resolves, and the repoint is loud (ProfileEvent + the ref's cached view erased so a
 /// subsequent read serves the new manifest, not a stale retained one).
-TEST(CasRepoint, AddFileRepoints)
+TEST(CASRepoint, AddFileRepoints)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);

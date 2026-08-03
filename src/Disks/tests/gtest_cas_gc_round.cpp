@@ -80,7 +80,7 @@ PoolPtr openTestPoolWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, P
     return Pool::open(out_backend, std::move(config));
 }
 
-/// Fault decorator for triage #5's regression test (`CasGcRetention.LosingRoundNeverDestroysParentSealGeneration`
+/// Fault decorator for triage #5's regression test (`CASGcRetention.LosingRoundNeverDestroysParentSealGeneration`
 /// below): the `fail_at_call`-th `casPut` against `faulted_key` returns `Conflict` instead of committing —
 /// deterministically and single-threaded reproducing "this round's own gc/state CAS lost the race to a
 /// concurrent leader," which is the only condition under which the pre-CAS wholesale prune's choice of
@@ -191,7 +191,7 @@ std::map<String, String> snapshotKeyTokens(InMemoryBackend & b)
 /// attempts. The new model keeps gc/state {round, snap_generation, lease}, so these tests
 /// are model-agnostic and were ported verbatim from the pre-redesign suite.
 
-TEST(CasGcLease, FreshPoolAcquiresAndRenews)
+TEST(CASGcLease, FreshPoolAcquiresAndRenews)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -209,7 +209,7 @@ TEST(CasGcLease, FreshPoolAcquiresAndRenews)
     EXPECT_GT(st2.lease.seq, seq1);                              /// seq strictly advanced
 }
 
-TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
+TEST(CASGcLease, ContenderBacksOffWhileIncumbentRenews)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -225,7 +225,7 @@ TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);
 }
 
-TEST(CasGcLease, StealAfterObservedNonRenewalAdvancesLease)
+TEST(CASGcLease, StealAfterObservedNonRenewalAdvancesLease)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -241,7 +241,7 @@ TEST(CasGcLease, StealAfterObservedNonRenewalAdvancesLease)
     EXPECT_GT(st.lease.seq, st0.lease.seq);
 }
 
-TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
+TEST(CASGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
 {
     /// B160: a slow-but-alive incumbent whose lease.seq is frozen for its (long) round must NOT be
     /// stolen from, because its advisory heartbeat keeps advancing.
@@ -268,7 +268,7 @@ TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
 /// and steal a LIVE leader — exactly the hazard the allow_steal gate alone does not close, since it only
 /// stops the MANUAL call itself from executing the steal CAS, not from contaminating the shared `Gc`
 /// instance's observation state that the next allow_steal=true call reads.
-TEST(CasGcLease, ManualObservationNeverArmsTheLoopsStealDecision)
+TEST(CASGcLease, ManualObservationNeverArmsTheLoopsStealDecision)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);
@@ -305,7 +305,7 @@ TEST(CasGcLease, ManualObservationNeverArmsTheLoopsStealDecision)
 /// only wires `i_am_leader.store(true, ...)` + one `pulseHeartbeat` call into that hook - a thread-pacing
 /// wire-up not practically unit-testable without sleeps; verified by code review + the full gtest run).
 
-TEST(CasGcLease, WithoutAcquireTimePulseFirstRoundStealsDeterministically)
+TEST(CASGcLease, WithoutAcquireTimePulseFirstRoundStealsDeterministically)
 {
     /// RED-before-the-fix scenario: gc1 acquires the lease and (simulating a long first round) never
     /// pulses `gc/hb` and never renews - exactly what happened before `on_lease_acquired` existed.
@@ -321,7 +321,7 @@ TEST(CasGcLease, WithoutAcquireTimePulseFirstRoundStealsDeterministically)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
 }
 
-TEST(CasGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
+TEST(CASGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
 {
     /// GREEN-after-the-fix scenario: with the fix, `i_am_leader` flips true and the FIRST pulse fires
     /// the instant gc1 acquires the lease - before B's first observation even happens - and the
@@ -344,7 +344,7 @@ TEST(CasGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);       /// gc1 keeps the lease through its whole first round
 }
 
-TEST(CasGcLease, StaleOwnerHeartbeatDoesNotEnableFalseSteal)
+TEST(CASGcLease, StaleOwnerHeartbeatDoesNotEnableFalseSteal)
 {
     /// A deposed leader's heartbeat thread keeps pulsing until its next round notices the lost lease
     /// (`i_am_leader` is only reset there), and `pulseHeartbeat` stamps `owner = self` while a losing
@@ -384,7 +384,7 @@ TEST(CasGcLease, StaleOwnerHeartbeatDoesNotEnableFalseSteal)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcC);
 }
 
-TEST(CasGcLease, FailoverStealOnceHeartbeatStops)
+TEST(CASGcLease, FailoverStealOnceHeartbeatStops)
 {
     /// B160: once the incumbent stops heartbeating (it died), a follower observing the now-frozen
     /// heartbeat steals — automatic failover is preserved.
@@ -402,7 +402,7 @@ TEST(CasGcLease, FailoverStealOnceHeartbeatStops)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
 }
 
-TEST(CasGcLease, DeadIncumbentThenRevivedIncumbentWinsRace)
+TEST(CASGcLease, DeadIncumbentThenRevivedIncumbentWinsRace)
 {
     /// A stalled incumbent that revives and renews BEFORE the contender's second look resets the
     /// contender's window: gc2's second observation sees a NEW seq => NOT steal-eligible => backs off.
@@ -418,7 +418,7 @@ TEST(CasGcLease, DeadIncumbentThenRevivedIncumbentWinsRace)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);
 }
 
-TEST(CasGcLease, ConcurrentStealLosesCas)
+TEST(CASGcLease, ConcurrentStealLosesCas)
 {
     /// The CAS-race horn: gc2 is steal-eligible and goes for the CAS, but gc/state moved under it
     /// (injected one-shot conflict). It must back off (never acquired=true off a lost CAS) and the
@@ -441,7 +441,7 @@ TEST(CasGcLease, ConcurrentStealLosesCas)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
 }
 
-TEST(CasGcLease, CreateConflictReReadsWithinTheBound)
+TEST(CASGcLease, CreateConflictReReadsWithinTheBound)
 {
     /// The create-Conflict branch: a fresh pool where the create-if-absent CAS conflicts (one-shot).
     /// The contender re-reads and falls through within its bounded (2) CAS attempts — the re-read still
@@ -457,7 +457,7 @@ TEST(CasGcLease, CreateConflictReReadsWithinTheBound)
     EXPECT_EQ(st.lease.seq, 1u);
 }
 
-TEST(CasGcLease, CtorFailsClosedOnBadArguments)
+TEST(CASGcLease, CtorFailsClosedOnBadArguments)
 {
     /// Guards: a null store and gc_id == 0 (reserved for "lease never held") are caller bugs.
     std::shared_ptr<InMemoryBackend> b;
@@ -466,7 +466,7 @@ TEST(CasGcLease, CtorFailsClosedOnBadArguments)
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { Gc(s, DB::UInt128(0)); });
 }
 
-TEST(CasGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
+TEST(CASGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
 {
     /// The incumbent's own renew CAS conflicts (one-shot). Re-read sees our own ownership => the renew
     /// is retried ONCE within the bounded (2) CAS attempts => acquired. Never acquired=true without a
@@ -483,7 +483,7 @@ TEST(CasGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
     EXPECT_EQ(st.lease.seq, 2u);                                 /// the committed retry's seq
 }
 
-TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
+TEST(CASGcLease, VanishedStateAfterObservationFailsClosed)
 {
     /// gc/state is never legally deleted - absent AFTER a recorded observation proves an out-of-model
     /// deletion. Recreating a default state would reset round/cursors; the lease protocol
@@ -509,7 +509,7 @@ TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
 /// the round protocol collects the blob (exact-token delete) AND the owner-removed manifest body, and a
 /// further round is a clean no-op. The strongest no-loss/no-leak oracle: while the ref is live the blob
 /// is NEVER touched; once dropped, BOTH the blob and the manifest are gone and nothing dangles.
-TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
+TEST(CASGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -544,7 +544,7 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
 /// retired-in-snapshot T4: after a round condemns one blob, the ADOPTED fold seal's per-shard
 /// condemned_summary reflects it (condemned_total == 1, pending_total == 0) — distilled zero-I/O from the
 /// kCondemned rows the fold sealed into the snapshot run.
-TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
+TEST(CASGcRound, CondemnRoundSealSummaryCountsCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -587,7 +587,7 @@ TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
 /// with the STORED condemn-time token — `awaiting_graduation` while newly condemned, then `delete_pending`
 /// once graduated, and NOTHING once the exact-token redelete has removed the blob. The preview performs no
 /// HEAD on the condemned rows (the token is durable in-run) and is WRITE-FREE throughout (spec §5 req 1).
-TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
+TEST(CASGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -633,7 +633,7 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 /// A fully idle fold pure-carries every shard's authoritative rows verbatim. The parent is first made
 /// non-vacuous with one live blob in each of two shards; the forced no-delta successor must preserve
 /// both `btr` rows and the total `cnd` domain byte-for-byte.
-TEST(CasGcRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
+TEST(CASGcRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -724,7 +724,7 @@ TEST(CasGcRound, PureCarryRoundPreservesAuthoritativeShardRowsVerbatim)
 /// path may resolve it. `previewDeletes` reads the in-degree generation strictly at the adopted
 /// `(snap_generation, snap_attempt)`, so the decoy must not change its output and must not throw. This
 /// is the implementation-level complement to the TLA+ `INV_ONLY_ADOPTED_VIEWABLE` gate.
-TEST(CasGcRound, NonAdoptedAttemptSealIgnored)
+TEST(CASGcRound, NonAdoptedAttemptSealIgnored)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -760,7 +760,7 @@ TEST(CasGcRound, NonAdoptedAttemptSealIgnored)
 /// B11: the round summary must count manifest-body (tree) deletes separately from blob deletes. A drop
 /// that reclaims one manifest body must report manifests_deleted >= 1 in the RoundReport of the
 /// reclaiming round, while blobs and manifests remain separately countable.
-TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
+TEST(CASGcRound, RoundSummaryCountsManifestBodyDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -824,7 +824,7 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
 /// tables' manifests are all owner-removed in one fold; with a budget of 2, exactly 2 bodies are deleted
 /// THIS round while the other 3 survive it, and only the (unrelated, already-running) orphan sweep
 /// eventually reclaims them over further rounds.
-TEST(CasGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
+TEST(CASGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// The GC's own mount root is distinct from the synthetic dead-builder root below (matching
@@ -911,7 +911,7 @@ TEST(CasGcRound, ManifestCleanupBudgetCapsPerRoundDeletesAndLeaksToOrphanSweep)
 /// (`manifest_sweep_list_budget_keys` zeroed below disables that pass entirely). The mandatory per-round
 /// `cas/ns/stream/` scan -- `listRefPrefix`'s pre-fold DEFER signal and the fold share its result --
 /// must still land at least one page each round.
-TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
+TEST(CASGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     PoolConfig config;
@@ -936,7 +936,7 @@ TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
 /// stays in the journal, so a round that re-folds from 0 emits a SECOND +1 and drives the blob's in-degree
 /// to 2 (a silent over-pin => leak). The fix carries the per-shard fold cursor into the completion seal so
 /// the next round recovers the exact cursor. Asserts in-degree stays EXACTLY 1 across >= 2 re-folds.
-TEST(CasGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
+TEST(CASGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -971,7 +971,7 @@ TEST(CasGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
 /// Multi-ref sharing (INV-NO-LOSS): one blob referenced by TWO committed refs is spared until BOTH
 /// drop. Dropping the first ref must NOT collect the blob (the second ref still pins it); only after the
 /// second ref drops does the round collect it.
-TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
+TEST(CASGcRound, SharedBlobSparedUntilBothRefsDrop)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1007,12 +1007,12 @@ TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
 
 /// `gc_round_outcome_entry_budget` bounds only the `GcOutcomes` AUDIT row per spared decision, never the
 /// decision itself. Five blobs are condemned (owner dropped, indegree 0, durable retired rows), then --
-/// BEFORE graduation -- a fresh manifest re-references all five (the `CasThreeCursorMerge.RecoverySpares`
+/// BEFORE graduation -- a fresh manifest re-references all five (the `CASThreeCursorMerge.RecoverySpares`
 /// shape, scaled up and driven through the real round path): recovery wins unconditionally for every one
 /// of them. `CASGcRetiredSpared` and blob survival prove all five decisions happened regardless of the
 /// budget, but with a budget of 2, only 2 of the 5 get a row in the round's `GcOutcomes` log, so
 /// `RoundReport::spared` (tallied from that log) reports 2, not 5.
-TEST(CasGcRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
+TEST(CASGcRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1074,7 +1074,7 @@ TEST(CasGcRound, OutcomeEntryBudgetCapsSparedLogRowsWithoutRecondemning)
 /// folds the racing publish and SPARES the re-referenced blob (recovery wins in the pass merge, dropping
 /// its retired entry), while the genuinely-unreferenced blob proceeds through the condemn -> graduate ->
 /// delete pipeline. The discriminating assertion: at fixpoint, one is spared (kept) and the other gone.
-TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
+TEST(CASGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1114,7 +1114,7 @@ TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
 /// Idempotent fixpoint: once a pool is quiescent (all live refs folded, nothing to collect), repeated
 /// rounds are pure no-ops — no blob is collected, no manifest disappears, the in-degree generation is
 /// stable, and no round throws. The split-brain-safety bedrock: every step is idempotent.
-TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
+TEST(CASGcRound, IdempotentRerunAtFixpointIsNoOp)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1154,7 +1154,7 @@ TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
 /// and both contend to collect the now-unreferenced blob. The exact-token delete is the only destructive
 /// authority, so the blob is removed exactly once and a losing/duplicate attempt is a harmless 404/412 —
 /// no exception escapes, and the blob ends up gone exactly once with no dangling owner.
-TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
+TEST(CASGcRound, SplitBrainLeadersOnlyDuplicateWork)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1189,7 +1189,7 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
-/// (`CasGcRound.TrimOnlyBelowSealedCoverage` and the B12 lazy/batched-trim tests
+/// (`CASGcRound.TrimOnlyBelowSealedCoverage` and the B12 lazy/batched-trim tests
 /// `LazyTrimSkipsSmallJournalAndKeepsTokenStable`, `LazyTrimCompactsAtThresholdOrSoftLimit`,
 /// `MaintenanceTrimCompactsEverythingOnce` were removed with the snapshot+log ref model. They asserted
 /// GC compacts a MUTABLE shard journal in place (INV-JOURNAL-COVERAGE / `gc_trim_min_events` gates).
@@ -1207,30 +1207,30 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 ///     AbsentTree*, NoChurnRound*} — fold-step behaviour now in gtest_cas_gc_fold.cpp
 ///     (CommittedAdd/Removal/Precommit/FoldBarrier/Clamp+anomaly/RefMismatch).
 ///   - CasGcCorruptCommittedTree.MissingTreeOfLiveRefDoesNotHaltGc — now
-///     CasGcFold.CommittedMissingBodyClampsCursorAndRecordsAnomaly.
-///   - CasGcRetire.{Observes*, AbsentCandidate*, DeletedCandidate*, DeleteTimePrune*, BlobOnlyPrune*,
+///     CASGcFold.CommittedMissingBodyClampsCursorAndRecordsAnomaly.
+///   - CASGcRetire.{Observes*, AbsentCandidate*, DeletedCandidate*, DeleteTimePrune*, BlobOnlyPrune*,
 ///     RetireForgets*, RetireSetsDurable*, Diverged*, BlobHeaderUnderflow*, RetireUsesFoldCommitted*,
 ///     RetireReplayAdoptsOwnCrashedAttempt} — retire-step behaviour now split between
 ///     gtest_cas_gc_ack_floor.cpp and the retire-view suite.
-///   - CasGcRecheck.{SparedWhenPublishRacesTheFence, ReplacedWhenResurrectionWins, AbsentWhenAlreadyGone}
-///     — now CasGcRecheck.{PublishRacingFenceSparesBlob, UnreferencedBlobDeletedExactToken}.
+///   - CASGcRecheck.{SparedWhenPublishRacesTheFence, ReplacedWhenResurrectionWins, AbsentWhenAlreadyGone}
+///     — now CASGcRecheck.{PublishRacingFenceSparesBlob, UnreferencedBlobDeletedExactToken}.
 ///   - CasGcFence.* / CasGcDiscovery.UsesRegistryNotList — the fence machinery is retired; the equivalent
 ///     no-op-round-does-not-mutate-ref-shards property is gtest_cas_gc_ack_floor.cpp::
-///     CasGcAckFloor.NoOpRoundDoesNotMutateRefShards (+ helper registerNamespaceRaw discovery is
+///     CASGcAckFloor.NoOpRoundDoesNotMutateRefShards (+ helper registerNamespaceRaw discovery is
 ///     exercised by every fold test).
 ///   - CasGcCascade.* — the cascade/closure model is REMOVED; in-degree is per-blob, so a shared
-///     child surviving one parent's deletion is now CasGcRound.SharedBlobSparedUntilBothRefsDrop above,
-///     and "never cascades on replaced" is CasGcRound.RepublishDuringFenceWindowSparesOnlyReReferencedBlob.
-///   - CasGcTrim.* — now gtest_cas_gc_resume.cpp::CasGcRound.TrimDropsFoldedOwnerEvents.
+///     child surviving one parent's deletion is now CASGcRound.SharedBlobSparedUntilBothRefsDrop above,
+///     and "never cascades on replaced" is CASGcRound.RepublishDuringFenceWindowSparesOnlyReReferencedBlob.
+///   - CasGcTrim.* — now gtest_cas_gc_resume.cpp::CASGcRound.TrimDropsFoldedOwnerEvents.
 ///   - CasGcResume.{CompletesRoundAfterCrashBeforeFencePersist, AdoptsOutcomesAfterCrashBeforeCascadePersist}
 ///     — now gtest_cas_gc_resume.cpp::CasGcResume.ResumeFromDurableFoldSealCompletesRound.
 ///   - CasGcScenario.ZombieDeleteAfterResurrectIs412 — relied on the snap/tree publish path + held
 ///     in-flight deletes; the in-degree-spare equivalent is RepublishDuringFenceWindowSparesOnly...
 ///     above (exact-token delete is the sole authority; a zombie carrying a stale token 412s).
-///   - CasGcRound.PreviewDeletesIsWriteFreeAndSubsetOfUnreachable — previewDeletes survives, but it is
+///   - CASGcRound.PreviewDeletesIsWriteFreeAndSubsetOfUnreachable — previewDeletes survives, but it is
 ///     covered by the fsck/preview suite; not duplicated here.
 ///   - CasGcWatermark.LiveBuildPrecommitHonoredAcrossGcRounds /
-///     CasGcRetire.ReclaimsAbandonedPrecommitWhenFloorPasses — precommit removal is now the WRITER's job
+///     CASGcRetire.ReclaimsAbandonedPrecommitWhenFloorPasses — precommit removal is now the WRITER's job
 ///     (an exact `owner_transition` on abandon, or a fenced successor's stale-precommit sweep); GC no
 ///     longer reclaims abandoned precommits. Exercised by the orphan-manifest-sweep / build-root suites.
 
@@ -1239,7 +1239,7 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 /// retention floor (snap_generation - gc_snap_generations_to_keep), advancing snap_pruned_through. This
 /// test drives enough rounds to accumulate several generations, then asserts that everything at or below
 /// the floor is GONE while the last `keep` generations (and the live current one) remain.
-TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
+TEST(CASGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
@@ -1291,7 +1291,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 /// under `gc/gen/<g>/attempt/<a>/`), not just the final adopted attempt's. This test plants a retired
 /// set AND a decoy fold seal under a NON-adopted attempt at an old generation, ages that generation out,
 /// and asserts the whole `gc/gen/<g>/` subtree is gone (the per-key single-attempt prune leaked it).
-TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
+TEST(CASGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
@@ -1362,7 +1362,7 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
 /// generation carrying far more debris than that forces multiple rounds to fully drain it; the
 /// invariant under test is that AT EVERY ROUND, `snap_pruned_through >= old_gen` implies the old
 /// generation's prefix is already empty -- the cursor never claims completion it has not earned.
-TEST(CasGcSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration)
+TEST(CASGcSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1434,7 +1434,7 @@ TEST(CasGcSnapRetention, PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAParti
 /// round; instead it waits until its generation ages past `keep` and the wholesale prefix-delete
 /// reclaims the whole `gc/gen/<g>/` subtree — every attempt at once, including this orphan. This test
 /// plants the orphan at a fold generation, ages that generation out, and asserts retention reclaims it.
-TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
+TEST(CASGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
@@ -1493,7 +1493,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 /// ref that idle-carries across generations, `pruneSupersededGenerations` SKIPS gen-1's prefix every
 /// round while advancing the cursor over it. The gen-1 run object (physically holding the seal's ref)
 /// must survive, and folding/in-degree resolution THROUGH the carried ref must keep working.
-TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
+TEST(CASGcRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
@@ -1553,7 +1553,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 /// run — whose generation the retention cursor already passed while it was retained — is reclaimed by the
 /// post-CAS HAND-OFF delete in `runRegularRound` (the wholesale prune never revisits a generation behind
 /// its cursor, so the ordinary prune would leak it). The whole `gc/gen/<old>/` prefix must be gone.
-TEST(CasGcRetention, HandOffDeletesSupersededRef)
+TEST(CASGcRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
@@ -1616,7 +1616,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
 /// `PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration`, mid-drain over several rounds on
 /// a starvation-small prune budget), running CONCURRENTLY with an idle-carried ref that finally moves off
 /// its generation (like `HandOffDeletesSupersededRef`) in one of those very same mid-drain rounds.
-TEST(CasGcRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
+TEST(CASGcRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// `gc_shards = 2` with the "keep" and "debris" blobs routed to DIFFERENT shards is load-bearing: with
@@ -1722,7 +1722,7 @@ TEST(CasGcRetention, HandoffOwnBudgetSurvivesAPruneHeavyRound)
 /// externally observable: a round whose own CAS SUCCEEDS reclaims the same generation moments later via
 /// the existing (unrelated, unchanged) post-CAS hand-off delete regardless of this fix, so a plain
 /// successful round cannot tell bug from fix apart.
-TEST(CasGcRetention, LosingRoundNeverDestroysParentSealGeneration)
+TEST(CASGcRetention, LosingRoundNeverDestroysParentSealGeneration)
 {
     auto backend = std::make_shared<GcStateCasFaultBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
@@ -1804,7 +1804,7 @@ TEST(CasGcRetention, LosingRoundNeverDestroysParentSealGeneration)
 }
 
 /// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.
-TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
+TEST(CASGcSnapRetention, KeepZeroPrunesNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 0});
@@ -1835,7 +1835,7 @@ TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
     }
 }
 
-TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
+TEST(CASGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
 {
     std::shared_ptr<InMemoryBackend> backend;
     PoolConfig config;
@@ -1968,7 +1968,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
 
 /// Source-edge idempotency: re-folding the same blob activation does not double-count.
 /// A blob activated twice from the SAME source edge (same ManifestId + path) has in-degree 1, not 2.
-TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
+TEST(CASGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1990,7 +1990,7 @@ TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
 
 /// Re-fold of a removal is idempotent: the fold barrier + source-edge set model ensure that
 /// folding the same removal twice (the H1b scenario) does NOT drive the in-degree below zero.
-TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
+TEST(CASGcRound, ReFoldOfRemovalIsIdempotent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -2017,7 +2017,7 @@ TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
 
 /// Two distinct manifests referencing the same blob contribute TWO independent source edges.
 /// Dropping one manifest leaves the other's edge intact (in-degree stays 1, blob is spared).
-TEST(CasGcRound, TwoManifestsTwoSourceEdgesDropOneSpares)
+TEST(CASGcRound, TwoManifestsTwoSourceEdgesDropOneSpares)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

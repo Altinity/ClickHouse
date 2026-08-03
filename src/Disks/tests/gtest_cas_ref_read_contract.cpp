@@ -107,10 +107,10 @@ NamespaceLifeId admitReplacementLife(
 /// life-handle operation, not a fresh logical-name admission: it may still answer life 1's committed
 /// value (or absent), but it must never surface life 2's -- the opaque physical life id makes the
 /// successor's bytes structurally unreachable through an unrefreshed handle.
-TEST(CasRefReadContract, HeldRuntimeAfterSameNameRebirthReadsStaleOrNotFoundNeverSuccessorRefs)
+TEST(CASRefReadContract, HeldRuntimeAfterSameNameRebirthReadsStaleOrNotFoundNeverSuccessorRefs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// A 1-byte whole-table cache budget is the production knob (`CasRefTableCacheEviction`) that lets a
+    /// A 1-byte whole-table cache budget is the production knob (`CASRefTableCacheEviction`) that lets a
     /// single store instance both HOLD a table's runtime and, later, genuinely forget it by touching a
     /// different table -- so the "fresh resolution" positive control below is a real re-recovery, not
     /// a second mount.
@@ -164,7 +164,7 @@ TEST(CasRefReadContract, HeldRuntimeAfterSameNameRebirthReadsStaleOrNotFoundNeve
 /// The disjoint half of the read-side contract: once a table's runtime is resident, an ordinary read
 /// costs no catalog request at all -- the recovered-and-cached `RefTableState` is this process's
 /// sole authority for a table it has already opened.
-TEST(CasRefReadContract, HotRefReadsThroughHeldRuntimeIssueZeroCatalogRequests)
+TEST(CASRefReadContract, HotRefReadsThroughHeldRuntimeIssueZeroCatalogRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr store = openPoolForTest(backend);
@@ -210,7 +210,7 @@ TEST(CasRefReadContract, HotRefReadsThroughHeldRuntimeIssueZeroCatalogRequests)
 /// The one held ref-WRITER seam the classification found: `dropNamespace(const NamespaceLifeId &)`'s
 /// exact-incarnation guard. A stale holder can only be refused, never allowed to act on the successor
 /// -- there is no path by which it could target life 2's row or its ref data.
-TEST(CasRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccessor)
+TEST(CASRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccessor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -247,7 +247,7 @@ TEST(CasRefReadContract, StaleLifeDropRefusesAfterRebirthAndNeverTouchesSuccesso
     EXPECT_EQ(catalog_get_after->bytes, catalog_get_before->bytes);
 
     /// Life 2's ref data is untouched: a fresh resolution (a separate mount over the same backend,
-    /// exactly like `CasRefWriterRuntimeIdentity.ColdReadRejectsReplacementByExternalPoolActor`'s
+    /// exactly like `CASRefWriterRuntimeIdentity.ColdReadRejectsReplacementByExternalPoolActor`'s
     /// `external_store`) still sees exactly the value published above.
     auto verify_store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "verify"});
     const auto resolved = verify_store->resolveRef(ns, ref_name);

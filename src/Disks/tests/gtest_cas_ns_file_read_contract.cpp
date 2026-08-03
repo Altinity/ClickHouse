@@ -148,7 +148,7 @@ NamespaceLifeId currentLife(DB::ContentAddressedMetadataStorage & storage)
 /// This storage already holds life 1. Reusing its warm runtime after same-name rebirth is a retained
 /// life-handle operation, not a fresh logical-name admission: it may still see predecessor bytes (or
 /// answer absent), but the opaque physical life id makes successor bytes structurally unreachable.
-TEST(CasNamespaceFileReadContract, HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes)
+TEST(CASNamespaceFileReadContract, HeldLifeAfterSameNameRebirthNeverSeesSuccessorBytes)
 {
     DiskFixture fixture = openDiskFixture();
     writeVerbatimThroughDisk(*fixture.storage, kFilePath, "life-1\n");
@@ -164,7 +164,7 @@ TEST(CasNamespaceFileReadContract, HeldLifeAfterSameNameRebirthNeverSeesSuccesso
 
 /// Mutation caught: capturing only the namespace name and resolving it when the buffer finalizes would
 /// overwrite life 2. The real buffer must retain the exact life admitted when it was opened.
-TEST(CasNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTokenOrBytes)
+TEST(CASNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTokenOrBytes)
 {
     DiskFixture fixture = openDiskFixture();
     writeVerbatimThroughDisk(*fixture.storage, kFilePath, "life-1-before\n");
@@ -221,7 +221,7 @@ TEST(CasNamespaceFileReadContract, DelayedInlineFinalizeCannotChangeSuccessorTok
 /// `listNamespaceFiles` derives its LIST prefix from `layout.namespaceFilesPrefix(life)` -- a physical
 /// life-scoped stream, not the catalog. Listing under a held life must cost exactly one LIST of the
 /// files prefix and nothing else.
-TEST(CasNamespaceFileReadContract, ListThroughHeldLifeIssuesZeroCatalogRequests)
+TEST(CASNamespaceFileReadContract, ListThroughHeldLifeIssuesZeroCatalogRequests)
 {
     auto backend = std::make_shared<CountingBackend>();
     PoolPtr store = openPoolForTest(backend);

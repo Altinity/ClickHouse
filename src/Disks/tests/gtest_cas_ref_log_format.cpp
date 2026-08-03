@@ -11,7 +11,7 @@
 /// format-agnostic (they only assert `encodeRefLogTxn` throws) and carry over verbatim; the old
 /// binary-offset byte-patch decode tests (`bytes[k] = 99`) are gone — the shape-level corruption
 /// classes (truncation, `v`+1 forward-gate, wrong type, leading garbage) are now covered by the
-/// `CasFormatBattery.RefLog` row below. `RefTxnId` render/parse coverage lives here too (it rode in
+/// `CASFormatBattery.RefLog` row below. `RefTxnId` render/parse coverage lives here too (it rode in
 /// the same suite and is independent of either ref codec).
 
 using namespace DB::Cas;
@@ -31,7 +31,7 @@ ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 /// RefTxnId: render / parse
 /// ===================================================================================
 
-TEST(CasRefCodec, RenderCanonicalForm)
+TEST(CASRefCodec, RenderCanonicalForm)
 {
     EXPECT_EQ(renderRefTxnId(RefTxnId{7, 0x8e}), "0000000000000007-000000000000008e");
     EXPECT_EQ(renderRefTxnId(RefTxnId{1, 1}), "0000000000000001-0000000000000001");
@@ -39,7 +39,7 @@ TEST(CasRefCodec, RenderCanonicalForm)
         "ffffffffffffffff-ffffffffffffffff");
 }
 
-TEST(CasRefCodec, RenderRejectsZeroComponent)
+TEST(CASRefCodec, RenderRejectsZeroComponent)
 {
     EXPECT_DEATH(
         {
@@ -61,7 +61,7 @@ TEST(CasRefCodec, RenderRejectsZeroComponent)
         "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
 }
 
-TEST(CasRefCodec, ParseRoundTrip)
+TEST(CASRefCodec, ParseRoundTrip)
 {
     for (const RefTxnId id : {RefTxnId{7, 0x8e}, RefTxnId{1, 1}, RefTxnId{255, 2}, RefTxnId{0x100000000ULL, 3},
                                RefTxnId{0x8000000000000000ULL, 0x8000000000000000ULL},
@@ -74,41 +74,41 @@ TEST(CasRefCodec, ParseRoundTrip)
     }
 }
 
-TEST(CasRefCodec, ParseRejectsShort)
+TEST(CASRefCodec, ParseRejectsShort)
 {
     EXPECT_FALSE(parseRefTxnId("000000000000007-000000000000008e").has_value());   /// 32 chars, one short
     EXPECT_FALSE(parseRefTxnId("7-8e").has_value());
     EXPECT_FALSE(parseRefTxnId("").has_value());
 }
 
-TEST(CasRefCodec, ParseRejectsLong)
+TEST(CASRefCodec, ParseRejectsLong)
 {
     EXPECT_FALSE(parseRefTxnId("00000000000000007-000000000000008e").has_value());  /// 34 chars, one long
     EXPECT_FALSE(parseRefTxnId("0000000000000007-000000000000008e0").has_value());
 }
 
-TEST(CasRefCodec, ParseRejectsUppercase)
+TEST(CASRefCodec, ParseRejectsUppercase)
 {
     EXPECT_FALSE(parseRefTxnId("0000000000000007-00000000000000AE").has_value());
     EXPECT_FALSE(parseRefTxnId("0000000000000007-000000000000008E").has_value());
     EXPECT_FALSE(parseRefTxnId("0000000000000007-00000000000000Ae").has_value());  /// mixed case
 }
 
-TEST(CasRefCodec, ParseRejectsZeroComponent)
+TEST(CASRefCodec, ParseRejectsZeroComponent)
 {
     EXPECT_FALSE(parseRefTxnId("0000000000000000-000000000000008e").has_value());
     EXPECT_FALSE(parseRefTxnId("0000000000000007-0000000000000000").has_value());
     EXPECT_FALSE(parseRefTxnId("0000000000000000-0000000000000000").has_value());
 }
 
-TEST(CasRefCodec, ParseRejectsNonHexGarbage)
+TEST(CASRefCodec, ParseRejectsNonHexGarbage)
 {
     EXPECT_FALSE(parseRefTxnId("000000000000000g-000000000000008e").has_value());
     EXPECT_FALSE(parseRefTxnId("!!!!!!!!!!!!!!!!-000000000000008e").has_value());
     EXPECT_FALSE(parseRefTxnId("0000000000000007_000000000000008e").has_value());  /// wrong separator
 }
 
-TEST(CasRefCodec, ParseRejectsMisplacedSeparator)
+TEST(CASRefCodec, ParseRejectsMisplacedSeparator)
 {
     /// 17 hex digits then '-' then 15: same total length (33), dash at the wrong index -- the kind of
     /// shape that, read naively without a fixed dash position, could be mistaken for an in-range but
@@ -116,7 +116,7 @@ TEST(CasRefCodec, ParseRejectsMisplacedSeparator)
     EXPECT_FALSE(parseRefTxnId("00000000000000078-00000000000000e").has_value());
 }
 
-TEST(CasRefCodec, OrderMatchesLexicalOrderOfRender)
+TEST(CASRefCodec, OrderMatchesLexicalOrderOfRender)
 {
     const std::vector<uint64_t> values{1, 2, 255, 1ULL << 32, 1ULL << 63};
     std::vector<RefTxnId> ids;
@@ -140,7 +140,7 @@ TEST(CasRefCodec, OrderMatchesLexicalOrderOfRender)
 /// RefLogTxn: round trip
 /// ===================================================================================
 
-TEST(CasRefCodec, RoundTripNamespaceBirth)
+TEST(CASRefCodec, RoundTripNamespaceBirth)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
@@ -154,7 +154,7 @@ TEST(CasRefCodec, RoundTripNamespaceBirth)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RoundTripRemoveNamespace)
+TEST(CASRefCodec, RoundTripRemoveNamespace)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
@@ -168,7 +168,7 @@ TEST(CasRefCodec, RoundTripRemoveNamespace)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RoundTripSetPublishedAt)
+TEST(CASRefCodec, RoundTripSetPublishedAt)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
@@ -191,7 +191,7 @@ TEST(CasRefCodec, RoundTripSetPublishedAt)
 /// `"pl"` field paired with a still-recognized op word would otherwise be `skipUnknown`'d. It is a
 /// removed field, not a genuinely-unknown one: decoding an op record that still carries `"pl"` must FAIL
 /// with `CORRUPTED_DATA` naming the removed field.
-TEST(CasRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
+TEST(CASRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
@@ -213,7 +213,7 @@ TEST(CasRefCodec, DecodeRejectsRemovedPayloadFieldInOpRecord)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-TEST(CasRefCodec, RoundTripSetPublishedAtZeroTimestamp)
+TEST(CASRefCodec, RoundTripSetPublishedAtZeroTimestamp)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -230,7 +230,7 @@ TEST(CasRefCodec, RoundTripSetPublishedAtZeroTimestamp)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RoundTripOwnerTransitionAdd)
+TEST(CASRefCodec, RoundTripOwnerTransitionAdd)
 {
     /// new-only = add: no old_binding, a fresh new_binding.
     RefLogTxn txn;
@@ -248,7 +248,7 @@ TEST(CasRefCodec, RoundTripOwnerTransitionAdd)
     EXPECT_FALSE(decoded.ops[0].old_binding.has_value());
 }
 
-TEST(CasRefCodec, RoundTripOwnerTransitionRemoval)
+TEST(CASRefCodec, RoundTripOwnerTransitionRemoval)
 {
     /// old-only = removal: an old_binding, no new_binding.
     RefLogTxn txn;
@@ -266,7 +266,7 @@ TEST(CasRefCodec, RoundTripOwnerTransitionRemoval)
     ASSERT_TRUE(decoded.ops[0].old_binding.has_value());
 }
 
-TEST(CasRefCodec, RoundTripOwnerTransitionReplace)
+TEST(CASRefCodec, RoundTripOwnerTransitionReplace)
 {
     /// both present = replace.
     RefLogTxn txn;
@@ -285,7 +285,7 @@ TEST(CasRefCodec, RoundTripOwnerTransitionReplace)
     ASSERT_TRUE(decoded.ops[0].new_binding.has_value());
 }
 
-TEST(CasRefCodec, RoundTripMultipleOpsInOneTransaction)
+TEST(CASRefCodec, RoundTripMultipleOpsInOneTransaction)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -314,7 +314,7 @@ TEST(CasRefCodec, RoundTripMultipleOpsInOneTransaction)
 }
 
 /// A re-encode of a decoded transaction is byte-identical (the encoder is a pure function of the txn).
-TEST(CasRefCodec, ByteIdenticalReencode)
+TEST(CASRefCodec, ByteIdenticalReencode)
 {
     RefLogTxn txn;
     txn.ns = "srv1/db/table@cas@";
@@ -347,7 +347,7 @@ TEST(CasRefCodec, ByteIdenticalReencode)
 /// RefLogTxn: validation rejections (encoder-side + key/body binding + truncation)
 /// ===================================================================================
 
-TEST(CasRefCodec, EncodeRejectsZeroTxnId)
+TEST(CASRefCodec, EncodeRejectsZeroTxnId)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -355,7 +355,7 @@ TEST(CasRefCodec, EncodeRejectsZeroTxnId)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, DecodeRejectsTruncatedBuffer)
+TEST(CASRefCodec, DecodeRejectsTruncatedBuffer)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -372,7 +372,7 @@ TEST(CasRefCodec, DecodeRejectsTruncatedBuffer)
         [&] { decodeRefLogTxn(bytes.substr(0, bytes.size() - 3), txn.ns, txn.txn_id); });
 }
 
-TEST(CasRefCodec, DecodeRejectsBodyNamespaceMismatch)
+TEST(CASRefCodec, DecodeRejectsBodyNamespaceMismatch)
 {
     RefLogTxn txn;
     txn.ns = "ns-a";
@@ -386,7 +386,7 @@ TEST(CasRefCodec, DecodeRejectsBodyNamespaceMismatch)
         [&] { decodeRefLogTxn(bytes, "ns-b", txn.txn_id); });
 }
 
-TEST(CasRefCodec, DecodeRejectsBodyTxnIdMismatch)
+TEST(CASRefCodec, DecodeRejectsBodyTxnIdMismatch)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -400,7 +400,7 @@ TEST(CasRefCodec, DecodeRejectsBodyTxnIdMismatch)
         [&] { decodeRefLogTxn(bytes, txn.ns, RefTxnId{1, 2}); });
 }
 
-TEST(CasRefCodec, EncodeRejectsEmptyRefName)
+TEST(CASRefCodec, EncodeRejectsEmptyRefName)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -413,7 +413,7 @@ TEST(CasRefCodec, EncodeRejectsEmptyRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsDotRefName)
+TEST(CASRefCodec, EncodeRejectsDotRefName)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -426,7 +426,7 @@ TEST(CasRefCodec, EncodeRejectsDotRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsDotDotSegment)
+TEST(CASRefCodec, EncodeRejectsDotDotSegment)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -439,7 +439,7 @@ TEST(CasRefCodec, EncodeRejectsDotDotSegment)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsRepeatedSeparator)
+TEST(CASRefCodec, EncodeRejectsRepeatedSeparator)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -452,7 +452,7 @@ TEST(CasRefCodec, EncodeRejectsRepeatedSeparator)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsLeadingSlash)
+TEST(CASRefCodec, EncodeRejectsLeadingSlash)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -465,7 +465,7 @@ TEST(CasRefCodec, EncodeRejectsLeadingSlash)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsTrailingSlash)
+TEST(CASRefCodec, EncodeRejectsTrailingSlash)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -478,7 +478,7 @@ TEST(CasRefCodec, EncodeRejectsTrailingSlash)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsBackslash)
+TEST(CASRefCodec, EncodeRejectsBackslash)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -491,7 +491,7 @@ TEST(CasRefCodec, EncodeRejectsBackslash)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsNonCanonicalOwnerBindingRefName)
+TEST(CASRefCodec, EncodeRejectsNonCanonicalOwnerBindingRefName)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -503,7 +503,7 @@ TEST(CasRefCodec, EncodeRejectsNonCanonicalOwnerBindingRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsEmbeddedNulRefName)
+TEST(CASRefCodec, EncodeRejectsEmbeddedNulRefName)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -516,7 +516,7 @@ TEST(CasRefCodec, EncodeRejectsEmbeddedNulRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsTooManyOps)
+TEST(CASRefCodec, EncodeRejectsTooManyOps)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -530,7 +530,7 @@ TEST(CasRefCodec, EncodeRejectsTooManyOps)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeAllowsExactlyMaxOps)
+TEST(CASRefCodec, EncodeAllowsExactlyMaxOps)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -546,7 +546,7 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxOps)
     EXPECT_EQ(decoded.ops.size(), ref_txn_max_ops);
 }
 
-TEST(CasRefCodec, EncodeRejectsOversizedNormalTransaction)
+TEST(CASRefCodec, EncodeRejectsOversizedNormalTransaction)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -559,7 +559,7 @@ TEST(CasRefCodec, EncodeRejectsOversizedNormalTransaction)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
+TEST(CASRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
 {
     /// A RemoveNamespace transaction carrying a ref_name bigger than the NORMAL limit but within the
     /// REMOVAL limit must succeed -- proving the removal-class flag actually lifts the byte budget
@@ -586,7 +586,7 @@ TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, RemovalClassTransactionStillRejectsBeyondRemovalLimit)
+TEST(CASRefCodec, RemovalClassTransactionStillRejectsBeyondRemovalLimit)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -605,7 +605,7 @@ TEST(CasRefCodec, RemovalClassTransactionStillRejectsBeyondRemovalLimit)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, RemovalClassTransactionNotCappedOnOpCount)
+TEST(CASRefCodec, RemovalClassTransactionNotCappedOnOpCount)
 {
     /// A removal-class transaction may exceed `ref_txn_max_ops` -- only the (much larger) byte budget
     /// bounds it, per spec ("its operation count is bounded by that byte limit").
@@ -637,7 +637,7 @@ TEST(CasRefCodec, RemovalClassTransactionNotCappedOnOpCount)
 /// stays comfortably under `ref_txn_max_bytes`, pinned by `CanonicalMaxTransactionRoundTrips` in
 /// `gtest_cas_ref_chunked_flush.cpp`).
 
-TEST(CasRefCodec, EncodeAllowsExactlyMaxPerOpBytes)
+TEST(CASRefCodec, EncodeAllowsExactlyMaxPerOpBytes)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -660,7 +660,7 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxPerOpBytes)
     EXPECT_EQ(decoded, txn);
 }
 
-TEST(CasRefCodec, EncodeRejectsOversizedOpOnNormalTransaction)
+TEST(CASRefCodec, EncodeRejectsOversizedOpOnNormalTransaction)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -682,7 +682,7 @@ TEST(CasRefCodec, EncodeRejectsOversizedOpOnNormalTransaction)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeAllowsExactlyMaxRemovalBytes)
+TEST(CASRefCodec, EncodeAllowsExactlyMaxRemovalBytes)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -713,7 +713,7 @@ TEST(CasRefCodec, EncodeAllowsExactlyMaxRemovalBytes)
 /// binds both codecs). Encoder-side only -- the decode path re-runs the identical checks and is
 /// covered by the round-trips + the battery.
 
-TEST(CasRefCodec, EncodeRejectsZeroManifestRefWriterEpochInOwnerBinding)
+TEST(CASRefCodec, EncodeRejectsZeroManifestRefWriterEpochInOwnerBinding)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -725,7 +725,7 @@ TEST(CasRefCodec, EncodeRejectsZeroManifestRefWriterEpochInOwnerBinding)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsZeroManifestRefBuildSequenceInOwnerBinding)
+TEST(CASRefCodec, EncodeRejectsZeroManifestRefBuildSequenceInOwnerBinding)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -737,7 +737,7 @@ TEST(CasRefCodec, EncodeRejectsZeroManifestRefBuildSequenceInOwnerBinding)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
+TEST(CASRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -749,7 +749,7 @@ TEST(CasRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPublishedAt)
+TEST(CASRefCodec, EncodeRejectsZeroManifestRefInSetPublishedAt)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -766,7 +766,7 @@ TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPublishedAt)
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
 
-TEST(CasFormatBattery, RefLog)
+TEST(CASFormatBattery, RefLog)
 {
     RefLogTxn txn;
     txn.ns = "ns";

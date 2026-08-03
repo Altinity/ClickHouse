@@ -12,7 +12,7 @@
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-TEST(CasGcShardConfig, DefaultIsSingleShard)
+TEST(CASGcShardConfig, DefaultIsSingleShard)
 {
     PoolConfig cfg;
     EXPECT_EQ(cfg.gc_shards, 1u);
@@ -20,7 +20,7 @@ TEST(CasGcShardConfig, DefaultIsSingleShard)
     EXPECT_EQ(cfg.manifest_sweep_delete_budget_keys, 100u);
 }
 
-TEST(CasGcShardConfig, GcStateRoundTripPreservesShardCount)
+TEST(CASGcShardConfig, GcStateRoundTripPreservesShardCount)
 {
     GcState s;
     s.gc_shards = 4;
@@ -32,7 +32,7 @@ TEST(CasGcShardConfig, GcStateRoundTripPreservesShardCount)
 
 /// ---- blobShard tests (Phase 4, Task 3) ----
 
-TEST(CasGcShardScatter, DeterministicAndStable)
+TEST(CASGcShardScatter, DeterministicAndStable)
 {
     /// A fixed hash — the same bytes every run. blobShard must return the same value twice,
     /// must be strictly less than gc_shards=4, and must be 0 when gc_shards=1.
@@ -47,7 +47,7 @@ TEST(CasGcShardScatter, DeterministicAndStable)
     EXPECT_EQ(blobShard(hd, 1), 0u) << "gc_shards==1 must route every hash to shard 0";
 }
 
-TEST(CasGcShardScatter, DisjointCoverageOverManyHashes)
+TEST(CASGcShardScatter, DisjointCoverageOverManyHashes)
 {
     /// Over 4096 spread-out hashes with gc_shards=4: every result in [0,4) and every shard
     /// gets at least one hash (no dead shard).
@@ -90,7 +90,7 @@ static std::pair<BlobRef, BlobRef> makeTwoShardHashes()
 ///   - b1 routes to shard 0; net = +2 - 1 = 1; in-degree after reduce = 1.
 ///   - b2 routes to shard 1; net = +1; in-degree after reduce = 1.
 ///   - Each reducer touches ONLY its own shard's key space.
-TEST(CasGcShardReducer, MergesDeltasToInDegree)
+TEST(CASGcShardReducer, MergesDeltasToInDegree)
 {
     const auto [b1, b2] = makeTwoShardHashes();
     ASSERT_EQ(blobShard(b1, 2), 0u) << "b1 must route to shard 0";
@@ -165,7 +165,7 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
 
 /// `ShardReducer::owns` partitions the blob hash space: for any hash, exactly ONE reducer among
 /// {r0, r1} owns it (union == all, intersection == empty).
-TEST(CasGcShardReducer, TwoReducersCoverDisjointShards)
+TEST(CASGcShardReducer, TwoReducersCoverDisjointShards)
 {
     constexpr uint64_t kNumHashes = 4096;
     constexpr uint64_t kGcShards = 2;
@@ -196,7 +196,7 @@ TEST(CasGcShardReducer, TwoReducersCoverDisjointShards)
 ///
 /// Phase 0 `SabotageKeyByRefNotId`: if routing used only the `ManifestRef`, two namespaces sharing
 /// the same ref would land on the same worker, merging cleanup work that belongs to distinct objects.
-TEST(CasGcShardCleanup, RoutesByQualifiedManifestIdNotRef)
+TEST(CASGcShardCleanup, RoutesByQualifiedManifestIdNotRef)
 {
     /// Shared ManifestRef: identical across both ManifestIds.
     const ManifestRef shared_ref{
@@ -248,7 +248,7 @@ TEST(CasGcShardCleanup, RoutesByQualifiedManifestIdNotRef)
 
 /// Over many `ManifestId`s with `gc_shards=4`: every owner shard is covered, and each id lands in
 /// exactly one shard (total, disjoint coverage).
-TEST(CasGcShardCleanup, DisjointWorkerCoverage)
+TEST(CASGcShardCleanup, DisjointWorkerCoverage)
 {
     constexpr uint64_t kNumIds = 4096;
     constexpr uint64_t kShards = 4;
@@ -279,7 +279,7 @@ TEST(CasGcShardCleanup, DisjointWorkerCoverage)
 /// each bucket via its own `ShardReducer`, exactly as `Gc::fold` does. This test replicates that
 /// partition-and-reduce step over `gc_shards = 2` and asserts each blob's in-degree lands in its
 /// owning shard's run and nowhere else. (The full two-replica round is covered by Task 8.)
-TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
+TEST(CASGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
 {
     constexpr uint64_t kGcShards = 2;
     const auto [b0, b1] = makeTwoShardHashes();
@@ -335,7 +335,7 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
 /// `blobTargetRunKey(g, 0, 0)` for the shard-0 run AND `blobTargetRunKey(g, 1, 0)` for the (empty)
 /// shard-1 run. The per-blob in-degree (the load-bearing property — it drives the spare/delete
 /// decision) is identical; the seal's key-set legitimately differs by shard count.
-TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
+TEST(CASGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
 {
     /// Build three blob hashes that ALL route to shard 0 under gc_shards=2 (high64 % 2 == 0).
     /// high64=0 => shard 0, high64=2 => shard 0, high64=4 => shard 0.
@@ -447,7 +447,7 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
 /// Interleaving: driven entirely from the test thread (no threads, no sleeps). The two reducers are
 /// constructed and called sequentially from the test thread. This proves the protocol is correct even
 /// when reducer work interleaves arbitrarily — the key-space disjointness is static.
-TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
+TEST(CASGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
 {
     constexpr uint64_t kGcShards = 2;
     constexpr uint64_t kNewGen = 1;
@@ -531,7 +531,7 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
 /// `previewDeletes` (also shard-0-only pre-fix) never lists it, the recheck never spares-or-deletes it,
 /// and `blobExists(b1)` stays true at fixpoint. The shard-0 blob would still be reclaimed — which is
 /// exactly why the existing in-degree-equivalence tests (all blobs route to shard 0) did not catch it.
-TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
+TEST(CASGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
 {
     constexpr uint64_t kGcShards = 2;
 

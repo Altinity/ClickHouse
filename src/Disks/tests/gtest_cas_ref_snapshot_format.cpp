@@ -8,7 +8,7 @@
 /// `gtest_cas_ref_codecs.cpp` and re-pointed at the TEXT codec. The encoder-side validation tests are
 /// format-agnostic and carry over verbatim; the old binary-offset byte-patch decode tests
 /// (`bytes[k] = 99`) are gone -- the shape-level corruption classes (truncation, `v`+1 forward-gate,
-/// wrong type, leading garbage) are covered by the `CasFormatBattery.RefSnapshot` row below, which also
+/// wrong type, leading garbage) are covered by the `CASFormatBattery.RefSnapshot` row below, which also
 /// subsumes the old `DecodeRejectsFutureFormatVersion`/`DecodeRejectsFormatVersionOne` pair (there is
 /// no `format_version` byte any more -- the header `v` gate is the single forward-compat mechanism).
 
@@ -53,7 +53,7 @@ RefTableSnapshot makeLiveSnapshot()
 /// RefTableSnapshot: round trip
 /// ===================================================================================
 
-TEST(CasRefSnapshotCodec, RoundTripLive)
+TEST(CASRefSnapshotCodec, RoundTripLive)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     const String bytes = encodeRefTableSnapshot(s);
@@ -61,7 +61,7 @@ TEST(CasRefSnapshotCodec, RoundTripLive)
     EXPECT_EQ(decoded, s);
 }
 
-TEST(CasRefSnapshotCodec, DecodeRequiresLifecycleField)
+TEST(CASRefSnapshotCodec, DecodeRequiresLifecycleField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
@@ -74,7 +74,7 @@ TEST(CasRefSnapshotCodec, DecodeRequiresLifecycleField)
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
+TEST(CASRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
@@ -87,7 +87,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsTerminalLifecycleWord)
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
+TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
@@ -100,7 +100,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnEpochField)
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
+TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
@@ -113,7 +113,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnSequenceField)
         [&] { (void)decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
+TEST(CASRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     String bytes = encodeRefTableSnapshot(s);
@@ -130,7 +130,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRetiredRemoveTxnFieldPair)
 /// committed-row wire in stage-1 T12. It is NOT a genuinely-unknown future field the tolerant reader may
 /// skip -- silently discarding a persisted payload would lose data -- so decoding a committed row that
 /// still carries `"pl"` must FAIL with `CORRUPTED_DATA` naming the removed field, not `skipUnknown` it.
-TEST(CasRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
+TEST(CASRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -152,7 +152,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsRemovedPayloadFieldInCommittedRow)
         [&] { decodeRefTableSnapshot(tampered, s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, RoundTripLiveEmpty)
+TEST(CASRefSnapshotCodec, RoundTripLiveEmpty)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -165,7 +165,7 @@ TEST(CasRefSnapshotCodec, RoundTripLiveEmpty)
     EXPECT_TRUE(decoded.precommits.empty());
 }
 
-TEST(CasRefSnapshotCodec, ByteIdenticalReencode)
+TEST(CASRefSnapshotCodec, ByteIdenticalReencode)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     const String bytes1 = encodeRefTableSnapshot(s);
@@ -174,7 +174,7 @@ TEST(CasRefSnapshotCodec, ByteIdenticalReencode)
     EXPECT_EQ(bytes1, bytes2);
 }
 
-TEST(CasRefSnapshotCodec, RoundTripPrecommitsSameNameDifferentManifest)
+TEST(CASRefSnapshotCodec, RoundTripPrecommitsSameNameDifferentManifest)
 {
     /// Two builds racing for the same final ref name: same ref_name, different manifest_ref, sorted
     /// by manifest_ref as the tiebreak.
@@ -198,7 +198,7 @@ TEST(CasRefSnapshotCodec, RoundTripPrecommitsSameNameDifferentManifest)
 /// range survives a round trip without JSON's number semantics getting involved. This used to be pinned
 /// through the retired sentinel seal, whose synthetic `{E-1, UINT64_MAX}` id was the only place such a
 /// value arose; the representation guarantee is what actually mattered and it is pinned directly here.
-TEST(CasRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
+TEST(CASRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
 {
     RefTableSnapshot m;
     m.ns = "ns";
@@ -214,7 +214,7 @@ TEST(CasRefSnapshotFormat, MaximalRefSequenceRoundTripsAsADecimalString)
 /// RefTableSnapshot: validation rejections (encoder-side + key/body binding + truncation)
 /// ===================================================================================
 
-TEST(CasRefSnapshotCodec, EncodeRejectsZeroSnapshotId)
+TEST(CASRefSnapshotCodec, EncodeRejectsZeroSnapshotId)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -222,7 +222,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsZeroSnapshotId)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsUnsortedCommitted)
+TEST(CASRefSnapshotCodec, EncodeRejectsUnsortedCommitted)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -238,7 +238,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsUnsortedCommitted)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsDuplicateCommittedRefName)
+TEST(CASRefSnapshotCodec, EncodeRejectsDuplicateCommittedRefName)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -254,7 +254,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsDuplicateCommittedRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsUnsortedPrecommits)
+TEST(CASRefSnapshotCodec, EncodeRejectsUnsortedPrecommits)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -264,7 +264,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsUnsortedPrecommits)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsPrecommitsSameNameWrongManifestOrder)
+TEST(CASRefSnapshotCodec, EncodeRejectsPrecommitsSameNameWrongManifestOrder)
 {
     /// Same ref_name but the manifest_ref tiebreak is descending -- must be rejected even though the
     /// names alone look sorted.
@@ -276,7 +276,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsPrecommitsSameNameWrongManifestOrder)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsDuplicatePrecommitBinding)
+TEST(CASRefSnapshotCodec, EncodeRejectsDuplicatePrecommitBinding)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -286,7 +286,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsDuplicatePrecommitBinding)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsNonCanonicalCommittedRefName)
+TEST(CASRefSnapshotCodec, EncodeRejectsNonCanonicalCommittedRefName)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -298,7 +298,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsNonCanonicalCommittedRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsNonCanonicalPrecommitRefName)
+TEST(CASRefSnapshotCodec, EncodeRejectsNonCanonicalPrecommitRefName)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -307,7 +307,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsNonCanonicalPrecommitRefName)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsPrecommitWrongKind)
+TEST(CASRefSnapshotCodec, EncodeRejectsPrecommitWrongKind)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -316,7 +316,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsPrecommitWrongKind)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsZeroManifestRefFields)
+TEST(CASRefSnapshotCodec, EncodeRejectsZeroManifestRefFields)
 {
     {
         RefTableSnapshot s;
@@ -340,7 +340,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsZeroManifestRefFields)
     }
 }
 
-TEST(CasRefSnapshotCodec, EncodeRejectsOversizedSnapshot)
+TEST(CASRefSnapshotCodec, EncodeRejectsOversizedSnapshot)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -354,7 +354,7 @@ TEST(CasRefSnapshotCodec, EncodeRejectsOversizedSnapshot)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(s); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsTruncatedBuffer)
+TEST(CASRefSnapshotCodec, DecodeRejectsTruncatedBuffer)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     const String bytes = encodeRefTableSnapshot(s);
@@ -363,7 +363,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsTruncatedBuffer)
         [&] { decodeRefTableSnapshot(bytes.substr(0, bytes.size() - 3), s.ns, s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsNamespaceMismatch)
+TEST(CASRefSnapshotCodec, DecodeRejectsNamespaceMismatch)
 {
     RefTableSnapshot s;
     s.ns = "ns-a";
@@ -373,7 +373,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsNamespaceMismatch)
         [&] { decodeRefTableSnapshot(bytes, "ns-b", s.snapshot_id); });
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsSnapshotIdMismatch)
+TEST(CASRefSnapshotCodec, DecodeRejectsSnapshotIdMismatch)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -383,7 +383,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsSnapshotIdMismatch)
         [&] { decodeRefTableSnapshot(bytes, s.ns, RefTxnId{1, 2}); });
 }
 
-TEST(CasRefSnapshotCodec, EncodeAllowsExactlySnapshotMaxBytes)
+TEST(CASRefSnapshotCodec, EncodeAllowsExactlySnapshotMaxBytes)
 {
     RefTableSnapshot s;
     s.ns = "ns";
@@ -406,7 +406,7 @@ TEST(CasRefSnapshotCodec, EncodeAllowsExactlySnapshotMaxBytes)
     EXPECT_EQ(decoded, s);
 }
 
-TEST(CasRefSnapshotCodec, DecodeRejectsOversizedBufferDirectly)
+TEST(CASRefSnapshotCodec, DecodeRejectsOversizedBufferDirectly)
 {
     /// A body with no line terminator inside the first `line_cap` bytes fails closed before any field
     /// parsing (the text `readLine` line-cap guard, the text-codec analogue of the old early size guard).
@@ -419,7 +419,7 @@ TEST(CasRefSnapshotCodec, DecodeRejectsOversizedBufferDirectly)
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
 
-TEST(CasFormatBattery, RefSnapshot)
+TEST(CASFormatBattery, RefSnapshot)
 {
     const RefTableSnapshot s = makeLiveSnapshot();
     const String ns = s.ns;

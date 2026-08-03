@@ -51,7 +51,7 @@ void publishOneBlobPart(const PoolPtr & s, const String & ns, const String & ref
 /// `push_back`s would tear the vector (and TSan on that lane would flag the data race); serialized
 /// delivery makes the unguarded append correct. The count/uniqueness assertions catch dropped or
 /// duplicated events on any lane.
-TEST(CasEventDispatcher, SerializesConcurrentEmitters)
+TEST(CASEventDispatcher, SerializesConcurrentEmitters)
 {
     EventDispatcher disp;
     std::vector<CasEvent> seen;   /// unguarded on purpose -- the dispatcher is the only serialization
@@ -89,7 +89,7 @@ TEST(CasEventDispatcher, SerializesConcurrentEmitters)
 /// finds a drain already running, enqueues, and returns; the running loop delivers it after the
 /// current sink returns. Delivery is synchronous on the emitting thread, so no timed wait is needed:
 /// `emit` returns only after the whole queue (including the reentrant event) has drained.
-TEST(CasEventDispatcher, ReentrantSinkDoesNotDeadlock)
+TEST(CASEventDispatcher, ReentrantSinkDoesNotDeadlock)
 {
     EventDispatcher disp;
     std::vector<CasEventType> delivered;
@@ -122,7 +122,7 @@ TEST(CasEventDispatcher, ReentrantSinkDoesNotDeadlock)
 /// worker would re-lock `state_mutex` on the same thread from inside the sink and self-deadlock. The
 /// restructured emit (after the lock scope) lets the reentrant read take the lock freshly, and the
 /// dispatcher serializes the concurrent upload emissions.
-TEST(CasEventDispatcher, LedgerEmissionOutsideLocks)
+TEST(CASEventDispatcher, LedgerEmissionOutsideLocks)
 {
     auto b = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> seen;   /// declared before the Pool so it outlives any late background emit

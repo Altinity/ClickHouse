@@ -10,7 +10,7 @@ namespace DB::ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-TEST(CasFormatBattery, GcState)
+TEST(CASFormatBattery, GcState)
 {
     GcState s;
     s.round = 4;
@@ -28,7 +28,7 @@ TEST(CasFormatBattery, GcState)
         "\"lo\":\"00000000000000000000000000000001\",\"ls\":\"12\"}\n"});
 }
 
-TEST(CasFormatBattery, GcHeartbeat)
+TEST(CASFormatBattery, GcHeartbeat)
 {
     GcHeartbeat hb{UInt128(1), 1741};
     runFormatBattery({FormatId::GcHeartbeat,
@@ -40,7 +40,7 @@ TEST(CasFormatBattery, GcHeartbeat)
 
 /// ---------- field round-trips (migrated from gtest_cas_gc_formats.cpp, re-pointed at the text codec) ----------
 
-TEST(CasGcStateFormat, RoundTripsCoreFields)
+TEST(CASGcStateFormat, RoundTripsCoreFields)
 {
     GcState s;
     s.round = 7;
@@ -56,7 +56,7 @@ TEST(CasGcStateFormat, RoundTripsCoreFields)
     EXPECT_EQ(d.lease.seq, 5u);
 }
 
-TEST(CasGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
+TEST(CASGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
 {
     GcState s;
     s.gc_shards = 2;
@@ -70,7 +70,7 @@ TEST(CasGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
     EXPECT_EQ(d.manifest_sweep_cursor, s.manifest_sweep_cursor);
 }
 
-TEST(CasGcStateFormat, DefaultsRoundTrip)
+TEST(CASGcStateFormat, DefaultsRoundTrip)
 {
     GcState s;   /// gc_shards defaults to 1
     EXPECT_EQ(s.gc_shards, 1u);
@@ -81,7 +81,7 @@ TEST(CasGcStateFormat, DefaultsRoundTrip)
     EXPECT_EQ(d.lease.owner, UInt128{});
 }
 
-TEST(CasGcStateFormat, RejectsZeroGcShards)
+TEST(CASGcStateFormat, RejectsZeroGcShards)
 {
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.
@@ -93,9 +93,9 @@ TEST(CasGcStateFormat, RejectsZeroGcShards)
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
 /// encodeGcState(gc_shards=0) throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
-/// builds instead of behaving like a catchable exception -- CasGcStateFormatDeathTest below proves the
+/// builds instead of behaving like a catchable exception -- CASGcStateFormatDeathTest below proves the
 /// abort positively in those builds instead.
-TEST(CasGcStateFormat, RejectsZeroGcShardsOnEncode)
+TEST(CASGcStateFormat, RejectsZeroGcShardsOnEncode)
 {
     GcState state;
     state.gc_shards = 0;
@@ -113,7 +113,7 @@ TEST(CasGcStateFormat, RejectsZeroGcShardsOnEncode)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
+TEST(CASGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 {
     GcState state;
     state.gc_shards = 0;
@@ -121,7 +121,7 @@ TEST(CasGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 }
 #endif
 
-TEST(CasGcStateFormat, RejectsAbsentGcShards)
+TEST(CASGcStateFormat, RejectsAbsentGcShards)
 {
     /// An absent gcs key must fail closed (the writer always emits it) rather than silently defaulting
     /// to the struct's gc_shards = 1 — a missing shard count means a corrupt object, not "use the floor".
@@ -133,13 +133,13 @@ TEST(CasGcStateFormat, RejectsAbsentGcShards)
     EXPECT_THROW(decodeGcState(bad), DB::Exception);
 }
 
-TEST(CasGcStateFormat, GarbageFailsClosed)
+TEST(CASGcStateFormat, GarbageFailsClosed)
 {
     EXPECT_THROW(decodeGcState(String("")), DB::Exception);
     EXPECT_THROW(decodeGcState(String("not a cas object\n")), DB::Exception);
 }
 
-TEST(CasGcHeartbeatFormat, RoundTripAndBoundaries)
+TEST(CASGcHeartbeatFormat, RoundTripAndBoundaries)
 {
     GcHeartbeat hb;
     hb.owner = hexToU128("0123456789abcdeffedcba9876543210");
@@ -155,7 +155,7 @@ TEST(CasGcHeartbeatFormat, RoundTripAndBoundaries)
     EXPECT_THROW(decodeGcHeartbeat(String("short")), DB::Exception);
 }
 
-TEST(CasGcHeartbeatFormat, RejectsMissingIdentityFields)
+TEST(CASGcHeartbeatFormat, RejectsMissingIdentityFields)
 {
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.

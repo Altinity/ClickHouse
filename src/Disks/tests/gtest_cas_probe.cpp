@@ -17,7 +17,7 @@ namespace ErrorCodes
 
 using namespace DB::Cas;
 
-TEST(CasProbe, PassesOnEnforcingBackend)
+TEST(CASProbe, PassesOnEnforcingBackend)
 {
     auto b = std::make_shared<InMemoryBackend>();
     EXPECT_NO_THROW(runCapabilityProbe(*b, "p/.cas_probe"));
@@ -41,28 +41,28 @@ public:
     }
 };
 
-TEST(CasProbe, CleanupNeverDeletesWithEmptyToken)
+TEST(CASProbe, CleanupNeverDeletesWithEmptyToken)
 {
     auto b = std::make_shared<EmptyTokenDeleteRecorder>();
     EXPECT_NO_THROW(runCapabilityProbe(*b, "p/.cas_probe"));
     EXPECT_EQ(b->empty_token_deletes, 0u);
 }
 
-TEST(CasProbe, FailsClosedOnNonEnforcingDelete)
+TEST(CASProbe, FailsClosedOnNonEnforcingDelete)
 {
     auto b = std::make_shared<InMemoryBackend>();
     b->setEnforceTokens(false);                                  // the MinIO-OSS failure mode
     EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
 }
 
-TEST(CasProbe, FailsClosedOnDeleteMarkers)
+TEST(CASProbe, FailsClosedOnDeleteMarkers)
 {
     auto b = std::make_shared<InMemoryBackend>();
     b->setSimulateDeleteMarkers(true);                           // versioning enabled on the prefix
     EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
 }
 
-TEST(CasProbe, PassesOnEmulatedLocal)
+TEST(CASProbe, PassesOnEmulatedLocal)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
@@ -76,7 +76,7 @@ TEST(CasProbe, PassesOnEmulatedLocal)
 /// throws NOT_IMPLEMENTED ("putIfAbsent on a fresh key returned PreconditionFailed"). With the
 /// per-mount unique probe prefix `<pool>/_probe/<rand>/token`, the seeded key does not collide and
 /// the open succeeds — exactly the concurrent-shared-pool-mount behaviour we need.
-TEST(CasProbe, ConcurrentMountsDoNotCollide)
+TEST(CASProbe, ConcurrentMountsDoNotCollide)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
@@ -108,7 +108,7 @@ public:
     }
 };
 
-TEST(CasProbe, FailsClosedOnPoolPreconditions)
+TEST(CASProbe, FailsClosedOnPoolPreconditions)
 {
     auto b = std::make_shared<PreconditionRefusingBackend>();
     EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
@@ -119,7 +119,7 @@ TEST(CasProbe, FailsClosedOnPoolPreconditions)
 /// `Pool::open` wraps the pool backend in `InstrumentedBackend` BEFORE calling `runCapabilityProbe`
 /// (see CasPool.cpp), so the hook must actually fire THROUGH the wrapper on the real mount path —
 /// not just on a raw backend, which `FailsClosedOnPoolPreconditions` above already covers.
-TEST(CasProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
+TEST(CASProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
 {
     auto inner = std::make_shared<PreconditionRefusingBackend>();
     InstrumentedBackend wrapped(inner);
@@ -135,7 +135,7 @@ TEST(CasProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
 /// implementation only answers true for Default), so Native mode over it is exactly the case this must
 /// refuse. EmulatedSingleProcess is exempt: it never claims single-attempt S3 semantics in the first
 /// place (PassesOnEmulatedLocal above).
-TEST(CasProbe, FailsClosedOnUnsupportedSingleAttemptProfile)
+TEST(CASProbe, FailsClosedOnUnsupportedSingleAttemptProfile)
 {
     auto native = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
@@ -148,7 +148,7 @@ TEST(CasProbe, FailsClosedOnUnsupportedSingleAttemptProfile)
 
 /// The same fail-closed refusal through the actual capability probe (Step 0b) — the real gate a
 /// writable Pool::open goes through, not just the hook in isolation above.
-TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
+TEST(CASProbe, MissingSingleAttemptClientFailsCapabilityProbe)
 {
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     /// Native mode passes the key to the object storage verbatim, so the probe prefix must be anchored
@@ -169,7 +169,7 @@ TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
 
 /// Mirrors PoolPreconditionsFireThroughInstrumentedWrapper: the real mount path wraps the backend in
 /// InstrumentedBackend BEFORE calling runCapabilityProbe, so this check must fire through it too.
-TEST(CasProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
+TEST(CASProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
 {
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
     auto inner = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
@@ -292,7 +292,7 @@ private:
 /// site got past the gate: a probe that regressed to the hardcoded-Emulated construction would still
 /// pass (no throw) but under-count here by exactly one at each of the three sites, since the dialect
 /// gate would swallow that one call before `inner` ever saw it.
-TEST(CasProbe, WrongTokenAttemptsReachTheBackendPastTheDialectGate)
+TEST(CASProbe, WrongTokenAttemptsReachTheBackendPastTheDialectGate)
 {
     DialectGatedCountingBackend b;
     EXPECT_NO_THROW(runCapabilityProbe(b, "p/.cas_probe"));

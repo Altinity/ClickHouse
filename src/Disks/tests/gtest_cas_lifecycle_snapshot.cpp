@@ -76,7 +76,7 @@ void deleteKeyExact(DB::Cas::Backend & backend, const String & key)
 
 /// (a) Live: the snapshot reads `live` with no reason and no `since`, and always carries the disk's
 /// last-known identity (pool_id + server_root_id).
-TEST(CasLifecycleSnapshot, LiveIsTruthfulWithIdentity)
+TEST(CASLifecycleSnapshot, LiveIsTruthfulWithIdentity)
 {
     auto storage = openSnapshotStorage();
     commitOnePart(*storage);
@@ -95,7 +95,7 @@ TEST(CasLifecycleSnapshot, LiveIsTruthfulWithIdentity)
 /// non-auto-recovering `identity_lost` state with the [D5] detail present and `since` set. The enum-clean
 /// `reason` word is empty here — it carries only the `vanished` sub-state, and `identity_lost` is already
 /// fully named by the `lifecycle` column.
-TEST(CasLifecycleSnapshot, IdentityLostHasDetailAndSince)
+TEST(CASLifecycleSnapshot, IdentityLostHasDetailAndSince)
 {
     auto storage = openSnapshotStorage();
     commitOnePart(*storage);
@@ -116,7 +116,7 @@ TEST(CasLifecycleSnapshot, IdentityLostHasDetailAndSince)
 /// enum-clean `reason` word `forgotten` (so Task 14's `lifecycle || '(' || lifecycle_reason || ')'` reads
 /// EXACTLY `vanished(forgotten)`), the [D5] `detail` carrying the operator's decommission timestamp, `since`
 /// set, and the identity still present.
-TEST(CasLifecycleSnapshot, VanishedForgottenIsEnumCleanWithTimestampedDetail)
+TEST(CASLifecycleSnapshot, VanishedForgottenIsEnumCleanWithTimestampedDetail)
 {
     auto storage = openSnapshotStorage();
     commitOnePart(*storage);
@@ -139,7 +139,7 @@ TEST(CasLifecycleSnapshot, VanishedForgottenIsEnumCleanWithTimestampedDetail)
 
 /// (d) A null pool never crashes the accessor and reports the storage-level lifecycle: `constructing`
 /// before the first startup, `shutdown` after teardown. reason/since stay empty/0 (no terminal cause).
-TEST(CasLifecycleSnapshot, NullPoolReportsConstructingThenShutdown)
+TEST(CASLifecycleSnapshot, NullPoolReportsConstructingThenShutdown)
 {
     auto settings = Cas::tests::makeSettingsForTest(
         kSrid, std::filesystem::temp_directory_path() / "ca_snapshot_null_scratch");
@@ -167,7 +167,7 @@ TEST(CasLifecycleSnapshot, NullPoolReportsConstructingThenShutdown)
 /// (e) The accessor is I/O-free (spec §1 Factory class): NO backend op runs, in any lifecycle state. Proven
 /// against a `CountingBackend` — the totals recorded after open do not move across snapshot reads, whether
 /// the pool is Live or forced terminal.
-TEST(CasLifecycleSnapshot, PerformsZeroBackendOps)
+TEST(CASLifecycleSnapshot, PerformsZeroBackendOps)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -201,7 +201,7 @@ TEST(CasLifecycleSnapshot, PerformsZeroBackendOps)
 /// (f) A NATURAL transition (not the forced setter) captures the detail + `since`, and the snapshot's detail
 /// is EXACTLY the [D5] text `throwIfLifecycleTerminal` throws (minus the pool-name prefix) — the spec §1
 /// "same reason strings in the snapshot and the error" guarantee, so the two can never drift.
-TEST(CasLifecycleSnapshot, NaturalIdentityLostMatchesThrowDetail)
+TEST(CASLifecycleSnapshot, NaturalIdentityLostMatchesThrowDetail)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);

@@ -203,7 +203,7 @@ void armOneShotInstallFailure(const PoolPtr & store)
 /// reaches it is RECORDED: the tail counter advances exactly once per install, and the ref resolves.
 /// The equality is the point -- it is the invariant the old code could break, since there the install
 /// was an allocating apply that could throw between the durable `PUT` and the counter bump.
-TEST(CasRefInstallSafety, PostDurableInstallIsAllocationFree)
+TEST(CASRefInstallSafety, PostDurableInstallIsAllocationFree)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -241,7 +241,7 @@ TEST(CasRefInstallSafety, PostDurableInstallIsAllocationFree)
 /// `Mode::Unresolved` deliberately lands NOTHING, so this test also pins the other half of the wedge
 /// contract: an ambiguous outcome wedges even when the object turns out never to have existed. The tail
 /// counter must NOT advance -- an unproven transaction is not a recorded one.
-TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
+TEST(CASRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -291,7 +291,7 @@ TEST(CasRefInstallSafety, UnresolvedAlwaysRecordsTheWedge)
 /// No fault injection anywhere in this test, deliberately: the ZERO ref-log I/O assertion below is the
 /// direct proof that nothing was sent, and it would be meaningless if a fault backend were swallowing
 /// the request.
-TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
+TEST(CASRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPoolFenceControlled(backend);
@@ -350,7 +350,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalDoesNotWedgeTheLane)
 /// converted a resolvable wedge into a recorded transaction, and the old code immediately re-wedged the
 /// lane over an id whose object was never written -- turning a wedge that WOULD have cleared into one
 /// that never can.
-TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneClean)
+TEST(CASRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneClean)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolFenceControlled(backend);
@@ -405,7 +405,7 @@ TEST(CasRefInstallSafety, PreAttemptRefusalAfterAWedgeResolutionLeavesTheLaneCle
 /// pass by the fix having weakened the wedge generally. Same flush shape (resolve a durable wedge, then
 /// commit a new chunk), except the new chunk's PUT is genuinely ambiguous: an attempt WAS sent, so the
 /// lane must wedge again, now over the NEW transaction.
-TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
+TEST(CASRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolFenceControlled(backend);
@@ -456,7 +456,7 @@ TEST(CasRefInstallSafety, AmbiguousChunkAfterAWedgeResolutionRewedgesTheLane)
 /// if that diagnostic is ever suppressed. Both directions fail closed; neither can widen the allow-list
 /// by omission. The `static_assert`s make the mapping a compile-time fact, and the `EXPECT`s repeat it
 /// so a break names the offending value in the test report.
-TEST(CasRefInstallSafety, OnlyNoAttemptSentMaySkipTheWedge)
+TEST(CASRefInstallSafety, OnlyNoAttemptSentMaySkipTheWedge)
 {
     static_assert(unresolvedProvesNothingWasSent(CasUnresolvedReason::NoAttemptSent));
     static_assert(!unresolvedProvesNothingWasSent(CasUnresolvedReason::NotUnresolved));
@@ -493,7 +493,7 @@ TEST(CasRefInstallSafety, OnlyNoAttemptSentMaySkipTheWedge)
 /// object landed but whose acknowledgement -- and whose immediate verification read -- were both lost,
 /// then a second append whose flush resolves it. The tail counter is the "exactly once" witness: it is
 /// bumped once per install, so a re-applied transaction shows up as one extra.
-TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
+TEST(CASRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -549,7 +549,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallsExactlyOnce)
 /// construction (`Exception.cpp`) — death is the only observable outcome, and a throw-only variant is
 /// dead code.
 #if defined(MEMORY_TRACKER_DEBUG_CHECKS)
-TEST(CasRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
+TEST(CASRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
 {
     EXPECT_DEATH(
         {
@@ -566,7 +566,7 @@ TEST(CasRefInstallSafetyDeathTest, DenyGuardStopsAnAllocation)
 /// part 1 this assertion is immune to how a build type renders a `LOGICAL_ERROR`. Together the two
 /// parts give what a single death test was meant to give, and a failure now names WHICH half broke:
 /// "the guard does not fire" versus "the install region is never reached / not armed".
-TEST(CasRefInstallSafety, InstallRegionProbeIsInvokedAndTheGuardIsArmed)
+TEST(CASRefInstallSafety, InstallRegionProbeIsInvokedAndTheGuardIsArmed)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -596,7 +596,7 @@ TEST(CasRefInstallSafety, InstallRegionProbeIsInvokedAndTheGuardIsArmed)
 /// ===================================================================================
 
 /// The exact attempt is visible as `Writing` after durability and before installation.
-TEST(CasRefInstallSafety, WritingOwnsTheAttemptUntilInstall)
+TEST(CASRefInstallSafety, WritingOwnsTheAttemptUntilInstall)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -629,7 +629,7 @@ TEST(CasRefInstallSafety, WritingOwnsTheAttemptUntilInstall)
 }
 
 /// Ambiguity transfers the same exact attempt from `Writing` to `Wedged`.
-TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
+TEST(CASRefInstallSafety, UnresolvedTransfersWritingToWedged)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -651,7 +651,7 @@ TEST(CasRefInstallSafety, UnresolvedTransfersWritingToWedged)
 }
 
 /// Durable resolution installs the attempt and returns the lane to `Ready`.
-TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
+TEST(CASRefInstallSafety, WedgeResolutionReturnsReady)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -682,7 +682,7 @@ TEST(CasRefInstallSafety, WedgeResolutionReturnsReady)
 }
 
 /// A foreign occupant is a terminal `Faulted` verdict.
-TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
+TEST(CASRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -706,7 +706,7 @@ TEST(CasRefInstallSafety, ConclusiveForeignConflictFaultsTheLane)
 /// `DefiniteFailure` proves nothing became durable and returns the lane to `Ready`. Needs S3 error
 /// classification: that is the only exception family
 /// `classifyConditionalWriteResult` will ever call definite (everything else is fail-safe Unresolved).
-TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
+TEST(CASRefInstallSafety, DefiniteFailureReturnsReady)
 {
 #if !USE_AWS_S3
     GTEST_SKIP() << "DefiniteFailure classification requires S3 error types (USE_AWS_S3 off)";
@@ -740,8 +740,8 @@ TEST(CasRefInstallSafety, DefiniteFailureReturnsReady)
 /// to abort the server), where it used to raise the process-aborting `LOGICAL_ERROR` and this test had
 /// to be release-only with a death-test twin standing in. The marker is cleared BEFORE the anomaly
 /// reaction, which is what this test pins; the fence/audit half is
-/// `CasAnomalyPolicy.ForeignBytesAtWedgeKeyTripFenceAndRemount`'s.
-TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
+/// `CASAnomalyPolicy.ForeignBytesAtWedgeKeyTripFenceAndRemount`'s.
+TEST(CASRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -778,7 +778,7 @@ TEST(CasRefInstallSafety, WedgeResolutionProvenForeignFaultsTheLane)
 /// in production with §A1 landed -- the region allocates nothing -- so the probe seam simulates the
 /// post-durable failure. The transaction is durable at that point, but the runtime has not installed it:
 /// exactly the condition that `NeedsRecovery` names.
-TEST(CasRefInstallSafety, PostDurableInstallFailureRequiresRecovery)
+TEST(CASRefInstallSafety, PostDurableInstallFailureRequiresRecovery)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -802,7 +802,7 @@ TEST(CasRefInstallSafety, PostDurableInstallFailureRequiresRecovery)
 /// one region over: the resolving GET already PROVED the object durable, so an install that does not
 /// complete there leaves the same missing transaction -- and the wedge survives, because the swap that
 /// would have cleared it is in the same region that threw.
-TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
+TEST(CASRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -833,7 +833,7 @@ TEST(CasRefInstallSafety, WedgeResolutionInstallFailureRequiresRecovery)
 
 /// A later append may proceed only after the top-of-flush recovery has replayed the known-durable
 /// transaction and returned the lane to `Ready`.
-TEST(CasRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
+TEST(CASRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPool(backend);
@@ -884,7 +884,7 @@ TEST(CasRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
 /// The fix is the same discipline the wedge itself uses: record the intent BEFORE the ambiguous
 /// operation. Both assertions below fail against the old code -- the body is gone, and the precommit is
 /// still live once the wedge resolves.
-TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
+TEST(CASRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
 {
     auto backend = std::make_shared<DB::Cas::tests::ChunkFaultBackend>();
     auto store = openPoolSingleAttempt(backend);
@@ -933,7 +933,7 @@ TEST(CasRefInstallSafety, UncertainPrecommitKeepsItsCleanupOwnerAndItsBody)
 /// true with the presence check this test pins). Here the append is refused BEFORE any request is sent,
 /// which is provably-nothing-durable, and yet the transaction has already recorded the intent -- so the
 /// removal it owes must resolve to a no-op rather than to `CORRUPTED_DATA`.
-TEST(CasRefInstallSafety, UncertainPrecommitThatNeverLandedStillAbandonsCleanly)
+TEST(CASRefInstallSafety, UncertainPrecommitThatNeverLandedStillAbandonsCleanly)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = openPoolFenceControlled(backend);

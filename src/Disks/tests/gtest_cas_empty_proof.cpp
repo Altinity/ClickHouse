@@ -142,7 +142,7 @@ ReadOnlyMount openReadOnlyOverBootstrappedBacking()
 /// never answer empty. Both mandatory authorities disappear; table enumeration observes the missing
 /// `cas/ref_catalog` first, so `CORRUPTED_DATA` takes precedence over the later `_pool_meta` empty-proof
 /// check. The pool-meta-only companion below keeps the typed 668 contract pinned separately.
-TEST(CasEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
+TEST(CASEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
 {
     auto mount = openReadOnlyOverBootstrappedBacking();
 
@@ -167,7 +167,7 @@ TEST(CasEmptyProof, ReadOnlyOverErasedBackingThrowsInsteadOfEmpty)
 /// intact — so the authoritative probe verdicts `KeyAbsent` instead. Both flavours must reach the SAME
 /// "backing may be erased" refusal (distinct from the transient "transport or permission fault" one), so a
 /// targeted deletion of just the identity object (a partial erase) is caught exactly like a whole-root wipe.
-TEST(CasEmptyProof, ReadOnlyWithOnlyPoolMetaDeletedThrowsErasedFlavoredOnKeyAbsent)
+TEST(CASEmptyProof, ReadOnlyWithOnlyPoolMetaDeletedThrowsErasedFlavoredOnKeyAbsent)
 {
     auto mount = openReadOnlyOverBootstrappedBacking();
 
@@ -194,7 +194,7 @@ TEST(CasEmptyProof, ReadOnlyWithOnlyPoolMetaDeletedThrowsErasedFlavoredOnKeyAbse
 
 /// (b) A Live pool over a genuinely-empty table dir with `_pool_meta` present answers empty AND issues
 /// EXACTLY ONE uncached sentinel probe -- and it happens on the empty (`isDirectoryEmpty` == true) path.
-TEST(CasEmptyProof, LiveEmptyTableDirAnswersEmptyWithExactlyOneProbe)
+TEST(CASEmptyProof, LiveEmptyTableDirAnswersEmptyWithExactlyOneProbe)
 {
     auto storage = openStorage();
 
@@ -210,7 +210,7 @@ TEST(CasEmptyProof, LiveEmptyTableDirAnswersEmptyWithExactlyOneProbe)
 }
 
 /// (c) The zero-cost hot path: a NON-empty table dir issues NO probe at all.
-TEST(CasEmptyProof, LiveNonEmptyTableDirIssuesNoProbe)
+TEST(CASEmptyProof, LiveNonEmptyTableDirIssuesNoProbe)
 {
     auto storage = openStorage();
     commitOnePart(*storage);
@@ -224,7 +224,7 @@ TEST(CasEmptyProof, LiveNonEmptyTableDirIssuesNoProbe)
 
 /// (d) A Vanished pool answers truth-empty WITHOUT any probe: `checkOpAdmitted`'s Probe -> TruthAbsent
 /// short-circuit answers before classification, so the terminal path never pays the empty-proof.
-TEST(CasEmptyProof, VanishedPoolAnswersTruthEmptyWithoutProbe)
+TEST(CASEmptyProof, VanishedPoolAnswersTruthEmptyWithoutProbe)
 {
     auto storage = openStorage();
     commitOnePart(*storage);
@@ -240,7 +240,7 @@ TEST(CasEmptyProof, VanishedPoolAnswersTruthEmptyWithoutProbe)
 }
 
 /// (e) Scope discipline: a deeper (non-root) part-dir enumeration that answers empty is NOT gated.
-TEST(CasEmptyProof, DeeperPartDirEmptyAnswerIsNotGated)
+TEST(CASEmptyProof, DeeperPartDirEmptyAnswerIsNotGated)
 {
     auto storage = openStorage();
 
@@ -256,7 +256,7 @@ TEST(CasEmptyProof, DeeperPartDirEmptyAnswerIsNotGated)
 /// refusal, never an empty answer. Unproven absence is unavailability, so the refusal carries the
 /// upstream-retryable class -- unlike the `KeyAbsent`/`ContainerAbsent` arm, where absence IS proven and
 /// the 668 stands. The fault is injected through the empty-proof override seam.
-TEST(CasEmptyProof, IndeterminateProbeThrowsTransientNeverEmpty)
+TEST(CASEmptyProof, IndeterminateProbeThrowsTransientNeverEmpty)
 {
     auto storage = openStorage();
     storage->setEmptyProofProbeOverrideForTest(

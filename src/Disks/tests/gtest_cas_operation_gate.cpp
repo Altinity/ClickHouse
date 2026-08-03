@@ -125,7 +125,7 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
 }
 
 /// (a) Probes on a Vanished disk answer the truth: absent/empty, WITHOUT reaching the pool.
-TEST(CasOperationGate, ProbesOnVanishedAnswerAbsentEmpty)
+TEST(CASOperationGate, ProbesOnVanishedAnswerAbsentEmpty)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -154,7 +154,7 @@ TEST(CasOperationGate, ProbesOnVanishedAnswerAbsentEmpty)
 
 /// (b) Removes on a Vanished disk are no-op SUCCESS and never touch the backend: after restoring Live the
 /// part is still there. This is what lets a vanished-disk table's DROP complete.
-TEST(CasOperationGate, RemovesOnVanishedAreNoOpSuccessBackendUntouched)
+TEST(CASOperationGate, RemovesOnVanishedAreNoOpSuccessBackendUntouched)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -184,7 +184,7 @@ TEST(CasOperationGate, RemovesOnVanishedAreNoOpSuccessBackendUntouched)
 
 /// (c) A content read on a Vanished disk throws the typed per-reason [D5] message -- the exact substring
 /// names the ACTUAL sub-state (replaced / forgotten), never a wrong diagnosis.
-TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
+TEST(CASOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -206,7 +206,7 @@ TEST(CasOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
 /// refusal its `isRetryableException` hatch does not recognise, so coding a blip 668 made healthy parts
 /// look corrupt (BACKLOG {#lease-blip-part-check-collapse};
 /// `docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md`).
-TEST(CasOperationGate, EveryClassThrowsRetryableTransientOnTransientNotLive)
+TEST(CASOperationGate, EveryClassThrowsRetryableTransientOnTransientNotLive)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -246,7 +246,7 @@ TEST(CasOperationGate, EveryClassThrowsRetryableTransientOnTransientNotLive)
 /// (`INVALID_STATE`) class and its own richer [D5] diagnosis ("identity lost … restart or FORGET").
 /// Nothing about the transient re-coding may leak here: a terminal state that read as retryable would
 /// make every consumer spin forever on a disk that will never come back.
-TEST(CasOperationGate, EveryClassThrows668OnIdentityLost)
+TEST(CASOperationGate, EveryClassThrows668OnIdentityLost)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -282,7 +282,7 @@ TEST(CasOperationGate, EveryClassThrows668OnIdentityLost)
 /// consults before declaring a part broken. A transient CA refusal must satisfy it (the part stays
 /// queued); a terminal one must not (the disk is genuinely unusable and must surface). Pinning the
 /// predicate rather than `NETWORK_ERROR` keeps this test meaningful if upstream's list ever moves.
-TEST(CasOperationGate, TransientRefusalIsUpstreamRetryableTerminalIsNot)
+TEST(CASOperationGate, TransientRefusalIsUpstreamRetryableTerminalIsNot)
 {
     {
         auto storage = openGateStorage();
@@ -307,7 +307,7 @@ TEST(CasOperationGate, TransientRefusalIsUpstreamRetryableTerminalIsNot)
 
 /// (e) `createTransaction` (Factory: I/O-free) and the capability/introspection getters construct fine on
 /// a Vanished disk -- so a vanished-disk table's DROP can allocate its removal transaction.
-TEST(CasOperationGate, FactoryClassWorksOnVanished)
+TEST(CASOperationGate, FactoryClassWorksOnVanished)
 {
     auto storage = openGateStorage();
     storage->store()->setLifecycleForTest(PoolLifecycle::VanishedForgotten);   /// one force from Live
@@ -321,7 +321,7 @@ TEST(CasOperationGate, FactoryClassWorksOnVanished)
 /// (f) `tryGetInManifestBytes` PROPAGATES the typed refusal — terminal 668 on a `Vanished` disk, the
 /// transient class in a lease gap — rather than converting either into a silent-absent `std::nullopt`
 /// (the narrowed catch). RED before the narrowing.
-TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
+TEST(CASOperationGate, TryGetInManifestBytesPropagatesTypedError)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -344,7 +344,7 @@ TEST(CasOperationGate, TryGetInManifestBytesPropagatesTypedError)
 /// pool is torn down (`shutdown()`) refuses EVERY class, `Probe` included, with `INVALID_STATE`
 /// ("not started") -- there is no benign-absent answer for a not-started disk; only a genuinely `Vanished`
 /// POOL answers truth-absent. Replaces the deleted `DormantDiskKeepsOldBenignAbsent_RemoveAtTask15`.
-TEST(CasOperationGate, NullPoolFailsLoudForEveryClass)
+TEST(CASOperationGate, NullPoolFailsLoudForEveryClass)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);
@@ -362,7 +362,7 @@ TEST(CasOperationGate, NullPoolFailsLoudForEveryClass)
 }
 
 /// (h) The raw GC round entry points refuse on a not-live pool (Admin class): typed [D5] reason once Vanished.
-TEST(CasOperationGate, GcEntryPointsRefuseOnNotLive)
+TEST(CASOperationGate, GcEntryPointsRefuseOnNotLive)
 {
     auto storage = openGateStorage();
     auto pool = storage->store();   /// captured while Live
@@ -376,7 +376,7 @@ TEST(CasOperationGate, GcEntryPointsRefuseOnNotLive)
 
 /// (i) `CasGcScheduler::isQuiescent` reflects the round-in-flight flag: a round in flight => not quiescent.
 /// (This is the join-completion signal the FORGET / GC-STOP tests rely on.)
-TEST(CasOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
+TEST(CASOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
 {
     auto backend = std::make_shared<Cas::InMemoryBackend>();
     auto pool = Cas::tests::openPoolForTest(backend);
@@ -397,7 +397,7 @@ TEST(CasOperationGate, GcSchedulerIsQuiescentReflectsRoundInFlight)
 /// continuous arc on the same pool. Closes the "access throws in the gap, auto-recovers, a Remove re-queues
 /// and drains" matrix row end-to-end (the per-table DROP re-queue itself is the MergeTree caller's job; the
 /// CAS contract is exactly this: refuse in the gap, admit after recovery).
-TEST(CasOperationGate, RemoveThrowsDuringTransientAndDrainsAfterRecovery)
+TEST(CASOperationGate, RemoveThrowsDuringTransientAndDrainsAfterRecovery)
 {
     auto storage = openGateStorage();
     commitOnePart(*storage);

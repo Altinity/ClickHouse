@@ -39,14 +39,14 @@ RefOp namespaceBirthOp()
 /// refLogTxnIsEpochSeal / refLogTxnIsRemovalClass classification
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, IsEpochSealTrueForSoleSealOp)
+TEST(CASRefEpochSealFormat, IsEpochSealTrueForSoleSealOp)
 {
     RefLogTxn txn;
     txn.ops.push_back(epochSealOp());
     EXPECT_TRUE(refLogTxnIsEpochSeal(txn));
 }
 
-TEST(CasRefEpochSealFormat, IsEpochSealFalseForSealPlusOtherOp)
+TEST(CASRefEpochSealFormat, IsEpochSealFalseForSealPlusOtherOp)
 {
     RefLogTxn txn;
     txn.ops.push_back(epochSealOp());
@@ -54,21 +54,21 @@ TEST(CasRefEpochSealFormat, IsEpochSealFalseForSealPlusOtherOp)
     EXPECT_FALSE(refLogTxnIsEpochSeal(txn));
 }
 
-TEST(CasRefEpochSealFormat, IsEpochSealFalseForNonSealOp)
+TEST(CASRefEpochSealFormat, IsEpochSealFalseForNonSealOp)
 {
     RefLogTxn txn;
     txn.ops.push_back(namespaceBirthOp());
     EXPECT_FALSE(refLogTxnIsEpochSeal(txn));
 }
 
-TEST(CasRefEpochSealFormat, IsEpochSealFalseForEmptyOps)
+TEST(CASRefEpochSealFormat, IsEpochSealFalseForEmptyOps)
 {
     RefLogTxn txn;
     EXPECT_FALSE(refLogTxnIsEpochSeal(txn));
 }
 
 /// Step 3's explicit regression note: an `EpochSeal`-only op vector is not removal-class.
-TEST(CasRefEpochSealFormat, RemovalClassIsFalseForEpochSeal)
+TEST(CASRefEpochSealFormat, RemovalClassIsFalseForEpochSeal)
 {
     std::vector<RefOp> ops{epochSealOp()};
     EXPECT_FALSE(refLogTxnIsRemovalClass(ops));
@@ -78,7 +78,7 @@ TEST(CasRefEpochSealFormat, RemovalClassIsFalseForEpochSeal)
 /// Round trip
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, RoundTripSealAtSequenceOneWithPrevEpochSeal)
+TEST(CASRefEpochSealFormat, RoundTripSealAtSequenceOneWithPrevEpochSeal)
 {
     /// An empty dead epoch (3) closes with a sequence-1 seal, which is therefore itself required to
     /// carry `prev_epoch_seal` chaining to the seal that closed epoch 2 (spec INV-2's grammar: required
@@ -98,7 +98,7 @@ TEST(CasRefEpochSealFormat, RoundTripSealAtSequenceOneWithPrevEpochSeal)
     EXPECT_EQ(decoded.ops[0].kind, RefOpKind::EpochSeal);
 }
 
-TEST(CasRefEpochSealFormat, RoundTripSealWithoutPrevEpochSeal)
+TEST(CASRefEpochSealFormat, RoundTripSealWithoutPrevEpochSeal)
 {
     /// The common case: epoch 2 had real records (greatest applied sequence 5), so its closing seal
     /// lands at sequence 6 -- not sequence 1 -- and therefore must NOT carry `prev_epoch_seal`.
@@ -115,7 +115,7 @@ TEST(CasRefEpochSealFormat, RoundTripSealWithoutPrevEpochSeal)
 
 /// A re-encode of a decoded seal transaction is byte-identical (the encoder is a pure function of the
 /// txn), matching the pin `gtest_cas_ref_log_format.cpp` keeps for the other op kinds.
-TEST(CasRefEpochSealFormat, ByteIdenticalReencodeWithPrevEpochSeal)
+TEST(CASRefEpochSealFormat, ByteIdenticalReencodeWithPrevEpochSeal)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -133,7 +133,7 @@ TEST(CasRefEpochSealFormat, ByteIdenticalReencodeWithPrevEpochSeal)
 /// Structural grammar (validateEpochSealGrammarStructural, via encode/decode -- context-free)
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, EncodeRejectsSealTxnWithTwoSealOps)
+TEST(CASRefEpochSealFormat, EncodeRejectsSealTxnWithTwoSealOps)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -143,7 +143,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsSealTxnWithTwoSealOps)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefEpochSealFormat, EncodeRejectsSealTxnWithSecondNonSealOp)
+TEST(CASRefEpochSealFormat, EncodeRejectsSealTxnWithSecondNonSealOp)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -157,7 +157,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsSealTxnWithSecondNonSealOp)
 /// produce a 2-op seal body, so only a decode-only splice proves `decodeRefLogTxn` independently
 /// re-derives the rule rather than trusting whatever the encoder produced -- deleting the structural
 /// validator's call site inside `decodeRefLogTxn` would leave this the only failing test.
-TEST(CasRefEpochSealFormat, DecodeRejectsSealTxnWithTwoOpsSpliced)
+TEST(CASRefEpochSealFormat, DecodeRejectsSealTxnWithTwoOpsSpliced)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -181,7 +181,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsSealTxnWithTwoOpsSpliced)
 
 /// Decode-side pin for the same op-count rule, with a DIFFERENT second op kind -- proves the rule
 /// rejects any companion op, not just a second `epoch_seal`.
-TEST(CasRefEpochSealFormat, DecodeRejectsSealTxnWithSecondNonSealOpSpliced)
+TEST(CASRefEpochSealFormat, DecodeRejectsSealTxnWithSecondNonSealOpSpliced)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -203,7 +203,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsSealTxnWithSecondNonSealOpSpliced)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(tampered, txn.ns, txn.txn_id); });
 }
 
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealAtNonUnitSequence)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealAtNonUnitSequence)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -216,7 +216,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealAtNonUnitSequence)
 /// Decode-side pin for the sequence-1-only rule (review finding I1). `prev_epoch_seal`'s
 /// writer_epoch (1) is strictly below the transaction's own (5), satisfying the I3 chain-direction
 /// rule, so this isolates the sequence-1 rule specifically rather than incidentally also tripping I3.
-TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
+TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -235,7 +235,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealAtNonUnitSequenceSpliced)
 
 /// Well-formedness (review finding M2): a zero component inside `prev_epoch_seal` is rejected the
 /// same way a zero component in the primary `txn_id` is (`checkRefTxnIdNonzero`, shared code path).
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroWriterEpoch)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroWriterEpoch)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -245,7 +245,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroWriterEpoch)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroRefSequence)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroRefSequence)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -258,7 +258,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealWithZeroRefSequence)
 /// Decode-side splice: `prev_epoch_seal` present as only one of its two wire fields ("!pse" without
 /// "!pss") -- a shape only reachable via corrupted bytes, since the encoder always writes both
 /// together. Boundary-plus-one for the additive-field decode contract (Constraint 7).
-TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
+TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -280,7 +280,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealMissingPssComponent)
 /// sequence-1 transaction in the next numeric epoch must name it. This remains context-free (a
 /// property of one transaction), so it belongs in the structural half; Tasks 2/6 walk this pointer
 /// backwards over untrusted decoded bodies and must not have to re-derive the rule themselves.
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtSameEpoch)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtSameEpoch)
 {
     /// Self-pointer: prev_epoch_seal names the SAME epoch this transaction is in.
     RefLogTxn txn;
@@ -291,7 +291,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtSameEpoch)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
 }
 
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtFutureEpoch)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtFutureEpoch)
 {
     /// Forward-pointer: prev_epoch_seal names an epoch AFTER this transaction's own.
     RefLogTxn txn;
@@ -305,7 +305,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealPointingAtFutureEpoch)
 /// INV-2 materializes every global writer epoch for an existing life.  A sequence-1 transaction in
 /// epoch E therefore chains to the seal of exactly E-1: accepting an older link would make an omitted
 /// epoch look like a proved boundary and let a fold bypass its missing seal.
-TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealSkippingImmediateEpoch)
+TEST(CASRefEpochSealFormat, EncodeRejectsPrevEpochSealSkippingImmediateEpoch)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -318,7 +318,7 @@ TEST(CasRefEpochSealFormat, EncodeRejectsPrevEpochSealSkippingImmediateEpoch)
 
 /// A damaged object bypasses the encoder, so the decoder must independently reject the same skipped
 /// link before any GC or recovery walker can treat it as boundary evidence.
-TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpliced)
+TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpliced)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -338,7 +338,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealSkippingImmediateEpochSpli
 /// Decode-side pin for the chain-direction rule (review finding I3): the encoder's own check would
 /// refuse to produce this shape (the two Encode* tests above pin that direction), so a splice into an
 /// otherwise-valid sequence-1 body proves decode re-derives the rule independently.
-TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpochSpliced)
+TEST(CASRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpochSpliced)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -360,7 +360,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsPrevEpochSealPointingAtSameOrFutureEpoc
 /// life_epoch values -- the writer-runtime call sites are wired by later tasks)
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, ContextualRejectsMissingPrevEpochSealWhenRequired)
+TEST(CASRefEpochSealFormat, ContextualRejectsMissingPrevEpochSealWhenRequired)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -370,7 +370,7 @@ TEST(CasRefEpochSealFormat, ContextualRejectsMissingPrevEpochSealWhenRequired)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { validateEpochSealGrammarContextual(txn, /*life_epoch=*/1); });
 }
 
-TEST(CasRefEpochSealFormat, ContextualRejectsPrevEpochSealWhenForbidden)
+TEST(CASRefEpochSealFormat, ContextualRejectsPrevEpochSealWhenForbidden)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -384,7 +384,7 @@ TEST(CasRefEpochSealFormat, ContextualRejectsPrevEpochSealWhenForbidden)
 
 /// codex r2 finding 2: "genesis" is per-namespace. A namespace first born at global epoch 5 (not
 /// epoch 1) appends {5, 1} with NO prev_epoch_seal -- that IS its genesis, not a transition.
-TEST(CasRefEpochSealFormat, ContextualAllowsGenesisBirthAboveEpochOneWithoutPrevEpochSeal)
+TEST(CASRefEpochSealFormat, ContextualAllowsGenesisBirthAboveEpochOneWithoutPrevEpochSeal)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -397,7 +397,7 @@ TEST(CasRefEpochSealFormat, ContextualAllowsGenesisBirthAboveEpochOneWithoutPrev
 /// site, which calls this on every txn it mints, including ordinary sequence->=2 transactions in a
 /// post-transition epoch that legitimately carry no `prev_epoch_seal`. Pinned on both sides of the
 /// life_epoch relation to prove the early return fires regardless of it.
-TEST(CasRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAboveLifeEpoch)
+TEST(CASRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAboveLifeEpoch)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -407,7 +407,7 @@ TEST(CasRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAboveLifeEpoch)
     EXPECT_NO_THROW(validateEpochSealGrammarContextual(txn, /*life_epoch=*/1));
 }
 
-TEST(CasRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAtOrBelowLifeEpoch)
+TEST(CASRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAtOrBelowLifeEpoch)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -429,7 +429,7 @@ TEST(CasRefEpochSealFormat, ContextualPassesThroughNonSequenceOneAtOrBelowLifeEp
 /// unrecognized `!`-prefixed key with `UNKNOWN_FORMAT_VERSION` (never a silent skip), so this pins
 /// the general mechanism the meta-line reader relies on to keep `!pse`/`!pss` safe against a decoder
 /// that doesn't (yet, or anymore) understand them.
-TEST(CasRefEpochSealFormat, DecodeRejectsUnknownCriticalKeyInMetaLine)
+TEST(CASRefEpochSealFormat, DecodeRejectsUnknownCriticalKeyInMetaLine)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -450,7 +450,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsUnknownCriticalKeyInMetaLine)
 /// Regression guard: existing unknown-op-word behavior stays intact after adding "epoch_seal"
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, DecodeRejectsUnknownOpWordRegressionGuard)
+TEST(CASRefEpochSealFormat, DecodeRejectsUnknownOpWordRegressionGuard)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -471,7 +471,7 @@ TEST(CasRefEpochSealFormat, DecodeRejectsUnknownOpWordRegressionGuard)
 /// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
 /// ===================================================================================
 
-TEST(CasRefEpochSealFormat, FormatBatteryEpochSeal)
+TEST(CASRefEpochSealFormat, FormatBatteryEpochSeal)
 {
     RefLogTxn txn;
     txn.ns = "ns";

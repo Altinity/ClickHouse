@@ -90,7 +90,7 @@ public:
 };
 }
 
-TEST(CasSemanticRefFixture, WrapperCreatesInitialRecoverableCheckpoint)
+TEST(CASSemanticRefFixture, WrapperCreatesInitialRecoverableCheckpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -109,7 +109,7 @@ TEST(CasSemanticRefFixture, WrapperCreatesInitialRecoverableCheckpoint)
     EXPECT_FALSE(ckpt->ckpt.last_epoch_seal.has_value());
 }
 
-TEST(CasSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
+TEST(CASSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -138,7 +138,7 @@ TEST(CasSemanticRefFixture, WrapperAdvancesCheckpointWithoutDiscardingSnapshot)
     EXPECT_FALSE(ckpt->ckpt.last_epoch_seal.has_value());
 }
 
-TEST(CasSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
+TEST(CASSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -158,7 +158,7 @@ TEST(CasSemanticRefFixture, CheckpointAdvanceRejectsNonMonotoneAndInvalidState)
     EXPECT_EQ(backend->get(invalid_key)->bytes, "not a checkpoint");
 }
 
-TEST(CasRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
+TEST(CASRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -176,7 +176,7 @@ TEST(CasRawRefFixture, RawLogWriteDoesNotCreateCheckpoint)
     EXPECT_FALSE(readCkpt(*backend, store->layout(), life).has_value());
 }
 
-TEST(CasRawRefFixture, ReplaceRecoverableCheckpointWritesTheSuppliedFullState)
+TEST(CASRawRefFixture, ReplaceRecoverableCheckpointWritesTheSuppliedFullState)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -205,7 +205,7 @@ TEST(CasRawRefFixture, ReplaceRecoverableCheckpointWritesTheSuppliedFullState)
     EXPECT_EQ(replaced->ckpt.last_epoch_seal, next.last_epoch_seal);
 }
 
-TEST(CasRawRefFixture, ReplaceRecoverableCheckpointRejectsStaleRegressiveAndWrongLife)
+TEST(CASRawRefFixture, ReplaceRecoverableCheckpointRejectsStaleRegressiveAndWrongLife)
 {
     auto backend = std::make_shared<CkptReplacementConflictBackend>();
     auto store = openPoolForTest(backend);
@@ -233,7 +233,7 @@ TEST(CasRawRefFixture, ReplaceRecoverableCheckpointRejectsStaleRegressiveAndWron
 }
 
 /// The owner-removed manifest body is deleted only after a full round (its decrement is sealed — #11).
-TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
+TEST(CASGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -251,7 +251,7 @@ TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
 }
 
 /// A publish racing the pass (in-degree restored) is SPARED, not deleted (#14).
-TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
+TEST(CASGcRecheck, PublishRacingFenceSparesBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -276,7 +276,7 @@ TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
 /// A genuinely unreferenced blob is deleted with its exact token (the single content-delete site). The
 /// delete is not one-round-after-drop: the entry condemns, graduates the round AFTER the condemning
 /// round (round-paced, unconditional), then the NEXT pass executes the exact-token delete.
-TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
+TEST(CASGcRecheck, UnreferencedBlobDeletedExactToken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -296,7 +296,7 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
 /// Task 5 (spec 2026-07-09 §raw-body-refinement, v3): GC writes the writer's freshness meta ALONGSIDE
 /// the unchanged ledger retire (RetiredEntry, body token) — the meta is the writer/promote gate's
 /// point-read signal (Task 3/4), not a replacement for the ledger or the exact-token body delete.
-TEST(CasGcRetire, CondemnWritesMetaCondemned)
+TEST(CASGcRetire, CondemnWritesMetaCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -318,7 +318,7 @@ TEST(CasGcRetire, CondemnWritesMetaCondemned)
 
 /// Task 5: the round's exact-token body delete drops the meta alongside it (advisory, no tombstone —
 /// an absent meta reads exactly like a Clean one for the writer's point-read gate).
-TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
+TEST(CASGcRetire, DeleteRemovesBodyAndMeta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -348,7 +348,7 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
 /// token, which a stale exact-token redelete then deletes (INV_NO_LOSS live-blob loss —
 /// `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`). The spare leaves the meta `Condemned`;
 /// ONLY a writer that displaces the body with a fresh incarnation token publishes `Clean`.
-TEST(CasGcRetire, SpareLeavesMetaCondemned)
+TEST(CASGcRetire, SpareLeavesMetaCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -426,7 +426,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
 /// (exactly the token a paused leader's `delete_pending` snapshot holds) and firing that exact
 /// `deleteExact` AFTER the surviving leader's spare and the writer's resurrect — the faithful destructive
 /// op, without a mid-round CAS-interrupt seam on the delete path (which the backend does not expose).
-TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
+TEST(CASGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -500,7 +500,7 @@ TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 /// after a condemned incarnation (hash, t0) is displaced by a verified copy-forward (fresh token t1)
 /// and the republished part's +1 lands, the listed (hash, t0) entry settles WITHOUT touching the new
 /// incarnation: its exact-token delete is a mismatch no-op and the entry drops; the blob survives at t1.
-TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
+TEST(CASGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -543,7 +543,7 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
 /// promote pre-pass runs (reachability-before-content, B188), so an abandoned real copy-forward
 /// is fully reclaimed by the pipeline (+1 spare -> reclaim -1 -> transition to zero -> fresh
 /// (hash, t1) entry -> exact delete). The raw shape pins the GC-side invariant in isolation.
-TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
+TEST(CASGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -581,7 +581,7 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 /// fold's (snap_generation, snap_attempt) together). Completion seals are a retired concept, so the durable
 /// index of the adopted round is the FOLD seal at (snap_generation, snap_attempt). Across rounds each
 /// `runRegularRound` re-acquires the lease (bumping `lease.seq`), so a later round mints a FRESH attempt.
-TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
+TEST(CASGcRecheck, CompletionInheritsFoldAttempt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -616,7 +616,7 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
 /// A regular round performs NO writes to the ref objects: ref state is writer-owned (immutable
 /// `_log`/`_snap`), and GC only reads it (plus deletes covered objects via ref-object cleanup, which
 /// needs a covering snapshot -- none exists here). So a no-op round adds and removes NO ref object.
-TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
+TEST(CASGcAckFloor, NoOpRoundDoesNotMutateRefShards)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -658,7 +658,7 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
 /// AFTER THAT executes the exact-token delete and the blob becomes absent. This pins the critical
 /// off-by-one: current_round MUST equal state.round + 1 (the SAME basis condemn_round is stamped at),
 /// so an entry graduates exactly one round after it was condemned — never the same round, never never.
-TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
+TEST(CASGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -710,8 +710,8 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 /// End-to-end through the real round driver (`Gc::runRegularRound`) rather than
 /// `foldDeltasIntoGeneration` directly: a cohort well past `gc_round_redelete_budget` still drains
 /// completely, but no single round's `redeleted` count exceeds the cap — the same convergence the
-/// merge-level `CasThreeCursorMerge` budget tests pin, proven through the production entry point.
-TEST(CasGcAckFloor, RedeleteBudgetCapsRoundDrainAndConverges)
+/// merge-level `CASThreeCursorMerge` budget tests pin, proven through the production entry point.
+TEST(CASGcAckFloor, RedeleteBudgetCapsRoundDrainAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     constexpr uint64_t kCap = 5;
@@ -770,7 +770,7 @@ TEST(CasGcAckFloor, RedeleteBudgetCapsRoundDrainAndConverges)
 
 /// A publish re-referencing the condemned blob before graduation is folded and SPARES the entry: the entry
 /// is dropped (recovery wins even past graduation) and the blob survives.
-TEST(CasGcAckFloor, PublishBeforeGraduationSpares)
+TEST(CASGcAckFloor, PublishBeforeGraduationSpares)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -821,7 +821,7 @@ TEST(CasGcAckFloor, PublishBeforeGraduationSpares)
 /// (persistent) `mono_ms_fn` across two rounds: round 1 seeds the observation for both mounts; the
 /// STORE's own mount is then renewed (as a live leader would) before round 2 crosses the threshold —
 /// srid2, never renewed again after its one-shot claim, is the one that gets fenced.
-TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
+TEST(CASGcAckFloor, ExpiredMountFencedOutAndExcluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -907,7 +907,7 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
 /// an explicit `mono_ms_fn` -- exercising the DEFAULT under test. If the default still read the real
 /// wall clock, this round would see essentially zero elapsed mono time and never cross the fence-out
 /// threshold; the fix makes it default to `store->bootMsNow()`, which tracks the SAME fake clock.
-TEST(CasGcAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
+TEST(CASGcAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t fake_boot = 0;
@@ -944,7 +944,7 @@ TEST(CasGcAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 /// deleteExact against a blob the writer RECREATED (fresh incarnation, different token) between the pending
 /// publish and the deleting pass lands TokenMismatch — a terminal-OK outcome recorded as a replace: the
 /// fresh incarnation is a live object and survives. report.replaced counts it.
-TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
+TEST(CASGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -992,7 +992,7 @@ TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 /// and the round still completes. We model the crash-after-delete-before-CAS replay by manually deleting
 /// the pending blob (its exact token) BEFORE the deleting pass, then asserting the pass reports the delete
 /// as absent (report.absent == 1) and completes (round advances).
-TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
+TEST(CASGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1050,7 +1050,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 /// (`TokenMismatchOnAbsentBackend` reproduces it deterministically). The redelete site must disambiguate
 /// via a follow-up HEAD: the object is truly gone, so the outcome must settle as Absent (never Replaced)
 /// and the `.meta` cleanup (gated on Deleted/NotFound) must still run.
-TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
+TEST(CASGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
 {
     auto backend = std::make_shared<TokenMismatchOnAbsentBackend>();
     auto store = openPoolForTest(backend);
@@ -1123,7 +1123,7 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
 /// A condemned entry whose marker write was swallowed must be CARRIED round after round — never
 /// graduated, never deleted — until durable `Condemned` evidence exists. Once the backend heals, the
 /// carry-time marker retry lands and the normal two-phase pipeline reclaims the blob (delay, not a leak).
-TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
+TEST(CASGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 {
     auto backend = std::make_shared<MetaWriteFaultBackend>();
     auto store = openPoolForTest(backend);
@@ -1174,7 +1174,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 /// The healthy-path counterpart: with the condemn-time marker write landing normally, the gate must not
 /// change the canonical schedule — condemned at round K, graduated (delete_pending) at K+1, deleted at
 /// K+2 — and the durable Condemned marker exists from the condemning round on.
-TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
+TEST(CASGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1219,7 +1219,7 @@ TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
 /// re-check: the durable `Condemned` meta observed now is sufficient evidence on its own, with no
 /// in-process (hash, token) confirmation available at all. This proves the fallback branch -- not just
 /// the in-process registry -- authorizes the delete.
-TEST(CasGcCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
+TEST(CASGcCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

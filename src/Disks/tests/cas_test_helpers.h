@@ -131,10 +131,9 @@ void expectThrowsCode(int expected_code, F && fn)
 /// Build a `LocalObjectStorage` rooted at a fresh, unique temporary directory (one per call).
 ///
 /// Used by the unit tests that exercise the `Cas::Backend` seam against a real on-disk object storage
-/// (the `EmulatedSingleProcess` adapter mode and the capability probe). The construction mirrors the
-/// existing PoC gtest `gtest_content_addressed_metadata.cpp`: for `LocalObjectStorage` the object key
-/// IS the local path verbatim, so the unique root keeps every test instance isolated even under the
-/// parallel gtest runner.
+/// (the `EmulatedSingleProcess` adapter mode and the capability probe). For `LocalObjectStorage` the
+/// object key IS the local path verbatim, so the unique root keeps every test instance isolated even
+/// under the parallel gtest runner.
 inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
 {
     static std::atomic<uint64_t> counter{0};

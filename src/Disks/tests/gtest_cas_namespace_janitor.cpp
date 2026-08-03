@@ -174,7 +174,7 @@ NamespaceLifeId life(const char * name, uint64_t id)
 
 }
 
-TEST(CasNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut)
+TEST(CASNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -199,7 +199,7 @@ TEST(CasNamespaceJanitor, DeletesDeadFilesAndCheckpointFromOnePostListCatalogCut
     EXPECT_EQ(readGcMaintenanceState(backend, layout).state, GcMaintenanceState{});
 }
 
-TEST(CasNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
+TEST(CASNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -221,7 +221,7 @@ TEST(CasNamespaceJanitor, RetainsEveryCurrentLifecycleAndSuppressesAmbiguousCut)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
-TEST(CasNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
+TEST(CASNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -251,7 +251,7 @@ TEST(CasNamespaceJanitor, CatalogFirstCreatingRetainsEveryObjectOfTheNewLife)
     EXPECT_TRUE(backend.get(file));
 }
 
-TEST(CasNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLifecycle)
+TEST(CASNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLifecycle)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -277,7 +277,7 @@ TEST(CasNamespaceJanitor, CancelledCreatingCheckpointIsReclaimedThroughPublicLif
     EXPECT_FALSE(backend.get(ckpt));
 }
 
-TEST(CasNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
+TEST(CASNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -301,7 +301,7 @@ TEST(CasNamespaceJanitor, SuppressionAndFenceLossDeleteNothing)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
-TEST(CasNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
+TEST(CASNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -326,7 +326,7 @@ TEST(CasNamespaceJanitor, FenceLossOnRetainedOnlyPageDoesNotAdvanceCursor)
         << "a tenure that observes fence loss cannot publish progress even when every object was retained";
 }
 
-TEST(CasNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBackDelete)
+TEST(CASNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBackDelete)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -347,7 +347,7 @@ TEST(CasNamespaceJanitor, FenceLossAfterLastDeleteRetainsCursorWithoutRollingBac
         << "losing the fence after the delete keeps this page selected for an idempotent retry";
 }
 
-TEST(CasNamespaceJanitor, CursorResumesThenResetsAtEnd)
+TEST(CASNamespaceJanitor, CursorResumesThenResetsAtEnd)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -367,7 +367,7 @@ TEST(CasNamespaceJanitor, CursorResumesThenResetsAtEnd)
     EXPECT_TRUE(readGcMaintenanceState(backend, layout).state->janitor_cursor.empty());
 }
 
-TEST(CasNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalformedKey)
+TEST(CASNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalformedKey)
 {
     OrderedJanitorBackend backend;
     const Layout layout("p");
@@ -393,7 +393,7 @@ TEST(CasNamespaceJanitor, TakesOneCatalogCutAfterListingAndContinuesPastMalforme
     EXPECT_EQ(backend.getCount(layout.refCatalogKey()), 1u);
 }
 
-TEST(CasNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
+TEST(CASNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -417,7 +417,7 @@ TEST(CasNamespaceJanitor, MalformedKeyIsFinalAndAdvancesCursor)
         << "malformed keys are surfaced and skipped, but do not pin the cleanup cycle";
 }
 
-TEST(CasNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
+TEST(CASNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
 {
     CountingBackend backend;
     const Layout layout("p");
@@ -439,7 +439,7 @@ TEST(CasNamespaceJanitor, DuplicateCurrentLifeSuppressesWholePage)
         << "an ambiguous catalog cut leaves the selected page undecided for an authoritative retry";
 }
 
-TEST(CasNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmittedCycleRetries)
+TEST(CASNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmittedCycleRetries)
 {
     OmitFirstNamespacePageBackend backend;
     const Layout layout("p");
@@ -456,7 +456,7 @@ TEST(CasNamespaceJanitor, CorruptProgressResetsWithoutDeletingAndFilesOnlyOmitte
     EXPECT_FALSE(backend.get(dead));
 }
 
-TEST(CasNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
+TEST(CASNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
 {
     ReplaceBeforeJanitorDeleteBackend backend;
     const Layout layout("p");
@@ -477,7 +477,7 @@ TEST(CasNamespaceJanitor, ExactTokenMismatchRetainsConcurrentReplacement)
         << "an exact-token mismatch retains the rewrite but completes this page's decision";
 }
 
-TEST(CasNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement)
+TEST(CASNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacement)
 {
     TokenlessListBackend backend;
     const Layout layout("p");
@@ -508,7 +508,7 @@ TEST(CasNamespaceJanitor, TokenlessListHeadsDeadKeysAndRetainsConcurrentReplacem
     EXPECT_EQ(backend.deleteCount(raced_key), 1u);
 }
 
-TEST(CasNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
+TEST(CASNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
 {
     FenceLossDuringHeadBackend backend;
     const Layout layout("p");
@@ -526,7 +526,7 @@ TEST(CasNamespaceJanitor, TokenlessListRechecksFenceAfterHeadBeforeDelete)
     EXPECT_TRUE(backend.get(dead_key));
 }
 
-TEST(CasNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet)
+TEST(CASNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet)
 {
     const auto created = life("created", 121);
     CatalogAfterListBackend backend(created);
@@ -545,7 +545,7 @@ TEST(CasNamespaceJanitor, PostListCatalogCutProtectsConcurrentCreationWithOneGet
     EXPECT_TRUE(backend.get(second));
 }
 
-TEST(CasNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
+TEST(CASNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
 {
     RejectCursorBackend backend;
     const Layout layout("p");
@@ -560,7 +560,7 @@ TEST(CasNamespaceJanitor, BackendRejectedCursorResetsExactlyAndDeletesNothing)
     EXPECT_TRUE(readGcMaintenanceState(backend, layout).state->janitor_cursor.empty());
 }
 
-TEST(CasNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
+TEST(CASNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
 {
     FailMaintenancePublicationBackend backend;
     const Layout layout("p");
@@ -574,7 +574,7 @@ TEST(CasNamespaceJanitor, CursorPublicationFailureIsLeakOnly)
     EXPECT_FALSE(backend.get(dead));
 }
 
-TEST(CasNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
+TEST(CASNamespaceJanitorIntegration, RegularGcRoundDeletesDeadNamespaceBytes)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

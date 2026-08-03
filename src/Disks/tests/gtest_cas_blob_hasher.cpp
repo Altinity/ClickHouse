@@ -32,7 +32,7 @@ std::string makePayload(size_t size)
 
 }
 
-TEST(CasBlobHasher, Xxh3StreamingMatchesOneShotAndBlobHashHexOneShot)
+TEST(CASBlobHasher, Xxh3StreamingMatchesOneShotAndBlobHashHexOneShot)
 {
     const std::string payload = makePayload(10000);
 
@@ -74,7 +74,7 @@ TEST(CasBlobHasher, Xxh3StreamingMatchesOneShotAndBlobHashHexOneShot)
     EXPECT_EQ(blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload), one_shot_hex);
 }
 
-TEST(CasBlobHasher, CityHash128ByteIdenticalToHashingWriteBuffer)
+TEST(CASBlobHasher, CityHash128ByteIdenticalToHashingWriteBuffer)
 {
     /// Cover payloads both under and over one `DBMS_DEFAULT_HASHING_BLOCK_SIZE` (2048 B) hash block,
     /// plus exactly at the boundary, since the chunked convention only matters once a payload spans
@@ -118,7 +118,7 @@ TEST(CasBlobHasher, CityHash128ByteIdenticalToHashingWriteBuffer)
     }
 }
 
-TEST(CasBlobHasher, AlgoNameAndParseRoundTrip)
+TEST(CASBlobHasher, AlgoNameAndParseRoundTrip)
 {
     EXPECT_EQ(blobHashAlgoName(BlobHashAlgo::CityHash128), "ch128");
     EXPECT_EQ(blobHashAlgoName(BlobHashAlgo::XXH3_128), "xxh3");
@@ -134,7 +134,7 @@ TEST(CasBlobHasher, AlgoNameAndParseRoundTrip)
     EXPECT_THROW(parseBlobHashAlgo(""), DB::Exception);
 }
 
-TEST(CasBlobHasher, Sha256OneShotGoldenVectors)
+TEST(CASBlobHasher, Sha256OneShotGoldenVectors)
 {
     /// NIST/FIPS 180-2 test vectors, the standard SHA-256 sanity check.
     EXPECT_EQ(blobHashHexOneShot(BlobHashAlgo::Sha256, "abc"),
@@ -143,7 +143,7 @@ TEST(CasBlobHasher, Sha256OneShotGoldenVectors)
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
 }
 
-TEST(CasBlobHasher, Sha256StreamingMatchesOneShotAndIsPassthrough)
+TEST(CASBlobHasher, Sha256StreamingMatchesOneShotAndIsPassthrough)
 {
     /// Bigger than `DBMS_DEFAULT_HASHING_BLOCK_SIZE` (2048 B) so the payload chunks through several
     /// `nextImpl` flushes, not just a single call.

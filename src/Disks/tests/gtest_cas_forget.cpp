@@ -209,7 +209,7 @@ std::string raceForgetIntoGcVerbWindow(ContentAddressedMetadataStorage & storage
 
 /// (a) FORGET on a LIVE pool: the local fence is tripped, the injected GC-stop step runs, the pool settles
 /// `Vanished(forgotten)`, and store-class access fails loud with the timestamped [D5] message.
-TEST(CasForget, ForgetOnLivePoolTripsFenceAndVanishes)
+TEST(CASForget, ForgetOnLivePoolTripsFenceAndVanishes)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -238,7 +238,7 @@ TEST(CasForget, ForgetOnLivePoolTripsFenceAndVanishes)
 /// step). A long interval keeps any round from firing during the test window, so this isolates the
 /// thread-lifecycle: `start()` spawns the two workers, FORGET's callback `stop()`s + joins them, and the
 /// test completing (no hang) plus a clean `isQuiescent()` proves the join.
-TEST(CasForget, ForgetStopsAndJoinsRealGcScheduler)
+TEST(CASForget, ForgetStopsAndJoinsRealGcScheduler)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -262,7 +262,7 @@ TEST(CasForget, ForgetStopsAndJoinsRealGcScheduler)
 
 /// (c) Double FORGET is idempotent: the second call is a no-op (the pool is already `Vanished(forgotten)`),
 /// so it never re-runs the protocol — the GC-stop callback is NOT invoked again, and the first reason wins.
-TEST(CasForget, DoubleForgetIsIdempotent)
+TEST(CASForget, DoubleForgetIsIdempotent)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -285,7 +285,7 @@ TEST(CasForget, DoubleForgetIsIdempotent)
 
 /// (d) FORGET on an `IdentityLost` pool → `Vanished(forgotten)` — the escape hatch. `IdentityLost` is
 /// non-absorbing and has no benign answer, so FORGET is the operator's way out.
-TEST(CasForget, ForgetOnIdentityLostPoolVanishesForgotten)
+TEST(CASForget, ForgetOnIdentityLostPoolVanishesForgotten)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -309,7 +309,7 @@ TEST(CasForget, ForgetOnIdentityLostPoolVanishesForgotten)
 /// (a'') The clean-farewell is EARNED, never unconditional: on a drained pool FORGET stamps the mount lease
 /// with the terminated sentinel (`min_active == UINT64_MAX`) so a same-server restart reclaims immediately,
 /// but with an UNSETTLED (wedged) ref lane it must NOT — the lease is left to expire by observation.
-TEST(CasForget, ForgetCleanFarewellGatedOnDrain)
+TEST(CASForget, ForgetCleanFarewellGatedOnDrain)
 {
     using DB::Cas::decodeMountLease;
     constexpr uint64_t kTerminated = std::numeric_limits<uint64_t>::max();
@@ -354,7 +354,7 @@ TEST(CasForget, ForgetCleanFarewellGatedOnDrain)
 /// faulting backend keeps every attempt at `StayTransient` (it never reaches `armMountFence`), so this
 /// isolates the join/no-deadlock property; the fence re-arm path is covered by (b2) below. Uses a
 /// `std::future` timeout wait (never a sleep) — the timeout only fires on a genuine deadlock regression.
-TEST(CasForget, ForgetRacingActiveRemountThreadCompletesBounded)
+TEST(CASForget, ForgetRacingActiveRemountThreadCompletesBounded)
 {
     auto backend = std::make_shared<ToggleableTransportFaultBackend>();
     /// `background_watermark = true` so `scheduleRemount` actually spawns a recovery thread (mirrors
@@ -398,7 +398,7 @@ TEST(CasForget, ForgetRacingActiveRemountThreadCompletesBounded)
 /// fence, and `tryRemountOnce`'s step-0 gate checks `isVanished()` — still false in this window — so it does
 /// NOT bail. The re-arm therefore lands after trip#1 and before trip#2, exactly the interval trip#2 guards.
 /// Verified to go RED when trip#2 is removed (see task-10-report.md — test_task10b_reddemo.log).
-TEST(CasForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
+TEST(CASForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -424,7 +424,7 @@ TEST(CasForget, ForgetReLatchesFenceAfterAReclaimReachesArmMountFence)
 /// `Vanished(forgotten)` must win. We drive a REAL `tryRemountOnce` from FORGET's own GC-stop step (spec §5
 /// step 3/4, strictly AFTER the step-1 intent publish, BEFORE the step-6 settle), against a FOREIGN
 /// `_pool_meta` (the `Replaced` verdict), and assert the guard bailed.
-TEST(CasForget, ForgetIntentBlocksNaturalReplacedPromotion)
+TEST(CASForget, ForgetIntentBlocksNaturalReplacedPromotion)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -463,7 +463,7 @@ TEST(CasForget, ForgetIntentBlocksNaturalReplacedPromotion)
 /// (e) End-to-end through the verb entry `ContentAddressedMetadataStorage::forgetDisk` and the six-class
 /// gate: after FORGET, a Probe answers truth-absent, a Remove no-ops, and a content read throws the [D5]
 /// message with the REAL decommission timestamp produced by the handler.
-TEST(CasForget, ForgetEndToEndGatesTruthWithTimestampedMessage)
+TEST(CASForget, ForgetEndToEndGatesTruthWithTimestampedMessage)
 {
     auto storage = openForgetStorage();
     commitOnePart(*storage);
@@ -496,7 +496,7 @@ TEST(CasForget, ForgetEndToEndGatesTruthWithTimestampedMessage)
 /// admission→lock window while the FORGET thread drives the real teardown. The lasting-damage observable is
 /// `gcHealth()` staying empty: a resurrected scheduler (the pre-fix behavior) would make it non-empty.
 /// Verified RED against the pre-fix ordering (see task-17-report.md).
-TEST(CasForget, GcRunAdmittedWhileLiveRefusesAfterConcurrentForget)
+TEST(CASForget, GcRunAdmittedWhileLiveRefusesAfterConcurrentForget)
 {
     auto storage = openForgetStorage();
     /// Capture the pool while Live (store() is fail-closed once Vanished) to assert its terminal state after.
@@ -524,7 +524,7 @@ TEST(CasForget, GcRunAdmittedWhileLiveRefusesAfterConcurrentForget)
 /// the rebuild WHILE it holds the mutex; a FORGET launched in that window must NOT complete until the rebuild
 /// releases the lock. The pre-fix `runGcRebuildNow` took NO lock, so an in-flight rebuild was invisible to
 /// FORGET and FORGET would complete immediately. Verified RED against the pre-fix code (see task-17-report.md).
-TEST(CasForget, GcRebuildInFlightSerializesForget)
+TEST(CASForget, GcRebuildInFlightSerializesForget)
 {
     auto storage = openForgetStorage();
     auto pool = storage->store();   /// captured while Live

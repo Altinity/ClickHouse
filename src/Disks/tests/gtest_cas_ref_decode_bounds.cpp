@@ -54,7 +54,7 @@ RefOp paddedSetPublishedAtOp(size_t target_bytes)
 /// declared content size -- skipping compression must never also skip the size cap.
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasRefDecodeBounds, RawOverCapObjectRejected)
+TEST(CASRefDecodeBounds, RawOverCapObjectRejected)
 {
     const FormatTraits & t = traitsFor(FormatId::RefLog);
     ASSERT_NE(t.object_cap, 0u);
@@ -66,7 +66,7 @@ TEST(CasRefDecodeBounds, RawOverCapObjectRejected)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::RefLog, oversized); });
 }
 
-TEST(CasRefDecodeBounds, RawAtCapObjectAccepted)
+TEST(CASRefDecodeBounds, RawAtCapObjectAccepted)
 {
     /// The boundary itself must stay legal: exactly `object_cap` bytes, raw, still opens unchanged.
     const FormatTraits & t = traitsFor(FormatId::RefLog);
@@ -80,7 +80,7 @@ TEST(CasRefDecodeBounds, RawAtCapObjectAccepted)
 /// padding smuggled through an oversized raw body.
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasRefDecodeBounds, PaddedNormalTxnOver20MiBRejected)
+TEST(CASRefDecodeBounds, PaddedNormalTxnOver20MiBRejected)
 {
     RefLogTxn txn;
     txn.ns = "ns";
@@ -115,7 +115,7 @@ TEST(CasRefDecodeBounds, PaddedNormalTxnOver20MiBRejected)
 /// a release build must reject an over-cap encode, not silently persist it.
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CasRefDecodeBounds, WriterPostEncodeThrowIsRuntime)
+TEST(CASRefDecodeBounds, WriterPostEncodeThrowIsRuntime)
 {
     /// Constructed directly at the codec level -- bypassing the ledger's op-count admission gate
     /// (`ref_txn_max_ops`) -- so the transaction's total encoded size alone drives the outcome: the

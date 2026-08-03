@@ -286,7 +286,7 @@ def poll_unreachable_to_stable(unreachable_fn, *, timeout_s: float, interval_s: 
 
     The incremental, journal-driven GC's fixpoint is NOT unreachable==0: per the CA spec §8 it cannot
     reclaim "debris"/"drift" — e.g. blobs orphaned by a tree that is added-and-displaced within one
-    fold window, so its child-blob edges are never recorded (the gtest `CasGcLeak.
+    fold window, so its child-blob edges are never recorded (the gtest `CASGcLeak.
     DisplacedUnexpandedTreeBlobsLeak` documents this). The Full-GC mark-sweep (milestone M-F, NOT yet
     implemented, tracked as B140) is the documented backstop that drains this residual to 0. So the
     correct fixpoint of the CURRENTLY-IMPLEMENTED GC is the stable residual. This residual is NOT

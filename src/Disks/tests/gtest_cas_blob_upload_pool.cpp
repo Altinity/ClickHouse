@@ -48,10 +48,10 @@ void ensureBlobUploadPoolForTest(size_t size)
 
 /// `blobUploadPool()` on an uninitialized pool throws `LOGICAL_ERROR`, which aborts the whole
 /// process in debug/sanitizer builds instead of behaving like a catchable exception (see
-/// `handle_error_code` in `Common/Exception.cpp`) -- `CasBlobUploadPoolDeathTest` below proves the
+/// `handle_error_code` in `Common/Exception.cpp`) -- `CASBlobUploadPoolDeathTest` below proves the
 /// abort positively in those builds instead, following `gtest_cas_gc_state_format.cpp`'s pattern.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasBlobUploadPool, GetterThrowsBeforeInit)
+TEST(CASBlobUploadPool, GetterThrowsBeforeInit)
 {
     shutdownBlobUploadPool();
     EXPECT_FALSE(blobUploadPoolInitializedForTest());
@@ -60,7 +60,7 @@ TEST(CasBlobUploadPool, GetterThrowsBeforeInit)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasBlobUploadPoolDeathTest, GetterAbortsBeforeInit)
+TEST(CASBlobUploadPoolDeathTest, GetterAbortsBeforeInit)
 {
     shutdownBlobUploadPool();
     ASSERT_FALSE(blobUploadPoolInitializedForTest());
@@ -68,7 +68,7 @@ TEST(CasBlobUploadPoolDeathTest, GetterAbortsBeforeInit)
 }
 #endif
 
-TEST(CasBlobUploadPool, InitZeroRejected)
+TEST(CASBlobUploadPool, InitZeroRejected)
 {
     shutdownBlobUploadPool();
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [] { initializeBlobUploadPool(0); });
@@ -77,7 +77,7 @@ TEST(CasBlobUploadPool, InitZeroRejected)
     shutdownBlobUploadPool();
 }
 
-TEST(CasBlobUploadPool, InitThenGetWorks)
+TEST(CASBlobUploadPool, InitThenGetWorks)
 {
     shutdownBlobUploadPool();
     initializeBlobUploadPool(4);
@@ -95,7 +95,7 @@ TEST(CasBlobUploadPool, InitThenGetWorks)
 /// `initializeBlobUploadPool` call throws `LOGICAL_ERROR`, which aborts under
 /// `DEBUG_OR_SANITIZER_BUILD`.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasBlobUploadPool, DoubleInitThrows)
+TEST(CASBlobUploadPool, DoubleInitThrows)
 {
     shutdownBlobUploadPool();
     initializeBlobUploadPool(2);
@@ -105,7 +105,7 @@ TEST(CasBlobUploadPool, DoubleInitThrows)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasBlobUploadPoolDeathTest, DoubleInitAborts)
+TEST(CASBlobUploadPoolDeathTest, DoubleInitAborts)
 {
     shutdownBlobUploadPool();
     initializeBlobUploadPool(2);
@@ -114,7 +114,7 @@ TEST(CasBlobUploadPoolDeathTest, DoubleInitAborts)
 }
 #endif
 
-TEST(CasBlobUploadPool, ShutdownIdempotent)
+TEST(CASBlobUploadPool, ShutdownIdempotent)
 {
     /// Idempotent even when never initialized.
     shutdownBlobUploadPool();
@@ -128,7 +128,7 @@ TEST(CasBlobUploadPool, ShutdownIdempotent)
     EXPECT_FALSE(blobUploadPoolInitializedForTest());
 }
 
-TEST(CasBlobUploadPool, EnsureForTestHelperLazilyInitializes)
+TEST(CASBlobUploadPool, EnsureForTestHelperLazilyInitializes)
 {
     shutdownBlobUploadPool();
     EXPECT_FALSE(blobUploadPoolInitializedForTest());

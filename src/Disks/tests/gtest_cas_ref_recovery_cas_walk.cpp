@@ -499,7 +499,7 @@ CatalogEntry replaceCatalogLifeForTest(
 
 /// The durable stream is `{1,1} {1,2} {1,3}` while the backend hides the middle key from LIST.
 /// Recovery must make zero stream LIST requests and recover the same exact checkpoint range.
-TEST(CasRefRecoveryCasWalk, HiddenMiddleLogDoesNotAffectCheckpointRecovery)
+TEST(CASRefRecoveryCasWalk, HiddenMiddleLogDoesNotAffectCheckpointRecovery)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -525,7 +525,7 @@ TEST(CasRefRecoveryCasWalk, HiddenMiddleLogDoesNotAffectCheckpointRecovery)
 
 /// The same sentinel at the tail. A hidden tail key is still found by the bounded exact walk, not by a
 /// stream enumeration.
-TEST(CasRefRecoveryCasWalk, HiddenTailLogDoesNotAffectCheckpointRecovery)
+TEST(CASRefRecoveryCasWalk, HiddenTailLogDoesNotAffectCheckpointRecovery)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -549,7 +549,7 @@ TEST(CasRefRecoveryCasWalk, HiddenTailLogDoesNotAffectCheckpointRecovery)
 
 /// Hiding the checkpoint base snapshot from LIST cannot matter: the checkpoint names it, recovery
 /// exact-reads its matching non-seal log first, then exact-reads the snapshot.
-TEST(CasRefRecoveryCasWalk, CkptNamedBaseIsRecoveredWithoutStreamList)
+TEST(CASRefRecoveryCasWalk, CkptNamedBaseIsRecoveredWithoutStreamList)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -577,7 +577,7 @@ TEST(CasRefRecoveryCasWalk, CkptNamedBaseIsRecoveredWithoutStreamList)
     EXPECT_TRUE(refs.contains("c"));
 }
 
-TEST(CasRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption)
+TEST(CASRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -604,7 +604,7 @@ TEST(CasRefRecoveryCasWalk, MissingExactIdAtOrBelowCommittedFrontierIsCorruption
         << "an unchanged checkpoint makes the missing committed id corruption, not a shorter stream";
 }
 
-TEST(CasRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
+TEST(CASRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -634,7 +634,7 @@ TEST(CasRefRecoveryCasWalk, UncommittedSnapshotIsUnobservedWithoutStreamList)
         << "a physical snapshot not named by `_ckpt` cannot raise the recovered cut";
 }
 
-TEST(CasRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
+TEST(CASRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
 {
     const Layout layout("p");
     const RootNamespace ns{"srv1/list_equivalence"};
@@ -707,7 +707,7 @@ TEST(CasRefRecoveryCasWalk, ListingShapeDoesNotAffectCheckpointRecovery)
     EXPECT_TRUE(empty.contains("b"));
 }
 
-TEST(CasRefRecoveryCasWalk, PhantomListedSnapshotIsUnobserved)
+TEST(CASRefRecoveryCasWalk, PhantomListedSnapshotIsUnobserved)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -736,7 +736,7 @@ TEST(CasRefRecoveryCasWalk, PhantomListedSnapshotIsUnobserved)
     EXPECT_TRUE(refs.contains("b"));
 }
 
-TEST(CasRefRecoveryCasWalk, ListedFPlusTwoWithoutFPlusOneIsInertUncommittedDebris)
+TEST(CASRefRecoveryCasWalk, ListedFPlusTwoWithoutFPlusOneIsInertUncommittedDebris)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -756,7 +756,7 @@ TEST(CasRefRecoveryCasWalk, ListedFPlusTwoWithoutFPlusOneIsInertUncommittedDebri
     EXPECT_FALSE(refs.contains("debris"));
 }
 
-TEST(CasRefRecoveryCasWalk, DuplicateCatalogLifeIsCorruptionBeforeColdRuntimeAdmission)
+TEST(CASRefRecoveryCasWalk, DuplicateCatalogLifeIsCorruptionBeforeColdRuntimeAdmission)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -784,7 +784,7 @@ TEST(CasRefRecoveryCasWalk, DuplicateCatalogLifeIsCorruptionBeforeColdRuntimeAdm
     });
 }
 
-TEST(CasRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInstall)
+TEST(CASRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInstall)
 {
     auto backend = std::make_shared<AfterGetHookBackend>();
     const Layout layout("p");
@@ -818,7 +818,7 @@ TEST(CasRefRecoveryCasWalk, CheckpointAdvanceAfterLastLogProbeRestartsBeforeInst
         << "the final authority observation is recovery's linearization point";
 }
 
-TEST(CasRefRecoveryCasWalk, LiveCatalogLifeWithoutReadableCheckpointIsCorruption)
+TEST(CASRefRecoveryCasWalk, LiveCatalogLifeWithoutReadableCheckpointIsCorruption)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -837,7 +837,7 @@ TEST(CasRefRecoveryCasWalk, LiveCatalogLifeWithoutReadableCheckpointIsCorruption
 /// in a dense stream is corruption. Recovery exact-reads the checkpoint token once to distinguish a
 /// concurrently moved cut from durable-data loss, then FAILS CLOSED while that token is unchanged. It
 /// must never fold what it has: that is precisely how an acknowledged transaction disappears.
-TEST(CasRefRecoveryCasWalk, AbsentIdBelowADurableHigherIdFailsClosed)
+TEST(CASRefRecoveryCasWalk, AbsentIdBelowADurableHigherIdFailsClosed)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -862,7 +862,7 @@ TEST(CasRefRecoveryCasWalk, AbsentIdBelowADurableHigherIdFailsClosed)
 /// The ordinary case: one dead epoch, closed by OUR seal at `{E, T+1}` -- the exact key a dying
 /// predecessor's in-flight PUT would have taken, which is what makes the store's conditional create the
 /// fence (INV-2) rather than a detector after the fact.
-TEST(CasRefRecoveryCasWalk, DeadEpochIsClosedByOurOwnSealAtTPlusOne)
+TEST(CASRefRecoveryCasWalk, DeadEpochIsClosedByOurOwnSealAtTPlusOne)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -892,7 +892,7 @@ TEST(CasRefRecoveryCasWalk, DeadEpochIsClosedByOurOwnSealAtTPlusOne)
 /// A concurrent recoverer got there first. Its seal is already at `{E, T+1}`, so our conditional create
 /// loses -- and the right reaction is to ADOPT it, not to treat a peer's correct write as interference.
 /// The adopted seal is the same chain link ours would have been.
-TEST(CasRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
+TEST(CASRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
 {
     auto backend = std::make_shared<LateMaterializeBackend>();
     const Layout layout("p");
@@ -920,7 +920,7 @@ TEST(CasRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
 /// tail and before our seal. The rule is state-derived ids (INV-2): adopt the transaction, advance `T`
 /// by ONE, and re-seal at the NEW `T+1`. Never mint `T+2` around it -- that writes a hole into the
 /// durable stream that no later reader can tell from a lost object.
-TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlusOne)
+TEST(CASRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlusOne)
 {
     auto backend = std::make_shared<LateMaterializeBackend>();
     const Layout layout("p");
@@ -950,7 +950,7 @@ TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{1, 3}));
 }
 
-TEST(CasRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingPastIt)
+TEST(CASRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingPastIt)
 {
     struct Case
     {
@@ -1009,7 +1009,7 @@ TEST(CasRefRecoveryCasWalk, RecoveryPublishesEveryOccupiedObjectBeforeAdvancingP
 /// anomaly. Each empty epoch is closed by its own sequence-1 seal, and each carries the previous seal as
 /// its `prev_epoch_seal`: the chain is what makes a MISSING epoch detectable, which arithmetic within an
 /// epoch cannot do.
-TEST(CasRefRecoveryCasWalk, TwoBurnedEmptyEpochsProduceTwoChainedSequenceOneSeals)
+TEST(CASRefRecoveryCasWalk, TwoBurnedEmptyEpochsProduceTwoChainedSequenceOneSeals)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1044,7 +1044,7 @@ TEST(CasRefRecoveryCasWalk, TwoBurnedEmptyEpochsProduceTwoChainedSequenceOneSeal
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{3, 1}));
 }
 
-TEST(CasRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNextEpochSeal)
+TEST(CASRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNextEpochSeal)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1095,7 +1095,7 @@ TEST(CasRefRecoveryCasWalk, RecoveryPublishesEachCreatedSealBeforeCreatingTheNex
 /// A straggler is not an exception to the recovered-successor rule. When it materializes in the seal
 /// slot, recovery adopts it as the one object above its accepted checkpoint and must certify that exact
 /// frontier before it can create the following seal at the new `T+1`.
-TEST(CasRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingItsFollowingSeal)
+TEST(CASRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingItsFollowingSeal)
 {
     auto backend = std::make_shared<LateMaterializeBackend>();
     const Layout layout("p");
@@ -1143,7 +1143,7 @@ TEST(CasRefRecoveryCasWalk, RecoveryPublishesAnAdoptedStragglerBeforeCreatingIts
 /// and writes no phantom seals below it, and with no transition ever having happened it installs NO
 /// chain link -- `nullopt` means genesis and must mean it exactly, or the table's first transaction
 /// would be required to name a seal that never existed.
-TEST(CasRefRecoveryCasWalk, GenesisAtEpochFiveWritesNoPhantomSealsBelowLifeEpoch)
+TEST(CASRefRecoveryCasWalk, GenesisAtEpochFiveWritesNoPhantomSealsBelowLifeEpoch)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1174,7 +1174,7 @@ TEST(CasRefRecoveryCasWalk, GenesisAtEpochFiveWritesNoPhantomSealsBelowLifeEpoch
 /// admitted this work is gone. Nothing may be installed -- the recovered view belongs to a mount that no
 /// longer owns the namespace. The table stays unrecovered, and a retry under the CURRENT generation
 /// succeeds, which is what makes this a refusal rather than a wedge.
-TEST(CasRefRecoveryCasWalk, FenceBumpedMidWalkRefusesTheInstallAndTheRetrySucceeds)
+TEST(CASRefRecoveryCasWalk, FenceBumpedMidWalkRefusesTheInstallAndTheRetrySucceeds)
 {
     auto backend = std::make_shared<GetSeamBackend>();
     const Layout layout("p");
@@ -1204,7 +1204,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedMidWalkRefusesTheInstallAndTheRetrySuccee
     EXPECT_EQ(store->listRefs(ns).size(), 1u) << "the retry through the remounted runtime succeeds";
 }
 
-TEST(CasRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNothing)
+TEST(CASRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNothing)
 {
     auto backend = std::make_shared<GetSeamBackend>();
     const Layout layout("p");
@@ -1295,7 +1295,7 @@ TEST(CasRefRecoveryCasWalk, RetiredLifePausedInRealRecoveryIoWritesAndInstallsNo
 /// The seal is durable (it was written under a generation that was still valid), but the checkpoint must
 /// NOT advance and nothing may be installed. This is the seam a single "check the fence at entry" would
 /// miss entirely.
-TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoCheckpoint)
+TEST(CASRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoCheckpoint)
 {
     auto backend = std::make_shared<PutHookBackend>();
     const Layout layout("p");
@@ -1327,7 +1327,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterSlotOccupyBeforeCkptCasAdvancesNoChe
 /// merge is a semantic maximum, so the retry re-derives the same or a greater value), but the STATE must
 /// not be published: this runtime's view belongs to a dead incarnation. Today there is no such recheck
 /// at all -- that gap is the whole reason this test exists.
-TEST(CasRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState)
+TEST(CASRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState)
 {
     auto backend = std::make_shared<PutHookBackend>();
     const Layout layout("p");
@@ -1372,7 +1372,7 @@ TEST(CasRefRecoveryCasWalk, FenceBumpedAfterCkptCasBeforeInstallPublishesNoState
 /// Driven at a real I/O seam: recovery blocks inside a `get`, the remount barrier is invoked from
 /// another thread and must BLOCK, the recovery is released, acknowledges the cancellation, and only then
 /// does the barrier return.
-TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledgesCancellation)
+TEST(CASRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledgesCancellation)
 {
     auto backend = std::make_shared<GetSeamBackend>();
     const Layout layout("p");
@@ -1446,7 +1446,7 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
 }
 
 /// A `NeedsRecovery` lane replays the known-durable transaction before returning to `Ready`.
-TEST(CasRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
+TEST(CASRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout("p");
@@ -1514,7 +1514,7 @@ TEST(CasRefRecoveryCasWalk, NeedsRecoveryReplaysTheStrandedTxn)
         << "only a completed recovery install returns the lane to Ready";
 }
 
-TEST(CasRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAndPublishesItsFrontier)
+TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAndPublishesItsFrontier)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1558,7 +1558,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryAdoptsOneExactUnfrontieredSuccessorAnd
         << "the successor is not installable until the current admitted fence publishes its frontier";
 }
 
-TEST(CasRefRecoveryCasWalk, ColdWriterRecoveryPublishesOneExactUnfrontieredSuccessorBeforeSealing)
+TEST(CASRefRecoveryCasWalk, ColdWriterRecoveryPublishesOneExactUnfrontieredSuccessorBeforeSealing)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1587,7 +1587,7 @@ TEST(CasRefRecoveryCasWalk, ColdWriterRecoveryPublishesOneExactUnfrontieredSucce
     EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 3}));
 }
 
-TEST(CasRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochOnlyCheckpoint)
+TEST(CASRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochOnlyCheckpoint)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1633,7 +1633,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryAdoptsFirstCommittedTxnAboveLifeEpochO
     EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
 }
 
-TEST(CasRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPrivateCandidate)
+TEST(CASRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPrivateCandidate)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1678,7 +1678,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryRestartsWhenCheckpointAdvancesPastPriv
     EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, later.txn_id);
 }
 
-TEST(CasRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterExactCheckpointReread)
+TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterExactCheckpointReread)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1720,7 +1720,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryRejectsTwoUnfrontieredSuccessorsAfterE
         << "corruption must not launder either successor into the frontier";
 }
 
-TEST(CasRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheRetainedSuccessorSlot)
+TEST(CASRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheRetainedSuccessorSlot)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1743,7 +1743,7 @@ TEST(CasRefRecoveryCasWalk, WriterRecoveryRejectsDifferentOrdinaryBytesAtTheReta
     EXPECT_EQ(readCkpt(*backend, layout, life)->ckpt.committed_through, (RefTxnId{1, 1}));
 }
 
-TEST(CasRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorSeal)
+TEST(CASRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorSeal)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1779,7 +1779,7 @@ TEST(CasRefRecoveryCasWalk, RetainedOldWriterAttemptLosesConclusiveToASuccessorS
 /// state to guess about: recovery takes the transient-retry path and, once its budget is spent, fails
 /// closed with the table left unrecovered. Exposing a table whose dead epoch may or may not be closed is
 /// the one outcome that must be impossible.
-TEST(CasRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
+TEST(CASRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1818,7 +1818,7 @@ TEST(CasRefRecoveryCasWalk, UnresolvedSealSlotFailsClosedWithoutInstalling)
 /// exactly that slot. When the ghost's conditional create finally reaches the store there is nothing for
 /// it to do -- the key is write-once and taken. The old sentinel seal was a SNAPSHOT at a synthetic id,
 /// which left `{1,2}` free: the ghost landed, and all anyone could do was notice afterwards.
-TEST(CasRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStore)
+TEST(CASRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStore)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1851,7 +1851,7 @@ TEST(CasRefRecoveryCasWalk, ALatePredecessorPutAtTheSealedSlotIsRefusedByTheStor
 /// unknown. Recovery fails closed on it -- and, just as importantly, stays RESTARTABLE: the throw must
 /// leave `recovery_in_progress` cleared, or the table would be unrecoverable for the mount's life and
 /// every later toucher would park forever on a condition variable nobody will signal.
-TEST(CasRefRecoveryCasWalk, UndecodableOccupantAtTheSealSlotFailsClosedAndLeavesRecoveryRestartable)
+TEST(CASRefRecoveryCasWalk, UndecodableOccupantAtTheSealSlotFailsClosedAndLeavesRecoveryRestartable)
 {
     auto backend = std::make_shared<LateMaterializeBackend>();
     const Layout layout("p");
@@ -1879,7 +1879,7 @@ TEST(CasRefRecoveryCasWalk, UndecodableOccupantAtTheSealSlotFailsClosedAndLeaves
 /// while the loser adopts correctly, they would also both replay the whole tail and one would install a
 /// state the other's install immediately replaces -- work and I/O for nothing, on the path that is
 /// already the most expensive one in the system.
-TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
+TEST(CASRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
 {
     auto backend = std::make_shared<GetSeamBackend>();
     const Layout layout("p");
@@ -1946,7 +1946,7 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
 /// With authoritative `_ckpt.life_epoch=2`, epoch 2 is instead the current life's genesis and the walk
 /// begins at `{2,1}`. Epoch-1 objects are inert predecessor-life debris: they neither supply state nor
 /// receive a recovery seal.
-TEST(CasRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredecessorStreamUntouched)
+TEST(CASRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredecessorStreamUntouched)
 {
     auto backend = std::make_shared<HidingListBackend>();
     const Layout layout("p");
@@ -1988,7 +1988,7 @@ TEST(CasRefRecoveryCasWalk, RecoveryStartsAtRecreatedLifeGenesisAndLeavesPredece
 /// `PutHookBackend::casPut` must route through its immediate parent `HidingListBackend::casPut`, not
 /// past it to `CountingBackend`, so that a test arming BOTH layers on one `PutHookBackend` instance
 /// gets both behaviors composed rather than one silently disabled by the other.
-TEST(CasRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultInjection)
+TEST(CASRefRecoveryCasWalk, PutHookBackendComposesHidingListBackendCasPutFaultInjection)
 {
     auto backend = std::make_shared<PutHookBackend>();
 

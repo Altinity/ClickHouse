@@ -343,7 +343,7 @@ std::vector<std::pair<const char *, CasFoldSeal>> illFormedSealsTheEncoderMustRe
 /// rather than re-derived per format: a cap is the largest PERMITTED value (equality fits), and every
 /// sum saturates, because a wrapped sum answers "fits" for an object that does not — turning an
 /// overflow into a durable object nothing can read.
-TEST(CasGcHoldGrammarBudget, BothPredicatesAcceptEqualityAndRefuseOneMore)
+TEST(CASGcHoldGrammarBudget, BothPredicatesAcceptEqualityAndRefuseOneMore)
 {
     static_assert(fitsLineCap(64, 64));
     static_assert(!fitsLineCap(65, 64));
@@ -360,7 +360,7 @@ TEST(CasGcHoldGrammarBudget, BothPredicatesAcceptEqualityAndRefuseOneMore)
     EXPECT_TRUE(fitsObjectCap(std::numeric_limits<uint64_t>::max(), 1, 0));
 }
 
-TEST(CasGcHoldGrammarBudget, SumsSaturateInsteadOfWrapping)
+TEST(CASGcHoldGrammarBudget, SumsSaturateInsteadOfWrapping)
 {
     constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
     static_assert(addByteBudget(kMax, 1) == kMax);
@@ -373,7 +373,7 @@ TEST(CasGcHoldGrammarBudget, SumsSaturateInsteadOfWrapping)
 
 /// ===================== THE STRICT CLASSIFICATION-4 GRAMMAR =====================
 
-TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
+TEST(CASGcHoldGrammar, EveryHoldReasonRoundTrips)
 {
     for (const HoldReason reason : {HoldReason::GapBelowWitness, HoldReason::UnconsumedSealCrossing,
                                     HoldReason::WitnessDisappeared, HoldReason::BodyUndecodable,
@@ -403,7 +403,7 @@ TEST(CasGcHoldGrammar, EveryHoldReasonRoundTrips)
 /// (`handle_error_code`), so the same table is asserted as a death expectation there; the contract
 /// ("these bytes are never produced") is what both forms pin.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasGcHoldGrammar, TheEncoderRefusesEveryIllFormedCoverageRow)
+TEST(CASGcHoldGrammar, TheEncoderRefusesEveryIllFormedCoverageRow)
 {
     for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
     {
@@ -414,7 +414,7 @@ TEST(CasGcHoldGrammar, TheEncoderRefusesEveryIllFormedCoverageRow)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasGcHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
+TEST(CASGcHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
 {
     for (const auto & entry : illFormedSealsTheEncoderMustRefuse())
     {
@@ -424,7 +424,7 @@ TEST(CasGcHoldGrammarDeathTest, TheEncoderRefusesEveryIllFormedCoverageRow)
 }
 #endif
 
-TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
+TEST(CASGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
@@ -443,7 +443,7 @@ TEST(CasGcHoldGrammar, AHoldOnAnyOtherClassificationIsRefusedByTheDecoder)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(text); });
 }
 
-TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
+TEST(CASGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
 {
     CasFoldSeal seal;
     seal.generation = 1;
@@ -468,7 +468,7 @@ TEST(CasGcHoldGrammar, ClassificationFourWithoutAHoldIsRefusedByTheDecoder)
     }
 }
 
-TEST(CasGcHoldGrammar, DuplicateHoldKeyIsCorruptedData)
+TEST(CASGcHoldGrammar, DuplicateHoldKeyIsCorruptedData)
 {
     CasFoldSeal seal;
     seal.generation = 1;
@@ -488,7 +488,7 @@ TEST(CasGcHoldGrammar, DuplicateHoldKeyIsCorruptedData)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeFoldSeal(doubled); });
 }
 
-TEST(CasGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
+TEST(CASGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
 {
     CasFoldSeal seal;
     seal.generation = 1;
@@ -519,7 +519,7 @@ TEST(CasGcHoldGrammar, UnknownHoldReasonWordIsCorruptedData)
 /// is truncated first and validated (if at all) afterwards: 258 becomes 2, "everything through the
 /// cursor was folded". The value has to be judged WIDE, before the narrowing, or the wire can buy
 /// coverage that no fold ever performed.
-TEST(CasGcHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
+TEST(CASGcHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
     ASSERT_EQ(fixtureCoverage(decodeFoldSeal(clean), "ns/0").classification, 2)
@@ -545,7 +545,7 @@ TEST(CasGcHoldGrammar, AClassificationOutsideTheGrammarIsCorruptedData)
 
 /// And the field itself is required: an absent `cls` reads as 0, which is not "nothing was said about
 /// this namespace" but the positive claim "no round folded it".
-TEST(CasGcHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
+TEST(CASGcHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
 {
     const String clean = encodeFoldSeal(cleanSeal("ns/0"));
     const size_t at = clean.find("\"cls\":2,");
@@ -560,7 +560,7 @@ TEST(CasGcHoldGrammar, ACoverageRowWithoutAClassificationIsCorruptedData)
 /// stops BELOW its position and nothing is below zero. The namespace advances with no record that it was
 /// ever held. A zero in EITHER component is the same defect, and is additionally unnameable: the sweep
 /// renders the position when it reports what it retained, and `renderRefTxnId` refuses a zero component.
-TEST(CasGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedData)
+TEST(CASGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedData)
 {
     const String held = encodeFoldSeal(heldSeal("ns/0"));
     ASSERT_TRUE(fixtureCoverage(decodeFoldSeal(held), "ns/0").hold.has_value());
@@ -579,7 +579,7 @@ TEST(CasGcHoldGrammar, AHoldWhoseOffendingPositionHasAZeroComponentIsCorruptedDa
 /// (3) The duplicate row. Two `cov` records for the same (namespace, shard) — held first, clean second —
 /// used to be accepted with last-wins, so a single appended line erased a hold without touching the one
 /// that recorded it. There is exactly one row per key, and a second one is corruption.
-TEST(CasGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
+TEST(CASGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
 {
     const String held_line = covLineOf(encodeFoldSeal(heldSeal("ns/0")));
     const String clean_line = covLineOf(encodeFoldSeal(cleanSeal("ns/0")));
@@ -610,7 +610,7 @@ TEST(CasGcHoldGrammar, ASecondCoverageRowForTheSameKeyIsCorruptedData)
 
 /// The same one-record-per-key rule applies to `cnd`: a repeated row rewrites a shard's condemned
 /// totals, which graduation paces on.
-TEST(CasGcHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
+TEST(CASGcHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
 {
     CasFoldSeal seal = cleanSeal("ns/0");
     seal.condemned_summary[0] = CondemnedSummary{.condemned_total = 5, .pending_total = 1,
@@ -639,7 +639,7 @@ TEST(CasGcHoldGrammar, ASecondCondemnedSummaryRecordIsCorruptedData)
 
 /// Unified cleanup evidence still requires a canonical nonzero removal transaction id. Decoding
 /// foreign bytes must fail this read, never the process.
-TEST(CasGcHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
+TEST(CASGcHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
 {
     CasFoldSeal seal = cleanSeal("ns/0");
     seal.ref_lives.at(fixtureLifeId("ns/0")).cleanup_evidence =
@@ -659,7 +659,7 @@ TEST(CasGcHoldGrammar, CleanupEvidenceWithAZeroRemovalIdIsCorruptedData)
 /// is read raw, never through `openObject`), so an oversized PUT would leave a durable seal that no
 /// later round can decode — unrecoverable. The gate therefore sits before the bytes are handed out, and
 /// equality is still accepted: the cap is the largest permitted size, not the first forbidden one.
-TEST(CasGcHoldGrammar, ObjectCapAcceptsEqualityAndRefusesOneMoreByte)
+TEST(CASGcHoldGrammar, ObjectCapAcceptsEqualityAndRefusesOneMoreByte)
 {
     const uint64_t object_cap = foldSealCaps().object_cap;
     ASSERT_EQ(object_cap, 256u * 1024 * 1024);
@@ -674,7 +674,7 @@ TEST(CasGcHoldGrammar, ObjectCapAcceptsEqualityAndRefusesOneMoreByte)
 
 /// ===================== HOLDS ARE CREATED WITH AN EXACT POSITION =====================
 
-TEST(CasGcHoldGrammar, GapBelowWitnessNamesTheExactAbsentPosition)
+TEST(CASGcHoldGrammar, GapBelowWitnessNamesTheExactAbsentPosition)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -698,7 +698,7 @@ TEST(CasGcHoldGrammar, GapBelowWitnessNamesTheExactAbsentPosition)
     EXPECT_EQ(sealedCursorOf(*backend, layout, ns), (RefTxnId{1, 2}));
 }
 
-TEST(CasGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
+TEST(CASGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -729,7 +729,7 @@ TEST(CasGcHoldGrammar, UnconsumedSealCrossingNamesTheAbsentPosition)
         << "nothing beyond the unproven boundary may fold";
 }
 
-TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
+TEST(CASGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -753,7 +753,7 @@ TEST(CasGcHoldGrammar, UndecodableBodyNamesTheRecordItCouldNotRead)
 /// has appended its precommit record but not yet finished uploading the manifest body. It gets the same
 /// durable treatment as the corruption shapes because it stops the namespace the same way — and because
 /// a barrier that is durably named is one an operator can distinguish from a wedge.
-TEST(CasGcHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
+TEST(CASGcHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -779,7 +779,7 @@ TEST(CasGcHoldGrammar, MissingManifestBodyBarrierIsADurableHold)
 /// frontier: nothing may legitimately remove an object above the fold cursor. It is the one hold shape
 /// that no amount of waiting can clear, and naming it durably is what stops a later round from reading
 /// the same namespace as quiet and granting it a frontier proof.
-TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
+TEST(CASGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
 {
     /// Answers on odd-numbered reads and 404s on even ones: `crossFromSeal` proves the position, and
     /// the walk's own GET of it then fails.
@@ -836,7 +836,7 @@ TEST(CasGcHoldGrammar, AWitnessThatStopsAnsweringIsWitnessDisappeared)
 /// round's probes, so an absent expected-next reads as a frontier when it is really a gap. The
 /// namespace's own durable checkpoint decides the same question without asking the listing anything —
 /// and this pair of pools is the proof, because they differ in nothing else.
-TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
+TEST(CASGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
 {
     const RootNamespace ns{"00/aa@cas@"};
     /// Stage B (Task 4-C): no pin needed here -- `publishAt` below (draining into `writeRefLogTxnRaw`)
@@ -890,7 +890,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessHoldsAGapTheHintIsSilentAbout)
 /// in the round's universe by nothing but its CARRIED HOLD. Its checkpoint is why
 /// `readCheckpointWitnesses` takes the parent cursors as well as the hint — the hold alone witnesses only
 /// the position it stopped at, so a gap ABOVE that position, once the hold resolves, has no witness left.
-TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerNames)
+TEST(CASGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerNames)
 {
     const RootNamespace ns{"00/aa@cas@"};
     /// Stage B (Task 4-C): no pin needed -- `publishAt` inside `seedPool` (draining into
@@ -957,7 +957,7 @@ TEST(CasGcHoldGrammar, CheckpointWitnessReachesAHeldNamespaceTheHintNoLongerName
 /// namespace's cursor, seal and cleanup stopped, every round, on one unreadable 4 KiB object, and the
 /// exception named neither the namespace nor the key. The rule is the one §5 states for every other
 /// per-namespace failure: hold the namespace that owns the object, fold everything else.
-TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
+TEST(CASGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 {
     const RootNamespace bad{"00/aa@cas@"};
     /// Stage B (Task 4-C): no pin needed -- `publishAt(..., birth=true)` below (draining into
@@ -1046,7 +1046,7 @@ TEST(CasGcHoldGrammar, AnUndecodableCheckpointHoldsOnlyItsOwnNamespace)
 /// records legitimately do not exist. The anomaly carries it instead, which is enough because it shuts
 /// the same round-wide destructive gate a hold would, and because everything the checkpoint gates is a
 /// no-op for a namespace the walk cannot even start on: nothing to fold, and an empty delete plan.
-TEST(CasGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomalyAndMintsNoHold)
+TEST(CASGcHoldGrammar, AnUndecodableCheckpointWithNoWalkPositionRecordsAnAnomalyAndMintsNoHold)
 {
     const RootNamespace phantom{"00/aa@cas@"};
     const RootNamespace good{"00/bb@cas@"};
@@ -1134,7 +1134,7 @@ RefHold seedHeldThenUnhinted(
 
 }
 
-TEST(CasGcHoldGrammar, HoldRidesARoundWhoseHintOmitsTheNamespace)
+TEST(CASGcHoldGrammar, HoldRidesARoundWhoseHintOmitsTheNamespace)
 {
     auto backend = std::make_shared<HintHoleCountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1154,7 +1154,7 @@ TEST(CasGcHoldGrammar, HoldRidesARoundWhoseHintOmitsTheNamespace)
     EXPECT_EQ(second.retry_count, first.retry_count + 1);
 }
 
-TEST(CasGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
+TEST(CASGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
 {
     auto backend = std::make_shared<HintHoleCountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1176,7 +1176,7 @@ TEST(CasGcHoldGrammar, HoldForcesAnExactRetryOfItsOffendingPositionWhenUnhinted)
 /// offending position absent AGAIN, with no witness anywhere — exactly the observation a lying store
 /// produces — and the hold survives it. Only the record actually appearing, being folded, and the
 /// result reaching `gc/state` clears it.
-TEST(CasGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
+TEST(CASGcHoldGrammar, HoldClearsOnlyByFoldingThroughTheOffendingPosition)
 {
     auto backend = std::make_shared<HintHoleCountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1244,7 +1244,7 @@ RefHold plantedHold()
 
 /// A rebuild carries a hold only for the matching catalog life. A historical row whose id is absent
 /// from the rebuild cut is dropped and cannot mint output work.
-TEST(CasGcHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
+TEST(CASGcHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1294,7 +1294,7 @@ TEST(CasGcHoldGrammar, RebuildCarriesMatchingHoldAndDropsAbsentLife)
 /// seal. That spends no trust the maximum had not already been given. What it does NOT weaken is the
 /// refusal above the maximum: that one stays terminal, because a seal found there is the listing
 /// caught lying, not merely being incomplete about seals.
-TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelowIt)
+TEST(CASGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelowIt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1356,7 +1356,7 @@ TEST(CasGcHoldGrammar, RebuildStepsDownPastACrashedNewestGenerationToTheSealBelo
 /// unknowable. The rebuild refuses rather than blessing a baseline whose provenance it cannot state —
 /// a pool-wide hold is not representable (there is no offending position anyone could ever fold
 /// through), so the honest answer is the refusal, and the recovery path is pool recreation.
-TEST(CasGcHoldGrammar, RebuildRefusesWithAMissingPriorSeal)
+TEST(CASGcHoldGrammar, RebuildRefusesWithAMissingPriorSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1385,7 +1385,7 @@ TEST(CasGcHoldGrammar, RebuildRefusesWithAMissingPriorSeal)
     EXPECT_EQ(after.snap_generation, st.snap_generation) << "a refused rebuild adopts nothing";
 }
 
-TEST(CasGcHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
+TEST(CASGcHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1418,7 +1418,7 @@ TEST(CasGcHoldGrammar, RebuildRefusesWithAnUndecodablePriorSeal)
 /// carries its holds. This keeps the pool's disaster recovery intact — losing `gc/state` on a
 /// lived-in pool is the scenario `REBUILD` exists for — while making it impossible to write a
 /// hold-free baseline over a pool that had holds.
-TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
+TEST(CASGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1457,7 +1457,7 @@ TEST(CasGcHoldGrammar, RebuildWithLostStateStillCarriesHoldsFromTheNewestSeal)
 
 /// ...and when that newest seal cannot be read either, there is nothing left to carry and no way to
 /// know what was lost, so the rebuild refuses exactly as it does for an unreadable adopted seal.
-TEST(CasGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsLost)
+TEST(CASGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1495,7 +1495,7 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenTheNewestSealIsUnreadableAndTheStateIsL
 /// The fixture is the production shape rather than a contrivance: the broad `gc/gen/` enumeration
 /// omits the newest generation's objects while a listing scoped to that generation still returns
 /// them — the same class of lie the arithmetic ref walk was built for one layer down.
-TEST(CasGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMaximum)
+TEST(CASGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMaximum)
 {
     /// Omits keys from ONE enumeration prefix only. Every other query — including a listing scoped to
     /// the generation itself — answers truthfully.
@@ -1567,7 +1567,7 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
 /// reading a disaster-recovery run needs to see that the clean slate came from enumeration rather than
 /// from proof. `CASGcRebuildVirginByEnumeration` on a pool that has ever completed a round means the
 /// enumeration lied.
-TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTheVerdict)
+TEST(CASGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTheVerdict)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

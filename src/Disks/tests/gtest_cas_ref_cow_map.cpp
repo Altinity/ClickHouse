@@ -27,7 +27,7 @@ RefCommittedRow row(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 /// Keyed ops (spec 2026-07-17-cas-reftable-cow-map-design.md §Mechanism)
 /// ===================================================================================
 
-TEST(CasRefCowMap, EmptyMapHasNoEntries)
+TEST(CASRefCowMap, EmptyMapHasNoEntries)
 {
     RefCowMap m;
     EXPECT_TRUE(m.empty());
@@ -36,7 +36,7 @@ TEST(CasRefCowMap, EmptyMapHasNoEntries)
     EXPECT_FALSE(m.contains("a"));
 }
 
-TEST(CasRefCowMap, EmplaceThenFind)
+TEST(CASRefCowMap, EmplaceThenFind)
 {
     RefCowMap m;
     const auto [it, inserted] = m.emplace("a", row(1, 1, 1));
@@ -47,7 +47,7 @@ TEST(CasRefCowMap, EmplaceThenFind)
     EXPECT_EQ(m.at("a").manifest_ref, (ManifestRef{1, 1, 1}));
 }
 
-TEST(CasRefCowMap, EmplaceDoesNotOverwriteExisting)
+TEST(CASRefCowMap, EmplaceDoesNotOverwriteExisting)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -57,7 +57,7 @@ TEST(CasRefCowMap, EmplaceDoesNotOverwriteExisting)
     EXPECT_EQ(m.at("a").manifest_ref, (ManifestRef{1, 1, 1}));   /// unchanged
 }
 
-TEST(CasRefCowMap, InsertOrAssignOverwritesExisting)
+TEST(CASRefCowMap, InsertOrAssignOverwritesExisting)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -67,7 +67,7 @@ TEST(CasRefCowMap, InsertOrAssignOverwritesExisting)
     EXPECT_EQ(m.at("a").manifest_ref, (ManifestRef{2, 2, 2}));
 }
 
-TEST(CasRefCowMap, InsertOrAssignInsertsWhenAbsent)
+TEST(CASRefCowMap, InsertOrAssignInsertsWhenAbsent)
 {
     RefCowMap m;
     const auto [it, inserted] = m.insert_or_assign("a", row(1, 1, 1));
@@ -76,7 +76,7 @@ TEST(CasRefCowMap, InsertOrAssignInsertsWhenAbsent)
     EXPECT_EQ(it->second.manifest_ref, (ManifestRef{1, 1, 1}));
 }
 
-TEST(CasRefCowMap, EraseByKey)
+TEST(CASRefCowMap, EraseByKey)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -87,13 +87,13 @@ TEST(CasRefCowMap, EraseByKey)
     EXPECT_EQ(m.erase("nonexistent"), 0u);
 }
 
-TEST(CasRefCowMap, AtThrowsOnMissingKey)
+TEST(CASRefCowMap, AtThrowsOnMissingKey)
 {
     RefCowMap m;
     EXPECT_THROW(m.at("missing"), std::out_of_range);
 }
 
-TEST(CasRefCowMap, CountMatchesContains)
+TEST(CASRefCowMap, CountMatchesContains)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -106,7 +106,7 @@ TEST(CasRefCowMap, CountMatchesContains)
 /// iteration: merge-iterate base and overlay ... a standard two-sorted-range merge").
 /// ===================================================================================
 
-TEST(CasRefCowMap, OrderedIterationOverAllBaseRowsIsSorted)
+TEST(CASRefCowMap, OrderedIterationOverAllBaseRowsIsSorted)
 {
     RefCowMap m;
     m.emplace("c", row(1, 3, 1));
@@ -119,7 +119,7 @@ TEST(CasRefCowMap, OrderedIterationOverAllBaseRowsIsSorted)
     EXPECT_EQ(names, (std::vector<String>{"a", "b", "c"}));
 }
 
-TEST(CasRefCowMap, MergedIterationAppliesTombstonesAndOverrides)
+TEST(CASRefCowMap, MergedIterationAppliesTombstonesAndOverrides)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -144,7 +144,7 @@ TEST(CasRefCowMap, MergedIterationAppliesTombstonesAndOverrides)
     EXPECT_EQ(m.size(), 3u);
 }
 
-TEST(CasRefCowMap, FindOverlayOnlyKeyIteratesIntoBase)
+TEST(CASRefCowMap, FindOverlayOnlyKeyIteratesIntoBase)
 {
     RefCowMap m;
     m.emplace("A", row(1, 1, 1));
@@ -161,7 +161,7 @@ TEST(CasRefCowMap, FindOverlayOnlyKeyIteratesIntoBase)
     EXPECT_EQ(it->first, "D");
 }
 
-TEST(CasRefCowMap, EraseByIteratorReturnsNextAndRemovesTheRow)
+TEST(CASRefCowMap, EraseByIteratorReturnsNextAndRemovesTheRow)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -177,7 +177,7 @@ TEST(CasRefCowMap, EraseByIteratorReturnsNextAndRemovesTheRow)
     EXPECT_EQ(m.size(), 2u);
 }
 
-TEST(CasRefCowMap, EraseByIteratorOfLastElementReturnsEnd)
+TEST(CASRefCowMap, EraseByIteratorOfLastElementReturnsEnd)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -191,7 +191,7 @@ TEST(CasRefCowMap, EraseByIteratorOfLastElementReturnsEnd)
 /// materialize() (spec §Materialization)
 /// ===================================================================================
 
-TEST(CasRefCowMap, MaterializeFoldsOverlayIntoFreshBaseAndKeepsValuesUnchanged)
+TEST(CASRefCowMap, MaterializeFoldsOverlayIntoFreshBaseAndKeepsValuesUnchanged)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -207,7 +207,7 @@ TEST(CasRefCowMap, MaterializeFoldsOverlayIntoFreshBaseAndKeepsValuesUnchanged)
     EXPECT_EQ(m.size(), 1u);
 }
 
-TEST(CasRefCowMap, MaterializeOnAnEmptyOverlayIsANoOp)
+TEST(CASRefCowMap, MaterializeOnAnEmptyOverlayIsANoOp)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -218,7 +218,7 @@ TEST(CasRefCowMap, MaterializeOnAnEmptyOverlayIsANoOp)
     EXPECT_TRUE(m.contains("a"));
 }
 
-TEST(CasRefCowMap, MaterializeDoesNotAffectACopyTakenBeforeIt)
+TEST(CASRefCowMap, MaterializeDoesNotAffectACopyTakenBeforeIt)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -234,7 +234,7 @@ TEST(CasRefCowMap, MaterializeDoesNotAffectACopyTakenBeforeIt)
 /// materialize() fast path: fold into a uniquely-owned base IN PLACE, no O(N) copy (E5).
 /// ===================================================================================
 
-TEST(CasRefCowMap, MaterializeReusesBaseWhenUniquelyOwned)
+TEST(CASRefCowMap, MaterializeReusesBaseWhenUniquelyOwned)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -254,7 +254,7 @@ TEST(CasRefCowMap, MaterializeReusesBaseWhenUniquelyOwned)
     EXPECT_EQ(m.size(), 1u);                            /// net_delta reset, size still exact
 }
 
-TEST(CasRefCowMap, MaterializeBuildsFreshBaseWhenBaseIsShared)
+TEST(CASRefCowMap, MaterializeBuildsFreshBaseWhenBaseIsShared)
 {
     RefCowMap original;
     original.emplace("a", row(1, 1, 1));
@@ -280,7 +280,7 @@ TEST(CasRefCowMap, MaterializeBuildsFreshBaseWhenBaseIsShared)
     EXPECT_EQ(writer.size(), 2u);
 }
 
-TEST(CasRefCowMap, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
+TEST(CASRefCowMap, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
 {
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
@@ -292,7 +292,7 @@ TEST(CasRefCowMap, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
     EXPECT_TRUE(m.contains("a"));
 }
 
-TEST(CasRefCowMap, EqualityComparesEffectiveContentsNotInternalLayout)
+TEST(CASRefCowMap, EqualityComparesEffectiveContentsNotInternalLayout)
 {
     RefCowMap a;
     a.emplace("x", row(1, 1, 1));
@@ -310,7 +310,7 @@ TEST(CasRefCowMap, EqualityComparesEffectiveContentsNotInternalLayout)
 /// Copy-on-write isolation + O(1)-copy assertion (spec §Correctness & testing)
 /// ===================================================================================
 
-TEST(CasRefCowMap, CopyIsIsolatedFromOriginal)
+TEST(CASRefCowMap, CopyIsIsolatedFromOriginal)
 {
     RefCowMap original;
     original.emplace("a", row(1, 1, 1));
@@ -327,7 +327,7 @@ TEST(CasRefCowMap, CopyIsIsolatedFromOriginal)
     EXPECT_TRUE(copy.contains("b"));
 }
 
-TEST(CasRefCowMap, CopySharesBaseUntilEitherSideMaterializesANewOne)
+TEST(CASRefCowMap, CopySharesBaseUntilEitherSideMaterializesANewOne)
 {
     RefCowMap original;
     original.emplace("a", row(1, 1, 1));
@@ -355,7 +355,7 @@ TEST(CasRefCowMap, CopySharesBaseUntilEitherSideMaterializesANewOne)
 /// tombstone/override correctness on the merged iterator").
 /// ===================================================================================
 
-TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
+TEST(CASRefCowMap, PropertyMatchesStdMapOverRandomOps)
 {
     std::mt19937 rng(20260717); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
 
@@ -439,7 +439,7 @@ TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
 /// -- which handle `net_delta`, tombstones, and overrides differently -- never diverge.
 /// ===================================================================================
 
-TEST(CasRefCowMap, FastAndForcedSlowMaterializeAgreeOverRandomOps)
+TEST(CASRefCowMap, FastAndForcedSlowMaterializeAgreeOverRandomOps)
 {
     std::mt19937 rng(20260722); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducible coverage.
 

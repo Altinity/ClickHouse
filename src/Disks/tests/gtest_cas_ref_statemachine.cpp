@@ -147,7 +147,7 @@ RefTableSnapshot buildCollidingBaseSnapshotForTest()
 /// NamespaceBirth
 /// ===================================================================================
 
-TEST(CasRefStateMachine, BirthFromNeverBornAccepts)
+TEST(CASRefStateMachine, BirthFromNeverBornAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -156,7 +156,7 @@ TEST(CasRefStateMachine, BirthFromNeverBornAccepts)
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 1}));
 }
 
-TEST(CasRefStateMachine, BirthWhileLiveRejectedAndStateUnchanged)
+TEST(CASRefStateMachine, BirthWhileLiveRejectedAndStateUnchanged)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -167,7 +167,7 @@ TEST(CasRefStateMachine, BirthWhileLiveRejectedAndStateUnchanged)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, BirthAfterRemovalAccepts)
+TEST(CASRefStateMachine, BirthAfterRemovalAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -184,28 +184,28 @@ TEST(CasRefStateMachine, BirthAfterRemovalAccepts)
 /// Ops rejected outside Live (never-born and Removed) except birth
 /// ===================================================================================
 
-TEST(CasRefStateMachine, OwnerTransitionWhileNeverBornRejected)
+TEST(CASRefStateMachine, OwnerTransitionWhileNeverBornRejected)
 {
     RefTableState state;
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {addPrecommitOp("a", manifestRef(1, 1, 1))})); });
 }
 
-TEST(CasRefStateMachine, SetPublishedAtWhileNeverBornRejected)
+TEST(CASRefStateMachine, SetPublishedAtWhileNeverBornRejected)
 {
     RefTableState state;
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {setPublishedAtOp("a", manifestRef(1, 1, 1))})); });
 }
 
-TEST(CasRefStateMachine, RemoveNamespaceWhileNeverBornRejected)
+TEST(CASRefStateMachine, RemoveNamespaceWhileNeverBornRejected)
 {
     RefTableState state;
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {removeNamespaceOp()})); });
 }
 
-TEST(CasRefStateMachine, OpsWhileRemovedRejectedExceptBirth)
+TEST(CASRefStateMachine, OpsWhileRemovedRejectedExceptBirth)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -231,14 +231,14 @@ TEST(CasRefStateMachine, OpsWhileRemovedRejectedExceptBirth)
 /// Add precommit (spec §Add Precommit)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, AddPrecommitAccepts)
+TEST(CASRefStateMachine, AddPrecommitAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     EXPECT_TRUE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
 }
 
-TEST(CasRefStateMachine, AddPrecommitRejectsExactDuplicate)
+TEST(CASRefStateMachine, AddPrecommitRejectsExactDuplicate)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -249,7 +249,7 @@ TEST(CasRefStateMachine, AddPrecommitRejectsExactDuplicate)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, AddPrecommitRejectsConflictingManifestUnderDifferentName)
+TEST(CASRefStateMachine, AddPrecommitRejectsConflictingManifestUnderDifferentName)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -261,7 +261,7 @@ TEST(CasRefStateMachine, AddPrecommitRejectsConflictingManifestUnderDifferentNam
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, AddPrecommitRejectsManifestAlreadyCommittedElsewhere)
+TEST(CASRefStateMachine, AddPrecommitRejectsManifestAlreadyCommittedElsewhere)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -274,7 +274,7 @@ TEST(CasRefStateMachine, AddPrecommitRejectsManifestAlreadyCommittedElsewhere)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, AddPrecommitAllowsDifferentManifestsRacingForSameName)
+TEST(CASRefStateMachine, AddPrecommitAllowsDifferentManifestsRacingForSameName)
 {
     /// Two builds racing for the same final ref name (same shape gtest_cas_ref_codecs.cpp's
     /// RoundTripPrecommitsSameNameDifferentManifest round-trips): distinct manifest_ref, no conflict.
@@ -290,7 +290,7 @@ TEST(CasRefStateMachine, AddPrecommitAllowsDifferentManifestsRacingForSameName)
 /// Remove precommit / remove committed (spec §Remove Precommit, §Remove Committed Ref)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, RemovePrecommitAccepts)
+TEST(CASRefStateMachine, RemovePrecommitAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -298,7 +298,7 @@ TEST(CasRefStateMachine, RemovePrecommitAccepts)
     EXPECT_TRUE(state.getPrecommits().empty());
 }
 
-TEST(CasRefStateMachine, RemovePrecommitRejectsAbsentBinding)
+TEST(CASRefStateMachine, RemovePrecommitRejectsAbsentBinding)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -309,7 +309,7 @@ TEST(CasRefStateMachine, RemovePrecommitRejectsAbsentBinding)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, RemovePrecommitRejectsWrongManifest)
+TEST(CASRefStateMachine, RemovePrecommitRejectsWrongManifest)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -320,7 +320,7 @@ TEST(CasRefStateMachine, RemovePrecommitRejectsWrongManifest)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, RemoveCommittedAccepts)
+TEST(CASRefStateMachine, RemoveCommittedAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -329,7 +329,7 @@ TEST(CasRefStateMachine, RemoveCommittedAccepts)
     EXPECT_TRUE(state.getCommitted().empty());
 }
 
-TEST(CasRefStateMachine, RemoveCommittedRejectsAbsentRef)
+TEST(CASRefStateMachine, RemoveCommittedRejectsAbsentRef)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -340,7 +340,7 @@ TEST(CasRefStateMachine, RemoveCommittedRejectsAbsentRef)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, RemoveCommittedRejectsWrongManifest)
+TEST(CASRefStateMachine, RemoveCommittedRejectsWrongManifest)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -356,7 +356,7 @@ TEST(CasRefStateMachine, RemoveCommittedRejectsWrongManifest)
 /// Promote (spec §Promote): exact precommit required, atomicity, invalid shapes
 /// ===================================================================================
 
-TEST(CasRefStateMachine, PromoteRejectsAbsentPrecommit)
+TEST(CASRefStateMachine, PromoteRejectsAbsentPrecommit)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -367,7 +367,7 @@ TEST(CasRefStateMachine, PromoteRejectsAbsentPrecommit)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediate)
+TEST(CASRefStateMachine, PromoteAtomicityNoOwnerlessIntermediate)
 {
     /// A bare promote (no set_published_at in the same transaction) is itself a complete, valid, and
     /// OBSERVABLE transaction -- there is no partial-op state exposed here, only the choice of
@@ -382,7 +382,7 @@ TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediate)
     EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 0u);
 }
 
-TEST(CasRefStateMachine, PromoteWithSetPublishedAtInSameTxnInstallsTimestamp)
+TEST(CASRefStateMachine, PromoteWithSetPublishedAtInSameTxnInstallsTimestamp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -393,7 +393,7 @@ TEST(CasRefStateMachine, PromoteWithSetPublishedAtInSameTxnInstallsTimestamp)
     EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 42u);
 }
 
-TEST(CasRefStateMachine, PromoteRejectsDisplacingAnotherCommittedManifest)
+TEST(CASRefStateMachine, PromoteRejectsDisplacingAnotherCommittedManifest)
 {
     /// A challenger precommit under the SAME ref_name as an already-committed (different) manifest is
     /// legal to stage (spec §Add Precommit only restricts manifest identity, not ref_name), but a bare
@@ -409,7 +409,7 @@ TEST(CasRefStateMachine, PromoteRejectsDisplacingAnotherCommittedManifest)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, PromoteAcceptsAfterExplicitRemovalOfStaleCommitted)
+TEST(CASRefStateMachine, PromoteAcceptsAfterExplicitRemovalOfStaleCommitted)
 {
     /// The correct atomic-replace sequence: an explicit removal of the old committed row, followed by
     /// the promote, in the SAME transaction -- both ops are recorded, so GC sees the old manifest's
@@ -427,7 +427,7 @@ TEST(CasRefStateMachine, PromoteAcceptsAfterExplicitRemovalOfStaleCommitted)
     EXPECT_FALSE(state.getPrecommits().contains({"a", manifestRef(1, 2, 1)}));
 }
 
-TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
+TEST(CASRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -470,7 +470,7 @@ TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
 /// SetPublishedAt (spec §Update Payload)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, SetPublishedAtRejectsWhenRefAbsent)
+TEST(CASRefStateMachine, SetPublishedAtRejectsWhenRefAbsent)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -481,7 +481,7 @@ TEST(CasRefStateMachine, SetPublishedAtRejectsWhenRefAbsent)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, SetPublishedAtRejectsManifestMismatch)
+TEST(CASRefStateMachine, SetPublishedAtRejectsManifestMismatch)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -493,7 +493,7 @@ TEST(CasRefStateMachine, SetPublishedAtRejectsManifestMismatch)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, SetPublishedAtAcceptsAndReplacesTimestamp)
+TEST(CASRefStateMachine, SetPublishedAtAcceptsAndReplacesTimestamp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -509,7 +509,7 @@ TEST(CasRefStateMachine, SetPublishedAtAcceptsAndReplacesTimestamp)
 /// RemoveNamespace ordering lens (spec §Remove Namespace; codec deliberately doesn't check this)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, RemoveNamespaceAloneOnEmptyTableAccepted)
+TEST(CASRefStateMachine, RemoveNamespaceAloneOnEmptyTableAccepted)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -519,7 +519,7 @@ TEST(CasRefStateMachine, RemoveNamespaceAloneOnEmptyTableAccepted)
     EXPECT_EQ(*state.getRemoveTxnId(), (RefTxnId{1, 2}));
 }
 
-TEST(CasRefStateMachine, CatalogedNeverBornLifeAcceptsAtomicEmptyBirthAndRemoval)
+TEST(CASRefStateMachine, CatalogedNeverBornLifeAcceptsAtomicEmptyBirthAndRemoval)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), removeNamespaceOp()}));
@@ -530,7 +530,7 @@ TEST(CasRefStateMachine, CatalogedNeverBornLifeAcceptsAtomicEmptyBirthAndRemoval
     EXPECT_TRUE(state.getPrecommits().empty());
 }
 
-TEST(CasRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
+TEST(CASRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -547,7 +547,7 @@ TEST(CasRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
     EXPECT_TRUE(state.getPrecommits().empty());
 }
 
-TEST(CasRefStateMachine, RemoveNamespaceRejectsWhenOwnersRemain)
+TEST(CASRefStateMachine, RemoveNamespaceRejectsWhenOwnersRemain)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -562,7 +562,7 @@ TEST(CasRefStateMachine, RemoveNamespaceRejectsWhenOwnersRemain)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, RemoveNamespaceMustBeFinalOp)
+TEST(CASRefStateMachine, RemoveNamespaceMustBeFinalOp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -573,7 +573,7 @@ TEST(CasRefStateMachine, RemoveNamespaceMustBeFinalOp)
     expectStatesEqual(before, state);
 }
 
-TEST(CasRefStateMachine, RemoveNamespaceRejectsNonRemovalEarlierOp)
+TEST(CASRefStateMachine, RemoveNamespaceRejectsNonRemovalEarlierOp)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -599,7 +599,7 @@ TEST(CasRefStateMachine, RemoveNamespaceRejectsNonRemovalEarlierOp)
 /// Whole-transaction atomicity: a failing LAST op leaves the whole txn (and earlier ops) unapplied
 /// ===================================================================================
 
-TEST(CasRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
+TEST(CASRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -623,7 +623,7 @@ TEST(CasRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
 /// `nextRefTxnId` derives from `greatest_applied`, which is also the only id the writer ever mints.
 /// Equal, lower, and skipped ids are all corruption -- the last of those is what makes "I can see ids
 /// 1..T" mean "nothing is missing", the property the whole invariant exists to provide.
-TEST(CasRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
+TEST(CASRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -666,7 +666,7 @@ TEST(CasRefStateMachine, ContiguousTxnIdsRejectEqualLowerAndSkipped)
 /// snapshotOf: canonical sort + terminal-state refusal
 /// ===================================================================================
 
-TEST(CasRefStateMachine, SnapshotOfSortsCommittedAndPrecommits)
+TEST(CASRefStateMachine, SnapshotOfSortsCommittedAndPrecommits)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -688,7 +688,7 @@ TEST(CasRefStateMachine, SnapshotOfSortsCommittedAndPrecommits)
     EXPECT_EQ(decoded, snap);
 }
 
-TEST(CasRefStateMachine, SnapshotOfRefusesTerminalState)
+TEST(CASRefStateMachine, SnapshotOfRefusesTerminalState)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -704,7 +704,7 @@ TEST(CasRefStateMachine, SnapshotOfRefusesTerminalState)
 /// replay: TableState = Replay(S_X.state, tail(X))
 /// ===================================================================================
 
-TEST(CasRefStateMachine, ReplayFromNoSnapshot)
+TEST(CASRefStateMachine, ReplayFromNoSnapshot)
 {
     std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -716,7 +716,7 @@ TEST(CasRefStateMachine, ReplayFromNoSnapshot)
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 }
 
-TEST(CasRefStateMachine, ReplayFromSnapshotPlusTail)
+TEST(CASRefStateMachine, ReplayFromSnapshotPlusTail)
 {
     RefTableState built;
     applyRefLogTxn(built, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -728,7 +728,7 @@ TEST(CasRefStateMachine, ReplayFromSnapshotPlusTail)
     EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 }
 
-TEST(CasRefStateMachine, StateFromSnapshotConstructsLiveState)
+TEST(CASRefStateMachine, StateFromSnapshotConstructsLiveState)
 {
     RefTableSnapshot snap;
     snap.ns = kNs;
@@ -739,7 +739,7 @@ TEST(CasRefStateMachine, StateFromSnapshotConstructsLiveState)
     EXPECT_FALSE(state.getRemoveTxnId().has_value());
 }
 
-TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAgainstSnapshot)
+TEST(CASRefStateMachine, ReplayRejectsTailNsMismatchAgainstSnapshot)
 {
     RefTableState built;
     applyRefLogTxn(built, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -749,7 +749,7 @@ TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAgainstSnapshot)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, tail); });
 }
 
-TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAcrossEntries)
+TEST(CASRefStateMachine, ReplayRejectsTailNsMismatchAcrossEntries)
 {
     std::vector<RefLogTxn> tail{
         makeTxn("ns-a", RefTxnId{1, 1}, {birthOp()}),
@@ -758,7 +758,7 @@ TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAcrossEntries)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(std::nullopt, tail); });
 }
 
-TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithDuplicateCommittedName)
+TEST(CASRefStateMachine, ReplayRejectsHandBuiltSnapshotWithDuplicateCommittedName)
 {
     /// A hand-built RefTableSnapshot (never passed through decodeRefTableSnapshot -- exactly what
     /// fsck hands to replay) with two committed rows sharing one ref_name must be rejected, not
@@ -779,7 +779,7 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithDuplicateCommittedNam
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
 }
 
-TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
+TEST(CASRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
 {
     RefTableSnapshot snap;
     snap.ns = kNs;
@@ -791,7 +791,7 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
 }
 
 /// Randomized replay equation: replay(snapshotOf(mid-state), tail) == full replay (spec §Table State).
-TEST(CasRefStateMachine, ReplayEquationPropertyTest)
+TEST(CASRefStateMachine, ReplayEquationPropertyTest)
 {
     std::mt19937 rng(4242); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     const std::vector<String> names{"a", "b", "c"};
@@ -891,7 +891,7 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 
 /// (Add path, committed collision) The writer's append-time contract rejects a fresh precommit that
 /// names a manifest already committed under a DIFFERENT ref_name, and leaves the state unchanged.
-TEST(CasRefStateMachine, LiveAppendRejectsAddPrecommitCollidingWithCommitted)
+TEST(CASRefStateMachine, LiveAppendRejectsAddPrecommitCollidingWithCommitted)
 {
     RefTableState state = stateFromSnapshot(buildCollidingBaseSnapshotForTest());
     const RefTableState before = state;
@@ -904,7 +904,7 @@ TEST(CasRefStateMachine, LiveAppendRejectsAddPrecommitCollidingWithCommitted)
 /// committed owner makes `replay` THROW -- it must NOT be silently accepted. This is the exact behavior
 /// the deleted `TrustedReplaySkipsCrossOwnerScanInRelease` test pinned as *desired*; post-consult it is
 /// the opposite: fail closed.
-TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithCommitted)
+TEST(CASRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithCommitted)
 {
     const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
     const std::vector<RefLogTxn> tail{makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))})};
@@ -913,7 +913,7 @@ TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithCommitted)
 
 /// (Replay path, precommit collision) The same, but the base already holds a PRECOMMIT for the manifest
 /// and the tail adds a second precommit for it under another ref_name (precommit/precommit collision).
-TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithPrecommit)
+TEST(CASRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithPrecommit)
 {
     const std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -925,7 +925,7 @@ TEST(CasRefStateMachine, ReplayRejectsTailAddPrecommitCollidingWithPrecommit)
 /// (Snapshot validation, committed/committed) A hand-built snapshot with two committed rows naming ONE
 /// manifest passes the codec (it checks only sortedness + no-duplicate ref_name) but must be rejected by
 /// `stateFromSnapshot`/`replay` as semantically corrupt.
-TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoCommittedRowsNamingOneManifest)
+TEST(CASRefStateMachine, ReplayRejectsSnapshotWithTwoCommittedRowsNamingOneManifest)
 {
     RefTableSnapshot snap;
     snap.ns = kNs;
@@ -945,7 +945,7 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoCommittedRowsNamingOneManif
 
 /// (Snapshot validation, committed/precommit) A committed row and a precommit binding sharing one
 /// manifest -- also codec-legal (different owner kinds, sorted independently) but corrupt.
-TEST(CasRefStateMachine, ReplayRejectsSnapshotWithCommittedAndPrecommitSharingManifest)
+TEST(CASRefStateMachine, ReplayRejectsSnapshotWithCommittedAndPrecommitSharingManifest)
 {
     RefTableSnapshot snap;
     snap.ns = kNs;
@@ -961,7 +961,7 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithCommittedAndPrecommitSharingMa
 
 /// (Snapshot validation, precommit/precommit) Two precommit bindings under different ref_names naming
 /// one manifest -- sorted by (ref_name, manifest_ref), so codec-legal, but corrupt.
-TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoPrecommitsSharingManifest)
+TEST(CASRefStateMachine, ReplayRejectsSnapshotWithTwoPrecommitsSharingManifest)
 {
     RefTableSnapshot snap;
     snap.ns = kNs;
@@ -975,7 +975,7 @@ TEST(CasRefStateMachine, ReplayRejectsSnapshotWithTwoPrecommitsSharingManifest)
 /// Positive equivalence: a VALID tail replayed via `replay` (the in-place trusted path) produces a state
 /// byte-identical (getters + encoded snapshot) to the same tail applied via the public strong-guarantee
 /// `applyRefLogTxn` -- the apply strategy changes nothing a legal transaction produces.
-TEST(CasRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
+TEST(CASRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
 {
     const std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -1024,7 +1024,7 @@ RefTableState buildPopulatedLiveState()
 /// precommits, the owned-manifest index and the body counters; the third is illegal. The whole
 /// transaction is rejected and `state` is byte-for-byte unchanged -- getters AND encoded-snapshot
 /// bytes. This is the writer's live-state contract, preserved verbatim by E3's `LiveAppend` arm.
-TEST(CasRefStateMachine, E3LiveAppendLaterOpThrowLeavesPopulatedStateByteIdentical)
+TEST(CASRefStateMachine, E3LiveAppendLaterOpThrowLeavesPopulatedStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
     const RefTableState before = state;
@@ -1047,7 +1047,7 @@ TEST(CasRefStateMachine, E3LiveAppendLaterOpThrowLeavesPopulatedStateByteIdentic
 /// LiveAppend-path atomicity, FIRST-op throw ("empty" abort path -- nothing applied before the throw): the
 /// symmetric guarantee still holds. Distinct from the case above because no op ever mutated the
 /// scratch, exercising the throw-before-any-effect branch.
-TEST(CasRefStateMachine, E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentical)
+TEST(CASRefStateMachine, E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
     const RefTableState before = state;
@@ -1066,7 +1066,7 @@ TEST(CasRefStateMachine, E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentic
 /// `admits` previews an op against `state` and must leave it byte-for-byte unchanged whether the op
 /// fits (true) or overflows (false) -- it is a pure query. Verified against both getters and encoded
 /// bytes, for both the accept and the reject verdicts.
-TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
+TEST(CASRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
     /// Must be an independent snapshot -- `state` is queried and potentially mutated below, and
@@ -1097,7 +1097,7 @@ TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
 /// state byte-identical to the SAME tail applied op-by-op through `LiveAppend` (scratch copy). This is the
 /// test only E3's in-place machinery can fail: a mis-maintained counter, a dropped owned-manifest
 /// index entry, or a lost `greatest_applied` update on the no-copy path would diverge here.
-TEST(CasRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
+TEST(CASRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
 {
     const std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(),
@@ -1132,7 +1132,7 @@ TEST(CasRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
 /// throw `CORRUPTED_DATA`. The in-place apply poisons a state that is entirely internal to the failed
 /// `replay` call (it is never assigned to a caller on a throw), so an INDEPENDENT replay of just the
 /// valid prefix is completely unaffected -- pinning that the poison never escapes.
-TEST(CasRefStateMachine, E3TrustedReplayPoisonOnBadTailIsInternal)
+TEST(CASRefStateMachine, E3TrustedReplayPoisonOnBadTailIsInternal)
 {
     const std::vector<RefLogTxn> good_prefix{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -1160,14 +1160,14 @@ TEST(CasRefStateMachine, E3TrustedReplayPoisonOnBadTailIsInternal)
 /// admits(): dual-bound admission budget (spec §Snapshot Format)
 /// ===================================================================================
 
-TEST(CasRefStateMachine, AdmitsAcceptsWellUnderBudget)
+TEST(CASRefStateMachine, AdmitsAcceptsWellUnderBudget)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     EXPECT_TRUE(admits(state, addPrecommitOp("a", manifestRef(1, 1, 1)), 1'000'000, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetOwnerTransitionAdd)
+TEST(CASRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetOwnerTransitionAdd)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
@@ -1181,7 +1181,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetOwnerTransitionAdd
     EXPECT_FALSE(admits(state, op, true_size - 1, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPublishedAt)
+TEST(CASRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPublishedAt)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -1196,7 +1196,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetSetPublishedAt)
     EXPECT_FALSE(admits(state, op, true_size - 1, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithSetPublishedAt)
+TEST(CASRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithSetPublishedAt)
 {
     /// The "promote-with-set_published_at" growth class: the owner_transition half of a promote is
     /// admitted cheaply (published_at_ms starts unset), but the immediately-following set_published_at
@@ -1216,7 +1216,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithSetPubl
     EXPECT_FALSE(admits(state, op, true_size - 1, 1'000'000));
 }
 
-TEST(CasRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
+TEST(CASRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -1235,7 +1235,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
 
 /// Randomized exactness property test: admits()'s internal size computation must exactly match the
 /// real encoders' output, for both bounds, across randomized states and candidate growing ops.
-TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
+TEST(CASRefStateMachine, AdmitsExactnessPropertyTest)
 {
     std::mt19937 rng(777); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
 
@@ -1306,7 +1306,7 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
 /// ===================================================================================
 /// Snapshot size helpers: framing + Σ per-row must equal a full encode, byte for byte.
 /// ===================================================================================
-TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
+TEST(CASRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
 {
     /// Build a non-trivial Live table: two committed rows (one with a stamped published_at_ms) and one
     /// precommit.
@@ -1334,7 +1334,7 @@ TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
 /// ===================================================================================
 /// Removal-txn size helpers: framing + Σ per-owner-op must equal a full removal-txn encode.
 /// ===================================================================================
-TEST(CasRefLogSizeHelpers, FramingPlusOpsEqualsFullRemovalEncode)
+TEST(CASRefLogSizeHelpers, FramingPlusOpsEqualsFullRemovalEncode)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
@@ -1381,7 +1381,7 @@ uint64_t recomputeRemovalBody(const RefTableState & s)
 }
 }
 
-TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
+TEST(CASRefStateCounters, CountersTrackRowsThroughEveryOpKind)
 {
     RefTableState state;
     EXPECT_EQ(state.getSnapshotBodyBytes(), 0u);
@@ -1408,7 +1408,7 @@ TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
 /// ===================================================================================
 /// Budget-size accessors equal the real encoders across randomized states.
 /// ===================================================================================
-TEST(CasRefBudgetSize, AccessorsEqualFullEncodeRandomized)
+TEST(CASRefBudgetSize, AccessorsEqualFullEncodeRandomized)
 {
     std::mt19937 rng(1234); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducibility.
     for (int trial = 0; trial < 30; ++trial)

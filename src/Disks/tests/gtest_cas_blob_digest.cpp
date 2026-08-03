@@ -48,7 +48,7 @@ UInt128 randomU128(std::mt19937_64 & rng)
 
 /// ---- THE KEY GATE ----
 
-TEST(CasBlobDigest, ShardOfBitIdenticalToOldHighBitsOver200RandomValues)
+TEST(CASBlobDigest, ShardOfBitIdenticalToOldHighBitsOver200RandomValues)
 {
     std::mt19937_64 rng(0xC0FFEE); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     const DigestCodec codec16(/*blob_hash_len*/ 16);
@@ -70,7 +70,7 @@ TEST(CasBlobDigest, ShardOfBitIdenticalToOldHighBitsOver200RandomValues)
 /// The same gate, but via `Cas::codecFor` (`CasBlobRef.h`), the ONE way production code obtains a
 /// codec (Phase 3 T4 deleted the pool-scoped `DigestCodec(PoolMeta)` constructor -- a mixed-algo
 /// pool has no single width; the codec is selected per-algo, never per-pool).
-TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
+TEST(CASBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -92,7 +92,7 @@ TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
 
 /// ---- round-trip ----
 
-TEST(CasBlobDigest, HexRoundTripLen16)
+TEST(CASBlobDigest, HexRoundTripLen16)
 {
     const DigestCodec codec(16);
     std::mt19937_64 rng(1); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
@@ -105,7 +105,7 @@ TEST(CasBlobDigest, HexRoundTripLen16)
     }
 }
 
-TEST(CasBlobDigest, HexRoundTripLen32)
+TEST(CASBlobDigest, HexRoundTripLen32)
 {
     const DigestCodec codec(32);
     BlobDigest d;
@@ -117,7 +117,7 @@ TEST(CasBlobDigest, HexRoundTripLen32)
     EXPECT_EQ(codec.fromHex(hex), d);
 }
 
-TEST(CasBlobDigest, BytesBERoundTripLen16)
+TEST(CASBlobDigest, BytesBERoundTripLen16)
 {
     const DigestCodec codec(16);
     std::mt19937_64 rng(2); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
@@ -130,7 +130,7 @@ TEST(CasBlobDigest, BytesBERoundTripLen16)
     }
 }
 
-TEST(CasBlobDigest, BytesBERoundTripLen32)
+TEST(CASBlobDigest, BytesBERoundTripLen32)
 {
     const DigestCodec codec(32);
     BlobDigest d;
@@ -145,7 +145,7 @@ TEST(CasBlobDigest, BytesBERoundTripLen32)
 /// `toBytesBE` at len16 must produce exactly the `u128ToBytesBE` bytes for the 16-byte prefix --
 /// same byte order, so a 128-bit pool's on-wire bytes stay unchanged when a later task migrates a
 /// field from `UInt128` to `BlobDigest`.
-TEST(CasBlobDigest, BytesBEAgreesWithU128ToBytesBEAtLen16)
+TEST(CASBlobDigest, BytesBEAgreesWithU128ToBytesBEAtLen16)
 {
     const DigestCodec codec(16);
     std::mt19937_64 rng(3); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
@@ -158,7 +158,7 @@ TEST(CasBlobDigest, BytesBEAgreesWithU128ToBytesBEAtLen16)
 
 /// ---- width rejection ----
 
-TEST(CasBlobDigest, FromHexRejectsWrongWidth)
+TEST(CASBlobDigest, FromHexRejectsWrongWidth)
 {
     const DigestCodec codec16(16);
     const DigestCodec codec32(32);
@@ -171,7 +171,7 @@ TEST(CasBlobDigest, FromHexRejectsWrongWidth)
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { codec16.fromHex(std::string(31, 'a') + "z"); });
 }
 
-TEST(CasBlobDigest, FromBytesBERejectsWrongWidth)
+TEST(CASBlobDigest, FromBytesBERejectsWrongWidth)
 {
     const DigestCodec codec16(16);
     const DigestCodec codec32(32);
@@ -183,7 +183,7 @@ TEST(CasBlobDigest, FromBytesBERejectsWrongWidth)
 
 /// ---- UInt128 conversion ----
 
-TEST(CasBlobDigest, U128RoundTrip)
+TEST(CASBlobDigest, U128RoundTrip)
 {
     std::mt19937_64 rng(4); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 200; ++i)
@@ -194,7 +194,7 @@ TEST(CasBlobDigest, U128RoundTrip)
     EXPECT_EQ(BlobDigest::fromU128(UInt128(0)).toU128(), UInt128(0));
 }
 
-TEST(CasBlobDigest, FromU128LeavesTailZero)
+TEST(CASBlobDigest, FromU128LeavesTailZero)
 {
     std::mt19937_64 rng(5); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     const UInt128 v = randomU128(rng);
@@ -205,7 +205,7 @@ TEST(CasBlobDigest, FromU128LeavesTailZero)
 
 /// ---- hasher / container use ----
 
-TEST(CasBlobDigest, UsableAsUnorderedMapKey)
+TEST(CASBlobDigest, UsableAsUnorderedMapKey)
 {
     std::mt19937_64 rng(6); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     std::unordered_map<BlobDigest, int, BlobDigestHash> m;
@@ -223,7 +223,7 @@ TEST(CasBlobDigest, UsableAsUnorderedMapKey)
 /// ---- PoolMeta::algos_used records the creating algo (Phase 3 T4 -- the width itself is no longer
 /// pool state at all: `blobHashLenFor(algo)`/`codecFor(algo)` derive it per-algo, never per-pool) ----
 
-TEST(CasBlobDigest, PoolMetaRecordsCreatingAlgoAndWidthDerivesFromIt)
+TEST(CASBlobDigest, PoolMetaRecordsCreatingAlgoAndWidthDerivesFromIt)
 {
     {
         auto backend = std::make_shared<InMemoryBackend>();
@@ -255,7 +255,7 @@ TEST(CasBlobDigest, PoolMetaRecordsCreatingAlgoAndWidthDerivesFromIt)
 /// ---- zero-tail len-drift guard (debug/sanitizer builds only: chassert aborts the process) ----
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasBlobDigestDeathTest, ZeroTailChassertFiresOnNonZeroTailAtLen16)
+TEST(CASBlobDigestDeathTest, ZeroTailChassertFiresOnNonZeroTailAtLen16)
 {
     const DigestCodec codec16(16);
     BlobDigest d = BlobDigest::fromU128(UInt128(1));

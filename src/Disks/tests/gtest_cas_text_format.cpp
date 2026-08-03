@@ -36,7 +36,7 @@ void expectCode(int code, F && f)
 
 /// ---- Task 2: FormatId entries for refsnaplog / blob meta / heartbeat ----
 
-TEST(CasFormatIds, NewIdsExistWithFrozenValues)
+TEST(CASFormatIds, NewIdsExistWithFrozenValues)
 {
     EXPECT_EQ(static_cast<uint16_t>(FormatId::RefLog), 19);
     EXPECT_EQ(static_cast<uint16_t>(FormatId::RefSnapshot), 20);
@@ -49,7 +49,7 @@ TEST(CasFormatIds, NewIdsExistWithFrozenValues)
 
 /// ---- Task 3: per-format traits registry ----
 
-TEST(CasFormatTraits, CompleteUniqueAndGated)
+TEST(CASFormatTraits, CompleteUniqueAndGated)
 {
     /// Completeness: every FormatId except the reserved Roster has traits.
     const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
@@ -70,7 +70,7 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
 #ifndef DEBUG_OR_SANITIZER_BUILD
     /// traitsFor(Roster) throws LOGICAL_ERROR (a reserved/unreachable FormatId), which aborts the
     /// whole process in debug/sanitizer builds instead of behaving like a catchable exception --
-    /// CasFormatTraitsDeathTest below proves the abort positively in those builds instead.
+    /// CASFormatTraitsDeathTest below proves the abort positively in those builds instead.
     EXPECT_THROW(traitsFor(FormatId::Roster), DB::Exception);
 #endif
     /// Deterministic formats are pinned raw + strict; spot-check the two.
@@ -91,8 +91,8 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
 #if defined(DEBUG_OR_SANITIZER_BUILD)
 /// Debug/sanitizer-build counterpart to CompleteUniqueAndGated's Roster check: LOGICAL_ERROR aborts
 /// the process here instead of throwing a catchable exception, so the check must be a death test
-/// (same pattern as CasBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
-TEST(CasFormatTraitsDeathTest, TraitsForRosterAborts)
+/// (same pattern as CASBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
+TEST(CASFormatTraitsDeathTest, TraitsForRosterAborts)
 {
     EXPECT_DEATH({ (void)traitsFor(FormatId::Roster); }, "");
 }
@@ -100,7 +100,7 @@ TEST(CasFormatTraitsDeathTest, TraitsForRosterAborts)
 
 /// ---- Task 4: JSON micro-vocabulary + JsonObjectReader ----
 
-TEST(CasJsonVocab, WriteAndReadBack)
+TEST(CASJsonVocab, WriteAndReadBack)
 {
     CasJsonWriter out;
     bool first = true;
@@ -130,7 +130,7 @@ TEST(CasJsonVocab, WriteAndReadBack)
     EXPECT_FALSE(r.nextKey(key));
 }
 
-TEST(CasJsonVocab, FailClosedRules)
+TEST(CASJsonVocab, FailClosedRules)
 {
     auto reader = [](std::string_view text, KeyStrictness s, auto && consume)
     {
@@ -184,7 +184,7 @@ TEST(CasJsonVocab, FailClosedRules)
 
 /// ---- Task 5: header line, trailer line, readLine ----
 
-TEST(CasTextHeader, WriteExpectSniffGate)
+TEST(CASTextHeader, WriteExpectSniffGate)
 {
     CasJsonWriter out;
     writeHeaderLine(out, FormatId::PoolMeta);
@@ -217,7 +217,7 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in4, FormatId::PoolMeta); });
 }
 
-TEST(CasTextLines, ReadLineAndTrailer)
+TEST(CASTextLines, ReadLineAndTrailer)
 {
     CasJsonWriter out;
     writeTrailerLine(out, 42);
@@ -237,7 +237,7 @@ TEST(CasTextLines, ReadLineAndTrailer)
 
 /// ---- Task 6: the zstd arm ----
 
-TEST(CasZstdArm, SealOpenPolicyAndCaps)
+TEST(CASZstdArm, SealOpenPolicyAndCaps)
 {
     /// Always types compress regardless of size (no threshold — the .zst key must be
     /// constructible without knowing the body); a raw body is still readable (repair path).
@@ -281,7 +281,7 @@ TEST(CasZstdArm, SealOpenPolicyAndCaps)
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::RefSnapshot, corrupted); });
 }
 
-TEST(CasTextValueEscaping, ForwardSlashPinnedUnescaped)
+TEST(CASTextValueEscaping, ForwardSlashPinnedUnescaped)
 {
     /// Goes RED if the global escape_forward_slashes default ever leaks back into CAS string values.
     /// CAS values are dense with '/' (ref-paths, fold-seal keys); their bytes must be CAS-owned so

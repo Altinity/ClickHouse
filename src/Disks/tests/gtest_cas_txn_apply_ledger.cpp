@@ -16,7 +16,7 @@ DB::UInt128 s(uint64_t n) { return DB::UInt128(n); }
 /// The ledger is pure round-local bookkeeping; test it directly rather than trying to fabricate a
 /// lost bucket inside a real fold. The fold-side wiring is covered by the gate: every existing GC
 /// test now runs with the ledger armed and would throw if a delta went missing.
-TEST(CasTxnApplyLedger, HealthyRoundReportsNothingUnapplied)
+TEST(CASTxnApplyLedger, HealthyRoundReportsNothingUnapplied)
 {
     TxnApplyLedger ledger;
     const uint32_t a = ledger.open(RootNamespace{"ns"}, RefTxnId{1, 1});
@@ -28,7 +28,7 @@ TEST(CasTxnApplyLedger, HealthyRoundReportsNothingUnapplied)
     EXPECT_TRUE(ledger.unapplied().empty());
 }
 
-TEST(CasTxnApplyLedger, CommittedAndProducedButNeverAppliedIsReported)
+TEST(CASTxnApplyLedger, CommittedAndProducedButNeverAppliedIsReported)
 {
     TxnApplyLedger ledger;
     const uint32_t a = ledger.open(RootNamespace{"ns"}, RefTxnId{1, 1});
@@ -38,7 +38,7 @@ TEST(CasTxnApplyLedger, CommittedAndProducedButNeverAppliedIsReported)
     EXPECT_EQ(ledger.unapplied().front(), a);
 }
 
-TEST(CasTxnApplyLedger, ClampedTransactionIsNotReported)
+TEST(CASTxnApplyLedger, ClampedTransactionIsNotReported)
 {
     /// A clamped log emits deltas into the per-log staging buffer that is then DISCARDED; it is never
     /// committed, so it must not be reported unapplied.
@@ -51,7 +51,7 @@ TEST(CasTxnApplyLedger, ClampedTransactionIsNotReported)
 /// The reducers mark `applied` by indexing the raw vector with `BlobDelta::txn_ordinal`, so the
 /// ledger's own vectors must stay index-parallel with the ordinals it hands out. Pin that: the
 /// ordinal is the position, and every parallel vector grows with it.
-TEST(CasTxnApplyLedger, OrdinalsIndexTheParallelVectors)
+TEST(CASTxnApplyLedger, OrdinalsIndexTheParallelVectors)
 {
     TxnApplyLedger ledger;
     EXPECT_EQ(ledger.open(RootNamespace{"a"}, RefTxnId{1, 7}), 0u);
@@ -67,7 +67,7 @@ TEST(CasTxnApplyLedger, OrdinalsIndexTheParallelVectors)
 /// PROBE B2's reach, pinned as a property rather than left to prose: a delta consumed by a reducer
 /// clears its transaction, and only the transaction whose ordinal was never written stays reported.
 /// This is the exact shape a delta lost in gc-shard routing produces.
-TEST(CasTxnApplyLedger, OnlyTheTransactionWhoseDeltasVanishedIsReported)
+TEST(CASTxnApplyLedger, OnlyTheTransactionWhoseDeltasVanishedIsReported)
 {
     TxnApplyLedger ledger;
     const uint32_t routed = ledger.open(RootNamespace{"ns"}, RefTxnId{1, 1});
@@ -91,7 +91,7 @@ TEST(CasTxnApplyLedger, OnlyTheTransactionWhoseDeltasVanishedIsReported)
 /// fold's hot path — and pins that a routed delta marks its ordinal while an ordinal no delta carries
 /// stays unmarked. Without this the fold-side wiring would only ever be covered negatively (the gate
 /// does not throw), which cannot distinguish "the probe is correct" from "the probe is inert".
-TEST(CasTxnApplyLedger, ReducerMarksTheOrdinalOfEveryDeltaItConsumes)
+TEST(CASTxnApplyLedger, ReducerMarksTheOrdinalOfEveryDeltaItConsumes)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -132,7 +132,7 @@ TEST(CasTxnApplyLedger, ReducerMarksTheOrdinalOfEveryDeltaItConsumes)
 /// collapse to nothing inside the set merge (an unmatched `-1` changes no state and emits no row), so
 /// a mark placed at run flush instead of at consumption would silently skip exactly this case and
 /// report a healthy round as lossy.
-TEST(CasTxnApplyLedger, ReducerMarksAnUnmatchedRemovalDelta)
+TEST(CASTxnApplyLedger, ReducerMarksAnUnmatchedRemovalDelta)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};

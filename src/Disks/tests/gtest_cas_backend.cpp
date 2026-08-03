@@ -52,7 +52,7 @@ struct NullBackend final : Backend
 
     WriteSinkPtr putIfAbsentStream(const String & /*key*/, const ObjectMeta & /*meta*/) override
     {
-        return nullptr;   /// trivial default — streaming behavior is pinned by the CasBackendContract suite
+        return nullptr;   /// trivial default — streaming behavior is pinned by the CASBackendContract suite
     }
 
     PutResult putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, const ObjectMeta & /*meta*/) override
@@ -78,7 +78,7 @@ struct NullBackend final : Backend
     bool supportsListTokens() const override { return false; }
 };
 
-TEST(CasBackend, NullBackendShapeAndDefaults)
+TEST(CASBackend, NullBackendShapeAndDefaults)
 {
     NullBackend b;
     // Use the base-class reference so virtual dispatch uses base-class default args.
@@ -124,7 +124,7 @@ TEST(CasBackend, NullBackendShapeAndDefaults)
 // Task 3: CasInMemoryBackend — enforcing token semantics
 // =====================================================================
 
-TEST(CasInMemory, PutIfAbsentAndGet)
+TEST(CASInMemory, PutIfAbsentAndGet)
 {
     InMemoryBackend b;
     const auto put = b.putIfAbsent("k", "v1");
@@ -139,7 +139,7 @@ TEST(CasInMemory, PutIfAbsentAndGet)
     EXPECT_FALSE(b.get("absent").has_value());
 }
 
-TEST(CasInMemory, OverwriteIsTokenExactAndMintsFreshToken)
+TEST(CASInMemory, OverwriteIsTokenExactAndMintsFreshToken)
 {
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
@@ -151,7 +151,7 @@ TEST(CasInMemory, OverwriteIsTokenExactAndMintsFreshToken)
     EXPECT_EQ(b.get("k")->bytes, "v2");
 }
 
-TEST(CasInMemory, CasPutCreateAndSwap)
+TEST(CASInMemory, CasPutCreateAndSwap)
 {
     InMemoryBackend b;
     const auto create = b.casPut("m", "s1", std::nullopt);
@@ -164,7 +164,7 @@ TEST(CasInMemory, CasPutCreateAndSwap)
     EXPECT_EQ(b.get("m")->bytes, "s2");
 }
 
-TEST(CasInMemory, DeleteExactEnforced)
+TEST(CASInMemory, DeleteExactEnforced)
 {
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
@@ -178,7 +178,7 @@ TEST(CasInMemory, DeleteExactEnforced)
     EXPECT_EQ(b.deleteExact("k", t1).kind, DeleteOutcome::Kind::NotFound);
 }
 
-TEST(CasInMemory, RangeGetAndHeadAndList)
+TEST(CASInMemory, RangeGetAndHeadAndList)
 {
     InMemoryBackend b;
     b.putIfAbsent("p/a", "0123456789");
@@ -206,7 +206,7 @@ TEST(CasInMemory, RangeGetAndHeadAndList)
 // Task 4: CasInMemoryBackend — fault injection and probe-test modes
 // =====================================================================
 
-TEST(CasInMemoryFaults, HeldDeleteLandsLater)
+TEST(CASInMemoryFaults, HeldDeleteLandsLater)
 {
     InMemoryBackend b;
     const Token t1 = b.putIfAbsent("k", "v1").token;
@@ -222,7 +222,7 @@ TEST(CasInMemoryFaults, HeldDeleteLandsLater)
     EXPECT_EQ(b.get("k")->bytes, "v1'");
 }
 
-TEST(CasInMemoryFaults, InjectedCasConflictFiresOnce)
+TEST(CASInMemoryFaults, InjectedCasConflictFiresOnce)
 {
     InMemoryBackend b;
     const Token t1 = b.casPut("m", "s1", std::nullopt).token;
@@ -232,7 +232,7 @@ TEST(CasInMemoryFaults, InjectedCasConflictFiresOnce)
     EXPECT_EQ(b.casPut("m", "s2", t1).outcome, CasOutcome::Committed);    // next attempt is real
 }
 
-TEST(CasInMemoryFaults, NonEnforcingModeMimicsBadBackend)
+TEST(CASInMemoryFaults, NonEnforcingModeMimicsBadBackend)
 {
     InMemoryBackend b;
     b.setEnforceTokens(false);                        // MinIO-OSS-shaped backend
@@ -242,7 +242,7 @@ TEST(CasInMemoryFaults, NonEnforcingModeMimicsBadBackend)
     EXPECT_FALSE(b.get("k").has_value());
 }
 
-TEST(CasInMemoryFaults, VersioningMarkerMode)
+TEST(CASInMemoryFaults, VersioningMarkerMode)
 {
     InMemoryBackend b;
     b.setSimulateDeleteMarkers(true);
@@ -250,7 +250,7 @@ TEST(CasInMemoryFaults, VersioningMarkerMode)
     EXPECT_TRUE(b.deleteExact("k", t1).created_delete_marker);    // probe must reject this pool
 }
 
-TEST(CasInMemoryBackend, RoundTripsUserMetadata)
+TEST(CASInMemoryBackend, RoundTripsUserMetadata)
 {
     DB::Cas::InMemoryBackend backend;
     const DB::Cas::ObjectMeta meta{{"cas_owner", "ab:7:42"}};
@@ -269,7 +269,7 @@ TEST(CasInMemoryBackend, RoundTripsUserMetadata)
 // getStream seam (forward-only reads of write-once objects)
 // =====================================================================
 
-TEST(CasBackendStream, StreamsBodyWindow)
+TEST(CASBackendStream, StreamsBodyWindow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     backend->putIfAbsent("k", "0123456789");
@@ -295,7 +295,7 @@ extern const Event CASBlobHeadMiss;
 extern const Event CASGcCompareSwap;
 }
 
-TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
+TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 {
     /// Namespace classification by substring.
     EXPECT_EQ(classifyCasNs("pool/blobs/ab/abcdef"), CasNs::Blob);
@@ -370,7 +370,7 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 /// string ("PreconditionFailed", "NoSuchKey", ...) that `S3Exception` carries from the response XML
 /// `<Code>` — a 412 is UNMODELED for the AWS SDK (the enum value is UNKNOWN), so the name is the only
 /// machine-readable signal.
-TEST(CasS3Signal, S3ExceptionCarriesCanonicalErrorName)
+TEST(CASS3Signal, S3ExceptionCarriesCanonicalErrorName)
 {
     DB::S3Exception e("412 from backend", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
     EXPECT_EQ(e.getExceptionName(), "PreconditionFailed");
@@ -406,7 +406,7 @@ private:
 /// detail::finalizeConditionalWrite maps a lost precondition to an OUTCOME by exact-matching the
 /// canonical S3 error name (plus the modeled NO_SUCH_KEY enum, which WriteBufferFromS3 surfaces
 /// nameless on retry exhaustion) and rethrows anything else.
-TEST(CasS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
+TEST(CASS3Signal, FinalizeClassifierMapsPreconditionLossExactly)
 {
     using DB::Cas::detail::finalizeConditionalWrite;
 
@@ -509,7 +509,7 @@ DB::ObjectStoragePtr makeAttributePreservingStorageForTest()
 /// `HeadResult::attributes` on `head`. Verified here over an attribute-preserving object storage
 /// (the production `LocalObjectStorage` drops attributes); the live S3/RustFS round trip is verified
 /// empirically out-of-band.
-TEST(CasObjectStorageBackend, EmulatedRoundTripsUserMetadata)
+TEST(CASObjectStorageBackend, EmulatedRoundTripsUserMetadata)
 {
     ObjectStorageBackend backend(makeAttributePreservingStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
 
@@ -596,7 +596,7 @@ ThrowOnReadFixture makeThrowOnReadStorageForTest(const std::string & key_suffix)
 /// `ObjectStorageBackend::get` in `Native` mode: when `tryGetObjectMetadata` (`nativeHead`) reports the
 /// key PRESENT but `readObject` throws `S3Exception(NO_SUCH_KEY)` — simulating a deletion in the
 /// HEAD→GET window — `get` MUST return `std::nullopt` rather than letting the raw exception escape.
-TEST(CasObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
+TEST(CASObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
 {
     /// The Native mode backend uses the key verbatim as the physical path (no emu_root prefix), so the
     /// logical key IS the physical one the fixture wrote and armed.
@@ -621,7 +621,7 @@ TEST(CasObjectStorageBackend, NativeModeGetReturnsNulloptOnMidGetNoSuchKey)
 /// same clamping the old read-whole-then-substr path had: a window whose offset is at or past EOF
 /// yields an empty result. The only-the-window I/O property (no whole-object read) is enforced by
 /// the `readObjectRanged` rewrite and cross-checked by the request-size gate in a later task.
-TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
+TEST(CASObjectStorageBackend, RangedGetReadsOnlyTheWindow)
 {
     auto backend = std::make_shared<ObjectStorageBackend>(
         tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
@@ -649,7 +649,7 @@ TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
 /// value that TEXTUALLY collides with a token persisted before the restart (e.g. a GC condemned-delete
 /// token queued for replay), even though the two values name completely different incarnations of the
 /// key. `deleteExact` must never let a stale, pre-restart token match a freshly recreated object.
-TEST(CasObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
+TEST(CASObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
 {
     auto storage = tests::makeLocalObjectStorageForTest();
 
@@ -688,7 +688,7 @@ TEST(CasObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
 /// fail-safe leak (never a wrong delete), but every consumer of listed tokens (GC namespace cleanup,
 /// `deletePrefixWholesale`, orphan sweep, decommission drain) always saw `TokenMismatch` against a
 /// LOCAL pool. `list` must surface the SAME (type, value) as `head` for the same key.
-TEST(CasObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
+TEST(CASObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
 {
     auto backend = std::make_shared<ObjectStorageBackend>(
         tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
@@ -745,7 +745,7 @@ DB::ObjectStoragePtr makeFixedEtagStorageForTest()
 /// whose underlying etag does not advance between them (stubbed here to model a coarse clock) must
 /// still mint DISTINCT emulated tokens, and a stale token from the first incarnation must not match
 /// the second.
-TEST(CasObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
+TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
 {
     ObjectStorageBackend backend(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
 
@@ -845,7 +845,7 @@ DB::ObjectStoragePtr makeClockEtagStorageForTest(const std::shared_ptr<std::atom
 /// lifetime of the backend instance. `deleteExact` erases a key's entry only when its last-minted
 /// etag is comfortably (>= 2s) in the past — recent enough to still collide with an immediate
 /// same-process recreate must be RETAINED (the mtime-quantum guard stays intact).
-TEST(CasObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfortablyOld)
+TEST(CASObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfortablyOld)
 {
     /// An etag far in the past (nanoseconds since epoch, ~2001): delete must erase the entry, so an
     /// immediate recreate reporting the SAME fixed etag is treated as a brand-new incarnation (bare
@@ -885,7 +885,7 @@ TEST(CasObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
     }
 }
 
-TEST(CasObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKeys)
+TEST(CASObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKeys)
 {
     constexpr uint64_t start_ns = 1'700'000'000'000'000'000ULL;
     constexpr uint64_t step_ns = 100'000'000ULL;
@@ -970,7 +970,7 @@ DB::ObjectStoragePtr makeCallCountingStorageForTest()
 /// blind to `Token::type`. A wrong-dialect token whose VALUE happens to equal the live incarnation's
 /// must be rejected LOCALLY -- before any wire call is made -- never merely rely on the remote
 /// backend to reject a foreign-dialect value it was never designed to compare.
-TEST(CasObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWire)
+TEST(CASObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWire)
 {
     auto storage = std::static_pointer_cast<CallCountingObjectStorage>(makeCallCountingStorageForTest());
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
@@ -999,7 +999,7 @@ TEST(CasObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWir
 /// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
 /// ~1 MiB. `casSizedReadSettings` shrinks the buffer to the known body size + slack, capped at the
 /// caller's default — never larger than before, regardless of the reported size.
-TEST(CasSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
+TEST(CASSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
 {
     DB::ReadSettings base;
     base.remote_fs_settings.buffer_size = 1ULL << 20;   /// 1 MiB default

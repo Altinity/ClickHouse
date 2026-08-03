@@ -57,7 +57,7 @@ PartManifest sample()
 
 }
 
-TEST(CasFormatBattery, PartManifest)
+TEST(CASFormatBattery, PartManifest)
 {
     const PartManifest m = sample();
     /// Interpolate the REAL digest (never hand-compute a CityHash128 hex by hand) so the golden text
@@ -76,7 +76,7 @@ TEST(CasFormatBattery, PartManifest)
         golden});
 }
 
-TEST(CasPartManifestFormat, RoundTripDescriptorAndEntries)
+TEST(CASPartManifestFormat, RoundTripDescriptorAndEntries)
 {
     const PartManifest m = sample();
     const PartManifest got = decodePartManifest(encodePartManifest(m));
@@ -97,7 +97,7 @@ TEST(CasPartManifestFormat, RoundTripDescriptorAndEntries)
     EXPECT_EQ(got.entries[1].inline_bytes, "hello world!");
 }
 
-TEST(CasPartManifestFormat, EmptyEntriesRoundTrips)
+TEST(CASPartManifestFormat, EmptyEntriesRoundTrips)
 {
     PartManifest m = sample();
     m.entries.clear();
@@ -109,7 +109,7 @@ TEST(CasPartManifestFormat, EmptyEntriesRoundTrips)
     EXPECT_FALSE(encodePartManifest(m).contains("==>"));
 }
 
-TEST(CasPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
+TEST(CASPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
 {
     const String text = encodePartManifest(sample());
     EXPECT_NE(text.find("\"pm\":\"blob\""), String::npos);
@@ -127,7 +127,7 @@ TEST(CasPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
 /// embedded '\n', a NUL byte, and a '"' character round-trip byte-faithfully. If this content were
 /// carried as a JSON string value it would need escaping (or would be flatly invalid for the NUL
 /// byte); the payload zone instead carries it as raw length-delimited bytes.
-TEST(CasPartManifestFormat, InlineBytesWithEmbeddedSpecialCharsRoundTripByteFaithfully)
+TEST(CASPartManifestFormat, InlineBytesWithEmbeddedSpecialCharsRoundTripByteFaithfully)
 {
     PartManifest m;
     m.ref = ManifestRef{7, 21, 2};
@@ -148,7 +148,7 @@ TEST(CasPartManifestFormat, InlineBytesWithEmbeddedSpecialCharsRoundTripByteFait
     EXPECT_EQ(got.entries[0].inline_bytes.size(), e.inline_bytes.size());
 }
 
-TEST(CasPartManifestFormat, ByteDeterminism)
+TEST(CASPartManifestFormat, ByteDeterminism)
 {
     const PartManifest m = sample();
     /// Encode twice -> identical bytes. Also encode a copy with entries pre-shuffled into the other
@@ -159,7 +159,7 @@ TEST(CasPartManifestFormat, ByteDeterminism)
     EXPECT_EQ(encodePartManifest(m), encodePartManifest(m2));
 }
 
-TEST(CasPartManifestFormat, MixedAlgoEntriesRoundTrip)
+TEST(CASPartManifestFormat, MixedAlgoEntriesRoundTrip)
 {
     PartManifest m;
     m.ref = ManifestRef{9, 33, 4};
@@ -215,7 +215,7 @@ static PartManifest manifestWithSinglePath(std::string_view path)
 /// hygiene as CasLayout::checkNamespace -- relative, no empty/'.'/'..' segments, no leading '/'.
 /// `encodePartManifest` does not itself reject these (see `manifestWithSinglePath`), so each case
 /// must fail closed at decode time instead.
-TEST(CasPartManifestFormat, DecodeRejectsMalformedEntryPaths)
+TEST(CASPartManifestFormat, DecodeRejectsMalformedEntryPaths)
 {
     for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
     {
@@ -227,7 +227,7 @@ TEST(CasPartManifestFormat, DecodeRejectsMalformedEntryPaths)
 
 /// Legal projection subdirectories (`<projection>.proj/<file>`) must not be caught by the shape
 /// check above -- it is syntactic only, not a directory-depth restriction.
-TEST(CasPartManifestFormat, DecodeAcceptsLegalProjectionSubdirPath)
+TEST(CASPartManifestFormat, DecodeAcceptsLegalProjectionSubdirPath)
 {
     const PartManifest m = manifestWithSinglePath("proj.proj/data.bin");
     const PartManifest got = decodePartManifest(encodePartManifest(m));
@@ -235,7 +235,7 @@ TEST(CasPartManifestFormat, DecodeAcceptsLegalProjectionSubdirPath)
     EXPECT_EQ(got.entries[0].path, "proj.proj/data.bin");
 }
 
-TEST(CasPartManifestFormat, DuplicatePathRejectedOnEncode)
+TEST(CASPartManifestFormat, DuplicatePathRejectedOnEncode)
 {
     PartManifest m = sample();
     ManifestEntry dup = m.entries[0];   /// same path as an existing entry
@@ -247,7 +247,7 @@ TEST(CasPartManifestFormat, DuplicatePathRejectedOnEncode)
 /// helpers needed - this is a text format, lines carry no per-line checksum). Both entries are Blob
 /// (no payload-zone bytes), so the swap cannot disturb payload-zone alignment - it isolates exactly
 /// the ordering check.
-TEST(CasPartManifestFormat, DecodeRejectsOutOfOrderEntries)
+TEST(CASPartManifestFormat, DecodeRejectsOutOfOrderEntries)
 {
     PartManifest m;
     m.ref = ManifestRef{11, 44, 5};
@@ -293,7 +293,7 @@ TEST(CasPartManifestFormat, DecodeRejectsOutOfOrderEntries)
 /// adjacent pairs" implementation would miss this (c is only ever compared against b, never against
 /// a); requiring strict ascending order against just the immediately-preceding entry still catches
 /// it, because the forged c(=a's path) is no longer greater than b either.
-TEST(CasPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
+TEST(CASPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
 {
     PartManifest m;
     m.ref = ManifestRef{13, 55, 6};
@@ -321,7 +321,7 @@ TEST(CasPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
 }
 
-TEST(CasPartManifestFormat, UnknownEntryAlgoFailsClosed)
+TEST(CASPartManifestFormat, UnknownEntryAlgoFailsClosed)
 {
     String bad = encodePartManifest(sample());
     const String needle = R"("ha":"ch128")";
@@ -334,7 +334,7 @@ TEST(CasPartManifestFormat, UnknownEntryAlgoFailsClosed)
 /// `DigestCodec::fromHex` throws BAD_ARGUMENTS (not CORRUPTED_DATA) on a width mismatch; decode must
 /// check the width itself first so this fails closed with the same code every other decode error
 /// here uses.
-TEST(CasPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
+TEST(CASPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
 {
     String bad = encodePartManifest(sample());
     const String key = R"("h":")";
@@ -351,7 +351,7 @@ TEST(CasPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
 /// Pure-function properties of computePayloadDigest, independent of decode-time verification: stable
 /// across calls for identical content, independent of the payload_digest field's own value, and
 /// content-sensitive (changes when real content changes).
-TEST(CasPartManifestFormat, PayloadDigestStableAndContentSensitive)
+TEST(CASPartManifestFormat, PayloadDigestStableAndContentSensitive)
 {
     const PartManifest m = sample();
     PartManifest with_different_stored_digest = m;
@@ -369,7 +369,7 @@ TEST(CasPartManifestFormat, PayloadDigestStableAndContentSensitive)
 
 /// No-smuggling: one extra trailing byte after the last payload-zone segment (or after the trailer,
 /// when there are no Inline entries) must be rejected - exercises the final `!in.eof()` check.
-TEST(CasPartManifestFormat, TrailingByteAfterPayloadZoneFailsClosed)
+TEST(CASPartManifestFormat, TrailingByteAfterPayloadZoneFailsClosed)
 {
     String bad = encodePartManifest(sample());
     bad += "X";
@@ -381,7 +381,7 @@ TEST(CasPartManifestFormat, TrailingByteAfterPayloadZoneFailsClosed)
 /// edited). The record's declared `il` is what decode uses both to build the expected banner text
 /// and to know how many bytes to read from the zone, so this must fail closed rather than silently
 /// reading the wrong byte count.
-TEST(CasPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClosed)
+TEST(CASPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClosed)
 {
     String bad = encodePartManifest(sample());
     const String needle = "\"il\":12";
@@ -396,14 +396,14 @@ TEST(CasPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClos
 /// functions carried over verbatim from the retired binary codec (untouched by the wire-shape
 /// migration) — reusing this file's own sample() fixture instead of reintroducing a second one. ====
 
-TEST(CasPartManifestFormat, RefMatchesBodyAcceptsExactRef)
+TEST(CASPartManifestFormat, RefMatchesBodyAcceptsExactRef)
 {
     const PartManifest m = sample();
     /// The journal ref equals the body ref -> true.
     EXPECT_TRUE(refMatchesBody(m.ref, m));
 }
 
-TEST(CasPartManifestFormat, RefMatchesBodyRejectsEachFieldMismatch)
+TEST(CASPartManifestFormat, RefMatchesBodyRejectsEachFieldMismatch)
 {
     const PartManifest m = sample();
     ManifestRef wrong_writer = m.ref; wrong_writer.writer_epoch = m.ref.writer_epoch + 1;
@@ -414,13 +414,13 @@ TEST(CasPartManifestFormat, RefMatchesBodyRejectsEachFieldMismatch)
     EXPECT_FALSE(refMatchesBody(wrong_inst, m));
 }
 
-TEST(CasPartManifestFormat, ManifestNamespaceMatchesAcceptsOwningNs)
+TEST(CASPartManifestFormat, ManifestNamespaceMatchesAcceptsOwningNs)
 {
     const PartManifest m = sample();
     EXPECT_TRUE(manifestNamespaceMatches(m.root_namespace_id, m));
 }
 
-TEST(CasPartManifestFormat, ManifestNamespaceMatchesRejectsForeignNs)
+TEST(CASPartManifestFormat, ManifestNamespaceMatchesRejectsForeignNs)
 {
     const PartManifest m = sample();
     /// sample()'s namespace is "00/aa@cas@" — pick a genuinely foreign one and a strict-prefix one.
@@ -429,7 +429,7 @@ TEST(CasPartManifestFormat, ManifestNamespaceMatchesRejectsForeignNs)
     EXPECT_FALSE(manifestNamespaceMatches(RootNamespace("00/aa"), m));
 }
 
-TEST(CasPartManifestFormat, FindEntryBinarySearch)
+TEST(CASPartManifestFormat, FindEntryBinarySearch)
 {
     std::vector<ManifestEntry> entries;
     for (const char * p : {"a.txt", "b/inner.txt", "b/z.txt", "c.txt"})
@@ -448,7 +448,7 @@ TEST(CasPartManifestFormat, FindEntryBinarySearch)
     EXPECT_EQ(findEntry({}, "a"), nullptr);                   /// empty
 }
 
-TEST(CasPartManifestFormat, EntryRangeContiguousPrefix)
+TEST(CASPartManifestFormat, EntryRangeContiguousPrefix)
 {
     std::vector<ManifestEntry> entries;
     for (const char * p : {"a.txt", "p.proj/data.bin", "p.proj/x.txt", "q.txt"})

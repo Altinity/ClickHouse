@@ -48,7 +48,7 @@ public:
 };
 }
 
-TEST(CasHeartbeat, AnchorCarriesFloor)
+TEST(CASHeartbeat, AnchorCarriesFloor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -71,7 +71,7 @@ TEST(CasHeartbeat, AnchorCarriesFloor)
     EXPECT_FALSE(m.gc_fenced);
 }
 
-TEST(CasHeartbeat, RenewRereadsCallbackAndBumpsSeq)
+TEST(CASHeartbeat, RenewRereadsCallbackAndBumpsSeq)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -96,7 +96,7 @@ TEST(CasHeartbeat, RenewRereadsCallbackAndBumpsSeq)
     EXPECT_EQ(m.expires_at_ms, 1500u + 100u);
 }
 
-TEST(CasHeartbeat, StopStampsExpiredAndFarewellSentinel)
+TEST(CASHeartbeat, StopStampsExpiredAndFarewellSentinel)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -123,7 +123,7 @@ TEST(CasHeartbeat, StopStampsExpiredAndFarewellSentinel)
 /// (uuid, epoch), unfenced, is state UNCERTAINTY (an ambiguous landed renewal of ours, or a
 /// same-pair twin after epoch-state loss) — fail closed via fence + self-remount, never an
 /// exception that aborts debug/ASan builds at construction.
-TEST(CasHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
+TEST(CASHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -164,7 +164,7 @@ TEST(CasHeartbeat, SameEpochUnfencedTouchIsUncertainNotFatal)
 
 /// A body under our own uuid but a NEWER writer_epoch is proven supersession — a normal fencing
 /// outcome (the TLA model's localLost), fail closed but never an abort.
-TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
+TEST(CASHeartbeat, SupersededTouchIsFailClosedNotFatal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -203,7 +203,7 @@ TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
 /// was the defect: the arm raised `LOGICAL_ERROR`, which aborts at CONSTRUCTION in debug/ASan builds,
 /// and it does so on the keeper's BACKGROUND thread — so an environment-reachable condition (clear the
 /// prefix, recreate under a different server id, and the survivor's next renewal lands there; see
-/// `CasRefContiguousAlloc.SurvivingWriterIsFencedByTheRecreatedPoolsMount`, which drives exactly that)
+/// `CASRefContiguousAlloc.SurvivingWriterIsFencedByTheRecreatedPoolsMount`, which drives exactly that)
 /// took the whole server down, and took the ASan gate down with it.
 ///
 /// What must NOT change is the outcome, which is what this test now pins: `renewOnce` throws, the throw
@@ -211,7 +211,7 @@ TEST(CasHeartbeat, SupersededTouchIsFailClosedNotFatal)
 /// sibling fencing arms use, which the background loop turns into a latched write fence. The
 /// `abort_on_logical_error` arming is deliberately kept: with it ON, a `LOGICAL_ERROR` would still abort,
 /// so reaching the `EXPECT_THROW` at all is the proof that this condition is no longer classified as one.
-TEST(CasHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
+TEST(CASHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -259,7 +259,7 @@ TEST(CasHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
 /// Mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE and every
 /// OBSERVED foreign/conflicting body becomes an event, carrying the conflicting body's identity —
 /// the payload the chronic "touched by a foreign writer" collisions need to be diagnosable.
-TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
+TEST(CASMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -289,7 +289,7 @@ TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
 
 /// The MountLeaseKeeper wiring: `start` adopting an already-claimed slot emits mount_claim, `stop`
 /// (the farewell write) emits mount_release.
-TEST(CasMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
+TEST(CASMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -321,7 +321,7 @@ TEST(CasMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
 /// a keeper for a DIFFERENT uuid (Y) tries to claim it. This must fail closed and — since the
 /// mount-audit sink is not yet installed at first-open — name X in the exception's message text
 /// (the only identity carrier in err.log at that point). MountConflict payload coverage is above.
-TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
+TEST(CASMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -352,7 +352,7 @@ TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
 /// claimed anything. Teardown must not throw "release before start"; there is nothing to release. A
 /// stop AFTER a successful start still performs the farewell (covered by
 /// `StopStampsExpiredAndFarewellSentinel` above); a genuinely-started DOUBLE terminate stays loud.
-TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
+TEST(CASHeartbeat, StopBeforeStartIsQuietNoOp)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -369,7 +369,7 @@ TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
 /// recoverable `MountFencedException`, distinct from the generic "touched by a foreign writer"
 /// `LOGICAL_ERROR` — the open path (Task 4) tells "re-open with a fresh epoch" apart from "fail hard"
 /// by this code, not by parsing message text.
-TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
+TEST(CASMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -416,7 +416,7 @@ TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
 /// fence our OWN (uuid, epoch) mount slot after our lease expires (a late renewal beat racing the
 /// GC's fence-out). The keeper must re-read and recognize this as its OWN incarnation being fenced —
 /// a recoverable `MountFencedException`, not the generic single-writer-violation text.
-TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
+TEST(CASHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -466,7 +466,7 @@ TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 /// confirmed `onRenewMismatch`) must not fence while the last confirmed lease still has more than
 /// `lease_safety_margin` left before it would expire -- the mount-lease protocol guarantees no other
 /// writer can claim the slot before that deadline, so riding it out is safe.
-TEST(CasHeartbeat, TransientRetryStaysWithinLeaseDeadline)
+TEST(CASHeartbeat, TransientRetryStaysWithinLeaseDeadline)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -498,7 +498,7 @@ TEST(CasHeartbeat, TransientRetryStaysWithinLeaseDeadline)
 /// `CasPool.cpp`'s note that unit tests drive `renewOnce` directly and never through the loop, so this
 /// test calls the promoted `onRenewSucceeded` itself to model exactly what one successful real beat
 /// does), not by a bare `renewOnce` call in isolation.
-TEST(CasHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
+TEST(CASHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -530,7 +530,7 @@ TEST(CasHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
 /// `onRenewSucceeded` refreshed `confirmed_deadline_ms`, so a direct `renewOnce` call left the wall
 /// deadline stale at the pre-redo anchor. A successful renewal must refresh the deadline regardless
 /// of who called `renewOnce` -- background loop or a direct caller alike.
-TEST(CasHeartbeat, DirectRenewOnceRefreshesConfirmedDeadlineWithoutOnRenewSucceeded)
+TEST(CASHeartbeat, DirectRenewOnceRefreshesConfirmedDeadlineWithoutOnRenewSucceeded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -581,7 +581,7 @@ public:
 
 /// Real background thread: two transient faults, then the third beat lands. The loop must NOT stop and
 /// must NOT fence (on_lost never fires) -- it just keeps retrying at the normal period.
-TEST(CasHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping)
+TEST(CASHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping)
 {
     auto backend = std::make_shared<TransientPutOverwriteFaultBackend>();
     Layout layout("pool");
@@ -629,7 +629,7 @@ TEST(CasHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping
 /// fatal (it throws `ABORTED`, not `LOGICAL_ERROR`), so the loop must recover via `on_lost` instead
 /// of dying -- observe the fence the same way `BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping`
 /// observes non-fencing.
-TEST(CasHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
+TEST(CASHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -692,7 +692,7 @@ public:
 /// renews with the now-stale token, gets a CONFIRMED mismatch, re-reads our own advanced body ->
 /// the Phase A uncertain branch -> the loop stops, on_lost fires (fence latches; in production the
 /// Pool self-remounts from there). No process death anywhere.
-TEST(CasHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
+TEST(CASHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
 {
     auto backend = std::make_shared<ApplyThenThrowPutOverwriteFaultBackend>();
     Layout layout("pool");
@@ -729,7 +729,7 @@ TEST(CasHeartbeat, BackgroundLoopSurvivesAmbiguousLandedRenewal)
 
 /// Phase B: the confirmed-lease deadline anchors at the ATTEMPT-START instant, not the response
 /// instant — a slow ack must not extend the local fence past what the durable body authorizes.
-TEST(CasHeartbeat, RenewDeadlineAnchorsAtAttemptStartNotResponseTime)
+TEST(CASHeartbeat, RenewDeadlineAnchorsAtAttemptStartNotResponseTime)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");

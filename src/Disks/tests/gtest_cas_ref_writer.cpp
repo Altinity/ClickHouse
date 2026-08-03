@@ -85,9 +85,9 @@ namespace
 /// reached, and the product correctly does not wedge -- flipping every wedge expectation downstream.
 ///
 /// That is not hypothetical. It took down
-/// `CasRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` on 5 of 6 sanitizer
-/// CI runs (fixed in `8f9e63c7a19`), `CasRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
-/// under parallel-build load, and `CasRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`
+/// `CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` on 5 of 6 sanitizer
+/// CI runs (fixed in `8f9e63c7a19`), `CASRefInstallSafety.UncertainPrecommitKeepsItsCleanupOwnerAndItsBody`
+/// under parallel-build load, and `CASRefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`
 /// in a full-binary ASan run -- the last one with the mechanism named verbatim in the thrown message
 /// ("refused BEFORE any request was sent ... the operation deadline rejected before the first request").
 ///
@@ -715,7 +715,7 @@ private:
 /// Recovery (spec §Recovery / exact checkpoint grounding)
 /// ===================================================================================
 
-TEST(CasRefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
+TEST(CASRefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -726,7 +726,7 @@ TEST(CasRefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
     EXPECT_EQ(store->refRecoveryRestartsForTest(ns), 0u);
 }
 
-TEST(CasRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
+TEST(CASRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -748,7 +748,7 @@ TEST(CasRefWriterNonMinting, ListRefsOnAbsentNamespaceDoesNotMutateCatalog)
     EXPECT_EQ(catalog_after->token, catalog_before->token);
 }
 
-TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation)
+TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocalInvalidation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -810,7 +810,7 @@ TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsCatalogLifeReplacedWithoutLocal
     EXPECT_EQ(*store->refTableLifeForTest(ns), successor_life);
 }
 
-TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
+TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -848,7 +848,7 @@ TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsReplacementByExternalPoolActor)
         NamespaceLifeId::fromCatalogEntry(successor.ns, successor.incarnation));
 }
 
-TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsUnrelatedCatalogMutationBetweenObservations)
+TEST(CASRefWriterRuntimeIdentity, ColdReadRejectsUnrelatedCatalogMutationBetweenObservations)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -870,7 +870,7 @@ TEST(CasRefWriterRuntimeIdentity, ColdReadRejectsUnrelatedCatalogMutationBetween
     EXPECT_NO_THROW((void)store->listRefs(ns));
 }
 
-TEST(CasRefWriterRuntimeIdentity, WarmReadableRuntimeDoesNotReadCatalog)
+TEST(CASRefWriterRuntimeIdentity, WarmReadableRuntimeDoesNotReadCatalog)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -888,7 +888,7 @@ TEST(CasRefWriterRuntimeIdentity, WarmReadableRuntimeDoesNotReadCatalog)
 
 /// `DROP DETACHED PART` reaches this point lookup for a part that may already be absent. Its probe
 /// must not turn a missing table namespace into a new catalog life.
-TEST(CasRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
+TEST(CASRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -910,7 +910,7 @@ TEST(CasRefWriterNonMinting, ResolveRefOnAbsentNamespaceDoesNotMutateCatalog)
     EXPECT_EQ(catalog_after->token, catalog_before->token);
 }
 
-TEST(CasRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
+TEST(CASRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -934,7 +934,7 @@ TEST(CasRefWriterNonMinting, DropNamespaceOnAbsentNamespaceDoesNotMutateCatalog)
 
 /// A table born by a log tail alone (no snapshot yet): `namespace_birth` with nothing else is a legal
 /// Live-but-empty table.
-TEST(CasRefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
+TEST(CASRefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -954,7 +954,7 @@ TEST(CasRefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
 
 /// Empty base + birth log recovery (spec unit test list): birth and the first precommit->promote span
 /// TWO separate log transactions with no snapshot at all.
-TEST(CasRefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
+TEST(CASRefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -983,7 +983,7 @@ TEST(CasRefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     EXPECT_TRUE(refs.contains("part_1"));
 }
 
-TEST(CasRefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSameLifeRebirth)
+TEST(CASRefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSameLifeRebirth)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -1022,7 +1022,7 @@ TEST(CasRefWriterRecovery, TerminalGapBelowCheckpointFrontierIsCorruptionNotSame
 /// drops "a" and publishes "b", and a STALE log at/below the snapshot id that must be ignored (its
 /// content, if replayed, would corrupt the result -- proving the "ignore log keys at or below the
 /// selected snapshot" rule).
-TEST(CasRefWriterRecovery, SnapshotPlusTailRecovery)
+TEST(CASRefWriterRecovery, SnapshotPlusTailRecovery)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -1070,7 +1070,7 @@ TEST(CasRefWriterRecovery, SnapshotPlusTailRecovery)
 /// Restart-on-vanish (spec §Recovery): the checkpoint-named snapshot vanishes during its exact GET
 /// while concurrent cleanup publishes a newer checkpoint base. Recovery must restart from the newer
 /// exact checkpoint, not treat the vanish as corruption.
-TEST(CasRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
+TEST(CASRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -1132,7 +1132,7 @@ TEST(CasRefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
 
 /// A DIFFERENT valid object at the exact snapshot key (not merely absent) is corruption, never a
 /// restart signal -- pins the boundary between "vanished" (restart) and "corrupt" (fail closed).
-TEST(CasRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
+TEST(CASRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -1179,7 +1179,7 @@ TEST(CasRefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestar
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================
 
-TEST(CasRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
+TEST(CASRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1327,7 +1327,7 @@ TEST(CasRefWriterAppendLane, CommittedChunkPublishesFrontierBeforeInstallAndAck)
     EXPECT_EQ(durable_ckpt->ckpt.committed_through, expected_frontier);
 }
 
-TEST(CasRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall)
+TEST(CASRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1359,7 +1359,7 @@ TEST(CasRefWriterAppendLane, CheckpointConflictAfterLogCommitRequiresRecoveryWit
         << "no later id may be allocated above an unfrontiered durable transaction";
 }
 
-TEST(CasRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
+TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecoveryWithoutInstall)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1394,7 +1394,7 @@ TEST(CasRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
 /// `flushRefBatch` did not materialize `rt->state.committed` after installing each flush's
 /// transaction, the overlay would grow by ~1 entry per flush and this would read back ~N,
 /// defeating the whole point of the COW map for a long-running table.
-TEST(CasRefWriterAppendLane, MaterializeKeepsOverlaySmallAcrossManyIsolatedFlushes)
+TEST(CASRefWriterAppendLane, MaterializeKeepsOverlaySmallAcrossManyIsolatedFlushes)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1409,7 +1409,7 @@ TEST(CasRefWriterAppendLane, MaterializeKeepsOverlaySmallAcrossManyIsolatedFlush
 }
 
 /// `B` compatible queued mutations share one create (spec §Writer Budget).
-TEST(CasRefWriterAppendLane, CompatibleMutationsShareOneCreate)
+TEST(CASRefWriterAppendLane, CompatibleMutationsShareOneCreate)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1453,7 +1453,7 @@ TEST(CasRefWriterAppendLane, CompatibleMutationsShareOneCreate)
 
 /// An invalid queued request returns its own exception without entering the transaction; the
 /// co-batched neighbor still lands, in the SAME one create.
-TEST(CasRefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
+TEST(CASRefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1502,7 +1502,7 @@ TEST(CasRefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
 /// Append lane: wedge semantics (spec §Writer-Side Linearization)
 /// ===================================================================================
 
-TEST(CasRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
+TEST(CASRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1540,7 +1540,7 @@ TEST(CasRefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     EXPECT_FALSE(store->resolveRef(ns_a, "x").has_value()) << "the wedged drop was adopted on resolution";
 }
 
-TEST(CasRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
+TEST(CASRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1580,7 +1580,7 @@ TEST(CasRefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 /// it; and the resolution must fold its applied overlay in place (no residual committed overlay). Under
 /// the default 256-log / 1 MiB snapshot thresholds this handful of txns never triggers a publish, so the
 /// tail counter is a stable running count.
-TEST(CasRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
+TEST(CASRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1624,7 +1624,7 @@ TEST(CasRefWriterAppendLane, WedgeResolutionJoinsTailCountersAndFoldsOverlay)
 /// `system.cas_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
 /// wedge -- neither a cached-but-healthy table nor an unrelated table's own successful mutation may move
 /// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
-TEST(CasRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)
+TEST(CASRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1682,7 +1682,7 @@ TEST(CasRefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroug
 ///   the FENCE is mount-wide -- while it is closed EVERY lane is refused, including untouched ones;
 ///   the DAMAGE is per-namespace -- a real remount replaces both immutable runtimes, then recovery of
 ///   the damaged stream still refuses while the unrelated table commits normally.
-TEST(CasRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
+TEST(CASRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemount)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -1747,7 +1747,7 @@ TEST(CasRefWriterAppendLane, I1AppendCorruptionSurfacesAndFencesTheMountForRemou
 /// builds, so the whole test had to be release-only with a death-test twin standing in elsewhere.
 /// Storage-controlled input must never be able to abort the server, so the arm now reports the
 /// occupant for what it is -- corruption -- and one test covers every build.
-TEST(CasRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
+TEST(CASRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1813,7 +1813,7 @@ TEST(CasRefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndFaultsLane)
 /// event -- the full anomaly-policy reaction, not just the throw. It runs in every build now that the
 /// arm reports `CORRUPTED_DATA` instead of the process-aborting `LOGICAL_ERROR`; the death twin that
 /// used to stand in for debug/sanitizer builds went with it.
-TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
+TEST(CASAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1871,7 +1871,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 /// An impossible non-`Ready` state at new-id allocation must refuse before minting an id, fault the
 /// lane, and trigger the anomaly policy. The synthetic wedge is injected after the top-of-flush
 /// resolver gate, so it represents an internal lifecycle contradiction rather than a normal wedge.
-TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
+TEST(CASAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     SynchronizedEventLog seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -1937,7 +1937,7 @@ TEST(CasAnomalyPolicy, NonReadyAtNewIdAllocationFaultsAndFailsClosed)
 /// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
 /// failed (the mount fence was lost after the write may have landed) is counted separately, not folded
 /// into the generic Unresolved classifier (spec §Late Predecessor PUT best-effort diagnostic).
-TEST(CasRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
+TEST(CASRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<CountingBackend>();
@@ -1959,7 +1959,7 @@ TEST(CasRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
 /// incarnation's token — from the attempt's own PutResult, and equally from a resolve that proves an
 /// earlier ambiguous attempt landed — so audit emitters (`PartWriteTxn::stageManifest`'s `ManifestPut`
 /// event) keep their token without a follow-up HEAD.
-TEST(CasRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
+TEST(CASRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
 {
     auto backend = std::make_shared<CountingBackend>();
     CasRequestController ctrl(backend, CasRequestBudget{}, [] { return static_cast<uint64_t>(0); });
@@ -1986,7 +1986,7 @@ TEST(CasRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
 /// most-recently-touched one resident, and an evicted table re-recovers its exact committed state on the
 /// next touch (spec §Startup And Recovery: "Evicting the table drops the entire object; the next access
 /// repeats recovery").
-TEST(CasRefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
+TEST(CASRefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPoolWithConfig(backend,
@@ -2015,7 +2015,7 @@ TEST(CasRefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
 }
 
 /// A zero budget disables eviction entirely: every touched table stays resident.
-TEST(CasRefTableCacheEviction, ZeroBudgetDisablesEviction)
+TEST(CASRefTableCacheEviction, ZeroBudgetDisablesEviction)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPoolWithConfig(backend,
@@ -2028,7 +2028,7 @@ TEST(CasRefTableCacheEviction, ZeroBudgetDisablesEviction)
 /// A table with a WEDGED append lane is never evicted, even when idle and over budget: its uncertain
 /// in-flight PUT is not reconstructable from the durable objects (spec §Writer-Side Linearization), so
 /// re-recovery must not be allowed to drop and re-materialize it (which could re-allocate an id).
-TEST(CasRefTableCacheEviction, WedgedTableIsNeverEvicted)
+TEST(CASRefTableCacheEviction, WedgedTableIsNeverEvicted)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -2067,7 +2067,7 @@ TEST(CasRefTableCacheEviction, WedgedTableIsNeverEvicted)
 /// equal an INDEPENDENT oracle's replay of the same logs through the published id (cache-replay
 /// equivalence), and the retained tail must be fully pruned afterward (spec: "Publication is
 /// background and never blocks an append").
-TEST(CasRefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentBytes)
+TEST(CASRefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentBytes)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2100,7 +2100,7 @@ TEST(CasRefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalent
 /// A publisher owns the runtime it captured, not the logical name. If that exact life is deleted and
 /// the name is reborn while snapshot bytes are still only local, the old attempt must become inert: in
 /// particular it must not recreate the predecessor's `_snap` or `_ckpt` after the GC retired them.
-TEST(CasRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameRebirth)
+TEST(CASRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameRebirth)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -2190,7 +2190,7 @@ TEST(CasRefWriterSnapshotPublish, CapturedPredecessorCannotPublishAfterSameNameR
 /// The runtime admission check belongs inside every retrying `_ckpt` CAS attempt, not merely before
 /// calling the checkpoint helper. Retirement in the body-PUT/checkpoint gap leaves the already-written
 /// snapshot as harmless debris but must not advance or recreate the predecessor checkpoint.
-TEST(CasRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapshotPut)
+TEST(CASRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapshotPut)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -2276,7 +2276,7 @@ TEST(CasRefWriterSnapshotPublish, RetiredPredecessorCannotAdvanceCkptAfterSnapsh
 /// A read that already owns the predecessor runtime does not consult the name slot again after a
 /// same-name successor is published. Because removal applies the terminal state before retirement, a
 /// reader paused immediately before its state lock resumes with `NotFound`, never successor data.
-TEST(CasRefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
+TEST(CASRefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -2351,7 +2351,7 @@ TEST(CasRefWriterRuntimeIdentity, CapturedReaderCannotRetargetSameNameSuccessor)
 /// Ordinary append admission also owns the runtime it captured. If removal and rebirth complete before
 /// enqueue, the predecessor's closed lane returns retry-later; it cannot enqueue into or mutate the
 /// successor even when the successor deliberately reuses the same logical ref name.
-TEST(CasRefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccessor)
+TEST(CASRefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccessor)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -2424,7 +2424,7 @@ TEST(CasRefWriterRuntimeIdentity, CapturedAppendCannotEnqueueIntoSameNameSuccess
 
 /// Exact retirement is pointer/key scoped. A delayed notification for the predecessor may arrive after
 /// its same-name successor is already attached; it must not erase or poison that successor slot.
-TEST(CasRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAttached)
+TEST(CASRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAttached)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -2465,7 +2465,7 @@ TEST(CasRefWriterRuntimeIdentity, LatePredecessorInvalidationLeavesSuccessorAtta
 /// Task 13 (spec §implementation-impact): a threshold snapshot publish increments the writer-side
 /// observability counters -- snapshot PUT bytes and the tail-logs-compacted count
 /// (logs-per-table-after-snapshot). Before/after deltas prove both sites fire.
-TEST(CasRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
+TEST(CASRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 {
     using ProfileEvents::global_counters;
     const auto bytes_before = global_counters[ProfileEvents::CASRefSnapshotPutBytes].load();
@@ -2494,7 +2494,7 @@ TEST(CasRefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
 /// snapshot-serializable; one ordinary successor makes the inherited over-threshold tail publishable.
 /// The single successor alone is below the threshold, so the dispatch still proves the mount-time tail
 /// was retained rather than forgotten during recovery.
-TEST(CasRefWriterSnapshotPublish, MountTimeRecoveredLargeTailPublishesAfterOrdinarySuccessor)
+TEST(CASRefWriterSnapshotPublish, MountTimeRecoveredLargeTailPublishesAfterOrdinarySuccessor)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2549,7 +2549,7 @@ TEST(CasRefWriterSnapshotPublish, MountTimeRecoveredLargeTailPublishesAfterOrdin
 
 /// A just-committed txn is covered by a publish forced immediately afterward -- no fake clock, no
 /// aging, no waiting: the OLD grace-window code would have published nothing here at all.
-TEST(CasRefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
+TEST(CASRefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2578,7 +2578,7 @@ TEST(CasRefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
 
 /// The count trigger fires purely off the tail counters -- no aging involved -- even under a boot
 /// clock that never advances (the old code REQUIRED aging past `snapshot_min_log_age_ms` to fire).
-TEST(CasRefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
+TEST(CASRefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2606,7 +2606,7 @@ TEST(CasRefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
 /// on the live counters. After adoption, the counters must equal precisely the amount appended AFTER
 /// the copy -- not zero (would drop the new txns from the next publish trigger) and not negative/
 /// wrapped (an unsigned underflow).
-TEST(CasRefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurrentAppends)
+TEST(CASRefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurrentAppends)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/publish_from_live_adoption"};
@@ -2633,7 +2633,7 @@ TEST(CasRefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurre
 /// Publication must never block a concurrent append on the SAME table (spec: "Publication is
 /// background and never blocks an append"): while a dispatched background publish is stuck mid-PUT, an
 /// ordinary mutation on the table must still complete promptly (a real deadlock would hang this test).
-TEST(CasRefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
+TEST(CASRefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2669,7 +2669,7 @@ TEST(CasRefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
 /// reference alone. Then unblocks it with no live Pool handle anywhere in this test any more -- a
 /// dangling-pointer crash here would abort the whole test binary, the strongest possible signal for
 /// this specific hazard.
-TEST(CasRefWriterSnapshotPublish, PublishThreadOutlivesDroppedPoolHandleWithoutCrashing)
+TEST(CASRefWriterSnapshotPublish, PublishThreadOutlivesDroppedPoolHandleWithoutCrashing)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/publish_outlives_store"};
@@ -2701,7 +2701,7 @@ TEST(CasRefWriterSnapshotPublish, PublishThreadOutlivesDroppedPoolHandleWithoutC
 /// between, so the NEXT published snapshot would silently omit committed transactions and recovery
 /// would lose refs. Deterministic, sleep-free: the fake backend blocks publish #1's PUT (capturing
 /// exactly its key) while a higher-id publish #2 runs to completion, then unblocks #1.
-TEST(CasRefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorDropCommittedTxns)
+TEST(CASRefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorDropCommittedTxns)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2771,7 +2771,7 @@ TEST(CasRefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseN
 /// storm trigger in a release build -- no `chassert` to catch it). Deterministic, sleep-free: two
 /// `_snap` PUTs are parked independently (both past their own capture, neither yet adopted) via
 /// `armPutBlockIndependently`, then released in the specific order that reproduces the hazard.
-TEST(CasRefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOutOfOrderAdoption)
+TEST(CASRefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOutOfOrderAdoption)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2841,7 +2841,7 @@ TEST(CasRefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOn
 
 /// Under a saturated backend (every `_snap` PUT is Unresolved), the read path must NOT re-dispatch a
 /// publish on each read: the failure arms the backoff, and while it holds no read re-dispatches.
-TEST(CasRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
+TEST(CASRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2884,7 +2884,7 @@ TEST(CasRefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublis
 /// is not snapshot-serializable, so admission itself must reject it: letting execution reject it would
 /// make settlement immediately dispatch another identical background attempt. A later ordinary record
 /// must re-enable the same scheduler.
-TEST(CasRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntilOrdinarySuccessor)
+TEST(CASRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUntilOrdinarySuccessor)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -2942,7 +2942,7 @@ TEST(CasRefWriterSnapshotPublish, RecoveredSealAboveThresholdDoesNotRedispatchUn
 
 /// While one background publish is in flight (blocked mid-PUT), further reads must NOT dispatch a
 /// second: the single-in-flight gate holds `pending_snapshot_publishes` at one per table.
-TEST(CasRefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
+TEST(CASRefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/c4_gate"};
@@ -2972,7 +2972,7 @@ TEST(CasRefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
 
 /// A non-Committed publish defers the next dispatch by the backoff, then a read past the backoff
 /// deadline dispatches exactly one retry that publishes a durable snapshot (freshness preserved).
-TEST(CasRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
+TEST(CASRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -3032,7 +3032,7 @@ TEST(CasRefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
 /// After a successful publish adopts `newest_snapshot_id`, the trigger arithmetic must restart from
 /// zero above it, not keep counting the table's already-covered history: 4 covered + 2 fresh entries
 /// must read as 2 (below a 3 threshold), never as 6.
-TEST(CasRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
+TEST(CASRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -3081,7 +3081,7 @@ TEST(CasRefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
 
 /// A predecessor's dangling (never-promoted) precommits are swept by the successor mount's first touch
 /// of the table; a precommit the SUCCESSOR itself adds under its OWN (current) epoch must survive.
-TEST(CasRefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpoch)
+TEST(CASRefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpoch)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/precommit_sweep_basic"};
@@ -3119,7 +3119,7 @@ TEST(CasRefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrent
 /// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (a later retry
 /// on this mount, or the next mount's recovery) to find." (Same-mount retry is pinned separately by
 /// `FailedSweepRearmsAndRetriesUntilClean`.)
-TEST(CasRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMounts)
+TEST(CASRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMounts)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -3208,7 +3208,7 @@ TEST(CasRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
     /// abandoned mid-wedge above -- Task 5's drain fails closed on an unresolved PUT, so no clean
     /// farewell was written -> this reclaim is `MountPriorState::UncleanObserved` (rev.6 Task 4), which
     /// pays a real ~36.5s token-stability observation wait here. Inject a fake `boot_ms_fn` +
-    /// `wait_sleep_fn` (mirroring `CasMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so it
+    /// `wait_sleep_fn` (mirroring `CASMountOpenWaits.UncleanOpenPaysOnlyTheObservationWindow`) so it
     /// resolves instantly.
     uint64_t resumer_fake_boot = 0;
     PoolConfig resumer_config;
@@ -3255,7 +3255,7 @@ TEST(CasRefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossM
 /// trigger -- here a mutation -- retries until a pass completes verified clean, clearing the flag
 /// permanently. Each reclaimed binding is audited: one `precommit_reclaim` CA-log event + one
 /// `CASRefStalePrecommitsReclaimed` increment, exactly per binding.
-TEST(CasRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
+TEST(CASRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -3366,7 +3366,7 @@ TEST(CasRefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 /// Verified-clean semantics: a sweep that finds NOTHING stale clears the flag on its very first pass
 /// and emits no reclaim event (so "no abandons" and "reclaim broken" stay distinguishable in the
 /// audit log).
-TEST(CasRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
+TEST(CASRefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -3482,7 +3482,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 /// A fence-loss generation is a rejection marker, not a runtime admission token. If remount then loses
 /// to a foreign owner, neither a warm name nor a never-seen name may select/materialize a runtime under
 /// that intermediate generation; the predecessor remains only as a detached diagnostic object.
-TEST(CasRefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneration)
+TEST(CASRefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneration)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3527,7 +3527,7 @@ TEST(CasRefWriterRemount, FailedRemountPublishesNoRuntimeUnderFenceLossGeneratio
 
 /// C1/N1 (stale cache): a warm table whose committed ref a twin durably dropped must re-recover to the
 /// twin's view after a self-remount. The unfixed code kept the stale cache and still resolved the ref.
-TEST(CasRefWriterRemount, ReRecoversStaleCacheToTwinDrop)
+TEST(CASRefWriterRemount, ReRecoversStaleCacheToTwinDrop)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3565,7 +3565,7 @@ TEST(CasRefWriterRemount, ReRecoversStaleCacheToTwinDrop)
 /// incarnation's live epoch, landing strictly above a twin's durable log (the pagination premise
 /// "a new log is never inserted at or below an already durable table log id"). The unfixed code stamped
 /// the stale open-time epoch, which sorts BELOW a higher-epoch twin log.
-TEST(CasRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
+TEST(CASRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3596,7 +3596,7 @@ TEST(CasRefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 /// wedged runtime cached across the remount. The drop is a plain cache detach and needs to certify
 /// nothing: the undecided PUT the wedge describes is settled by the seal the next recovery writes into
 /// its slot -- see `quiesceRefTablesForRemount`'s doc comment (`CasPool.h`).
-TEST(CasRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
+TEST(CASRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -3606,7 +3606,7 @@ TEST(CasRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 
     auto backend = std::make_shared<RefWriterTestBackend>();
     /// The self-remount below blocks on nothing (see
-    /// `CasRemountWaits.UnresolvedWedgeRemountPaysNoWaitEither`, `gtest_cas_pool.cpp`); the injected
+    /// `CASRemountWaits.UnresolvedWedgeRemountPaysNoWaitEither`, `gtest_cas_pool.cpp`); the injected
     /// `boot_ms_fn`/`wait_sleep_fn` keep this test off the real clock anyway.
     uint64_t fake_boot = 0;
     PoolConfig config;
@@ -3644,7 +3644,7 @@ TEST(CasRefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 /// fence-loss + remount window must NOT, on resume, allocate an id and PUT a transaction validated
 /// against its now-stale detached cache. The pre-allocate `superseded_by_remount` re-check fails it
 /// closed: the caller gets the failure and no backend `_log` object is created.
-TEST(CasRefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
+TEST(CASRefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     /// This test parks a flush leader (`leader_active` stays true) across the ENTIRE `tryRemountOnce`
@@ -3717,7 +3717,7 @@ TEST(CasRefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 
 /// A cached writer paused after its ordinary gates must re-check the exact catalog life immediately
 /// before id allocation. A concurrent `Live -> Removing` transition therefore admits no late owner.
-TEST(CasRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemovingIsPublished)
+TEST(CASRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemovingIsPublished)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3798,7 +3798,7 @@ TEST(CasRefWriterNamespaceRemoval, CachedPositiveWriterCannotAppendAfterRemoving
 
 /// dropNamespace's ONE body transaction names an exact removal for every committed ref AND every
 /// dangling precommit, with `remove_namespace` as the FINAL op -- never any other shape.
-TEST(CasRefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
+TEST(CASRefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3854,7 +3854,7 @@ TEST(CasRefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
 
 /// The terminal transaction is the only durable removal record. Generation 7 never publishes a
 /// terminal `Removed` snapshot; the ordinary cleanup/janitor paths own old immutable stream debris.
-TEST(CasRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSnapshot)
+TEST(CASRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSnapshot)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3893,7 +3893,7 @@ TEST(CasRefWriterNamespaceRemoval, RemovalPublishesTerminalLogWithoutTerminalSna
 /// the table on every future recovery and permanently wedging this table's lane). Drives
 /// `appendRefOps` directly with a deliberately malformed multi-op item (remove_namespace not last) to
 /// prove the whole-item shape check now rejects it BEFORE any backend object is created.
-TEST(CasRefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejectedBeforeAnyCreate)
+TEST(CASRefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejectedBeforeAnyCreate)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3926,7 +3926,7 @@ TEST(CasRefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalReje
 /// A caller cannot turn the generic append surface into a second namespace-removal capability, even
 /// when it disguises terminal operations as an ordinary mutation kind. Only `dropNamespace` may carry
 /// the exact runtime ownership established by the durable `Live -> Removing` transition.
-TEST(CasRefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogIsLive)
+TEST(CASRefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogIsLive)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -3972,7 +3972,7 @@ TEST(CasRefWriterNamespaceRemoval, GenericAppendCannotWriteTerminalWhileCatalogI
 /// The public generic surface must reject the terminal-capable operation kind before resolving or
 /// creating a life. Otherwise an absent name can acquire a catalog row and checkpoint before the
 /// internal terminal capability check rejects the actual operations.
-TEST(CasRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurableMutation)
+TEST(CASRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurableMutation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4005,7 +4005,7 @@ TEST(CasRefWriterNamespaceRemoval, GenericTerminalOnAbsentNamePerformsZeroDurabl
 
 /// A namespace file births a catalog life and checkpoint without necessarily creating a ref stream.
 /// Removing that table must still publish terminal evidence and let GC retire the catalog row.
-TEST(CasRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemoval)
+TEST(CASRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemoval)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4046,7 +4046,7 @@ TEST(CasRefWriterNamespaceRemoval, CatalogedNamespaceFilesOnlyLifeCompletesRemov
 
 /// If the first catalog read after closing the positive lane fails, the catch-side authoritative read
 /// is still allowed to prove the exact original `Live` row and reopen admission.
-TEST(CasRefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveLane)
+TEST(CASRefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveLane)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4073,7 +4073,7 @@ TEST(CasRefWriterNamespaceRemoval, PredurableCatalogReadFailureReopensExactLiveL
 /// build for the removed namespace must be cancelled once (and only once) the removal is durable: its
 /// next operation throws (ABORTED, from requireAlive) rather than promoting a fresh committed ref into
 /// the just-removed namespace.
-TEST(CasRefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows)
+TEST(CASRefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4104,7 +4104,7 @@ TEST(CasRefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThr
 
 /// The catalog transition precedes the terminal append. If that append is unresolved, the namespace
 /// remains `Removing`, positive ownership is refused, and a retry of the same removal resolves the wedge.
-TEST(CasRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCompletes)
+TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCompletes)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -4145,7 +4145,7 @@ TEST(CasRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
 
 /// Cancellation is namespace-scoped: dropping namespace N must not cancel an in-flight build targeting a
 /// DIFFERENT namespace M -- that build promotes normally.
-TEST(CasRefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespaces)
+TEST(CASRefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespaces)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4168,7 +4168,7 @@ TEST(CasRefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamesp
 
 /// A writer-side create/resolution cannot reuse the predecessor while its catalog row is `Removing`.
 /// Both the resident-runtime and fresh-runtime paths return typed retry-later without a durable write.
-TEST(CasRefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
+TEST(CASRefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/create-while-removing"};
@@ -4195,7 +4195,7 @@ TEST(CasRefWriterNamespaceRemoval, CreateAgainstRemovingRetriesWithoutMutation)
 
 /// Same-name rebirth must not inherit the predecessor's physical life or folded cursor even when the
 /// writer mount and its per-name runtime stay resident throughout the complete real removal sequence.
-TEST(CasRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResidentLifeAndStartsAtZeroCoverage)
+TEST(CASRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResidentLifeAndStartsAtZeroCoverage)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4323,7 +4323,7 @@ TEST(CasRefWriterNamespaceRemoval, SameNameSameWriterEpochRebirthInvalidatesResi
 /// Losing the response to an erase that committed must not strand the same resident writer runtime
 /// behind its old removal-admission gate. A complete resolution read proves the exact old row absent,
 /// so the same name can be born immediately under a fresh incarnation without inheriting coverage.
-TEST(CasRefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResidentRuntimeImmediately)
+TEST(CASRefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResidentRuntimeImmediately)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4364,7 +4364,7 @@ TEST(CasRefWriterNamespaceRemoval, CommitThenThrowEraseResolvesAndRebindsResiden
 
 /// If another actor wins the erase race by replacing the exact old row, `EntryChanged` still proves
 /// the predecessor life dead and must invalidate its resident runtime.
-TEST(CasRefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredecessorLife)
+TEST(CASRefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredecessorLife)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4398,7 +4398,7 @@ TEST(CasRefWriterNamespaceRemoval, OtherWinnerReplacementInvalidatesExactPredece
 
 /// Failure to read the catalog while resolving a lost erase response is not success. A later fresh
 /// name lookup nevertheless observes the old exact row absent and reconciles the resident runtime.
-TEST(CasRefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolutionReadFailure)
+TEST(CASRefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolutionReadFailure)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4425,7 +4425,7 @@ TEST(CasRefWriterNamespaceRemoval, LaterNameLookupReconcilesAfterEraseResolution
 
 /// The normal post-LIST catalog cut is also a reconciliation point. It repairs a missed local
 /// invalidation before any later writer touches the name.
-TEST(CasRefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvalidation)
+TEST(CASRefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvalidation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     PoolConfig config;
@@ -4455,7 +4455,7 @@ TEST(CasRefWriterNamespaceRemoval, PostListCatalogCutReconcilesMissedEraseInvali
 
 /// The writer assignment site may pin an already-`Live` catalog life, but recovering that empty life
 /// performs no catalog or stream mutation. It must install the exact incarnation from the observed row.
-TEST(CasRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation)
+TEST(CASRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutation)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4482,7 +4482,7 @@ TEST(CasRefWriterNamespaceBirth, ExistingLiveCatalogRowPinsExactLifeWithoutMutat
 /// A read of a never-born name may observe the catalog, but it must not allocate the local name slot
 /// or a life runtime. Otherwise arbitrary read traffic can fill the cache with identity-less runtimes,
 /// and a later birth has to mutate one of those objects into a different identity.
-TEST(CasRefWriterNamespaceBirth, NeverBornReadAllocatesNoRuntime)
+TEST(CASRefWriterNamespaceBirth, NeverBornReadAllocatesNoRuntime)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4496,7 +4496,7 @@ TEST(CasRefWriterNamespaceBirth, NeverBornReadAllocatesNoRuntime)
 }
 
 /// A never-born namespace follows the ordinary catalog-first birth path.
-TEST(CasRefWriterNamespaceBirth, BirthFromNeverBornUsesOrdinaryPath)
+TEST(CASRefWriterNamespaceBirth, BirthFromNeverBornUsesOrdinaryPath)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4512,7 +4512,7 @@ TEST(CasRefWriterNamespaceBirth, BirthFromNeverBornUsesOrdinaryPath)
 /// the pre-carve hook (mirrors `CompatibleMutationsShareOneCreate`), must NOT co-batch: per-request undo
 /// validates each op against the pre-batch state, so the batch carries at most one op per ref name and
 /// the two flush as two separate `_log` objects.
-TEST(CasRefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
+TEST(CASRefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);
@@ -4602,7 +4602,7 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
 }
 
 /// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
-/// `claimMount` followed by a GC fence-out -- mirrors `CasMountOpenWaits.FencedPriorReclaimsWithoutAnyWait`. A fenced
+/// `claimMount` followed by a GC fence-out -- mirrors `CASMountOpenWaits.FencedPriorReclaimsWithoutAnyWait`. A fenced
 /// prior is an immediate certificate of death (`claimMountAwaitingExpiry` reclaims it on its FIRST
 /// attempt, no observation polling), so a fake-clocked successor `Pool::open` above it becomes
 /// unclean deterministically, without any real sleep.
@@ -4614,7 +4614,7 @@ void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint6
 
 /// The budget every seal test's successor `Pool::open` uses: a 500ms lease TTL needs a scaled-down
 /// budget (RFC cas-s3-timeout-retry-control §required-timeout-model: attempt_timeout + safety_margin <
-/// lease TTL) -- mirrors `CasMountOpenWaits.FencedPriorReclaimsWithoutAnyWait` exactly.
+/// lease TTL) -- mirrors `CASMountOpenWaits.FencedPriorReclaimsWithoutAnyWait` exactly.
 CasRequestBudget sealTestTinyBudget()
 {
     return CasRequestBudget{
@@ -4625,7 +4625,7 @@ CasRequestBudget sealTestTinyBudget()
 }
 
 /// The `RefWriterRecoverySeal` suite is RETIRED with the sentinel seal it pinned, and the replacement is
-/// `gtest_cas_ref_recovery_cas_walk.cpp` (`CasRefRecoveryCasWalk`), which covers the same duties against
+/// `gtest_cas_ref_recovery_cas_walk.cpp` (`CASRefRecoveryCasWalk`), which covers the same duties against
 /// the in-band mechanism: a dead epoch closed at `{E, T+1}`, a concurrent recoverer's seal adopted, a
 /// straggler adopted and re-sealed at the new `T+1`, chained seals across burned epochs, and genesis.
 ///
@@ -4639,7 +4639,7 @@ CasRequestBudget sealTestTinyBudget()
 ///     replacement is what makes the detector unnecessary: the seal occupies the ghost's own log key, so
 ///     a late PUT is REFUSED by the store instead of landing somewhere a reader must learn to ignore.
 ///   - the `sealed_from` inventory assertions are gone with the field; the chain link recovery installs
-///     is `last_epoch_seal`, asserted in the new suite and in `CasRecoveryStreaming`'s inventory test.
+///     is `last_epoch_seal`, asserted in the new suite and in `CASRecoveryStreaming`'s inventory test.
 ///
 /// The fixtures above (`seedSealFixtureDeadEpochs`, `seedUncleanPredecessorMount`, `sealTestTinyBudget`)
 /// are KEPT: the recovery-retry suite below drives the same dead-epoch shape.
@@ -4651,7 +4651,7 @@ CasRequestBudget sealTestTinyBudget()
 /// brake still fail fast.
 /// ===================================================================================
 
-TEST(CasRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
+TEST(CASRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -4700,7 +4700,7 @@ TEST(CasRefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2);
 }
 
-TEST(CasRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
+TEST(CASRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
 {
     /// A recovery stream LIST used to be a transient failure leg. The checkpoint now names both the
     /// base and frontier, so the same injected failures must remain untouched while recovery seals.
@@ -4742,7 +4742,7 @@ TEST(CasRefWriterRecoveryRetry, RecoveryDoesNotEnumerateItsStream)
         << "two dead epochs (1 and 2) are closed without enumerating their stream";
 }
 
-TEST(CasRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
+TEST(CASRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -4777,7 +4777,7 @@ TEST(CasRefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
 }
 
-TEST(CasRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
+TEST(CASRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -4809,7 +4809,7 @@ TEST(CasRefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
     EXPECT_EQ(sleep_calls, 0u) << "a non-transient error must fail fast with zero backoff sleeps";
 }
 
-TEST(CasRefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
+TEST(CASRefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -4856,7 +4856,7 @@ TEST(CasRefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     EXPECT_EQ(sleep_calls, 0u) << "no backoff sleep for missing immutable checkpoint authority";
 }
 
-TEST(CasRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
+TEST(CASRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
 {
     /// If the backoff sleep itself throws (e.g. a clock syscall failure), the retry loop must re-acquire
     /// state_mutex before unwinding so the SCOPE_EXIT that clears `recovery_in_progress` runs LOCKED --
@@ -4903,7 +4903,7 @@ TEST(CasRefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
 /// without materializing the full ref map (an early-exit scan).
 /// ===================================================================================
 
-TEST(CasRefWriterListRefs, HasAnyRefWithPrefixMatchesListRefsEmptiness)
+TEST(CASRefWriterListRefs, HasAnyRefWithPrefixMatchesListRefsEmptiness)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend);

@@ -61,7 +61,7 @@ ManifestId publishOneBlobPart(
 /// B170/Task 1 (Part A audit events): `PartWriteTxn::stageManifest` writes a part-manifest body but never
 /// emitted an audit row for it — the log could not answer "when was this manifest written." Verifies
 /// the emitted `ManifestPut` event (exactly once per successful stage).
-TEST(CasObservability, StageManifestEmitsManifestPut)
+TEST(CASObservability, StageManifestEmitsManifestPut)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -92,7 +92,7 @@ TEST(CasObservability, StageManifestEmitsManifestPut)
 /// audited the removal — the log could not distinguish "never precommitted" from "precommitted then
 /// abandoned." Verifies the emitted `PrecommitRemoved` event (exactly once, only when a precommit was
 /// actually live).
-TEST(CasObservability, AbandonEmitsPrecommitRemoved)
+TEST(CASObservability, AbandonEmitsPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -125,7 +125,7 @@ TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 
 /// A build that never precommitted has nothing to remove: `abandon` must not fabricate a
 /// `PrecommitRemoved` row for a binding that was never live.
-TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
+TEST(CASObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -152,12 +152,12 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 /// observation hook — which double-emitted `blob_retire` alongside `blob_retire_replaced` and
 /// double-counted `CASGcRetiredCondemned` for what is really ONE physical condemnation (the resurrect
 /// replaced a stale retired entry with the current token). Drives the same condemn-A / resurrect-B /
-/// drop-B sequence as `CasGcLeak.ResurrectReplacedIncarnationReclaimed`, then isolates the ONE round
+/// drop-B sequence as `CASGcLeak.ResurrectReplacedIncarnationReclaimed`, then isolates the ONE round
 /// that folds B's create+drop and supersedes A's stale retired entry: that round must emit exactly one
 /// `blob_retire_replaced` (carrying the STALE token A in `detail["superseded_token"]`), ZERO
 /// `blob_retire` for this hash, one `CASGcRetireReplaced` increment, and NO `CASGcRetiredCondemned`
 /// double-count.
-TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
+TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -254,7 +254,7 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 
 /// The legacy mutable ref-shard object is gone (snapshot+log ref model); inspect now decodes the two
 /// immutable ref objects. A `_snap/<id>.proto` renders as a ref-table snapshot...
-TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
+TEST(CASObservability, CaInspectDecodesRefSnapshotToJson)
 {
     using DB::Cas::tests::committedRow;
     using DB::Cas::tests::minimalLiveSnapshot;
@@ -276,7 +276,7 @@ TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
 }
 
 /// ...and a `_log/<txn-id>` renders as a ref-transaction log.
-TEST(CasObservability, CaInspectDecodesRefLogToJson)
+TEST(CASObservability, CaInspectDecodesRefLogToJson)
 {
     Layout layout("p");
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -297,7 +297,7 @@ TEST(CasObservability, CaInspectDecodesRefLogToJson)
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
 }
 
-TEST(CasObservability, CaInspectDecodesPartManifestToJson)
+TEST(CASObservability, CaInspectDecodesPartManifestToJson)
 {
     Layout layout("p");
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -320,7 +320,7 @@ TEST(CasObservability, CaInspectDecodesPartManifestToJson)
     EXPECT_NE(json.find("\"manifest_ordinal\":3"), String::npos);
 }
 
-TEST(CasObservability, CaInspectDecodesMountLeaseToJson)
+TEST(CASObservability, CaInspectDecodesMountLeaseToJson)
 {
     Layout layout("p");
     MountLease lease;
@@ -335,7 +335,7 @@ TEST(CasObservability, CaInspectDecodesMountLeaseToJson)
     EXPECT_NE(json.find("host1"), String::npos);
 }
 
-TEST(CasObservability, CaInspectDecodesGcStateToJson)
+TEST(CASObservability, CaInspectDecodesGcStateToJson)
 {
     Layout layout("p");
     GcState state;
@@ -348,7 +348,7 @@ TEST(CasObservability, CaInspectDecodesGcStateToJson)
     EXPECT_NE(json.find("\"gc_shards\":4"), String::npos);
 }
 
-TEST(CasObservability, CaInspectUnknownKeyThrows)
+TEST(CASObservability, CaInspectUnknownKeyThrows)
 {
     Layout layout("p");
     EXPECT_THROW(caInspectToJson(layout, "p/not/a/ca/object", "xxxx"), DB::Exception);   /// BAD_ARGUMENTS

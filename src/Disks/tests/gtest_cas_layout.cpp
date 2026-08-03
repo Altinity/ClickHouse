@@ -19,7 +19,7 @@ BlobRef prefixedRef(BlobHashAlgo algo)
 }
 }
 
-TEST(CasLayout, KeyShapes)
+TEST(CASLayout, KeyShapes)
 {
     /// Per design §10 EVERY algo carries an explicit path segment: `blobs/ch128/...`, not the legacy
     /// `blobs/...`.
@@ -32,7 +32,7 @@ TEST(CasLayout, KeyShapes)
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
 
-TEST(CasLayout, BlobKeyCarriesAlgoSegment)
+TEST(CASLayout, BlobKeyCarriesAlgoSegment)
 {
     /// Every algo gets its own segment (design §3/§10), so two algos can never collide in the key
     /// space even after a config change on a fresh pool. `Layout` itself carries no algo anymore --
@@ -57,7 +57,7 @@ TEST(CasLayout, BlobKeyCarriesAlgoSegment)
     EXPECT_EQ(l.blobsPrefix(), "p/blobs/");
 }
 
-TEST(CasLayout, RootNamespaceKeys)
+TEST(CASLayout, RootNamespaceKeys)
 {
     Layout l("p");
     RootNamespace ns{"srv1/3f2e-uuid"};
@@ -70,7 +70,7 @@ TEST(CasLayout, RootNamespaceKeys)
         "p/cas/ns/state/" + renderIncarnation(ns_id.incarnation) + "/_files/");
 }
 
-TEST(CasLayout, OpaqueLifeIdSeparatesStreamFromState)
+TEST(CASLayout, OpaqueLifeIdSeparatesStreamFromState)
 {
     /// This catches a builder that accidentally puts the logical namespace back into a life-owned
     /// key. The two different names deliberately share one physical id: object identity is the id,
@@ -92,7 +92,7 @@ TEST(CasLayout, OpaqueLifeIdSeparatesStreamFromState)
     EXPECT_EQ(l.namespaceFileKey(second, "nested/file"), l.namespaceFileKey(first, "nested/file"));
 }
 
-TEST(CasLayout, RelocatedRefAndManifestKeys)
+TEST(CASLayout, RelocatedRefAndManifestKeys)
 {
     Layout l("p");
     const RootNamespace ns{"srid/store/ab/uuid@cas@"};
@@ -115,7 +115,7 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
     EXPECT_EQ(key.find("/_manifests/"), String::npos) << key;
 }
 
-TEST(CasLayout, RootNamespaceValidation)
+TEST(CASLayout, RootNamespaceValidation)
 {
     Layout l("p");
     /// Opaque physical life keys deliberately do not inspect the logical namespace. Namespace-bearing
@@ -139,7 +139,7 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_NO_THROW(l.manifestNamespacePrefix(RootNamespace{"my_files/tbl"}));
 }
 
-TEST(CasLayout, GenerationAndRootsKeys)
+TEST(CASLayout, GenerationAndRootsKeys)
 {
     Layout l("p");
     /// rev. 15: gc/snap is gone; generations carry write-once seals + blob-target / cleanup runs.
@@ -150,7 +150,7 @@ TEST(CasLayout, GenerationAndRootsKeys)
     EXPECT_EQ(l.rootsPrefix(), "p/roots/");
 }
 
-TEST(CasLayout, AttemptScopedGenKeys)
+TEST(CASLayout, AttemptScopedGenKeys)
 {
     DB::Cas::Layout layout("p");
     EXPECT_EQ(layout.foldSealKey(4, 42), "p/gc/gen/4/attempt/42/fold_seal");
@@ -160,7 +160,7 @@ TEST(CasLayout, AttemptScopedGenKeys)
     EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
 }
 
-TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
+TEST(CASLayout, RegistryDeletedGcDiscoveryViaList)
 {
     /// Task 4: the namespace registry (`gc/registry`) is deleted; discovery authority moved to LIST.
     /// The `_registry` namespace segment is not reserved (it was only reserved while the registry lived
@@ -171,12 +171,12 @@ TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
     EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"a/_files"})));
 }
 
-TEST(CasLayout, CasArchiveSuffixConstant)
+TEST(CASLayout, CasArchiveSuffixConstant)
 {
     EXPECT_EQ(DB::Cas::kCasArchiveSuffix, "@cas@");
 }
 
-TEST(CasVfsPaths, MirroredArchiveNamespace)
+TEST(CASVfsPaths, MirroredArchiveNamespace)
 {
     using DB::Cas::mirroredArchiveNamespace;
     /// Atomic: bare uuid -> store/<u3>/<uuid>@cas@
@@ -187,7 +187,7 @@ TEST(CasVfsPaths, MirroredArchiveNamespace)
               "data/mydb/events@cas@");
 }
 
-TEST(CasLayout, ManifestKeyShape)
+TEST(CASLayout, ManifestKeyShape)
 {
     Layout l("p");
     ManifestId id;
@@ -201,7 +201,7 @@ TEST(CasLayout, ManifestKeyShape)
         "0000000000000007-0000000000000412/000001.zst");
 }
 
-TEST(CasLayout, ManifestsSegmentReserved)
+TEST(CASLayout, ManifestsSegmentReserved)
 {
     Layout l("p");
     ManifestId bad;
@@ -212,7 +212,7 @@ TEST(CasLayout, ManifestsSegmentReserved)
     EXPECT_NO_THROW(l.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(RootNamespace{"my_manifests/tbl"})));
 }
 
-TEST(CasLayout, ManifestKeyHexRoundTrip)
+TEST(CASLayout, ManifestKeyHexRoundTrip)
 {
     Layout l("p");
     ManifestId id;
@@ -247,7 +247,7 @@ TEST(CasLayout, ManifestKeyHexRoundTrip)
         "0000000000000007-000000000000008E/000042.zst").has_value());   /// uppercase hex
 }
 
-TEST(CasLayout, RefObjectKeyRoundTrips)
+TEST(CASLayout, RefObjectKeyRoundTrips)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
@@ -273,7 +273,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
 
 }
 
-TEST(CasLayout, RefObjectKeyLexicalOrder)
+TEST(CASLayout, RefObjectKeyLexicalOrder)
 {
     Layout l("p");
     const NamespaceLifeId ns_id = DB::Cas::tests::fixture::fixtureLife(RootNamespace{"srv1/tbl@cas@"});
@@ -281,7 +281,7 @@ TEST(CasLayout, RefObjectKeyLexicalOrder)
     EXPECT_LT(l.refLogKey(ns_id, id), l.refSnapshotKey(ns_id, id));
 }
 
-TEST(CasLayout, ParseRefObjectKeyRejections)
+TEST(CASLayout, ParseRefObjectKeyRejections)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
@@ -323,7 +323,7 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
 /// for the same reason `parseRefObjectKey` does: classifying an untrusted listed key is an ordinary
 /// "is this ours" question. Refusal is reserved for a key that IS ours but names no life --
 /// `gtest_cas_ref_namespace_id.cpp` owns that half.
-TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
+TEST(CASLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
 {
     Layout l("p");
     const RootNamespace ns{"srv1/tbl@cas@"};
@@ -363,7 +363,7 @@ TEST(CasLayout, RefCkptKeyRoundTripsAndRejectsEverythingElse)
 
 /// C3: blobKey/parseBlobKey are inverses; pins the grammar before relocating the definitions
 /// from CasPartWriteTxn.cpp to CasLayout.cpp (relocation must not change a single byte of output).
-TEST(CasLayout, BlobKeyRoundTripsThroughParse)
+TEST(CASLayout, BlobKeyRoundTripsThroughParse)
 {
     DB::Cas::Layout layout("pool0");
     const DB::Cas::BlobRef ref{DB::Cas::BlobHashAlgo::XXH3_128,

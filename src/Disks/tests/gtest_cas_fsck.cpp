@@ -358,7 +358,7 @@ FsckReport runCheckpointBaseFsckWithListingMode(
 }
 
 /// A committed ref whose manifest body is present and whose blobs exist => clean.
-TEST(CasFsck, CleanManifestPoolHasNoDangling)
+TEST(CASFsck, CleanManifestPoolHasNoDangling)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -374,7 +374,7 @@ TEST(CasFsck, CleanManifestPoolHasNoDangling)
 }
 
 /// A committed ref naming a MISSING manifest body is an ERROR (Dangling).
-TEST(CasFsck, OwnerVisibleMissingManifestBodyIsError)
+TEST(CASFsck, OwnerVisibleMissingManifestBodyIsError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -389,7 +389,7 @@ TEST(CasFsck, OwnerVisibleMissingManifestBodyIsError)
 }
 
 /// A committed ref whose blob body is missing is an ERROR (Dangling).
-TEST(CasFsck, ReachableBlobMissingIsError)
+TEST(CASFsck, ReachableBlobMissingIsError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -407,7 +407,7 @@ TEST(CasFsck, ReachableBlobMissingIsError)
 /// operator reaches for after something has already gone wrong, so one bad key must not make it report
 /// NOTHING -- including about the healthy namespaces it would never reach. The finding is hard (an
 /// un-incarnated key is corruption behind the format bump) and counted once per key, not once per sweep.
-TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
+TEST(CASFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -449,7 +449,7 @@ TEST(CasFsck, LifelessKeyIsRecordedAndTheHealthyNamespaceIsStillReported)
 /// catalog row is then removed entirely -- exactly what a fenced GC's exact-CAS row deletion leaves
 /// behind, before the perpetual namespace janitor's next page reaches it -- must classify as
 /// `janitor_pending`, a SOFT finding, never `lifeless_keys`. The report stays clean.
-TEST(CasFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
+TEST(CASFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -492,7 +492,7 @@ TEST(CasFsck, CanonicalDeadLifeResidueIsJanitorPendingNotHardFinding)
 
 /// The observe-then-cut race: a life admitted between fsck's namespace-tree LIST and the catalog cut
 /// it takes AFTER that listing must NOT be misread as residue. Mirrors
-/// `CasNamespaceJanitor.PostListCatalogCutProtectsConcurrentCreationWithOneGet` -- the same ordering,
+/// `CASNamespaceJanitor.PostListCatalogCutProtectsConcurrentCreationWithOneGet` -- the same ordering,
 /// the same reason: creation admits `Creating` before writing any life-owned object, so a life visible
 /// only in the LATER cut cannot have raced this listing.
 namespace
@@ -521,7 +521,7 @@ private:
 };
 }
 
-TEST(CasFsck, LifeAdmittedBetweenNamespaceListingAndLaterCutIsNotResidue)
+TEST(CASFsck, LifeAdmittedBetweenNamespaceListingAndLaterCutIsNotResidue)
 {
     const RootNamespace ns{"00/late@cas@"};
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(ns, UInt128{909});
@@ -544,7 +544,7 @@ TEST(CasFsck, LifeAdmittedBetweenNamespaceListingAndLaterCutIsNotResidue)
 /// Malformed or non-canonical namespace-tree shapes must stay HARD findings even after the
 /// janitor-pending split: a dirty `_files` relative name (the parser-asymmetry fix), a zero life id, an
 /// uppercase life id, and an unrecognized kind directory all name no current writer's grammar.
-TEST(CasFsck, MalformedNamespaceTreeShapesStayHardFindings)
+TEST(CASFsck, MalformedNamespaceTreeShapesStayHardFindings)
 {
     const Layout layout("p");
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{"00/bb@cas@"}, UInt128{909});
@@ -571,7 +571,7 @@ TEST(CasFsck, MalformedNamespaceTreeShapesStayHardFindings)
 /// Mutation caught: calling the destructive consumer's global `throwIfAmbiguous` from fsck aborts
 /// before the unique row is audited. The read-only tool reports the ambiguous physical id and
 /// continues through an unrelated unique namespace.
-TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses)
+TEST(CASFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -612,7 +612,7 @@ TEST(CasFsck, DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgr
 /// Mirrors `DuplicateLifeIdIsReportedWhileAnUnrelatedUniqueNamespaceStillProgresses`, but that fixture
 /// has no physical object under the duplicated life id, so it never drives a candidate into the new
 /// post-listing loop at all -- this is the case that actually exercises it.
-TEST(CasFsck, AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted)
+TEST(CASFsck, AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -659,7 +659,7 @@ TEST(CasFsck, AmbiguousLifeUnderAPhysicalKeyIsRecordedNotAborted)
 /// its own `_ckpt`-anchored arithmetic walk and so is reachable here. The distinct
 /// `manifestStillReferenced` recheck now receives the same frozen catalog row and exact `_ckpt` authority;
 /// its competing-cut regression is pinned separately by `MissingManifestRecheckStaysOnInitialCatalogCut`.
-TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
+TEST(CASFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend);
@@ -692,22 +692,22 @@ TEST(CasFsck, CatalogLiveNamespaceHiddenFromListIsStillWalked)
            "of its keys, or the catalog-authoritative universe supplement did not run";
 }
 
-TEST(CasFsckAuthority, FullListingDoesNotDefineStreamGeometry)
+TEST(CASFsckAuthority, FullListingDoesNotDefineStreamGeometry)
 {
     expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Full, "full"));
 }
 
-TEST(CasFsckAuthority, EmptyListingDoesNotDefineStreamGeometry)
+TEST(CASFsckAuthority, EmptyListingDoesNotDefineStreamGeometry)
 {
     expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Empty, "empty"));
 }
 
-TEST(CasFsckAuthority, PartialListingDoesNotDefineStreamGeometry)
+TEST(CASFsckAuthority, PartialListingDoesNotDefineStreamGeometry)
 {
     expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Partial, "partial"));
 }
 
-TEST(CasFsckAuthority, ReorderedListingDoesNotDefineStreamGeometry)
+TEST(CASFsckAuthority, ReorderedListingDoesNotDefineStreamGeometry)
 {
     expectListingIndependentFsck(runFsckWithListingMode(FsckListingMode::Reordered, "reordered"));
 }
@@ -717,7 +717,7 @@ TEST(CasFsckAuthority, ReorderedListingDoesNotDefineStreamGeometry)
 /// snapshot are inert garbage, while damage to the exact checkpoint base remains a hard finding under
 /// every listing. Mutation caught: the old LIST-derived snapshot oracle makes only listings that reveal
 /// the unadopted pair non-clean.
-TEST(CasFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
+TEST(CASFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
 {
     const std::array modes{
         FsckListingMode::Full,
@@ -752,7 +752,7 @@ TEST(CasFsckAuthority, StreamListingDoesNotChangeCheckpointBaseVerdict)
 
 /// A durable but unfrontiered F+1 is not part of this fsck cut. Mutation caught: probing one position
 /// beyond `_ckpt.committed_through` walks the visible record and changes both coverage and reachability.
-TEST(CasFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
+TEST(CASFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -789,7 +789,7 @@ TEST(CasFsckAuthority, VisibleFPlusOneDoesNotAffectVerdict)
 /// INV-2 materializes every burned global epoch, including an empty one, as a sequence-1 seal. A
 /// direct `{1,2}` -> `{7,1}` chain that omits `{2,1}` is therefore data loss, not a legal sparse epoch
 /// transition. Mutation caught: accepting the later head as a shortcut blesses the missing seal.
-TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
+TEST(CASFsckAuthority, MissingBurnedEpochSealIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -833,7 +833,7 @@ TEST(CasFsckAuthority, MissingBurnedEpochSealIsChainBroken)
 /// The checkpoint base is the inclusive frontier, so there is no replay tail in which another hole
 /// could satisfy this test. The missing same-id log itself makes the stable exact authority corrupt.
 /// Mutation caught: mapping every `readCheckpointSnapshotBase` failure to `Unchecked` leaves `clean` true.
-TEST(CasFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
+TEST(CASFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -853,7 +853,7 @@ TEST(CasFsckAuthority, MissingCheckpointBaseLogIsChainBroken)
 
 /// A present, valid non-seal base log rules out a stream hole; only its checkpoint-named same-id
 /// snapshot is absent. Stable exact absence is damage, not lost diagnostic coverage.
-TEST(CasFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
+TEST(CASFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -878,7 +878,7 @@ TEST(CasFsckAuthority, MissingCheckpointBaseSnapshotIsChainBroken)
 /// OLDER seal, deliberately different from `last_epoch_seal`, so comparing checkpoint metadata cannot
 /// expose it: the stream audit must exact-read the base log and reject it before recovery can bless the
 /// same-id snapshot.
-TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
+TEST(CASFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -924,7 +924,7 @@ TEST(CasFsckAuthority, CheckpointSnapshotAtOlderEpochSealIsChainBroken)
 
 /// An unstable transport failure while exact-reading the same valid checkpoint base proves neither
 /// presence nor absence. It remains the honest third answer and must not become a hard finding.
-TEST(CasFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
+TEST(CASFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
 {
     auto backend = std::make_shared<FailExactGetBackend>();
     auto store = openPoolForTest(backend);
@@ -953,7 +953,7 @@ TEST(CasFsckAuthority, CheckpointBaseTransportFailureIsUnchecked)
 /// retire its old base before fsck exact-reads it. The miss is then authority instability, not evidence
 /// that either durable checkpoint incarnation was internally corrupt.
 /// Mutation caught: classifying `CORRUPTED_DATA` without rechecking the sampled checkpoint token.
-TEST(CasFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
+TEST(CASFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
 {
     auto backend = std::make_shared<MutateOnFirstGetBackend>();
     auto store = openPoolForTest(backend);
@@ -986,7 +986,7 @@ TEST(CasFsckAuthority, CheckpointBaseVanishingAfterAuthorityAdvanceIsUnchecked)
 /// A Live catalog row without `_ckpt` is not a recoverable table, even when a listing happens to show a
 /// complete ref log. Mutation caught: replacing the authority-taking recovery with the old LIST replay
 /// makes this audit look clean and silently blesses a life whose durable frontier is unknown.
-TEST(CasFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
+TEST(CASFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1014,7 +1014,7 @@ TEST(CasFsck, LiveNamespaceWithoutCheckpointIsUnchecked)
 /// Mutation caught: re-resolve `ns` from `manifestStillReferenced`. The first manifest GET changes the
 /// catalog to a fresh, empty life; the second resolution then sees no owner and suppresses the dangle. A
 /// recovery from the original cut continues to see the original owner and reports it.
-TEST(CasFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
+TEST(CASFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
 {
     auto backend = std::make_shared<MutateOnFirstGetBackend>();
     auto store = openPoolForTest(backend);
@@ -1036,7 +1036,7 @@ TEST(CasFsck, MissingManifestRecheckStaysOnInitialCatalogCut)
 }
 
 /// A pre-precommit body in an eligible prefix (no owner) is INFO (Unreachable), not an error.
-TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
+TEST(CASFsck, ReclaimablePrePrecommitBodyIsInfo)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1056,7 +1056,7 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 /// Pipeline classification (2026-07-02): a condemned-but-present blob is PendingGc — an EXPECTED
 /// pipeline state (deletion is scheduled), never the suspicious "unreachable" lump beta testers
 /// read as a leak. clean() is unaffected.
-TEST(CasFsck, CondemnedBlobClassifiesPendingGc)
+TEST(CASFsck, CondemnedBlobClassifiesPendingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1090,7 +1090,7 @@ TEST(CasFsck, CondemnedBlobClassifiesPendingGc)
 
 /// A drop whose -1 has NOT folded yet: the blob's edges are still in the GC snapshot => AwaitingGc
 /// (expected), not Unaccounted.
-TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
+TEST(CASFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1117,7 +1117,7 @@ TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
 /// the pool, so its removal still has a `-1` to fold (and the orphan sweep still has a body to reclaim).
 /// That is a genuine mid-pipeline backlog and must keep the `AwaitingGc` verdict — the new check may
 /// never turn an ordinary unfolded drop into a hard finding.
-TEST(CasFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
+TEST(CASFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1150,7 +1150,7 @@ TEST(CasFsck, UnfoldedDropWithPresentSourceManifestStaysAwaitingGc)
 /// round and the incremental GC can never nominate the blob. It must NOT be labeled `AwaitingGc`
 /// ("expected, no action needed", the sentence that hid 56 permanently retained blobs); it is the hard
 /// `StaleEdge` finding and the report is not `clean()`.
-TEST(CasFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
+TEST(CASFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1186,7 +1186,7 @@ TEST(CasFsck, ResidualEdgeNamingAnAbsentManifestClassifiesStaleEdge)
 
 /// GC never ran on the pool: nothing is classifiable through the GC view — everything unreferenced
 /// is AwaitingGc ("GC has not run yet"), never a false Unaccounted alarm.
-TEST(CasFsck, GcNeverRanClassifiesAwaitingGc)
+TEST(CASFsck, GcNeverRanClassifiesAwaitingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1200,7 +1200,7 @@ TEST(CasFsck, GcNeverRanClassifiesAwaitingGc)
 
 /// A blob outside the WHOLE GC view on a pool where GC runs: Unaccounted — expected only as a
 /// transient (fast create+drop between rounds); persistent occurrences violate INV-2.
-TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
+TEST(CASFsck, ForeignBlobClassifiesUnaccounted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1227,7 +1227,7 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
 /// graduation and no finite grace makes a persistent one hard evidence. It is still counted/reported;
 /// it must NOT be a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
 /// pipeline classes (the `.meta` key is excluded from body classification entirely). `clean()` stays TRUE.
-TEST(CasFsck, MetaWithoutBodyIsAdvisoryNotHard)
+TEST(CASFsck, MetaWithoutBodyIsAdvisoryNotHard)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1246,7 +1246,7 @@ TEST(CasFsck, MetaWithoutBodyIsAdvisoryNotHard)
 
 /// A body with no `.meta` sibling is a BENIGN not-yet-adopted (or crashed-birth) artifact — NOT a
 /// dangle, and it must still classify through the ordinary present-but-unreferenced pipeline.
-TEST(CasFsck, BodyWithoutMetaIsBenign)
+TEST(CASFsck, BodyWithoutMetaIsBenign)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1263,7 +1263,7 @@ TEST(CasFsck, BodyWithoutMetaIsBenign)
 /// A scan whose deadline is already in the past: partial_on_deadline=false keeps the old
 /// throw-on-timeout contract; partial_on_deadline=true returns the accumulated lower-bound counts
 /// instead of failing empty-handed (the 2026-07-05 campaign lost 5 verdicts to this).
-TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
+TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1285,7 +1285,7 @@ TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
 
 /// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
 /// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
-TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
+TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1320,7 +1320,7 @@ TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
 /// RE-PUBLISHED to a different manifest in that window, combined with a legitimate GC delete of the
 /// blob it used to name, must NOT surface as a phantom `dangling` — only a CURRENT ref over an absent
 /// object is a real dangle.
-TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
+TEST(CASFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
 {
     auto backend = std::make_shared<RepublishOnListBackend>();
     auto store = openPoolForTest(backend);
@@ -1359,7 +1359,7 @@ TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
 
 /// Same race, but the ref is DROPPED (not re-published) in the window between the walk and the
 /// HEAD-confirm — also must not surface as a phantom dangle.
-TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
+TEST(CASFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
 {
     auto backend = std::make_shared<RepublishOnListBackend>();
     auto store = openPoolForTest(backend);
@@ -1393,7 +1393,7 @@ TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
 /// Companion: the fix must never HIDE a real loss. A blob that a CURRENT ref still names, but whose
 /// object is genuinely gone (an operator error, a storage-layer bug — NOT a legitimate GC delete),
 /// stays `dangling` after the re-resolve.
-TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
+TEST(CASFsck, RealDanglingStillCaughtAfterReresolve)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -1420,7 +1420,7 @@ TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
 /// the ref is RE-PUBLISHED to a different manifest r2 and the OLD r1 manifest body is legitimately
 /// GC-deleted before the per-ref body GET. The missing OLD manifest must be revalidated away — a fresh
 /// re-resolve shows the CURRENT ref no longer names it — never surfacing as a phantom `dangling`.
-TEST(CasFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
+TEST(CASFsck, PhantomDanglingManifestFromRepublishedRefIsReresolvedAway)
 {
     auto backend = std::make_shared<MutateOnFirstGetBackend>();
     auto store = openPoolForTest(backend);
@@ -1487,7 +1487,7 @@ void commitOneRunningPart(DB::ContentAddressedMetadataStorage & storage)
 
 /// (rev.8) FSCK runs on a RUNNING disk: scanning a live pool with one committed part succeeds and reports
 /// its content (the one-row summary the SQL verb renders from this report).
-TEST(CasFsckRunning, FsckOnMountedDiskSucceeds)
+TEST(CASFsckRunning, FsckOnMountedDiskSucceeds)
 {
     auto storage = openRunningStorageForTest();
     commitOneRunningPart(*storage);
@@ -1504,7 +1504,7 @@ TEST(CasFsckRunning, FsckOnMountedDiskSucceeds)
 /// is meaningless (the operator has the snapshot / FORGET path). The two states refuse in DIFFERENT
 /// classes, and the pairing is the point: a lease blip is transient unavailability (upstream-retryable),
 /// an identity loss is terminal (668).
-TEST(CasFsckRunning, FsckOnNotLiveDiskRefusesTransientRetryableAndIdentityLostTerminal)
+TEST(CASFsckRunning, FsckOnNotLiveDiskRefusesTransientRetryableAndIdentityLostTerminal)
 {
     for (const auto & [lc, code] : {std::pair{PoolLifecycle::TransientNotLive, DB::ErrorCodes::NETWORK_ERROR},
                                     std::pair{PoolLifecycle::IdentityLost, DB::ErrorCodes::INVALID_STATE}})
@@ -1530,7 +1530,7 @@ TEST(CasFsckRunning, FsckOnNotLiveDiskRefusesTransientRetryableAndIdentityLostTe
 ///
 /// A per-finding DISTINCT value is what makes this more than a substring sweep: it catches a formatter
 /// that prints the right names against the wrong counters.
-TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
+TEST(CASFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
 {
     FsckReport rep;
     uint64_t value = 11;
@@ -1559,7 +1559,7 @@ TEST(CasFsckSummary, EveryHardFindingAppearsOnTheSummaryLine)
 /// A zero must be PRINTED, not omitted. The harness's `stale_edge_verdict` fails closed on an absent key
 /// precisely because "field missing" and "field zero" are different facts, and a formatter that skips
 /// zeros would turn every clean pool into an unparseable one.
-TEST(CasFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
+TEST(CASFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
 {
     const String line = formatFsckSummary(FsckReport{});
     /// Iterated for the same reason the test above is: a new hard finding printed only when nonzero is a
@@ -1573,7 +1573,7 @@ TEST(CasFsckSummary, ZeroValuedHardFindingsAreStillPrinted)
 /// A partial scan is a lower bound over the visited subset, so the flag and its reason must travel WITH
 /// the counts -- a consumer that sees the numbers but not `partial=1` reads a truncated walk as the pool
 /// truth.
-TEST(CasFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
+TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
 {
     FsckReport rep;
     rep.partial = true;

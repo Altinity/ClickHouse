@@ -205,7 +205,7 @@ size_t rowsMentioning(const FsckReport & rep, FsckClass cls, const String & need
 /// The catalog row plus `_ckpt` frontier make the ref-log record authoritative, so REBUILD must recover
 /// both owners despite the lying hint. The hidden manifest LIST still cannot justify condemnation: an
 /// omitted object costs retention and never data.
-TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
+TEST(CASRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -253,7 +253,7 @@ TEST(CasRebuildCondemnNothing, HiddenLiveManifestBlobIsNotCondemned)
 /// in-flight uploads, a manifest-less blob is unreclaimable, and the rebuild does NOT get to guess. The
 /// blob a live ref pins and the blob nothing pins are indistinguishable from a LIST, which is exactly
 /// why the old pass could not tell them apart either.
-TEST(CasRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
+TEST(CASRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -288,7 +288,7 @@ TEST(CasRebuildCondemnNothing, OrphanBlobIsRetainedNotCondemned)
 /// run over a pool holding one bad key. A name-bearing segment under the opaque stream root is not a
 /// canonical physical life id. The key must be skipped -- no catalog entry can claim it -- and the
 /// rebuild must continue over unrelated cataloged lives.
-TEST(CasRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
+TEST(CASRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -324,7 +324,7 @@ TEST(CasRebuildCondemnNothing, NonCanonicalLifeKeyDoesNotAbortTheRebuild)
 /// A decodable `gc/state` at generation 0 is what makes that branch run at all -- with no state object
 /// the health check never reaches it. The state here comes from one real round (so the lease belongs to
 /// this identity) with `snap_generation` written back to 0.
-TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTheRebuild)
+TEST(CASRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTheRebuild)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -362,7 +362,7 @@ TEST(CasRebuildCondemnNothing, NestedLifelessKeyUnderTheLifePrefixDoesNotAbortTh
     EXPECT_EQ(rep.committed_refs, 1u) << "the live namespace must still be folded";
 }
 
-TEST(CasRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
+TEST(CASRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
 {
     auto backend = std::make_shared<CatalogChangesOnSecondReadBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -399,7 +399,7 @@ TEST(CasRebuildCondemnNothing, OneCatalogCutDrivesHealthCheckAndRebuild)
 /// seal rides through VERBATIM (Task 8). Asserted together with the condemn-nothing rule because the
 /// two used to be produced by the same pass, and a hold dropped here would hand back a baseline that
 /// claims a frontier proof it does not have.
-TEST(CasRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
+TEST(CASRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -443,7 +443,7 @@ TEST(CasRebuildCondemnNothing, CarriesHoldsVerbatimWhileCondemningNothing)
 
 /// A pool with nothing wrong reports nothing: no hole, no unproven namespace, a clean bill of health
 /// and a zero exit. `unchecked` is not a resting state — it is a verdict a healthy pool never reaches.
-TEST(CasRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
+TEST(CASRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -468,7 +468,7 @@ TEST(CasRebuildCondemnNothingFsck, HealthyArithmeticPoolIsClean)
 /// this cannot be the end of a stream: a durable record is missing and every transaction above it is
 /// unreachable. The verdict is FATAL — it appears in the machine-parseable summary line and it makes
 /// the report unclean, which is what turns into the command's nonzero exit.
-TEST(CasRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
+TEST(CASRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -505,7 +505,7 @@ TEST(CasRebuildCondemnNothingFsck, MidChainHoleBelowAWitnessIsChainBroken)
 /// records above the checkpoint, so a listing-driven audit would see an empty tail and report a clean
 /// pool it never read. Arithmetic reads them by exact key: they are walked, counted, and the namespace
 /// comes back PROVEN — not `unchecked`, which is reserved for what cannot be proved at all.
-TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
+TEST(CASRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -539,7 +539,7 @@ TEST(CasRebuildCondemnNothingFsck, TailAboveTheCheckpointIsWalkedNotUnchecked)
 /// A SEALED multi-epoch stream, walked. The epoch boundary is crossed the way the protocol proves it —
 /// through the next epoch's `prev_epoch_seal` back-chain — never by guessing `epoch + 1`. The
 /// checkpoint sits below the seal, so the tail the walk owes covers the boundary itself.
-TEST(CasRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
+TEST(CASRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -564,7 +564,7 @@ TEST(CasRebuildCondemnNothingFsck, SealedStreamIsWalkedAcrossTheEpochBoundary)
 /// that position as the closing seal. The finite range is complete and proves the contradiction: this
 /// is NOT `unchecked`, and there is no earlier missing record that could make the test pass instead.
 /// The healthy `ns_b` in the same pool is unaffected — one broken namespace never spreads.
-TEST(CasRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChainBroken)
+TEST(CASRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChainBroken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -605,7 +605,7 @@ TEST(CasRebuildCondemnNothingFsck, ExactFrontierMakesAnUnsealedEpochCrossingChai
 /// `CORRUPTED_DATA` on a non-contiguous replay and nothing caught it, so one bad table aborted the
 /// audit and every namespace after it went unexamined. For recovery, throwing is the correct
 /// fail-close; for a read-only diagnostic it violates "record and continue, never wedge".
-TEST(CasRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
+TEST(CASRebuildCondemnNothingFsck, OneBadNamespaceDoesNotAbortTheAudit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

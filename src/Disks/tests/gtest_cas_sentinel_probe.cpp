@@ -74,7 +74,7 @@ public:
 }
 
 /// (a) A present key probes Present and carries the materialized body.
-TEST(CasSentinelProbe, PresentKeyReturnsPresentWithBody)
+TEST(CASSentinelProbe, PresentKeyReturnsPresentWithBody)
 {
     InMemoryBackend backend;
     ASSERT_EQ(backend.putIfAbsent("k", "hello").outcome, PutOutcome::Done);
@@ -86,7 +86,7 @@ TEST(CasSentinelProbe, PresentKeyReturnsPresentWithBody)
 }
 
 /// (b) A deleted (never-written) key probes KeyAbsent while the container/backend is otherwise alive.
-TEST(CasSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
+TEST(CASSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
 {
     InMemoryBackend backend;
     ASSERT_EQ(backend.putIfAbsent("other", "x").outcome, PutOutcome::Done);   // proves the backend is alive
@@ -102,7 +102,7 @@ TEST(CasSentinelProbe, AbsentKeyWithContainerAliveReturnsKeyAbsent)
 /// directory (the disk root) must probe `ContainerAbsent`, distinct from an ordinary absent key —
 /// `LocalObjectStorage::listObjects` silently reports zero children for BOTH a missing directory and
 /// an empty one, so the distinction only exists because `probeSentinelRaw` stats the container first.
-TEST(CasSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
+TEST(CASSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
 {
     auto storage = tests::makeLocalObjectStorageForTest();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
@@ -124,7 +124,7 @@ TEST(CasSentinelProbe, ContainerDirectoryRemovedReturnsContainerAbsent)
 /// `gtest_cas_backend.cpp`'s Native-mode tests use to exercise the Native code path without a live S3
 /// endpoint): a present key must probe `Present` and carry the materialized body via the raw-HEAD ->
 /// `get` path, not just the EmulatedSingleProcess path already covered above.
-TEST(CasSentinelProbe, NativePresentKeyReturnsPresentWithBody)
+TEST(CASSentinelProbe, NativePresentKeyReturnsPresentWithBody)
 {
     auto storage = tests::makeLocalObjectStorageForTest();
     ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
@@ -140,7 +140,7 @@ TEST(CasSentinelProbe, NativePresentKeyReturnsPresentWithBody)
 
 /// (d) A backend forced to throw a transport error must probe Indeterminate — NEVER KeyAbsent, even
 /// though the failure looks superficially like "nothing there" from the caller's point of view.
-TEST(CasSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
+TEST(CASSentinelProbe, TransportErrorNeverClassifiesAsAbsent)
 {
     TransportFaultBackend backend;
     const auto result = probeSentinel(backend, "k");
@@ -194,7 +194,7 @@ DB::ObjectStoragePtr makeThrowingS3MetadataStorageForTest()
 
 /// The full S3 IAM permutation table (spec §2): a raw NO_SUCH_KEY/NO_SUCH_BUCKET/ACCESS_DENIED HEAD
 /// error must classify EXACTLY, and anything unmodeled must fail closed to Indeterminate.
-TEST(CasSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
+TEST(CASSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_KEY);
@@ -207,7 +207,7 @@ TEST(CasSentinelProbe, NativeClassifiesNoSuchKeyAsKeyAbsent)
 /// instead derives `RESOURCE_NOT_FOUND` straight from the HTTP status (see `isNotFoundError`,
 /// `src/IO/S3/getObjectInfo.cpp`) — THIS is the code a genuinely absent key throws on real S3, not
 /// `NO_SUCH_KEY`. Without classifying it, every real-S3 absence would be `Indeterminate` forever.
-TEST(CasSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
+TEST(CASSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
@@ -216,7 +216,7 @@ TEST(CasSentinelProbe, NativeClassifiesResourceNotFoundAsKeyAbsent)
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::KeyAbsent);
 }
 
-TEST(CasSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
+TEST(CASSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);
@@ -225,7 +225,7 @@ TEST(CasSentinelProbe, NativeClassifiesNoSuchBucketAsContainerAbsent)
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::ContainerAbsent);
 }
 
-TEST(CasSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
+TEST(CASSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::ACCESS_DENIED);
@@ -234,7 +234,7 @@ TEST(CasSentinelProbe, NativeClassifiesAccessDeniedAsAccessDenied)
     EXPECT_EQ(probeSentinel(backend, nativeKeyUnder(storage, "some/key")).outcome, ProbeOutcome::AccessDenied);
 }
 
-TEST(CasSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
+TEST(CASSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::SERVICE_UNAVAILABLE);
@@ -251,7 +251,7 @@ TEST(CasSentinelProbe, NativeClassifiesUnmodeledErrorAsIndeterminate)
 /// deliberately: the generic default cannot produce `ContainerAbsent` at all (it only ever returns
 /// Present/KeyAbsent/Indeterminate), so this test can ONLY pass if the typed override is actually
 /// reached through the wrapper.
-TEST(CasSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
+TEST(CASSentinelProbe, InstrumentedBackendForwardsToInnerClassification)
 {
     auto storage = std::static_pointer_cast<ThrowingS3MetadataObjectStorage>(makeThrowingS3MetadataStorageForTest());
     storage->throwOnGetObjectMetadata(Aws::S3::S3Errors::NO_SUCH_BUCKET);

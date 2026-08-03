@@ -66,7 +66,7 @@ std::vector<SourceEdgeRecord> decodeRun(const String & bytes)
 
 }
 
-TEST(CasRecordStream, EmptyRunRoundTripsAndChecksumMatches)
+TEST(CASRecordStream, EmptyRunRoundTripsAndChecksumMatches)
 {
     const String bytes = encodeRun({});
     EXPECT_EQ(bytes, fmt::format(
@@ -80,7 +80,7 @@ TEST(CasRecordStream, EmptyRunRoundTripsAndChecksumMatches)
     reader.verifyAgainst(sourceEdgeRunChecksum(bytes));
 }
 
-TEST(CasRecordStream, EdgeZeroCondemnedRoundTrip)
+TEST(CASRecordStream, EdgeZeroCondemnedRoundTrip)
 {
     const BlobRef a = chRef(1);
     const BlobRef b = chRef(2);
@@ -112,7 +112,7 @@ TEST(CasRecordStream, EdgeZeroCondemnedRoundTrip)
     EXPECT_EQ(back[2].marker, kZeroMarker);
 }
 
-TEST(CasRecordStream, WriterIsByteDeterministic)
+TEST(CASRecordStream, WriterIsByteDeterministic)
 {
     std::vector<SourceEdgeRecord> recs = {
         edge(chRef(1), 5),
@@ -122,7 +122,7 @@ TEST(CasRecordStream, WriterIsByteDeterministic)
     EXPECT_EQ(encodeRun(recs), encodeRun(recs));   /// pure function of the sorted record set
 }
 
-TEST(CasRecordStream, SortOrderAcrossAlgosFollowsAlgoByte)
+TEST(CASRecordStream, SortOrderAcrossAlgosFollowsAlgoByte)
 {
     /// b = <algo byte 2-hex><digest hex>. The algo byte leads, so string-sorting b reproduces the
     /// binary (algo, digest, source_id) order: ch128 (01) < xxh3 (02) < sha256 (03).
@@ -142,7 +142,7 @@ TEST(CasRecordStream, SortOrderAcrossAlgosFollowsAlgoByte)
     EXPECT_EQ(back[2].ref.algo, BlobHashAlgo::Sha256);
 }
 
-TEST(CasRecordStream, AppendOutOfOrderThrows)
+TEST(CASRecordStream, AppendOutOfOrderThrows)
 {
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
@@ -155,7 +155,7 @@ TEST(CasRecordStream, AppendOutOfOrderThrows)
         "records appended out of");   /// ref regression
 }
 
-TEST(CasRecordStream, SourceIdRendersAs32Hex)
+TEST(CASRecordStream, SourceIdRendersAs32Hex)
 {
     const String bytes = encodeRun({edge(chRef(1), 10)});
     /// The source id 10 is a 32-char lowercase hex string ending in 'a'.
@@ -164,7 +164,7 @@ TEST(CasRecordStream, SourceIdRendersAs32Hex)
     EXPECT_NE(bytes.find("\"b\":\"01"), String::npos);
 }
 
-TEST(CasRecordStream, SealChecksumMismatchFailsClosed)
+TEST(CASRecordStream, SealChecksumMismatchFailsClosed)
 {
     const String bytes = encodeRun({edge(chRef(1), 10), edge(chRef(1), 20)});
     const UInt128 good = sourceEdgeRunChecksum(bytes);
@@ -191,7 +191,7 @@ TEST(CasRecordStream, SealChecksumMismatchFailsClosed)
     }, DB::Exception);
 }
 
-TEST(CasRecordStream, TrailerCountMismatchIsCorruptData)
+TEST(CASRecordStream, TrailerCountMismatchIsCorruptData)
 {
     String bytes = encodeRun({edge(chRef(1), 10)});
     /// Rewrite the trailer count 1 -> 2.
@@ -203,7 +203,7 @@ TEST(CasRecordStream, TrailerCountMismatchIsCorruptData)
     EXPECT_THROW(decodeRun(bytes), DB::Exception);
 }
 
-TEST(CasRecordStream, TruncationAtLineBoundaryFailsClosed)
+TEST(CASRecordStream, TruncationAtLineBoundaryFailsClosed)
 {
     const String bytes = encodeRun({edge(chRef(1), 10), edge(chRef(1), 20)});
     /// Drop the trailer line entirely (truncate after the last record's newline).
@@ -212,7 +212,7 @@ TEST(CasRecordStream, TruncationAtLineBoundaryFailsClosed)
     EXPECT_THROW(decodeRun(bytes.substr(0, trailer)), DB::Exception);
 }
 
-TEST(CasRecordStream, HeaderGates)
+TEST(CASRecordStream, HeaderGates)
 {
     /// Wrong type.
     {

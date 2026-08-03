@@ -17,14 +17,14 @@ using DB::Cas::tests::u128Of;
 /// Round-B opt §6: `reason` is templated rationale (a handful of distinct strings repeated across
 /// every row), unlike `object_hash`/`token` which are genuinely per-row varied -- it belongs alongside
 /// the log's other LowCardinality columns (event_type/object_kind/outcome), not as a full String.
-TEST(CasContentAddressedLog, ReasonColumnIsLowCardinality)
+TEST(CASContentAddressedLog, ReasonColumnIsLowCardinality)
 {
     const auto columns = DB::ContentAddressedLogElement::getColumnsDescription();
     const auto & reason_col = columns.get("reason");
     EXPECT_TRUE(typeid_cast<const DB::DataTypeLowCardinality *>(reason_col.type.get()))
         << "reason column must be LowCardinality(String) (Round-B opt §6)";
 }
-TEST(CasEvent, ConstructAndCopyAndName)
+TEST(CASEvent, ConstructAndCopyAndName)
 {
     CasEvent e;
     e.type = CasEventType::BlobDelete;
@@ -44,7 +44,7 @@ TEST(CasEvent, ConstructAndCopyAndName)
     EXPECT_EQ(toString(CasEventObjectKind::Manifest), "manifest");
 }
 
-TEST(CasEvent, PoolEmitsToSink)
+TEST(CASEvent, PoolEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -68,7 +68,7 @@ TEST(CasEvent, PoolEmitsToSink)
 /// caller's local is genuinely moved-from -- not merely copied via a const reference -- by the time
 /// the sink runs. Mirrors `makeCasEventSink`'s own move-out-of-the-by-value-event idiom (a small test
 /// double stands in for the `ContentAddressedLogElement` it would normally build).
-TEST(CasEvent, EmitEventMovesSourceIntoSink)
+TEST(CASEvent, EmitEventMovesSourceIntoSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
     String captured_reason;
@@ -157,7 +157,7 @@ bool hasType(const std::vector<CasEvent> & events, CasEventType t)
 /// B170 Task 4 acceptance: drive a full publish -> drop -> GC-to-delete lifecycle through a capturing
 /// sink and assert (a) the taxonomy of events is emitted, (b) EVERY event carries a non-empty reason,
 /// (c) filtering by a deleted blob's object_hash reconstructs its edge/retire/delete chain in order.
-TEST(CasEvent, LifecycleReconstructionFromRows)
+TEST(CASEvent, LifecycleReconstructionFromRows)
 {
     auto b = std::make_shared<InMemoryBackend>();
     /// Declared BEFORE the Pool so they OUTLIVE it: the Pool's background retired-view syncer can emit

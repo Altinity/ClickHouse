@@ -7,7 +7,7 @@ using namespace DB::Cas;
 /// The real cas_pool_meta case replaces the phase-1 toy proving instance. Every other control-plane
 /// format registers its own battery row in its own gtest_cas_<object>_format.cpp file (Tasks 3-6).
 
-TEST(CasFormatBattery, PoolMeta)
+TEST(CASFormatBattery, PoolMeta)
 {
     PoolMeta pm;
     pm.pool_id = hexToU128("00112233445566778899aabbccddeeff");

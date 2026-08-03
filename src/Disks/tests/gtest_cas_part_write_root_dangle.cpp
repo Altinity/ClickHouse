@@ -75,7 +75,7 @@ ManifestEntry blobEntry(const String & name, const String & payload)
 /// THE POSITIVE INVARIANT: the whole flow must succeed AND P must survive, because B's precommit pins
 /// P's closure across A's retire + GC (B171 two-phase commit; `checkAndResolveDeps` proves closure
 /// present at publish time).
-TEST(CasPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
+TEST(CASPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestPool(backend);
@@ -138,7 +138,7 @@ TEST(CasPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 /// would) AND dropping refA, then renew the watermark and run GC to fixpoint. With P's only protection
 /// (the precommit edge) gone and its owner retired, GC deletes P. PartWriteTxn B's publish must now ABORT
 /// (`checkAndResolveDeps` finds the adopted blob absent and not re-creatable) instead of committing a dangle.
-TEST(CasPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
+TEST(CASPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestPool(backend);
@@ -212,7 +212,7 @@ TEST(CasPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
         << rep.dangling << ", reachable=" << rep.reachable << ")";
 }
 
-/// (The GC-reclaim test `CasPartWriteTxnRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY
+/// (The GC-reclaim test `CASPartWriteTxnRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY
 /// reclaims an abandoned precommit of a judged-dead build and then collects its closure -- was removed
 /// with the snapshot+log ref model. Per spec §Responsibility Boundary, reclaiming an abandoned precommit
 /// is now the WRITER's job (it appends the exact `owner_transition` removal on recovery); GC never scans
@@ -224,7 +224,7 @@ TEST(CasPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
 /// pinned blobs) must survive a full GC run, and the build must still be able to promote it. In the
 /// snapshot+log model GC never reclaims a precommit at all, so this is purely a liveness pin: the live
 /// precommit's `+1` fold edge keeps its exclusively-owned blob alive across GC.
-TEST(CasPartWriteTxnRoot, LivePrecommitNotReclaimed)
+TEST(CASPartWriteTxnRoot, LivePrecommitNotReclaimed)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto s = openTestPool(backend);

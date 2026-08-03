@@ -207,7 +207,7 @@ PoolPtr openRecoveryPool(const std::shared_ptr<LiarBackend> & backend)
 /// Under listing-driven intake this fails on the BLOBS, not on the cursor: the cursor still reaches
 /// `{1,5}` (the last listed id) while records 3 and 4 were never folded -- and since nothing re-reads
 /// below a sealed cursor, their edges are gone for good. That is the production damage, exactly.
-TEST(CasListLiarEndToEnd, TheHiddenMiddleOfTheStreamFoldsThroughUnnoticed)
+TEST(CASListLiarEndToEnd, TheHiddenMiddleOfTheStreamFoldsThroughUnnoticed)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -238,7 +238,7 @@ TEST(CasListLiarEndToEnd, TheHiddenMiddleOfTheStreamFoldsThroughUnnoticed)
 /// RECOVERY, UNDER THE SAME LIE, AGAINST AN HONEST ORACLE. The comparison is against a second pool
 /// seeded by the SAME code over a store that does not lie -- not against a hand-written expectation,
 /// which could encode the same mistake the code makes.
-TEST(CasListLiarEndToEnd, RecoveryUnderTheSameLieReconstructsExactlyTheTruth)
+TEST(CASListLiarEndToEnd, RecoveryUnderTheSameLieReconstructsExactlyTheTruth)
 {
     const Layout layout("p");
     const RootNamespace ns{"00/recover@cas@"};
@@ -272,7 +272,7 @@ TEST(CasListLiarEndToEnd, RecoveryUnderTheSameLieReconstructsExactlyTheTruth)
 /// above it: the blob's in-degree reads zero while a live ref still names it, and the round deletes
 /// data that is referenced. That is the data loss, and it is why this arm asserts the blob was never
 /// even offered for deletion rather than merely that it is still present.
-TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLater)
+TEST(CASListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLater)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -327,7 +327,7 @@ TEST(CasListLiarEndToEnd, AHiddenPlusOneKeepsItsBlobWhenAVisibleMinusOneLandsLat
 /// owner forever: not data loss, but an object no incremental round can ever reclaim. Asserting the
 /// blob DOES go away is also what stops the data-loss arm above from being satisfiable by a fold that
 /// simply never deletes anything.
-TEST(CasListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaimed)
+TEST(CASListLiarEndToEnd, AHiddenMinusOneIsStillFoldedSoTheBlobIsActuallyReclaimed)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -435,7 +435,7 @@ ManifestRef buildKillShot(const std::shared_ptr<LiarBackend> & backend, const La
 /// claim is about: the arithmetic walk's exact-key probe reaches `hidden`'s birth despite the store
 /// hiding its whole stream from every listing, so the frontier it proves is complete and the blob
 /// survives on its own folded in-degree, not on a caller declining to supply a universe.
-TEST(CasListLiarEndToEnd, AHiddenNamespacesBirthIsFoundByExactKeyAndSavesTheBlobOnACompleteFrontier)
+TEST(CASListLiarEndToEnd, AHiddenNamespacesBirthIsFoundByExactKeyAndSavesTheBlobOnACompleteFrontier)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -476,7 +476,7 @@ TEST(CasListLiarEndToEnd, AHiddenNamespacesBirthIsFoundByExactKeyAndSavesTheBlob
 /// `hidden` drops its OWN reference too (still by exact key, still hidden from every listing), so its
 /// frontier is REALLY proven by the arithmetic-intake exact-key probe -- never declared so by fiat --
 /// and the blob is REALLY unreferenced by both namespaces. The round drains it.
-TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
+TEST(CASListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
 {
     auto backend = std::make_shared<LiarBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -546,7 +546,7 @@ TEST(CasListLiarEndToEnd, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFronti
 /// expectations: the claim is "identical to the truth", and a pass that quietly examined fewer records
 /// would satisfy a hand-written "clean" just as well.
 
-TEST(CasListLiarEndToEnd, FsckArithmeticStreamAuditIsUnmovedByAHiddenMiddle)
+TEST(CASListLiarEndToEnd, FsckArithmeticStreamAuditIsUnmovedByAHiddenMiddle)
 {
     const Layout layout("p");
     const RootNamespace ns{"00/fsck@cas@"};
@@ -588,7 +588,7 @@ TEST(CasListLiarEndToEnd, FsckArithmeticStreamAuditIsUnmovedByAHiddenMiddle)
 /// A hidden tail record is the silent variant of the historical residual: a LIST-driven replay could
 /// return a plausible but short table. Checkpoint-bounded recovery must produce the honest table even
 /// though the list omission is served.
-TEST(CasListLiarEndToEnd, FsckReachabilityRecoveryMatchesTruthUnderAHiddenTailTransaction)
+TEST(CASListLiarEndToEnd, FsckReachabilityRecoveryMatchesTruthUnderAHiddenTailTransaction)
 {
     const Layout layout("p");
     const RootNamespace ns{"00/fsck_tail@cas@"};

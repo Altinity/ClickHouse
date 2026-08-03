@@ -4,7 +4,7 @@
 
 using namespace DB::Cas;
 
-TEST(CasBlobRef, SameDigestDifferentAlgoAreDistinct)
+TEST(CASBlobRef, SameDigestDifferentAlgoAreDistinct)
 {
     const BlobDigest d = BlobDigest::fromU128(UInt128(0xDEADBEEF));
     const BlobRef a{BlobHashAlgo::CityHash128, d};
@@ -15,14 +15,14 @@ TEST(CasBlobRef, SameDigestDifferentAlgoAreDistinct)
     EXPECT_EQ(s.size(), 2u);
 }
 
-TEST(CasBlobRef, OrderIsAlgoThenDigest)
+TEST(CASBlobRef, OrderIsAlgoThenDigest)
 {
     const BlobRef small_algo_big_digest{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(0) - 1)};
     const BlobRef big_algo_small_digest{BlobHashAlgo::Sha256, BlobDigest::fromU128(UInt128(1))};
     EXPECT_LT(small_algo_big_digest, big_algo_small_digest);   /// algo decides first
 }
 
-TEST(CasBlobRef, HexAndIdRenderAtAlgoWidth)
+TEST(CASBlobRef, HexAndIdRenderAtAlgoWidth)
 {
     BlobRef r16{BlobHashAlgo::XXH3_128, BlobDigest::fromU128(UInt128(0xAB))};
     EXPECT_EQ(blobHexOf(r16).size(), 32u);

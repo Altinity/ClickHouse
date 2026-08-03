@@ -67,7 +67,7 @@ RefLogTxn txn(const String & ns, RefTxnId id, std::vector<RefOp> ops)
 }
 
 /// spec §gc-step-produce-manifest-edge-delta: each explicit operation states its own edge change.
-TEST(CasRefIntake, ManifestEdgesPerOperationShape)
+TEST(CASRefIntake, ManifestEdgesPerOperationShape)
 {
     /// Add precommit => one +1.
     {
@@ -126,7 +126,7 @@ TEST(CasRefIntake, ManifestEdgesPerOperationShape)
 /// `manifestEdgesOfTxn` rejects every `owner_transition` shape outside the four `classifyOwnerTransitionShape`
 /// recognizes (Pool/CasRefProtocol.cpp) -- it must never silently assign edge meaning to a shape the
 /// writer/replay state machine would refuse to apply. Each case throws `CORRUPTED_DATA`.
-TEST(CasRefIntake, ManifestEdgesRejectsUnrecognizedShapes)
+TEST(CASRefIntake, ManifestEdgesRejectsUnrecognizedShapes)
 {
     /// Neither binding: a degenerate owner_transition that names no owner change at all.
     EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 1), {rawOwnerTransition(std::nullopt, std::nullopt)})),
@@ -158,7 +158,7 @@ TEST(CasRefIntake, ManifestEdgesRejectsUnrecognizedShapes)
 }
 
 /// Namespaces are edge-distinct even with identical ManifestRef tuples (spec §gc-inputs-and-output).
-TEST(CasRefIntake, EdgesAreNamespaceQualified)
+TEST(CASRefIntake, EdgesAreNamespaceQualified)
 {
     const auto a = manifestEdgesOfTxn(txn("db/a", rid(1, 1), {addOwner(RefOwnerKind::Precommit, "p", mr(1, 5))}));
     const auto b = manifestEdgesOfTxn(txn("db/b", rid(1, 1), {addOwner(RefOwnerKind::Precommit, "p", mr(1, 5))}));
@@ -167,7 +167,7 @@ TEST(CasRefIntake, EdgesAreNamespaceQualified)
     EXPECT_NE(a[0].manifest_id, b[0].manifest_id);
 }
 
-TEST(CasRefIntake, RemovalTxnIdDetection)
+TEST(CASRefIntake, RemovalTxnIdDetection)
 {
     RefOp remove_ns;
     remove_ns.kind = RefOpKind::RemoveNamespace;
@@ -181,7 +181,7 @@ TEST(CasRefIntake, RemovalTxnIdDetection)
 
 /// spec §Step 1: one global LIST groups by table, split by kind, sorted; the reconstructed namespace is
 /// re-validated (VERIFY-AT-T12) and a malformed ref key aborts ref folding (throws).
-TEST(CasRefIntake, GroupRefKeys)
+TEST(CASRefIntake, GroupRefKeys)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"db/t"};
@@ -210,7 +210,7 @@ TEST(CasRefIntake, GroupRefKeys)
 /// A LIST can observe a snapshot after its PUT but before the `_ckpt` CAS makes it a recovery base.
 /// That physical object proves nothing by itself: without a checkpoint-named triple, cleanup leaks
 /// rather than deleting either the genesis log or the unacknowledged snapshot.
-TEST(CasRefIntake, PlanRefCleanupRequiresCheckpointNamedBase)
+TEST(CASRefIntake, PlanRefCleanupRequiresCheckpointNamedBase)
 {
     RefTableListing listing;
     listing.logs = {rid(1, 1), rid(1, 2), rid(1, 3)};
@@ -248,7 +248,7 @@ TEST(CasRefIntake, PlanRefCleanupRequiresCheckpointNamedBase)
 /// The checkpoint recovery anchor is a triple: `_ckpt`, its same-id `_snap`, and the same-id ordinary
 /// `_log` that proves the id is not an `EpochSeal`. Cleanup may reclaim older covered logs, but must
 /// retain that one witness for recovery and fsck.
-TEST(CasRefIntake, PlanRefCleanupRetainsCheckpointBaseLog)
+TEST(CASRefIntake, PlanRefCleanupRetainsCheckpointBaseLog)
 {
     RefTableListing listing;
     listing.logs = {rid(1, 1), rid(1, 2), rid(1, 3)};

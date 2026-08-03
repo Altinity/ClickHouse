@@ -11,7 +11,7 @@
 using namespace DB;
 using namespace DB::Cas;
 
-TEST(CasJsonWriter, KeyValueSequenceMatchesCanonicalShape)
+TEST(CASJsonWriter, KeyValueSequenceMatchesCanonicalShape)
 {
     CasJsonWriter w;
     bool first = true;
@@ -28,7 +28,7 @@ TEST(CasJsonWriter, KeyValueSequenceMatchesCanonicalShape)
     EXPECT_EQ(std::move(w).take(), "{\"we\":\"7\",\"mo\":3,\"ok\":true,\"ome\":\"1\"}\n");
 }
 
-TEST(CasJsonWriter, EmptyObjectAndClear)
+TEST(CASJsonWriter, EmptyObjectAndClear)
 {
     CasJsonWriter w;
     bool first = true;
@@ -38,7 +38,7 @@ TEST(CasJsonWriter, EmptyObjectAndClear)
     EXPECT_EQ(w.size(), 0u);
 }
 
-TEST(CasJsonWriter, Hex128MatchesU128ToHex)
+TEST(CASJsonWriter, Hex128MatchesU128ToHex)
 {
     const UInt128 v = (UInt128(0x0123456789abcdefULL) << 64) | UInt128(0xfedcba9876543210ULL);
     CasJsonWriter w;
@@ -46,7 +46,7 @@ TEST(CasJsonWriter, Hex128MatchesU128ToHex)
     EXPECT_EQ(std::move(w).take(), "\"" + u128ToHex(v) + "\"");
 }
 
-TEST(CasJsonWriter, U64Extremes)
+TEST(CASJsonWriter, U64Extremes)
 {
     CasJsonWriter w;
     w.u64Number(0);
@@ -75,7 +75,7 @@ String writerJson(std::string_view s)
 }
 }
 
-TEST(CasJsonWriterEscaping, TargetedCorpusMatchesWriteJSONString)
+TEST(CASJsonWriterEscaping, TargetedCorpusMatchesWriteJSONString)
 {
     const std::vector<String> corpus = {
         "",
@@ -101,7 +101,7 @@ TEST(CasJsonWriterEscaping, TargetedCorpusMatchesWriteJSONString)
         EXPECT_EQ(writerJson(s), referenceJson(s)) << "input bytes: " << s.size();
 }
 
-TEST(CasJsonWriterEscaping, FuzzMatchesWriteJSONString)
+TEST(CASJsonWriterEscaping, FuzzMatchesWriteJSONString)
 {
     std::mt19937 rng(20260720); // NOLINT(cert-msc32-c, cert-msc51-cpp)
     for (int iter = 0; iter < 5000; ++iter)
@@ -187,7 +187,7 @@ void closeObject(DB::WriteBuffer & out, bool & first)
 }
 }
 
-TEST(CasJsonWriterVocab, MatchesReferenceVocabulary)
+TEST(CASJsonWriterVocab, MatchesReferenceVocabulary)
 {
     using namespace DB::Cas;
     const UInt128 h = (UInt128(0xdeadbeefULL) << 64) | UInt128(42);

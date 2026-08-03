@@ -33,7 +33,7 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 /// deletable only once the namespace's sealed fold cursor sits in an epoch strictly above `E`. Tests
 /// whose subject is the eligibility or ownership rule therefore have to establish it, or they would
 /// assert a deletion the premise (not the rule under test) prevented. Tests whose subject is RETENTION
-/// deliberately do NOT call this — see `CasSweepDeletionPremise` for the premise's own coverage.
+/// deliberately do NOT call this — see `CASSweepDeletionPremise` for the premise's own coverage.
 void seedConsumedSealCursor(InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns)
 {
     seedFoldCursorForTest(backend, layout, ns, RefTxnId{kWriterEpoch + 1, 1});
@@ -158,7 +158,7 @@ private:
 }
 
 /// A staged-but-unowned body in an ELIGIBLE prefix, absent from the owner view, is deleted (#7).
-TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
+TEST(CASOrphanManifestSweep, EligibleAndUnownedIsDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -177,7 +177,7 @@ TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
 /// The orphan sweep must not turn a forged same-id snapshot at an OLDER `EpochSeal` into an empty owner
 /// view. The base differs from `last_epoch_seal`, so metadata equality cannot catch it; the candidate
 /// remains retained until the checkpoint is repaired.
-TEST(CasOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
+TEST(CASOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -224,7 +224,7 @@ TEST(CasOrphanManifestSweep, CheckpointSnapshotAtOlderEpochSealSkipsDeletion)
 }
 
 /// A body that IS in the owner view (committed) is NEVER swept (#8).
-TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
+TEST(CASOrphanManifestSweep, OwnedBodyIsSkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -252,8 +252,8 @@ TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
 /// sits in a lower epoch than the build, so any cursor high enough to satisfy rule (1) would also sit
 /// above the log and stop the tail scan from reading it at all. The case where the tail-removal
 /// protection is the ONLY thing standing — a removal in a LATER epoch, which is the direction removals
-/// actually cross — is `CasSweepDeletionPremise.AnUnconsumedTailRemovalRetainsItsTarget`.
-TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
+/// actually cross — is `CASSweepDeletionPremise.AnUnconsumedTailRemovalRetainsItsTarget`.
+TEST(CASOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -271,7 +271,7 @@ TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
 }
 
 /// The sweep emits NO blob deltas: the in-degree generation is unchanged.
-TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
+TEST(CASOrphanManifestSweep, EmitsNoBlobDeltas)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -289,7 +289,7 @@ TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
 }
 
-TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
+TEST(CASOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -313,7 +313,7 @@ TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
 }
 
 /// A NON-eligible prefix (no watermark fact) deletes NOTHING (#9: frozen-seq is not authority).
-TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
+TEST(CASOrphanManifestSweep, NoWatermarkIsNotAuthority)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -325,7 +325,7 @@ TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
+TEST(CASOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -343,7 +343,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
-TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
+TEST(CASOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -367,7 +367,7 @@ TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 /// A physical manifest captured before a catalog cut which omits its name is dead-life debris: a live
 /// creation cannot publish a life-owned object before its catalog row. It therefore has an eventual
 /// page-sweep owner without trying to reconstruct a deleted incarnation from the key.
-TEST(CasOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamespace)
+TEST(CASOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamespace)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -385,7 +385,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesObservedBodyWhenCatalogOmitsNamesp
 
 /// The candidate body and token must be frozen before the later catalog cut. A concurrent same-key
 /// replacement after that observation is a new physical incarnation and must lose the old-token delete.
-TEST(CasOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservation)
+TEST(CASOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservation)
 {
     auto backend = std::make_shared<ReplacingManifestAfterObservationBackend>();
     auto store = openPoolForTest(backend);
@@ -408,7 +408,7 @@ TEST(CasOrphanManifestSweep, CursorPageCannotDeleteManifestReplacedAfterObservat
 
 /// Any duplicate current life id makes the catalog-to-physical join ambiguous. The cursor page is
 /// destructive, so the whole cut must be rejected before it can nominate even an unrelated body.
-TEST(CasOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
+TEST(CASOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -436,7 +436,7 @@ TEST(CasOrphanManifestSweep, CursorPageRefusesAmbiguousCatalogLifeIndex)
     EXPECT_TRUE(backend->head(key).exists);
 }
 
-TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
+TEST(CASOrphanManifestSweep, CursorPageSkipsOwnedBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -454,7 +454,7 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
 /// A catalog-named life cannot be treated as an empty table merely because its mandatory recovery
 /// checkpoint is missing. The orphan sweep is destructive, so it must retain the body until the
 /// caller can recover from the same frozen catalog row and its exact `_ckpt`.
-TEST(CasOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecision)
+TEST(CASOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecision)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -480,7 +480,7 @@ TEST(CasOrphanManifestSweep, MissingRequiredCheckpointSuppressesDestructiveDecis
 /// exact tail begins at `{E+1, 1}` and must consume each one before reaching a later removal. The
 /// removal's target stays protected while an unrelated eligible body remains deletable; retaining both
 /// would hide a false missing-log failure at the first intermediate seal.
-TEST(CasOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccessor)
+TEST(CASOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccessor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -528,7 +528,7 @@ TEST(CasOrphanManifestSweep, EpochSealFoldCursorCrossesTailByExactDecodedSuccess
 /// A cleaned inherited cursor does not let a later epoch backlink skip the mandatory immediately-next
 /// global epoch. `{3,1}` is missing here, so the direct `{7,1} -> {2,2}` link cannot authorize a tail
 /// scan; the whole namespace must fail closed and retain even an otherwise unowned eligible body.
-TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkippedByLaterBacklink)
+TEST(CASOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkippedByLaterBacklink)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -588,7 +588,7 @@ TEST(CasOrphanManifestSweep, MissingImmediateEpochAfterCleanedCursorCannotBeSkip
 /// body proves the namespace was scanned rather than retained wholesale. The checkpoint base is the
 /// following same-epoch transaction: recovery therefore has a retained exact anchor without turning the
 /// deliberately cleaned predecessor seal into part of that anchor's proof.
-TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochHead)
+TEST(CASOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochHead)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -634,7 +634,7 @@ TEST(CasOrphanManifestSweep, CleanedCursorCrossesOnlyThroughExactImmediateEpochH
 /// The catalog row used to obtain coverage and the life used to recover ownership must be ONE frozen
 /// authority cut. A later catalog row for the same name may not make the old life's committed manifest
 /// look orphaned and therefore deletable.
-TEST(CasOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
+TEST(CASOrphanManifestSweep, LaterCatalogCutCannotSpliceOwnershipAuthority)
 {
     auto backend = std::make_shared<CatalogChangingOnSecondReadBackend>();
     auto store = openPoolForTest(backend);

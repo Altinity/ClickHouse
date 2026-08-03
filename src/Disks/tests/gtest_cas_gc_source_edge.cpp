@@ -6,7 +6,7 @@
 
 using namespace DB::Cas;
 
-TEST(CasSourceEdge, IdIsDeterministicAndPathSensitive)
+TEST(CASSourceEdge, IdIsDeterministicAndPathSensitive)
 {
     const ManifestId id{RootNamespace{"00/aa@cas@"}, ManifestRef{.writer_epoch = 1, .build_sequence = 15, .manifest_ordinal = 1}};
     EXPECT_EQ(sourceEdgeId(id, "a.bin"), sourceEdgeId(id, "a.bin"));           // deterministic
@@ -15,7 +15,7 @@ TEST(CasSourceEdge, IdIsDeterministicAndPathSensitive)
     EXPECT_NE(sourceEdgeId(id, "a.bin"), sourceEdgeId(id2, "a.bin"));          // ref-sensitive
 }
 
-TEST(CasSourceEdge, RunKeyRoundTripsAndOrdersByBlobThenSource)
+TEST(CASSourceEdge, RunKeyRoundTripsAndOrdersByBlobThenSource)
 {
     const BlobRef b1{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(1))};
     const BlobRef b2{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(2))};
@@ -31,7 +31,7 @@ TEST(CasSourceEdge, RunKeyRoundTripsAndOrdersByBlobThenSource)
     EXPECT_LT(SourceEdgeKeyCodec::key(b1, s1), SourceEdgeKeyCodec::key(b1, s2));   // source_id is the secondary sort
 }
 
-TEST(CasSourceEdge, KeyCodecSha256RoundTripAndRejectsBadSizes)
+TEST(CASSourceEdge, KeyCodecSha256RoundTripAndRejectsBadSizes)
 {
     /// sha256 (32-byte digest) round trip: key is 1 + 32 + 16 = 49 bytes, parse recovers the full ref.
     BlobDigest d32{};
@@ -64,7 +64,7 @@ TEST(CasSourceEdge, KeyCodecSha256RoundTripAndRejectsBadSizes)
     EXPECT_THROW(SourceEdgeKeyCodec::parse(bad_key, gb, gs), DB::Exception);
 }
 
-TEST(CasSourceEdge, KeyOrderSentinelFirstAtLen32)
+TEST(CASSourceEdge, KeyOrderSentinelFirstAtLen32)
 {
     /// At sha256 width, the sentinel (source_id 0) sorts before any nonzero source_id for the same
     /// digest, and digest magnitude order is preserved (big-endian raw-byte lexicographic order ==

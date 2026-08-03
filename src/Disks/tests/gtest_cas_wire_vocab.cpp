@@ -8,7 +8,7 @@ using namespace DB::Cas;
 
 namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
 
-TEST(CasWireVocab, EnumWordsRoundTrip)
+TEST(CASWireVocab, EnumWordsRoundTrip)
 {
     for (TokenType t : {TokenType::ETag, TokenType::Generation, TokenType::Emulated})
         EXPECT_EQ(tokenTypeFromWord(tokenTypeToWord(t), "t"), t);
@@ -19,7 +19,7 @@ TEST(CasWireVocab, EnumWordsRoundTrip)
     EXPECT_THROW(blobHashAlgoFromWord("nope", "a"), DB::Exception);
 }
 
-TEST(CasWireVocab, SiblingFieldsWriteAndReadBack)
+TEST(CASWireVocab, SiblingFieldsWriteAndReadBack)
 {
     CasJsonWriter out;
     bool first = true;

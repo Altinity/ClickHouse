@@ -19,7 +19,7 @@ using namespace DB::Cas::tests;
 /// with the v3 text cutover; the lifecycle + inspect tests below stay — they exercise the Core ops
 /// and CasInspect against the stable encode/decode signatures and must pass unchanged.
 
-TEST(CasBlobMeta, PutIfAbsentThenCasTransitions)
+TEST(CASBlobMeta, PutIfAbsentThenCasTransitions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -45,7 +45,7 @@ TEST(CasBlobMeta, PutIfAbsentThenCasTransitions)
     EXPECT_EQ(stale.outcome, CasOverwriteOutcome::Conflict);
 }
 
-TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
+TEST(CASBlobMeta, DeleteMetaExactMatchesEtag)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -62,7 +62,7 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
 /// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface PartWriteTxn/Gc
 /// use, just at a wider algo. Writes use the `Pool`'s controller; reads and exact deletion retain their
 /// direct `Backend`/`Layout` surface.
-TEST(CasBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
+TEST(CASBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -134,7 +134,7 @@ public:
 
 }
 
-TEST(CasBlobMeta, WritesUsePoolRequestController)
+TEST(CASBlobMeta, WritesUsePoolRequestController)
 {
     auto backend = std::make_shared<ControlledMetaWriteFaultBackend>();
     auto store = openPoolForTest(backend);
@@ -161,7 +161,7 @@ TEST(CasBlobMeta, WritesUsePoolRequestController)
 /// Phase 3 T3 (was Phase 2 Task 5 crux Test 2, dedup half): the dedup-cache set is `BlobRef`-keyed and
 /// admits a 32-byte digest without truncation/collision against its 16-byte zero-tailed sibling — even
 /// under a DIFFERENT algo (the whole point of the pair identity).
-TEST(CasBlobMeta, DedupCacheAdmitsWidth32Digest)
+TEST(CASBlobMeta, DedupCacheAdmitsWidth32Digest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test", .dedup_cache_bytes = 64ULL << 20};
@@ -186,7 +186,7 @@ TEST(CasBlobMeta, DedupCacheAdmitsWidth32Digest)
 
 /// `ca-inspect` dispatch (CasInspect.cpp): a `.meta` key must decode as a BlobMeta, NOT fall through
 /// to the `blobs/` envelope branch (the `.meta` key shares the `blobsPrefix()` prefix with a body key).
-TEST(CasBlobMeta, InspectRendersCondemnedMeta)
+TEST(CASBlobMeta, InspectRendersCondemnedMeta)
 {
     const Layout layout("p");
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-inspect"))};
@@ -200,7 +200,7 @@ TEST(CasBlobMeta, InspectRendersCondemnedMeta)
     EXPECT_NE(json.find("\"size\":123"), String::npos);
 }
 
-TEST(CasBlobMeta, InspectRendersCleanMeta)
+TEST(CASBlobMeta, InspectRendersCleanMeta)
 {
     const Layout layout("p");
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-inspect-clean"))};

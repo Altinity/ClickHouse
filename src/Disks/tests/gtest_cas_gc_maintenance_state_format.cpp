@@ -24,7 +24,7 @@ public:
 };
 }
 
-TEST(CasGcMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
+TEST(CASGcMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
 {
     EXPECT_EQ(static_cast<uint16_t>(FormatId::GcMaintenanceState), 25);
     const auto points = changePoints(FormatId::GcMaintenanceState);
@@ -53,7 +53,7 @@ TEST(CasGcMaintenanceStateFormat, RegistryLayoutAndCanonicalCodec)
     EXPECT_EQ(decodeGcMaintenanceState(encodeGcMaintenanceState(state)), state);
 }
 
-TEST(CasGcMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
+TEST(CASGcMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
 {
     const auto bad = [](std::string_view body)
     {
@@ -86,7 +86,7 @@ TEST(CasGcMaintenanceStateFormat, RejectsMalformedAndBoundsCursor)
         [&] { (void)decodeGcMaintenanceState(oversized); });
 }
 
-TEST(CasGcMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
+TEST(CASGcMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -119,7 +119,7 @@ TEST(CasGcMaintenanceState, ReadsAndCasWithoutAdoptingConflicts)
     EXPECT_EQ(decodeGcMaintenanceState(backend.get(key)->bytes).janitor_cursor, "winner");
 }
 
-TEST(CasGcMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
+TEST(CASGcMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
 {
     InMemoryBackend backend;
     const Layout layout("p");
@@ -134,7 +134,7 @@ TEST(CasGcMaintenanceState, ClassifiesCorruptionAndResetsOnlyExactToken)
     EXPECT_EQ(decodeGcMaintenanceState(backend.get(key)->bytes), GcMaintenanceState{});
 }
 
-TEST(CasGcMaintenanceState, UsesExactlyOneReadOrCasAttempt)
+TEST(CASGcMaintenanceState, UsesExactlyOneReadOrCasAttempt)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -166,7 +166,7 @@ TEST(CasGcMaintenanceState, UsesExactlyOneReadOrCasAttempt)
     EXPECT_EQ(decodeGcMaintenanceState(backend.InMemoryBackend::get(key)->bytes).janitor_cursor, "winner");
 }
 
-TEST(CasGcMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
+TEST(CASGcMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -182,7 +182,7 @@ TEST(CasGcMaintenanceState, FutureVersionPropagatesInsteadOfResetting)
     EXPECT_THROW((void)readGcMaintenanceState(failing, layout), std::runtime_error);
 }
 
-TEST(CasGcMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
+TEST(CASGcMaintenanceState, LosingCorruptResetPreservesConcurrentWinner)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");

@@ -33,7 +33,7 @@ constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
 constexpr uint32_t kLegacyHardCapBlockSize = 1024u * 1024u;
 }
 
-TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
+TEST(CASBlobInDegree, FoldStartsFromEmptyPriorGeneration)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -53,7 +53,7 @@ TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
     EXPECT_TRUE(zero.empty());   /// nothing at zero yet
 }
 
-TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
+TEST(CASBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -73,7 +73,7 @@ TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
     EXPECT_EQ(zero[0].ref, bh(1));
 }
 
-TEST(CasBlobInDegree, RunsAreByteDeterministic)
+TEST(CASBlobInDegree, RunsAreByteDeterministic)
 {
     InMemoryBackend a;
     InMemoryBackend b2;
@@ -95,7 +95,7 @@ TEST(CasBlobInDegree, RunsAreByteDeterministic)
     EXPECT_EQ(ra[0].checksum, rb[0].checksum);
 }
 
-TEST(CasBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
+TEST(CASBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
 {
     /// Idempotency: activating the same (blob_hash, source_id) twice must not double-count.
     /// The source-edge set is a SET, not a counter — re-adding the same edge is a no-op.
@@ -117,7 +117,7 @@ TEST(CasBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
     EXPECT_TRUE(zero.empty());   /// b1 still has an active edge
 }
 
-TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
+TEST(CASBlobInDegree, FoldDeltaByteEqualReplayAdopts)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -130,7 +130,7 @@ TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
     EXPECT_EQ(runs1, runs2);
 }
 
-TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
+TEST(CASBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -269,7 +269,7 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 /// well-formed (so `cursor.advance()` never aborts first) but whose `RunRef.checksum` disagrees with the
 /// stored bytes must fail closed at each deletion-deriving consumer BEFORE any decision is produced. The
 /// stored bytes are the valid run; only the seal checksum handed to the consumer is wrong.
-TEST(CasBlobInDegree, FoldSealChecksumMismatchFailsClosed)
+TEST(CASBlobInDegree, FoldSealChecksumMismatchFailsClosed)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -287,7 +287,7 @@ TEST(CasBlobInDegree, FoldSealChecksumMismatchFailsClosed)
         DB::Exception);
 }
 
-TEST(CasBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
+TEST(CASBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -299,7 +299,7 @@ TEST(CasBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
     EXPECT_THROW(zeroInDegree(backend, runs), DB::Exception);
 }
 
-TEST(CasThreeCursorMerge, FloorBoundary)
+TEST(CASThreeCursorMerge, FloorBoundary)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -339,7 +339,7 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
-TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
+TEST(CASThreeCursorMerge, PendingRedeletesAndDrops)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -366,7 +366,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
-TEST(CasThreeCursorMerge, RecoverySpares)
+TEST(CASThreeCursorMerge, RecoverySpares)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -392,7 +392,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
     EXPECT_EQ(out.edges[0].first, b(1));
 }
 
-TEST(CasThreeCursorMerge, NewCandidateCondemned)
+TEST(CASThreeCursorMerge, NewCandidateCondemned)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -423,7 +423,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     EXPECT_TRUE(out.zero_markers.empty());
 }
 
-TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
+TEST(CASThreeCursorMerge, AbsentBlobNotCondemned)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -449,7 +449,7 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     EXPECT_EQ(out.zero_markers[0], b(3));
 }
 
-TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
+TEST(CASThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
 {
     /// Retired-in-snapshot changes the byte-invariant: the retired machinery now WRITES kCondemned
     /// sentinel rows into the run, so a retired-engaged run is no longer byte-identical to a plain one.
@@ -483,7 +483,7 @@ TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
     EXPECT_TRUE(engaged_run.condemned[0].second.delete_pending);
 }
 
-TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
+TEST(CASTwoCursorMerge, CarriedSentinelIsNotATouch)
 {
     /// Gen 1 condemns b (a real +edge/-edge net-to-zero with head_blob present) -> a kCondemned row. Gen 2
     /// has NO deltas at all: the carried row must (a) survive byte-identically, (b) emit no zero marker,
@@ -527,7 +527,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
     EXPECT_TRUE(g2.zero_markers.empty());
 }
 
-TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
+TEST(CASTwoCursorMerge, MalformedRunFailsClosed)
 {
     Layout layout{"pool"};
 
@@ -574,7 +574,7 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
 /// sees only block-bounded ranged/stream requests for it — never a whole-object get of the prior run
 /// key. Byte-reproducibility of the merged output is the load-bearing canary (the merge logic is
 /// unchanged; only the prior cursor's byte source moved from materialize-whole to stream).
-TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
+TEST(CASBlobInDegree, FoldStreamsPriorRunBlockBounded)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
@@ -645,7 +645,7 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
 /// backend sees only block-bounded ranged/stream requests for the run key (never a whole-object get), and
 /// the candidate set equals the pre-change (borrowed-mode) result. Byte-parity against an InMemory oracle
 /// is the load-bearing canary — the scan logic is unchanged; only the byte source moved to the stream.
-TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
+TEST(CASBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 {
     using DB::Cas::tests::CountingBackend;
     CountingBackend backend;
@@ -700,7 +700,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 
 /// ==== kCondemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
 
-TEST(CasCondemnedRow, RoundTripAllTokenTypes)
+TEST(CASCondemnedRow, RoundTripAllTokenTypes)
 {
     for (auto type : {DB::Cas::TokenType::ETag, DB::Cas::TokenType::Generation, DB::Cas::TokenType::Emulated})
     {
@@ -716,7 +716,7 @@ TEST(CasCondemnedRow, RoundTripAllTokenTypes)
     }
 }
 
-TEST(CasCondemnedRow, UnknownFlagBitsFailClosed)
+TEST(CASCondemnedRow, UnknownFlagBitsFailClosed)
 {
     DB::Cas::CondemnedRow row;
     row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
@@ -725,7 +725,7 @@ TEST(CasCondemnedRow, UnknownFlagBitsFailClosed)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
-TEST(CasCondemnedRow, UnknownTokenTypeFailsClosed)
+TEST(CASCondemnedRow, UnknownTokenTypeFailsClosed)
 {
     DB::Cas::CondemnedRow row;
     row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
@@ -734,7 +734,7 @@ TEST(CasCondemnedRow, UnknownTokenTypeFailsClosed)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
-TEST(CasCondemnedRow, TruncatedPayloadFailsClosed)
+TEST(CASCondemnedRow, TruncatedPayloadFailsClosed)
 {
     DB::Cas::CondemnedRow row;
     row.token = DB::Cas::Token{.value = "0123456789", .type = DB::Cas::TokenType::ETag};
@@ -743,7 +743,7 @@ TEST(CasCondemnedRow, TruncatedPayloadFailsClosed)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
-TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
+TEST(CASSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
     /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
     /// (probability 2^-128 — the check documents the reservation).
@@ -758,7 +758,7 @@ TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 
 /// ==== schema 3 key codec (Phase 3 T3, mixed-algo pools) ====
 
-TEST(CasSourceEdgeKeySchema3, MixedWidthKeysOrderAlgoFirst)
+TEST(CASSourceEdgeKeySchema3, MixedWidthKeysOrderAlgoFirst)
 {
     const BlobDigest d16 = BlobDigest::fromU128((UInt128(0xFFFFFFFFFFFFFFFFULL) << 64) | 0xFFULL);
     BlobDigest d32{};                                    /// sha256 digest starting 0x00,0x01 — small bytes
@@ -776,7 +776,7 @@ TEST(CasSourceEdgeKeySchema3, MixedWidthKeysOrderAlgoFirst)
     EXPECT_LT(SourceEdgeKeyCodec::key(ch, UInt128(0)), k_ch);
 }
 
-TEST(CasSourceEdgeKeySchema3, ParseFailsClosed)
+TEST(CASSourceEdgeKeySchema3, ParseFailsClosed)
 {
     BlobRef r; UInt128 sid;
     String k = SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::XXH3_128, BlobDigest::fromU128(UInt128(5))}, UInt128(9));
@@ -790,7 +790,7 @@ TEST(CasSourceEdgeKeySchema3, ParseFailsClosed)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]{ SourceEdgeKeyCodec::parse(std::string_view(k).substr(0, 20), r, sid); });
 }
 
-TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
+TEST(CASBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
 {
     /// Step 3 (Phase 3 T3): extend the fold with deltas for ch128:X and sha256:Y in ONE shard run —
     /// both settle (edges present, condemn on removal works per ref), mixed rows in one run, no
@@ -834,7 +834,7 @@ TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
 /// sibling manifest's edge for the SAME blob. The whole "that interleaving is harmless" argument in
 /// the publish-confirm design rests on this; if the model ever regresses to counter arithmetic this
 /// test goes red and premature deletion becomes reachable again.
-TEST(CasBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
+TEST(CASBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -862,7 +862,7 @@ TEST(CasBlobInDegree, UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges)
 /// This test pins the COUNTING surface added on top: `RetiredMergeResult::unmatched_removes` /
 /// `unmatched_remove_example` must report the unmatched remove precisely (one hit, naming the right blob
 /// and source id), while the byte-level no-op behaviour (asserted above) is unchanged.
-TEST(CasBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
+TEST(CASBlobInDegree, UnmatchedRemovalIsCountedWithAnExample)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -912,7 +912,7 @@ std::vector<std::pair<UInt128, CondemnedRow>> condemnedCohort(uint64_t n, uint64
 /// The redelete cohort is capped at `GcRoundWorkBudget::max_redeletes` per call. Excess
 /// entries stay in `still_retired`, still `delete_pending`, to be redeleted by a later round — the
 /// durable pipeline never loses one to the cap.
-TEST(CasThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
+TEST(CASThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -940,7 +940,7 @@ TEST(CasThreeCursorMerge, RedeleteBudgetCapsCohortAndCarriesExcess)
 /// Mirror test for the graduation cap: entries past `max_graduations` carry unchanged (still
 /// condemned, NOT yet delete_pending) rather than being force-graduated; the floor re-evaluates them
 /// next round.
-TEST(CasThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
+TEST(CASThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
@@ -970,7 +970,7 @@ TEST(CasThreeCursorMerge, GraduationBudgetCapsCohortAndCarriesExcess)
 /// The mandatory convergence proof: a cohort well past the per-round cap fully drains over
 /// ceil(N / cap) rounds, feeding each round's output run back as the next round's prior — the exact
 /// shape a real GC round repeats every pass.
-TEST(CasThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
+TEST(CASThreeCursorMerge, RedeleteBudgetDrainsCohortToFixpointOverRounds)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};

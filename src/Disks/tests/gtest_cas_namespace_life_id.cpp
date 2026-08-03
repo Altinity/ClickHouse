@@ -126,7 +126,7 @@ concept HasLifeScopedManifestNamespacePrefix =
 
 /// Every ref-layer key names one life by an opaque fixed-width physical id. The logical namespace is
 /// intentionally absent and must be supplied by a catalog join.
-TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
+TEST(CASNamespaceLifeId, KeysCarryTheIncarnationSegment)
 {
     Layout l("p");
     const NamespaceLifeId id = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
@@ -155,7 +155,7 @@ TEST(CasNamespaceLifeId, KeysCarryTheIncarnationSegment)
 
 /// The property the type exists for: two lives of the SAME namespace name share no key at all, so a
 /// reborn namespace can neither read nor delete the previous life's objects by name.
-TEST(CasNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
+TEST(CASNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
 {
     Layout l("p");
     const RefTxnId txn{7, 0x8e};
@@ -185,10 +185,10 @@ TEST(CasNamespaceLifeId, TwoLivesOfOneNamespaceShareNoKeys)
 ///
 /// Both throws below raise `LOGICAL_ERROR`, which aborts the process in debug/sanitizer builds
 /// instead of behaving like a catchable exception (`Common/Exception.cpp`'s `handle_error_code`) --
-/// `CasNamespaceLifeIdDeathTest.ZeroIncarnationIsUnconstructibleAborts` below proves the abort
+/// `CASNamespaceLifeIdDeathTest.ZeroIncarnationIsUnconstructibleAborts` below proves the abort
 /// positively in those builds instead.
 #ifndef DEBUG_OR_SANITIZER_BUILD
-TEST(CasNamespaceLifeId, ZeroIncarnationIsUnconstructible)
+TEST(CASNamespaceLifeId, ZeroIncarnationIsUnconstructible)
 {
     EXPECT_THROW(NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}), DB::Exception);
     EXPECT_THROW(renderIncarnation(UInt128{0}), DB::Exception);
@@ -197,7 +197,7 @@ TEST(CasNamespaceLifeId, ZeroIncarnationIsUnconstructible)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CasNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
+TEST(CASNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
 {
     EXPECT_DEATH({ (void)NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, UInt128{0}); }, "incarnation must be nonzero");
     EXPECT_DEATH({ (void)renderIncarnation(UInt128{0}); }, "incarnation must be nonzero");
@@ -207,7 +207,7 @@ TEST(CasNamespaceLifeIdDeathTest, ZeroIncarnationIsUnconstructibleAborts)
 
 /// Generation-5 namespace-bearing keys are outside the generation-6 parser roots altogether. Pool
 /// admission rejects their generation before any listed-key parser is involved.
-TEST(CasNamespaceLifeId, GenerationFiveNamespaceBearingKeysAreOutsideTheFinalGrammar)
+TEST(CASNamespaceLifeId, GenerationFiveNamespaceBearingKeysAreOutsideTheFinalGrammar)
 {
     Layout l("p");
     const String legacy_log = "p/cas/refs/" + kNs + "/_log/" + kTxn + ".zst";
@@ -226,7 +226,7 @@ TEST(CasNamespaceLifeId, GenerationFiveNamespaceBearingKeysAreOutsideTheFinalGra
 
 /// An all-zero incarnation segment is well-formed hex naming no life, so it is corruption on the read
 /// side exactly as it is unconstructible on the write side.
-TEST(CasNamespaceLifeId, ParsersRefuseAZeroIncarnation)
+TEST(CASNamespaceLifeId, ParsersRefuseAZeroIncarnation)
 {
     Layout l("p");
     const String zeros(32, '0');
@@ -240,7 +240,7 @@ TEST(CasNamespaceLifeId, ParsersRefuseAZeroIncarnation)
 /// The incarnation segment has ONE canonical spelling. A key that is nearly right -- wrong width,
 /// upper case, a non-hex digit -- is refused rather than repaired, so two spellings of one life can
 /// never both exist.
-TEST(CasNamespaceLifeId, ParsersRefuseAMalformedIncarnationSegment)
+TEST(CASNamespaceLifeId, ParsersRefuseAMalformedIncarnationSegment)
 {
     Layout l("p");
     const String upper = "112233445566778899AABBCCDDEEFF01";
@@ -261,7 +261,7 @@ TEST(CasNamespaceLifeId, ParsersRefuseAMalformedIncarnationSegment)
 /// recognized as OUR ref objects; anything else keeps returning `std::nullopt`, because classifying an
 /// untrusted listed key remains an ordinary "is this ours" question and a sweep must be able to walk
 /// past foreign debris without an exception.
-TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
+TEST(CASNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
 {
     Layout l("p");
     const NamespaceLifeId id = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
@@ -287,7 +287,7 @@ TEST(CasNamespaceLifeId, ForeignAndUnrecognizedKeysStayInert)
 /// Namespace files are life-keyed too: `cas/ns/state/<life_id>/_files/<relative-name>`. The
 /// round trip covers a flat name and a NESTED one, because the dedup log's segments live in a
 /// table-level subdirectory and the nested shape is the one on the insert path.
-TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
+TEST(CASNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
 {
     Layout l("p");
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
@@ -314,7 +314,7 @@ TEST(CasNamespaceLifeId, NamespaceFileKeysCarryTheIncarnationSegment)
 
 /// Generation-5 namespace-bearing file keys are outside the final parser root. Malformed ids under the
 /// final state root are corruption and name the offending key.
-TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnations)
+TEST(CASNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnations)
 {
     Layout l("p");
     const String zeros(32, '0');
@@ -342,7 +342,7 @@ TEST(CasNamespaceLifeId, NamespaceFileParserRefusesLegacyAndMalformedIncarnation
 /// keys already identified as OUR namespace files by their reserved `_files` segment. A loose
 /// mountpoint object has no such segment and is a legitimate inhabitant of `roots/`, so it must parse
 /// as `std::nullopt` and never as damage.
-TEST(CasNamespaceLifeId, ForeignAndMountpointKeysStayInertForTheFileParser)
+TEST(CASNamespaceLifeId, ForeignAndMountpointKeysStayInertForTheFileParser)
 {
     Layout l("p");
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
@@ -359,7 +359,7 @@ TEST(CasNamespaceLifeId, ForeignAndMountpointKeysStayInertForTheFileParser)
 
 /// Physical file keys use only `life_id`, so changing the logical spelling cannot redirect a key. A
 /// relative name may still contain `_files` and round-trips after the fixed delimiter.
-TEST(CasNamespaceLifeId, PhysicalFileKeysIgnoreLogicalNamespaceSpelling)
+TEST(CASNamespaceLifeId, PhysicalFileKeysIgnoreLogicalNamespaceSpelling)
 {
     Layout l("p");
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(RootNamespace{kNs}, incarnationA());
@@ -376,7 +376,7 @@ TEST(CasNamespaceLifeId, PhysicalFileKeysIgnoreLogicalNamespaceSpelling)
 /// The "cannot compile" half of spec §9 r9-5 #3: after this task there is no way to reach a ref-layer
 /// key from a namespace alone, so dropping the incarnation is a compile error rather than an aliasing
 /// bug. Each helper is asserted twice -- the namespace-only form absent, the incarnation form present.
-TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
+TEST(CASNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 {
     static_assert(!HasNamespaceOnlyRefsNamespacePrefix<Layout>);
     static_assert(HasIncarnationRefsNamespacePrefix<Layout>);
@@ -404,7 +404,7 @@ TEST(CasNamespaceLifeId, NamespaceOnlyKeyHelpersDoNotExist)
 /// interconverts in either direction today and only an explicit `.ns` crosses. Without these
 /// assertions a later convenience conversion would land unnoticed, and dropping the incarnation would
 /// become representable again -- which is the property the whole re-keying rests on.
-TEST(CasNamespaceLifeId, NamespaceLifeIdAndRootNamespaceDoNotInterconvert)
+TEST(CASNamespaceLifeId, NamespaceLifeIdAndRootNamespaceDoNotInterconvert)
 {
     static_assert(!std::convertible_to<NamespaceLifeId, RootNamespace>);
     static_assert(!std::constructible_from<RootNamespace, NamespaceLifeId>);
@@ -417,7 +417,7 @@ TEST(CasNamespaceLifeId, NamespaceLifeIdAndRootNamespaceDoNotInterconvert)
 /// objects and part manifests on the identity they have today, so this task must NOT have qualified
 /// them. If a negative here fails, someone added a life-scoped overload to a family the amendment
 /// explicitly excluded; if a positive fails, someone removed the un-scoped one those callers use.
-TEST(CasNamespaceLifeId, MountpointObjectsAndManifestsStayUnqualified)
+TEST(CASNamespaceLifeId, MountpointObjectsAndManifestsStayUnqualified)
 {
     static_assert(HasUnscopedMountpointObjectKey<Layout>);
     static_assert(!HasLifeScopedMountpointObjectKey<Layout>);

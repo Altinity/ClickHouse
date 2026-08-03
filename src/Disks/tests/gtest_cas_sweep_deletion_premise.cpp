@@ -73,7 +73,7 @@ struct OrphanFixture
 /// Rule (1), the load-bearing case. The cursor is still INSIDE the build's own epoch, so epoch 1's
 /// closing seal is not proven consumed and an unfolded `+1` naming this build may still exist above the
 /// cursor. The body survives, and the sweep says so through its `warnings` out-param.
-TEST(CasSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
+TEST(CASSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
 {
     OrphanFixture f;
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
@@ -91,7 +91,7 @@ TEST(CasSweepDeletionPremise, AnUnconsumedEpochSealRetainsTheBuildsManifests)
 }
 
 /// Rule (1) satisfied and the tail clean: the ordinary reclaim still happens, by exact token.
-TEST(CasSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
+TEST(CASSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
 {
     OrphanFixture f;
     /// A cursor at `{2, 1}` is in an epoch strictly above the build's. An epoch is left ONLY over its
@@ -109,7 +109,7 @@ TEST(CasSweepDeletionPremise, AConsumedEpochSealWithACleanTailDeletes)
 /// Uncertainty rule, hold arm. The cursor HAS consumed epoch 1's seal, so rule (1) alone would let the
 /// body go -- but the namespace is held, which means the fold could not account for everything at or
 /// above the held position. A held namespace retains everything under it.
-TEST(CasSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
+TEST(CASSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
 {
     OrphanFixture f;
     const RefHold hold{.reason = HoldReason::GapBelowWitness,
@@ -131,7 +131,7 @@ TEST(CasSweepDeletionPremise, AHeldNamespaceRetainsEvenAboveAConsumedSeal)
 /// Uncertainty rule, unreached-frontier arm in its most complete form: the adopted seal carries no row
 /// for this namespace at all, so no round has ever sealed a cursor for it and nothing about its ref
 /// stream is proven. This is also the state of a pool whose GC has never run.
-TEST(CasSweepDeletionPremise, ANamespaceWithNoSealedCursorRetains)
+TEST(CASSweepDeletionPremise, ANamespaceWithNoSealedCursorRetains)
 {
     OrphanFixture f;
     /// A seal exists and is adopted, but it covers a DIFFERENT namespace.
@@ -152,7 +152,7 @@ TEST(CasSweepDeletionPremise, ANamespaceWithNoSealedCursorRetains)
 /// The predicate is exercised directly here because the sweep's own protection view already spares a
 /// listed tail removal before the premise is ever consulted -- the point of the rule is that the SAME
 /// answer is reached by the predicate both paths share, so neither path can lose it.
-TEST(CasSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
+TEST(CASSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
 {
     OrphanFixture f;
     const String key = f.orphanKey();
@@ -178,7 +178,7 @@ TEST(CasSweepDeletionPremise, AnUnconsumedTailRemovalRetainsItsTarget)
 
 /// Both sweep paths call the ONE predicate: the cursor-paced page must refuse the same body the
 /// per-namespace sweep refuses, for the same reason.
-TEST(CasSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
+TEST(CASSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 {
     OrphanFixture f;
     seedFoldCursorForTest(*f.backend, f.store->layout(), f.ns, RefTxnId{kBuildEpoch, 3});
@@ -203,7 +203,7 @@ TEST(CasSweepDeletionPremise, TheCursorPagePathHonoursTheSamePremise)
 /// is the safe direction and it is deliberate, but it is not "delay": reclaiming this class needs the
 /// sweep's own rework (registers R2/R3, Stage B) -- the writer duty queue that knows what it staged, and
 /// the nomination path. The premise ships as the safety floor, not as the reclaim policy.
-TEST(CasSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIndefinitely)
+TEST(CASSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIndefinitely)
 {
     OrphanFixture f;
     /// No ref stream, no coverage row -- repeated passes change nothing.
@@ -223,7 +223,7 @@ TEST(CasSweepDeletionPremise, DebrisUnderANamespaceTheFoldNeverWalksIsRetainedIn
 /// Non-vacuous by construction: two namespaces on ONE page are retained for DIFFERENT reasons, so a
 /// counter wired to the wrong class, or one bucket catching everything, changes the answer. A
 /// single-reason page would pass against a single mislabelled counter.
-TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
+TEST(CASSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -284,7 +284,7 @@ TEST(CasSweepDeletionPremise, DistinctRetainReasonsLandInDistinctCounters)
 /// before it -- is retained, and the cursor must not step over it: the sweep's cursor is a
 /// cleanup-progress hint whose skipped range is not revisited until a full wrap, so advancing past an
 /// undecided candidate converts "retained this round" into "unexamined for a whole cycle".
-TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTheRest)
+TEST(CASSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTheRest)
 {
     OrphanFixture f;
     const ManifestRef second = ref(5, 0xAC);
@@ -320,7 +320,7 @@ TEST(CasSweepDeletionPremise, AnExhaustedDeleteBudgetRetainsAndDoesNotStepOverTh
 /// this namespace's candidates is retained (never nominated, never deleted), yet the page still DECIDES
 /// them (a retained candidate is a decision) and the cursor advances across pages until the whole
 /// keyspace is covered.
-TEST(CasSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgingTheCursor)
+TEST(CASSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgingTheCursor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -395,7 +395,7 @@ TEST(CasSweepDeletionPremise, RecoveryWorkBudgetRetainsAndConvergesWithoutWedgin
 /// namespaces share one page; with `max_sweep_namespaces = 1`, only the first namespace this page
 /// touches gets a protection view built at all -- the second is retained under the work-budget cause,
 /// never given a partial or best-effort view.
-TEST(CasSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
+TEST(CASSweepDeletionPremise, NamespaceWorkBudgetCapsDistinctViewsPerPage)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);

@@ -102,7 +102,7 @@ public:
 /// `isVanished()` still reads false (it is a distinct terminal), but a direct gate re-probe refuses without
 /// ever claiming/allocating/writing (the thread-exit behavior of the background observer is covered by
 /// `RemountThreadSelfExitsOnceIdentityLost` below).
-TEST(CasLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
+TEST(CASLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -137,7 +137,7 @@ TEST(CasLifecycleCondition, SentinelsDeletedEntersIdentityLostTerminal)
 /// — mirroring how a `Vanished` pool refuses to arm one. With `background_watermark = true`, `scheduleRemount`
 /// must REFUSE to arm a recovery thread once the pool is `IdentityLost` (`remountTerminal()` covers it),
 /// exactly as it refuses on a published `Vanished` intent.
-TEST(CasLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
+TEST(CASLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// `background_watermark = true` so `scheduleRemount` actually arms a recovery thread in production mode
@@ -158,7 +158,7 @@ TEST(CasLifecycleCondition, RemountThreadSelfExitsOnceIdentityLost)
 }
 
 /// (b) `_pool_meta` present but its `pool_id` is foreign → `Vanished(replaced)` immediately.
-TEST(CasLifecycleCondition, PoolMetaForeignPoolIdEntersVanishedReplacedImmediately)
+TEST(CASLifecycleCondition, PoolMetaForeignPoolIdEntersVanishedReplacedImmediately)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -181,7 +181,7 @@ TEST(CasLifecycleCondition, PoolMetaForeignPoolIdEntersVanishedReplacedImmediate
 /// (c) [B6] trap: `_pool_meta` present, pool_id + blob_header_len match, but `algos_used` differs → NOT a
 /// replacement (`algos_used` is legally mutable); the existing recovery proceeds and the pool returns to
 /// `Live`.
-TEST(CasLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProceeds)
+TEST(CASLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProceeds)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -209,7 +209,7 @@ TEST(CasLifecycleCondition, PoolMetaAlgosUsedDifferIsNotReplacementRecoveryProce
 
 /// (d) [D3] no auto-revival: from `IdentityLost`, restoring both sentinels with matching identity does NOT
 /// bring the disk back — the observer stays fail-loud; only a restart recovers.
-TEST(CasLifecycleCondition, IdentityLostDoesNotAutoReviveWhenSentinelsRestored)
+TEST(CASLifecycleCondition, IdentityLostDoesNotAutoReviveWhenSentinelsRestored)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
@@ -236,7 +236,7 @@ TEST(CasLifecycleCondition, IdentityLostDoesNotAutoReviveWhenSentinelsRestored)
 /// (e) Transport error from the probe → the pool stays `TransientNotLive` (recoverable); absence is never
 /// proven, so no terminal transition fires and store()-class access does NOT throw the terminal lifecycle
 /// error (the transient class stays fence-gated until Task 8).
-TEST(CasLifecycleCondition, ProbeTransportErrorStaysTransientAndRetries)
+TEST(CASLifecycleCondition, ProbeTransportErrorStaysTransientAndRetries)
 {
     auto backend = std::make_shared<ToggleableTransportFaultBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
