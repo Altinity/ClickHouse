@@ -28,8 +28,8 @@ rows.
 - `process_id` ([UInt64](/sql-reference/data-types/int-uint)) — Process id recorded in the lease body.
 - `writer_epoch` ([UInt64](/sql-reference/data-types/int-uint)) — Fenced writer epoch of the incarnation.
 - `renewal_sequence` ([UInt64](/sql-reference/data-types/int-uint)) — Lease renewal sequence number.
-- `started_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease started.
-- `expires_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease expires.
+- `started_at` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease started.
+- `expires_at` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease expires.
 - `min_active_build_sequence` ([UInt64](/sql-reference/data-types/int-uint)) — Oldest in-flight build sequence (`UINT64_MAX` means the mount said farewell).
 - `gc_fenced` ([UInt8](/sql-reference/data-types/int-uint)) — `1` if GC fenced this slot out (terminal).
 - `state` ([String](/sql-reference/data-types/string)) — One of `live`, `expired`, `terminated`, `fenced`, `corrupt`.
