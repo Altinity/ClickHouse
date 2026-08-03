@@ -286,7 +286,9 @@ TEST(CasRefCatalogBirthWiring, AnExistingLiveEntryIsAdoptedRatherThanReminted)
     const RefTxnId id = publishBirth(store, ns, "a");
     EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));
 
-    const CatalogEntry * after = findEntry(CasRefCatalog::read(*backend, layout).catalog, ns);
+    /// The read result must outlive the returned pointer -- findEntry points into its entries.
+    const auto after_cut = CasRefCatalog::read(*backend, layout);
+    const CatalogEntry * after = findEntry(after_cut.catalog, ns);
     ASSERT_NE(after, nullptr);
     EXPECT_EQ(after->incarnation, UInt128(0xcafe)) << "adopted, not re-minted";
     EXPECT_EQ(after->state, NsState::Live);
@@ -317,7 +319,9 @@ TEST(CasRefCatalogBirthWiring, ANamespaceStuckCreatingUnderALiveForeignFenceRefu
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { publishBirth(store, ns, "a"); });
 
     /// Nothing was written: the entry is exactly as observed, still Creating, still the foreign fence.
-    const CatalogEntry * still = findEntry(CasRefCatalog::read(*backend, layout).catalog, ns);
+    /// The read result must outlive the returned pointer -- findEntry points into its entries.
+    const auto still_cut = CasRefCatalog::read(*backend, layout);
+    const CatalogEntry * still = findEntry(still_cut.catalog, ns);
     ASSERT_NE(still, nullptr);
     EXPECT_EQ(*still, entry) << "a refused resolution must write nothing";
     EXPECT_EQ(backend->putTotal(), 0u);
@@ -350,7 +354,9 @@ TEST(CasRefCatalogBirthWiring, AStaleCreatingEntryFromATerminatedForeignFenceIsR
     const RefTxnId id = publishBirth(store, ns, "a");
     EXPECT_EQ(id, (RefTxnId{store->writerEpoch(), 1}));
 
-    const CatalogEntry * live = findEntry(CasRefCatalog::read(*backend, layout).catalog, ns);
+    /// The read result must outlive the returned pointer -- findEntry points into its entries.
+    const auto live_cut = CasRefCatalog::read(*backend, layout);
+    const CatalogEntry * live = findEntry(live_cut.catalog, ns);
     ASSERT_NE(live, nullptr);
     EXPECT_EQ(live->state, NsState::Live);
     EXPECT_EQ(live->incarnation, UInt128(0xbeef)) << "the SAME incarnation throughout -- resumption, not rebirth";
