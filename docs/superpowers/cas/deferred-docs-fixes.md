@@ -721,3 +721,13 @@ Carried, not a docs fix: `CasRefInstallSafetyDeathTest` is executed by NEITHER g
 both release and sanitizer builds define `NDEBUG` while the suite is gated on
 `MEMORY_TRACKER_DEBUG_CHECKS` (needs `!NDEBUG`). Covering it requires a plain debug build in the
 gate. Pre-existing; belongs to the T8 residual row.
+
+### D47 — pre-existing provenance-citing comments {#d47-provenance-comments}
+
+The comment policy forbids citing reviews, plans, tasks, or finding IDs in code (those artifacts
+leave the branch; the comment must stand alone with the REASON). Four pre-existing sites still cite
+theirs and were deliberately left out of the T6b cleanup to keep that commit scoped:
+`gtest_cas_mount.cpp:260` ("codex round-3 finding 1"), `gtest_cas_ref_log_format.cpp:188` and
+`gtest_cas_ref_snapshot_format.cpp:129` ("codex round-2, finding 3"),
+`gtest_cas_upload_fanout.cpp:975` ("Test 6c (codex stage-1 review, Critical)"). Keep each sentence's
+constraint, drop the citation.
