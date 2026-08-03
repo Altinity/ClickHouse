@@ -665,3 +665,8 @@ self-matching pgrep.
 - LANE-G: idle at b988b289704 on laneg/t8-soaks, awaiting controller's soak-worktree decision.
 - Crons live: CI check :11 hourly (PR 2073), watchdog :04/:24/:44.
 - Next: t8-lead residual-row commits + Step-1 gate TOTALS; then battery orchestration.
+
+STANDING ORDER (user, 23:5x): ONE heavy stage at a time box-wide — never two of
+{build, full gate, praktika run, soak} concurrently. T8 battery/soak orchestration is strictly
+sequential: gate release → gate ASan → praktika groups one by one → soaks one by one
+(smoke → its full → next scenario). Relayed to t8-lead.
