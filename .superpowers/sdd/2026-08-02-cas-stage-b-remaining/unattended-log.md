@@ -641,3 +641,20 @@ tidy worktrees SPENT (content landed) — removable later via git worktree remov
 Agent-ops lessons this campaign: idle-on-long-run pattern (wake with specifics); watcher shells
 must be bounded-for+grep-marker (9 self-matching pgrep loops killed); ps -auxwww full-width for
 inspection; evidence provenance = binary mtime vs run window.
+
+## Unattended phase 2 — 2026-08-03 evening (post-renames, T8 start) {#unattended-2}
+
+Context at entry: T6+T6b integrated (budgets; C2 mf-cleanup cap REMOVED after soak FAIL/PASS pair);
+naming unification (8 tasks) + obscure-names (7 tasks + disks commands) landed; altinity/antalya-26.6
+merged (4950cb23446, 2 conflicts resolved: copyFileImpl guard+dispatch, workflows regenerated);
+PR-2073 review fixes landed (9ad3e15b688); shortkeys ns→namespace (397251114c3) — its gates
+(release 2006/2006, ASan 2011/2011 full CA) double as the merged-tree verification. Final tidy
+CANCELLED by user (CI/CD tidy is the gate). Codex big review CANCELLED by user. Standalone 20m soak
+folded into T8's smoke stage.
+
+Standing orders (user, 2026-08-03 evening): hourly CI check of PR 2073 (no pushes!; on failure —
+systematic debugging from artifacts, fix prepared LOCALLY on lane-g); watchdog every 20 min (status
++ wake stalled agents + this log); T8 now on master worktree; unattended mode — deep systematic
+debugging, no handwaving; obvious safe fixes done, hard ones consulted with codex; watch
+correctness/guarantees, S3 budget, cpu/mem/disk; nohup+file+monitor for >20min tasks; no
+self-matching pgrep.
