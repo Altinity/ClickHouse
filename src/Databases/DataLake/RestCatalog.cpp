@@ -2,6 +2,7 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/RemoteHostFilter.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
@@ -46,16 +47,13 @@
 #include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/SSLManager.h>
 #include <Poco/StreamCopier.h>
-<<<<<<< HEAD
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Common/FailPoint.h>
-=======
 #include <Poco/DateTime.h>
 #include <Poco/DateTimeFormat.h>
 #include <Poco/DateTimeParser.h>
 #include <Poco/StringTokenizer.h>
 #include <Poco/Timestamp.h>
->>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
 
 
 namespace DB::ErrorCodes
@@ -68,35 +66,18 @@ namespace DB::ErrorCodes
 
 namespace DB::Setting
 {
-<<<<<<< HEAD
     extern const SettingsBool allow_experimental_geo_types_in_iceberg;
 }
 
 namespace DB::FailPoints
 {
     extern const char check_database_datalake_negative[];
-=======
-    extern const Event DataLakeRestCatalogLoadConfig;
-    extern const Event DataLakeRestCatalogLoadConfigMicroseconds;
-    extern const Event DataLakeRestCatalogGetNamespaces;
-    extern const Event DataLakeRestCatalogGetNamespacesMicroseconds;
-    extern const Event DataLakeRestCatalogGetTables;
-    extern const Event DataLakeRestCatalogGetTablesMicroseconds;
-    extern const Event DataLakeRestCatalogGetTableMetadata;
-    extern const Event DataLakeRestCatalogGetTableMetadataMicroseconds;
-    extern const Event DataLakeRestCatalogGetCredentials;
-    extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
+}
+
+namespace ProfileEvents
+{
     extern const Event DataLakeRestCatalogCredentialsVended;
     extern const Event DataLakeRestCatalogCredentialsCacheHits;
-    extern const Event DataLakeRestCatalogCreateNamespace;
-    extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
-    extern const Event DataLakeRestCatalogCreateTable;
-    extern const Event DataLakeRestCatalogCreateTableMicroseconds;
-    extern const Event DataLakeRestCatalogUpdateTable;
-    extern const Event DataLakeRestCatalogUpdateTableMicroseconds;
-    extern const Event DataLakeRestCatalogDropTable;
-    extern const Event DataLakeRestCatalogDropTableMicroseconds;
->>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
 }
 
 namespace DataLake
@@ -1485,7 +1466,7 @@ VendedStorageCredentials RestCatalog::getCredentialsAndEndpoint(Poco::JSON::Obje
             {
                 auto gcs_token = object->get(gcs_token_str).extract<String>();
                 LOG_DEBUG(log, "Using GCS OAuth2 token for location {}", location);
-                return {std::make_shared<GCSCredentials>(gcs_token), ""};
+                return {std::make_shared<GCSCredentials>(gcs_token), "", std::nullopt};
             }
 
             std::string access_key_id;

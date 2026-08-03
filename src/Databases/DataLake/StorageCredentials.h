@@ -35,11 +35,8 @@ public:
         , session_token(session_token_)
     {}
 
-<<<<<<< HEAD
-=======
     bool isEmpty() const override { return access_key_id.empty() || secret_access_key.empty(); }
 
->>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
     void addCredentialsToEngineArgs(DB::ASTs & engine_args) const override
     {
         if (engine_args.size() != 1)
@@ -96,6 +93,8 @@ public:
     }
 
     const std::string & getToken() const { return oauth_token; }
+
+    bool isEmpty() const override { return oauth_token.empty(); }
 
 private:
     std::string oauth_token;

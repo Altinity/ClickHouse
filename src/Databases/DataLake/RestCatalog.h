@@ -144,10 +144,7 @@ protected:
     std::string auth_scope;
     std::string oauth_server_uri;
     bool oauth_server_use_request_body;
-<<<<<<< HEAD
     mutable MultiVersion<AccessToken> access_token;
-=======
-    mutable std::optional<AccessToken> access_token;
 
     /// TTL for caching vended credentials per table (0 means no caching).
     std::atomic<std::chrono::seconds> vended_credentials_cache_ttl{std::chrono::seconds::zero()};
@@ -158,27 +155,6 @@ protected:
 
     mutable std::map<std::pair<std::string, std::string>, VendedStorageCredentials> credentials_cache
         TSA_GUARDED_BY(credentials_cache_mutex);
-
-public:
-    class AllowedNamespaces
-    {
-    public:
-        AllowedNamespaces() {}
-        explicit AllowedNamespaces(const std::string & namespaces_);
-
-        /// Check if nested namespaces (nested=true) or tables (nested=false) are allowed in namespace
-        bool isNamespaceAllowed(const std::string & namespace_, bool nested) const;
-
-    private:
-        /// List of allowed nested namespaces
-        std::unordered_map<std::string, AllowedNamespaces> nested_namespaces;
-        /// Tables from current level are allowed
-        bool allow_tables = false;
-    };
-
-protected:
-    AllowedNamespaces allowed_namespaces;
->>>>>>> cf885680ce4 (Merge pull request #1923 from Altinity/fix/antalya-26.3/iceberg-creds)
 
     Poco::Net::HTTPBasicCredentials credentials{};
 
