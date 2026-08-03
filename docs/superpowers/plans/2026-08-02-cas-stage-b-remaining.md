@@ -1020,10 +1020,15 @@ ownership-partition proof exists).
 - [ ] **Step E1: AMD tidy lane.** Configure `build_tidy` with the `BuildTypes.AMD_TIDY` cmake
   shape (`ci/defs/defs.py` profile; Debug, no-sanitizer, x86_64, `-DENABLE_CLANG_TIDY=1`; the
   repo `.clang-tidy` supplies checks; set `CTCACHE_DIR` for the cache). Build to
-  `build_tidy/tidy_build.log`. Read ONLY diagnostics under
-  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` and
-  `src/Disks/tests/gtest_ca*`/`gtest_cas*`; report the rest without fixing. Findings in scope are
-  CODE findings for the owning task's lane.
+  `build_tidy/tidy_build.log`. **Scope (user directive 2026-08-03): every CAS-related diagnostic
+  is FIXED, regardless of which stage introduced it** — files under
+  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`, `src/Disks/tests/gtest_ca*`/
+  `gtest_cas*`/`cas_*`, and CA-owned regions of shared files (e.g.
+  `ContentAddressedGarbageCollectionLog.cpp`). Fixes land as a reviewed slice with targeted
+  re-tidy of the changed TUs + the affected unit suites (release+ASan); a diagnostic whose "fix"
+  would change deliberate semantics (e.g. an intentionally-uninitialized field) is suppressed
+  with a NOLINT + reason instead, recorded per site. Non-CAS diagnostics are reported without
+  fixing.
 - [ ] **Step E2: executable-prose sweep.** Grep the Stage-B diff (old plan Task 0 baseline →
   current) for "whenever/always/must also/in the same change" in comments; for each hit, convert
   the rule to something that fails a build or test, or record in `BACKLOG.md` why it cannot be.
