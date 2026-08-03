@@ -91,7 +91,9 @@ command and its output; the baseline figures are expectations, not facts to trus
 - The unit-test binary is `build/src/unit_tests_dbms` (target `unit_tests_dbms`). The **full CA
   gate** is: `utils/cas-gate/generate_cas_suites.sh build` (regenerates the suite list from
   sources and fails loud on any unclaimed suite), then one run of `build/src/unit_tests_dbms` with
-  the generated colon-joined `--gtest_filter`, logged under `build/`. Both gate scripts
+  the generated suite list joined as `<suite>.*:<suite>.*:...` (the names in `cas_suites.txt`
+  are bare — each needs the `.*` suffix or the filter matches zero tests), logged under
+  `build/`. Both gate scripts
   (`generate_cas_suites.sh`, `run_cas_gate_per_suite.sh`) are versioned in `utils/cas-gate/` by
   the publication commit itself — the gate never depends on untracked `tmp/` files.
 - TLC reruns only when a model's transition system, invariants, action correspondence, configs,
@@ -126,6 +128,12 @@ command and its output; the baseline figures are expectations, not facts to trus
   every `LOGICAL_ERROR` expectation sits behind the death-test split (gtest death tests fork, so
   sanitizer aborts are child-isolated), enforced by the hygiene sweep; the per-suite runner
   remains a diagnostic tool only.
+- **Post-tidy parallel kickoff (user directive 2026-08-03):** IMMEDIATELY after the final tidy
+  re-run completes, launch in PARALLEL: (1) the codex implementation review (gpt-5.6-sol xhigh,
+  nohup — it runs long) over the whole Stage-B implementation delta, and (2) a 20-minute PLAIN
+  general soak (`python3 -m soak.run --phase 3 --duration 20m` — NOT a scenarios/cards run) WITH
+  CHAOS enabled (the harness's fault-injection mode). Both are additional quality gates ahead of
+  the T8 battery; the chaos smoke does not replace the T8 soak program.
 - **Final tidy re-run (user directive 2026-08-03):** after ALL C++-changing tasks are complete
   (i.e. once T5/T6/the fsck slice and any fix waves have landed, before T8's battery), run ONE
   incremental clang-tidy pass — `ninja -k 0 -C build_amd_tidy unit_tests_dbms` in the MAIN

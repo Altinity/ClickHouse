@@ -289,7 +289,7 @@ DETECTOR_METRICS = (
     ("fold_ref_intake", "logs_applied"),
     ("fold_reduce", "txns_unapplied"),
     # Not a detector value but the verdict the detectors drive: the round refused to fold.
-    ("fold_ref_list", "ref_folding_aborted"),
+    ("fold_ref_group", "ref_folding_aborted"),
 )
 
 # Scalar columns pulled out of `phase_metrics` by name. `map['absent']` is a DEFINED zero for a

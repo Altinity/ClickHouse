@@ -210,12 +210,12 @@ def test_parse_phase_summary_accepts_json_quoted_64bit_integers():
 
 def test_summarize_ranks_the_slowest_phases():
     text = "\n".join([
-        _phase_row("fold_ref_list", total_us="9000", max_us="5000"),
+        _phase_row("fold_ref_group", total_us="9000", max_us="5000"),
         _phase_row("fold_reduce", total_us="4000", max_us="2000"),
         _phase_row("lease", total_us="10", max_us="5"),
     ])
     s = summarize_phases(parse_phase_summary(text), top_n=2)
-    assert [x["phase"] for x in s["slowest"]] == ["fold_ref_list", "fold_reduce"]
+    assert [x["phase"] for x in s["slowest"]] == ["fold_ref_group", "fold_reduce"]
     assert s["phases"] == 3
     assert s["rounds"] == 3
     assert s["total_us"] == 13010
@@ -223,17 +223,17 @@ def test_summarize_ranks_the_slowest_phases():
 
 def test_summarize_surfaces_the_detector_values():
     text = "\n".join([
-        _phase_row("fold_ref_list", ref_folding_aborted="1"),
+        _phase_row("fold_ref_group", ref_folding_aborted="1"),
         _phase_row("fold_ref_intake", logs_accounted="10", logs_applied="7"),
         _phase_row("fold_reduce", txns_unapplied="3"),
     ])
     s = summarize_phases(parse_phase_summary(text))
-    assert s["detector"]["fold_ref_list.ref_folding_aborted"] == 1
+    assert s["detector"]["fold_ref_group.ref_folding_aborted"] == 1
     assert s["detector"]["fold_reduce.txns_unapplied"] == 3
     # The identity the intake pair exists to check: every position the sealed cut covers reached the
     # single cursor-advance site.
     assert s["intake_mismatch"] == 3
-    assert "fold_ref_list.ref_folding_aborted=1" in format_phase_summary(s)
+    assert "fold_ref_group.ref_folding_aborted=1" in format_phase_summary(s)
 
 
 def test_a_renamed_phase_metric_fails_closed_instead_of_reading_zero():

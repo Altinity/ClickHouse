@@ -19,7 +19,7 @@ from soak.signals import CAS_SIGNAL_EVENTS, PhaseCoverage, SignalTracker
 # The `metrics` maps carry each phase's own detector keys, exactly as the server's `sumMap` does — the
 # presence guard in `summarize_phases` reads them to tell "the value is zero" from "the name moved".
 PHASE_ROWS = "\n".join([
-    json.dumps({"phase": "fold_ref_list", "rounds": "2", "calls": "2", "total_us": "5000",
+    json.dumps({"phase": "fold_ref_group", "rounds": "2", "calls": "2", "total_us": "5000",
                 "max_us": "3000", "logs_accounted": "0", "logs_applied": "0",
                 "txns_unapplied": "0", "ref_folding_aborted": "0",
                 "metrics": {"ref_keys_listed": "12", "ref_folding_aborted": "0"},
@@ -100,12 +100,12 @@ def test_phase_summary_is_logged_and_persisted(tmp_path):
     assert written == 2
     assert coverage.captured == 1
     rows = {r["phase"]: r for r in metrics_mod.gc_phase_rows(conn)}
-    assert rows["fold_ref_list"]["ref_folding_aborted"] == 0
-    assert rows["fold_ref_list"]["ts"] == 555
-    assert rows["fold_ref_list"]["checkpoint"] == "GC checkpoint"
+    assert rows["fold_ref_group"]["ref_folding_aborted"] == 0
+    assert rows["fold_ref_group"]["ts"] == 555
+    assert rows["fold_ref_group"]["checkpoint"] == "GC checkpoint"
     # The slowest phase and the detector values are both on the checkpoint's log line.
-    assert "fold_ref_list=5.0ms" in lines[0]
-    assert "fold_ref_list.ref_folding_aborted=0" in lines[0]
+    assert "fold_ref_group=5.0ms" in lines[0]
+    assert "fold_ref_group.ref_folding_aborted=0" in lines[0]
 
 
 def test_a_node_that_is_down_is_a_counted_gap_not_an_empty_summary(tmp_path):

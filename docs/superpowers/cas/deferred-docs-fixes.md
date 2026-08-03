@@ -665,3 +665,13 @@ From `t3-review.md` (F5 plus its own PROSE section, on `laneg/t3-finish`):
    exit-code list (`dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`) is still correct
    after the `janitor_pending` split — `namespace_janitor_pending` is deliberately soft and does not
    belong in that list.
+
+### D43 — T5-review prose batch {#d43-t5-review-prose}
+
+From `t5-review.md`: (P1, FALSE) `t5-report.md` misquotes the draft pick's commit subject;
+(P2, FALSE) the kept detector tests' comment describes the pre-pick `probe_a_period` default that
+no longer exists (and mislabels 16 as non-sampling); (P3, IMPRECISE) the anti-vacuity comment in
+`gtest_cas_holey_list_detector.cpp` still speaks of a "sampled mechanism" post-retirement;
+(P5, IMPRECISE) `pre_fold_ref_drain` and `namespace_cleanup` carry no `PHASE N/18` comment —
+16 of 18 phases annotated. (P4 — the plan's gate-recipe `.*`-suffix trap — fixed directly in the
+plan, it was an executor hazard.)
