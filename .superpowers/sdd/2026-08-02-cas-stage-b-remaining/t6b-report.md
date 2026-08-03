@@ -324,3 +324,32 @@ anything, and this one initially hadn't.
    settings-plumbing files risked leaving one half in a non-building state. Flagging in case a cleaner
    split is wanted for review purposes — I can still produce one on request since both slices are
    logically separable in the diff (orphan-planner files vs. cleanup-family sites in `CasGc.cpp`).
+
+## Post-submission comment cleanup — 2026-08-03
+
+Citations to review task references ("codex T6-1", "codex T6-3", "T6b Slice 2", "T6b Slice 3") were
+removed from the T6b comments per the campaign's durability rule: code comments must state the constraint
+or reason, never internal citations (those artifacts leave the branch; the comment must stand alone).
+
+**Commit:** `84c24d3abbf` — "ca: gc — comments state the budget constraints without citing their
+provenance"
+
+**Changes:** 7 files, 16 insertions/16 deletions (comment-only; no semantic changes).
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp`: 4 citations removed
+  ("(codex T6-3)" × 4).
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp`: 3 citations
+  removed ("(codex T6-1)" × 3).
+- `src/Disks/tests/gtest_cas_blob_indegree.cpp`: 1 citation removed ("T6b Slice 1:").
+- `src/Disks/tests/gtest_cas_gc_ack_floor.cpp`: 2 citations removed ("T6b Slice 1" + legacy review
+  triage reference "(codex-review triage 2026-07-17 §3.4, №4)").
+- `src/Disks/tests/gtest_cas_gc_round.cpp`: 1 citation removed ("T6b Slice 3 (codex T6-3):").
+- `src/Disks/tests/gtest_cas_ref_gc.cpp`: 1 citation removed ("T6b Slice 3 (codex T6-3):").
+- `src/Disks/tests/gtest_cas_sweep_deletion_premise.cpp`: 2 citations removed ("T6b Slice 2 (codex T6-1):"
+  × 2).
+
+**Verification:**
+- **Build:** Release mode `ninja unit_tests_dbms` at `build/t6b_comments_build.log` — success.
+- **Tests:** Filtered suites in release mode only (ASan not needed for comment-only changes):
+  `CasBlobInDegree`, `CasThreeCursorMerge`, `CasGcAckFloor`, `CasGcCondemnMarker`, `CasGcRound`,
+  `CasGcSnapRetention`, `CasRefGc`, `CasSweepDeletionPremise` at `build/t6b_comments_test.log` —
+  **81/81 tests passed**.
