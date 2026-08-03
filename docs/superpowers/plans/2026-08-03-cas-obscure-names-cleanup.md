@@ -21,6 +21,7 @@
 - `duration_ms` (system.cas_gc_log) — verified: `UInt64` count of milliseconds → keep.
 - Clear violations to fix: `srid` → `server_root_id`; `Ckpt` → `Checkpoint`; `gen` → `generation`; `indeg` → `indegree`; `snap` → `snapshot`; `Txns` → `Transactions`; `phase_duration_us` → `phase_duration_microseconds`.
 - Async metric `ReaderExecutorModeledCostMsPerRequestedMiB` — do not publish at all: remove the derived metric (magic-weight model, interval-dependent ratio-of-deltas); keep the two honest ProfileEvents (`ReaderExecutorModeledCostMicroseconds`, `ReaderExecutorRequestedBytes`) so observers can compute the ratio themselves.
+- `clickhouse-disks` CA commands (missed by the parent plan): `ca-fsck`, `ca-gc-dryrun`, `ca-gc-rebuild`, `ca-inspect`, `ca-drop-member` → `cas-*`; the deprecated `fsck` alias is dropped outright (no-alias policy, branch unreleased).
 
 ## Global Constraints
 
@@ -261,14 +262,46 @@ git add -A src/ tests/ && git commit -m "cas: drop the ReaderExecutor modeled-co
 
 ---
 
-### Task 7: Final sweep
+### Task 7: clickhouse-disks — `ca-*` commands → `cas-*`, drop the deprecated `fsck` alias
+
+**Files:**
+- Modify: `programs/disks/CommandFsck.cpp` (`command_name = "ca-fsck"`:24, `"fsck"`:198, every `"ca-fsck: …"` message/description string, and the whole `CommandFsckDeprecated` wrapper class ~:190-215 — delete it), `programs/disks/CommandCaGcDryRun.cpp` (`"ca-gc-dryrun"`:22), `programs/disks/CommandCaDropMember.cpp` (`"ca-drop-member"`:26), `programs/disks/CommandCaGcRebuild.cpp` (`"ca-gc-rebuild"`:34), `programs/disks/CommandCaInspect.cpp` (`"ca-inspect"`:28, `"ca-inspect: …"` messages)
+- Modify: `programs/disks/DisksApp.cpp:345-350` (registration map: five `cas-*` entries, the `"fsck"`/`makeCommandFsckDeprecated` line is deleted) and any help/epilog text listing the commands
+- Modify: consumers — `tests/integration/test_cas_drop_pool_member/test.py`, `tests/integration/test_cas_ref_snaplog/test.py`, `utils/ca-soak/**` (`soak/run.py`, `tests/test_fsck_partial.py`, `tests/test_checkpoint_stale_edge.py`, `scenarios/cards/s41_wide_insert_baseline.py`, `README.md`, `scenarios/README.md`)
+
+C++ class names (`CommandCaInspect`, `makeCommandCaGcDryRun`, …) are internal — keep.
+
+**Interfaces:**
+- Produces: `clickhouse-disks` commands `cas-fsck`, `cas-gc-dryrun`, `cas-gc-rebuild`, `cas-inspect`, `cas-drop-member`; bare `fsck` no longer exists.
+
+- [ ] **Step 1: Rename the command strings, delete the alias**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+git ls-files 'programs/disks/*' 'tests/integration/*' 'utils/ca-soak/*' | xargs grep -l 'ca-fsck\|ca-gc-dryrun\|ca-gc-rebuild\|ca-inspect\|ca-drop-member' 2>/dev/null \
+  | xargs sed -i 's/ca-fsck/cas-fsck/g; s/ca-gc-dryrun/cas-gc-dryrun/g; s/ca-gc-rebuild/cas-gc-rebuild/g; s/ca-inspect/cas-inspect/g; s/ca-drop-member/cas-drop-member/g'
+```
+Then by hand: delete the `CommandFsckDeprecated` class in `CommandFsck.cpp` (with its `makeCommandFsckDeprecated` factory) and the `command_descriptions.emplace("fsck", …)` line in `DisksApp.cpp:346`. Re-check the sed did not mangle prose ("replica"-style false positives are impossible for these hyphenated tokens, but review `git diff programs/disks` anyway).
+
+- [ ] **Step 2: Verify, build, commit**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+git ls-files | xargs grep -n 'ca-fsck\|ca-gc-dryrun\|ca-gc-rebuild\|ca-inspect\|ca-drop-member\|FsckDeprecated' 2>/dev/null | grep -v 'docs/superpowers'   # expect empty
+ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
+git add -A programs/ tests/integration utils/ca-soak && git commit -m "cas: clickhouse-disks -- cas-* command names, drop the deprecated fsck alias"
+```
+
+---
+
+### Task 8: Final sweep
 
 - [ ] **Step 1: Grep gate over the decided renames**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files | grep -vE '^docs/superpowers/|^\.superpowers/|^contrib/' \
-  | xargs grep -nE 'CASGc[A-Z]|CASRefCkpt|FoldedTxns|PutDedup\b|DedupCache|indeg_zero|prev_indeg|phase_duration_us|started_at_ms|expires_at_ms|dedup_cache_bytes|gc_snap_generations|ModeledCostMsPerRequestedMiB' 2>/dev/null \
+  | xargs grep -nE 'CASGc[A-Z]|CASRefCkpt|FoldedTxns|PutDedup\b|DedupCache|indeg_zero|prev_indeg|phase_duration_us|started_at_ms|expires_at_ms|dedup_cache_bytes|gc_snap_generations|ModeledCostMsPerRequestedMiB|ca-fsck|ca-gc-dryrun|ca-gc-rebuild|ca-inspect|ca-drop-member' 2>/dev/null \
   | grep -v 'CasFoldSealFormat'   # expect empty
 git ls-files 'docs/en/*' 'tests/queries/*' | xargs grep -nw 'srid\|gen\|snap' 2>/dev/null | grep -v 'docs/superpowers'
 ```
