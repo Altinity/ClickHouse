@@ -62,9 +62,11 @@ Blast-radius detector: `build/t6f_gate_release_wave0.log`.
 | `gtest_cas_gc_frontier_gate.cpp` | `AnExhaustedProbeBudgetSuppressesEveryDeleteFamily` | Subject IS a suppressor (the mandatory 3c arm), so it must stay on the production path; the fixture was wrong, not the posture. Fixed the fixture and added `frontier_unprobed_budget > 0` so the arm pins its own suppressor. See §5. |
 | `gtest_cas_gc_round_defer.cpp` | `FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan` | Subject is walk-plan construction, which was unaffected (`CasGcRefWalkPlansBuilt == 1` and `walk_plan_builds == 1` both passed). Only the incidental catalog-GET count moved, 2 → 3, so the assertion was ADAPTED and the third reader named. |
 
-**No blanket conversions were made.** Exactly one test was left on an explicit
-`StageA_Suppressed` posture by me — none: the draft had already converted the five
-suppression-subject tests, and the wave neither added nor removed a conversion.
+**No blanket conversions were made, and the wave added none.** The draft had already converted the
+five suppression-subject tests; my wave neither added a `StageA_Suppressed` conversion nor removed
+one. Of the four fixes above, one is a compile repair and three adapt assertions to a reclaiming
+round — which is the correct side of the draft's own rule for every one of them, because none of
+the three has suppression as its subject.
 
 Gate after the wave: **1989/1989 across 278 suites** (`build/t6f_gate_release_final.log`).
 
@@ -344,3 +346,17 @@ rounds; if a future change makes the sweep unreachable again, that count is what
   explicitly as the negative-policy seam, so renaming it was out of scope for this task.
 - **T5 reconciliation is not done here.** My branch point predates T5's closure commit; per the
   dispatch, integration is by ordinary merge at MAIN, never rebase.
+
+## 14. State at the final tip
+
+- `git diff --name-only a1686eb699a..HEAD` contains no `.cpp`/`.h`: every commit after the gated one
+  touches only two Python files and this report, so the release and ASan gate numbers in §8 are
+  about HEAD's C++ and not about an earlier tree.
+- Tracked tree CLEAN; both mutations reverted and confirmed reverted before either gate number was
+  taken.
+- Re-verified at the final tip:
+  `CasGcFrontierGate*:CasGcBoundedWalk*:CasGcRoundDefer*:CasGcLog*:CaWiring*` = **74/74**
+  (`build/t6f_final_verify.log`) — this covers both restored gtest assertions,
+  `CasGcLog.EmitsStartFinishWithCounts` and `CaWiring`'s `unreachable == 0`.
+- Repo-root debris `k/`, `p/`, `tmp-lock-sites.txt` is dated 2026-07-31/08-01 and predates this
+  session; nothing was staged with `git add -A` at any point.
