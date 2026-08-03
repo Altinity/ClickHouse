@@ -626,7 +626,7 @@ TEST(CASUploadFanout, MergeNothingOnFailure)
 /// Test 4: two DISTINCT-ref fresh uploads, latch-crossed so both are inside `uploadBlobDetached` (hence
 /// both touching the ONE shared dedup cache) at once. The cache's internal locking makes the concurrent
 /// insertion correct; on the TSan lane this pins that there is no data race on the shared cache.
-TEST(CASUploadFanout, ConcurrentDedupCacheInsertion)
+TEST(CASUploadFanout, ConcurrentDeduplicationCacheInsertion)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);

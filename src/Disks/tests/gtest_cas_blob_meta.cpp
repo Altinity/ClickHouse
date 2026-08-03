@@ -161,7 +161,7 @@ TEST(CASBlobMeta, WritesUsePoolRequestController)
 /// Phase 3 T3 (was Phase 2 Task 5 crux Test 2, dedup half): the dedup-cache set is `BlobRef`-keyed and
 /// admits a 32-byte digest without truncation/collision against its 16-byte zero-tailed sibling — even
 /// under a DIFFERENT algo (the whole point of the pair identity).
-TEST(CASBlobMeta, DedupCacheAdmitsWidth32Digest)
+TEST(CASBlobMeta, DeduplicationCacheAdmitsWidth32Digest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test", .dedup_cache_bytes = 64ULL << 20};

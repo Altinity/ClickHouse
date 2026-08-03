@@ -44,12 +44,12 @@ TEST(CASFormatBattery, GcOutcomes)
         "\"tt\":\"etag\",\"tv\":\"e-1\",\"oc\":\"deleted\"}\n{\"n\":1}\n"});
 }
 
-TEST(CASGcOutcomesFormat, EmptyRoundTrips)
+TEST(CASGCOutcomesFormat, EmptyRoundTrips)
 {
     EXPECT_EQ(decodeOutcomeLog(encodeOutcomeLog(OutcomeLog{})).entries.size(), 0u);
 }
 
-TEST(CASGcOutcomesFormat, MultiEntryRoundTripAllOutcomes)
+TEST(CASGCOutcomesFormat, MultiEntryRoundTripAllOutcomes)
 {
     OutcomeLog log;
     log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))},
@@ -75,7 +75,7 @@ TEST(CASGcOutcomesFormat, MultiEntryRoundTripAllOutcomes)
     EXPECT_EQ(encodeOutcomeLog(d), text);
 }
 
-TEST(CASGcOutcomesFormat, GarbageAndUnknownWordsFailClosed)
+TEST(CASGCOutcomesFormat, GarbageAndUnknownWordsFailClosed)
 {
     EXPECT_THROW(decodeOutcomeLog(String("")), DB::Exception);
     EXPECT_THROW(decodeOutcomeLog(String("not a cas object\n")), DB::Exception);
@@ -89,7 +89,7 @@ TEST(CASGcOutcomesFormat, GarbageAndUnknownWordsFailClosed)
     EXPECT_THROW(decodeOutcomeLog(miscount), DB::Exception);
 }
 
-TEST(CASGcOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
+TEST(CASGCOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
 {
     /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the "h" field is truncated
     /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not

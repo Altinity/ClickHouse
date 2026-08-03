@@ -63,9 +63,9 @@ using namespace DB::Cas::tests;
 
 namespace ProfileEvents
 {
-extern const Event CASGcRefWalkPlansBuilt;
-extern const Event CASGcUnmatchedAdoptedParentLives;
-extern const Event CASGcNamespaceCleanupLeaks;
+extern const Event CASGCRefWalkPlansBuilt;
+extern const Event CASGCUnmatchedAdoptedParentLives;
+extern const Event CASGCNamespaceCleanupLeaks;
 }
 
 namespace
@@ -388,7 +388,7 @@ enum class CompetingCatalogOutcome : uint8_t
     Replacement,
 };
 
-class CASGcCompletedRemovalFenceRace : public testing::TestWithParam<CompetingCatalogOutcome>
+class CASGCCompletedRemovalFenceRace : public testing::TestWithParam<CompetingCatalogOutcome>
 {
 };
 
@@ -582,7 +582,7 @@ PoolPtr buildCrossNamespaceScenario(const std::shared_ptr<CountingHintHoleBacken
 /// `hidden`'s own publish left it a real checkpoint, so the arithmetic walk's exact-key probe finds and
 /// folds its `+1` no matter what the LIST hides: the blob survives on its own complete, proven frontier,
 /// not on the round declining to touch anything.
-TEST(CASGcFrontierGate, AHiddenEdgeIsFoundByTheExactKeyProbeAndSavesTheBlobOnACompleteFrontier)
+TEST(CASGCFrontierGate, AHiddenEdgeIsFoundByTheExactKeyProbeAndSavesTheBlobOnACompleteFrontier)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
@@ -620,7 +620,7 @@ TEST(CASGcFrontierGate, AHiddenEdgeIsFoundByTheExactKeyProbeAndSavesTheBlobOnACo
 /// this whole file is about), so its frontier is REALLY proven, not merely declared so, and the blob is
 /// REALLY unreferenced by both namespaces. The round drains it -- the zero-deletion arm above would pass
 /// identically if the round were simply incapable of ever deleting anything.
-TEST(CASGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
+TEST(CASGCFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
@@ -662,7 +662,7 @@ TEST(CASGcFrontierGate, TheSameBlobDrainsOnceHiddenGenuinelyProvesItsOwnFrontier
 /// namespace was folded once first, so it carries a sealed cursor and is therefore IN the universe even
 /// though the hint has gone silent about it. The round probes its expected-next by exact key, finds the
 /// record the listing hid, folds the `+1`, and the blob is never condemned.
-TEST(CASGcFrontierGate, AKnownNamespaceIsProbedByExactKeyAndItsHiddenEdgeSavesTheBlob)
+TEST(CASGCFrontierGate, AKnownNamespaceIsProbedByExactKeyAndItsHiddenEdgeSavesTheBlob)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     const RootNamespace hidden{"00/hidden@cas@"};
@@ -685,7 +685,7 @@ TEST(CASGcFrontierGate, AKnownNamespaceIsProbedByExactKeyAndItsHiddenEdgeSavesTh
 /// nothing hidden, nothing held, no anomaly, and every namespace walked to an honest end-of-stream OPENS
 /// the gate and reclaims. The two booleans are read off the fold's own rows, so a formula that computed
 /// them differently would fail here rather than agree with the test.
-TEST(CASGcFrontierGate, AHealthyCatalogRoundOpensTheGateAndReclaims)
+TEST(CASGCFrontierGate, AHealthyCatalogRoundOpensTheGateAndReclaims)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -757,7 +757,7 @@ DB::UInt128 buildPoolWithWorkAtEverySite(const std::shared_ptr<CountingBackend> 
 /// universe suppresses on that term ALONE: this pool has no anomaly, no hold, and a frontier every
 /// per-namespace probe proves -- the control at the end of the test is what says so, since the identical
 /// pool drains on the production path.
-TEST(CASGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
+TEST(CASGCFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -793,7 +793,7 @@ TEST(CASGcFrontierGate, EveryInventoriedDestructiveSiteIsInertUnderSuppression)
 /// checkpoint" anomaly, and the round declines every site on that. It leaves the frontier incomplete too,
 /// so what this arm pins is "an anomaly suppresses", not "only the anomaly does" -- which is why every
 /// assertion below is about inertness and not about which term fired.
-TEST(CASGcFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamily)
+TEST(CASGCFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamily)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -833,7 +833,7 @@ TEST(CASGcFrontierGate, AnUndecodableCheckpointAnomalySuppressesEveryDeleteFamil
 /// (2) ONE CARRIED HOLD. The gate's second term reads the SEAL, not this round's anomaly list, so the
 /// round that matters here is a LATER one: the hold was detected earlier, rides forward because its
 /// offending position is still unresolved, and must suppress on its own.
-TEST(CASGcFrontierGate, ACarriedHoldSuppressesEveryDeleteFamily)
+TEST(CASGCFrontierGate, ACarriedHoldSuppressesEveryDeleteFamily)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -880,7 +880,7 @@ TEST(CASGcFrontierGate, ACarriedHoldSuppressesEveryDeleteFamily)
 /// (3c) THE PROBE BUDGET. A namespace with a sealed cursor, no `_ckpt` and no listing left can be proven
 /// only by a successor probe; a zero budget denies it one, so it counts toward the universe and not toward
 /// the proofs, and the equality fails.
-TEST(CASGcFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
+TEST(CASGCFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolWithProbeBudget(backend, /*budget*/ 0);
@@ -935,7 +935,7 @@ TEST(CASGcFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
 /// `parent_cursors` -- carries nothing), and no ref-log hint (none was ever written). A condemned blob
 /// with a real, present body and in-degree 0 is queued the way a real round would leave it
 /// (`injectRetire`), so if the guard is missing this round has every reason to delete it.
-TEST(CASGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqualsZero)
+TEST(CASGCFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqualsZero)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -991,7 +991,7 @@ TEST(CASGcFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
 /// The generation prune's cursor must not move on a suppressed round either. It is a monotone
 /// high-water mark that the wholesale prune never revisits, so a cursor that advanced past a generation
 /// this round declined to delete would strand that generation's whole prefix with no reclaimer left.
-TEST(CASGcFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
+TEST(CASGCFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1028,7 +1028,7 @@ TEST(CASGcFrontierGate, ASuppressedRoundDoesNotAdvanceTheGenerationPruneCursor)
 ///
 /// It is reachable under suppression precisely because FOLDING still happens on a suppressed round: the
 /// ref moves off the old generation exactly as it would otherwise, and only the reclaim is withheld.
-TEST(CASGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
+TEST(CASGCFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
@@ -1084,7 +1084,7 @@ TEST(CASGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
     /// cursor already advanced, so a plain retry will NOT re-attempt it; fsck is the backstop").
     /// Bounded (one small run per shard per occurrence) and not a correctness problem.
     ///
-    /// The hand-off itself is not going untested: `CASGcRetention.HandOffDeletesSupersededRef` drives
+    /// The hand-off itself is not going untested: `CASGCRetention.HandOffDeletesSupersededRef` drives
     /// the same transition on an authoritative round and asserts the prefix IS reclaimed.
     runRegularRoundReclaiming(gc);
     EXPECT_FALSE(backend->list(old_prefix, "", 1000).keys.empty())
@@ -1099,7 +1099,7 @@ TEST(CASGcFrontierGate, TheHandOffReclaimIsInertUnderSuppression)
 /// It is gated with its CURSOR, not just its deletes. The cursor paces a cold-prefix enumeration and
 /// nothing revisits a range it passed, so advancing it on a round that swept nothing would silently
 /// skip that range forever. A suppressed round therefore declines the whole pass.
-TEST(CASGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression)
+TEST(CASGCFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppression)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
@@ -1175,7 +1175,7 @@ TEST(CASGcFrontierGate, TheOrphanManifestSweepAndItsCursorAreInertUnderSuppressi
 /// integration test reads it too. A valid checkpoint at every quiet namespace's carried cursor is
 /// authoritative independently of LIST and the probe budget: all three lives are proven without
 /// successor probes, so the budget leaves no namespace unprobed.
-TEST(CASGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSet)
+TEST(CASGCFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSet)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolWithProbeBudget(backend, /*budget*/ 1);
@@ -1235,7 +1235,7 @@ TEST(CASGcFrontierGate, APartialProbeBudgetPublishesATallyThatMatchesTheSealedSe
 
 /// A checkpoint boundary already equal to the carried cursor proves a quiet catalog life complete;
 /// GC must not manufacture a successor `GET` merely because its LIST is empty.
-TEST(CASGcFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSuccessorGet)
+TEST(CASGCFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSuccessorGet)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1281,7 +1281,7 @@ TEST(CASGcFrontierGate, AQuietKnownNamespaceAtItsCheckpointFrontierCostsNoSucces
 
 /// A checkpoint must never retreat below a sealed cursor. Its inclusive frontier can prove a cursor
 /// already at that point, but cannot explain one that has advanced beyond it.
-TEST(CASGcFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
+TEST(CASGCFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1330,7 +1330,7 @@ TEST(CASGcFrontierGate, CheckpointFrontierBehindAnInheritedCursorFailsClosed)
 /// A carried `EpochSeal` may have its authoritative successor in the next epoch. The arithmetic
 /// successor in the sealed epoch is absent by design, so the exact checkpoint frontier must nominate
 /// the shared seal-chain crossing before that absence is classified as a same-epoch gap.
-TEST(CASGcFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
+TEST(CASGCFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1382,7 +1382,7 @@ TEST(CASGcFrontierGate, CheckpointFrontierCrossesAnInheritedEpochSeal)
 
 /// The exact checkpoint successor must chain to the seal just consumed. Merely being in the next epoch
 /// is insufficient: an incorrect predecessor would skip an unclosed history segment forever.
-TEST(CASGcFrontierGate, CheckpointFrontierRejectsWrongPredecessorAfterFreshEpochSeal)
+TEST(CASGCFrontierGate, CheckpointFrontierRejectsWrongPredecessorAfterFreshEpochSeal)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1419,7 +1419,7 @@ TEST(CASGcFrontierGate, CheckpointFrontierRejectsWrongPredecessorAfterFreshEpoch
 
 /// A namespace that was WRONGLY quiet -- the hint hid a record that is durably there -- is walked this
 /// round, not next: the probe finds the record and the walk continues from it.
-TEST(CASGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
+TEST(CASGCFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1466,7 +1466,7 @@ TEST(CASGcFrontierGate, AWronglyQuietNamespaceIsWalkedTheSameRound)
 /// absent probe. A durable `F+1` is physically present but not committed history, so this fold may apply
 /// only `F`; in particular it must not read `F+2`. Reaching `F` still proves the checkpoint-bounded
 /// cut, so the physical successor cannot suppress otherwise eligible destructive work.
-TEST(CASGcFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccessor)
+TEST(CASGCFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccessor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1522,7 +1522,7 @@ TEST(CASGcFrontierGate, CheckpointFrontierBoundsOrdinaryFoldBeforeDurableSuccess
 /// With no physical successor at all, consuming the exact inclusive checkpoint frontier proves this
 /// catalog life complete. This is the control for the same bounded-cut proof exercised with a durable
 /// uncommitted successor above.
-TEST(CASGcFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSuccessor)
+TEST(CASGCFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSuccessor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1562,7 +1562,7 @@ TEST(CASGcFrontierGate, ConsumedCheckpointFrontierProvesOrdinaryLifeWithoutSucce
 /// The same cut remains complete when the durable uncommitted successor is hidden from every LIST.
 /// Exact reads still serve that successor, but the checkpoint ceiling must leave it untouched and must
 /// not let the list omission suppress the checkpoint-bounded destructive path.
-TEST(CASGcFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
+TEST(CASGCFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1615,7 +1615,7 @@ TEST(CASGcFrontierGate, CheckpointFrontierProvesLifeWithHiddenDurableSuccessor)
 
 /// The checkpoint's inclusive endpoint is itself a durable witness. If that exact log is absent,
 /// the namespace is corrupt rather than complete; a 404 at the endpoint must not authorize cleanup.
-TEST(CASGcFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFrontier)
+TEST(CASGCFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFrontier)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1657,7 +1657,7 @@ TEST(CASGcFrontierGate, MissingCommittedCheckpointLogHoldsInsteadOfProvingTheFro
 
 /// A checkpoint may name a durable record that the round's LIST omitted. Exact GETs must still fold
 /// that committed record; the frozen list tail is only a scheduling hint, never a history boundary.
-TEST(CASGcFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityCeiling)
+TEST(CASGCFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityCeiling)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1699,7 +1699,7 @@ TEST(CASGcFrontierGate, HiddenCommittedCheckpointLogIsFoldedThroughTheAuthorityC
 
 /// A valid checkpoint with no committed record is an authoritative empty history. It is complete for
 /// a never-folded life without probing a fabricated first transaction.
-TEST(CASGcFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
+TEST(CASGCFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1726,7 +1726,7 @@ TEST(CASGcFrontierGate, EmptyCheckpointFrontierProvesAnUnfoldedLife)
 
 /// Empty history cannot explain an inherited cursor. An operator-corrupted checkpoint that erases its
 /// own committed boundary must clamp the life rather than silently authorize destruction.
-TEST(CASGcFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
+TEST(CASGCFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1774,7 +1774,7 @@ TEST(CASGcFrontierGate, EmptyCheckpointFrontierRejectsAnInheritedCursor)
 
 /// A catalog `Live` life without its exact checkpoint cannot derive either its genesis or a frontier
 /// from the ref LIST. Even a durable listed first log must be retained until the authority is repaired.
-TEST(CASGcFrontierGate, CatalogLifeWithoutCheckpointDefersWithoutUsingListedFrontier)
+TEST(CASGCFrontierGate, CatalogLifeWithoutCheckpointDefersWithoutUsingListedFrontier)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1817,7 +1817,7 @@ TEST(CASGcFrontierGate, CatalogLifeWithoutCheckpointDefersWithoutUsingListedFron
 /// A valid checkpoint frontier proves a quiet unhinted life without spending the successor-probe budget.
 /// A zero budget therefore cannot suppress unrelated destructive work merely because this life is absent
 /// from LIST.
-TEST(CASGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
+TEST(CASGCFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolWithProbeBudget(backend, /*budget*/ 0);
@@ -1863,7 +1863,7 @@ TEST(CASGcFrontierGate, AnExhaustedProbeBudgetSealsCursorsAndDeletesNothing)
 /// A hold's committed checkpoint frontier remains a durable witness of its own gap. Hiding the later
 /// log from LIST cannot make that gap quiet: every retry exact-reads the missing position, redetects the
 /// hold, and suppresses destructive work until an operator repairs the record stream.
-TEST(CASGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
+TEST(CASGCFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1959,7 +1959,7 @@ TEST(CASGcFrontierGate, ACommittedGapIsRedetectedAndSuppressesEveryRound)
 /// ARM (a): a `+1` that lands after this round's probes and is followed by the SAME round's
 /// condemnation. Round pacing makes it safe on its own: an entry condemned at round K cannot graduate
 /// before K+1 and cannot be deleted before K+2, so the round that condemns never deletes.
-TEST(CASGcFrontierGate, ABlobCondemnedThisRoundIsNeverDeletedThisRound)
+TEST(CASGCFrontierGate, ABlobCondemnedThisRoundIsNeverDeletedThisRound)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -1987,7 +1987,7 @@ TEST(CASGcFrontierGate, ABlobCondemnedThisRoundIsNeverDeletedThisRound)
 /// outright, `indeg > 0` winning over `delete_pending` past the floor. The other two arms bound WHEN
 /// and WHAT a delete may remove; only this one asks whether the blob is still referenced at the moment
 /// the pass decides.
-TEST(CASGcFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
+TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2026,7 +2026,7 @@ TEST(CASGcFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 /// a FRESH incarnation -- so the delayed exact-token delete the previous round published finds a
 /// different token and removes nothing. The blob's identity is preserved by re-upload, never by
 /// reviving the condemned object.
-TEST(CASGcFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelete)
+TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelete)
 {
     ensureBlobUploadPoolForTest();
     ensureCondemnedUploadAdmissionForTest();
@@ -2088,7 +2088,7 @@ TEST(CASGcFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelet
 /// then rests entirely on ORDER, so the operation journal has to show it: the receiver's `+1` is
 /// durable BEFORE the source releases its own committed edge, and no point in the schedule leaves the
 /// blob with zero durable owners.
-TEST(CASGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSourceReleases)
+TEST(CASGCFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSourceReleases)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2131,7 +2131,7 @@ TEST(CASGcFrontierGate, ATokenlessRelinkMakesTheReceiverEdgeDurableBeforeTheSour
 /// round's side effects. Its sole coverage authority is the checkpoint-named base; a listed snapshot
 /// is merely a physical observation until the same-id triple has been validated.
 
-TEST(CASGcFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCursor)
+TEST(CASGCFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCursor)
 {
     RefTableListing listing;
     listing.logs = {{1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}};
@@ -2156,7 +2156,7 @@ TEST(CASGcFrontierGateCleanupRange, CoveredLogsStopAtTheMinimumOfCheckpointAndCu
     EXPECT_EQ(ahead.deletable_snapshots, (std::vector<RefTxnId>{{1, 5}}));
 }
 
-TEST(CASGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStrictlyOlderOnesGo)
+TEST(CASGCFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStrictlyOlderOnesGo)
 {
     RefTableListing listing;
     listing.logs = {{1, 1}, {1, 2}, {1, 3}};
@@ -2179,7 +2179,7 @@ TEST(CASGcFrontierGateCleanupRange, ASnapshotAtTheCheckpointSurvivesAndOnlyStric
 /// Cleanup shares recovery's validator rather than inferring its own authority from a LIST. The
 /// missing-base case is the no-checkpoint range above; the three physical triple failures below must
 /// each reject exactly the checkpoint-named candidate.
-TEST(CASGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnapshotAndSeal)
+TEST(CASGCFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnapshotAndSeal)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout{"p"};
@@ -2214,7 +2214,7 @@ TEST(CASGcFrontierGateCleanupRange, CheckpointBaseValidatorRejectsMissingLogSnap
     }
 }
 
-TEST(CASGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCannotLicenseDeletion)
+TEST(CASGCFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCannotLicenseDeletion)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout{"p"};
@@ -2261,7 +2261,7 @@ TEST(CASGcFrontierGateCleanupRange, LaterEpochBaseWithoutItsContextualBacklinkCa
 
 /// Folding a namespace terminal records evidence but performs no lifecycle-specific physical cleanup.
 /// The checkpoint is inert debris for the perpetual janitor, and no `_cleanup` marker is published.
-TEST(CASGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor)
+TEST(CASGCFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2326,7 +2326,7 @@ TEST(CASGcFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
 /// Once a terminal has folded, a later physical read failure is janitor debt, not lifecycle evidence
 /// loss. Removing this per-key leak handling would either make the signal disappear or let one dead
 /// object prevent the janitor from considering the rest of its page.
-TEST(CASGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingProgress)
+TEST(CASGCFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingProgress)
 {
     auto backend = std::make_shared<PostFoldUnreadableTerminalBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2385,7 +2385,7 @@ TEST(CASGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
 
     std::map<String, UInt64> namespace_cleanup;
     const uint64_t leaks_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcNamespaceCleanupLeaks].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks].load();
     gc.setPhaseSink([&](const GcPhaseRecord & record)
     {
         if (record.phase == "namespace_cleanup")
@@ -2408,14 +2408,14 @@ TEST(CASGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
     ASSERT_FALSE(namespace_cleanup.empty());
     EXPECT_EQ(namespace_cleanup["leaked"], 1u);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGcNamespaceCleanupLeaks].load() - leaks_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCNamespaceCleanupLeaks].load() - leaks_before,
         1u);
     const String captured = log_capture.captured();
     EXPECT_NE(captured.find(terminal_key), String::npos);
     EXPECT_NE(captured.find("leak"), String::npos);
 }
 
-TEST(CASGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDeletion)
+TEST(CASGCFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDeletion)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2444,12 +2444,12 @@ TEST(CASGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
 
     dropRefTransition(*backend, layout, ns, "victim", mref);
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
     const RoundReport report = runRegularRoundReclaiming(gc);
 
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load() - events_before,
         1u);
     EXPECT_EQ(report.manifests_deleted, 1u)
         << "an unmatched adopted-parent row is observed and dropped, not promoted to pool-wide suppression";
@@ -2693,7 +2693,7 @@ TEST(CASCatalogLifecycleReconciler, PropagatesAuthorityFailureAfterMandatoryReso
     }
 }
 
-TEST(CASGcFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
+TEST(CASGCFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2709,7 +2709,7 @@ TEST(CASGcFrontierGate, HealthyRebuildUsesTheCatalogLifecycleReconciler)
     EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before + 1);
 }
 
-TEST(CASGcFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
+TEST(CASGCFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2740,7 +2740,7 @@ TEST(CASGcFrontierGate, DamagedStateRebuildDoesNotDeleteCompletedRemovingRows)
     EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
 }
 
-TEST(CASGcFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
+TEST(CASGCFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/100);
@@ -2788,7 +2788,7 @@ TEST(CASGcFrontierGate, DeferredRoundDrainsCompletedRemovingBeforeReturning)
     EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
 }
 
-TEST(CASGcFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListing)
+TEST(CASGCFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListing)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2870,7 +2870,7 @@ TEST(CASGcFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListi
     EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
 }
 
-TEST(CASGcFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
+TEST(CASGCFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2909,7 +2909,7 @@ TEST(CASGcFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
 /// A stale leader may learn from its mandatory resolution read that the old life is gone, and must
 /// invalidate that exact runtime, but loss of the leader fence remains the control outcome. It must
 /// abort before the hot LIST and cannot build or publish any successor generation.
-TEST_P(CASGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrReplacesLife)
+TEST_P(CASGCCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrReplacesLife)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2966,7 +2966,7 @@ TEST_P(CASGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 
     backend->clearJournal();
     const uint64_t plans_before  /// NOLINT(clang-analyzer-deadcode.DeadStores)
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
     backend->releaseBlockedCatalogCas();
     leader_a.join();
 
@@ -2982,7 +2982,7 @@ TEST_P(CASGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         EXPECT_NE(e.message().find("pre-fold drain lost authority"), String::npos) << e.message();
     }
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 0u);
     EXPECT_EQ(findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0), journal.size());
     EXPECT_EQ(findJournalAfter(journal, "cas_begin " + layout.gcStateKey(), 0), journal.size());
     EXPECT_FALSE(std::any_of(journal.begin(), journal.end(), [](const String & entry)
@@ -3001,7 +3001,7 @@ TEST_P(CASGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 
 INSTANTIATE_TEST_SUITE_P(
     CASWinnerShape,
-    CASGcCompletedRemovalFenceRace,
+    CASGCCompletedRemovalFenceRace,
     testing::Values(CompetingCatalogOutcome::Absent, CompetingCatalogOutcome::Replacement),
     [](const testing::TestParamInfo<CompetingCatalogOutcome> & parameter)
     {
@@ -3012,7 +3012,7 @@ INSTANTIATE_TEST_SUITE_P(
 /// read becomes the next selection snapshot. Therefore N uncontended deletes cost N+1 reads before
 /// the hot LIST. The round then takes one post-LIST walk-plan cut and, later in the separate
 /// `namespace_cleanup` phase, one post-page janitor cut.
-TEST(CASGcFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
+TEST(CASGCFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
 {
     auto backend = std::make_shared<DrainRaceBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

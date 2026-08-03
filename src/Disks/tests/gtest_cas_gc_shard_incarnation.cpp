@@ -46,7 +46,7 @@ ManifestRef testRef(uint64_t seq)
 ///   (b) a `Creating` entry is EXCLUDED -- spec §3, no publication can exist yet;
 ///   (c) a namespace with ref OBJECTS but NO catalog entry is EXCLUDED -- the C1 shape: the catalog is
 ///       the authority, so its absence is authoritative too, however much debris LIST would still find.
-TEST(CASGcShardIncarnation, DiscoveryEqualsPresentShards)
+TEST(CASGCShardIncarnation, DiscoveryEqualsPresentShards)
 {
     for (const uint64_t gc_shards : {1u, 4u})
     {
@@ -107,7 +107,7 @@ TEST(CASGcShardIncarnation, DiscoveryEqualsPresentShards)
 
 /// Catalog ambiguity stops destructive GC and REBUILD before either can derive authority from a
 /// first row. No attempted delete is allowed on the rejected regular round.
-TEST(CASGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
+TEST(CASGCShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = 1});
@@ -137,7 +137,7 @@ TEST(CASGcShardIncarnation, DuplicateLifeIdStopsDestructiveRoundAndRebuild)
 /// logical name to a new life, the former stream is opaque debris: it cannot redirect GC to that name
 /// or contribute an edge to the current-life fold. The separately paced janitor may reclaim its
 /// unowned physical objects after that fold.
-TEST(CASGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
+TEST(CASGCShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
@@ -197,7 +197,7 @@ TEST(CASGcShardIncarnation, DeadLifeStreamIsOpaqueInertDebris)
 
 /// Checkpoints live in the state tree and are read by exact key from the catalog cut. They are never
 /// discovered through the hot stream LIST, so hiding one from LIST must not affect the round.
-TEST(CASGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
+TEST(CASGCShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
 {
     auto backend = std::make_shared<HintHoleBackendOn<CountingBackend>>();
     auto store = Pool::open(backend, PoolConfig{
@@ -265,7 +265,7 @@ TEST(CASGcShardIncarnation, CurrentLifeCheckpointIsReadByExactKeyOutsideHotList)
 
 /// A stream life absent from the immutable catalog cut cannot be attributed to any logical namespace.
 /// It remains inert debris rather than producing a made-up name or a round anomaly.
-TEST(CASGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace)
+TEST(CASGCShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace)
 {
     std::shared_ptr<InMemoryBackend> backend;
     auto store = makePoolWithShards(backend, /*gc_shards=*/1);
@@ -293,7 +293,7 @@ TEST(CASGcShardIncarnation, UncatalogedStreamLifeDefersWithoutInventingNamespace
 
 /// State-tree objects are point-addressed only. A stalled creator's checkpoint and an unowned opaque
 /// checkpoint are both outside the hot stream scan and cannot manufacture logical namespace anomalies.
-TEST(CASGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
+TEST(CASGCShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Pool::open(backend,
@@ -374,7 +374,7 @@ TEST(CASGcShardIncarnation, StateCheckpointsOutsideCatalogAreInertToHotWalk)
 }
 
 /// `listNamespaces` projects the authoritative catalog; physical streams never contribute names.
-TEST(CASGcShardIncarnation, ListNamespacesFromCatalog)
+TEST(CASGCShardIncarnation, ListNamespacesFromCatalog)
 {
     for (const uint64_t gc_shards : {1u, 4u})
     {
@@ -422,7 +422,7 @@ TEST(CASGcShardIncarnation, ListNamespacesFromCatalog)
 ///
 /// Both gc_shards=1 and gc_shards>1 are exercised. The self-floor and promote gate are independent
 /// of the blob-hash-prefix sharding axis (fence_round lives in the ROOT shard).
-TEST(CASGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDrop)
+TEST(CASGCShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDrop)
 {
     for (const uint64_t gc_shards : {1u, 4u})
     {

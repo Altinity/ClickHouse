@@ -35,7 +35,7 @@ So the assertions are now about that seal, in three layers:
      agree, a full restart re-recovers the namespace from the durable stream with the object sitting
      there and still returns the same data, and the counters that carry "a durable transaction went
      missing" / "the fold advanced past work" / "the stream stopped being dense"
-     (`CASRefNeedsRecovery`, `CASGcUnappliedFoldedTxns`, `CASRefRecoveryStreamHole`) all stay at zero
+     (`CASRefNeedsRecovery`, `CASGCUnappliedFoldedTransactions`, `CASRefRecoveryStreamHole`) all stay at zero
      across driven GC rounds. The recovery walk reads the dead epoch by exact key, meets the seal and
      advances to the next epoch, so an id above the seal is unreachable by construction — the
      injected object is not "tolerated", it is not on any path.
@@ -82,7 +82,7 @@ _HUGE_SEQ = 0xFFFFFFFFFFFFFFFE
 # Counters that carry the violation half of the invariant. Each is documented in `ProfileEvents.cpp`
 # as always-zero; the soak driver gates on the same three (`soak/signals.py`
 # LATE_PUT_VIOLATION_NOTES), and this card asserts them around the injection specifically.
-_VIOLATION_EVENTS = ("CASRefNeedsRecovery", "CASGcUnappliedFoldedTxns", "CASRefRecoveryStreamHole")
+_VIOLATION_EVENTS = ("CASRefNeedsRecovery", "CASGCUnappliedFoldedTransactions", "CASRefRecoveryStreamHole")
 
 def _render_ref_txn_id(writer_epoch: int, ref_sequence: int) -> str:
     """Mirrors `renderRefTxnId` (CasRefIds.h): two 16-digit lowercase hex fields joined by '-'."""

@@ -18,7 +18,7 @@ using namespace DB::Cas::tests;
 
 namespace ProfileEvents
 {
-extern const Event CASGcRefWalkPlansBuilt;
+extern const Event CASGCRefWalkPlansBuilt;
 }
 
 namespace
@@ -26,7 +26,7 @@ namespace
 const UInt128 kGc = UInt128(0xAB);
 }
 
-TEST(CASGcRoundDefer, PredicateTruthTable)
+TEST(CASGCRoundDefer, PredicateTruthTable)
 {
     /// threshold=1 (default): defer ONLY when zero shards changed AND no graduation due AND within bound.
     EXPECT_TRUE (shouldDeferRound(/*changed*/0, /*grad_due*/false, /*since*/0, /*threshold*/1, /*max*/8));
@@ -44,7 +44,7 @@ TEST(CASGcRoundDefer, PredicateTruthTable)
 /// graduationDue (retired-in-snapshot T4): read ZERO-I/O from the adopted seal's condemned_summary. An
 /// entry whose oldest non-pending condemn round crosses current_round forces it true; a delete_pending
 /// entry forces it true regardless of the round; otherwise false.
-TEST(CASGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
+TEST(CASGCRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -76,7 +76,7 @@ TEST(CASGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 /// graduationDue fail-closed: when the adopted seal OBJECT is deleted out from under gc/state, the signal
 /// must be TRUE (forces the fold so the round's own fail-closed path surfaces the corrupt bookkeeping),
 /// never a silent defer.
-TEST(CASGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
+TEST(CASGCRoundDefer, GraduationDueFailsClosedWhenSealMissing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -98,7 +98,7 @@ TEST(CASGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
 }
 
 /// graduationDue is FALSE on a TOTAL all-zero summary: nothing condemned in any shard => nothing due.
-TEST(CASGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
+TEST(CASGCRoundDefer, GraduationDueFalseOnAllZeroSummary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -123,7 +123,7 @@ TEST(CASGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
 
 /// `listRefPrefix`'s `changed_shards`: with the fold seal covering shard s at its current token, a quiescent pool reports
 /// 0; after one publish to a ref in shard s, it reports 1.
-TEST(CASGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
+TEST(CASGCRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -161,7 +161,7 @@ TEST(CASGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 /// Mutation caught: widening the hot LIST from `cas/ns/stream/` to `cas/ns/` would offer `_ckpt` and
 /// `_files` state objects to the fold. The backend-observed result set must contain both immutable
 /// stream kinds and neither state kind.
-TEST(CASGcRoundDefer, HotEnumerationOffersLogsAndSnapshotsButNeverCheckpointOrFiles)
+TEST(CASGCRoundDefer, HotEnumerationOffersLogsAndSnapshotsButNeverCheckpointOrFiles)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -189,7 +189,7 @@ TEST(CASGcRoundDefer, HotEnumerationOffersLogsAndSnapshotsButNeverCheckpointOrFi
 
 /// The authoritative cut follows the completed hot LIST. A listed life absent from that later cut is
 /// inert dead-life debris: it is not admitted and does not defer the round or read the body.
-TEST(CASGcRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
+TEST(CASGCRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -208,7 +208,7 @@ TEST(CASGcRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
 
 /// The post-LIST cut classifies every immutable stream kind, not only logs. A snapshot belonging to a
 /// life absent from that later cut is inert debris and its body is not read.
-TEST(CASGcRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
+TEST(CASGCRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -235,7 +235,7 @@ TEST(CASGcRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
 /// SETTLING NOTE: immutable `_log` objects are never trimmed in place (unlike the legacy mutable shard
 /// journal, whose fold-then-trim token rewrite forced a second settling round), so the pool quiesces the
 /// round AFTER the folding round -- the very next round defers.
-TEST(CASGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
+TEST(CASGCRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -285,7 +285,7 @@ TEST(CASGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 
 /// Every ordinary round constructs one complete catalog-authoritative walk plan after the hot LIST,
 /// before deciding DEFER. A fold consumes that exact frozen plan; it must not build another one.
-TEST(CASGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
+TEST(CASGCRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -302,9 +302,9 @@ TEST(CASGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
 
     backend->resetCounts();
     const uint64_t fold_builds_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
     ASSERT_FALSE(gc.runRegularRound().deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - fold_builds_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - fold_builds_before, 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
         << "the hot walk must enumerate the stream tree exactly once";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -329,9 +329,9 @@ TEST(CASGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
     phases.clear();
     backend->resetCounts();
     const uint64_t defer_builds_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
     ASSERT_TRUE(gc.runRegularRound().deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - defer_builds_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - defer_builds_before, 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u)
         << "a deferred round still builds exactly one complete hot walk plan";
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -360,7 +360,7 @@ TEST(CASGcRoundDefer, FoldAndDeferEachBuildExactlyOneCompletePostListWalkPlan)
 /// The next acquired round may DEFER its fold, but it has no authoritative destructive verdict. It
 /// must therefore inspect exactly one janitor page without deleting OR advancing past it; the bounded
 /// forced fold then retries the same page under its computed global gate and reclaims the debris.
-TEST(CASGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutPublishingSuccessor)
+TEST(CASGCRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutPublishingSuccessor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/1);
@@ -403,13 +403,13 @@ TEST(CASGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
     Gc gc(store, kGc);
     gc.setPhaseSink([&](const GcPhaseRecord & phase) { phases.push_back(phase); });
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
 
     const RoundReport report = gc.runRegularRound();
 
     ASSERT_TRUE(report.acquired_lease);
     ASSERT_TRUE(report.deferred);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u)
         << "DEFER still constructs its one immutable hot walk plan, never a second janitor-derived plan";
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u)
@@ -467,7 +467,7 @@ TEST(CASGcRoundDefer, DeferredRoundRetriesPartialJanitorPageAtForcedFoldWithoutP
 /// The same idle-defer property under a sharded blob-target GC (gc_shards=2): graduationDue's loop
 /// over state.retired_refs and `listRefPrefix`'s discovery must both settle to "nothing due" once
 /// quiesced, regardless of how many gc-shards partition the retired bookkeeping.
-TEST(CASGcRoundDefer, IdleRoundDefersUnderShardedGc)
+TEST(CASGCRoundDefer, IdleRoundDefersUnderShardedGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -491,7 +491,7 @@ TEST(CASGcRoundDefer, IdleRoundDefersUnderShardedGc)
 /// The +1 guard (mirror of the 2026-06-27 leak): a blob condemned + published delete_pending, then
 /// re-referenced WHILE it is pending, must NOT be over-deleted -- the due graduation forces a fold
 /// (never a defer) that sees the +1 and spares the blob.
-TEST(CASGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
+TEST(CASGCRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -511,7 +511,7 @@ TEST(CASGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     store->renewWatermarkOnce();
 
     /// Drive rounds until the entry graduates (published delete_pending) -- mirrors
-    /// CASGcAckFloor.CondemnThenDeleteNextRoundAfterAcks. It is still PRESENT at that pass, and the
+    /// CASGCAckFloor.CondemnThenDeleteNextRoundAfterAcks. It is still PRESENT at that pass, and the
     /// ack floor is by construction already past its condemn_round (that is what graduated it).
     bool saw_pending = false;
     for (int i = 0; i < 6 && !saw_pending; ++i)
@@ -550,7 +550,7 @@ TEST(CASGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
 /// changed shard is nowhere near 1000) nor the liveness-bound branch (this is round 1) can fire --
 /// `graduationDue` is the ONLY thing in `shouldDeferRound` that can force this round's fold, making
 /// `EXPECT_FALSE(rep.deferred)` below load-bearing for `graduationDue` specifically.
-TEST(CASGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
+TEST(CASGCRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -575,7 +575,7 @@ TEST(CASGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
     writeBlobBody(*backend, layout, blob);
 
     /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1),
-    /// mirroring `CASGcRoundDefer.GraduationDueDetectsDuePendingAndRoundCrossing`. Retired-in-snapshot
+    /// mirroring `CASGCRoundDefer.GraduationDueDetectsDuePendingAndRoundCrossing`. Retired-in-snapshot
     /// (T4): graduationDue reads this summary ZERO-I/O off the adopted seal — a delete_pending entry forces
     /// it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of
     /// `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF
@@ -607,7 +607,7 @@ TEST(CASGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 /// Bounded deferral: with a large fold_threshold and a small standing delta (one shard changed,
 /// forever, since deferring never resolves it), at most gc_fold_max_defer_rounds consecutive rounds
 /// defer, then one round forces a fold (the liveness bound).
-TEST(CASGcRoundDefer, BoundedDeferralForcesFoldWithinWindow)
+TEST(CASGCRoundDefer, BoundedDeferralForcesFoldWithinWindow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,

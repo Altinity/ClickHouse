@@ -781,12 +781,12 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   elapses (`gc_fold_max_defer_rounds`, default 8), so no candidate is starved of eventual fold. Safety
   gated by the TLA+ model `CaGcRoundDeferCore` (`NoOverDelete` + `EventuallyFolded`). Verified by a
   soak-harness ops-budget assertion (`S03`, `utils/ca-soak/scenarios/cards/s03_s05_scale.py`): an
-  isolated idle round's `CASGcGet` delta must be `< 50` (was ~1362) with `fsck dangling == 0`. **Not
+  isolated idle round's `CASGCGet` delta must be `< 50` (was ~1362) with `fsck dangling == 0`. **Not
   resolved:** the large-delta case remains O(universe) per round — see Lever B below (incremental
   point-updatable in-degree), still open.
 - **Logged (UTC):** 2026-07-05 (campaign S03 full 20M rows/400 parts)
 - **Severity:** s3-budget / efficiency
-- **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CASGcGet + ~643 CASBlobHead
+- **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CASGCGet + ~643 CASBlobHead
   + ~457 CASRootGet PER ROUND (~2500 S3 ops/round) with nothing changing. GC memory is bounded
   (1.57 GB) but S3 op volume is not idle-cheap — each round re-reads the generation runs and HEADs
   candidate blobs regardless of change.
@@ -1241,7 +1241,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   touched this fold window with net in-degree 0, HEAD the current token and ensure a condemn entry for the
   CURRENT token, superseding any stale-token retired entry — i.e. condemn/retire keyed on `(hash, current
   token)`, matching `CaIncarnationCore`'s `GRetire`. Adds `blob_retire_replaced` CA-log event +
-  `CASGcRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
+  `CASGCRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
   TLA+-gated by `CaGcResurrectReuploadOrphan` (`_bug.cfg` violates `NoLeakForever`, `_fix.cfg` holds; see
   `docs/superpowers/cas/06-tla-models.md` §Area 12). Commits `5156d37454b`(TLA+)..`6da55fce2a0`(tests), fix
   `308360e595d`. Verified: unit `CasGcLeak.*` (RED→GREEN + idempotency + writer-side retire-view), and S30 —
@@ -1306,7 +1306,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   observability-only):** (a) `CasBlobInDegree.cpp` `closeBlob`'s supersede reuses the `head_blob` peek,
   which is the *fresh-condemn* observation hook — so a resurrect supersede emits BOTH `blob_retire` and
   `blob_retire_replaced` for the same (hash, token, round) and double-increments
-  `CASGcRetiredCondemned`+`CASGcRetireReplaced`. Give the peek a side-effect-free HEAD (or an observe-only
+  `CASGCRetiredCondemned`+`CASGCRetireReplaced`. Give the peek a side-effect-free HEAD (or an observe-only
   `head_blob` mode) so `blob_retire_replaced` is the SOLE retire event for the supersede — this pollutes
   the very audit log used to triage such leaks. (b) `blob_retire_replaced` records only the new token; the
   spec (`…resurrect-reupload-orphan-fix-design.md` §Observability) intended `{hash, old_token, new_token,
@@ -1318,7 +1318,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   per-object in `system.content_addressed_log` and "precommit created, never removed" is a visible gap. The
   dead `ManifestExpand`/`ManifestRetire`/`ManifestStrip` enum entries were deleted. Blob-audit fixes: the
   resurrect supersede in `closeBlob` now uses a side-effect-free peek (same single S3 HEAD) so it emits ONLY
-  `blob_retire_replaced` (not also `blob_retire`) with a single `CASGcRetireReplaced` increment, and records
+  `blob_retire_replaced` (not also `blob_retire`) with a single `CASGCRetireReplaced` increment, and records
   the superseded `old_token` in `detail["superseded_token"]` (a review caught + fixed a size-unit regression
   in the peek — now applies `retiredLogicalSize` like `head_blob`). Commits `ab74694aaa8`, `0f539bafc0b`,
   `99cbe199580`. Unit: `CasObservability.*`.
@@ -2956,7 +2956,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      Before dropping the size branch entirely, confirm whether the target S3 endpoint actually
      early-closes doomed conditional PUTs (if not, the branch defends against a non-existent problem).
 - **Confirming metrics (per INSERT `query_id`, `system.query_log` ProfileEvents / `system.events`):**
-  `S3HeadObject`, `S3GetObject`, `CASBlobHeadFirst`/`CASBlobBodyPutAvoided`/`CASBlobDedupCacheHit`,
+  `S3HeadObject`, `S3GetObject`, `CASBlobHeadFirst`/`CASBlobBodyPutAvoided`/`CASBlobDeduplicationCacheHit`,
   `CASRefBatchFlushes` vs `CASRefBatchedMutations`, and `CASRefQueueWaitMicroseconds` summed vs query
   wall time (the smoking gun for #1). The full write-path code map + evidence is in the session memory
   note `project_cas_insert_slowness_writepath`.
@@ -3175,7 +3175,7 @@ than to an error.
 - **Logged (UTC):** 2026-07-29T11:53:26
 - **Severity:** suspected-bug
 - **Run:** 20260729T115218_S38_seed20260729
-- **Observed:** scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefApplyPoisoned', 'CASGcUnappliedFoldedTxns', 'CASRefRecoveryStreamHole'] — the binary does not have these counters, or the query shape changed; refusing to treat absence as zero
+- **Observed:** scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefApplyPoisoned', 'CASGCUnappliedFoldedTransactions', 'CASRefRecoveryStreamHole'] — the binary does not have these counters, or the query shape changed; refusing to treat absence as zero
 
 ## S43-20260729T115326-1: scenario raised: name '_zstd_decompress' is not defined
 

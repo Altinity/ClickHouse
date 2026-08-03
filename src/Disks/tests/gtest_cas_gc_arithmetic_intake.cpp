@@ -109,7 +109,7 @@ std::map<String, UInt64> runRoundAndReadIntakeMetrics(const PoolPtr & store)
 /// reached `{1, 5}` (the last LISTED id) while the two hidden records' edges were never folded -- the
 /// exact damage shape the production blocker caused, since a cursor sealed above an unfolded record can
 /// never be re-read.
-TEST(CASGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
+TEST(CASGCArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend);
@@ -143,7 +143,7 @@ TEST(CASGcArithmeticIntake, HintOmittingMiddleRecordsFoldsThroughUnnoticed)
 
 /// A clean, hole-free namespace still ends its walk exactly where it should: at the first absent id,
 /// with no witness above it and therefore no hold.
-TEST(CASGcArithmeticIntake, WalkEndsAtFrontierWithoutHold)
+TEST(CASGCArithmeticIntake, WalkEndsAtFrontierWithoutHold)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// Fold every round: the default defer window would skip the second round entirely and leave the
@@ -180,7 +180,7 @@ TEST(CASGcArithmeticIntake, WalkEndsAtFrontierWithoutHold)
 /// `{1,1} {1,2} seal{1,3} | {2,1} {2,2}`: the seal is applied as a table no-op, counted applied, and
 /// the walk continues at `{2, 1}` -- whose `prev_epoch_seal` names the seal just consumed, which is what
 /// makes the crossing provable rather than guessed.
-TEST(CASGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
+TEST(CASGCArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend);
@@ -219,7 +219,7 @@ TEST(CASGcArithmeticIntake, SealCrossesEpochAndIsAppliedAsNoOp)
 /// Two chained seals in ONE round, the middle epoch entirely EMPTY (its seal is its only record, at
 /// sequence 1, carrying `prev_epoch_seal`). The hint omits that whole epoch, so the only way to reach it
 /// is the back-chain: the record the hint DOES show names the seal that must be consumed first.
-TEST(CASGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
+TEST(CASGCArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -265,7 +265,7 @@ TEST(CASGcArithmeticIntake, ChainedEmptyEpochSealsBothConsumedInOneRound)
 /// A round that ends ON a seal (nothing above it yet) leaves the cursor there. The NEXT round must
 /// still cross into the epoch that appears later -- the cursor sitting on a closed epoch's seal is the
 /// ordinary steady state after a writer-epoch change, not a wedge.
-TEST(CASGcArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
+TEST(CASGCArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -303,7 +303,7 @@ TEST(CASGcArithmeticIntake, CursorRestingOnSealCrossesInALaterRound)
 ///
 /// Listing-driven intake folded `{1,4}` and sealed the cursor at it -- permanently, since a record below
 /// the cursor is never re-read.
-TEST(CASGcArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClassificationFour)
+TEST(CASGCArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClassificationFour)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -334,7 +334,7 @@ TEST(CASGcArithmeticIntake, GapBelowWitnessHoldsNamespaceAtClassificationFour)
 /// A record of a LATER epoch reachable while the current epoch's seal was never consumed: the crossing
 /// has no proof (the later epoch's `prev_epoch_seal` names a seal this cursor never reached), so the
 /// namespace holds instead of jumping the boundary.
-TEST(CASGcArithmeticIntake, UnconsumedSealCrossingHoldsNamespace)
+TEST(CASGCArithmeticIntake, UnconsumedSealCrossingHoldsNamespace)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -371,7 +371,7 @@ TEST(CASGcArithmeticIntake, UnconsumedSealCrossingHoldsNamespace)
 /// grant the crossing and declare epoch 1 closed while its writer may still be appending -- any later
 /// `{1,k}` would then land permanently below the cursor, which is exactly the damage the seal exists to
 /// prevent. The walk applied that record itself this round, so it knows its kind for free: refuse.
-TEST(CASGcArithmeticIntake, CrossingFromANonSealRecordIsRefusedEvenWhenTheChainMatches)
+TEST(CASGCArithmeticIntake, CrossingFromANonSealRecordIsRefusedEvenWhenTheChainMatches)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -409,7 +409,7 @@ TEST(CASGcArithmeticIntake, CrossingFromANonSealRecordIsRefusedEvenWhenTheChainM
 ///
 /// The fixture is the only shape that reaches it: a key that alternates present/absent across reads, so
 /// `crossFromSeal` keeps succeeding while the walk's own GET keeps failing.
-TEST(CASGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadOfSpinning)
+TEST(CASGCArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadOfSpinning)
 {
     /// Answers `flaky` on odd-numbered reads and 404s on even ones. Nothing else is disturbed.
     class AlternatingGetBackend : public InMemoryBackend
@@ -473,7 +473,7 @@ TEST(CASGcArithmeticIntake, EpochStartThatAnswersOnlyEveryOtherReadHoldsInsteadO
 /// Spec §5 narrows the whole-round abort to a key that cannot be attributed to any namespace. An
 /// undecodable BODY belongs to exactly one namespace, so it clamps that namespace and nothing else:
 /// `ns_a` holds at its last good record while `ns_b` folds and seals normally in the same round.
-TEST(CASGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
+TEST(CASGCArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -522,7 +522,7 @@ TEST(CASGcArithmeticIntake, CorruptBodyClampsOneNamespaceWhileAnotherFolds)
 /// listing-driven intake used to do silently. The identity must survive both a hint hole (positions
 /// applied that the listing never mentioned) and a seal crossing (an applied no-op, and a cut that
 /// spans two epochs).
-TEST(CASGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
+TEST(CASGCArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -558,7 +558,7 @@ TEST(CASGcArithmeticIntake, B1IdentityHoldsOverAHoleyCutThatCrossesASeal)
 /// A namespace the hint omits ENTIRELY still folds through the checkpoint's authoritative frontier.
 /// Every log key remains readable by exact key, and the cursor reaches `{1,3}` despite the empty hint.
 /// When the hint reappears, it changes neither the cursor nor the owner edges.
-TEST(CASGcArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheckpoint)
+TEST(CASGCArithmeticIntake, WhollyOmittedNamespaceFoldsThroughAuthoritativeCheckpoint)
 {
     auto backend = std::make_shared<HintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

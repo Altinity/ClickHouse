@@ -919,11 +919,11 @@ TEST(CASRefGc, InvalidRefLogBodyHoldsNamespaceNoPartialDelta)
 }
 
 /// Coverage gap (Task 13a): the per-table baseline guard (spec §Offline Recovery) has no positive-trip
-/// test at HEAD -- the adapted successor of the retired CASGcBaselineGuard.FreshStateOverTrimmedJournals
+/// test at HEAD -- the adapted successor of the retired CASGCBaselineGuard.FreshStateOverTrimmedJournals
 /// contract. A table whose logs at/below its newest snapshot are gone and that has no sealed fold cursor
 /// is the "a prior fold advanced+cleaned covered logs, then gc/state was lost" signature: folding it from
 /// {0,0} would emit no edges and mass-condemn its still-referenced blob. GC must refuse the round before
-/// any delete. The existing CASGcBaselineGuard tests cover only the genuinely-fresh pass case and the
+/// any delete. The existing CASGCBaselineGuard tests cover only the genuinely-fresh pass case and the
 /// adopted-seal-missing guard, not this branch.
 TEST(CASRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
 {

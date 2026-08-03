@@ -1060,8 +1060,8 @@ private:
     {
         size_t operator()(const DedupPresent &) const { return 64; }
     };
-    using DedupCache = CacheBase<BlobRef, DedupPresent, BlobRefHash, DedupWeight>;
-    std::unique_ptr<DedupCache> dedup_cache;
+    using DeduplicationCache = CacheBase<BlobRef, DedupPresent, BlobRefHash, DedupWeight>;
+    std::unique_ptr<DeduplicationCache> dedup_cache;
     Layout pool_layout;
     /// The plain-object surface (namespace files + loose mountpoint objects), extracted from Pool.
     /// Stateless over `Backend &` + `const Layout &`; declared AFTER

@@ -112,7 +112,7 @@ class S23(Scenario):
                 #   (a) S3* and DiskS3* are the same physical HTTP requests counted twice
                 #       (DiskS3* wraps S3*), so summing both would double-count every request;
                 #   (b) Cas* counters are the CA-domain level counts that map 1:1 to logical
-                #       object-store operations from GC's perspective (CASGcGet, CASGcPut, etc.)
+                #       object-store operations from GC's perspective (CASGCGet, CASGCPut, etc.)
                 #       and do not double-count.
                 # Exclude timing / retry / error variants: Cas*Microseconds / *Errors are not
                 # operation counts. Accept all Cas* that are plain integer operation counters
@@ -142,9 +142,9 @@ class S23(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["idle_window_counters"] = delta
-        # The README §"Common observations" highlights CASRootList/CASGcGet etc. as the idle-GC cost.
+        # The README §"Common observations" highlights CASRootList/CASGCGet etc. as the idle-GC cost.
         result.observations["idle_gc_op_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASRootList", "CASRootGet", "CASGcGet", "CASGcPut", "CASGcList", "CASGcHead",
+            "CASRootList", "CASRootGet", "CASGCGet", "CASGCPut", "CASGCList", "CASGCHead",
             "CASBlobList", "CASBlobHead", "CASBlobDelete")}
 
         # --- idle GC S3 ops per round below a small budget ---------------------------------
@@ -275,7 +275,7 @@ class S24(Scenario):
         """Prove the in-memory dedup-hint cache is a bound-only shortcut: with a tiny cache
         (1 MiB) a large working set of distinct blob heads evicts entries, forcing remote
         HEAD-first probes (`CASBlobHeadFirst`) on re-insert instead of in-memory
-        `CASBlobDedupCacheHit` short-circuits.  Correctness and dedup must be preserved via the
+        `CASBlobDeduplicationCacheHit` short-circuits.  Correctness and dedup must be preserved via the
         remote HEAD path (CASBlobBodyPutAvoided stays positive; replica-agreement oracle holds).
         """
         cl = ctx.cluster
@@ -319,8 +319,8 @@ class S24(Scenario):
         fill_delta = fill_counters().get("_total", {})
         result.observations["fill_counters"] = {
             k: int(fill_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobDedupCacheHit", "CASBlobHeadFirst",
-                "CASBlobBodyPutAvoided", "CASBlobPutDedup")}
+                "CASBlobPut", "CASBlobDeduplicationCacheHit", "CASBlobHeadFirst",
+                "CASBlobBodyPutAvoided", "CASBlobPutDeduplicated")}
 
         # --- phase 2: re-insert a hot subset with a FIXED payload (deterministic blob hash) ----
         # We use a FIXED string (not randomString) for the hot subset so the blob hash is stable.
@@ -336,20 +336,20 @@ class S24(Scenario):
         hot_delta = hot_counters().get("_total", {})
         result.observations["hot_reinsert_counters"] = {
             k: int(hot_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobDedupCacheHit", "CASBlobHeadFirst",
-                "CASBlobBodyPutAvoided", "CASBlobPutDedup")}
+                "CASBlobPut", "CASBlobDeduplicationCacheHit", "CASBlobHeadFirst",
+                "CASBlobBodyPutAvoided", "CASBlobPutDeduplicated")}
 
         # --- VERDICT: correctness — dedup still avoids body re-uploads despite cache misses -----
         hot_body_puts = int(hot_delta.get("CASBlobPut", 0))
         hot_avoided = (int(hot_delta.get("CASBlobBodyPutAvoided", 0)) +
-                       int(hot_delta.get("CASBlobPutDedup", 0)) +
-                       int(hot_delta.get("CASBlobDedupCacheHit", 0)))
+                       int(hot_delta.get("CASBlobPutDeduplicated", 0)) +
+                       int(hot_delta.get("CASBlobDeduplicationCacheHit", 0)))
         hot_head_first = int(hot_delta.get("CASBlobHeadFirst", 0))
         # The hot payload is fixed (same content every re-insert), so even without a cache hit
         # the remote HEAD must detect the blob as already present and avoid the body upload.
         result.add(Verdict.check(
             "dedup avoids body re-upload despite small cache",
-            "CASBlobBodyPutAvoided/Dedup/DedupCacheHit > 0 on hot re-inserts",
+            "CASBlobBodyPutAvoided/Dedup/DeduplicationCacheHit > 0 on hot re-inserts",
             f"body_puts={hot_body_puts} avoided={hot_avoided} head_first={hot_head_first}",
             hot_avoided > 0 or hot_body_puts == 0,
             "" if (hot_avoided > 0 or hot_body_puts == 0) else
@@ -360,15 +360,15 @@ class S24(Scenario):
         # --- VERDICT: cache misses ARE observed (the working set exceeded the 1 MiB bound) ------
         # With a 1 MiB cache and a working set of distinct * blob_b bytes >> 1 MiB, the cache must
         # have evicted entries.  We expect some hot re-inserts to go through the remote HEAD path
-        # (CASBlobHeadFirst > 0) rather than all hitting the in-memory cache (CASBlobDedupCacheHit
+        # (CASBlobHeadFirst > 0) rather than all hitting the in-memory cache (CASBlobDeduplicationCacheHit
         # == hot * hot_reinserts would mean the cache never evicted anything, which is impossible
         # at dev-scale working set ~10 MiB >> 1 MiB cache).
-        fill_cache_hits = int(fill_delta.get("CASBlobDedupCacheHit", 0))
-        hot_cache_hits = int(hot_delta.get("CASBlobDedupCacheHit", 0))
+        fill_cache_hits = int(fill_delta.get("CASBlobDeduplicationCacheHit", 0))
+        hot_cache_hits = int(hot_delta.get("CASBlobDeduplicationCacheHit", 0))
         total_hot_ops = hot * hot_reinserts
         result.observations["cache_hit_rate"] = {
-            "fill_CasBlobDedupCacheHit": fill_cache_hits,
-            "hot_CasBlobDedupCacheHit": hot_cache_hits,
+            "fill_CasBlobDeduplicationCacheHit": fill_cache_hits,
+            "hot_CasBlobDeduplicationCacheHit": hot_cache_hits,
             "hot_CasBlobHeadFirst": hot_head_first,
             "hot_total_ops": total_hot_ops,
         }
@@ -639,8 +639,8 @@ class S26(Scenario):
         cas_root = {k: int(delta.get(k, 0)) for k in (
             "CASRootCompareSwap", "CASRootGet", "CASRootList", "CASRootCompareSwapConflict")}
         cas_blob = {k: int(delta.get(k, 0)) for k in (
-            "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASBlobDelete",
-            "CASBlobDedupCacheHit")}
+            "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASBlobDelete",
+            "CASBlobDeduplicationCacheHit")}
         result.observations["s26_cas_root_counters"] = cas_root
         result.observations["s26_cas_blob_counters"] = cas_blob
 
@@ -657,8 +657,8 @@ class S26(Scenario):
 
         # Identical inserts must dedup (no unbounded new blob bodies for repeated content).
         body_puts = cas_blob["CASBlobPut"]
-        avoided = cas_blob["CASBlobBodyPutAvoided"] + cas_blob["CASBlobPutDedup"] \
-            + cas_blob["CASBlobDedupCacheHit"]
+        avoided = cas_blob["CASBlobBodyPutAvoided"] + cas_blob["CASBlobPutDeduplicated"] \
+            + cas_blob["CASBlobDeduplicationCacheHit"]
         result.add(Verdict.check(
             "identical inserts dedup (no blob churn)",
             "repeated identical inserts avoid re-uploading the same blob body",

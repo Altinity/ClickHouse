@@ -86,7 +86,7 @@ private:
 };
 }
 
-/// (`CASGcRound.TrimDropsFoldedOwnerEvents` was removed with the snapshot+log ref model: it asserted GC
+/// (`CASGCRound.TrimDropsFoldedOwnerEvents` was removed with the snapshot+log ref model: it asserted GC
 /// trims folded owner events out of a MUTABLE shard journal in place. Immutable `_log` objects are never
 /// trimmed in place; the new-model equivalent -- ref-object cleanup deletes a covered `_log`/`_snap` key
 /// once BOTH the durable cursor AND a checkpoint-named validated recovery triple cover it -- is exercised in
@@ -95,7 +95,7 @@ private:
 /// A crashed round leaves only never-adopted attempt-scoped debris (there is no resume machinery in the
 /// one-pass round). A fresh Gc simply re-runs the round under a fresh attempt and the deletion pipeline
 /// converges idempotently — a delete that already landed replays onto NotFound.
-TEST(CASGcReplay, FreshAttemptRerunCompletes)
+TEST(CASGCReplay, FreshAttemptRerunCompletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -124,7 +124,7 @@ TEST(CASGcReplay, FreshAttemptRerunCompletes)
 /// never adopted). A SECOND leader (different id => a fresh lease.seq, hence a fresh attempt) re-runs the
 /// round from scratch and completes: no wedge, no CORRUPTED_DATA, and the prior-round artifacts under the
 /// old (unadopted) attempt are simply unreferenced. The pool drains to a fixpoint.
-TEST(CASGcReplay, DeposedRoundRerunsUnderFreshAttempt)
+TEST(CASGCReplay, DeposedRoundRerunsUnderFreshAttempt)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
     auto store = openPoolForTest(backend);

@@ -244,13 +244,13 @@ class S36(Scenario):
                                  _parts_by_disk(cl.node1, table, partition=str(move_pk)),
                                  moved_partition_ok))
 
-        blob_puts = int(to_ca_delta.get("CASBlobPut", 0)) + int(to_ca_delta.get("CASBlobPutDedup", 0))
+        blob_puts = int(to_ca_delta.get("CASBlobPut", 0)) + int(to_ca_delta.get("CASBlobPutDeduplicated", 0))
         result.observations["to_ca_counters"] = {
             k: int(to_ca_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobPutDedup", "CASManifestPut", "CASRootCompareSwap")}
+                "CASBlobPut", "CASBlobPutDeduplicated", "CASManifestPut", "CASRootCompareSwap")}
         result.add(Verdict.check(
             "TO-CA move publishes via the normal build path",
-            "blobs/manifest/refs written (CASBlobPut/CASBlobPutDedup > 0)",
+            "blobs/manifest/refs written (CASBlobPut/CASBlobPutDeduplicated > 0)",
             f"CASBlobPut+Dedup={blob_puts}", blob_puts > 0,
             "" if blob_puts > 0 else "no blob/manifest writes observed during the TO-CA move"))
 
@@ -349,7 +349,7 @@ class S36(Scenario):
 
         # A/B differential: table A's move pays the real upload cost (CASBlobPut > 0 in ITS OWN
         # window); table B's byte-identical move must then dedup-resolve those same blobs instead
-        # of re-uploading them (CASBlobPut == 0 in ITS OWN window). CASBlobPutDedup is recorded as
+        # of re-uploading them (CASBlobPut == 0 in ITS OWN window). CASBlobPutDeduplicated is recorded as
         # an observation only, not a pass-condition: when the dedup resolves above the per-blob
         # path (identical whole-part manifest), that counter never increments even though B
         # correctly performed zero uploads -- the real requirement is "did not re-upload", which
@@ -358,17 +358,17 @@ class S36(Scenario):
         cl.node1.command(f"ALTER TABLE {dedup_table_a} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
         delta_a = counters_dedup_a().get("_total", {})
         a_puts = int(delta_a.get("CASBlobPut", 0))
-        a_dedup_puts = int(delta_a.get("CASBlobPutDedup", 0))
+        a_dedup_puts = int(delta_a.get("CASBlobPutDeduplicated", 0))
 
         counters_dedup_b = _common.counters_window(ctx)
         cl.node1.command(f"ALTER TABLE {dedup_table_b} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
         delta_b = counters_dedup_b().get("_total", {})
         b_puts = int(delta_b.get("CASBlobPut", 0))
-        b_dedup_puts = int(delta_b.get("CASBlobPutDedup", 0))
+        b_dedup_puts = int(delta_b.get("CASBlobPutDeduplicated", 0))
 
         result.observations["dedup_on_to_ca_counters"] = {
-            "table_a_CasBlobPut": a_puts, "table_a_CasBlobPutDedup": a_dedup_puts,
-            "table_b_CasBlobPut": b_puts, "table_b_CasBlobPutDedup": b_dedup_puts,
+            "table_a_CasBlobPut": a_puts, "table_a_CasBlobPutDeduplicated": a_dedup_puts,
+            "table_b_CasBlobPut": b_puts, "table_b_CasBlobPutDeduplicated": b_dedup_puts,
         }
         dedup_ok = a_puts > 0 and b_puts == 0
         result.add(Verdict.check(
@@ -570,7 +570,7 @@ class S37(Scenario):
             "" if ttl_moved_ok else
             "TTL MOVE TO VOLUME 'cas' did not relocate the part within the poll budget"))
         result.observations["ttl_move_counters"] = {
-            k: int(ttl_delta.get(k, 0)) for k in ("CASBlobPut", "CASBlobPutDedup", "CASManifestPut")}
+            k: int(ttl_delta.get(k, 0)) for k in ("CASBlobPut", "CASBlobPutDeduplicated", "CASManifestPut")}
 
         # Neutralize the (permanently-expired) TTL rule now that the TTL-driven TO-CA move is
         # verified, BEFORE the explicit move-back and the downstream legs. The rule
@@ -649,7 +649,7 @@ class S37(Scenario):
         placement_mixed_post = _parts_by_disk(cl.node1, mixed_table)
         result.observations["mixed_placement_after_merge"] = placement_mixed_post
         result.observations["mixed_merge_counters"] = {
-            k: int(merge_delta.get(k, 0)) for k in ("CASBlobPut", "CASBlobPutDedup", "CASManifestPut")}
+            k: int(merge_delta.get(k, 0)) for k in ("CASBlobPut", "CASBlobPutDeduplicated", "CASManifestPut")}
         merged_ok = len(placement_mixed_post) == 1 and next(iter(placement_mixed_post.values())) in (
             "local1", "local2", "ca")
         result.add(Verdict.check(

@@ -104,11 +104,11 @@ def test_missing_counter_raises_rather_than_reading_as_zero():
     """The headline case: a renamed or not-yet-existing counter must kill the run, not read as a
     permanent quiet zero for four hours."""
     values = {e: 0 for e in CAS_SIGNAL_EVENTS}
-    dropped = values.pop("CASGcUnappliedFoldedTxns")
+    dropped = values.pop("CASGCUnappliedFoldedTransactions")
     assert dropped == 0
     with pytest.raises(SignalsUnsupported) as ei:
         parse_signal_events(_events_tsv(values))
-    assert "CASGcUnappliedFoldedTxns" in str(ei.value)
+    assert "CASGCUnappliedFoldedTransactions" in str(ei.value)
 
 
 def test_extra_counters_in_the_answer_are_ignored():
@@ -363,7 +363,7 @@ def test_the_late_put_losing_is_evidence_not_a_violation():
     f = LatePutFencing()
     assert f.observe("n1", {"CASRefRecoveryEpochSealed": 4, "CASRefAppendSealRejected": 100,
                             "CASRefRecoveryStragglerAdopted": 2, "CASRefNeedsRecovery": 0,
-                            "CASGcUnappliedFoldedTxns": 0, "CASRefRecoveryStreamHole": 0}) == []
+                            "CASGCUnappliedFoldedTransactions": 0, "CASRefRecoveryStreamHole": 0}) == []
     assert f.exercised
     assert f.evidence_peak["CASRefAppendSealRejected"] == 100
     text = "\n".join(f.report_lines())

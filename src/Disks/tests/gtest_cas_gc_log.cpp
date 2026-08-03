@@ -82,7 +82,7 @@ std::vector<Rec> roundRowsOnly(const std::vector<Rec> & rows)
 /// (candidates condemned, nothing deleted) and, some rounds later once the mount's ack floor graduates
 /// them, a DELETING round whose Finish carries the count through. The ordering is asserted, because a
 /// deletion reported before its marking would mean the row is not describing the round it names.
-TEST(CASGcLog, EmitsStartFinishWithCounts)
+TEST(CASGCLog, EmitsStartFinishWithCounts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// gc_fold_max_defer_rounds=0: this test drives up to 16 consecutive rounds through the scheduler
@@ -215,10 +215,10 @@ public:
 /// background loop's own interval-paced ticks provide. Two manual calls have no such guarantee (they
 /// can land microseconds apart in a real query), so a manual round must NEVER execute the steal CAS,
 /// no matter how many times it re-observes the same frozen tuple. Dead-incumbent recovery stays the
-/// loop's job (bounded ~2*interval; covered by the CASGcLease loop-driven steal tests in
+/// loop's job (bounded ~2*interval; covered by the CASGCLease loop-driven steal tests in
 /// gtest_cas_gc_round.cpp, e.g. StealAfterObservedNonRenewalBumpsEpoch / FailoverStealOnceHeartbeatStops).
 /// Deterministic: "time" is the order of runRegularRound calls; no sleep, no clock, no threads.
-TEST(CASGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
+TEST(CASGCSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -240,11 +240,11 @@ TEST(CASGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
 
 /// Negative-control companion to the test above (reviewer-requested): with the incumbent visibly alive
 /// (its heartbeat advancing between the manual round's observations, exactly like
-/// CASGcLease.HeartbeatBlocksFalseStealOfAliveLeader at the Core level), the manual round must still
+/// CASGCLease.HeartbeatBlocksFalseStealOfAliveLeader at the Core level), the manual round must still
 /// correctly back off — confirming the new observe-only branch didn't regress the PRE-EXISTING
 /// incumbent_renewed/hb_alive liveness detection (this test would already pass on the protocol's own
 /// terms even without the A7-HIGH-fix; it pins that the fix didn't break it).
-TEST(CASGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
+TEST(CASGCSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -267,7 +267,7 @@ TEST(CASGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
 /// A round whose backend throws must produce a Finish with `outcome == Aborted` and a non-empty
 /// `error`, and `runOneRoundNow` must rethrow the exception (the round failure is observable, not
 /// swallowed — the logging sink itself is best-effort, but the round error propagates).
-TEST(CASGcLog, AbortedFinishOnThrowingRound)
+TEST(CASGCLog, AbortedFinishOnThrowingRound)
 {
     auto backend = std::make_shared<ThrowingBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -303,7 +303,7 @@ TEST(CASGcLog, AbortedFinishOnThrowingRound)
 /// non-empty `round_id`, and two rounds carry DIFFERENT ones. That is the property the column exists
 /// for: `round` is 0 on Start, is only known after the round's single `gc/state` CAS, and is absent on a
 /// round that never led, so it cannot serve as the correlator.
-TEST(CASGcLog, EveryRowOfARoundSharesOneRoundId)
+TEST(CASGCLog, EveryRowOfARoundSharesOneRoundId)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -366,7 +366,7 @@ std::map<String, UInt64> metricsOf(const std::vector<Rec> & rows, size_t from, c
 /// ProfileEvents are deliberately NOT asserted: `runOneRoundNow` runs on the bare gtest thread, which
 /// has no attached `ThreadStatus`, so per-phase capture degrades to an empty map exactly as the
 /// round-level capture already does (see the note at the top of this file).
-TEST(CASGcLog, FoldingRoundEmitsEveryPhaseInOrder)
+TEST(CASGCLog, FoldingRoundEmitsEveryPhaseInOrder)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,
@@ -432,7 +432,7 @@ TEST(CASGcLog, FoldingRoundEmitsEveryPhaseInOrder)
 
 /// A round that never leads emits ONLY the phase it reached. `round` does not exist for such a round,
 /// so `round_id` is the only thing tying its rows together -- which is why it is the correlator.
-TEST(CASGcLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
+TEST(CASGCLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -458,7 +458,7 @@ TEST(CASGcLog, NotALeaderRoundEmitsOnlyTheLeasePhase)
 /// B3: the scheduler exposes per-disk GC health for system.cas_mounts (the process-
 /// global CurrentMetrics gauges were clobbered with >= 2 CAS disks). Drive one leader round and
 /// assert the health snapshot reflects leadership, the pending-reclaim backlog and a fresh success.
-TEST(CASGcHealth, ReflectsLeadershipAndPendingReclaim)
+TEST(CASGCHealth, ReflectsLeadershipAndPendingReclaim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend,

@@ -140,7 +140,7 @@ class S28(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["insert_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASBlobPut", "CASBlobPutDedup", "DiskS3CreateMultipartUpload", "DiskS3UploadPart")}
+            "CASBlobPut", "CASBlobPutDeduplicated", "DiskS3CreateMultipartUpload", "DiskS3UploadPart")}
 
         # --- scratch high-water vs sum of concurrently-staged payloads ----------------------
         scratch_peaks = smp.peak_scratch_bytes()
@@ -381,7 +381,7 @@ class S30(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["churn_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASRootList", "CASRootGet", "CASGcGet", "CASGcList", "CASBlobDelete", "CASGcDelete")}
+            "CASRootList", "CASRootGet", "CASGCGet", "CASGCList", "CASBlobDelete", "CASGCDelete")}
 
         # --- characterize monotone fanout: per-round cost vs number of EVER-created namespaces ------
         # `root_dirs` (count of roots/<ns> dirs) and CASRootList/CASRootGet per batch are the
@@ -433,7 +433,7 @@ class S30(Scenario):
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
         """Measure the STEADY-STATE per-round GC fanout floor: the cost of an IDLE deferred round
-        (`CASGcDelete==0 AND CASRootGet==0`), NOT a single mid-churn round.
+        (`CASGCDelete==0 AND CASRootGet==0`), NOT a single mid-churn round.
 
         A single round's `CASRootGet` conflates reclaim-phase GETs (O(pending drop backlog) — grows
         with the drop burst, not the universe) with discovery. Sampling one round per checkpoint made
@@ -454,11 +454,11 @@ class S30(Scenario):
                 "drain_rounds": attempt + 1,
                 "CASRootList": int(delta.get("CASRootList", 0)),
                 "CASRootGet": int(delta.get("CASRootGet", 0)),
-                "CASGcGet": int(delta.get("CASGcGet", 0)),
-                "CASGcDelete": int(delta.get("CASGcDelete", 0)),
+                "CASGCGet": int(delta.get("CASGCGet", 0)),
+                "CASGCDelete": int(delta.get("CASGCDelete", 0)),
                 "root_dirs": S30._count_root_dirs(),
             }
-            if last["CASGcDelete"] == 0 and last["CASRootGet"] == 0:
+            if last["CASGCDelete"] == 0 and last["CASRootGet"] == 0:
                 break
         return last
 

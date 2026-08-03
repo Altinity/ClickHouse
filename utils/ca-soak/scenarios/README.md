@@ -84,10 +84,10 @@ Collect these for every run:
   of the question, pull the top stack traces (by sample count) for `CPU`, `Real`, and `Memory` trace
   types SEPARATELY — each answers a different question (CPU = busy-spinning, Real = includes blocked/
   off-CPU waits, Memory = allocation hot paths) and must not be conflated into one combined ranking.
-- CA operation counters from `ProfileEvents`: `CASBlobPut`, `CASBlobPutDedup`, `CASBlobHead`,
-  `CASBlobHeadMiss`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDedupCacheHit`, `CASBlobDelete`,
-  `CASBlobList`, `CASRootGet`, `CASRootHead`, `CASRootCompareSwap`, `CASRootCompareSwapConflict`, `CASRootList`, `CASGcGet`,
-  `CASGcHead`, `CASGcCompareSwap`, `CASGcDelete`, `CASGcList`, and corresponding `DiskS3*`/`S3*` counters.
+- CA operation counters from `ProfileEvents`: `CASBlobPut`, `CASBlobPutDeduplicated`, `CASBlobHead`,
+  `CASBlobHeadMiss`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDeduplicationCacheHit`, `CASBlobDelete`,
+  `CASBlobList`, `CASRootGet`, `CASRootHead`, `CASRootCompareSwap`, `CASRootCompareSwapConflict`, `CASRootList`, `CASGCGet`,
+  `CASGCHead`, `CASGCCompareSwap`, `CASGCDelete`, `CASGCList`, and corresponding `DiskS3*`/`S3*` counters.
 - Container samples: cgroup memory, CPU throttling, IO bytes, network bytes, and scratch-dir bytes.
 
 Each report should include a short "budget verdict" table:
@@ -190,7 +190,7 @@ Workload:
 
 Observations:
 
-- `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDedupCacheHit`, `CASBlobPutDedup`, and
+- `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDeduplicationCacheHit`, `CASBlobPutDeduplicated`, and
   multipart counters for the second insert only.
 - Pool bytes before and after the second insert.
 - Query latency for reading both parts.
@@ -216,7 +216,7 @@ Workload:
 Observations:
 
 - `GC` duration and peak memory per round.
-- `CASRootList`, `CASRootGet`, `CASGcGet`, `CASGcPut`, `CASBlobList`, `CASBlobHead`, and `CASBlobDelete`.
+- `CASRootList`, `CASRootGet`, `CASGCGet`, `CASGCPut`, `CASBlobList`, `CASBlobHead`, and `CASBlobDelete`.
 - `system.trace_log` `CPU` samples inside `Cas::Gc::fold`, `Cas::Gc::retire`, `Cas::Gc::recheck`, and run
   decoding.
 
@@ -240,7 +240,7 @@ Workload:
 
 Observations:
 
-- Deleted objects per round, `duration_ms`, `CASBlobHead`, `CASBlobDelete`, `CASGcPut`, `CASGcDelete`, and
+- Deleted objects per round, `duration_ms`, `CASBlobHead`, `CASBlobDelete`, `CASGCPut`, `CASGCDelete`, and
   exact-token mismatch counts through `objects_replaced`/`objects_spared`.
 - Pool bytes and object count after every round.
 - Peak memory and CPU per round.
@@ -360,7 +360,7 @@ Workload:
 
 Observations:
 
-- `CASBlobPut`, `CASBlobPutDedup`, `CASBlobBodyPutAvoided`, and pool-byte growth per mutation.
+- `CASBlobPut`, `CASBlobPutDeduplicated`, `CASBlobBodyPutAvoided`, and pool-byte growth per mutation.
 - `system.part_log` mutation entries and `ProfileEvents` from `system.query_log`.
 - `system.cas_log` `blob_reuse_adopt`, `blob_put`, and `build_publish` counts.
 
@@ -427,7 +427,7 @@ Observations:
 
 - `system.cas_gc_log` by `gc_id`: successful leader rounds versus
   `NotALeader` rounds.
-- `CASGcCompareSwapConflict`, `CASRootCompareSwapConflict`, `CASBlobPutDedup`, pool bytes, and replica-local ref counts.
+- `CASGCCompareSwapConflict`, `CASRootCompareSwapConflict`, `CASBlobPutDeduplicated`, pool bytes, and replica-local ref counts.
 - Replication queue depth and fetch traffic.
 
 Expected:
@@ -506,7 +506,7 @@ Workload:
 Observations:
 
 - `CASRefNeedsRecovery`, `QueryMemoryLimitExceeded`, `CASRefAppendWedged`/`CASRefAppendUnwedged`/
-  `CASRefAppendDefiniteFailure`, `CASGcUnmatchedRemoveDeltas` (reported, never gating),
+  `CASRefAppendDefiniteFailure`, `CASGCUnmatchedRemoveDeltas` (reported, never gating),
   `fsck` `stale_edge`/`unaccounted`, acked-vs-lost blocks, max query duration.
 
 Expected:
@@ -636,7 +636,7 @@ Workload:
 
 Observations:
 
-- Replication fetch logs, `CASBlobPut`, `CASBlobPutDedup`, `CASRootCompareSwap`, network bytes, and pool bytes.
+- Replication fetch logs, `CASBlobPut`, `CASBlobPutDeduplicated`, `CASRootCompareSwap`, network bytes, and pool bytes.
 
 Expected:
 
@@ -711,7 +711,7 @@ Workload:
 
 Observations:
 
-- `CASBlobDedupCacheHit`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, memory, and upload counters.
+- `CASBlobDeduplicationCacheHit`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, memory, and upload counters.
 
 Expected:
 

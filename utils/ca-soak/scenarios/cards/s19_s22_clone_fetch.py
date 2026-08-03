@@ -117,7 +117,7 @@ class S19(Scenario):
         move_delta = counters().get("_total", {})
         result.observations["move_counters"] = {
             k: int(move_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
+                "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         # --- REPLACE PARTITION p FROM src (clone a partition into dst, src still holds it) --------
         replace_key = 1 if nparts > 1 else 0
@@ -128,7 +128,7 @@ class S19(Scenario):
         replace_delta = counters2().get("_total", {})
         result.observations["replace_counters"] = {
             k: int(replace_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
+                "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         pool_after = observe.pool_shape(timeout_s=120)
         result.observations["pool_after_clone"] = pool_after.get("_total")
@@ -351,15 +351,15 @@ class S20(Scenario):
         total_delta = delta.get("_total", {})
         result.observations["follower_fetch_counters"] = {
             k: int(follower_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap",
+                "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap",
                 "CASBlobHead", "CASBlobHeadFirst")}
         result.observations["total_fetch_counters"] = {
             k: int(total_delta.get(k, 0)) for k in (
-                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
+                "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         # --- VERDICT: follower does NOT re-upload existing large blob bodies ----------------------
         follower_body_puts = _blob_body_puts(follower_delta)
-        follower_dedup = (int(follower_delta.get("CASBlobPutDedup", 0)) +
+        follower_dedup = (int(follower_delta.get("CASBlobPutDeduplicated", 0)) +
                           int(follower_delta.get("CASBlobBodyPutAvoided", 0)))
         # A re-upload of the whole table would be ~nparts full payloads worth of CASBlobPut. The
         # follower publishes its own refs/sidecars (small CASRootCompareSwap + maybe tiny metadata puts) but
@@ -368,7 +368,7 @@ class S20(Scenario):
         ok = follower_body_puts <= big_body_count and (follower_dedup > 0 or follower_body_puts == 0)
         result.add(Verdict.check(
             "follower relinks without re-uploading big blobs",
-            "follower CASBlobPut for big bodies ~ 0; CASBlobPutDedup/BodyPutAvoided > 0",
+            "follower CASBlobPut for big bodies ~ 0; CASBlobPutDeduplicated/BodyPutAvoided > 0",
             f"follower CASBlobPut={follower_body_puts} dedup/avoided={follower_dedup}",
             ok,
             "" if ok else

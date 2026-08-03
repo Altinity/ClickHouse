@@ -114,8 +114,8 @@ class S34(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["churn_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASRootList", "CASRootGet", "CASGcGet", "CASGcList",
-            "CASBlobDelete", "CASGcDelete")}
+            "CASRootList", "CASRootGet", "CASGCGet", "CASGCList",
+            "CASBlobDelete", "CASGCDelete")}
 
         # --- D1 win: per-round GC fanout must NOT grow linearly with ever-created tables -------
         # Pre-D1 (S30): CASRootList/Get and root_dirs grew proportionally. Post-D1 they should
@@ -171,7 +171,7 @@ class S34(Scenario):
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
         """Measure the STEADY-STATE per-round DISCOVERY cost — the cost of a round that reclaims
-        NOTHING (`CASGcDelete==0`).
+        NOTHING (`CASGCDelete==0`).
 
         A round's `CASRootGet` conflates THREE regimes: (a) reclaim-phase GETs, O(pending
         condemn/graduation backlog); (b) a fold round that re-reads the current generation
@@ -179,9 +179,9 @@ class S34(Scenario):
         DEFERS (Phase-4 skip-unchanged) — O(1) LISTs, zero GETs. The D1 win is that the
         fixed per-round FLOOR — the idle deferred round (c) — must NOT grow with
         tables-ever-created. Sampling a single mid-churn round captured (a)/(b) and grew with
-        the drop burst, NOT the universe (verified: `CASRootGet` tracked `CASGcDelete>0`; a
+        the drop burst, NOT the universe (verified: `CASRootGet` tracked `CASGCDelete>0`; a
         drained round on a stale generation defers to 0). So drive rounds until an IDLE
-        deferred round (`CASGcDelete==0 AND CASRootGet==0`) and report it: that floor is the
+        deferred round (`CASGCDelete==0 AND CASRootGet==0`) and report it: that floor is the
         real per-round steady-state cost. If it can't reach idle, the last round is returned
         and a genuine monotone fanout would surface as a non-zero, growing floor."""
         last = {}
@@ -198,12 +198,12 @@ class S34(Scenario):
                 "gc_wall_s": round(wall, 3),
                 "CASRootList": int(delta.get("CASRootList", 0)),
                 "CASRootGet": int(delta.get("CASRootGet", 0)),
-                "CASGcGet": int(delta.get("CASGcGet", 0)),
-                "CASGcDelete": int(delta.get("CASGcDelete", 0)),
+                "CASGCGet": int(delta.get("CASGCGet", 0)),
+                "CASGCDelete": int(delta.get("CASGCDelete", 0)),
                 "root_dirs": S34._count_root_dirs(),
             }
             # Idle deferred round: nothing reclaimed AND no discovery GETs → the per-round floor.
-            if last["CASGcDelete"] == 0 and last["CASRootGet"] == 0:
+            if last["CASGCDelete"] == 0 and last["CASRootGet"] == 0:
                 break
         return last
 
@@ -311,12 +311,12 @@ class S35(Scenario):
                     "gc_wall_s": round(wall, 3),
                     "CASRootList": int(bdelta.get("CASRootList", 0)),
                     "CASRootGet": int(bdelta.get("CASRootGet", 0)),
-                    "CASGcDelete": int(bdelta.get("CASGcDelete", 0)),
+                    "CASGCDelete": int(bdelta.get("CASGCDelete", 0)),
                 })
                 ctx.log(f"S35: cycle {c+1}/{cycles}: "
                         f"gc_wall={wall:.2f}s "
                         f"CASRootList={bdelta.get('CASRootList')} "
-                        f"CASGcDelete={bdelta.get('CASGcDelete')}")
+                        f"CASGCDelete={bdelta.get('CASGCDelete')}")
 
         result.observations["gc_batches"] = gc_batches
         result.observations["cycle_errors"] = errors[:32]
@@ -324,7 +324,7 @@ class S35(Scenario):
         delta = counters().get("_total", {})
         result.observations["rotation_counters"] = {k: int(delta.get(k, 0)) for k in (
             "CASBlobPut", "CASBlobDelete", "CASRootCompareSwap", "CASRootCompareSwapConflict",
-            "CASGcDelete", "CASGcGet")}
+            "CASGCDelete", "CASGCGet")}
 
         # --- incarnation-monotonicity proxy: no bad CA-log events during the churn loop --------
         # The incarnation invariant cannot be directly queried from SQL alone; we use the CA-log

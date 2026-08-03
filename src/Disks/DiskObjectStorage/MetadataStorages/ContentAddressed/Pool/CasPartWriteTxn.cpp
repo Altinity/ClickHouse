@@ -19,7 +19,7 @@
 
 namespace ProfileEvents
 {
-    extern const Event CASBlobDedupCacheHit;
+    extern const Event CASBlobDeduplicationCacheHit;
     extern const Event CASBlobHeadFirst;
     extern const Event CASBlobBodyPutAvoided;
     extern const Event CASBlobAdoptTrusted;
@@ -193,7 +193,7 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
     /// a stale/absent HEAD ⇒ fall through to the normal conditional upload. SAFE by construction: we
     /// always genuinely observe present-at-round before skipping the body, so the cache can never cause
     /// a dangle (a stale hit just HEADs 404 and uploads). The cache membership is read ONCE here: it both
-    /// arms the HEAD-first gate and distinguishes the `DedupCacheHit` outcome from a size-triggered `HeadHit`.
+    /// arms the HEAD-first gate and distinguishes the `DeduplicationCacheHit` outcome from a size-triggered `HeadHit`.
     const bool cache_hit = store->dedupCacheContains(logical_ref);
     const bool head_first =
         cache_hit
@@ -206,13 +206,13 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
         {
             ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
             if (cache_hit)
-                ProfileEvents::increment(ProfileEvents::CASBlobDedupCacheHit);
+                ProfileEvents::increment(ProfileEvents::CASBlobDeduplicationCacheHit);
             try
             {
                 const BlobDepRecord dep = observeAndAdmit(ObjectKind::Blob, logical_ref, key, hr);
                 store->dedupCacheAdd(logical_ref);
                 return BlobUploadResult{req.ref, dep,
-                    cache_hit ? BlobUploadOutcome::DedupCacheHit : BlobUploadOutcome::HeadHit};
+                    cache_hit ? BlobUploadOutcome::DeduplicationCacheHit : BlobUploadOutcome::HeadHit};
             }
             catch (const Exception & e)
             {

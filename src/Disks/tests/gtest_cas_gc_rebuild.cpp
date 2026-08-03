@@ -17,7 +17,7 @@ using namespace DB::Cas::tests;
 
 namespace ProfileEvents
 {
-extern const Event CASGcRefWalkPlansBuilt;
+extern const Event CASGCRefWalkPlansBuilt;
 }
 
 namespace DB::ErrorCodes
@@ -34,16 +34,16 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 }
 }
 
-/// (`CASGcBaselineGuard.FreshStateOverTrimmedJournalsFailsClosed` was removed with the snapshot+log ref
+/// (`CASGCBaselineGuard.FreshStateOverTrimmedJournalsFailsClosed` was removed with the snapshot+log ref
 /// model. It asserted that a fresh GC over a MUTABLE shard journal whose folded history had been TRIMMED
 /// must refuse, lest it fold only the surviving tails and mass-delete live data. Immutable `_log`/`_snap`
 /// objects are never trimmed in place: a fresh GC always reconstructs the FULL ref state via the recovery
 /// equation (newest snapshot + later log tail), so the "trimmed history" hazard cannot arise. The
-/// vanished-`gc/state` disaster-recovery path is covered by `CASGcRebuild.RecoversLostStateAndConverges`,
-/// and the corrupt-bookkeeping guard by `CASGcBaselineGuard.AbsentAdoptedSealFailsClosed`.)
+/// vanished-`gc/state` disaster-recovery path is covered by `CASGCRebuild.RecoversLostStateAndConverges`,
+/// and the corrupt-bookkeeping guard by `CASGCBaselineGuard.AbsentAdoptedSealFailsClosed`.)
 
 /// A genuinely fresh pool (journals start at version 1) passes the guard — rounds run as today.
-TEST(CASGcBaselineGuard, GenuinelyFreshPoolIsUnaffected)
+TEST(CASGCBaselineGuard, GenuinelyFreshPoolIsUnaffected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -59,7 +59,7 @@ TEST(CASGcBaselineGuard, GenuinelyFreshPoolIsUnaffected)
 
 /// (б) audit: snap_generation > 0 whose adopted fold seal is ABSENT must be CORRUPTED_DATA,
 /// never silently treated as an empty baseline.
-TEST(CASGcBaselineGuard, AbsentAdoptedSealFailsClosed)
+TEST(CASGCBaselineGuard, AbsentAdoptedSealFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -91,7 +91,7 @@ TEST(CASGcBaselineGuard, AbsentAdoptedSealFailsClosed)
 /// (spec §7 — the condemnation that used to catch this case was the r5-finding-4 data-loss vector).
 /// Such a blob is retained until register R4's build/upload registry can enumerate it safely. That is
 /// the NAMED Stage-A residual, and it is asserted here rather than left to be discovered.
-TEST(CASGcRebuild, RecoversLostStateAndConverges)
+TEST(CASGCRebuild, RecoversLostStateAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// gc_fold_max_defer_rounds=0: this test drives MANY consecutive rounds via runRoundsUntilAbsent
@@ -162,7 +162,7 @@ TEST(CASGcRebuild, RecoversLostStateAndConverges)
 
 /// (б): a run object named by a healthy state is lost -> the regular round fails closed -> the
 /// PLAIN rebuild (no FORCE) recovers, and rounds converge afterwards.
-TEST(CASGcRebuild, RecoversLostGenerationArtifact)
+TEST(CASGCRebuild, RecoversLostGenerationArtifact)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -198,7 +198,7 @@ TEST(CASGcRebuild, RecoversLostGenerationArtifact)
 }
 
 /// FORCE: a healthy state refuses the plain rebuild; FORCE rebuilds; rounds run clean after.
-TEST(CASGcRebuild, HealthyStateRequiresForce)
+TEST(CASGCRebuild, HealthyStateRequiresForce)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -216,10 +216,10 @@ TEST(CASGcRebuild, HealthyStateRequiresForce)
 
     backend->resetCounts();
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
     const RebuildReport forced = gc.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(forced.performed) << forced.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u)
         << "healthy FORCE REBUILD must share the same one-shot authoritative plan builder";
     EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), 2u)
         << "healthy FORCE REBUILD may read the catalog for the conclusive drain and the one post-LIST cut only";
@@ -233,7 +233,7 @@ TEST(CASGcRebuild, HealthyStateRequiresForce)
 ///
 /// This catches a regression back to the legacy `recoverRefTable` overload, whose full LIST-derived
 /// replay consumes the second transaction and therefore refuses on `unfrontiered`'s missing body.
-TEST(CASGcRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
+TEST(CASGCRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -276,7 +276,7 @@ TEST(CASGcRebuild, FrozenCheckpointFrontierExcludesVisibleUnfrontieredTail)
 /// A catalog-admitted life without its exact checkpoint has no bounded recovery frontier. REBUILD
 /// must refuse rather than falling back to a list-derived history and publishing a baseline it cannot
 /// prove complete.
-TEST(CASGcRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
+TEST(CASGCRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -307,7 +307,7 @@ TEST(CASGcRebuild, LiveCatalogLifeWithoutCheckpointFailsClosed)
 /// A syntactically valid snapshot at an OLDER `EpochSeal` id must not let REBUILD synthesize a
 /// baseline. The forged base differs from `last_epoch_seal`, so metadata equality cannot reject it;
 /// REBUILD must use the retained same-id log witness.
-TEST(CASGcRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
+TEST(CASGCRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -353,7 +353,7 @@ TEST(CASGcRebuild, CheckpointSnapshotAtOlderEpochSealFailsClosed)
         << "a rejected checkpoint base must not publish a REBUILD baseline";
 }
 
-TEST(CASGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
+TEST(CASGCRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);
@@ -376,12 +376,12 @@ TEST(CASGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load();
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(report.performed) << report.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCRefWalkPlansBuilt].load() - plans_before, 1u);
     EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(*backend, layout);
     ASSERT_EQ(catalog.catalog.entries.size(), 1u);
@@ -391,7 +391,7 @@ TEST(CASGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
 
 /// Refusal: a committed owner with a MISSING manifest body is data loss — the rebuild refuses,
 /// names the owner, and writes nothing (gc/state stays absent).
-TEST(CASGcRebuild, MissingCommittedManifestRefuses)
+TEST(CASGCRebuild, MissingCommittedManifestRefuses)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -429,7 +429,7 @@ TEST(CASGcRebuild, MissingCommittedManifestRefuses)
 
 /// A live precommit with a durable body contributes edges (no clamp); the rebuilt baseline
 /// protects its blob from condemnation.
-TEST(CASGcRebuild, LivePrecommitEdgesIncluded)
+TEST(CASGCRebuild, LivePrecommitEdgesIncluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -460,7 +460,7 @@ TEST(CASGcRebuild, LivePrecommitEdgesIncluded)
 
 /// O(budget) attempt iteration: a tiny edge budget forces multi-batch folding; the rebuilt
 /// baseline still protects every committed blob (same convergence as the single-batch path).
-TEST(CASGcRebuild, BatchedRebuildProtectsAllRefs)
+TEST(CASGCRebuild, BatchedRebuildProtectsAllRefs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     constexpr uint64_t gc_shards = 2;
@@ -537,7 +537,7 @@ TEST(CASGcRebuild, BatchedRebuildProtectsAllRefs)
 /// Trimmed-but-live (design delta 2): the precommit's journal evidence is gone (trim), the build
 /// is NOT provably dead (a live build holds min_active down) — the unowned-alive sweep must
 /// over-protect the manifest's edges.
-TEST(CASGcRebuild, UnownedAliveManifestOverProtected)
+TEST(CASGCRebuild, UnownedAliveManifestOverProtected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -574,7 +574,7 @@ TEST(CASGcRebuild, UnownedAliveManifestOverProtected)
 /// Task 4 (SYSTEM CAS GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
 /// the lease, even under FORCE (FORCE bypasses the "healthy state" refusal, not the lease). Gc A's
 /// runRegularRound freshly acquires/renews the lease; Gc B (a different gc_id) must see it as live.
-TEST(CASGcRebuild, LeaseConflictRefuses)
+TEST(CASGCRebuild, LeaseConflictRefuses)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -609,7 +609,7 @@ TEST(CASGcRebuild, LeaseConflictRefuses)
 /// behind the clamp; the clamp release then folds the +1 into a DANGLING reference (the model's
 /// SabotageSkipChangedShard, realized). With suppression a clamped pass neither graduates nor
 /// redeletes; X survives until the clamp clears, after which the +1 folds and X is SPARED.
-TEST(CASGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
+TEST(CASGCClampSuppression, LandedEdgeBehindClampNeverDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)

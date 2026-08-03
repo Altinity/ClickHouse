@@ -82,9 +82,9 @@ std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout,
 }
 
 /// dedup-cache hit: the ref is known-present in the dedup cache ⇒ HEAD-first ⇒ present ⇒ adopt.
-/// The returned result is a complete tokened adopt dep with the `DedupCacheHit` outcome; the build's
+/// The returned result is a complete tokened adopt dep with the `DeduplicationCacheHit` outcome; the build's
 /// dep set stays untouched; the backend body/meta match the serial `putBlob` for the same input.
-TEST(CASUploadDetached, DedupCacheHitAdoptsBuildUntouched)
+TEST(CASUploadDetached, DeduplicationCacheHitAdoptsBuildUntouched)
 {
     const RootNamespace ns{"srv1/nsDedup"};
     const String ref_name = "part";
@@ -112,7 +112,7 @@ TEST(CASUploadDetached, DedupCacheHitAdoptsBuildUntouched)
     const BlobUploadResult r = build1->uploadBlobDetached(
         BlobUploadRequest{blob, BlobSource::fromString(payload), payload.size()});
 
-    EXPECT_EQ(r.outcome, BlobUploadOutcome::DedupCacheHit);
+    EXPECT_EQ(r.outcome, BlobUploadOutcome::DeduplicationCacheHit);
     EXPECT_EQ(r.ref, blob);
     EXPECT_EQ(r.dep.kind, ObjectKind::Blob);
     ASSERT_TRUE(r.dep.token.has_value());

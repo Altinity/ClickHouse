@@ -62,7 +62,7 @@ extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASRefRecoveryEpochSealAdopted;
 extern const Event CASRefRecoveryStragglerAdopted;
 extern const Event CASRefRecoveryCancelled;
-extern const Event CASRefCkptPublished;
+extern const Event CASRefCheckpointPublished;
 }
 
 using namespace DB::Cas;
@@ -1401,7 +1401,7 @@ TEST(CASRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
         cv.wait(lock, [&] { return release_recovery; });
     };
 
-    const uint64_t ckpt_before = counterOf(ProfileEvents::CASRefCkptPublished);
+    const uint64_t ckpt_before = counterOf(ProfileEvents::CASRefCheckpointPublished);
     const uint64_t cancelled_before = counterOf(ProfileEvents::CASRefRecoveryCancelled);
 
     std::thread recovery([&] { try { store->listRefs(ns); } catch (...) {} }); // NOLINT(bugprone-empty-catch): the outcome is asserted below via the ProfileEvents counters, not this thread's exception
@@ -1440,7 +1440,7 @@ TEST(CASRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
 
     EXPECT_GT(counterOf(ProfileEvents::CASRefRecoveryCancelled), cancelled_before)
         << "the released recovery must observe the cancellation rather than run to completion";
-    EXPECT_EQ(counterOf(ProfileEvents::CASRefCkptPublished), ckpt_before)
+    EXPECT_EQ(counterOf(ProfileEvents::CASRefCheckpointPublished), ckpt_before)
         << "a cancelled recovery performs ZERO _ckpt CASes";
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "and ZERO installs";
 }

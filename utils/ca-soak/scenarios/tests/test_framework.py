@@ -21,11 +21,11 @@ def test_parse_duration():
 
 def test_events_delta_basic_and_reset():
     before = {"CASBlobPut": 10, "CASBlobHead": 5}
-    after = {"CASBlobPut": 17, "CASBlobHead": 5, "CASGcDelete": 3}
+    after = {"CASBlobPut": 17, "CASBlobHead": 5, "CASGCDelete": 3}
     d = observe.events_delta(before, after)
     assert d["CASBlobPut"] == 7
     assert "CASBlobHead" not in d  # zero delta dropped
-    assert d["CASGcDelete"] == 3
+    assert d["CASGCDelete"] == 3
     # counter reset (after < before) -> report post-reset absolute value
     d2 = observe.events_delta({"CASBlobPut": 100}, {"CASBlobPut": 4})
     assert d2["CASBlobPut"] == 4

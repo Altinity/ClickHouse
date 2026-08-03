@@ -20,8 +20,8 @@ using namespace DB::Cas;
 
 namespace ProfileEvents
 {
-    extern const Event CASGcUnmatchedAdoptedParentLives;
-    extern const Event CASGcStuckRemovals;
+    extern const Event CASGCUnmatchedAdoptedParentLives;
+    extern const Event CASGCStuckRemovals;
 }
 
 namespace DB::Cas::tests
@@ -1341,7 +1341,7 @@ TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreat
     EXPECT_EQ(backend.deleteTotal(), 0);
 }
 
-TEST(CASGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
+TEST(CASGCRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuildInputs)
 {
     RefCatalog catalog;
     catalog.entries = {
@@ -1425,7 +1425,7 @@ TEST(CASGcRefWalkPlan, CatalogIsSoleRowAdmissionAuthorityAcrossOrdinaryAndRebuil
     EXPECT_FALSE(rebuild.contains(UInt128{5}));
 }
 
-TEST(CASGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
+TEST(CASGCStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
 {
     const Layout layout("p");
     RefWalkPlanRow row{
@@ -1452,7 +1452,7 @@ TEST(CASGcStuckRemoval, ThresholdAndRestartUseOnlyDurableRounds)
     EXPECT_FALSE(stuckRemovalWarning(row, 100, 3, layout));
 }
 
-TEST(CASGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
+TEST(CASGCStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
 {
     const Layout layout("p");
     RefWalkPlanRow row{
@@ -1485,7 +1485,7 @@ TEST(CASGcStuckRemoval, BoundaryAndAbsentVersusUnreadableMessagesAreExact)
         << "the diagnostic must not promise a command that cannot recover this exact object";
 }
 
-TEST(CASGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
+TEST(CASGCStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
 {
     DB::Cas::tests::CountingBackend backend;
     const Layout layout("p");
@@ -1505,7 +1505,7 @@ TEST(CASGcStuckRemoval, DiagnosticDoesNotAppendOrMutateBackend)
     EXPECT_EQ(backend.deleteTotal(), 0u);
 }
 
-TEST(CASGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
+TEST(CASGCStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1549,7 +1549,7 @@ TEST(CASGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     ASSERT_EQ(backend->putIfAbsent(layout.gcStateKey(), encodeGcState(state)).outcome, PutOutcome::Done);
 
     const uint64_t signals_before
-        = ProfileEvents::global_counters[ProfileEvents::CASGcStuckRemovals].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals].load();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(removing.ns, life_id);
     const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
     const uint64_t append_puts_before = backend->putCount(unreadable_ref_log_key);
@@ -1559,7 +1559,7 @@ TEST(CASGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     Gc restarted_process(store, gc_id);
     EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcStuckRemovals].load() - signals_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGCStuckRemovals].load() - signals_before, 2u);
     EXPECT_EQ(backend->putCount(unreadable_ref_log_key), append_puts_before)
         << "the diagnostic cannot append the unreadable ref log";
     const String captured = log_capture.captured();
@@ -1568,7 +1568,7 @@ TEST(CASGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     EXPECT_NE(captured.find("is unreadable"), String::npos);
 }
 
-TEST(CASGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
+TEST(CASGCStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Pool::open(backend, PoolConfig{
@@ -1579,7 +1579,7 @@ TEST(CASGcStuckRemoval, ZeroThresholdIsRefusedAtGcConstruction)
         [&] { Gc gc(store, UInt128{1}); });
 }
 
-TEST(CASGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)
+TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan)
 {
     const NamespaceLifePhysicalId current_life{2};
     const NamespaceLifePhysicalId unmatched_life =
@@ -1594,12 +1594,12 @@ TEST(CASGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
 
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
     ScopedCasGcLogCapture log_capture;
     const RefPlan plan = tests::buildRefWalkPlanForTest(scan, cut);
 
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load() - events_before,
         1u);
     EXPECT_EQ(plan.droppedParentRows(), 1u);
     EXPECT_EQ(plan.size(), 1u);
@@ -1612,7 +1612,7 @@ TEST(CASGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
     EXPECT_EQ(std::count(captured.begin(), captured.end(), '\n'), 1u);
 }
 
-TEST(CASGcRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
+TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
 {
     /// This catches a plan that borrows the post-LIST observations or lets its successor state alias a
     /// row. Replacing the owning `RoundInput`/`RefPlan` boundary with the former loose inputs, or

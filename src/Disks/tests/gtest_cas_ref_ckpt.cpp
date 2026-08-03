@@ -253,7 +253,7 @@ private:
 
 /// Every combination of the frontier and existing optionals survives a round trip. Both-absent is the shape a namespace
 /// carries from creation until its first snapshot, so it is a real state and not a degenerate one.
-TEST(CASRefCkpt, RoundTripsEveryFieldCombination)
+TEST(CASRefCheckpoint, RoundTripsEveryFieldCombination)
 {
     const std::vector<RefCkpt> cases = {
         RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt},
@@ -266,7 +266,7 @@ TEST(CASRefCkpt, RoundTripsEveryFieldCombination)
         EXPECT_EQ(decodeRefCkpt(encodeRefCkpt(ckpt)), ckpt);
 }
 
-TEST(CASRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
+TEST(CASRefCheckpoint, CommittedThroughHasCanonicalExactWireEncoding)
 {
     const RefCkpt ckpt{.life_epoch = std::optional<uint64_t>{7},
                        .committed_through = RefTxnId{9, 11},
@@ -283,7 +283,7 @@ TEST(CASRefCkpt, CommittedThroughHasCanonicalExactWireEncoding)
 /// `last_epoch_seal` is chain evidence, not an arbitrary lower bound. It either names the frontier
 /// itself when that frontier is the terminal seal, or closes the immediately preceding numeric epoch.
 /// Accepting a gap or a later same-epoch frontier would manufacture a boundary that INV-2 never proved.
-TEST(CASRefCkpt, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
+TEST(CASRefCheckpoint, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
 {
     const RefCkpt valid{.life_epoch = 7, .committed_through = RefTxnId{8, 5},
                         .checkpoint_snapshot_id = RefTxnId{7, 4}, .last_epoch_seal = RefTxnId{7, 9}};
@@ -313,7 +313,7 @@ TEST(CASRefCkpt, CodecRejectsIncoherentCommittedFrontierAndSealEpochs)
 /// STRICT means an unknown key is corruption, not something to skip. A `_ckpt` decides deletions, so a
 /// reader that ignored a field it did not understand would be authorizing them from a body it only
 /// partly read.
-TEST(CASRefCkpt, RejectsAnUnknownKey)
+TEST(CASRefCheckpoint, RejectsAnUnknownKey)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_1, .checkpoint_snapshot_id = ID_1_1,
                                               .last_epoch_seal = std::nullopt});
@@ -329,7 +329,7 @@ TEST(CASRefCkpt, RejectsAnUnknownKey)
 }
 
 /// A duplicate key has no single meaning, so it can never be resolved by a reader's preference.
-TEST(CASRefCkpt, RejectsADuplicateKey)
+TEST(CASRefCheckpoint, RejectsADuplicateKey)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt});
@@ -341,7 +341,7 @@ TEST(CASRefCkpt, RejectsADuplicateKey)
 /// Truncation in each of its shapes. Half an optional pair is the dangerous one: silently dropping it
 /// would turn a truncated body into a well-formed `_ckpt` with NO checkpoint, which reads as
 /// "recovery has no base" and would be trusted.
-TEST(CASRefCkpt, RejectsTruncation)
+TEST(CASRefCheckpoint, RejectsTruncation)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1}, .committed_through = ID_1_2, .checkpoint_snapshot_id = ID_1_2,
                                               .last_epoch_seal = std::nullopt});
@@ -368,7 +368,7 @@ TEST(CASRefCkpt, RejectsTruncation)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefCkpt(frontier_half); });
 }
 
-TEST(CASRefCkpt, RejectsTrailingBytes)
+TEST(CASRefCheckpoint, RejectsTrailingBytes)
 {
     const String good = encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{7}, .checkpoint_snapshot_id = std::nullopt,
                                               .last_epoch_seal = std::nullopt});
@@ -378,7 +378,7 @@ TEST(CASRefCkpt, RejectsTrailingBytes)
 /// The field-validity rule runs in BOTH directions: a struct this build refuses to read can never be
 /// written by it either, so a bug on the write side surfaces at the writer and not as an unreadable
 /// object discovered by a future recovery.
-TEST(CASRefCkpt, RejectsInvalidFieldsOnEncodeAndOnDecode)
+TEST(CASRefCheckpoint, RejectsInvalidFieldsOnEncodeAndOnDecode)
 {
     /// PRESENT means REAL: an absent field is legal, a present-but-impossible one is not. A zero
     /// `life_epoch` would give the field two meanings ("unknown" and "epoch zero") on an object that
@@ -402,7 +402,7 @@ TEST(CASRefCkpt, RejectsInvalidFieldsOnEncodeAndOnDecode)
 
 /// The registry row is part of the contract: Control/Strict decides how the decoder treats unknown
 /// keys, and the caps are the first thing that fires if a foreign object ever lands at the key.
-TEST(CASRefCkpt, RegistryRowIsControlStrictWithTightCaps)
+TEST(CASRefCheckpoint, RegistryRowIsControlStrictWithTightCaps)
 {
     const FormatTraits & traits = traitsFor(FormatId::RefCkpt);
     EXPECT_EQ(traits.type, "cas_ref_ckpt");
@@ -424,7 +424,7 @@ TEST(CASRefCkpt, RegistryRowIsControlStrictWithTightCaps)
 /// The key
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CASRefCkpt, KeyIsTheLifeLeafAndParsesBack)
+TEST(CASRefCheckpoint, KeyIsTheLifeLeafAndParsesBack)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_key"};
@@ -445,7 +445,7 @@ TEST(CASRefCkpt, KeyIsTheLifeLeafAndParsesBack)
 
 /// The hot stream grouping accepts logs and snapshots while ignoring a checkpoint from the separate
 /// state tree. An unrecognized key inside the stream tree still aborts the round.
-TEST(CASRefCkpt, GroupRefKeysScopesHotIntakeToTheStreamTree)
+TEST(CASRefCheckpoint, GroupRefKeysScopesHotIntakeToTheStreamTree)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_group"};
@@ -473,7 +473,7 @@ TEST(CASRefCkpt, GroupRefKeysScopesHotIntakeToTheStreamTree)
 /// The per-field table the ledger obligation from the TLA phase asks for: each field independently
 /// newer on either side, plus both-absent and equal bodies. A merge that is not per-field would pass
 /// some rows and fail others, which is the point of enumerating them.
-TEST(CASRefCkpt, MergeTakesThePerFieldSemanticMaximum)
+TEST(CASRefCheckpoint, MergeTakesThePerFieldSemanticMaximum)
 {
     const RefCkpt low{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = ID_1_1, .last_epoch_seal = ID_1_1};
     const RefCkpt high_ckpt{.life_epoch = std::optional<uint64_t>{3}, .checkpoint_snapshot_id = ID_1_2, .last_epoch_seal = ID_1_1};
@@ -486,7 +486,7 @@ TEST(CASRefCkpt, MergeTakesThePerFieldSemanticMaximum)
     /// The `life_epoch` rows stay mirrored, and that is a deliberate statement rather than an oversight:
     /// a `life_epoch` that FALLS is refused, but the refusal lives in `publishCkpt`, which knows which
     /// side is durable, and NOT here. This function stays commutative, so both directions must keep
-    /// yielding the maximum. See `CASRefCkptJoin` (`gtest_cas_ref_ckpt_join.cpp`) for the refusal itself
+    /// yielding the maximum. See `CASRefCheckpointJoin` (`gtest_cas_ref_ckpt_join.cpp`) for the refusal itself
     /// and for why it cannot be expressed at this level.
     EXPECT_EQ(mergeCkpt(low, high_ckpt), high_ckpt);
     EXPECT_EQ(mergeCkpt(high_ckpt, low), high_ckpt);
@@ -523,7 +523,7 @@ TEST(CASRefCkpt, MergeTakesThePerFieldSemanticMaximum)
 /// publishCkpt
 /// ---------------------------------------------------------------------------------------------
 
-TEST(CASRefCkpt, CreatesTheObjectWhenItIsAbsent)
+TEST(CASRefCheckpoint, CreatesTheObjectWhenItIsAbsent)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -543,7 +543,7 @@ TEST(CASRefCkpt, CreatesTheObjectWhenItIsAbsent)
 /// `life_epoch` merges in afterwards. Order does not matter -- the merge is a per-field maximum, and
 /// no writer ever supplies a field it does not know (a guess here would be permanent, since the merge
 /// can never lower it).
-TEST(CASRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLater)
+TEST(CASRefCheckpoint, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLater)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -571,7 +571,7 @@ TEST(CASRefCkpt, EachWriterCreatesWithOnlyWhatItKnowsAndTheOtherFieldsMergeInLat
 /// The conflict path is the whole reason the algorithm re-READS instead of retrying its bytes: the
 /// winner's field must survive the loser's retry. Here a concurrent writer advances the seal between
 /// our read and our CAS; our retry must merge onto the new body, not overwrite it.
-TEST(CASRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
+TEST(CASRefCheckpoint, TokenConflictRereadsAndMergesOntoTheWinner)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_conflict"};
@@ -613,7 +613,7 @@ TEST(CASRefCkpt, TokenConflictRereadsAndMergesOntoTheWinner)
 /// A contribution that adds nothing issues NO write. This is a correctness property, not a saving:
 /// both writers publish on every snapshot and every seal, and a no-op write would mint a fresh token
 /// each time, turning every other writer's in-flight CAS into a conflict for identical bytes.
-TEST(CASRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
+TEST(CASRefCheckpoint, AnIdenticalMergedBodyIssuesNoWrite)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -641,7 +641,7 @@ TEST(CASRefCkpt, AnIdenticalMergedBodyIssuesNoWrite)
 /// The fence is re-checked AFTER the read and BEFORE the write, on every attempt. A generation that
 /// moved means this writer's lease incarnation is gone, so its merged body is stale even if the fence
 /// is live again under a fresh incarnation.
-TEST(CASRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
+TEST(CASRefCheckpoint, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -674,7 +674,7 @@ TEST(CASRefCkpt, AFenceBumpBetweenTheReadAndTheCasWritesNothing)
 /// Persistent contention fails CLOSED and says so. There is no partial state to clean up -- every
 /// attempt either committed the complete merged body or changed nothing -- but the caller must be told
 /// its contribution is unpublished rather than left to assume it landed.
-TEST(CASRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
+TEST(CASRefCheckpoint, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
 {
     const Layout layout{"p"};
     const RootNamespace ns{"srv1/ckpt_exhausted"};
@@ -705,7 +705,7 @@ TEST(CASRefCkpt, AnExhaustedDeadlineUnderPersistentConflictThrowsRetryLater)
                                                              "committed the complete merged body or wrote nothing";
 }
 
-TEST(CASRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
+TEST(CASRefCheckpoint, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
@@ -724,7 +724,7 @@ TEST(CASRefCkpt, AmbiguousCommittedCasIsResolvedByOneExactReadWithoutBlindRetry)
     EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
 }
 
-TEST(CASRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
+TEST(CASRefCheckpoint, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
@@ -743,7 +743,7 @@ TEST(CASRefCkpt, AmbiguousUncommittedCasRetriesAgainstTheExactReadToken)
     EXPECT_EQ(readCkptOrFail(*backend, layout, life).committed_through, ID_1_2);
 }
 
-TEST(CASRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
+TEST(CASRefCheckpoint, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
@@ -765,7 +765,7 @@ TEST(CASRefCkpt, AmbiguousCasAcceptsAValidDominatingDurableFrontier)
     EXPECT_EQ(readCkptOrFail(*backend, layout, life), dominating);
 }
 
-TEST(CASRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
+TEST(CASRefCheckpoint, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
@@ -787,7 +787,7 @@ TEST(CASRefCkpt, FailedExactReadAfterAmbiguousCasFailsClosedWithoutAnotherCas)
     EXPECT_EQ(readCkptOrFail(*backend, layout, life), base);
 }
 
-TEST(CASRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
+TEST(CASRefCheckpoint, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
 {
     for (const bool move_before_read : {true, false})
     {
@@ -820,7 +820,7 @@ TEST(CASRefCkpt, FenceMovementAroundAmbiguityResolutionMakesTheExactReadInert)
     }
 }
 
-TEST(CASRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCasAttempts)
+TEST(CASRefCheckpoint, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCasAttempts)
 {
     auto backend = std::make_shared<AmbiguousCkptBackend>();
     const Layout layout{"p"};
@@ -848,7 +848,7 @@ TEST(CASRefCkpt, ContinuedAmbiguityStopsAtTheDeadlineAndNeverIssuesConsecutiveCa
 /// A `_ckpt` that does not decode is NEVER overwritten. It is the only record of recovery's base and
 /// of what cleanup may delete, so replacing it with a body derived from the contribution alone would
 /// erase the base and leave a well-formed object a reader would trust.
-TEST(CASRefCkpt, ACorruptCheckpointIsNeverOverwritten)
+TEST(CASRefCheckpoint, ACorruptCheckpointIsNeverOverwritten)
 {
     auto backend = std::make_shared<CountingBackend>();
     const Layout layout{"p"};
@@ -874,7 +874,7 @@ TEST(CASRefCkpt, ACorruptCheckpointIsNeverOverwritten)
 /// ---------------------------------------------------------------------------------------------
 
 /// INV-4's three-way revalidation of a base that turned out to be missing.
-TEST(CASRefCkpt, AMissingSampledBaseRestartsOnAnAdvancedTokenAndIsCorruptionOnAnUnchangedOne)
+TEST(CASRefCheckpoint, AMissingSampledBaseRestartsOnAnAdvancedTokenAndIsCorruptionOnAnUnchangedOne)
 {
     const Token sampled{"t1", TokenType::Emulated};
     const Token advanced{"t2", TokenType::Emulated};
@@ -890,7 +890,7 @@ TEST(CASRefCkpt, AMissingSampledBaseRestartsOnAnAdvancedTokenAndIsCorruptionOnAn
 
 /// The deletion gate is STRICTLY below, because the checkpoint names the snapshot a recovery is
 /// entitled to fetch by exact key. At-or-below is TLC counterexample `_sab_staleckptcorruption`.
-TEST(CASRefCkpt, SnapshotsAreDeletableStrictlyBelowTheCheckpoint)
+TEST(CASRefCheckpoint, SnapshotsAreDeletableStrictlyBelowTheCheckpoint)
 {
     EXPECT_TRUE(snapshotDeletableUnderCkpt(ID_1_1, ID_1_2));
     EXPECT_FALSE(snapshotDeletableUnderCkpt(ID_1_2, ID_1_2)) << "the checkpoint's own base is off limits";
@@ -906,7 +906,7 @@ TEST(CASRefCkpt, SnapshotsAreDeletableStrictlyBelowTheCheckpoint)
 
 /// The namespace-birth transaction creates the checkpoint, and it is the only writer that can: the
 /// `life_epoch` is this transaction's own writer epoch.
-TEST(CASRefCkpt, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
+TEST(CASRefCheckpoint, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -929,7 +929,7 @@ TEST(CASRefCkpt, NamespaceBirthCreatesTheCheckpointCarryingItsLifeEpoch)
 }
 
 /// The snapshot publisher is INV-4's second writer: the body PUT commits, then the checkpoint names it.
-TEST(CASRefCkpt, ACommittedSnapshotPublishAdvancesTheCheckpoint)
+TEST(CASRefCheckpoint, ACommittedSnapshotPublishAdvancesTheCheckpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -957,7 +957,7 @@ TEST(CASRefCkpt, ACommittedSnapshotPublishAdvancesTheCheckpoint)
 /// The body-PUT/cleanup/`_ckpt` race, decided by the ORDER of the two writes: cleanup planned in the
 /// window between the snapshot body PUT and the checkpoint CAS still reads the OLD checkpoint, and the
 /// gate is strictly below it -- so it cannot delete the snapshot just published.
-TEST(CASRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewSnapshot)
+TEST(CASRefCheckpoint, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewSnapshot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -991,7 +991,7 @@ TEST(CASRefCkpt, CleanupPlannedBetweenTheBodyPutAndTheCkptCasCannotDeleteTheNewS
 
 /// One `_ckpt` write per publication and not one more: the checkpoint is written where the snapshot is
 /// published, and a publisher with nothing above its newest snapshot touches it at all.
-TEST(CASRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
+TEST(CASRefCheckpoint, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -1019,7 +1019,7 @@ TEST(CASRefCkpt, TheCheckpointIsWrittenOncePerPublicationAndNotOnIdleAttempts)
     EXPECT_EQ(readCkptOrFail(*backend, store->layout(), life), after_publish->ckpt);
 }
 
-TEST(CASRefCkpt, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite)
+TEST(CASRefCheckpoint, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite)
 {
     auto backend = std::make_shared<CountingBackend>();
     const RootNamespace ns{"srv1/no_snapshot_at_seal"};
@@ -1055,7 +1055,7 @@ TEST(CASRefCkpt, SnapshotPublisherRefusesEpochSealCandidateWithoutAnyWrite)
 }
 
 /// Publication replays a `NeedsRecovery` lane before it captures a snapshot and advances `_ckpt`.
-TEST(CASRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
+TEST(CASRefCheckpoint, NeedsRecoveryReplaysBeforeCheckpointAdvance)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -1099,7 +1099,7 @@ TEST(CASRefCkpt, NeedsRecoveryReplaysBeforeCheckpointAdvance)
 /// A publish admitted under an incarnation that is replaced mid-attempt advances NOTHING, and does not
 /// adopt the snapshot either -- adopting would suppress every later publication for it while the
 /// checkpoint still pointed below it, leaving recovery on an older base with nothing to fix it.
-TEST(CASRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
+TEST(CASRefCheckpoint, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
 {
     const RootNamespace ns{"srv1/ckpt_stale_gen"};
 
@@ -1156,7 +1156,7 @@ TEST(CASRefCkpt, APublishFencedOutMidAttemptDoesNotAdvanceTheCheckpoint)
 /// backend and the real append lane, which this suite already drives through `publishRef` (including
 /// the namespace birth, the one chunk shape whose first durable effect is the `_ckpt` and not the
 /// ref-log `PUT`).
-TEST(CASRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
+TEST(CASRefCheckpoint, CommitRefChunkDurableBytesUnchangedByExtraction)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -1201,7 +1201,7 @@ TEST(CASRefCkpt, CommitRefChunkDurableBytesUnchangedByExtraction)
 /// COUNTS per key. Request ORDER is not checked here and cannot be with these counters; the ordering
 /// that matters for a birth -- `_ckpt` before the ref-log `PUT` -- is argued at the call site and would
 /// need a sequence-recording backend to pin.
-TEST(CASRefCkpt, AppendRequestCountUnchangedByExtraction)
+TEST(CASRefCheckpoint, AppendRequestCountUnchangedByExtraction)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);
@@ -1251,7 +1251,7 @@ TEST(CASRefCkpt, AppendRequestCountUnchangedByExtraction)
 /// the commit install, since nothing here wedges. It goes red if the region stops being entered at all
 /// (a lost commit path, a skipped install arm); a refactor that lifted the swap out of the scope while
 /// leaving the guard shell and the probe behind would keep it GREEN.
-TEST(CASRefCkpt, PostDurableInstallRegionStillEnteredAfterExtraction)
+TEST(CASRefCheckpoint, PostDurableInstallRegionStillEnteredAfterExtraction)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPool(backend);

@@ -243,10 +243,10 @@ class S02(Scenario):
 
         # Dedup verdict: the second insert must avoid re-uploading existing large blob bodies.
         avoided = delta.get("CASBlobBodyPutAvoided", 0)
-        dedup_hits = delta.get("CASBlobPutDedup", 0) + delta.get("CASBlobDedupCacheHit", 0)
+        dedup_hits = delta.get("CASBlobPutDeduplicated", 0) + delta.get("CASBlobDeduplicationCacheHit", 0)
         body_puts = delta.get("CASBlobPut", 0)
         result.add(Verdict.check("dedup avoided body upload",
-                                 "CASBlobBodyPutAvoided>0 or CASBlobPutDedup>0",
+                                 "CASBlobBodyPutAvoided>0 or CASBlobPutDeduplicated>0",
                                  f"avoided={avoided} dedup={dedup_hits} put={body_puts}",
                                  avoided > 0 or dedup_hits > 0))
 

@@ -116,7 +116,7 @@ private:
 /// A leader whose round-commit CAS is denied (lease lost mid-round) leaves its fold seal ONLY under its
 /// own attempt `a1`; it never occupies the adopted attempt, so a subsequent honest round is not wedged
 /// and drains the now-unreachable blob to zero.
-TEST(CASGcAttempt, DeposedFoldAttemptDoesNotWedge)
+TEST(CASGCAttempt, DeposedFoldAttemptDoesNotWedge)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
     auto store = openPoolForTest(backend);

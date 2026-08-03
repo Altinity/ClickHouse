@@ -54,7 +54,7 @@ insert's rows present (S40-shaped, block-granular); replicas agree; fsck `dangli
 GC rounds succeed again after disarm; no permanently wedged ref lane; no query
 hung past a bound.
 
-**Reported, never gating:** `CASGcUnmatchedRemoveDeltas` (removal deltas reaching the in-degree
+**Reported, never gating:** `CASGCUnmatchedRemoveDeltas` (removal deltas reaching the in-degree
 reducer without their matching activation). Its benign rate is not characterised yet, so this card
 records it and says so — it does not fail on it.
 """
@@ -80,7 +80,7 @@ _EVENTS_OF_INTEREST = (
     "CASRefBatchFlushes", "CASRefBatchedMutations",
     "CASRefSnapshotPublishDispatched", "CASRefSnapshotPublishBackoff",
     "CASRefRecoveryEpochSealed",
-    "CASGcUnmatchedRemoveDeltas",     # reported only, never gating (benign rate uncharacterised)
+    "CASGCUnmatchedRemoveDeltas",     # reported only, never gating (benign rate uncharacterised)
 )
 
 # The transition's log line (`CasRefLedger::requireRecovery`). Corroboration only: the LOG_ERROR
@@ -616,13 +616,13 @@ class S42(Scenario):
                 "GC did not recover after the allocation faults cleared"))
 
         # Reported, never gating (see the module docstring).
-        unmatched = (int(armed_delta.get("CASGcUnmatchedRemoveDeltas", 0))
-                     + _event_total(ev_post, "CASGcUnmatchedRemoveDeltas"))
+        unmatched = (int(armed_delta.get("CASGCUnmatchedRemoveDeltas", 0))
+                     + _event_total(ev_post, "CASGCUnmatchedRemoveDeltas"))
         result.add(Verdict.reported(
-            "CASGcUnmatchedRemoveDeltas (reported, not gating)",
+            "CASGCUnmatchedRemoveDeltas (reported, not gating)",
             "(recorded; benign rate not yet characterised)",
-            f"{unmatched} (armed window {armed_delta.get('CASGcUnmatchedRemoveDeltas', 0)}, "
-            f"post-restart {_event_total(ev_post, 'CASGcUnmatchedRemoveDeltas')})",
+            f"{unmatched} (armed window {armed_delta.get('CASGCUnmatchedRemoveDeltas', 0)}, "
+            f"post-restart {_event_total(ev_post, 'CASGCUnmatchedRemoveDeltas')})",
             "removal deltas that matched no existing source edge; a per-key no-op by design, but a "
             "persistent rate means deltas reach the reducer without their activation"))
         result.add(Verdict.reported(

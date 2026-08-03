@@ -123,8 +123,8 @@ BUCKETS = [
 
 # Upload-relevant ProfileEvents to pull from system.query_log for each measured insert.
 CA_EVENT_KEYS = [
-    "CASBlobPut", "CASBlobPutDedup", "CASBlobHead", "CASBlobHeadMiss", "CASBlobHeadFirst",
-    "CASBlobBodyPutAvoided", "CASBlobDedupCacheHit", "CASBlobDelete", "CASBlobList",
+    "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobHead", "CASBlobHeadMiss", "CASBlobHeadFirst",
+    "CASBlobBodyPutAvoided", "CASBlobDeduplicationCacheHit", "CASBlobDelete", "CASBlobList",
     "CASRootGet", "CASRootHead", "CASRootCompareSwap", "CASRootCompareSwapConflict", "CASRootList",
     "CASRefBatchFlushes", "CASRefBatchedMutations", "CASRefQueueWaitMicroseconds",
     "CASRefLogBodyGets", "CASRefGlobalListPages", "CASManifestPut",

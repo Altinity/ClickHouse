@@ -10,8 +10,8 @@
 
 namespace ProfileEvents
 {
-    extern const Event CASGcRetiredSparedByReref;
-    extern const Event CASGcUnmatchedRemoveDeltas;
+    extern const Event CASGCRetiredSparedByReref;
+    extern const Event CASGCUnmatchedRemoveDeltas;
 }
 #include <city.h>
 #include <algorithm>
@@ -459,7 +459,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                     "CAS gc fold ({}): delete_pending blob {} (condemned at round {}, observed at round {}) "
                     "recovered in-degree {} -- a fresh dedup-adopt raced the condemn; sparing (never a "
                     "fail-closed delete)", layout.poolPrefix(), blobIdOf(e.ref), e.condemn_round, current_round, indeg);
-                ProfileEvents::increment(ProfileEvents::CASGcRetiredSparedByReref);
+                ProfileEvents::increment(ProfileEvents::CASGCRetiredSparedByReref);
             }
             rmr.spared.push_back(e);            /// recovery wins, even past the floor
         }
@@ -529,7 +529,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
             /// `peek_head` is deliberately side-effect-free and is not `head_blob` —
             /// `head_blob` is the fresh-condemn hook (emits `BlobRetire` + increments
-            /// `CASGcRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
+            /// `CASGCRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
             /// `blob_retire_replaced` this supersede already produces below, and double-count the
             /// condemned counter for one physical condemnation.
             bool superseded = false;
@@ -644,7 +644,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             if (scattered[di].remove && !present)
             {
                 ++rmr.unmatched_removes;
-                ProfileEvents::increment(ProfileEvents::CASGcUnmatchedRemoveDeltas);
+                ProfileEvents::increment(ProfileEvents::CASGCUnmatchedRemoveDeltas);
                 if (!rmr.unmatched_remove_example)
                     rmr.unmatched_remove_example = UnmatchedRemoveExample{blob_ref, source_id};
             }

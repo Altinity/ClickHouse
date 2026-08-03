@@ -61,7 +61,7 @@ size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
 /// edges come from reading its OWN manifest body at fold time. So this is now a black-box no-loss
 /// oracle: two live refs share `B`, drop one, GC to a fixpoint, assert `B` survives (`dangling == 0`)
 /// because the surviving ref's manifest still contributes its +1 edge — `B`'s in-degree never reaches 0.
-TEST(CASGcDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
+TEST(CASGCDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestPool(b);

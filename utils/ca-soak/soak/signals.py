@@ -41,7 +41,7 @@ from soak.cluster import QueryError, is_node_down
 # Each entry is (event, why the soak watches it). The tuple is the contract with the product: when a
 # counter here is renamed or removed, `preflight_signals` fails the run rather than silently reading 0.
 CAS_SIGNAL_EVENT_NOTES = (
-    ("CASGcUnmatchedRemoveDeltas",
+    ("CASGCUnmatchedRemoveDeltas",
      "GC in-degree removal deltas that matched no source edge. Per-key no-op by design, so it cannot "
      "cause a false delete — but a persistent rate means removals reach the reducer without their "
      "activation, which is the retention-leak signal that stayed silent for months (2026-07-25)."),
@@ -53,10 +53,10 @@ CAS_SIGNAL_EVENT_NOTES = (
     ("CASRefAppendWedged",
      "Ref-log append lanes that exhausted retries after an UNCERTAIN put. Ref-log progress may be "
      "stalled on that lane."),
-    ("CASGcClampSuppressedPasses",
+    ("CASGCClampSuppressedPasses",
      "GC passes that deferred graduation and deletion because reachability was uncertain — GC held "
      "back. Fail-closed behaviour, but a steady rate means GC is not converging."),
-    ("CASGcCondemnMarkerUnconfirmedCarry",
+    ("CASGCCondemnMarkerUnconfirmedCarry",
      "Retirements delayed because a durable condemn marker could not be confirmed. Safe (deletion is "
      "postponed) but points at marker write/read failures."),
 )
@@ -96,7 +96,7 @@ LATE_PUT_VIOLATION_NOTES = (
      "A ref table whose cached state may be MISSING a durable transaction — an install failed while "
      "its ref-log object may already be durable. The LOSS half of the invariant: acknowledged work "
      "that the writer's own view no longer contains."),
-    ("CASGcUnappliedFoldedTxns",
+    ("CASGCUnappliedFoldedTransactions",
      "Ref transactions a round folded and merged but whose blob deltas never reached a shard reducer. "
      "The FOLD half: the round would advance its cursor past a transaction it never applied. The "
      "product already fails such a round closed; the soak must not finish green having seen one."),
@@ -283,7 +283,7 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 #   fold_ref_intake.logs_applied     — … versus logs that reached the single cursor-advance site.
 #                                      Inequality means the cursor advanced over unapplied work.
 #   fold_reduce.txns_unapplied       — folded+merged transactions whose blob deltas never reached a
-#                                      shard reducer. The fail-closed twin of CASGcUnappliedFoldedTxns.
+#                                      shard reducer. The fail-closed twin of CASGCUnappliedFoldedTransactions.
 DETECTOR_METRICS = (
     ("fold_ref_intake", "logs_accounted"),
     ("fold_ref_intake", "logs_applied"),

@@ -105,7 +105,7 @@ for s in "${binary_suites[@]}"; do in_binary["$s"]=1; done
 # guarded suite must be added here deliberately, with the build that contains it verified once.
 KNOWN_COMPILE_GUARDED=(
     CASBlobDigestDeathTest CASBlobUploadPoolDeathTest CASFoldSealFormatDeathTest
-    CASFormatTraitsDeathTest CASGcHoldGrammarDeathTest CASGcStateFormatDeathTest
+    CASFormatTraitsDeathTest CASGCHoldGrammarDeathTest CASGCStateFormatDeathTest
     CASNamespaceLifeIdDeathTest CASNsCreationLifecycleDeathTest CASPartFolderAccessDeathTest
     CASPromoteRepublishDeathTest CASRefCatalogDeathTest CASRefCatalogFormatDeathTest
     CASRefCatalogRemovalDeathTest CASRefInstallSafetyDeathTest CASRequestControllerCreateDeathTest

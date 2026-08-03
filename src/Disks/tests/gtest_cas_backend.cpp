@@ -289,10 +289,10 @@ TEST(CASBackendStream, StreamsBodyWindow)
 namespace ProfileEvents
 {
 extern const Event CASBlobPut;
-extern const Event CASBlobPutDedup;
+extern const Event CASBlobPutDeduplicated;
 extern const Event CASBlobHead;
 extern const Event CASBlobHeadMiss;
-extern const Event CASGcCompareSwap;
+extern const Event CASGCCompareSwap;
 }
 
 TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
@@ -321,16 +321,16 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 
     using ProfileEvents::global_counters;
     const auto blob_put_before   = global_counters[ProfileEvents::CASBlobPut].load();
-    const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDedup].load();
+    const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDeduplicated].load();
     const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead].load();
     const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss].load();
-    const auto gc_cas_before     = global_counters[ProfileEvents::CASGcCompareSwap].load();
+    const auto gc_cas_before     = global_counters[ProfileEvents::CASGCCompareSwap].load();
 
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
     /// First put of a blob ⇒ Put.
     EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::Done);
-    /// Second put of the same key ⇒ PutDedup (content already exists).
+    /// Second put of the same key ⇒ PutDeduplicated (content already exists).
     EXPECT_EQ(b.putIfAbsent(blob_key, "payload").outcome, PutOutcome::PreconditionFailed);
     /// head of an absent blob key ⇒ HeadMiss (the 404 signal).
     EXPECT_FALSE(b.head("pool/blobs/zz/absent").exists);
@@ -350,10 +350,10 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load()      - blob_put_before,   2u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDedup].load() - blob_dedup_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated].load() - blob_dedup_before, 1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CASGcCompareSwap].load()        - gc_cas_before,     1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASGCCompareSwap].load()        - gc_cas_before,     1u);
 #else
     (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
     (void)blob_miss_before; (void)gc_cas_before;

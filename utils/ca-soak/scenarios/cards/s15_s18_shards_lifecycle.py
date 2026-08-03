@@ -345,8 +345,8 @@ class S16(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["cycle_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASBlobDelete",
-            "CASBlobHead", "CASBlobHeadMiss", "CASGcDelete")}
+            "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASBlobDelete",
+            "CASBlobHead", "CASBlobHeadMiss", "CASGCDelete")}
 
         # CA event audit for this run window (blob_reuse_resurrect/adopt, blob_put, blob_delete, etc).
         ca_events = _ca_events_since(ctx)
@@ -517,7 +517,7 @@ class S17(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["lifecycle_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CASBlobPut", "CASBlobDelete", "CASBlobHead", "CASGcDelete", "CASRootCompareSwap")}
+            "CASBlobPut", "CASBlobDelete", "CASBlobHead", "CASGCDelete", "CASRootCompareSwap")}
         ca_events = _ca_events_since(ctx)
         result.observations["ref_events"] = {
             et: _event_total(ca_events, et) for et in ("ref_publish", "ref_drop")}

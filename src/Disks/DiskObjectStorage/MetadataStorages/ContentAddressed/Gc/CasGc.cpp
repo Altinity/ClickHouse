@@ -28,24 +28,24 @@
 
 namespace ProfileEvents
 {
-    extern const Event CASGcClampSuppressedPasses;
-    extern const Event CASGcDeadPrecommitSkipped;
-    extern const Event CASGcRetiredCondemned;
-    extern const Event CASGcRetiredSpared;
-    extern const Event CASGcRetiredGraduated;
-    extern const Event CASGcRetiredRedeleted;
-    extern const Event CASGcRetireReplaced;
-    extern const Event CASGcCondemnMarkerUnconfirmedCarry;
-    extern const Event CASGcHeartbeatFenceOuts;
-    extern const Event CASGcMetaWriteAnomaly;
-    extern const Event CASGcMetaOps;
-    extern const Event CASGcEnumerationPages;
-    extern const Event CASGcRefWalkPlansBuilt;
-    extern const Event CASGcUnmatchedAdoptedParentLives;
-    extern const Event CASGcStuckRemovals;
-    extern const Event CASGcNamespaceCleanupLeaks;
-    extern const Event CASGcRebuildVirginByEnumeration;
-    extern const Event CASGcUnappliedFoldedTxns;
+    extern const Event CASGCClampSuppressedPasses;
+    extern const Event CASGCDeadPrecommitSkipped;
+    extern const Event CASGCRetiredCondemned;
+    extern const Event CASGCRetiredSpared;
+    extern const Event CASGCRetiredGraduated;
+    extern const Event CASGCRetiredRedeleted;
+    extern const Event CASGCRetireReplaced;
+    extern const Event CASGCCondemnMarkerUnconfirmedCarry;
+    extern const Event CASGCHeartbeatFenceOuts;
+    extern const Event CASGCMetaWriteAnomaly;
+    extern const Event CASGCMetaOps;
+    extern const Event CASGCEnumerationPages;
+    extern const Event CASGCRefWalkPlansBuilt;
+    extern const Event CASGCUnmatchedAdoptedParentLives;
+    extern const Event CASGCStuckRemovals;
+    extern const Event CASGCNamespaceCleanupLeaks;
+    extern const Event CASGCRebuildVirginByEnumeration;
+    extern const Event CASGCUnappliedFoldedTransactions;
     extern const Event CASRefGlobalListPages;
     extern const Event CASRefLogBodyGets;
     extern const Event CASRefManifestBodyFoldGets;
@@ -82,7 +82,7 @@ namespace
 /// per physical LIST page, never per listed key.
 void onGcEnumerationPage()
 {
-    ProfileEvents::increment(ProfileEvents::CASGcEnumerationPages);
+    ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
 }
 
 /// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` can
@@ -221,7 +221,7 @@ std::optional<String> stuckRemovalWarning(
 
 RefPlan buildRefWalkPlan(RoundInput && round_input)
 {
-    ProfileEvents::increment(ProfileEvents::CASGcRefWalkPlansBuilt);
+    ProfileEvents::increment(ProfileEvents::CASGCRefWalkPlansBuilt);
     RefPlan plan{std::move(round_input.ref_scan), std::move(round_input.catalog_cut)};
     const CasRefCatalog::Snapshot & catalog_cut = plan.catalog_cut;
     const RefScanSummary & ref_scan = plan.ref_scan;
@@ -247,7 +247,7 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         const auto it = plan.rows.find(life_id);
         if (it == plan.rows.end())
         {
-            ProfileEvents::increment(ProfileEvents::CASGcUnmatchedAdoptedParentLives);
+            ProfileEvents::increment(ProfileEvents::CASGCUnmatchedAdoptedParentLives);
             LOG_WARNING(getLogger("CasGc"),
                 "CAS GC dropped adopted-parent ref-life row absent from the current catalog cut: life_id={}",
                 u128ToHex(life_id));
@@ -389,14 +389,14 @@ void Gc::scheduleMetaJob(std::function<void()> job)
         /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
         /// round's own thread (the scheduling-failure fallback below) -- either way this is pool-scoped
         /// work, so the counter is GLOBAL-only by design.
-        ProfileEvents::increment(ProfileEvents::CASGcMetaOps);
+        ProfileEvents::increment(ProfileEvents::CASGCMetaOps);
         try
         {
             job();
         }
         catch (...)
         {
-            ProfileEvents::increment(ProfileEvents::CASGcMetaWriteAnomaly);
+            ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
             tryLogCurrentException(job_logger,
                 "CAS gc: a per-hash freshness-meta op failed on the bounded pool (advisory-only; "
                 "never wedges the round)");
@@ -414,7 +414,7 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     {
         /// Scheduling itself failed (e.g. resource exhaustion under a mass-DROP burst) -- run inline
         /// rather than silently lose the meta write. `run` still never throws.
-        ProfileEvents::increment(ProfileEvents::CASGcMetaWriteAnomaly);
+        ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
         tryLogCurrentException(logger,
             "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
         run();
@@ -474,7 +474,7 @@ void Gc::runNamespaceJanitorPage(
         for (const String & anomaly : janitor_result.anomalies)
             LOG_WARNING(logger, "CAS namespace janitor: {}", anomaly);
         if (janitor_result.leaked)
-            ProfileEvents::increment(ProfileEvents::CASGcNamespaceCleanupLeaks, janitor_result.leaked);
+            ProfileEvents::increment(ProfileEvents::CASGCNamespaceCleanupLeaks, janitor_result.leaked);
     }
     catch (const std::exception & e)
     {
@@ -575,7 +575,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                                                            stable_threshold_ms, mount_obs);
         report.fence_outs = floor.fenced_now;
         if (floor.fenced_now > 0)
-            ProfileEvents::increment(ProfileEvents::CASGcHeartbeatFenceOuts, floor.fenced_now);
+            ProfileEvents::increment(ProfileEvents::CASGCHeartbeatFenceOuts, floor.fenced_now);
 
         /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
         /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
@@ -849,7 +849,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 ++round_work_budget.outcome_entries_used;
             }
             ++report.redeleted;
-            ProfileEvents::increment(ProfileEvents::CASGcRetiredRedeleted);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
             /// Drop the per-hash meta only on Deleted/NotFound — a Replaced (TokenMismatch) outcome
             /// means a writer already resurrected a fresh incarnation at this hash (INV-1), and that
             /// writer's own resurrect path already flipped the meta back to Clean; blindly deleting here
@@ -866,7 +866,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RetiredEntry & entry : merge.spared)
         {
             /// A fresh dedup-adopt raced the condemn (see the matching CasGcFold Debug log emitted
-            /// during the merge, which increments CASGcRetiredSparedByReref) -- not an ack-floor
+            /// during the merge, which increments CASGCRetiredSparedByReref) -- not an ack-floor
             /// violation, so this is Debug, not a page-worthy Warning.
             if (entry.delete_pending)
                 LOG_DEBUG(logger,
@@ -894,7 +894,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                                                                .token = entry.token, .outcome = OutcomeKind::Spared});
                 ++round_work_budget.outcome_entries_used;
             }
-            ProfileEvents::increment(ProfileEvents::CASGcRetiredSpared);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredSpared);
             /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
             /// but the meta stays `Condemned` (conservative marker) until a WRITER displaces the body with
@@ -910,7 +910,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RetiredEntry & entry : merge.graduated)
         {
             ++report.graduated;
-            ProfileEvents::increment(ProfileEvents::CASGcRetiredGraduated);
+            ProfileEvents::increment(ProfileEvents::CASGCRetiredGraduated);
             /// Floor-passed — republished pending; the NEXT pass executes the delete.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -928,7 +928,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const ReplacedEntry & replaced : merge.replaced)
         {
             const RetiredEntry & entry = replaced.fresh;
-            ProfileEvents::increment(ProfileEvents::CASGcRetireReplaced);
+            ProfileEvents::increment(ProfileEvents::CASGCRetireReplaced);
             /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
             /// the fold superseded that entry and re-condemned the current token in the same window.
             /// `detail["superseded_token"]` carries the STALE token the supersede
@@ -1287,7 +1287,7 @@ void Gc::reportStuckRemovals(const RefPlan & plan, uint64_t current_round)
             store->layout());
         if (!warning)
             continue;
-        ProfileEvents::increment(ProfileEvents::CASGcStuckRemovals);
+        ProfileEvents::increment(ProfileEvents::CASGCStuckRemovals);
         LOG_WARNING(logger, "{}", *warning);
     }
 }
@@ -1572,7 +1572,7 @@ std::optional<std::pair<uint64_t, uint64_t>> Gc::newestFoldSealRef()
             listed_anything ? "that enumeration did return objects under it"
                             : "a narrow probe of generation 1 found objects the wide listing omitted");
 
-    ProfileEvents::increment(ProfileEvents::CASGcRebuildVirginByEnumeration);
+    ProfileEvents::increment(ProfileEvents::CASGCRebuildVirginByEnumeration);
     LOG_WARNING(logger,
         "CAS GC rebuild PROCEEDING AS NEVER-SEALED: no fold seal was found by the broad listing of {} "
         "or by the generation-1 probe, and gc/state is absent or unreadable, so NO durable hold is "
@@ -1820,7 +1820,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             return std::nullopt;
         ++report.candidates;
         ++report.condemned;
-        ProfileEvents::increment(ProfileEvents::CASGcRetiredCondemned);
+        ProfileEvents::increment(ProfileEvents::CASGCRetiredCondemned);
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::BlobRetire;
@@ -1846,7 +1846,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
     /// Side-effect-free peek: the fold's resurrect-supersede branch (inside
     /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that a resurrect replaced a stale
-    /// retired entry, but must NOT emit the fresh-condemn trail or bump `CASGcRetiredCondemned` — that
+    /// retired entry, but must NOT emit the fresh-condemn trail or bump `CASGCRetiredCondemned` — that
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
     /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
     /// events, no counters.
@@ -1883,12 +1883,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
         catch (...)
         {
-            ProfileEvents::increment(ProfileEvents::CASGcMetaWriteAnomaly);
+            ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
             tryLogCurrentException(logger,
                 "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
                 "the entry is carried, never wedges the round)");
         }
-        ProfileEvents::increment(ProfileEvents::CASGcCondemnMarkerUnconfirmedCarry);
+        ProfileEvents::increment(ProfileEvents::CASGCCondemnMarkerUnconfirmedCarry);
         /// Accepted race: this retry writes `Condemned` per-hash, with no token check. If a writer
         /// resurrected this exact hash under a FRESH token between the original swallowed write and this
         /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
@@ -2536,7 +2536,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                            BuildPrefix{.writer_epoch = edge.manifest_id.ref.writer_epoch,
                                        .build_sequence = edge.manifest_id.ref.build_sequence}))
                 {
-                    ProfileEvents::increment(ProfileEvents::CASGcDeadPrecommitSkipped);
+                    ProfileEvents::increment(ProfileEvents::CASGCDeadPrecommitSkipped);
                     ++intake_dead_precommits_skipped;
                     EventEmitter{*store}.emit([&](CasEvent & ev)
                     {
@@ -3040,7 +3040,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
     {
-        ProfileEvents::increment(ProfileEvents::CASGcClampSuppressedPasses);
+        ProfileEvents::increment(ProfileEvents::CASGCClampSuppressedPasses);
         /// LEVEL SPLIT, deliberately. A pass suppressed by an anomaly, a hold, an unproven namespace or
         /// an empty universe has a per-round cause an operator can chase, and that is a WARNING. A pass
         /// suppressed because the CALLER refused to supply a universe carries no such cause -- nothing on
@@ -3172,7 +3172,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Aggregate the unmatched-remove signal across every gc-shard this pass touched and log ONCE per
     /// round with the total plus one example, rather than from the hot per-edge inner loop that detects
     /// them (see `foldDeltasIntoGeneration`'s comment) — that loop runs over potentially millions of
-    /// rows, so it only counts (`ProfileEvents::CASGcUnmatchedRemoveDeltas`, incremented per occurrence)
+    /// rows, so it only counts (`ProfileEvents::CASGCUnmatchedRemoveDeltas`, incremented per occurrence)
     /// and hands back one example; this is the bounded, once-per-round operator-visible trail.
     {
         uint64_t total_unmatched_removes = 0;
@@ -3252,7 +3252,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             detail += ledger.namespaces[unapplied_txns[i]] + "@"
                 + renderRefTxnId(ledger.txns[unapplied_txns[i]]);
         }
-        ProfileEvents::increment(ProfileEvents::CASGcUnappliedFoldedTxns, unapplied_txns.size());
+        ProfileEvents::increment(ProfileEvents::CASGCUnappliedFoldedTransactions, unapplied_txns.size());
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
@@ -3513,7 +3513,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
     {
         ListPage page = backend.list(prefix, cursor, kListPageLimit);
         /// One page fetched, not one increment per listed key below.
-        ProfileEvents::increment(ProfileEvents::CASGcEnumerationPages);
+        ProfileEvents::increment(ProfileEvents::CASGCEnumerationPages);
         for (const auto & listed : page.keys)
         {
             if (deleted >= bounded_remaining)

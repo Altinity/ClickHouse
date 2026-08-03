@@ -40,7 +40,7 @@ TEST(CASFormatBattery, GcHeartbeat)
 
 /// ---------- field round-trips (migrated from gtest_cas_gc_formats.cpp, re-pointed at the text codec) ----------
 
-TEST(CASGcStateFormat, RoundTripsCoreFields)
+TEST(CASGCStateFormat, RoundTripsCoreFields)
 {
     GcState s;
     s.round = 7;
@@ -56,7 +56,7 @@ TEST(CASGcStateFormat, RoundTripsCoreFields)
     EXPECT_EQ(d.lease.seq, 5u);
 }
 
-TEST(CASGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
+TEST(CASGCStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
 {
     GcState s;
     s.gc_shards = 2;
@@ -70,7 +70,7 @@ TEST(CASGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
     EXPECT_EQ(d.manifest_sweep_cursor, s.manifest_sweep_cursor);
 }
 
-TEST(CASGcStateFormat, DefaultsRoundTrip)
+TEST(CASGCStateFormat, DefaultsRoundTrip)
 {
     GcState s;   /// gc_shards defaults to 1
     EXPECT_EQ(s.gc_shards, 1u);
@@ -81,7 +81,7 @@ TEST(CASGcStateFormat, DefaultsRoundTrip)
     EXPECT_EQ(d.lease.owner, UInt128{});
 }
 
-TEST(CASGcStateFormat, RejectsZeroGcShards)
+TEST(CASGCStateFormat, RejectsZeroGcShards)
 {
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.
@@ -93,9 +93,9 @@ TEST(CASGcStateFormat, RejectsZeroGcShards)
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
 /// encodeGcState(gc_shards=0) throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
-/// builds instead of behaving like a catchable exception -- CASGcStateFormatDeathTest below proves the
+/// builds instead of behaving like a catchable exception -- CASGCStateFormatDeathTest below proves the
 /// abort positively in those builds instead.
-TEST(CASGcStateFormat, RejectsZeroGcShardsOnEncode)
+TEST(CASGCStateFormat, RejectsZeroGcShardsOnEncode)
 {
     GcState state;
     state.gc_shards = 0;
@@ -113,7 +113,7 @@ TEST(CASGcStateFormat, RejectsZeroGcShardsOnEncode)
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-TEST(CASGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
+TEST(CASGCStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 {
     GcState state;
     state.gc_shards = 0;
@@ -121,7 +121,7 @@ TEST(CASGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
 }
 #endif
 
-TEST(CASGcStateFormat, RejectsAbsentGcShards)
+TEST(CASGCStateFormat, RejectsAbsentGcShards)
 {
     /// An absent gcs key must fail closed (the writer always emits it) rather than silently defaulting
     /// to the struct's gc_shards = 1 — a missing shard count means a corrupt object, not "use the floor".
@@ -133,13 +133,13 @@ TEST(CASGcStateFormat, RejectsAbsentGcShards)
     EXPECT_THROW(decodeGcState(bad), DB::Exception);
 }
 
-TEST(CASGcStateFormat, GarbageFailsClosed)
+TEST(CASGCStateFormat, GarbageFailsClosed)
 {
     EXPECT_THROW(decodeGcState(String("")), DB::Exception);
     EXPECT_THROW(decodeGcState(String("not a cas object\n")), DB::Exception);
 }
 
-TEST(CASGcHeartbeatFormat, RoundTripAndBoundaries)
+TEST(CASGCHeartbeatFormat, RoundTripAndBoundaries)
 {
     GcHeartbeat hb;
     hb.owner = hexToU128("0123456789abcdeffedcba9876543210");
@@ -155,7 +155,7 @@ TEST(CASGcHeartbeatFormat, RoundTripAndBoundaries)
     EXPECT_THROW(decodeGcHeartbeat(String("short")), DB::Exception);
 }
 
-TEST(CASGcHeartbeatFormat, RejectsMissingIdentityFields)
+TEST(CASGCHeartbeatFormat, RejectsMissingIdentityFields)
 {
     /// `v:3` is deliberate and must NOT follow a future `G_BUILD` bump: any version <= G_BUILD passes
     /// the header gate, which is the point — the BODY is what has to fail here.

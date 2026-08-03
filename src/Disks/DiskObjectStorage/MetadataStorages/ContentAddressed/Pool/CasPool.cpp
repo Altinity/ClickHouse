@@ -60,14 +60,14 @@ namespace ProfileEvents
     extern const Event CASRefSnapshotTailLogs;
     extern const Event CASRefSnapshotPublishDispatched;
     extern const Event CASRefSnapshotPublishBackoff;
-    extern const Event CASDedupCacheHits;
-    extern const Event CASDedupCacheMisses;
+    extern const Event CASDeduplicationCacheHits;
+    extern const Event CASDeduplicationCacheMisses;
 }
 
 namespace CurrentMetrics
 {
-    extern const Metric CASDedupCacheBytes;
-    extern const Metric CASDedupCacheEntries;
+    extern const Metric CASDeduplicationCacheBytes;
+    extern const Metric CASDeduplicationCacheEntries;
 }
 
 namespace DB::Cas
@@ -209,9 +209,9 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] { return tryRemountOnce(); })
 {
     if (config.dedup_cache_bytes > 0)
-        dedup_cache = std::make_unique<DedupCache>(
-            "LRU", CurrentMetrics::CASDedupCacheBytes, CurrentMetrics::CASDedupCacheEntries,
-            config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
+        dedup_cache = std::make_unique<DeduplicationCache>(
+            "LRU", CurrentMetrics::CASDeduplicationCacheBytes, CurrentMetrics::CASDeduplicationCacheEntries,
+            config.dedup_cache_bytes, DeduplicationCache::NO_MAX_COUNT, DeduplicationCache::DEFAULT_SIZE_RATIO);
 }
 
 bool Pool::isAlgoAdmitted(BlobHashAlgo algo) const
@@ -248,7 +248,7 @@ bool Pool::dedupCacheContains(const BlobRef & ref) const
     /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
     /// probe. `PartWriteTxn::putBlob` calls this seam up to twice on a genuine hit (once to pick the
     /// HEAD-first branch, once more just to attribute `CASBlobBodyPutAvoided` to the cache -- see
-    /// CasPartWriteTxn.cpp), so `CASDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
+    /// CasPartWriteTxn.cpp), so `CASDeduplicationCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
     /// does not itself skip the HEAD that follows in putBlob's HEAD-first branch -- it steers the call
     /// onto that cheap branch instead of an unconditional body stream; the body PUT is what a hit
     /// actually avoids.
@@ -256,10 +256,10 @@ bool Pool::dedupCacheContains(const BlobRef & ref) const
         return false;
     if (dedup_cache->contains(ref))
     {
-        ProfileEvents::increment(ProfileEvents::CASDedupCacheHits);
+        ProfileEvents::increment(ProfileEvents::CASDeduplicationCacheHits);
         return true;
     }
-    ProfileEvents::increment(ProfileEvents::CASDedupCacheMisses);
+    ProfileEvents::increment(ProfileEvents::CASDeduplicationCacheMisses);
     return false;
 }
 

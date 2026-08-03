@@ -66,7 +66,7 @@ struct BlobDepRecord
 /// merge/fan-out layers (and tests) can assert the branch taken without inferring it from the dep.
 enum class BlobUploadOutcome
 {
-    DedupCacheHit,      /// dedup cache said present; HEAD-first confirmed a live incarnation; adopted
+    DeduplicationCacheHit,      /// dedup cache said present; HEAD-first confirmed a live incarnation; adopted
     HeadHit,            /// size-triggered HEAD-first found a present live incarnation; adopted
     HeadMissAdopted,    /// the write-once create 412'd on a live incarnation (or a racing writer's); adopted
     FreshUpload,        /// the write-once conditional create streamed a fresh local body

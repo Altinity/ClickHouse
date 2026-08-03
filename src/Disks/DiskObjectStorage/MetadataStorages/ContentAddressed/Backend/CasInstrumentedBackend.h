@@ -36,7 +36,7 @@ enum class CasNs : uint8_t
 static constexpr size_t CAS_NS_COUNT = 6;
 
 /// Operation + outcome class (11 classes), mapped from the `Backend` method and its return value.
-///   putIfAbsent / putIfAbsentStream finalize → Done ⇒ Put ; PreconditionFailed ⇒ PutDedup
+///   putIfAbsent / putIfAbsentStream finalize → Done ⇒ Put ; PreconditionFailed ⇒ PutDeduplicated
 ///   putOverwrite                              → Done ⇒ Overwrite ; PreconditionFailed ⇒ CasConflict
 ///   casPut                                    → Committed ⇒ Cas ; Conflict ⇒ CasConflict
 ///   head                                      → exists ⇒ Head ; !exists ⇒ HeadMiss (the 404 signal)
@@ -47,7 +47,7 @@ static constexpr size_t CAS_NS_COUNT = 6;
 enum class CasOp : uint8_t
 {
     Put = 0,
-    PutDedup,
+    PutDeduplicated,
     Overwrite,
     Cas,
     CasConflict,
@@ -72,7 +72,7 @@ void incrementCasEvent(CasNs ns, CasOp op);
 /// Transparent `Backend` decorator that records operation counts without changing the wrapped
 /// backend's results, exceptions, or state transitions. The inner backend is owned by this object.
 /// For streaming creates, namespace classification happens when the sink is created and the
-/// `Put`/`PutDedup` event is emitted only when `finalize` returns, because the outcome is unavailable
+/// `Put`/`PutDeduplicated` event is emitted only when `finalize` returns, because the outcome is unavailable
 /// earlier.
 class InstrumentedBackend final : public Backend
 {
@@ -126,11 +126,11 @@ public:
         return result;
     }
 
-    /// Count a successful create as `Put` and an existing-key precondition result as `PutDedup`.
+    /// Count a successful create as `Put` and an existing-key precondition result as `PutDeduplicated`.
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         PutResult result = inner->putIfAbsent(key, bytes, meta);
-        incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
+        incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDeduplicated);
         return result;
     }
 
@@ -180,8 +180,8 @@ public:
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override
     {
         PutResult result = inner->promoteStaged(staging_key, blob_key);
-        /// A write-once server-side copy is a create attempt on the BLOB key: Done ⇒ Put, 412 ⇒ PutDedup.
-        incrementCasEvent(classifyCasNs(blob_key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
+        /// A write-once server-side copy is a create attempt on the BLOB key: Done ⇒ Put, 412 ⇒ PutDeduplicated.
+        incrementCasEvent(classifyCasNs(blob_key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDeduplicated);
         return result;
     }
 

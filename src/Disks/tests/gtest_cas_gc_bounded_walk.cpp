@@ -200,7 +200,7 @@ void publishRange(Backend & backend, const Layout & layout, const RootNamespace 
 /// Against the unbounded walk this fails on the cursor: it chases the appends and seals a cursor far
 /// above the round-start tail. On a real pool nothing bounds that chase at all; the appender here stops
 /// after `appended_mid_round` so the unpatched behaviour is measurable rather than a hang.
-TEST(CASGcBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers)
+TEST(CASGCBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers)
 {
     const uint64_t planted = 6;
     const uint64_t appended_mid_round = 40;
@@ -249,7 +249,7 @@ TEST(CASGcBoundedWalk, ARoundFoldsThroughItsRoundStartTailAndLeavesTheStragglers
 ///
 /// Two namespaces; only one gets a new record. The unchanged one must fold NOTHING. Its CTE already
 /// authorizes the sealed cursor as a frontier, so an exact probe at `cursor + 1` would be redundant.
-TEST(CASGcBoundedWalk, ACTEAuthorizedUnchangedNamespaceFoldsNothingWithoutAProbe)
+TEST(CASGCBoundedWalk, ACTEAuthorizedUnchangedNamespaceFoldsNothingWithoutAProbe)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -300,7 +300,7 @@ TEST(CASGcBoundedWalk, ACTEAuthorizedUnchangedNamespaceFoldsNothingWithoutAProbe
 /// comparison: `RefScanSummary::changed_shards` counts the namespaces whose greatest listed log sits
 /// above their sealed cursor. So a round in which no tail moved folds nothing at all -- no intake phase,
 /// no per-namespace walk, not even the probes -- and an append un-defers it.
-TEST(CASGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
+TEST(CASGCBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend);   /// the DEFAULT defer window: this test is about the skip
@@ -357,7 +357,7 @@ TEST(CASGcBoundedWalk, ARoundWhereNoTailMovedIsDeferredAndAnAppendUnDefersIt)
 /// never committed, so it is neither a reason to extend the fold nor a reason to suppress destruction:
 /// LIST may observe it, but it cannot manufacture a later authoritative frontier. The dropped blob is
 /// therefore reclaimable after the normal condemn/graduation pipeline.
-TEST(CASGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruction)
+TEST(CASGCBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruction)
 {
     auto backend = std::make_shared<ChasingWriterBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -406,7 +406,7 @@ TEST(CASGcBoundedWalk, ARawRecordBeyondTheCommittedFrontierCannotSuppressDestruc
 /// QUIET, and a quiet namespace is exactly the shape the exact-key probe at `cursor + 1` exists for. It
 /// has no listed tail at all, and no bound is taken from a listing anyway -- bounding a namespace by a
 /// tail the liar refuses to admit to would hand it the omission it was hoping for.
-TEST(CASGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
+TEST(CASGCBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
 {
     auto backend = std::make_shared<CountingHintHoleBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -442,7 +442,7 @@ TEST(CASGcBoundedWalk, AListHiddenTailIsCaughtAndFoldedByTheQuietProbePath)
 ///
 /// The edge fold used to pay HEAD-then-GET: two serial round trips per manifest edge, on every folded
 /// log, where the GET alone already answers "is it there".
-TEST(CASGcBoundedWalk, ManifestEdgeFoldsPayAGetAndNeverAHead)
+TEST(CASGCBoundedWalk, ManifestEdgeFoldsPayAGetAndNeverAHead)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -477,7 +477,7 @@ TEST(CASGcBoundedWalk, ManifestEdgeFoldsPayAGetAndNeverAHead)
 
 /// An absent manifest body still takes the record-and-continue path -- the GET's own absence is the
 /// signal the HEAD used to carry -- and still raises the fold barrier without ever HEADing the key.
-TEST(CASGcBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
+TEST(CASGCBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -517,7 +517,7 @@ TEST(CASGcBoundedWalk, AnAbsentManifestBodyStillHoldsWithoutAHead)
 /// not a lost optimisation, it is a re-fold from `{0, 0}`: every owner edge counted a second time, every
 /// blob's in-degree inflated, and the eventual correction mass-condemning live data. This pins the row
 /// against exactly that.
-TEST(CASGcBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
+TEST(CASGCBoundedWalk, ANamespaceThatFoldedNothingKeepsItsSealedCursor)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);

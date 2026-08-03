@@ -159,7 +159,7 @@ class S12(Scenario):
         tot = delta.get("_total", {})
         result.observations["dedup_counters"] = {
             k: int(tot.get(k, 0)) for k in
-            ("CASBlobBodyPutAvoided", "CASBlobDedupCacheHit", "CASBlobHeadFirst", "CASManifestPut")}
+            ("CASBlobBodyPutAvoided", "CASBlobDeduplicationCacheHit", "CASBlobHeadFirst", "CASManifestPut")}
         avoided = int(tot.get("CASBlobBodyPutAvoided", 0))
         dedup_expected = shared_rows > 0
         result.add(Verdict.check(

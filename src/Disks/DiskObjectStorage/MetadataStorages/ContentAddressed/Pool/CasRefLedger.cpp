@@ -65,9 +65,9 @@ namespace ProfileEvents
     extern const Event CASRefSnapshotTailLogs;
     extern const Event CASRefSnapshotPublishDispatched;
     extern const Event CASRefSnapshotPublishBackoff;
-    extern const Event CASRefCkptPublished;
-    extern const Event CASRefCkptIdenticalSkip;
-    extern const Event CASRefCkptNotAdvanced;
+    extern const Event CASRefCheckpointPublished;
+    extern const Event CASRefCheckpointIdenticalSkip;
+    extern const Event CASRefCheckpointNotAdvanced;
     extern const Event CASRefRecoveryEpochSealed;
     extern const Event CASRefRecoveryEpochSealAdopted;
     extern const Event CASRefRecoveryStragglerAdopted;
@@ -4203,9 +4203,9 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId &
     const CkptPublishOutcome outcome = publishCkpt(
         backend, layout, life, contribution, admitted_generation, check_admission, deadline);
     if (outcome == CkptPublishOutcome::Published)
-        ProfileEvents::increment(ProfileEvents::CASRefCkptPublished);
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
-        ProfileEvents::increment(ProfileEvents::CASRefCkptIdenticalSkip);
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointIdenticalSkip);
     return outcome;
 }
 
@@ -4384,7 +4384,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
     }
     if (!ckpt_advanced)
     {
-        ProfileEvents::increment(ProfileEvents::CASRefCkptNotAdvanced);
+        ProfileEvents::increment(ProfileEvents::CASRefCheckpointNotAdvanced);
         std::lock_guard lock(rt->state_mutex);
         advancePublishBackoff(*rt);
         return false;

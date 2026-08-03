@@ -15,8 +15,8 @@
 
 namespace ProfileEvents
 {
-extern const Event CASGcRetiredCondemned;
-extern const Event CASGcRetireReplaced;
+extern const Event CASGCRetiredCondemned;
+extern const Event CASGCRetireReplaced;
 }
 
 using namespace DB::Cas;
@@ -150,12 +150,12 @@ TEST(CASObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 /// Task 2 (Part A audit fix, 2026-07-08): the resurrect-supersede branch inside `closeBlob`
 /// (`CasBlobInDegree.cpp`) used to peek the current token via `head_blob` — the FRESH-CONDEMN
 /// observation hook — which double-emitted `blob_retire` alongside `blob_retire_replaced` and
-/// double-counted `CASGcRetiredCondemned` for what is really ONE physical condemnation (the resurrect
+/// double-counted `CASGCRetiredCondemned` for what is really ONE physical condemnation (the resurrect
 /// replaced a stale retired entry with the current token). Drives the same condemn-A / resurrect-B /
-/// drop-B sequence as `CASGcLeak.ResurrectReplacedIncarnationReclaimed`, then isolates the ONE round
+/// drop-B sequence as `CASGCLeak.ResurrectReplacedIncarnationReclaimed`, then isolates the ONE round
 /// that folds B's create+drop and supersedes A's stale retired entry: that round must emit exactly one
 /// `blob_retire_replaced` (carrying the STALE token A in `detail["superseded_token"]`), ZERO
-/// `blob_retire` for this hash, one `CASGcRetireReplaced` increment, and NO `CASGcRetiredCondemned`
+/// `blob_retire` for this hash, one `CASGCRetireReplaced` increment, and NO `CASGCRetiredCondemned`
 /// double-count.
 TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 {
@@ -195,16 +195,16 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     /// with a fresh condemn of B (peek, not the fresh-condemn `head_blob` hook). Capture events + the
     /// counters for exactly THIS round.
     using ProfileEvents::global_counters;
-    const auto condemned_before = global_counters[ProfileEvents::CASGcRetiredCondemned].load();
-    const auto replaced_before  = global_counters[ProfileEvents::CASGcRetireReplaced].load();
+    const auto condemned_before = global_counters[ProfileEvents::CASGCRetiredCondemned].load();
+    const auto replaced_before  = global_counters[ProfileEvents::CASGCRetireReplaced].load();
 
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     const RoundReport rep = gc.runRegularRound();
     s->setEventSink(nullptr);
     ASSERT_TRUE(rep.acquired_lease);
 
-    const auto condemned_after = global_counters[ProfileEvents::CASGcRetiredCondemned].load();
-    const auto replaced_after  = global_counters[ProfileEvents::CASGcRetireReplaced].load();
+    const auto condemned_after = global_counters[ProfileEvents::CASGCRetiredCondemned].load();
+    const auto replaced_after  = global_counters[ProfileEvents::CASGCRetireReplaced].load();
 
     /// Phase 3 (mixed-algo pools): event `object_hash` renders are `blobIdOf(ref)` ("<algoName>:<hex>"),
     /// never a bare hex.
@@ -225,9 +225,9 @@ TEST(CASObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA.token.value)
         << "superseded_token must name the STALE token (A) the resurrect replaced";
 
-    EXPECT_EQ(replaced_after - replaced_before, 1u) << "CASGcRetireReplaced increments exactly once";
+    EXPECT_EQ(replaced_after - replaced_before, 1u) << "CASGCRetireReplaced increments exactly once";
     EXPECT_EQ(condemned_after - condemned_before, 0u)
-        << "supersede peek must not fresh-condemn -- CASGcRetiredCondemned must not double-count";
+        << "supersede peek must not fresh-condemn -- CASGCRetiredCondemned must not double-count";
 
     /// Size-unit regression guard (audit fix, 2026-07-08): `peek_head` used to return the RAW
     /// `backend.head(...)` size (physical, header-included), while the fresh-condemn hook `head_blob`

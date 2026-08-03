@@ -209,7 +209,7 @@ String encodedCkptOfNamespaceWithRefs(const PoolPtr & store, Backend & backend, 
 /// knows a namespace's genesis epoch, so every other contribution is `nullopt` and must leave what is
 /// on record alone -- in BOTH argument orders, because the two `_ckpt` writers have no ordering
 /// between them and the merge is what makes that safe.
-TEST(CASRefCkptJoin, JoinUnknownLifeEpochWithPresentYieldsPresent)
+TEST(CASRefCheckpointJoin, JoinUnknownLifeEpochWithPresentYieldsPresent)
 {
     const RefCkpt unknown{.life_epoch = std::nullopt, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt present{.life_epoch = 7, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -227,7 +227,7 @@ TEST(CASRefCkptJoin, JoinUnknownLifeEpochWithPresentYieldsPresent)
 /// The ordinary steady state: both writers agree. Asserted for its own sake because it is what
 /// `publishCkpt`'s may-not-decrease rule must keep admitting -- an equal republish is not a decrease --
 /// and it is also what `publishCkpt` turns into "no write at all".
-TEST(CASRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
+TEST(CASRefCheckpointJoin, JoinEqualLifeEpochsYieldsSame)
 {
     const RefCkpt a{.life_epoch = 9, .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
     const RefCkpt b{.life_epoch = 9, .checkpoint_snapshot_id = RefTxnId{9, 4}, .last_epoch_seal = std::nullopt};
@@ -239,7 +239,7 @@ TEST(CASRefCkptJoin, JoinEqualLifeEpochsYieldsSame)
         << "an equal life_epoch must not disturb the other fields' own join";
 }
 
-TEST(CASRefCkptJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
+TEST(CASRefCheckpointJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
 {
     const RefCkpt older{.life_epoch = std::nullopt, .committed_through = RefTxnId{7, 9},
                          .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt};
@@ -288,7 +288,7 @@ TEST(CASRefCkptJoin, CrossEpochFrontierRequiresAnImmediatelyAdjacentSeal)
 /// member's `server_root_id`, so a creator and its reconciler are always actors of the same server root
 /// and draw from the same durable-monotone epoch counter. That is the whole basis for "contributions
 /// only ever rise", so the fixture must not quietly model two roots.
-TEST(CASRefCkptJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
+TEST(CASRefCheckpointJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -328,7 +328,7 @@ TEST(CASRefCkptJoin, ResumedCreationRaisesLifeEpochWithoutRefusal)
 /// production interleaving, not a stand-in for it. `completeCreation` contributes the catalog creator's
 /// epoch; the mount's writer epoch then advances (a restart, a remount); the first precommit's birth
 /// chunk contributes the `NamespaceBirth` record's epoch. CREATE TABLE, restart, INSERT.
-TEST(CASRefCkptJoin, RestartBetweenCreationAndFirstWriteRaisesLifeEpochWithoutRefusal)
+TEST(CASRefCheckpointJoin, RestartBetweenCreationAndFirstWriteRaisesLifeEpochWithoutRefusal)
 {
     InMemoryBackend backend;
     Layout layout("p");
@@ -362,7 +362,7 @@ TEST(CASRefCkptJoin, RestartBetweenCreationAndFirstWriteRaisesLifeEpochWithoutRe
 /// lives and the only place it CAN live. `mergeCkpt` is commutative -- the stated reason the two writers
 /// need no ordering between them -- so it cannot tell a decrease from an increase, having no idea which
 /// of its arguments is durable. There is deliberately no merge-level counterpart to this test.
-TEST(CASRefCkptJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
+TEST(CASRefCheckpointJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
 {
     CountingBackend backend;
     Layout layout("p");
@@ -411,7 +411,7 @@ TEST(CASRefCkptJoin, JoinDecreasingLifeEpochIsCorruptionAndPublishesNothing)
 /// returns rather than throws. Reporting corruption for it would turn "your incarnation moved, retry"
 /// into a permanent verdict on the namespace, which is the opposite of what the detector means: the
 /// violation is a STILL-ADMITTED writer contributing a superseded epoch.
-TEST(CASRefCkptJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFencedOutNotCorruption)
+TEST(CASRefCheckpointJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFencedOutNotCorruption)
 {
     CountingBackend backend;
     Layout layout("p");
@@ -440,7 +440,7 @@ TEST(CASRefCkptJoin, ADecreasingLifeEpochFromAFencedOutWriterIsReportedFencedOut
 /// that sampled an older body from regressing the other writer's progress (TLC counterexample
 /// `_sab_sealclobbersbase`, which costs an acked transaction). Both directions and present-beats-absent,
 /// since the two writers have no ordering between them.
-TEST(CASRefCkptJoin, CheckpointAndSealStillMergeBySemanticMaximum)
+TEST(CASRefCheckpointJoin, CheckpointAndSealStillMergeBySemanticMaximum)
 {
     const RefCkpt lower{.life_epoch = std::nullopt, .checkpoint_snapshot_id = RefTxnId{3, 5}, .last_epoch_seal = RefTxnId{3, 4}};
     const RefCkpt higher{.life_epoch = std::nullopt, .checkpoint_snapshot_id = RefTxnId{4, 1}, .last_epoch_seal = RefTxnId{4, 2}};
@@ -473,7 +473,7 @@ TEST(CASRefCkptJoin, CheckpointAndSealStillMergeBySemanticMaximum)
 
 /// REFS and FILES: byte-equal, because they never enter the body. Driven through the REAL append lane
 /// (see `encodedCkptOfNamespaceWithRefs` on why a hand-built struct pair would not fence anything).
-TEST(CASRefCkptJoin, EncodedCkptSizeIsIndependentOfCardinality)
+TEST(CASRefCheckpointJoin, EncodedCkptSizeIsIndependentOfCardinality)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPool(backend);
@@ -505,7 +505,7 @@ TEST(CASRefCkptJoin, EncodedCkptSizeIsIndependentOfCardinality)
 /// TRANSACTIONS and WRITER EPOCHS: not equality -- they enter as the decimal width of the id pairs --
 /// but ceilinged, because the fields are `uint64_t`. The worst case is constructible exactly (every
 /// field present at `UINT64_MAX`), so the bound is asserted on it rather than believed about it.
-TEST(CASRefCkptJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsAndEpochs)
+TEST(CASRefCheckpointJoin, EncodedCkptSizeHasAConstantCeilingAcrossTransactionsAndEpochs)
 {
     /// The true worst case over every namespace history: all three fields present, every component at
     /// the widest value its type can hold. No real `_ckpt` can encode larger, because there is no field

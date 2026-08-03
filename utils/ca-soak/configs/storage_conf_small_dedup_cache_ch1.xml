@@ -6,7 +6,7 @@
                  in-memory dedup-hint eviction path.  When the working set of distinct
                  blob heads exceeds 1 MiB, the cache evicts entries, forcing remote
                  HEAD-first probes (CASBlobHeadFirst) on re-insert rather than in-memory
-                 CASBlobDedupCacheHit short-circuits.  Correctness / dedup must be
+                 CASBlobDeduplicationCacheHit short-circuits.  Correctness / dedup must be
                  preserved via the remote HEAD path; only the in-memory shortcut rate drops. -->
             <ca>
                 <type>object_storage</type>
