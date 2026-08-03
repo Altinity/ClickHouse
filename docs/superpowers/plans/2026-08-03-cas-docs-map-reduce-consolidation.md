@@ -18,7 +18,7 @@
 - Platform claims verbatim from spec §3: AWS and GCP work; Azure probably works; other S3-compatible stores only with atomic/conditional operations (`If-None-Match` and friends).
 - Codex prompts always go via file: `codex exec -m gpt-5.6-luna - < prompt.txt` (inline strings can strand stdin).
 - `*.tla` / `*.cfg` files are never modified or deleted.
-- Deletion of ANY old doc happens only in Task 15, only after the user approves the coverage matrix.
+- Deletion of ANY old doc happens only in Task 16, only after the user approves the coverage matrix.
 - Every gate task ends by reporting cumulative token/cost so the user can coarsen the next phase.
 
 **Working directory for all pipeline artifacts:** `WORKDIR=docs/superpowers/cas/consolidation-2026-08`
@@ -680,7 +680,7 @@ git commit -m "cas-docs: antalya/cas — operations runbooks"
 
 **Interfaces:**
 - Consumes: ALL verdicts (`done`/`rejected`/`open`), walkthrough §17.2 known gaps.
-- Produces: public roadmap; regroomed internal backlog. Task 14 uses the strike-through/carry-over lists.
+- Produces: public roadmap; regroomed internal backlog. Task 15 uses the strike-through/carry-over lists.
 
 - [ ] **Step 1: Author `roadmap.md`**
 
@@ -702,7 +702,39 @@ git commit -m "cas-docs: public roadmap + BACKLOG regroom from verified verdicts
 
 ---
 
-### Task 14: Cross-page consistency review + coverage matrix (Gate D packet)
+### Task 14: Agent working guide — `docs/superpowers/cas/AGENTS.md`
+
+**Files:**
+- Create: `docs/superpowers/cas/AGENTS.md` (persistent survivor — never a deletion candidate)
+
+**Interfaces:**
+- Consumes: `docs/superpowers/cas/INTENT.md` and `02-methodology.md` (absorbed here before Task 16 deletes them); the assistant's cross-session memory items (provided by the controller in the dispatch prompt — a subagent cannot read the controller's memory directory); `runbook-fact`/`contract` clusters tagged `keep-in-place`.
+- Produces: the one file a future agent (any model, any session) reads before touching this branch. Listed as `KEEP-IN-PLACE` in the Task 15 matrix, alongside `BACKLOG.md`.
+
+- [ ] **Step 1: Author `AGENTS.md` (~250 lines max; same compactness discipline — tables over prose)**
+
+Controller (not a blind subagent) drafts it, because half the sources live in the controller's memory. Sections, each entry one-two lines + a pointer:
+
+1. **Orientation** — what the branch is, where the spec/plans/BACKLOG/public docs live, what `consolidation-2026-08/COVERAGE-MATRIX.md` is.
+2. **Hard invariants (never violate; user-vetoed classes)** — revival = fresh re-upload only, never GET a condemned object; GC never throws on a 404 during fold (record + continue); no CA-specific fields in generic Replicated/Keeper code or formats; protocol steps (e.g. HEAD-before-PUT) are not "cheap optimization" targets — user veto, consult first; no compat scaffolding pre-release; fail-close, no fallback paths; the S3 LIST-trust verdict is SETTLED — read the verdict doc, do not re-argue.
+3. **Build & test recipes** — `Cas*` gtest name filter is the gate (watch for suites that escape the filter); `LOGICAL_ERROR` sites need the death-test split (naive `EXPECT_THROW` aborts sanitizer lanes); praktika invocation lines for stateless/integration + binary at `ci/tmp/clickhouse`; ca-soak: real soak = phase 3 `--duration Nm`, `down -v` for a clean restart; local praktika runs prune docker — never overlap with a live soak.
+4. **Delegation & git policy** — mechanical work → `codex exec -m gpt-5.6-luna`, prompt via file; review stays with Claude; never push unprompted, a push request is not standing; commit discipline in a shared worktree (verify HEAD after commit); never `git add -A` on artifact dirs.
+5. **Known traps** — `/tmp` inode exhaustion under concurrent gates (`df -i`); `grep -a` for NUL-embedded logs; unquoted `;` breaks mermaid; jemalloc profiling needs `jemalloc_enable_global_profiler` + restart; `LogSeriesLimiter` "accepted series X/N" counts the whole logger.
+6. **Reporting conventions** — scenario results as a table: № / description / result / artifacts / planned fix; "no known reds" rule: any red gets an RCA or a tracked return-item.
+
+Every claim fact-checked at authoring time: recipes are re-verified by running the referenced command's `--help`/dry form or grepping the referenced flag/symbol at HEAD; anything unverifiable is dropped or marked stale-suspect. Frontmatter per CLAUDE.md docs rules (slug `/superpowers/cas/agents`).
+
+- [ ] **Step 2: Style-gate and commit**
+
+```bash
+python3 $WORKDIR/tools/check_page.py docs/superpowers/cas/AGENTS.md
+git add docs/superpowers/cas/AGENTS.md
+git commit -m "cas-docs: AGENTS.md — persistent agent working guide (absorbs INTENT + methodology + memory items)"
+```
+
+---
+
+### Task 15: Cross-page consistency review + coverage matrix (Gate D packet)
 
 **Files:**
 - Create: `$WORKDIR/tools/build_coverage.py`
@@ -723,7 +755,7 @@ One reviewer agent (Fable) over the whole `docs/en/antalya/cas/` tree: terminolo
 
 - [ ] **Step 3: Nominate KEEP-IN-PLACE files**
 
-From clusters with `target: keep-in-place` + judgement pass over `specs/` files whose verdict profile is mostly `open` (still-actual designs likely to be implemented — the user's criterion). Also always-keep: `docs/superpowers/models/**` (sources AND `*_RESULTS.md`), `docs/superpowers/cas/BACKLOG.md`, `.claude/agents/ca-*.md` (active tooling, not docs). List each with a one-line reason in the matrix.
+From clusters with `target: keep-in-place` + judgement pass over `specs/` files whose verdict profile is mostly `open` (still-actual designs likely to be implemented — the user's criterion). Also always-keep: `docs/superpowers/models/**` (sources AND `*_RESULTS.md`), `docs/superpowers/cas/BACKLOG.md`, `docs/superpowers/cas/AGENTS.md` (Task 14), `.claude/agents/ca-*.md` (active tooling, not docs). Cross-check before Gate D: `INTENT.md` and `02-methodology.md` may be marked deleted only if `AGENTS.md` exists and the matrix lists it as their destination. List each with a one-line reason in the matrix.
 
 - [ ] **Step 4: USER CHECKPOINT — Gate D review, commit the packet**
 
@@ -736,7 +768,7 @@ git commit -m "cas-docs: consistency review + coverage matrix (Gate D packet)"
 
 ---
 
-### Task 15: Deletion (only after explicit user approval of the matrix)
+### Task 16: Deletion (only after explicit user approval of the matrix)
 
 **Files:**
 - Delete: everything the matrix marks for deletion (grouped commits)
@@ -778,6 +810,6 @@ git commit -m "cas-docs: consolidation complete — workdir reduced to coverage 
 - Spec §2 corpus additions (untracked root notes, `utils/ca-soak`, `.superpowers/sdd`) → Task 1. Non-doc debris line item → Task 1 Step 3.
 - Spec §5 schema/verdicts/blindness → Tasks 2, 6 (blindness enforced by prompt construction: clusters JSON only).
 - Spec §6 scoped verification → Task 6 Step 1; audits → Tasks 4/7; live example validation → Tasks 11/12.
-- Spec §7 resource model → codex in Tasks 3/5/13, sonnet in 6/9–12, Fable only in 7/9-review/14; token reporting at every gate.
-- Spec §8 end state → Tasks 13 (BACKLOG stays), 14 (KEEP-IN-PLACE incl. `models/*_RESULTS.md`), 15 (grouped deletes, matrix-driven).
+- Spec §7 resource model → codex in Tasks 3/5/13, sonnet in 6/9–12, Fable only in 7/9-review/15; token reporting at every gate.
+- Spec §8 end state → Tasks 13 (BACKLOG stays), 14 (`AGENTS.md` survivor absorbing `INTENT.md`/`02-methodology.md` + memory items), 15 (KEEP-IN-PLACE incl. `models/*_RESULTS.md`), 16 (grouped deletes, matrix-driven).
 - Spec §9 risks: moving target → `checked_at` HEAD pinning (Task 6 gate re-queues stale verdicts); false done/stale → Task 7; map summarization → Task 4 audit; bloat → Task 8 volume limits.

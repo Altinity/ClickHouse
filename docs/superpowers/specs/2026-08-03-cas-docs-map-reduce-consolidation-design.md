@@ -36,6 +36,7 @@ one compact, current documentation set under `docs/en/antalya/cas/`, (d) regroom
 | Verification standard | Everything against code at HEAD — but scoped to what is published or what justifies removal (see §6) |
 | Pipeline shape | Approach A (claim ledger, push) with a pull element in synthesis: page authors work from the verified ledger seeded by the freshest documents, and may read code directly |
 | History | Public `architecture/design-history.md` is a condensed version of `how-we-got-here.md`; the full version stays in git history as future blog material |
+| Agent guide | A persistent internal `docs/superpowers/cas/AGENTS.md` (~250 lines) consolidates everything an agent working on this branch needs: hard CA invariants, gate/test recipes, delegation policy, known traps, pointers. Sources: the assistant's cross-session memory (CAS-relevant items), `INTENT.md`, `02-methodology.md` — the latter two are absorbed there before deletion |
 
 ## 3. Tone, style, and hard limits {#style}
 
@@ -215,6 +216,7 @@ Every gate reports tokens spent so far; the user can slow down or coarsen the ne
 |---|---|---|
 | `docs/en/antalya/cas/` | the new set (~20 pages) | the only documentation of the feature |
 | `docs/superpowers/cas/BACKLOG.md` | regroomed live backlog | working tool; IDs preserved |
+| `docs/superpowers/cas/AGENTS.md` | agent working guide: invariants, gate/test recipes, traps, policies, pointers | the one place future agents (any model, any session) read before touching the branch; absorbs `INTENT.md` + `02-methodology.md` agent-relevant content and durable memory items |
 | `docs/superpowers/specs/` (subset) | `KEEP-IN-PLACE` specs: still actual, likely to be implemented | user decision |
 | `docs/superpowers/models/` | in full: `*.tla`, `*.cfg` **and** `*_RESULTS.md` | RESULTS are run protocols next to the model sources; `correctness.md` summarizes but does not replace them |
 | `docs/superpowers/cas/consolidation-2026-08/` | coverage matrix only | the audit artifact of deletion |
