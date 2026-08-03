@@ -319,7 +319,7 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
             return {};
         case PoolLifecycle::IdentityLost:
             return "identity lost — the pool sentinels are absent; access fails loud. Recover by restart or "
-                   "SYSTEM CONTENT ADDRESSED FORGET (a matching-sentinel restore does not auto-revive it).";
+                   "SYSTEM CAS FORGET (a matching-sentinel restore does not auto-revive it).";
         case PoolLifecycle::VanishedReplaced:
             return "data root replaced by a foreign pool (pool_id mismatch) — our generation is gone; "
                    "restart re-registers the name.";
@@ -332,7 +332,7 @@ String Pool::lifecycleReasonDetail(PoolLifecycle lc) const
             const String & reason = mount_runtime.vanishedReason();
             if (!reason.empty())
                 return reason;
-            return "decommissioned by SYSTEM CONTENT ADDRESSED FORGET — erasure was NOT verified; if this "
+            return "decommissioned by SYSTEM CAS FORGET — erasure was NOT verified; if this "
                    "was a mistake the data may be intact (restart re-registers the name).";
         }
     }
@@ -897,7 +897,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     const ThreadName tn = getThreadName();
     chassert(tn != ThreadName::CAS_REMOUNT && tn != ThreadName::CAS_GC_SCHEDULER
              && tn != ThreadName::CAS_GC_HEARTBEAT
-             && "SYSTEM CONTENT ADDRESSED FORGET must not run on a CAS pool thread (self-join deadlock)");
+             && "SYSTEM CAS FORGET must not run on a CAS pool thread (self-join deadlock)");
 
     /// Idempotent: an already-terminal `Vanished` pool (a second FORGET, or a pool that naturally vanished
     /// as replaced) is already the terminal truth — nothing to force, and re-running the teardown

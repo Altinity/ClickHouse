@@ -202,7 +202,7 @@ def wait_until(predicate, timeout, what):
 
 
 def fsck(node, disk=CA_DISK):
-    """`SYSTEM CONTENT ADDRESSED FSCK <disk>` as a dict of column -> value.
+    """`SYSTEM CAS FSCK <disk>` as a dict of column -> value.
 
     Driven through `clickhouse-client --format` rather than a trailing `FORMAT` clause: `ASTSystemQuery`
     is not an `ASTQueryWithOutput`, so `SYSTEM ... FORMAT TSVWithNames` is a syntax error. Reading the
@@ -213,7 +213,7 @@ def fsck(node, disk=CA_DISK):
             "bash",
             "-c",
             "clickhouse client --format TSVWithNames --query {}".format(
-                shlex.quote("SYSTEM CONTENT ADDRESSED FSCK '{}'".format(disk))
+                shlex.quote("SYSTEM CAS FSCK '{}'".format(disk))
             ),
         ]
     ).splitlines()
@@ -224,7 +224,7 @@ def fsck(node, disk=CA_DISK):
 
 
 def gc_round(node, disk=CA_DISK):
-    node.query("SYSTEM CONTENT ADDRESSED GC RUN '{}'".format(disk))
+    node.query("SYSTEM CAS GC RUN '{}'".format(disk))
 
 
 def drop_everywhere(table):

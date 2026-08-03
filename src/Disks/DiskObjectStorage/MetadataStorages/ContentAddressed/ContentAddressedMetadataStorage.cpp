@@ -606,7 +606,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
     /// Admin class (rev.7 spec §1): refuse on a transient / IdentityLost / Vanished pool before touching
-    /// the scheduler -- `SYSTEM CONTENT ADDRESSED GC RUN` reaches here directly.
+    /// the scheduler -- `SYSTEM CAS GC RUN` reaches here directly.
     checkOpAdmitted(CasOpClass::Admin);
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
@@ -928,7 +928,7 @@ String utcStampNow()
 
 void ContentAddressedMetadataStorage::forgetDisk()
 {
-    /// SYSTEM CONTENT ADDRESSED FORGET (spec §5): the operator force-Vanish. A lifecycle verb, NOT a
+    /// SYSTEM CAS FORGET (spec §5): the operator force-Vanish. A lifecycle verb, NOT a
     /// store()-class op — it must work on a NOT-live disk (a stuck transient / IdentityLost pool), so it
     /// reaches the pool DIRECTLY, never through `poolAccess()`/`checkOpAdmitted` (which refuse a not-live
     /// disk). Serialized against FSCK / GC STOP / GC START by `lifecycle_mutex`, and against a concurrent
@@ -954,7 +954,7 @@ void ContentAddressedMetadataStorage::forgetDisk()
         /// restart re-registers the name. Idempotent no-op. (The detached `scheduler` is null here too —
         /// `cas_store`/`gc_scheduler` are published and cleared together.)
         LOG_WARNING(getLogger("ContentAddressedMetadataStorage"),
-            "SYSTEM CONTENT ADDRESSED FORGET on content-addressed disk '{}': no published pool — nothing "
+            "SYSTEM CAS FORGET on content-addressed disk '{}': no published pool — nothing "
             "to decommission (a restart re-registers the name).", disk_name);
         return;
     }
@@ -963,7 +963,7 @@ void ContentAddressedMetadataStorage::forgetDisk()
     /// an erasure proof — the wording says so). `Pool::throwIfLifecycleTerminal` surfaces it verbatim to
     /// every store-class caller after the transition, and the WARN at the transition logs it too.
     const String reason = fmt::format(
-        "decommissioned by SYSTEM CONTENT ADDRESSED FORGET at {} — erasure was NOT verified; if this was a "
+        "decommissioned by SYSTEM CAS FORGET at {} — erasure was NOT verified; if this was a "
         "mistake the data may be intact (restart re-registers the name)", utcStampNow());
 
     /// Run the fence-first protocol on the pool. The GC-stop callback stops+joins the (detached) scheduler
@@ -973,7 +973,7 @@ void ContentAddressedMetadataStorage::forgetDisk()
 
 void ContentAddressedMetadataStorage::gcStop()
 {
-    /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
+    /// SYSTEM CAS GC STOP (spec §6): stop ONLY the background GC scheduler. STOP-IN-PLACE --
     /// the scheduler object is RETAINED in the member (contrast `forgetDisk`/`shutdown`, which `std::move`
     /// it out and destroy it): a later `gcStart` must re-enter the SAME instance so its `gc_id` + lease
     /// observation history survive. Keeping it in the member also keeps `gcHealth` reading the (stopped)
@@ -997,7 +997,7 @@ void ContentAddressedMetadataStorage::gcStop()
         /// disk that runs none is a no-op success -- the operator's intent ("no GC background activity")
         /// already holds.
         LOG_INFO(getLogger("ContentAddressedMetadataStorage"),
-            "SYSTEM CONTENT ADDRESSED GC STOP on content-addressed disk '{}': no GC scheduler "
+            "SYSTEM CAS GC STOP on content-addressed disk '{}': no GC scheduler "
             "(disabled/read-only/not started) -- nothing to stop.", disk_name);
         return;
     }
@@ -1009,7 +1009,7 @@ void ContentAddressedMetadataStorage::gcStop()
 
 void ContentAddressedMetadataStorage::gcStart()
 {
-    /// SYSTEM CONTENT ADDRESSED GC START (spec §6): restart the background GC scheduler stopped by `gcStop`.
+    /// SYSTEM CAS GC START (spec §6): restart the background GC scheduler stopped by `gcStop`.
     /// Serialized like `gcStop`. Unlike it, START refuses on a decommissioned/uncertain pool: restarting GC
     /// there would only spin failing rounds, so it goes through the uniform GC gate.
     std::lock_guard lifecycle(lifecycle_mutex);
@@ -1149,7 +1149,7 @@ CasOpAdmission ContentAddressedMetadataStorage::checkOpAdmitted(CasOpClass op) c
         /// throws an error its retryable-classifier does not list. `IdentityLost` gets its own richer,
         /// TERMINAL 668 below -- it does not auto-recover, so both "temporarily unreachable" and the
         /// retryable class would misdiagnose it. The wait-and-retry guidance is actionable for every caller
-        /// here, and specifically for `SYSTEM CONTENT ADDRESSED GC START` run mid-recovery by an operator
+        /// here, and specifically for `SYSTEM CAS GC START` run mid-recovery by an operator
         /// who STOPped GC pre-maintenance: this is a wait, not a dead end.
         Cas::throwCasTransientUnavailable(
             fmt::format("content-addressed disk '{}'", disk_name),

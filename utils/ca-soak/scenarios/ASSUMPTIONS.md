@@ -77,7 +77,7 @@ as a hard verdict, per the README's structural-inspection caveat).
 
 ## GC driving
 
-`SYSTEM CONTENT ADDRESSED GC RUN ca` runs one synchronous round on the node it hits (only
+`SYSTEM CAS GC RUN ca` runs one synchronous round on the node it hits (only
 the lease holder makes progress). A fixpoint drive issues rounds on both replicas until the fsck
 unreachable count settles. The root-local part-manifest GC has no displaced-tree debris class, so the
 expectation for a non-abandoning scenario is `unreachable == 0` after forced GC; a nonzero residual is

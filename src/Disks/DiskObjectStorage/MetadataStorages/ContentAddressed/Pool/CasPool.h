@@ -345,7 +345,7 @@ public:
     /// For a writable configuration, `open` also claims the configured mount before returning; a
     /// read-only configuration returns an instance that performs no mutating startup operations.
     static PoolPtr open(BackendPtr backend, PoolConfig config);
-    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CONTENT ADDRESSED DROP POOL
+    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CAS DROP POOL
     /// MEMBER`. Impersonates the victim's
     /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
     /// lingering mount lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim
@@ -446,7 +446,7 @@ public:
     };
     LifecycleSnapshot lifecycleSnapshot() const;
 
-    /// `SYSTEM CONTENT ADDRESSED FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
+    /// `SYSTEM CAS FORGET` — the operator force-Vanish (spec §5). Drives THIS pool to
     /// `Vanished(forgotten)` with the fence-first protocol, node-locally, regardless of the current
     /// lifecycle (it works precisely on a NOT-live disk — a stuck transient/`IdentityLost` pool). In order:
     /// (1) publish the terminal-intent latch FIRST (so the remount loop / keeper callback bail at their

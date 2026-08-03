@@ -574,7 +574,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
     HeartbeatFloor floor;
 
     /// `obs` is keyed by every srid this leader has EVER observed, but a
-    /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CONTENT ADDRESSED
+    /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CAS
     /// DROP POOL MEMBER`) is never visited by the loop below again, so its entry would otherwise linger
     /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
     /// srid actually seen THIS pass and prune anything else out of `obs` at the end -- disjoint from the

@@ -53,7 +53,7 @@ $CLIENT -q "TRUNCATE TABLE t_ca_p9"
 # round-paced, so we poll for a round boundary to pass rather than assume a fixed round count).
 deleted=0
 for _ in $(seq 1 40); do
-    $CLIENT -q "SYSTEM CONTENT ADDRESSED GC RUN '${DISK}'" > /dev/null
+    $CLIENT -q "SYSTEM CAS GC RUN '${DISK}'" > /dev/null
     $CLIENT -q "SYSTEM FLUSH LOGS content_addressed_garbage_collection_log"
     deleted=$($CLIENT -q "
         SELECT sum(objects_deleted)

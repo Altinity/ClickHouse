@@ -8,7 +8,7 @@
 # Build one named inline CA disk, run a synchronous GC round so this process has led at least once,
 # then assert the column shapes on the healthy single-disk fixture.
 #
-# This is a .sh test (not .sql) because `SYSTEM CONTENT ADDRESSED GC RUN` now returns a
+# This is a .sh test (not .sql) because `SYSTEM CAS GC RUN` now returns a
 # one-row-per-disk result set (UX pass); the round below only cares about its side effect (leading
 # once), so its own output is redirected to /dev/null.
 
@@ -36,7 +36,7 @@ INSERT INTO t_cas_mounts_gc_health SELECT number, toString(number) FROM numbers(
 TRUNCATE TABLE t_cas_mounts_gc_health;
 """
 
-${CLICKHOUSE_CLIENT} -q "SYSTEM CONTENT ADDRESSED GC RUN '05010_content_addressed_mounts_gc_health'" > /dev/null
+${CLICKHOUSE_CLIENT} -q "SYSTEM CAS GC RUN '05010_content_addressed_mounts_gc_health'" > /dev/null
 
 ${CLICKHOUSE_CLIENT} --multiline -q """
 SELECT is_leader, wedged_namespace_count

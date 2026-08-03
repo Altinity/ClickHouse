@@ -2,7 +2,7 @@
 # Tags: no-fasttest
 # ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# `SYSTEM CONTENT ADDRESSED FSCK <disk>` (runs on a RUNNING disk, T13) + GC RUN's `pending_*` drain
+# `SYSTEM CAS FSCK <disk>` (runs on a RUNNING disk, T13) + GC RUN's `pending_*` drain
 # columns + the fail-closed FORGET teardown (spec rev.8 §5/§9). FSCK is a read-only reachability audit
 # that now runs directly on the mounted, live disk and prints a clean one-row summary. The GC RUN result
 # set carries the retire pipeline's REMAINING (not this-round-delta) `pending_*` columns; on a disk with
@@ -36,24 +36,24 @@ SETTINGS disk = ${DISK_CA}"
 
 # --- GC RUN's result set carries the new pending_* columns while the disk is mounted, and they read 0
 #     on this fresh pool (nothing was ever written, so nothing was ever condemned) ---
-${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" \
+${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CAS GC RUN '${DISK_NAME}'" \
     | tr '\t' '\n' | grep -c "pending_candidates\|pending_condemned\|pending_retired"
-${CLICKHOUSE_CLIENT} --format TSV --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" \
+${CLICKHOUSE_CLIENT} --format TSV --query "SYSTEM CAS GC RUN '${DISK_NAME}'" \
     | awk -F'\t' '{print $(NF-2), $(NF-1), $NF}'
 
 # --- FSCK on the RUNNING, healthy pool (T13: FSCK runs on a mounted disk): a clean one-row summary,
 #     no dangling/unreachable ---
-${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" \
+${CLICKHOUSE_CLIENT} --format TSVWithNames --query "SYSTEM CAS FSCK '${DISK_NAME}'" \
     | sed "s/${DISK_NAME}/<disk>/"
 
 # --- A non-CA disk is rejected (the always-present local \`default\`) ---
 echo -n 'fsck_non_ca_disk_rejected: '
-${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FSCK default" 2>&1 \
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FSCK default" 2>&1 \
     | grep -cm1 "is not a content-addressed disk"
 
 # --- FSCK requires an explicit disk (syntax error) ---
 echo -n 'fsck_requires_disk: '
-${CLICKHOUSE_CLIENT} --query "SYSTEM CONTENT ADDRESSED FSCK" 2>&1 \
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FSCK" 2>&1 \
     | grep -cm1 "Syntax error"
 
 # --- Fail-closed teardown (spec rev.8 §5/§9): DROP the table, FORGET the disk (force-Vanish, node-local),
@@ -64,7 +64,7 @@ ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_fsck SYNC"
 # clickhouse-test harness runs the client at --send_logs_level=warning, which would stream that expected
 # warning to stderr and be flagged as a failure. Suppress it on the client for the FORGET call only.
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
-    --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
+    --query "SYSTEM CAS FORGET '${DISK_NAME}'" || {
     echo "FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
 LIFECYCLE=$(${CLICKHOUSE_CLIENT} --query "
     SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts
@@ -75,7 +75,7 @@ LIFECYCLE=$(${CLICKHOUSE_CLIENT} --query "
 # --- A second FORGET is idempotent: it succeeds and the disk stays `vanished(forgotten)` (an already
 #     terminal Vanished pool is the terminal truth — nothing to force, nothing to double-retire). ---
 ${CLICKHOUSE_CLIENT} --allow_repeated_settings --send_logs_level=fatal \
-    --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
+    --query "SYSTEM CAS FORGET '${DISK_NAME}'" || {
     echo "second FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
 LIFECYCLE_AGAIN=$(${CLICKHOUSE_CLIENT} --query "
     SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts

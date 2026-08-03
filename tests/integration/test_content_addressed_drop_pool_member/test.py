@@ -173,7 +173,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     transitioned still counts as "owned" and the retirement fence correctly refuses the slot.
     #     This is a success with GC completion pending, not a failure.
     report_tsv = node1.query(
-        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+        "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
     ).rstrip("\n")
     fields = report_tsv.split("\t")
     assert len(fields) == 10, report_tsv
@@ -190,9 +190,9 @@ def test_drop_dead_pool_member_heals_the_pool():
     #      cadence. Catalog-row pruning is Task 5's catalog-only pre-fold drain and does not consult
     #      Stage A's destructive-reclaim suppression, so this heals under the current Stage-A posture.
     for _ in range(30):
-        node1.query("SYSTEM CONTENT ADDRESSED GC RUN '{}'".format(CA_DISK))
+        node1.query("SYSTEM CAS GC RUN '{}'".format(CA_DISK))
         report_tsv = node1.query(
-            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+            "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
         ).rstrip("\n")
         fields = report_tsv.split("\t")
         assert len(fields) == 10, report_tsv
@@ -290,7 +290,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     # with CORRUPTED_DATA and a message telling the operator this server-root was explicitly
     # decommissioned and will not silently resume.
     err = node1.query_and_get_error(
-        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+        "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
     )
     assert "explicitly decommissioned" in err, err
 
@@ -302,6 +302,6 @@ def test_drop_pool_member_rejected_on_readonly_disk():
     # not a silent no-op or a crash further down the call chain.
     node1 = cluster.instances["node1"]
     err = node1.query_and_get_error(
-        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'whatever' FROM DISK '{}'".format(RO_DISK)
+        "SYSTEM CAS DROP POOL MEMBER 'whatever' FROM DISK '{}'".format(RO_DISK)
     )
     assert "read-only" in err, err

@@ -23,7 +23,7 @@
 #include <string>
 #include <thread>
 
-/// Task 10 (rev.7 spec §5): `SYSTEM CONTENT ADDRESSED FORGET` — the operator force-Vanish. FORGET drives a
+/// Task 10 (rev.7 spec §5): `SYSTEM CAS FORGET` — the operator force-Vanish. FORGET drives a
 /// content-addressed pool to `Vanished(forgotten)` with the fence-first protocol: (1) publish terminal
 /// intent, (2) trip the local fence, (3+4) stop the GC scheduler, (5) join keeper/remount, drain, retire
 /// the keeper WITHOUT an unearned clean farewell, (6) publish `Vanished(forgotten)` with the [D5] message
@@ -49,7 +49,7 @@ const String kSrid = "test";
 /// string flows through `enterVanished` into the `throwIfLifecycleTerminal` message (the timestamp
 /// threading the metadata storage does in production). It keeps the two [D5] substrings the gate relies on.
 const String kForgetReason =
-    "decommissioned by SYSTEM CONTENT ADDRESSED FORGET at 2099-01-02 03:04:05 UTC — erasure was NOT "
+    "decommissioned by SYSTEM CAS FORGET at 2099-01-02 03:04:05 UTC — erasure was NOT "
     "verified; if this was a mistake the data may be intact (restart re-registers the name)";
 
 /// Delete an existing key exactly (its current token comes from the same GET). Mirrors
@@ -229,7 +229,7 @@ TEST(CasForget, ForgetOnLivePoolTripsFenceAndVanishes)
     /// The [D5] message carries the operator's FORGET timestamp (threaded through the reason) and still
     /// names the sub-state ("erasure was NOT verified").
     const std::string msg = messageOf([&] { store->throwIfLifecycleTerminal(); });
-    EXPECT_NE(msg.find("SYSTEM CONTENT ADDRESSED FORGET at "), std::string::npos) << msg;
+    EXPECT_NE(msg.find("SYSTEM CAS FORGET at "), std::string::npos) << msg;
     EXPECT_NE(msg.find("2099-01-02 03:04:05 UTC"), std::string::npos) << msg;
     EXPECT_NE(msg.find("erasure was NOT verified"), std::string::npos) << msg;
 }
@@ -484,12 +484,12 @@ TEST(CasForget, ForgetEndToEndGatesTruthWithTimestampedMessage)
 
     /// Content read → the typed [D5] message, with the handler's real UTC timestamp.
     const std::string msg = messageOf([&] { storage->getFileSize(kPartFile); });
-    EXPECT_NE(msg.find("SYSTEM CONTENT ADDRESSED FORGET at "), std::string::npos) << msg;
+    EXPECT_NE(msg.find("SYSTEM CAS FORGET at "), std::string::npos) << msg;
     EXPECT_NE(msg.find(" UTC"), std::string::npos) << msg;
     EXPECT_NE(msg.find("erasure was NOT verified"), std::string::npos) << msg;
 }
 
-/// (I-1 regression) A manual `SYSTEM CONTENT ADDRESSED GC RUN` admitted while `Live` but that acquires
+/// (I-1 regression) A manual `SYSTEM CAS GC RUN` admitted while `Live` but that acquires
 /// `gc_scheduler_mutex` strictly AFTER a concurrent FORGET completes must NOT resurrect a `CasGcScheduler`
 /// on the now-`Vanished` pool: the under-lock admission re-check refuses with the typed [D5] message. The
 /// interleave is deterministic (bounded cv waits, no sleep) — the GC-verb seam parks the RUN in the
@@ -517,7 +517,7 @@ TEST(CasForget, GcRunAdmittedWhileLiveRefusesAfterConcurrentForget)
     EXPECT_EQ(pool->lifecycle(), PoolLifecycle::VanishedForgotten);
 }
 
-/// (I-2 regression) A `SYSTEM CONTENT ADDRESSED GC REBUILD` holds `gc_scheduler_mutex` for its whole
+/// (I-2 regression) A `SYSTEM CAS GC REBUILD` holds `gc_scheduler_mutex` for its whole
 /// duration, so a concurrent FORGET must SERIALIZE behind it — FORGET cannot report the disk decommissioned
 /// while the rebuild is still issuing durable `gc/`-plane writes. Deterministic (bounded cv waits + a bounded
 /// negative future poll anchored by a positive control, never a sleep-to-fix-a-race): the in-lock seam parks

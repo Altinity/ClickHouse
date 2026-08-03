@@ -3,7 +3,7 @@
 # ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
 # Introspection coverage for the content-addressed (CA) garbage collector: the
-# `SYSTEM CONTENT ADDRESSED GC RUN <disk>` command runs one GC round synchronously and
+# `SYSTEM CAS GC RUN <disk>` command runs one GC round synchronously and
 # the round is recorded in `system.content_addressed_garbage_collection_log` (a Start + Finish row
 # per round, like `part_log`). We build a CA disk inline (named, so the SYSTEM command can target it),
 # create garbage by inserting then truncating, run the round a few times, flush the log, and assert
@@ -11,7 +11,7 @@
 # (the Manual round runs on the query thread, which always has an attached ThreadStatus that captures
 # ProfileEvents).
 #
-# This is a .sh test (not .sql) because `SYSTEM CONTENT ADDRESSED GC RUN` now returns a
+# This is a .sh test (not .sql) because `SYSTEM CAS GC RUN` now returns a
 # one-row-per-disk result set (UX pass); the three synchronous rounds below only care about their
 # side effects on the log, so their own output is redirected to /dev/null.
 
@@ -22,7 +22,7 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ${CLICKHOUSE_CLIENT} --multiline -q """
 DROP TABLE IF EXISTS t_cas_gc_introspection;
 
--- A named inline CA disk: the \`name\` is what \`SYSTEM CONTENT ADDRESSED GC RUN <name>\`
+-- A named inline CA disk: the \`name\` is what \`SYSTEM CAS GC RUN <name>\`
 -- targets and what lands in the log's \`disk_name\` column.
 CREATE TABLE t_cas_gc_introspection (a UInt64, s String)
 ENGINE = MergeTree ORDER BY a
@@ -46,9 +46,9 @@ TRUNCATE TABLE t_cas_gc_introspection;
 
 # Run several synchronous rounds: the first rounds mark the retired candidates, later rounds delete
 # them once the durable watermark floor advances past the builds (the background renewer does this).
-${CLICKHOUSE_CLIENT} -q "SYSTEM CONTENT ADDRESSED GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
-${CLICKHOUSE_CLIENT} -q "SYSTEM CONTENT ADDRESSED GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
-${CLICKHOUSE_CLIENT} -q "SYSTEM CONTENT ADDRESSED GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
+${CLICKHOUSE_CLIENT} -q "SYSTEM CAS GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
+${CLICKHOUSE_CLIENT} -q "SYSTEM CAS GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
+${CLICKHOUSE_CLIENT} -q "SYSTEM CAS GC RUN '05007_content_addressed_gc_introspection'" > /dev/null
 
 ${CLICKHOUSE_CLIENT} --multiline -q """
 SYSTEM FLUSH LOGS content_addressed_garbage_collection_log;
@@ -102,7 +102,7 @@ WHERE disk_name LIKE '%05007_content_addressed_gc_introspection%'
   AND event_type = 'Phase' AND phase = 'defer_decision';
 
 -- The error path: a non-CA disk (the always-present local \`default\`) is rejected.
-SYSTEM CONTENT ADDRESSED GC RUN 'default'; -- { serverError BAD_ARGUMENTS }
+SYSTEM CAS GC RUN 'default'; -- { serverError BAD_ARGUMENTS }
 
 DROP TABLE t_cas_gc_introspection;
 SELECT 'ok';

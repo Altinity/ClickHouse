@@ -745,7 +745,7 @@ class S32(Scenario):
 class S33(Scenario):
     """REGRESSION GUARD for the KNOWN open finding BACKLOG "GC-CONCURRENT-LEADER-LEAK".
 
-    Issuing explicit `SYSTEM CONTENT ADDRESSED GC RUN ca` on BOTH replicas concurrently
+    Issuing explicit `SYSTEM CAS GC RUN ca` on BOTH replicas concurrently
     can PERMANENTLY orphan dropped-table blobs: explicit `runGarbageCollectionRoundNow` is not
     lease-gated the way the background `CasGcScheduler` is, so two concurrent leaders collide on the
     fold seal. The fold-abort path correctly preserves SAFETY (`fsck dangling==0`, no over-delete),
@@ -833,7 +833,7 @@ class S33(Scenario):
         # --- DELIBERATELY drive concurrent explicit GC on BOTH replicas at once --------------
         # This is the one place in the suite where we manufacture the concurrent-leader collision
         # (everywhere else uses single-leader gc_drive_round). Each round: two threads fire
-        # `SYSTEM CONTENT ADDRESSED GC RUN ca` on node1 and node2 simultaneously.
+        # `SYSTEM CAS GC RUN ca` on node1 and node2 simultaneously.
         nodes = cl.nodes()
         node_a = nodes[0]
         node_b = nodes[-1] if len(nodes) > 1 else nodes[0]
@@ -842,7 +842,7 @@ class S33(Scenario):
 
         def _fire(node, tag, sink):
             try:
-                node.command("SYSTEM CONTENT ADDRESSED GC RUN ca", timeout=120)
+                node.command("SYSTEM CAS GC RUN ca", timeout=120)
                 with lock:
                     sink.append((tag, "ok"))
             except Exception as e:

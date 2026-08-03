@@ -33,7 +33,7 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
 ///                          fail-loud and TERMINAL (rev.8). The remount/GC observer threads self-exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
-///                          restart or `SYSTEM CONTENT ADDRESSED FORGET`.
+///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
 ///                          disk was decommissioned by `FORGET`. Store-class access fails loud from here.
 enum class PoolLifecycle : uint8_t
@@ -196,7 +196,7 @@ public:
     void setLifecycleForTest(PoolLifecycle lc);
 
     /// Publish the terminal-intent latch (`vanished_intent`) WITHOUT settling the lifecycle state. This is
-    /// spec §5 step 1 of `SYSTEM CONTENT ADDRESSED FORGET`: publishing the latch FIRST makes the keeper
+    /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the keeper
     /// callback stop arming remounts and the remount loop bail at its next step boundary, so FORGET's
     /// subsequent thread joins are bounded to one step + one backend timeout. The state store + WARN happen
     /// later, in `enterVanished` at step 6. Idempotent; lock-free (a single release store). A natural

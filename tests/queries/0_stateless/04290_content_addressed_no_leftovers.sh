@@ -14,12 +14,12 @@
 #   (2) CREATE a MergeTree on the CA disk and INSERT several distinct batches to make many blobs,
 #   (3) assert the count rose above baseline,
 #   (4) DROP TABLE ... SYNC so the refs are unlinked and the blobs/footers become GC fodder,
-#   (5) drain the retire pipeline deterministically via `SYSTEM CONTENT ADDRESSED GC RUN` (bounded
+#   (5) drain the retire pipeline deterministically via `SYSTEM CAS GC RUN` (bounded
 #       loop on the `pending_*` gauges, NOT a fixed sleep), then run `FSCK` directly on the running
 #       disk (T13): a clean reachability audit reading back zero `unreachable`/`dangling` is a
 #       strictly stronger no-leftovers oracle than polling the pool directory ever was.
 # `_pool_meta` (durable single-owner marker) and the `store/` metadata tree are expected to remain.
-# Teardown is fail-closed (spec rev.8 §5/§9): `SYSTEM CONTENT ADDRESSED FORGET` the disk (force-Vanish,
+# Teardown is fail-closed (spec rev.8 §5/§9): `SYSTEM CAS FORGET` the disk (force-Vanish,
 # node-local), verify it reads `vanished(forgotten)` in system.content_addressed_mounts, and only then
 # `rm -rf` — FORGET stopped and joined every CAS background thread for this disk.
 
@@ -83,13 +83,13 @@ fi
 # (4) Drop: refs unlinked synchronously, blobs/footers become unreferenced GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_leftovers SYNC"
 
-# (5) Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+# (5) Drain GC deterministically: loop `SYSTEM CAS GC RUN` rounds until the retire
 #     pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
 #     spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
 #     loop keeps working if the result set gains columns.
 PENDING=1
 for _ in $(seq 1 60); do
-    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CAS GC RUN '${DISK_NAME}'" --format TSVWithNames \
         | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                       { print $col["pending_condemned"] }   # already candidates+retired per its doc in Gc/CasGc.h; summing all three double-counts')
     [ "${PENDING}" = "0" ] && break
@@ -104,7 +104,7 @@ fi
 # (6) FSCK runs directly on the running disk (T13): a reachability audit that must read back zero
 #     unreachable/dangling objects. This is a strictly stronger no-leftovers oracle than the old
 #     dir-poll.
-$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
+$CLICKHOUSE_CLIENT --query "SYSTEM CAS FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                   { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
@@ -121,7 +121,7 @@ fi
 #     FORGET logs an operator WARNING; the harness runs the client at --send_logs_level=warning, so that
 #     expected warning would stream to stderr and be flagged as a failure -- suppress it for this call.
 $CLICKHOUSE_CLIENT --allow_repeated_settings --send_logs_level=fatal \
-    --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
+    --query "SYSTEM CAS FORGET '${DISK_NAME}'" || {
     echo "FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
 LIFECYCLE=$($CLICKHOUSE_CLIENT --query "
     SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts

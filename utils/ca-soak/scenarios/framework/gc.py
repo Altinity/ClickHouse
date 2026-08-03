@@ -1,8 +1,8 @@
 """Explicit GC driving for the scenario suite.
 
-The README requires that every scenario drive `SYSTEM CONTENT ADDRESSED GC RUN ca`
+The README requires that every scenario drive `SYSTEM CAS GC RUN ca`
 explicitly at checkpoints — even when background GC is enabled — so a report can separate workload
-cost from reclamation cost. `SYSTEM CONTENT ADDRESSED GC RUN ca` runs ONE synchronous GC
+cost from reclamation cost. `SYSTEM CAS GC RUN ca` runs ONE synchronous GC
 round on the node that receives it (only the lease holder makes progress; a non-leader round is a
 cheap no-op), so a fixpoint drive issues rounds on both replicas until the unreachable count settles.
 """
@@ -11,7 +11,7 @@ import time
 
 from soak.cluster import QueryError
 
-GC_SQL = "SYSTEM CONTENT ADDRESSED GC RUN {disk}"
+GC_SQL = "SYSTEM CAS GC RUN {disk}"
 
 
 def gc_round(node, disk: str = "ca", timeout: float = 600.0) -> bool:
@@ -51,7 +51,7 @@ def forced_gc_to_fixpoint(cluster, unreachable_fn, *, max_seconds: float = 240.0
     """Drain the pool to its reclamation fixpoint and return (residual_unreachable, history).
 
     Drains PRIMARILY via the lease-gated BACKGROUND GC, which runs a single leader per round and
-    reclaims cleanly. We issue ONE explicit single-node `SYSTEM CONTENT ADDRESSED GC RUN`
+    reclaims cleanly. We issue ONE explicit single-node `SYSTEM CAS GC RUN`
     round up front (satisfies the README "drive explicit GC at checkpoints" + the cost-measurement
     requirement) and then POLL the fsck unreachable count, letting background GC do the work, until it
     stops decreasing for `stable` consecutive reads or `max_seconds` elapses. If the count stalls above

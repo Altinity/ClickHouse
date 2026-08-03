@@ -571,7 +571,7 @@ TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
     EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).exists);
 }
 
-/// Task 4 (SYSTEM CONTENT ADDRESSED GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
+/// Task 4 (SYSTEM CAS GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
 /// the lease, even under FORCE (FORCE bypasses the "healthy state" refusal, not the lease). Gc A's
 /// runRegularRound freshly acquires/renews the lease; Gc B (a different gc_id) must see it as live.
 TEST(CasGcRebuild, LeaseConflictRefuses)

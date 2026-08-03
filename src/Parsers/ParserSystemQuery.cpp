@@ -457,9 +457,9 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 return false;
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_RUN:
+        case Type::CAS_GC_RUN:
         {
-            /// SYSTEM CONTENT ADDRESSED GC RUN [<disk>] [ON CLUSTER cluster]. The disk is OPTIONAL.
+            /// SYSTEM CAS GC RUN [<disk>] [ON CLUSTER cluster]. The disk is OPTIONAL.
             /// When omitted, the empty disk means "all content-addressed disks on this node".
             /// First try the full target form (which also handles ON CLUSTER); if no disk follows,
             /// fall back to parsing just the optional ON CLUSTER clause and leave the disk empty.
@@ -474,37 +474,37 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
             }
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        case Type::CAS_GC_REBUILD:
         {
-            /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] <disk> [ON CLUSTER cluster]. Unlike the
+            /// SYSTEM CAS GC REBUILD [FORCE] <disk> [ON CLUSTER cluster]. Unlike the
             /// per-round GC RUN command, REBUILD requires an EXPLICIT disk: the destructive
             /// baseline rebuild must never fan out across every content-addressed disk from a bare
             /// command. parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
             /// syntax error.
-            res->content_addressed_gc_rebuild_force = ParserKeyword{Keyword::FORCE}.ignore(pos, expected);
+            res->cas_gc_rebuild_force = ParserKeyword{Keyword::FORCE}.ignore(pos, expected);
             if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
                 return false;
             break;
         }
-        case Type::CONTENT_ADDRESSED_FSCK:
-        case Type::CONTENT_ADDRESSED_FORGET:
-        case Type::CONTENT_ADDRESSED_GC_STOP:
-        case Type::CONTENT_ADDRESSED_GC_START:
+        case Type::CAS_FSCK:
+        case Type::CAS_FORGET:
+        case Type::CAS_GC_STOP:
+        case Type::CAS_GC_START:
         {
-            /// SYSTEM CONTENT ADDRESSED FSCK/FORGET/GC STOP/GC START <disk> [ON CLUSTER cluster].
-            /// Unlike GC RUN, the disk is REQUIRED -- mirrors CONTENT_ADDRESSED_GC_REBUILD (minus the FORCE
+            /// SYSTEM CAS FSCK/FORGET/GC STOP/GC START <disk> [ON CLUSTER cluster].
+            /// Unlike GC RUN, the disk is REQUIRED -- mirrors CAS_GC_REBUILD (minus the FORCE
             /// keyword): parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
             /// syntax error rather than a silent fan-out across every content-addressed disk.
             if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
                 return false;
             break;
         }
-        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        case Type::CAS_DROP_POOL_MEMBER:
         {
-            /// SYSTEM CONTENT ADDRESSED DROP POOL MEMBER <srid> FROM DISK <disk> [ON CLUSTER cluster].
+            /// SYSTEM CAS DROP POOL MEMBER <srid> FROM DISK <disk> [ON CLUSTER cluster].
             /// Both the srid and the disk name are REQUIRED quoted string literals -- an srid is an
             /// opaque server-root path (may contain '/'), not the bare identifier the sibling
-            /// CONTENT_ADDRESSED_* commands' disk TARGET accepts, so this does not go through
+            /// CAS_* commands' disk TARGET accepts, so this does not go through
             /// parseQueryWithOnClusterAndTarget.
             ASTPtr ast;
             if (!ParserStringLiteral{}.parse(pos, ast, expected))

@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <vector>
 
-/// Task 11 (rev.7 spec §6): `SYSTEM CONTENT ADDRESSED GC STOP` / `GC START` -- granular operator control
+/// Task 11 (rev.7 spec §6): `SYSTEM CAS GC STOP` / `GC START` -- granular operator control
 /// of ONLY the background GC scheduler. STOP is STOP-IN-PLACE: it joins the worker + heartbeat threads and
 /// clears the in-process leadership hint, but RETAINS the scheduler object so a later START restarts the
 /// SAME instance (its `gc_id` + lease-observation history preserved). The disk stays fully usable (reads/
@@ -441,7 +441,7 @@ TEST(CasGcStopStart, ConcurrentStopStartFromTwoThreadsStaysConsistent)
 /// (T11 cannot-verify, acceptance matrix) Operator intent PERSISTS across a transient recovery: after the
 /// operator STOPs GC, the disk loses its mount lease (transient-not-live) and self-remounts back to Live —
 /// and NOTHING restarts the GC scheduler. Recovery is a Pool-internal operation with no reference to the
-/// scheduler; only an explicit START (`SYSTEM CONTENT ADDRESSED GC START`) resumes it. We prove the scheduler
+/// scheduler; only an explicit START (`SYSTEM CAS GC START`) resumes it. We prove the scheduler
 /// was genuinely running+leading first, STOP it, drive a real transient→Live recovery on the pool, then show
 /// it stays stopped across a bounded observation window (a running 1s-paced scheduler would have produced
 /// several rounds), and finally that an explicit START — the ONLY resumption path — brings rounds back on the

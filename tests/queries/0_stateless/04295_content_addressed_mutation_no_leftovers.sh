@@ -9,7 +9,7 @@
 # shell can inspect directly. Mirrors 04290 but adds heavy mutations and a patch-part lightweight
 # DELETE before the drop: a mutation supersedes the source part (its uniquely-owned blobs become
 # unreachable) and writes a new part; carried-forward columns stay referenced. We assert that after
-# DROP, draining the retire pipeline via `SYSTEM CONTENT ADDRESSED GC RUN` then running `FSCK` on the
+# DROP, draining the retire pipeline via `SYSTEM CAS GC RUN` then running `FSCK` on the
 # running disk (T13) reads back zero `unreachable`/`dangling` objects (no mutated-away or patch-part
 # blobs left behind), and that `_pool_meta` survives. Teardown is fail-closed (spec rev.8 §5/§9): FORGET
 # the disk, verify `vanished(forgotten)`, then rm.
@@ -84,13 +84,13 @@ FROM t_cas_mut_leftovers"
 # Drop: every ref (original, mutated, and patch parts) is unlinked; all blobs/footers become GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_mut_leftovers SYNC"
 
-# Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+# Drain GC deterministically: loop `SYSTEM CAS GC RUN` rounds until the retire
 # pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
 # spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
 # loop keeps working if the result set gains columns.
 PENDING=1
 for _ in $(seq 1 60); do
-    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CAS GC RUN '${DISK_NAME}'" --format TSVWithNames \
         | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                       { print $col["pending_condemned"] }   # already candidates+retired per its doc in Gc/CasGc.h; summing all three double-counts')
     [ "${PENDING}" = "0" ] && break
@@ -104,7 +104,7 @@ fi
 
 # FSCK runs directly on the running disk (T13): a reachability audit that must read back zero
 # unreachable/dangling objects. This is a strictly stronger no-leftovers oracle than the old dir-poll.
-$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
+$CLICKHOUSE_CLIENT --query "SYSTEM CAS FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                   { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
@@ -120,7 +120,7 @@ fi
 # an operator WARNING; the harness runs the client at --send_logs_level=warning, so that expected warning
 # would stream to stderr and be flagged as a failure -- suppress it for this call.
 $CLICKHOUSE_CLIENT --allow_repeated_settings --send_logs_level=fatal \
-    --query "SYSTEM CONTENT ADDRESSED FORGET '${DISK_NAME}'" || {
+    --query "SYSTEM CAS FORGET '${DISK_NAME}'" || {
     echo "FORGET failed — leaving pool dir in place (fail-closed)"; exit 1; }
 LIFECYCLE=$($CLICKHOUSE_CLIENT --query "
     SELECT lifecycle || '(' || lifecycle_reason || ')' FROM system.content_addressed_mounts

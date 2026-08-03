@@ -155,7 +155,7 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         Type::CLEAR_QUERY_CACHE,
         /// The grammar parses `<srid> FROM DISK <disk>` before `ON CLUSTER` (ParserSystemQuery.cpp),
         /// so the round-trip format must print it last too.
-        Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER,
+        Type::CAS_DROP_POOL_MEMBER,
     };
 
     if (!queries_with_on_cluster_at_end.contains(type) && !cluster.empty())
@@ -262,11 +262,11 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
 
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        case Type::CAS_GC_REBUILD:
         {
-            /// FORCE precedes the required disk name: SYSTEM CONTENT ADDRESSED GC REBUILD
+            /// FORCE precedes the required disk name: SYSTEM CAS GC REBUILD
             /// [FORCE] <disk>.
-            if (content_addressed_gc_rebuild_force)
+            if (cas_gc_rebuild_force)
                 print_keyword(" FORCE");
             if (!disk.empty())
             {
@@ -275,21 +275,21 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
             }
             break;
         }
-        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        case Type::CAS_DROP_POOL_MEMBER:
         {
-            /// SYSTEM CONTENT ADDRESSED DROP POOL MEMBER <srid> FROM DISK <disk> -- both required, both
-            /// quoted string literals (unlike the sibling CONTENT_ADDRESSED_* commands' bare identifier
+            /// SYSTEM CAS DROP POOL MEMBER <srid> FROM DISK <disk> -- both required, both
+            /// quoted string literals (unlike the sibling CAS_* commands' bare identifier
             /// disk target: an srid is an opaque server-root path, not necessarily identifier-shaped).
             ostr << ' ' << quoteString(replica);
             print_keyword(" FROM DISK ") << quoteString(disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_FSCK:
-        case Type::CONTENT_ADDRESSED_FORGET:
-        case Type::CONTENT_ADDRESSED_GC_STOP:
-        case Type::CONTENT_ADDRESSED_GC_START:
+        case Type::CAS_FSCK:
+        case Type::CAS_FORGET:
+        case Type::CAS_GC_STOP:
+        case Type::CAS_GC_START:
         {
-            /// SYSTEM CONTENT ADDRESSED FSCK/FORGET/GC STOP/GC START <disk> -- the disk is REQUIRED
+            /// SYSTEM CAS FSCK/FORGET/GC STOP/GC START <disk> -- the disk is REQUIRED
             /// (unlike GC RUN's optional disk): each scan/decommission/scheduler-control verb targets
             /// exactly one disk, never a fan-out.
             ostr << ' ';
@@ -299,13 +299,13 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::RELOAD_DICTIONARY:
         case Type::RELOAD_MODEL:
         case Type::RELOAD_FUNCTION:
-        case Type::CONTENT_ADDRESSED_GC_RUN:
+        case Type::CAS_GC_RUN:
         case Type::RESTART_DISK:
         case Type::WAIT_BLOBS_CLEANUP:
         case Type::CLEAR_DISK_METADATA_CACHE:
         {
             /// RELOAD DICTIONARY prints its database/table target, RELOAD MODEL/FUNCTION their
-            /// identifier target; CONTENT ADDRESSED GC RUN's disk is optional.
+            /// identifier target; CAS GC RUN's disk is optional.
             if (table)
             {
                 ostr << ' ';

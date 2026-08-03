@@ -256,7 +256,7 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
 ///
 /// If that imprecision ever matters -- operator confusion, or a future upstream change
 /// that attaches merge-path handling to `NETWORK_ERROR` and reintroduces a collision --
-/// switch to a dedicated code (e.g. CONTENT_ADDRESSED_WRITE_RETRY_LATER) by changing the
+/// switch to a dedicated code (e.g. CAS_WRITE_RETRY_LATER) by changing the
 /// single throw below. A dedicated code is honest and collision-proof by construction
 /// (backoff still engages, since only `ABORTED` / `PART_IS_TEMPORARILY_LOCKED` are exempt);
 /// the only extra work is one appended line in `ErrorCodes.cpp` and, optionally, adding it

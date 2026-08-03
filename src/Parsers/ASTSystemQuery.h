@@ -147,13 +147,13 @@ public:
         INSTRUMENT_ADD,
         INSTRUMENT_REMOVE,
         RESET_DDL_WORKER,
-        CONTENT_ADDRESSED_GC_RUN,
-        CONTENT_ADDRESSED_GC_REBUILD,
-        CONTENT_ADDRESSED_DROP_POOL_MEMBER,
-        CONTENT_ADDRESSED_FSCK,
-        CONTENT_ADDRESSED_FORGET,
-        CONTENT_ADDRESSED_GC_STOP,
-        CONTENT_ADDRESSED_GC_START,
+        CAS_GC_RUN,
+        CAS_GC_REBUILD,
+        CAS_DROP_POOL_MEMBER,
+        CAS_FSCK,
+        CAS_FORGET,
+        CAS_GC_STOP,
+        CAS_GC_START,
         END
     };
 
@@ -184,9 +184,9 @@ public:
     String storage_policy;
     String volume;
     String disk;
-    /// SYSTEM CONTENT ADDRESSED GC REBUILD FORCE [<disk>] — the raw baseline-rebuild disaster
+    /// SYSTEM CAS GC REBUILD FORCE [<disk>] — the raw baseline-rebuild disaster
     /// recovery command's optional FORCE keyword (bypass the "healthy state" refusal).
-    bool content_addressed_gc_rebuild_force = false;
+    bool cas_gc_rebuild_force = false;
     UInt64 seconds{};
     UInt64 untracked_memory_size{};
 

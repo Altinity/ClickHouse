@@ -129,7 +129,7 @@ TEST(CasLifecycleSnapshot, VanishedForgottenIsEnumCleanWithTimestampedDetail)
     EXPECT_EQ(snap.reason, "forgotten");
     /// Task 14's teardown check depends on this exact concatenation.
     EXPECT_EQ(snap.lifecycle + "(" + snap.reason + ")", "vanished(forgotten)");
-    EXPECT_NE(snap.detail.find("SYSTEM CONTENT ADDRESSED FORGET at "), std::string::npos) << snap.detail;
+    EXPECT_NE(snap.detail.find("SYSTEM CAS FORGET at "), std::string::npos) << snap.detail;
     EXPECT_NE(snap.detail.find("erasure was NOT verified"), std::string::npos) << snap.detail;
     EXPECT_NE(snap.since, 0);
     /// The disk stays registered and introspectable under its identity after FORGET.

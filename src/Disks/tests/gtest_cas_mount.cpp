@@ -1158,7 +1158,7 @@ TEST(CasHeartbeatFloor, UnseenSridPrunedFromObservationMap)
     ASSERT_TRUE(obs.contains("s1"));
     ASSERT_TRUE(obs.contains("s2"));
 
-    /// s2's `/mount` key is removed entirely -- e.g. `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` -- so
+    /// s2's `/mount` key is removed entirely -- e.g. `SYSTEM CAS DROP POOL MEMBER` -- so
     /// no future LIST pass will ever visit it again. s1 renews (a live keeper would), so its OWN
     /// observation restarts and it stays `live` -- isolating this test to the pruning behavior alone,
     /// not confounding it with s1 also becoming fence-eligible (which would erase its `obs` entry too,

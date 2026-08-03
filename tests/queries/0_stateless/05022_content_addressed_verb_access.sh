@@ -26,42 +26,42 @@ REVOKE ALL ON *.* FROM ${USER};
 
 # (1) Zero grants: each verb is denied before the disk is resolved.
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED FORGET 'no_such_disk';   -- { serverError ACCESS_DENIED }
+SYSTEM CAS FORGET 'no_such_disk';   -- { serverError ACCESS_DENIED }
 """
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED GC STOP 'no_such_disk';  -- { serverError ACCESS_DENIED }
+SYSTEM CAS GC STOP 'no_such_disk';  -- { serverError ACCESS_DENIED }
 """
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED GC START 'no_such_disk'; -- { serverError ACCESS_DENIED }
+SYSTEM CAS GC START 'no_such_disk'; -- { serverError ACCESS_DENIED }
 """
 
 # Grant each verb its matching right.
 ${CLICKHOUSE_CLIENT} --multiline -q """
-GRANT SYSTEM CONTENT ADDRESSED FORGET   ON *.* TO ${USER};
-GRANT SYSTEM CONTENT ADDRESSED GC STOP  ON *.* TO ${USER};
-GRANT SYSTEM CONTENT ADDRESSED GC START ON *.* TO ${USER};
+GRANT SYSTEM CAS FORGET   ON *.* TO ${USER};
+GRANT SYSTEM CAS GC STOP  ON *.* TO ${USER};
+GRANT SYSTEM CAS GC START ON *.* TO ${USER};
 """
 
 # (2) Granted: the verb is permitted, then fails later on the disk-type check against `default`.
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED FORGET default;   -- { serverError BAD_ARGUMENTS }
+SYSTEM CAS FORGET default;   -- { serverError BAD_ARGUMENTS }
 """
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED GC STOP default;  -- { serverError BAD_ARGUMENTS }
+SYSTEM CAS GC STOP default;  -- { serverError BAD_ARGUMENTS }
 """
 ${CLICKHOUSE_CLIENT} --multiline --user "${USER}" --password pw -q """
-SYSTEM CONTENT ADDRESSED GC START default; -- { serverError BAD_ARGUMENTS }
+SYSTEM CAS GC START default; -- { serverError BAD_ARGUMENTS }
 """
 
 # (3) Each verb requires an explicit disk (syntax error).
 ${CLICKHOUSE_CLIENT} --multiline -q """
-SYSTEM CONTENT ADDRESSED FORGET;   -- { clientError SYNTAX_ERROR }
+SYSTEM CAS FORGET;   -- { clientError SYNTAX_ERROR }
 """
 ${CLICKHOUSE_CLIENT} --multiline -q """
-SYSTEM CONTENT ADDRESSED GC STOP;  -- { clientError SYNTAX_ERROR }
+SYSTEM CAS GC STOP;  -- { clientError SYNTAX_ERROR }
 """
 ${CLICKHOUSE_CLIENT} --multiline -q """
-SYSTEM CONTENT ADDRESSED GC START; -- { clientError SYNTAX_ERROR }
+SYSTEM CAS GC START; -- { clientError SYNTAX_ERROR }
 """
 
 ${CLICKHOUSE_CLIENT} --multiline -q """

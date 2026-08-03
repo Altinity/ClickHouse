@@ -1018,58 +1018,58 @@ BlockIO InterpreterSystemQuery::execute()
 
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_RUN:
+        case Type::CAS_GC_RUN:
         {
-            /// A manual GC RUN executes REGARDLESS of SYSTEM CONTENT ADDRESSED GC STOP: STOP pauses only the
+            /// A manual GC RUN executes REGARDLESS of SYSTEM CAS GC STOP: STOP pauses only the
             /// background PACER, not the GC engine, so an explicit operator round still runs (explicit intent
             /// wins). A round that acquires the lease sets the disk's in-process is_leader=true, which its
             /// introspection can surface transiently even while the background scheduler stays stopped —
             /// until a peer mounter steals the lease or GC START resumes pacing. This is truthful (the round
             /// DID lead) and harmless (no background thread acts on it while stopped).
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_RUN);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_RUN);
             result = runContentAddressedGcRun(query.disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        case Type::CAS_GC_REBUILD:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
-            result = runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_REBUILD);
+            result = runContentAddressedGcRebuild(query.disk, query.cas_gc_rebuild_force);
             break;
         }
-        case Type::CONTENT_ADDRESSED_FSCK:
+        case Type::CAS_FSCK:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_FSCK);
             result = runContentAddressedFsck(query.disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_FORGET:
+        case Type::CAS_FORGET:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_FORGET);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_FORGET);
             contentAddressedForget(query.disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_STOP:
+        case Type::CAS_GC_STOP:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_STOP);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_STOP);
             contentAddressedGcStop(query.disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_START:
+        case Type::CAS_GC_START:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_START);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_GC_START);
             contentAddressedGcStart(query.disk);
             break;
         }
-        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        case Type::CAS_DROP_POOL_MEMBER:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
+            getContext()->checkAccess(AccessType::SYSTEM_CAS_DROP_POOL_MEMBER);
 
             auto disk = getContext()->getDisk(query.disk);
             auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
             if (!ca)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
-            ca->checkNotReadOnly("SYSTEM CONTENT ADDRESSED DROP POOL MEMBER");
+                    "SYSTEM CAS DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
+            ca->checkNotReadOnly("SYSTEM CAS DROP POOL MEMBER");
 
             const auto & host_store = ca->store();
             const auto report = Cas::decommissionPoolMember(
@@ -2328,7 +2328,7 @@ void InterpreterSystemQuery::syncMerges()
 namespace
 {
 
-/// One-row-per-disk result-set builders for the CAS GC verbs, mirroring the SYSTEM CONTENT ADDRESSED
+/// One-row-per-disk result-set builders for the CAS GC verbs, mirroring the SYSTEM CAS
 /// DROP POOL MEMBER precedent (ColumnsDescription + MutableColumns + SourceFromSingleChunk; see also
 /// SYNC_FILESYSTEM_CACHE above).
 ColumnsDescription contentAddressedGcRoundColumns()
@@ -2422,7 +2422,7 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.adopted_seal_generation);
 }
 
-/// SYSTEM CONTENT ADDRESSED FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
+/// SYSTEM CAS FSCK's one-row-per-disk summary. Named UInt64 columns only, no DETAIL
 /// keyword (YAGNI -- the offline `clickhouse-disks ca-fsck --detail` applet already covers per-object
 /// listing). Field order/names mirror `Cas::FsckReport`; the row was a deliberate SUBSET of it until
 /// 2026-07-29, and is no longer one where findings are concerned -- see the rule stated at
@@ -2550,7 +2550,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk
     /// the fail-closed backstop for a directly-constructed AST.
     if (disk_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "SYSTEM CONTENT ADDRESSED GC REBUILD requires an explicit disk name");
+            "SYSTEM CAS GC REBUILD requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);
     auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
@@ -2588,7 +2588,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name
     /// against a fresh authoritative read, so it needs no quiesce. The disk is REQUIRED, enforced by the
     /// parser -- no fan-out form.
     if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FSCK requires an explicit disk name");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS FSCK requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);
     auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
@@ -2621,7 +2621,7 @@ void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
     /// `Vanished(forgotten)`. FORGET is an operator ASSERTION, not an erasure proof; the resulting [D5]
     /// error message says so.
     if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FORGET requires an explicit disk name");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS FORGET requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
     auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
@@ -2630,7 +2630,7 @@ void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
 
     ca->forgetDisk();
     LOG_WARNING(log,
-        "SYSTEM CONTENT ADDRESSED FORGET decommissioned content-addressed disk '{}' (node-local; erasure "
+        "SYSTEM CAS FORGET decommissioned content-addressed disk '{}' (node-local; erasure "
         "NOT verified). The disk stays registered and answers store-class access with a typed error; a "
         "server restart re-registers the name.",
         disk_name);
@@ -2638,14 +2638,14 @@ void InterpreterSystemQuery::contentAddressedForget(const String & disk_name)
 
 void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
 {
-    /// SYSTEM CONTENT ADDRESSED GC STOP (spec §6): stop ONLY the background GC scheduler on this disk. The
+    /// SYSTEM CAS GC STOP (spec §6): stop ONLY the background GC scheduler on this disk. The
     /// disk stays fully usable -- reads and writes are unaffected; this is granular operator control of GC
     /// alone (e.g. to pause reclamation during an incident), not a lifecycle transition. STOP-IN-PLACE: the
     /// scheduler object is retained so a later GC START restarts the SAME instance (its gc_id and lease
     /// observation history preserved). Idempotent; works even on a not-live/Vanished disk (stopping GC on a
     /// sick disk is legitimate). The disk is REQUIRED -- there is no fan-out form.
     if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED GC STOP requires an explicit disk name");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS GC STOP requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
     auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
@@ -2654,21 +2654,21 @@ void InterpreterSystemQuery::contentAddressedGcStop(const String & disk_name)
 
     ca->gcStop();
     LOG_INFO(log,
-        "SYSTEM CONTENT ADDRESSED GC STOP: stopped the background garbage-collection scheduler on "
-        "content-addressed disk '{}' (the disk stays fully usable; SYSTEM CONTENT ADDRESSED GC START "
+        "SYSTEM CAS GC STOP: stopped the background garbage-collection scheduler on "
+        "content-addressed disk '{}' (the disk stays fully usable; SYSTEM CAS GC START "
         "resumes it).",
         disk_name);
 }
 
 void InterpreterSystemQuery::contentAddressedGcStart(const String & disk_name)
 {
-    /// SYSTEM CONTENT ADDRESSED GC START (spec §6): restart the background GC scheduler stopped by GC STOP.
+    /// SYSTEM CAS GC START (spec §6): restart the background GC scheduler stopped by GC STOP.
     /// It re-enters the SAME scheduler instance; leadership is NOT auto-restored -- the scheduler re-acquires
     /// the durable `gc/state` lease through the next round's normal acquisition. Idempotent (a no-op on a
     /// running scheduler). Refuses on a decommissioned/uncertain pool (typed error) -- restarting GC there
     /// would only spin failing rounds. The disk is REQUIRED -- there is no fan-out form.
     if (disk_name.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED GC START requires an explicit disk name");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CAS GC START requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);                       /// UNKNOWN_DISK on a bad name
     auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
@@ -2677,7 +2677,7 @@ void InterpreterSystemQuery::contentAddressedGcStart(const String & disk_name)
 
     ca->gcStart();
     LOG_INFO(log,
-        "SYSTEM CONTENT ADDRESSED GC START: resumed the background garbage-collection scheduler on "
+        "SYSTEM CAS GC START: resumed the background garbage-collection scheduler on "
         "content-addressed disk '{}'.",
         disk_name);
 }
@@ -3240,39 +3240,39 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_WAIT_BLOBS_CLEANUP);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_RUN:
+        case Type::CAS_GC_RUN:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_RUN);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_RUN);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        case Type::CAS_GC_REBUILD:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_REBUILD);
             break;
         }
-        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        case Type::CAS_DROP_POOL_MEMBER:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_DROP_POOL_MEMBER);
             break;
         }
-        case Type::CONTENT_ADDRESSED_FSCK:
+        case Type::CAS_FSCK:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_FSCK);
             break;
         }
-        case Type::CONTENT_ADDRESSED_FORGET:
+        case Type::CAS_FORGET:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FORGET);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_FORGET);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_STOP:
+        case Type::CAS_GC_STOP:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_STOP);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_STOP);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GC_START:
+        case Type::CAS_GC_START:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_START);
+            required_access.emplace_back(AccessType::SYSTEM_CAS_GC_START);
             break;
         }
         case Type::UNFREEZE:

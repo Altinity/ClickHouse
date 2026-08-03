@@ -193,13 +193,13 @@ class S43(Scenario):
         # The first version of this card stopped the containers and emptied the prefix; the servers
         # then never came back healthy, because a mounted disk whose pool bookkeeping simply vanished
         # is not a recreated pool, it is a broken one — and the card never got to ask its question.
-        # `SYSTEM CONTENT ADDRESSED FORGET` is the product's own teardown: force-Vanish, node-local,
+        # `SYSTEM CAS FORGET` is the product's own teardown: force-Vanish, node-local,
         # stops and joins every CAS background thread for that disk. Only once BOTH mounts have
         # forgotten the pool is the prefix genuinely free to be reused.
         forgotten = {}
         for node in cl.nodes():
             try:
-                node.command(f"SYSTEM CONTENT ADDRESSED FORGET '{_DISK}'")
+                node.command(f"SYSTEM CAS FORGET '{_DISK}'")
                 forgotten[repr(node)] = node.scalar(
                     f"SELECT lifecycle || '(' || lifecycle_reason || ')' "
                     f"FROM system.content_addressed_mounts WHERE disk = '{_DISK}'") or "(no row)"

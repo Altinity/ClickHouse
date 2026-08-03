@@ -22,7 +22,7 @@ The exact entry point can change during implementation, but the contract should 
 - Enable `system.content_addressed_log`, `system.content_addressed_garbage_collection_log`,
   `system.query_log`, `system.part_log`, `system.metric_log`, `system.asynchronous_metric_log`, and
   `system.trace_log` when the scenario requests stack attribution.
-- Drive `SYSTEM CONTENT ADDRESSED GC RUN ca` explicitly at checkpoints, even when background
+- Drive `SYSTEM CAS GC RUN ca` explicitly at checkpoints, even when background
   `GC` is enabled, so a report can separate workload cost from reclamation cost.
 - End with a quiesced checkpoint: no active inserts, `SYSTEM SYNC REPLICA`, empty
   `system.replication_queue`, no unfinished `system.mutations`, no active `system.merges`, then forced
@@ -155,7 +155,7 @@ Workload:
 - Force `Wide` parts with `min_bytes_for_wide_part = 0` and `min_rows_for_wide_part = 0`.
 - Insert one part with a single large column file. The scale target is 100 GiB; allow smaller targets for
   developer runs, but the report must state the actual blob size.
-- Run one explicit `SYSTEM CONTENT ADDRESSED GC RUN ca` while the write is in progress if the
+- Run one explicit `SYSTEM CAS GC RUN ca` while the write is in progress if the
   harness can coordinate it, then again after quiescence.
 
 Observations:
@@ -211,7 +211,7 @@ Workload:
 
 - Prefill a valid pool with 1 million to 10 million live blob objects, part manifests, and refs.
 - Measurement phase is mostly idle: a small number of inserts/deletes touches less than 1 percent of refs.
-- Run background `GC` plus explicit `SYSTEM CONTENT ADDRESSED GC RUN ca` once per minute.
+- Run background `GC` plus explicit `SYSTEM CAS GC RUN ca` once per minute.
 
 Observations:
 

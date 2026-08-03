@@ -99,13 +99,13 @@ public:
     /// Starts the periodic round and heartbeat workers. Calling `start` more than once while the
     /// scheduler is running is a no-op; after `stop`, it may be started again on the SAME instance --
     /// the persistent `gc` observer and `gc_id` are preserved, so the lease's observation-window
-    /// protocol continues across a stop/start (`SYSTEM CONTENT ADDRESSED GC START`).
+    /// protocol continues across a stop/start (`SYSTEM CAS GC START`).
     void start();
 
     /// Stops both workers, wakes them if they are waiting, and joins them before returning. It is
     /// safe to call `stop` when the scheduler is not running and from the destructor. It also clears
     /// the in-process `i_am_leader` hint (after the joins), so a stopped scheduler reports it no longer
-    /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CONTENT ADDRESSED GC STOP`).
+    /// leads GC; the durable `gc/state` lease is untouched (`SYSTEM CAS GC STOP`).
     void stop();
 
     /// Wake the periodic worker so it starts the next ordinary round promptly. This does not create a
@@ -135,7 +135,7 @@ public:
 
     /// Whether GC is quiescent right now: TRUE iff NO round is currently in flight on this scheduler
     /// (`round_in_flight` is held for the WHOLE round body via `SCOPE_EXIT` in `runRoundLogged`, on both the
-    /// success and the exception path). Used by the `SYSTEM CONTENT ADDRESSED FORGET` / `GC STOP` tests to
+    /// success and the exception path). Used by the `SYSTEM CAS FORGET` / `GC STOP` tests to
     /// prove the scheduler's worker threads were joined — no round can be mid-flight once `stop()` returned.
     bool isQuiescent() const { return !round_in_flight.load(std::memory_order_acquire); }
 

@@ -1779,7 +1779,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC: the adopted fold seal (generation {}, attempt {}) is missing under a live "
             "gc/state — GC bookkeeping is corrupt. GC refuses to run; recover with "
-            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            "SYSTEM CAS GC REBUILD.",
             state.snap_generation, state.snap_attempt);
     /// Every fold decision below starts from the immutable plan, never from the raw scan that supplied
     /// it. The successor seal owns its mutable copy; this separate const snapshot remains the prior
@@ -2178,7 +2178,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
                     "no sealed fold cursor -- gc/state was lost after cleaning covered logs. GC refuses to "
-                    "run; recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                    "run; recover with SYSTEM CAS GC REBUILD.",
                     ns_str, renderRefTxnId(newest_snapshot));
         }
 
@@ -2833,7 +2833,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                     throw Exception(ErrorCodes::CORRUPTED_DATA,
                         "CAS GC fold: namespace {} sealed a cursor at {} that does not close the run it "
                         "walked (opened at {}). GC refuses to commit the round; recover with "
-                        "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                        "SYSTEM CAS GC REBUILD.",
                         ns_str, end == RefTxnId{} ? "none" : renderRefTxnId(end), renderRefTxnId(first));
                 logs_accounted += end.ref_sequence - first.ref_sequence + 1;
             }
@@ -3263,7 +3263,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             "CAS GC fold: {} ref transaction(s) folded and merged into the round buffers but NONE of "
             "their blob deltas reached a shard reducer ({}{}). The round would have advanced its "
             "cursor past a transaction it never applied. GC refuses to commit the round; recover with "
-            "SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            "SYSTEM CAS GC REBUILD.",
             unapplied_txns.size(), detail, unapplied_txns.size() > 8 ? ", ..." : "");
     }
 
@@ -3275,7 +3275,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS GC fold: the round sealed coverage over {} ref log(s) but only {} fully folded -- "
             "a cursor advanced past a log this round never applied. GC refuses to commit the round; "
-            "recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+            "recover with SYSTEM CAS GC REBUILD.",
             logs_accounted_this_round, logs_applied_this_round);
 
     /// PHASE 10/18 `fold_seal_write`: one PUT (or, on a deterministic replay, a byte-compare GET).

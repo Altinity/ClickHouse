@@ -201,11 +201,11 @@ public:
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
 
-    /// The `SYSTEM CONTENT ADDRESSED FSCK` handler: a read-only, independent reachability audit.
+    /// The `SYSTEM CAS FSCK` handler: a read-only, independent reachability audit.
     ///
     /// FSCK scans the LIVE running pool directly: Admin class -- it routes through
     /// `checkOpAdmitted(CasOpClass::Admin)` (refuses on a transient / `IdentityLost` / `Vanished` pool,
-    /// consistent with `SYSTEM CONTENT ADDRESSED GC RUN`), because an FSCK of a not-live disk is
+    /// consistent with `SYSTEM CAS GC RUN`), because an FSCK of a not-live disk is
     /// meaningless -- the operator has the snapshot / FORGET path. The scan tolerates concurrent writers:
     /// its ref-walk findings (missing manifest, dangling blob) are revalidated against a FRESH
     /// authoritative read before being reported, so a legitimate concurrent republish/drop + GC delete
@@ -278,7 +278,7 @@ public:
     /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
 
-    /// `SYSTEM CONTENT ADDRESSED FORGET` handler (Task 10, spec §5): the operator force-Vanish. Drives the
+    /// `SYSTEM CAS FORGET` handler (Task 10, spec §5): the operator force-Vanish. Drives the
     /// live pool to `Vanished(forgotten)` node-locally via `Pool::forgetDisk`'s fence-first protocol, and
     /// stops + joins the GC scheduler as part of it. Unlike the store()-class verbs, this must work on a
     /// NOT-live disk (a stuck transient / `IdentityLost` pool) — that is its purpose — so it reaches the
@@ -290,7 +290,7 @@ public:
     /// (against FSCK / GC STOP / GC START) and `gc_scheduler_mutex` (against a synchronous round).
     void forgetDisk() TSA_NO_THREAD_SAFETY_ANALYSIS;
 
-    /// `SYSTEM CONTENT ADDRESSED GC STOP` handler (Task 11, spec §6): stops ONLY the background GC scheduler.
+    /// `SYSTEM CAS GC STOP` handler (Task 11, spec §6): stops ONLY the background GC scheduler.
     /// The disk stays fully usable -- reads/writes are unaffected; this is granular operator control of the
     /// GC pacer alone, NOT a lifecycle transition. Unlike `forgetDisk` this is
     /// STOP-IN-PLACE: the scheduler object is RETAINED in the member (not detached/destroyed), so `gcHealth`
@@ -302,7 +302,7 @@ public:
     /// this does NOT consult `checkOpAdmitted`. Serialized by `lifecycle_mutex` and `gc_scheduler_mutex`.
     void gcStop() TSA_NO_THREAD_SAFETY_ANALYSIS;
 
-    /// `SYSTEM CONTENT ADDRESSED GC START` handler (Task 11, spec §6): restarts the background GC scheduler
+    /// `SYSTEM CAS GC START` handler (Task 11, spec §6): restarts the background GC scheduler
     /// stopped by `gcStop`, re-entering the SAME instance (its `start()` is re-enterable after a join).
     /// Leadership is NOT auto-restored -- the scheduler re-acquires the durable `gc/state` lease through the
     /// next round's normal acquisition. Idempotent (a no-op on a running scheduler). Unlike `gcStop`, it goes

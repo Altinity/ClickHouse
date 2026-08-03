@@ -289,7 +289,7 @@ class S13(Scenario):
             since = ctx.extra.get("since_event_time")
             for node in cl.nodes():
                 try:
-                    node.command("SYSTEM CONTENT ADDRESSED GC RUN ca", timeout=120)
+                    node.command("SYSTEM CAS GC RUN ca", timeout=120)
                 except Exception as e:
                     ctx.log(f"S13 GC round on {node.container} failed (continuing): {str(e)[:160]}")
             gc_all = observe.gc_log_all(cl, since)
