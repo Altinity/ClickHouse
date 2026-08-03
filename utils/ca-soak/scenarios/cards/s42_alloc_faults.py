@@ -54,7 +54,7 @@ insert's rows present (S40-shaped, block-granular); replicas agree; fsck `dangli
 GC rounds succeed again after disarm; no permanently wedged ref lane; no query
 hung past a bound.
 
-**Reported, never gating:** `CasGcUnmatchedRemoveDeltas` (removal deltas reaching the in-degree
+**Reported, never gating:** `CASGcUnmatchedRemoveDeltas` (removal deltas reaching the in-degree
 reducer without their matching activation). Its benign rate is not characterised yet, so this card
 records it and says so — it does not fail on it.
 """
@@ -76,11 +76,11 @@ _TABLE = "s42_alloc"
 _EVENTS_OF_INTEREST = (
     "CasRefApplyPoisoned",            # TARGETED: Clean/ApplyPending -> Poisoned transitions
     "QueryMemoryLimitExceeded",       # generic: every injected allocation fault that threw
-    "CasRefAppendWedged", "CasRefAppendUnwedged", "CasRefAppendDefiniteFailure",
-    "CasRefBatchFlushes", "CasRefBatchedMutations",
-    "CasRefSnapshotPublishDispatched", "CasRefSnapshotPublishBackoff",
+    "CASRefAppendWedged", "CASRefAppendUnwedged", "CASRefAppendDefiniteFailure",
+    "CASRefBatchFlushes", "CASRefBatchedMutations",
+    "CASRefSnapshotPublishDispatched", "CASRefSnapshotPublishBackoff",
     "CasRefRecoverySealPublished",
-    "CasGcUnmatchedRemoveDeltas",     # reported only, never gating (benign rate uncharacterised)
+    "CASGcUnmatchedRemoveDeltas",     # reported only, never gating (benign rate uncharacterised)
 )
 
 # The poison marker's log line (`CasRefLedger::poisonApplyState`). Corroboration only: the LOG_ERROR
@@ -616,19 +616,19 @@ class S42(Scenario):
                 "GC did not recover after the allocation faults cleared"))
 
         # Reported, never gating (see the module docstring).
-        unmatched = (int(armed_delta.get("CasGcUnmatchedRemoveDeltas", 0))
-                     + _event_total(ev_post, "CasGcUnmatchedRemoveDeltas"))
+        unmatched = (int(armed_delta.get("CASGcUnmatchedRemoveDeltas", 0))
+                     + _event_total(ev_post, "CASGcUnmatchedRemoveDeltas"))
         result.add(Verdict.reported(
-            "CasGcUnmatchedRemoveDeltas (reported, not gating)",
+            "CASGcUnmatchedRemoveDeltas (reported, not gating)",
             "(recorded; benign rate not yet characterised)",
-            f"{unmatched} (armed window {armed_delta.get('CasGcUnmatchedRemoveDeltas', 0)}, "
-            f"post-restart {_event_total(ev_post, 'CasGcUnmatchedRemoveDeltas')})",
+            f"{unmatched} (armed window {armed_delta.get('CASGcUnmatchedRemoveDeltas', 0)}, "
+            f"post-restart {_event_total(ev_post, 'CASGcUnmatchedRemoveDeltas')})",
             "removal deltas that matched no existing source edge; a per-key no-op by design, but a "
             "persistent rate means deltas reach the reducer without their activation"))
         result.add(Verdict.reported(
             "ref-lane wedge counters (reported)", "(recorded)",
-            f"wedged={armed_delta.get('CasRefAppendWedged', 0)} "
-            f"unwedged={armed_delta.get('CasRefAppendUnwedged', 0)} "
-            f"definite_failure={armed_delta.get('CasRefAppendDefiniteFailure', 0)}"))
+            f"wedged={armed_delta.get('CASRefAppendWedged', 0)} "
+            f"unwedged={armed_delta.get('CASRefAppendUnwedged', 0)} "
+            f"definite_failure={armed_delta.get('CASRefAppendDefiniteFailure', 0)}"))
 
         _common.standard_end(ctx, result, [_TABLE], expect_exception=True)

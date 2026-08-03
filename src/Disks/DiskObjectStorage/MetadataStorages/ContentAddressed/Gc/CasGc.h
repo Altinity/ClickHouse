@@ -325,7 +325,7 @@ private:
 /// Marking happens at reducer CONSUMPTION, not at run flush: the in-degree model is a SET, so an
 /// unmatched `-1` and a duplicate `+1` legitimately vanish inside the reducer and a flush-side mark
 /// would fire on healthy rounds. Loss INSIDE the reducer's own set collapse is a different class,
-/// covered by `CasGcUnmatchedRemoveDeltas` and by the mirror safety test in
+/// covered by `CASGcUnmatchedRemoveDeltas` and by the mirror safety test in
 /// `gtest_cas_holey_list_detector.cpp`; probe B2 does not claim it.
 ///
 /// SINGLE-THREADED: the shard reducers run sequentially on the fold thread (`Gc::fold`), so `applied`
@@ -742,7 +742,7 @@ private:
     ///
     /// THROWS `CORRUPTED_DATA` on that refusal, and on a pool whose enumeration yielded no seal but
     /// which is not provably new. Returning `nullopt` is the VIRGIN verdict — logged at WARNING with
-    /// its evidence enumerated and counted by `CasGcRebuildVirginByEnumeration`, because it rests on
+    /// its evidence enumerated and counted by `CASGcRebuildVirginByEnumeration`, because it rests on
     /// enumeration alone and no point read can prove it.
     std::optional<std::pair<uint64_t, uint64_t>> newestFoldSealRef();
 
@@ -849,7 +849,7 @@ private:
 
     /// Submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
     /// NEVER throws: `job` is wrapped in its own try/catch (an exception counts into the
-    /// `CasGcMetaWriteAnomaly` profile event + a log line); if scheduling itself fails (e.g. resource
+    /// `CASGcMetaWriteAnomaly` profile event + a log line); if scheduling itself fails (e.g. resource
     /// exhaustion) the op runs inline rather than being silently lost. Callers must capture every value
     /// `job` touches BY VALUE (never by reference to a loop-local like the fold's `cur_blob`, which
     /// mutates across iterations while this job may still be queued).

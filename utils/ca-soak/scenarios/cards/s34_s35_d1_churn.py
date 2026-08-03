@@ -9,7 +9,7 @@ ref-shard objects are reclaimed via an in-band tombstone + token-guarded delete,
   (a) `reclaimable == 0` (blobs/_manifests drained — the D1 win);
   (b) the "other" residual (empty ref-shard objects + old registry bookkeeping) is BOUNDED: it must
       not grow proportionally with the total-tables-ever-created count (the pre-D1 S30 monotone-fanout
-      regression); per-round GC work (`CasRootList`, `CasRootGet`) must also stay bounded;
+      regression); per-round GC work (`CASRootList`, `CASRootGet`) must also stay bounded;
   (c) `fsck dangling == 0`; no bad CA-log events; no `Failed` GC finish rows.
 
 - **S35 — rapid same-name rotation.** A tight loop of `CREATE TABLE t ... ; INSERT ; DROP TABLE t`
@@ -57,11 +57,11 @@ class S34(Scenario):
 
     Pre-D1 (S30): `dropNamespace` cleared refs but did not deregister the namespace, leaving a
     permanent per-table fanout in `GC discoverUniverse` — every round paid O(ever_created * root_shards)
-    in CasRootList/Get even after all tables were dropped.  D1 removes the GC namespace registry and
+    in CASRootList/Get even after all tables were dropped.  D1 removes the GC namespace registry and
     reclaims dropped ref-shard objects via an in-band tombstone + token-guarded delete.
 
     This card runs the same churn pattern as S30 but adds:
-      (a) a bounded-fanout assertion: per-round `CasRootList+CasRootGet` must not grow linearly
+      (a) a bounded-fanout assertion: per-round `CASRootList+CASRootGet` must not grow linearly
           with `iterations` (the D1 win; pre-D1 this grew monotonically);
       (b) a zero-reclaimable-residual assertion at the converged end checkpoint (blobs/_manifests
           must drain; "other" bookkeeping may remain and is only recorded, not failed on).
@@ -70,7 +70,7 @@ class S34(Scenario):
     title = "create/drop churn — D1 bounded GC fanout"
     priority = "P1"
     param_table = {
-        # dev: enough iterations to show bounded-vs-growing CasRootList; quick.
+        # dev: enough iterations to show bounded-vs-growing CASRootList; quick.
         "dev": {"iterations": 40, "rows": 80, "payload_bytes": 256, "gc_every": 5},
         "ci": {"iterations": 200, "rows": 300, "payload_bytes": 256, "gc_every": 20},
         "full": {"iterations": 1000, "rows": 600, "payload_bytes": 256, "gc_every": 50},
@@ -106,27 +106,27 @@ class S34(Scenario):
                 per_batch.append(batch)
                 ctx.log(
                     f"S34: batch@{i+1}: gc_wall={batch.get('gc_wall_s')}s "
-                    f"CasRootList={batch.get('CasRootList')} "
-                    f"CasRootGet={batch.get('CasRootGet')} "
+                    f"CASRootList={batch.get('CASRootList')} "
+                    f"CASRootGet={batch.get('CASRootGet')} "
                     f"root_dirs={batch.get('root_dirs')}")
 
         result.observations["per_batch"] = per_batch
 
         delta = counters().get("_total", {})
         result.observations["churn_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasRootList", "CasRootGet", "CasGcGet", "CasGcList",
-            "CasBlobDelete", "CasGcDelete")}
+            "CASRootList", "CASRootGet", "CASGcGet", "CASGcList",
+            "CASBlobDelete", "CASGcDelete")}
 
         # --- D1 win: per-round GC fanout must NOT grow linearly with ever-created tables -------
-        # Pre-D1 (S30): CasRootList/Get and root_dirs grew proportionally. Post-D1 they should
+        # Pre-D1 (S30): CASRootList/Get and root_dirs grew proportionally. Post-D1 they should
         # stay flat (or grow only by gc_shards * bounded bookkeeping, not per dropped namespace).
         if len(per_batch) >= 2:
             first = per_batch[0]
             last = per_batch[-1]
             # Each observation is from a single GC round; compare them as proxy for per-round cost.
-            grew_get = (isinstance(first.get("CasRootGet"), int)
-                        and isinstance(last.get("CasRootGet"), int)
-                        and last["CasRootGet"] > first["CasRootGet"] * 1.5)
+            grew_get = (isinstance(first.get("CASRootGet"), int)
+                        and isinstance(last.get("CASRootGet"), int)
+                        and last["CASRootGet"] > first["CASRootGet"] * 1.5)
             grew_dirs = (isinstance(first.get("root_dirs"), int)
                          and isinstance(last.get("root_dirs"), int)
                          and last["root_dirs"] > first["root_dirs"] + 2)
@@ -137,25 +137,25 @@ class S34(Scenario):
             result.observations["fanout_first_vs_last"] = {"first": first, "last": last}
             result.add(Verdict.check(
                 "per-round GC fanout bounded (D1 win)",
-                "CasRootGet and root_dirs must NOT grow proportionally with ever-created tables",
-                f"CasRootGet first={first.get('CasRootGet')} last={last.get('CasRootGet')}; "
+                "CASRootGet and root_dirs must NOT grow proportionally with ever-created tables",
+                f"CASRootGet first={first.get('CASRootGet')} last={last.get('CASRootGet')}; "
                 f"root_dirs first={first.get('root_dirs')} last={last.get('root_dirs')}",
                 fanout_bounded,
                 "" if fanout_bounded else
-                "per-round CasRootGet or root_dirs grew significantly with iteration count — "
+                "per-round CASRootGet or root_dirs grew significantly with iteration count — "
                 "D1 namespace registry reclaim may be incomplete; monotone-fanout regression "
                 "(checklist #6 / S30 pre-D1 finding) observed"))
             if not fanout_bounded:
                 result.note_anomaly(
                     f"S34 D1 regression: per-round GC fanout grew across create/drop iterations "
-                    f"(CasRootGet first={first.get('CasRootGet')} -> last={last.get('CasRootGet')}, "
+                    f"(CASRootGet first={first.get('CASRootGet')} -> last={last.get('CASRootGet')}, "
                     f"root_dirs {first.get('root_dirs')} -> {last.get('root_dirs')}) — D1 should "
                     "have eliminated the monotone namespace registry; investigate dropNamespace / "
                     "tombstone GC reclaim path")
         else:
             result.add(Verdict.inconclusive(
                 "per-round GC fanout bounded (D1 win)",
-                "CasRootGet and root_dirs stable across batches",
+                "CASRootGet and root_dirs stable across batches",
                 f"only {len(per_batch)} GC batch(es) measured — need >=2 to compare growth "
                 "(increase iterations / lower gc_every)"))
 
@@ -171,17 +171,17 @@ class S34(Scenario):
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
         """Measure the STEADY-STATE per-round DISCOVERY cost — the cost of a round that reclaims
-        NOTHING (`CasGcDelete==0`).
+        NOTHING (`CASGcDelete==0`).
 
-        A round's `CasRootGet` conflates THREE regimes: (a) reclaim-phase GETs, O(pending
+        A round's `CASRootGet` conflates THREE regimes: (a) reclaim-phase GETs, O(pending
         condemn/graduation backlog); (b) a fold round that re-reads the current generation
         (deletes nothing but still GETs); and (c) an IDLE round that finds nothing new and
         DEFERS (Phase-4 skip-unchanged) — O(1) LISTs, zero GETs. The D1 win is that the
         fixed per-round FLOOR — the idle deferred round (c) — must NOT grow with
         tables-ever-created. Sampling a single mid-churn round captured (a)/(b) and grew with
-        the drop burst, NOT the universe (verified: `CasRootGet` tracked `CasGcDelete>0`; a
+        the drop burst, NOT the universe (verified: `CASRootGet` tracked `CASGcDelete>0`; a
         drained round on a stale generation defers to 0). So drive rounds until an IDLE
-        deferred round (`CasGcDelete==0 AND CasRootGet==0`) and report it: that floor is the
+        deferred round (`CASGcDelete==0 AND CASRootGet==0`) and report it: that floor is the
         real per-round steady-state cost. If it can't reach idle, the last round is returned
         and a genuine monotone fanout would surface as a non-zero, growing floor."""
         last = {}
@@ -196,14 +196,14 @@ class S34(Scenario):
                 "after_iter": after_iter,
                 "drain_rounds": attempt + 1,
                 "gc_wall_s": round(wall, 3),
-                "CasRootList": int(delta.get("CasRootList", 0)),
-                "CasRootGet": int(delta.get("CasRootGet", 0)),
-                "CasGcGet": int(delta.get("CasGcGet", 0)),
-                "CasGcDelete": int(delta.get("CasGcDelete", 0)),
+                "CASRootList": int(delta.get("CASRootList", 0)),
+                "CASRootGet": int(delta.get("CASRootGet", 0)),
+                "CASGcGet": int(delta.get("CASGcGet", 0)),
+                "CASGcDelete": int(delta.get("CASGcDelete", 0)),
                 "root_dirs": S34._count_root_dirs(),
             }
             # Idle deferred round: nothing reclaimed AND no discovery GETs → the per-round floor.
-            if last["CasGcDelete"] == 0 and last["CasRootGet"] == 0:
+            if last["CASGcDelete"] == 0 and last["CASRootGet"] == 0:
                 break
         return last
 
@@ -309,22 +309,22 @@ class S35(Scenario):
                 gc_batches.append({
                     "after_cycle": c + 1,
                     "gc_wall_s": round(wall, 3),
-                    "CasRootList": int(bdelta.get("CasRootList", 0)),
-                    "CasRootGet": int(bdelta.get("CasRootGet", 0)),
-                    "CasGcDelete": int(bdelta.get("CasGcDelete", 0)),
+                    "CASRootList": int(bdelta.get("CASRootList", 0)),
+                    "CASRootGet": int(bdelta.get("CASRootGet", 0)),
+                    "CASGcDelete": int(bdelta.get("CASGcDelete", 0)),
                 })
                 ctx.log(f"S35: cycle {c+1}/{cycles}: "
                         f"gc_wall={wall:.2f}s "
-                        f"CasRootList={bdelta.get('CasRootList')} "
-                        f"CasGcDelete={bdelta.get('CasGcDelete')}")
+                        f"CASRootList={bdelta.get('CASRootList')} "
+                        f"CASGcDelete={bdelta.get('CASGcDelete')}")
 
         result.observations["gc_batches"] = gc_batches
         result.observations["cycle_errors"] = errors[:32]
 
         delta = counters().get("_total", {})
         result.observations["rotation_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasBlobPut", "CasBlobDelete", "CasRootCas", "CasRootCasConflict",
-            "CasGcDelete", "CasGcGet")}
+            "CASBlobPut", "CASBlobDelete", "CASRootCompareSwap", "CASRootCompareSwapConflict",
+            "CASGcDelete", "CASGcGet")}
 
         # --- incarnation-monotonicity proxy: no bad CA-log events during the churn loop --------
         # The incarnation invariant cannot be directly queried from SQL alone; we use the CA-log

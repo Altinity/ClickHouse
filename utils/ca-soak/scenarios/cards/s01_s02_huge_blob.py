@@ -160,10 +160,10 @@ class S01(Scenario):
         # --- multipart / blob upload counters --------------------------------------------
         mp = {k: total.get(k, 0) for k in (
             "DiskS3CreateMultipartUpload", "DiskS3UploadPart", "DiskS3CompleteMultipartUpload",
-            "DiskS3AbortMultipartUpload", "DiskS3PutObject", "CasBlobPut")}
+            "DiskS3AbortMultipartUpload", "DiskS3PutObject", "CASBlobPut")}
         result.observations["multipart_counters"] = mp
-        result.add(Verdict.check("blob uploaded", "CasBlobPut > 0", mp.get("CasBlobPut", 0),
-                                 mp.get("CasBlobPut", 0) > 0))
+        result.add(Verdict.check("blob uploaded", "CASBlobPut > 0", mp.get("CASBlobPut", 0),
+                                 mp.get("CASBlobPut", 0) > 0))
         if actual_bytes >= 64 * MIB:
             used_mp = mp.get("DiskS3CreateMultipartUpload", 0) > 0
             result.add(Verdict("multipart upload used", "> 0 for large blobs",
@@ -242,11 +242,11 @@ class S02(Scenario):
         result.observations["pool_after_second"] = bytes_after_second.get("_total")
 
         # Dedup verdict: the second insert must avoid re-uploading existing large blob bodies.
-        avoided = delta.get("CasBlobBodyPutAvoided", 0)
-        dedup_hits = delta.get("CasBlobPutDedup", 0) + delta.get("CasBlobDedupCacheHit", 0)
-        body_puts = delta.get("CasBlobPut", 0)
+        avoided = delta.get("CASBlobBodyPutAvoided", 0)
+        dedup_hits = delta.get("CASBlobPutDedup", 0) + delta.get("CASBlobDedupCacheHit", 0)
+        body_puts = delta.get("CASBlobPut", 0)
         result.add(Verdict.check("dedup avoided body upload",
-                                 "CasBlobBodyPutAvoided>0 or CasBlobPutDedup>0",
+                                 "CASBlobBodyPutAvoided>0 or CASBlobPutDedup>0",
                                  f"avoided={avoided} dedup={dedup_hits} put={body_puts}",
                                  avoided > 0 or dedup_hits > 0))
 

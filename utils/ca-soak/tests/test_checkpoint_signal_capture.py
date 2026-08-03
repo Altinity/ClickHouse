@@ -66,18 +66,18 @@ def _all_zero():
 
 def test_signals_are_read_from_every_node_and_logged():
     a = Node("ch1", events=_all_zero())
-    b = Node("ch2", events=dict(_all_zero(), CasRefAppendPreAttemptRefused=4))
+    b = Node("ch2", events=dict(_all_zero(), CASRefAppendPreAttemptRefused=4))
     tracker = SignalTracker()
     lines = []
     capture_checkpoint_signals(Cluster(a, b), "GC checkpoint", tracker=tracker, log_fn=lines.append)
     assert tracker.reads == 2
-    assert tracker.peak["CasRefAppendPreAttemptRefused"] == 4
-    assert "CasRefAppendPreAttemptRefused=4" in lines[0]
+    assert tracker.peak["CASRefAppendPreAttemptRefused"] == 4
+    assert "CASRefAppendPreAttemptRefused=4" in lines[0]
 
 
 def test_signals_do_not_gate_the_checkpoint():
     """Task 21 step 3: report, do not fail. Their benign rates are uncharacterised — in particular
-    `CasRefAppendPreAttemptRefused` is EXPECTED to be nonzero under chaos."""
+    `CASRefAppendPreAttemptRefused` is EXPECTED to be nonzero under chaos."""
     hot = {e: 99 for e in CAS_SIGNAL_EVENTS}
     capture_checkpoint_signals(Cluster(Node("ch1", events=hot)), "cp",
                                tracker=SignalTracker(), log_fn=lambda _m: None)

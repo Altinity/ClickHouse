@@ -26,8 +26,8 @@
 
 namespace ProfileEvents
 {
-extern const Event CasMountReleaseSkippedForeignOccupant;
-extern const Event CasMountExclusivityViolation;
+extern const Event CASMountReleaseSkippedForeignOccupant;
+extern const Event CASMountExclusivityViolation;
 }
 
 /// Stage A task 3 (INV-1): ref-log transaction ids are PER-NAMESPACE and CONTIGUOUS.
@@ -620,16 +620,16 @@ TEST(CasRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     const auto successor_slot_before = backend->get(survivor_mount_key);
     ASSERT_TRUE(successor_slot_before.has_value());
     const uint64_t skipped_before
-        = ProfileEvents::global_counters[ProfileEvents::CasMountReleaseSkippedForeignOccupant].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
 
     survivor.reset();
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountReleaseSkippedForeignOccupant].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
               skipped_before + 1)
         << "a deposed writer's release must take the skip-the-farewell arm";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               violations_before)
         << "and must NOT report an exclusivity violation: this is a failover, not a broken guarantee";
     const auto successor_slot_after = backend->get(survivor_mount_key);

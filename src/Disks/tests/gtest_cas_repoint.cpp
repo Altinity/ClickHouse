@@ -11,7 +11,7 @@
 
 namespace ProfileEvents
 {
-extern const Event CasRefRepoint;
+extern const Event CASRefRepoint;
 }
 
 using namespace DB::Cas;
@@ -61,7 +61,7 @@ TEST(CasRepoint, ByteEqualIsNoOp)
     const DB::Cas::PartRefKey key{ns, "part_1"};
 
     backend->resetCounts();
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
     const DB::Cas::CommitOutcome oc = access.repointRef(key, {inlineEntry("checksums.txt", "cs")}, ProvenanceOp::Other);
     EXPECT_FALSE(oc.created);
     EXPECT_EQ(oc.manifest_ref, id.ref) << "the byte-equal outcome must name the manifest ALREADY committed, unchanged";
@@ -69,7 +69,7 @@ TEST(CasRepoint, ByteEqualIsNoOp)
     EXPECT_EQ(backend->putTotal(), 0u) << "byte-equal repoint must perform ZERO pool mutations";
     EXPECT_EQ(store->resolveRef(ns, "part_1")->manifest_id, id)
         << "the committed manifest identity must be untouched";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before);
 }
 
 /// A genuinely different entry set on an already-committed ref republishes the manifest: the returned
@@ -89,7 +89,7 @@ TEST(CasRepoint, AddFileRepoints)
     /// Warm the retained view so the erase-on-success cache discipline is actually exercised.
     ASSERT_NE(access.getView(key, DB::Cas::Freshness::CachedForLoad), nullptr);
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
     const std::vector<ManifestEntry> new_entries{inlineEntry("checksums.txt", "cs"), inlineEntry("metadata_version.txt", "7")};
     const DB::Cas::CommitOutcome oc = access.repointRef(key, new_entries, ProvenanceOp::Other);
     EXPECT_FALSE(oc.created);
@@ -98,7 +98,7 @@ TEST(CasRepoint, AddFileRepoints)
     const auto resolved = store->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved.has_value());
     EXPECT_NE(resolved->manifest_id, id_before) << "a genuine content change must mint a fresh manifest";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before + 1);
 
     /// The view a caller reads next must reflect the new file, not a stale retained one.
     auto view = access.getView(key, DB::Cas::Freshness::CachedForLoad);

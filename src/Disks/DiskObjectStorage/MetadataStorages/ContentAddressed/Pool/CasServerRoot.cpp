@@ -21,9 +21,9 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasMountLeaseLost;
-    extern const Event CasMountReleaseSkippedForeignOccupant;
-    extern const Event CasMountExclusivityViolation;
+    extern const Event CASMountLeaseLost;
+    extern const Event CASMountReleaseSkippedForeignOccupant;
+    extern const Event CASMountExclusivityViolation;
 }
 
 namespace DB
@@ -1094,7 +1094,7 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
             /// allocateWriterEpoch re-mint guard). Both recover identically and fail closed: stop
             /// renewing, latch the write fence, self-remount under a fresh writer_epoch. Never a
             /// LOGICAL_ERROR — this shape is reachable by an ordinary network timeout.
-            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+            ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "same_epoch_state_uncertain", &current,
                 "own mount slot advanced past our held token under our own (uuid, epoch) — state "
                 "uncertain (ambiguous prior renewal or epoch-state loss); fencing and self-remounting");
@@ -1106,7 +1106,7 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
 
         if (current.server_uuid == server_uuid && current.writer_epoch != writer_epoch)
         {
-            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+            ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "superseded", &current,
                 "own mount slot is held by a different writer_epoch — superseded by a newer incarnation");
             /// A normal fencing outcome (the model's localLost), not a programming assertion:
@@ -1139,7 +1139,7 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
         /// `CasMountStartup.StaleSelfMountReclaimedAfterWait`,
         /// `CasPoolRemount.ForeignOwnerIsNeverTakenOver`) deliberately pin that abort, so changing it is
         /// a ruled decision rather than a local fix.
-        ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+        ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
             "mount slot is held by a foreign server — failing closed, never taking over");
         throw Exception(ErrorCodes::ABORTED,
@@ -1152,7 +1152,7 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
     /// error: there is no foreign writer to fail closed against. Stop renewing (fail-closed: the
     /// write fence latches to lost, we never re-mint) WITHOUT aborting the server --
     /// LOGICAL_ERROR here aborts debug/ASan builds at exception construction.
-    ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+    ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
     emitMountEvent(event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
         "mount slot object vanished (backing store deleted under a live mount) — stopping renewal, fail-closed");
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
@@ -1217,7 +1217,7 @@ void MountLeaseKeeper::terminate()
             /// discipline, not the absence of a `throw`, that keeps teardown alive.
             if (deposition_observed.load(std::memory_order_acquire))
             {
-                ProfileEvents::increment(ProfileEvents::CasMountReleaseSkippedForeignOccupant);
+                ProfileEvents::increment(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
                 emitMountEvent(event_sink, CasEventType::MountRelease, srid, "deposed_foreign_occupant", &current,
                     "mount slot is held by our successor and this incarnation was already deposed — "
                     "skipping the farewell, slot left untouched");
@@ -1239,7 +1239,7 @@ void MountLeaseKeeper::terminate()
             /// from the environment, which is precisely the input class that must never be able to kill
             /// the server. There is deliberately no `chassert` either — it would abort exactly the
             /// debug/ASan runs of the tests that now have to prove teardown SURVIVES this.
-            ProfileEvents::increment(ProfileEvents::CasMountExclusivityViolation);
+            ProfileEvents::increment(ProfileEvents::CASMountExclusivityViolation);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "exclusivity_violation", &current,
                 "mount slot is held by a foreign incarnation although this runtime never observed a "
                 "deposition — single-writer exclusivity is broken; refusing the release and fencing");
@@ -1260,7 +1260,7 @@ void MountLeaseKeeper::terminate()
         /// dir -- the same environmental condition the renewal path classifies as "vanished").
         /// The desired end state of a release is "no live lease object", which is already true, so
         /// this is a clean no-op release, never a LOGICAL_ERROR (which aborts debug/ASan builds).
-        ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+        ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
         emitMountEvent(event_sink, CasEventType::MountRelease, srid, "vanished", nullptr,
             "mount slot object already gone at release (backing store deleted) — no-op release");
         LOG_INFO(getLogger("CasMountLeaseKeeper"),

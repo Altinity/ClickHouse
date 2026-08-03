@@ -226,7 +226,7 @@ struct RetiredMergeResult
     /// in-degree model is a SET, so an unmatched remove is a per-key no-op BY DESIGN (never a false
     /// deletion), but a persistent nonzero rate means removal deltas are reaching the reducer without
     /// their matching activation, which is a correctness signal worth paging on. See
-    /// `ProfileEvents::CasGcUnmatchedRemoveDeltas`.
+    /// `ProfileEvents::CASGcUnmatchedRemoveDeltas`.
     uint64_t unmatched_removes = 0;
     /// The first unmatched remove observed this merge, for the caller's WARNING (one example is enough
     /// to start an investigation; logging every occurrence would flood a hot per-edge inner loop).
@@ -374,7 +374,7 @@ struct GcRoundWorkBudget
 /// `peek_head` is a side-effect-free HEAD used only by the resurrect-supersede
 /// branch (a `prior_retired` entry whose blob re-touched this pass at net in-degree 0, current token
 /// differs from the stale entry's token). `head_blob` is the FRESH-CONDEMN observation hook — it emits
-/// the `IndegZero`/`GcRetireObserve`/`BlobRetire` trail and increments `CasGcRetiredCondemned`, which is
+/// the `IndegZero`/`GcRetireObserve`/`BlobRetire` trail and increments `CASGcRetiredCondemned`, which is
 /// wrong for a supersede (the supersede's own event is `blob_retire_replaced`, emitted once by the
 /// caller from `RetiredMergeResult::replaced`). Calling `head_blob` from the supersede branch used to
 /// double-emit `blob_retire` alongside `blob_retire_replaced` and double-count the condemned counter;

@@ -10,9 +10,9 @@
 
 namespace CurrentMetrics
 {
-    extern const Metric CasBlobUploadPoolThreads;
-    extern const Metric CasBlobUploadPoolThreadsActive;
-    extern const Metric CasBlobUploadPoolThreadsScheduled;
+    extern const Metric CASBlobUploadPoolThreads;
+    extern const Metric CASBlobUploadPoolThreadsActive;
+    extern const Metric CASBlobUploadPoolThreadsScheduled;
 }
 
 namespace DB
@@ -43,9 +43,9 @@ void initializeBlobUploadPool(size_t size)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "The CAS blob upload pool is initialized twice");
 
     pool_instance = std::make_unique<ThreadPool>(
-        CurrentMetrics::CasBlobUploadPoolThreads,
-        CurrentMetrics::CasBlobUploadPoolThreadsActive,
-        CurrentMetrics::CasBlobUploadPoolThreadsScheduled,
+        CurrentMetrics::CASBlobUploadPoolThreads,
+        CurrentMetrics::CASBlobUploadPoolThreadsActive,
+        CurrentMetrics::CASBlobUploadPoolThreadsScheduled,
         size);
 }
 

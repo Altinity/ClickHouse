@@ -23,12 +23,12 @@
 
 namespace ProfileEvents
 {
-extern const Event CasMetaPut;
-extern const Event CasMetaCas;
-extern const Event CasMetaCreateClean;
-extern const Event CasMetaAdoptBackfill;
-extern const Event CasMetaResurrectClean;
-extern const Event CasBlobAdoptTrusted;
+extern const Event CASMetaPut;
+extern const Event CASMetaCompareSwap;
+extern const Event CASMetaCreateClean;
+extern const Event CASMetaAdoptBackfill;
+extern const Event CASMetaResurrectClean;
+extern const Event CASBlobAdoptTrusted;
 }
 
 namespace DB::ErrorCodes
@@ -281,13 +281,13 @@ TEST(CasPartWriteTxn, PutBlobFreshUploadWritesCleanMeta)
 }
 
 /// §0 introspection: a fresh body upload writes the Clean meta exactly once through the
-/// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaCreateClean`).
+/// `putMetaIfAbsent` choke point (`CASMetaPut`), tagged with its reason (`CASMetaCreateClean`).
 TEST(CasPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 {
-    /// Fresh body upload writes the Clean meta exactly once: CasMetaPut +1 (choke point)
-    /// and CasMetaCreateClean +1 (reason). Reuse the fixture of the nearest putBlob test.
-    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCreateClean].load();
+    /// Fresh body upload writes the Clean meta exactly once: CASMetaPut +1 (choke point)
+    /// and CASMetaCreateClean +1 (reason). Reuse the fixture of the nearest putBlob test.
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load();
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -297,19 +297,19 @@ TEST(CasPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load() - put_before, 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaCreateClean].load() - reason_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load() - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaCreateClean].load() - reason_before, 1);
 }
 
 /// §0 introspection: an adopt of a pre-existing body that has NO meta at all (a pre-protocol blob, or a
 /// lost race with a concurrent fresh-uploader's own meta write) backfills a Clean meta through the
-/// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaAdoptBackfill`). No
+/// `putMetaIfAbsent` choke point (`CASMetaPut`), tagged with its reason (`CASMetaAdoptBackfill`). No
 /// existing test elsewhere in the suite drives this branch: every other pre-seeded raw body in this file
 /// pairs `writeRawBlobBody` with `writeMetaClean`, which skips the `!lm` backfill branch entirely.
 TEST(CasPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
 {
-    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaAdoptBackfill].load();
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load();
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -334,8 +334,8 @@ TEST(CasPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load() - put_before, 1);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaAdoptBackfill].load() - reason_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaPut].load() - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaAdoptBackfill].load() - reason_before, 1);
 
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
     ASSERT_TRUE(lm.has_value()) << "the adopt-backfill must leave a Clean meta for future point-readers";
@@ -457,11 +457,11 @@ TEST(CasPartWriteTxn, PutBlobResurrectsWhenMetaCondemned)
 }
 
 /// §0 introspection: the resurrect (condemned-displacement) meta flip goes through the `casMeta`
-/// choke point (`CasMetaCas`), tagged with its reason (`CasMetaResurrectClean`).
+/// choke point (`CASMetaCompareSwap`), tagged with its reason (`CASMetaResurrectClean`).
 TEST(CasPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
 {
-    const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCas].load();
-    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load();
+    const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean].load();
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -481,8 +481,8 @@ TEST(CasPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasMetaCas].load() - cas_before, 1);
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load() - reason_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap].load() - cas_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean].load() - reason_before, 1);
 }
 
 TEST(CasPartWriteTxn, PutBlobWrongSizeFailsClosed)
@@ -910,7 +910,7 @@ TEST(CasPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     /// §4 manifest-trust: a committed-source adoptEvidence leaf is TRUSTED at the promote gate — the live
     /// source pins the blob (in-degree >= 1, not condemnable) and this build's precommit edge is durable,
     /// so promote publishes with NO per-file HEAD (presence) and NO loadMeta GET (the condemned point-read)
-    /// and NO copy-forward. The durable manifest edge is the liveness evidence. `CasBlobAdoptTrusted` counts
+    /// and NO copy-forward. The durable manifest edge is the liveness evidence. `CASBlobAdoptTrusted` counts
     /// the trusted leaf. A KeyCountingBackend proves zero probes on the blob key and the blob-meta key.
     auto raw = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<KeyCountingBackend>(raw);
@@ -931,14 +931,14 @@ TEST(CasPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    const auto trusted_before = ProfileEvents::global_counters[ProfileEvents::CasBlobAdoptTrusted].load();
+    const auto trusted_before = ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted].load();
     const size_t head_before = counting->headCountFor(blob_key);
     const size_t meta_get_before = counting->getCountFor(meta_key);
 
     build->promote(ns, "part_1", build->buildId(), id);
 
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasBlobAdoptTrusted].load() - trusted_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted].load() - trusted_before, 1);
     EXPECT_EQ(counting->headCountFor(blob_key) - head_before, 0u) << "trust must not HEAD the adopted blob";
     EXPECT_EQ(counting->getCountFor(meta_key) - meta_get_before, 0u) << "trust must not loadMeta the adopted blob";
 }

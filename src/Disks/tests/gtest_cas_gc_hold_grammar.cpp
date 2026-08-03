@@ -58,7 +58,7 @@ extern const int LOGICAL_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CasGcRebuildVirginByEnumeration;
+extern const Event CASGcRebuildVirginByEnumeration;
 }
 
 namespace
@@ -1565,7 +1565,7 @@ TEST(CasGcHoldGrammar, RebuildRefusesWhenANarrowProbeFindsASealAboveTheListingMa
 /// what it actually is. It rests on THREE pieces of enumeration evidence (wide LIST empty, narrow
 /// generation-1 probe empty, no `gc/state`) and on no point read at all, so it is COUNTED: an operator
 /// reading a disaster-recovery run needs to see that the clean slate came from enumeration rather than
-/// from proof. `CasGcRebuildVirginByEnumeration` on a pool that has ever completed a round means the
+/// from proof. `CASGcRebuildVirginByEnumeration` on a pool that has ever completed a round means the
 /// enumeration lied.
 TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTheVerdict)
 {
@@ -1580,11 +1580,11 @@ TEST(CasGcHoldGrammar, RebuildProceedsOnAPoolThatNeverSealedABaselineAndCountsTh
     ASSERT_FALSE(backend->head(layout.gcStateKey()).exists);
 
     using ProfileEvents::global_counters;
-    const auto virgin_before = global_counters[ProfileEvents::CasGcRebuildVirginByEnumeration].load();
+    const auto virgin_before = global_counters[ProfileEvents::CASGcRebuildVirginByEnumeration].load();
 
     Gc gc(store, kGc);
     const RebuildReport rep = gc.rebuildBaseline(/*force=*/false);
     EXPECT_TRUE(rep.performed) << rep.refusal;
-    EXPECT_GT(global_counters[ProfileEvents::CasGcRebuildVirginByEnumeration].load(), virgin_before)
+    EXPECT_GT(global_counters[ProfileEvents::CASGcRebuildVirginByEnumeration].load(), virgin_before)
         << "a clean slate granted from enumeration alone must be visible to whoever reads the run";
 }

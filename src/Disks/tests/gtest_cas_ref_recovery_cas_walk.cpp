@@ -57,12 +57,12 @@ extern const int NETWORK_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CasRefRecoveryRestarts;
-extern const Event CasRefRecoveryEpochSealed;
-extern const Event CasRefRecoveryEpochSealAdopted;
-extern const Event CasRefRecoveryStragglerAdopted;
-extern const Event CasRefRecoveryCancelled;
-extern const Event CasRefCkptPublished;
+extern const Event CASRefRecoveryRestarts;
+extern const Event CASRefRecoveryEpochSealed;
+extern const Event CASRefRecoveryEpochSealAdopted;
+extern const Event CASRefRecoveryStragglerAdopted;
+extern const Event CASRefRecoveryCancelled;
+extern const Event CASRefCkptPublished;
 }
 
 using namespace DB::Cas;
@@ -876,9 +876,9 @@ TEST(CasRefRecoveryCasWalk, DeadEpochIsClosedByOurOwnSealAtTPlusOne)
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 2u);
 
-    const uint64_t sealed_before = counterOf(ProfileEvents::CasRefRecoveryEpochSealed);
+    const uint64_t sealed_before = counterOf(ProfileEvents::CASRefRecoveryEpochSealed);
     ASSERT_EQ(store->listRefs(ns).size(), 1u);
-    EXPECT_EQ(counterOf(ProfileEvents::CasRefRecoveryEpochSealed), sealed_before + 1);
+    EXPECT_EQ(counterOf(ProfileEvents::CASRefRecoveryEpochSealed), sealed_before + 1);
 
     const RefTxnId seal_id{1, 2};
     const auto seal = readLogTxn(*backend, layout, ns, seal_id);
@@ -909,9 +909,9 @@ TEST(CasRefRecoveryCasWalk, ConcurrentRecoverersSealIsAdoptedNotContested)
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    const uint64_t adopted_before = counterOf(ProfileEvents::CasRefRecoveryEpochSealAdopted);
+    const uint64_t adopted_before = counterOf(ProfileEvents::CASRefRecoveryEpochSealAdopted);
     ASSERT_EQ(store->listRefs(ns).size(), 1u);
-    EXPECT_GT(counterOf(ProfileEvents::CasRefRecoveryEpochSealAdopted), adopted_before);
+    EXPECT_GT(counterOf(ProfileEvents::CASRefRecoveryEpochSealAdopted), adopted_before);
     EXPECT_EQ(store->lastEpochSealForTest(ns), std::optional<RefTxnId>(RefTxnId{1, 2}))
         << "an adopted seal is this namespace's chain link exactly as a minted one is";
 }
@@ -938,11 +938,11 @@ TEST(CasRefRecoveryCasWalk, StragglerAtTPlusOneIsAdoptedAndResealedAtTheNewTPlus
     auto store = openWalkPool(backend);
     ASSERT_TRUE(store);
 
-    const uint64_t straggler_before = counterOf(ProfileEvents::CasRefRecoveryStragglerAdopted);
+    const uint64_t straggler_before = counterOf(ProfileEvents::CASRefRecoveryStragglerAdopted);
     const auto refs = store->listRefs(ns);
     EXPECT_EQ(refs.size(), 2u) << "the straggler's transaction is durable and must be applied, not skipped";
     EXPECT_TRUE(refs.contains("late"));
-    EXPECT_GT(counterOf(ProfileEvents::CasRefRecoveryStragglerAdopted), straggler_before);
+    EXPECT_GT(counterOf(ProfileEvents::CASRefRecoveryStragglerAdopted), straggler_before);
 
     const auto seal = readLogTxn(*backend, layout, ns, RefTxnId{1, 3});
     ASSERT_TRUE(seal.has_value()) << "the epoch must be re-sealed at the NEW T+1 = {1,3}, never at a blindly minted T+2";
@@ -1401,8 +1401,8 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
         cv.wait(lock, [&] { return release_recovery; });
     };
 
-    const uint64_t ckpt_before = counterOf(ProfileEvents::CasRefCkptPublished);
-    const uint64_t cancelled_before = counterOf(ProfileEvents::CasRefRecoveryCancelled);
+    const uint64_t ckpt_before = counterOf(ProfileEvents::CASRefCkptPublished);
+    const uint64_t cancelled_before = counterOf(ProfileEvents::CASRefRecoveryCancelled);
 
     std::thread recovery([&] { try { store->listRefs(ns); } catch (...) {} }); // NOLINT(bugprone-empty-catch): the outcome is asserted below via the ProfileEvents counters, not this thread's exception
 
@@ -1438,9 +1438,9 @@ TEST(CasRefRecoveryCasWalk, RemountBarrierBlocksUntilAPausedRecoveryAcknowledges
     recovery.join();
     EXPECT_TRUE(barrier_returned.load());
 
-    EXPECT_GT(counterOf(ProfileEvents::CasRefRecoveryCancelled), cancelled_before)
+    EXPECT_GT(counterOf(ProfileEvents::CASRefRecoveryCancelled), cancelled_before)
         << "the released recovery must observe the cancellation rather than run to completion";
-    EXPECT_EQ(counterOf(ProfileEvents::CasRefCkptPublished), ckpt_before)
+    EXPECT_EQ(counterOf(ProfileEvents::CASRefCkptPublished), ckpt_before)
         << "a cancelled recovery performs ZERO _ckpt CASes";
     EXPECT_FALSE(store->refTableRecoveredForTest(ns)) << "and ZERO installs";
 }
@@ -1906,7 +1906,7 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
         cv.wait(lock, [&] { return release; });
     };
 
-    const uint64_t adopted_before = counterOf(ProfileEvents::CasRefRecoveryEpochSealAdopted);
+    const uint64_t adopted_before = counterOf(ProfileEvents::CASRefRecoveryEpochSealAdopted);
     std::thread first([&] { store->listRefs(ns); });
     {
         std::unique_lock lock(m);
@@ -1933,7 +1933,7 @@ TEST(CasRefRecoveryCasWalk, ASecondCallerWaitsForTheWalkInsteadOfRacingIt)
     /// Exactly ONE walk minted the seal, and no second walk ever met it as an occupant. Adopting is the
     /// CORRECT outcome for a concurrent recoverer -- it is just work this serialization exists to avoid
     /// paying inside one process, so observing zero adoptions is what proves the second caller waited.
-    EXPECT_EQ(counterOf(ProfileEvents::CasRefRecoveryEpochSealAdopted), adopted_before);
+    EXPECT_EQ(counterOf(ProfileEvents::CASRefRecoveryEpochSealAdopted), adopted_before);
     const auto seal = readLogTxn(*backend, layout, ns, RefTxnId{1, 2});
     ASSERT_TRUE(seal.has_value());
     EXPECT_TRUE(refLogTxnIsEpochSeal(*seal));

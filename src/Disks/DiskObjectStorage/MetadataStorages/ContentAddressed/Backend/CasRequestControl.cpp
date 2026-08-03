@@ -18,11 +18,11 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasConditionalWriteAttempts;
-    extern const Event CasConditionalWriteCommitted;
-    extern const Event CasConditionalWriteDefiniteFailure;
-    extern const Event CasConditionalWriteUnresolved;
-    extern const Event CasConditionalWriteFenceLostPostWrite;
+    extern const Event CASConditionalWriteAttempts;
+    extern const Event CASConditionalWriteCommitted;
+    extern const Event CASConditionalWriteDefiniteFailure;
+    extern const Event CASConditionalWriteUnresolved;
+    extern const Event CASConditionalWriteFenceLostPostWrite;
 }
 
 namespace DB
@@ -63,7 +63,7 @@ CasWriteOutcome classifyConditionalWriteResult([[maybe_unused]] const std::excep
 
 void recordConditionalWriteAttemptStarted()
 {
-    ProfileEvents::increment(ProfileEvents::CasConditionalWriteAttempts);
+    ProfileEvents::increment(ProfileEvents::CASConditionalWriteAttempts);
 }
 
 void recordConditionalWriteOutcome(CasWriteOutcome outcome)
@@ -71,13 +71,13 @@ void recordConditionalWriteOutcome(CasWriteOutcome outcome)
     switch (outcome)
     {
         case CasWriteOutcome::Committed:
-            ProfileEvents::increment(ProfileEvents::CasConditionalWriteCommitted);
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteCommitted);
             return;
         case CasWriteOutcome::DefiniteFailure:
-            ProfileEvents::increment(ProfileEvents::CasConditionalWriteDefiniteFailure);
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteDefiniteFailure);
             return;
         case CasWriteOutcome::Unresolved:
-            ProfileEvents::increment(ProfileEvents::CasConditionalWriteUnresolved);
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteUnresolved);
             return;
     }
 }
@@ -409,7 +409,7 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         /// fence loss is visible rather than folded into ordinary retry-budget exhaustion.
         if (!fence_ok())
         {
-            ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+            ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
             return unresolved(CasUnresolvedReason::FenceLostPostWrite);
         }
         if (out_token)
@@ -469,7 +469,7 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
             /// lost here means the write may have landed but this call must never claim it did.
             if (!fence_ok())
             {
-                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
                 return {CasCreateOutcome::Unresolved, {}};
             }
             return {CasCreateOutcome::Committed, put->token};
@@ -535,7 +535,7 @@ CasOverwriteResult CasRequestController::putOverwriteControlled(
         {
             if (!fence_ok())
             {
-                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
                 return {CasOverwriteOutcome::Unresolved, {}};
             }
             return {CasOverwriteOutcome::Committed, put->token};
@@ -563,7 +563,7 @@ CasOverwriteResult CasRequestController::putOverwriteControlled(
         {
             if (!fence_ok())
             {
-                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
                 return {CasOverwriteOutcome::Unresolved, {}};
             }
             return {CasOverwriteOutcome::Committed, got->token};
@@ -616,7 +616,7 @@ CasOverwriteResult CasRequestController::putIfAbsentControlledMutable(
         {
             if (!fence_ok())
             {
-                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
                 return {CasOverwriteOutcome::Unresolved, {}};
             }
             return {CasOverwriteOutcome::Committed, put->token};
@@ -644,7 +644,7 @@ CasOverwriteResult CasRequestController::putIfAbsentControlledMutable(
         {
             if (!fence_ok())
             {
-                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                ProfileEvents::increment(ProfileEvents::CASConditionalWriteFenceLostPostWrite);
                 return {CasOverwriteOutcome::Unresolved, {}};
             }
             return {CasOverwriteOutcome::Committed, got->token};

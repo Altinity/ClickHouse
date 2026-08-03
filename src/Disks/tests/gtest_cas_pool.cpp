@@ -33,8 +33,8 @@ extern const int NETWORK_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CasRefRecoveryEpochSealed;
-extern const Event CasMountExclusivityViolation;
+extern const Event CASRefRecoveryEpochSealed;
+extern const Event CASMountExclusivityViolation;
 }
 
 using namespace DB::Cas;
@@ -1449,10 +1449,10 @@ TEST(CasPoolRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_FALSE(invalid_store->tryRemountOnce()) << "a foreign owner is never taken over at remount";
 
     const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
     invalid_store.reset();   /// must not abort, must not terminate
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               violations_before + 1)
         << "the release must report the broken single-writer guarantee rather than dying on it";
     const auto occupant_after = foreign_backend->get(foreign_mount_key);
@@ -2003,13 +2003,13 @@ TEST(CasRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
 
     using ProfileEvents::global_counters;
-    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load();
+    const auto sealed_before = global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load();
 
     /// ns2's FIRST recovery under this incarnation happens now, at epoch 3 -- strictly after both
     /// remounts. Its only data is at epoch 1, so epochs 1 and 2 are both dead for it.
     EXPECT_EQ(store->listRefs(ns2).size(), 1u);
 
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryEpochSealed].load(), sealed_before + 2)
+    EXPECT_EQ(global_counters[ProfileEvents::CASRefRecoveryEpochSealed].load(), sealed_before + 2)
         << "both dead epochs must be closed -- the chain link is what a later reader needs to tell an "
            "EMPTY epoch from a LOST one, and that is independent of how each mount ended";
     EXPECT_TRUE(backend->get(layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns2), RefTxnId{1, 2})).has_value())

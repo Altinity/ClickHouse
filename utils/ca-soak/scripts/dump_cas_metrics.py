@@ -16,7 +16,7 @@ CH2_PORT = 9002
 def query_events(binary, port):
     out = subprocess.check_output(
         [binary, "client", "--host", "127.0.0.1", "--port", str(port),
-         "-q", "SELECT name, value FROM system.events WHERE name LIKE 'Cas%' ORDER BY name FORMAT TSV"],
+         "-q", "SELECT name, value FROM system.events WHERE name LIKE 'CAS%' ORDER BY name FORMAT TSV"],
         text=True,
     )
     d = {}

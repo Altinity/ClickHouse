@@ -206,12 +206,12 @@ class S09(Scenario):
 
         # Identity-update body-avoidance: dedup must have avoided the large body PUT.
         idelta = result.observations.get("counters_identity_update", {})
-        avoided = _counter(idelta, "CasBlobBodyPutAvoided")
-        dedup = _counter(idelta, "CasBlobPutDedup") + _counter(idelta, "CasBlobDedupCacheHit")
-        body_puts = _counter(idelta, "CasBlobPut")
+        avoided = _counter(idelta, "CASBlobBodyPutAvoided")
+        dedup = _counter(idelta, "CASBlobPutDedup") + _counter(idelta, "CASBlobDedupCacheHit")
+        body_puts = _counter(idelta, "CASBlobPut")
         result.add(Verdict.check(
             "identity update avoids large body re-upload",
-            "CasBlobBodyPutAvoided>0 or CasBlobPutDedup>0",
+            "CASBlobBodyPutAvoided>0 or CASBlobPutDedup>0",
             f"avoided={avoided} dedup={dedup} body_put={body_puts}",
             avoided > 0 or dedup > 0))
 
@@ -354,8 +354,8 @@ class S10(Scenario):
                     max_patch_parts = max(max_patch_parts, pc)
 
             delta = counters().get("_total", {})
-            cas_conflicts += _counter(delta, "CasRootCasConflict")
-            total_blob_puts += _counter(delta, "CasBlobPut")
+            cas_conflicts += _counter(delta, "CASRootCompareSwapConflict")
+            total_blob_puts += _counter(delta, "CASBlobPut")
 
             # mid-burst forced GC round (drains obsolete patch content as refs drop) — best-effort.
             try:

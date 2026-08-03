@@ -20,8 +20,8 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasIdentityLost;
-    extern const Event CasDataRootVanished;
+    extern const Event CASIdentityLost;
+    extern const Event CASDataRootVanished;
 }
 
 namespace DB::Cas
@@ -360,7 +360,7 @@ void CasMountRuntime::enterIdentityLost()
             expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire))
         return;
 
-    ProfileEvents::increment(ProfileEvents::CasIdentityLost);
+    ProfileEvents::increment(ProfileEvents::CASIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
         "Content-addressed pool '{}' entered IdentityLost: the pool sentinels (_pool_meta and the owner "
         "anchor) are authoritatively absent (both KeyAbsent). This is a fail-loud TERMINAL state: "
@@ -412,7 +412,7 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
     /// `Live`/`TransientNotLive`), so this value is absorbing.
     pool_lifecycle.store(which, std::memory_order_release);
 
-    ProfileEvents::increment(ProfileEvents::CasDataRootVanished);
+    ProfileEvents::increment(ProfileEvents::CASDataRootVanished);
     LOG_WARNING(getLogger("CasPool"),
         "Content-addressed pool '{}' entered Vanished({}): {}. The disk stays registered but store-class "
         "access now fails loud with a typed error (truth); restart re-registers the name.",

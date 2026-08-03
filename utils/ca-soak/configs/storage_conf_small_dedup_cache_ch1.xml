@@ -5,8 +5,8 @@
                  dedup_cache_bytes is reduced to 1 MiB (default 64 MiB) to exercise the
                  in-memory dedup-hint eviction path.  When the working set of distinct
                  blob heads exceeds 1 MiB, the cache evicts entries, forcing remote
-                 HEAD-first probes (CasBlobHeadFirst) on re-insert rather than in-memory
-                 CasBlobDedupCacheHit short-circuits.  Correctness / dedup must be
+                 HEAD-first probes (CASBlobHeadFirst) on re-insert rather than in-memory
+                 CASBlobDedupCacheHit short-circuits.  Correctness / dedup must be
                  preserved via the remote HEAD path; only the in-memory shortcut rate drops. -->
             <ca>
                 <type>object_storage</type>
@@ -21,7 +21,7 @@
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <!-- S24: 1 MiB dedup-cache (vs 64 MiB default) to exercise the eviction +
                      remote-HEAD fallback path.  Correctness unchanged: a cache miss still
-                     dedups via HEAD before the body PUT (CasBlobBodyPutAvoided stays
+                     dedups via HEAD before the body PUT (CASBlobBodyPutAvoided stays
                      positive). -->
                 <dedup_cache_bytes>1048576</dedup_cache_bytes>
             </ca>

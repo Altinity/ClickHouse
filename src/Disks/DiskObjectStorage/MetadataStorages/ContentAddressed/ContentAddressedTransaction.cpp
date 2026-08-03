@@ -32,8 +32,8 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasBlobUploadFanoutBatches;
-    extern const Event CasBlobUploadFanoutTasks;
+    extern const Event CASBlobUploadFanoutBatches;
+    extern const Event CASBlobUploadFanoutTasks;
 }
 
 namespace fs = std::filesystem;
@@ -1716,7 +1716,7 @@ void fanOutBlobUploads(
     if (grouped.empty())
         return;
 
-    ProfileEvents::increment(ProfileEvents::CasBlobUploadFanoutBatches);
+    ProfileEvents::increment(ProfileEvents::CASBlobUploadFanoutBatches);
 
     /// One result slot per unique ref, pre-sized so element addresses are STABLE: each task writes ONLY
     /// its own slot (no data race on the vector) and the vector never reallocates. Declared BEFORE the
@@ -1773,7 +1773,7 @@ void fanOutBlobUploads(
             }));
             if (task_hooks && task_hooks->after_enqueue)
                 task_hooks->after_enqueue(ref);   /// task already tracked ⇒ the drain guard joins it too
-            ProfileEvents::increment(ProfileEvents::CasBlobUploadFanoutTasks);
+            ProfileEvents::increment(ProfileEvents::CASBlobUploadFanoutTasks);
         }
         /// Drain ALL tasks, then rethrow the FIRST (ascending-ref dispatch order) that failed. A rethrow
         /// bypasses the merge below, so NOTHING is merged: `build` stays at its pre-fan-out pending-dep

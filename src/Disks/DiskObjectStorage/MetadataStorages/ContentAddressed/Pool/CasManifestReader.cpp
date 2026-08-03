@@ -7,13 +7,13 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasPartFolderManifestGets;
+    extern const Event CASPartFolderManifestGets;
 }
 
 namespace CurrentMetrics
 {
-    extern const Metric CasManifestDecodeCacheBytes;
-    extern const Metric CasManifestDecodeCacheEntries;
+    extern const Metric CASManifestDecodeCacheBytes;
+    extern const Metric CASManifestDecodeCacheEntries;
 }
 
 namespace DB
@@ -36,7 +36,7 @@ CasManifestReader::CasManifestReader(
 {
     if (manifest_decode_cache_bytes > 0)
         manifest_cache = std::make_unique<ManifestDecodeCache>(
-            "LRU", CurrentMetrics::CasManifestDecodeCacheBytes, CurrentMetrics::CasManifestDecodeCacheEntries,
+            "LRU", CurrentMetrics::CASManifestDecodeCacheBytes, CurrentMetrics::CASManifestDecodeCacheEntries,
             manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 }
 
@@ -88,7 +88,7 @@ std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const 
     if (!object)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "manifest at {} vanished between head and get — INV-NO-DANGLE", key);
-    ProfileEvents::increment(ProfileEvents::CasPartFolderManifestGets);
+    ProfileEvents::increment(ProfileEvents::CASPartFolderManifestGets);
 
     PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, object->bytes));
 

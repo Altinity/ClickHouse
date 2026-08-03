@@ -3,7 +3,7 @@
 # Inserts a part on ch1, syncs to ch2, then validates:
 #   1. Data parity (ch1 and ch2 have same rows/parts)
 #   2. Relink path was taken (part_manifest_v1 cookie in ch2 log)
-#   3. Blobs NOT re-uploaded on ch2 (CasObjectPut / CasBlobPut stays flat during fetch)
+#   3. Blobs NOT re-uploaded on ch2 (CasObjectPut / CASBlobPut stays flat during fetch)
 #   4. Distinct ManifestId on ch2 vs ch1 (own local manifest)
 #   5. Fallback works (confirmed code path analysis)
 # Exits nonzero on any assertion failure.
@@ -53,9 +53,9 @@ echo "Table created on both nodes."
 
 echo ""
 echo "--- Step 2: Capture blob-upload baseline on ch2 ---"
-# Capture CasBlobPut / CasObjectPut metrics BEFORE fetch so we can check they stay flat.
+# Capture CASBlobPut / CasObjectPut metrics BEFORE fetch so we can check they stay flat.
 # system.events counts are cumulative per-server-start so a snapshot delta works.
-blob_put_before=$(Q2 "SELECT value FROM system.events WHERE name LIKE '%CasObjectPut%' OR name LIKE '%CasBlobPut%' LIMIT 1 FORMAT TabSeparated" 2>/dev/null || echo "0")
+blob_put_before=$(Q2 "SELECT value FROM system.events WHERE name LIKE '%CasObjectPut%' OR name LIKE '%CASBlobPut%' LIMIT 1 FORMAT TabSeparated" 2>/dev/null || echo "0")
 echo "ch2 blob puts before: $blob_put_before"
 
 # Mark ch2 log position right before the fetch
@@ -124,15 +124,15 @@ else
 fi
 
 echo ""
-echo "--- Step 7: Assertion 3 - Blobs NOT re-uploaded (flat CasBlobPut counter) ---"
+echo "--- Step 7: Assertion 3 - Blobs NOT re-uploaded (flat CASBlobPut counter) ---"
 # Sleep briefly to let any async operations complete
 sleep 2
-blob_put_after=$(Q2 "SELECT value FROM system.events WHERE name LIKE '%CasObjectPut%' OR name LIKE '%CasBlobPut%' LIMIT 1 FORMAT TabSeparated" 2>/dev/null || echo "0")
+blob_put_after=$(Q2 "SELECT value FROM system.events WHERE name LIKE '%CasObjectPut%' OR name LIKE '%CASBlobPut%' LIMIT 1 FORMAT TabSeparated" 2>/dev/null || echo "0")
 echo "ch2 blob puts before: $blob_put_before"
 echo "ch2 blob puts after: $blob_put_after"
 
 # Also check all CA metrics on ch2
-ca_metrics=$(Q2 "SELECT name, value FROM system.events WHERE name LIKE 'Cas%' ORDER BY name FORMAT TabSeparated" 2>/dev/null || echo "N/A")
+ca_metrics=$(Q2 "SELECT name, value FROM system.events WHERE name LIKE 'CAS%' ORDER BY name FORMAT TabSeparated" 2>/dev/null || echo "N/A")
 echo "ch2 CA events:"
 echo "$ca_metrics"
 echo "$ca_metrics" > "$OUT_DIR/ch2_ca_events.txt"

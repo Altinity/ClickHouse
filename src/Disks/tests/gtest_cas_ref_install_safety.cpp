@@ -45,7 +45,7 @@ extern const int MEMORY_LIMIT_EXCEEDED;
 
 namespace ProfileEvents
 {
-extern const Event CasRefNeedsRecovery;
+extern const Event CASRefNeedsRecovery;
 }
 
 using namespace DB::Cas;
@@ -787,14 +787,14 @@ TEST(CasRefInstallSafety, PostDurableInstallFailureRequiresRecovery)
     publishEmptyPart(store, ns, "x");
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
 
-    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load();
+    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CASRefNeedsRecovery].load();
     armOneShotInstallFailure(store);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
     store->setInstallRegionProbeForTest(nullptr);
 
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery)
         << "an install that failed AFTER its object was durable must be visible, not silent";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load() - needs_recovery_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefNeedsRecovery].load() - needs_recovery_before, 1u)
         << "the transition to NeedsRecovery must be exported exactly once";
 }
 
@@ -842,7 +842,7 @@ TEST(CasRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load();
+    const uint64_t needs_recovery_before = ProfileEvents::global_counters[ProfileEvents::CASRefNeedsRecovery].load();
     armOneShotInstallFailure(store);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED, [&] { store->dropRef(ns, "x"); });
     store->setInstallRegionProbeForTest(nullptr);
@@ -866,7 +866,7 @@ TEST(CasRefInstallSafety, NeedsRecoveryReplaysBeforeALaterFlush)
         << "the stranded drop of 'x' is durable, so the re-derivation must install it before returning "
            "the lane to Ready";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Ready);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefNeedsRecovery].load() - needs_recovery_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefNeedsRecovery].load() - needs_recovery_before, 1u)
         << "the event counts transitions, so the successful flush must not have added another";
 }
 

@@ -19,8 +19,8 @@ namespace DB::ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasMountLeaseLost;
-    extern const Event CasMountExclusivityViolation;
+    extern const Event CASMountLeaseLost;
+    extern const Event CASMountExclusivityViolation;
 }
 
 using namespace DB::Cas;
@@ -430,7 +430,7 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     k.start();
 
     const String mount_key = l.mountKey("r");
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();  /// NOLINT(clang-analyzer-deadcode.DeadStores)
 
     /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the keeper still
     /// holds a (now stale) token for it.
@@ -446,7 +446,7 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
         EXPECT_EQ(e.code(), DB::ErrorCodes::FILE_DOESNT_EXIST) << e.message();
         EXPECT_NE(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load(), lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
 }
 
 /// STID 3982-3b48 (part 1b): the terminal/clean-release counterpart to the renewal fix above. When
@@ -457,7 +457,7 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
 /// this must be a no-op, never a `LOGICAL_ERROR` (which aborts debug/ASan builds).
 ///
 /// Driven WITHOUT a prior failed renew, so the count is deterministic: this is the only place along
-/// this path that increments `CasMountLeaseLost`, so we expect exactly +1 (not +2, since renewal was
+/// this path that increments `CASMountLeaseLost`, so we expect exactly +1 (not +2, since renewal was
 /// never invoked here).
 TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
 {
@@ -470,7 +470,7 @@ TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
     k.start();
 
     const String mount_key = l.mountKey("r");
-    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
 
     /// Simulate `rm -rf` of the backing store: the mount slot object is gone before we ever attempt
     /// a renewal, so `terminate()`'s token-guarded farewell PUT is the first thing to observe it.
@@ -478,7 +478,7 @@ TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
 
     EXPECT_NO_THROW(k.stop())
         << "clean release against a vanished store must be a no-op, not a LOGICAL_ERROR abort";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load(), lost_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
 }
 
 /// rev.6: a bare `claimMount` (no `proven_dead_token`) NEVER reclaims a same-uuid, different-epoch
@@ -988,11 +988,11 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     const auto reclaimer_slot_before = overlap_backend->get(overlap_mount_key);
     ASSERT_TRUE(reclaimer_slot_before.has_value());
     const uint64_t overlap_violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
 
     first.reset();   /// must not abort, must not terminate
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountExclusivityViolation].load(),
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               overlap_violations_before + 1);
     const auto reclaimer_slot_after = overlap_backend->get(overlap_mount_key);
     ASSERT_TRUE(reclaimer_slot_after.has_value());

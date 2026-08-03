@@ -44,10 +44,10 @@ def test_open_db_migrates_a_db_written_by_an_older_harness(tmp_path):
     old.close()
 
     conn = metrics_mod.open_db(db)
-    metrics_mod.record(conn, {"ts": 7, "node": "ch1", "CasRefAppendWedged": 2})
+    metrics_mod.record(conn, {"ts": 7, "node": "ch1", "CASRefAppendWedged": 2})
     got = metrics_mod.rows(conn)[0]
     assert got["ts"] == 7
-    assert got["CasRefAppendWedged"] == 2
+    assert got["CASRefAppendWedged"] == 2
 
 
 def test_gc_phase_rows_persist(tmp_path):

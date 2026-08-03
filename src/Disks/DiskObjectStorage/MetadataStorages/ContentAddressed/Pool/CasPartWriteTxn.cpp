@@ -19,13 +19,13 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasBlobDedupCacheHit;
-    extern const Event CasBlobHeadFirst;
-    extern const Event CasBlobBodyPutAvoided;
-    extern const Event CasBlobAdoptTrusted;
-    extern const Event CasMetaCreateClean;
-    extern const Event CasMetaAdoptBackfill;
-    extern const Event CasMetaResurrectClean;
+    extern const Event CASBlobDedupCacheHit;
+    extern const Event CASBlobHeadFirst;
+    extern const Event CASBlobBodyPutAvoided;
+    extern const Event CASBlobAdoptTrusted;
+    extern const Event CASMetaCreateClean;
+    extern const Event CASMetaAdoptBackfill;
+    extern const Event CASMetaResurrectClean;
 }
 
 namespace DB
@@ -200,13 +200,13 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
         || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes);
     if (head_first)
     {
-        ProfileEvents::increment(ProfileEvents::CasBlobHeadFirst);
+        ProfileEvents::increment(ProfileEvents::CASBlobHeadFirst);
         const HeadResult hr = store->backend().head(key);
         if (hr.exists)
         {
-            ProfileEvents::increment(ProfileEvents::CasBlobBodyPutAvoided);
+            ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
             if (cache_hit)
-                ProfileEvents::increment(ProfileEvents::CasBlobDedupCacheHit);
+                ProfileEvents::increment(ProfileEvents::CASBlobDedupCacheHit);
             try
             {
                 const BlobDepRecord dep = observeAndAdmit(ObjectKind::Blob, logical_ref, key, hr);
@@ -413,7 +413,7 @@ BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref
     /// means a racing writer already created it — both agree on the same Clean steady state.
     if (!lm)
     {
-        ProfileEvents::increment(ProfileEvents::CasMetaAdoptBackfill);
+        ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
         putMetaIfAbsent(*store, ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
     }
@@ -531,7 +531,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// freshness marker leaves stale state for the next point-reader.
     auto writeResurrectMetaClean = [&](std::optional<LoadedMeta> lm_before)
     {
-        ProfileEvents::increment(ProfileEvents::CasMetaResurrectClean);
+        ProfileEvents::increment(ProfileEvents::CASMetaResurrectClean);
         const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
         constexpr int max_meta_attempts = 8;
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
@@ -558,7 +558,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// reconciled to Clean the same way a resurrect does, not silently ignored.
     auto writeFreshMetaClean = [&]()
     {
-        ProfileEvents::increment(ProfileEvents::CasMetaCreateClean);
+        ProfileEvents::increment(ProfileEvents::CASMetaCreateClean);
         writeResurrectMetaClean(std::nullopt);
     };
 
@@ -1170,7 +1170,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                         "promote: blob leaf {} has no tokened and no adopted dep at commit — a staging bug "
                         "(a pending upload never completed); failing closed",
                         store->layout().blobKey(e.ref));
-                ProfileEvents::increment(ProfileEvents::CasBlobAdoptTrusted);
+                ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);
                 EventEmitter{*store}.emit([&](CasEvent & ev)
                 {
                     ev.type = CasEventType::BlobReuseAdopt;

@@ -40,9 +40,9 @@ extern const int NETWORK_ERROR;
 
 namespace ProfileEvents
 {
-extern const Event CasRefBatchFlushes;
-extern const Event CasRefBatchedMutations;
-extern const Event CasRefSnapshotPublishDispatched;
+extern const Event CASRefBatchFlushes;
+extern const Event CASRefBatchedMutations;
+extern const Event CASRefSnapshotPublishDispatched;
 }
 
 /// Task 8 (stage-1 §3 "Budget: counts only, chunked flush"): the counts-only admission caps --
@@ -561,7 +561,7 @@ AppendCaller launchAppendOps(const PoolPtr & store, const RootNamespace & ns, Mu
 /// in ONE leader tenure. Three items (2000 ops each = 6000 > 5000) split into chunk 1 = {item_a,item_b}
 /// (4000 ops, one id) and chunk 2 = {item_c} (2000 ops, the next id). Per-chunk assertions: committed
 /// ids (co-chunk survivors share one real id; the next chunk allocates the next), tail counters (one per
-/// chunk), per-chunk metrics (`CasRefBatchFlushes` once per chunk, `CasRefBatchedMutations` counting
+/// chunk), per-chunk metrics (`CASRefBatchFlushes` once per chunk, `CASRefBatchedMutations` counting
 /// survivors per chunk), follower wakeups (both followers return their correct real id -> completed +
 /// woken at their chunk's commit), `build_ops` at-most-once (invocation counters == 1), and folded state
 /// == the sequential result (the two durable transactions carry exactly item_a++item_b, then item_c).
@@ -586,8 +586,8 @@ TEST(CasRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
     auto c3 = std::make_shared<std::atomic<int>>(0);
 
     const size_t tail_before = store->tailSinceSnapshotCountForTest(ns);
-    const uint64_t flushes_before = ProfileEvents::global_counters[ProfileEvents::CasRefBatchFlushes].load();
-    const uint64_t mutations_before = ProfileEvents::global_counters[ProfileEvents::CasRefBatchedMutations].load();
+    const uint64_t flushes_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes].load();
+    const uint64_t mutations_before = ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations].load();
 
     auto sync = std::make_shared<CaseSync>();
     armPreCarveBlock(store, ns, sync, 3);
@@ -651,10 +651,10 @@ TEST(CasRefWriterChunkedFlush, ChunkedFlushCommitsPerChunk)
 
     /// Per-chunk metrics: one batch-flush per chunk (2), survivors counted per chunk (2 + 1 = 3). The
     /// snapshot-scheduling trigger is the final step of the SAME committed arm that increments
-    /// `CasRefBatchFlushes`, so == 2 also proves the scheduler was invoked per chunk;
+    /// `CASRefBatchFlushes`, so == 2 also proves the scheduler was invoked per chunk;
     /// `SnapshotPublisherLatchedAcrossChunks` proves that trigger actually re-fires across chunks.
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefBatchFlushes].load() - flushes_before, 2u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefBatchedMutations].load() - mutations_before, 3u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchFlushes].load() - flushes_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefBatchedMutations].load() - mutations_before, 3u);
 }
 
 namespace

@@ -27,8 +27,8 @@ namespace DB::ErrorCodes
 
 namespace ProfileEvents
 {
-extern const Event CasRefRollbackBestEffortDropFailed;
-extern const Event CasPartFolderValidateSkipped;
+extern const Event CASRefRollbackBestEffortDropFailed;
+extern const Event CASPartFolderValidateSkipped;
 }
 
 using namespace DB;
@@ -816,10 +816,10 @@ TEST(CasPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
     ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
     /// Body vanishes (a protocol violation the net would normally catch)...
     deleteManifestBody(*backend, layout, id);
-    const auto skips_before = ProfileEvents::global_counters[ProfileEvents::CasPartFolderValidateSkipped].load();
+    const auto skips_before = ProfileEvents::global_counters[ProfileEvents::CASPartFolderValidateSkipped].load();
     /// ...but `never` serves the retained view, no HEAD, no throw.
     EXPECT_NO_THROW(access.getView(key, Cas::Freshness::ForceFresh));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasPartFolderValidateSkipped].load() - skips_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASPartFolderValidateSkipped].load() - skips_before, 1);
 }
 
 TEST(CasPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
@@ -1151,10 +1151,10 @@ TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
     EXPECT_ANY_THROW(store->dropRef(ns_a, "part_a"));
 
     using ProfileEvents::global_counters;
-    const auto before = global_counters[ProfileEvents::CasRefRollbackBestEffortDropFailed].load();
+    const auto before = global_counters[ProfileEvents::CASRefRollbackBestEffortDropFailed].load();
     /// The compensating-rollback path must NOT throw (noexcept) and MUST record the swallowed failure.
     access.dropRefBestEffort(Cas::PartRefKey{ns_b, "part_b"});
-    const auto after = global_counters[ProfileEvents::CasRefRollbackBestEffortDropFailed].load();
+    const auto after = global_counters[ProfileEvents::CASRefRollbackBestEffortDropFailed].load();
     EXPECT_EQ(after, before + 1);
 
     backend->armed = false;   /// let store teardown release its lease cleanly

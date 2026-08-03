@@ -27,7 +27,7 @@ Verdicts (mirrors the churn (a) + rebirth (b) PASS criteria from the plan's `{#t
      or fails outright -- never silently applies against generation N+1's rows);
   2. `_files`/mutation-log debris from dead incarnations trends toward zero via the janitor without
      ever blocking a rebirth (recreate latency does not grow across cycles);
-  3. the always-zero CA counters (`CasRefApplyPoisoned`, `CasRefRecoveryStreamHole`) stay at zero;
+  3. the always-zero CA counters (`CasRefApplyPoisoned`, `CASRefRecoveryStreamHole`) stay at zero;
   4. fsck --detail clean at the end.
 """
 
@@ -41,7 +41,7 @@ from ..framework.report import Verdict
 from . import _common
 
 _TABLE = "s44_rebirth_nsfile"
-_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CasRefRecoveryStreamHole")
+_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CASRefRecoveryStreamHole")
 
 
 def _mutation_writer(node, stop_flag, errors, applied_counter):

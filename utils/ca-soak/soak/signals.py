@@ -41,22 +41,22 @@ from soak.cluster import QueryError, is_node_down
 # Each entry is (event, why the soak watches it). The tuple is the contract with the product: when a
 # counter here is renamed or removed, `preflight_signals` fails the run rather than silently reading 0.
 CAS_SIGNAL_EVENT_NOTES = (
-    ("CasGcUnmatchedRemoveDeltas",
+    ("CASGcUnmatchedRemoveDeltas",
      "GC in-degree removal deltas that matched no source edge. Per-key no-op by design, so it cannot "
      "cause a false delete — but a persistent rate means removals reach the reducer without their "
      "activation, which is the retention-leak signal that stayed silent for months (2026-07-25)."),
-    ("CasRefAppendPreAttemptRefused",
+    ("CASRefAppendPreAttemptRefused",
      "Ref-log append chunks refused BEFORE any request was sent (mount fence / deadline, zero attempts "
      "made, nothing can be durable). EXPECTED to be nonzero under chaos — this is the availability fix "
-     "working, and it is counted apart from CasRefAppendWedged so a falling wedge count cannot be "
+     "working, and it is counted apart from CASRefAppendWedged so a falling wedge count cannot be "
      "misread as nothing happening."),
-    ("CasRefAppendWedged",
+    ("CASRefAppendWedged",
      "Ref-log append lanes that exhausted retries after an UNCERTAIN put. Ref-log progress may be "
      "stalled on that lane."),
-    ("CasGcClampSuppressedPasses",
+    ("CASGcClampSuppressedPasses",
      "GC passes that deferred graduation and deletion because reachability was uncertain — GC held "
      "back. Fail-closed behaviour, but a steady rate means GC is not converging."),
-    ("CasGcCondemnMarkerUnconfirmedCarry",
+    ("CASGcCondemnMarkerUnconfirmedCarry",
      "Retirements delayed because a durable condemn marker could not be confirmed. Safe (deletion is "
      "postponed) but points at marker write/read failures."),
 )
@@ -69,20 +69,20 @@ CAS_SIGNAL_EVENT_NOTES = (
 # A dying writer epoch can have a PUT in flight for the id its successor's recovery is about to seal.
 # Recovery closes the dead epoch by writing an EpochSeal at that exact id as a CONDITIONAL CREATE, so
 # the two possible orders both end well: the seal lands first and the straggler's create is refused
-# (`CasRefAppendSealRejected` — the late PUT LOSES, and it was never acknowledged), or the straggler
-# lands first and recovery adopts it and reseals at the new T+1 (`CasRefRecoveryStragglerAdopted` —
+# (`CASRefAppendSealRejected` — the late PUT LOSES, and it was never acknowledged), or the straggler
+# lands first and recovery adopts it and reseals at the new T+1 (`CASRefRecoveryStragglerAdopted` —
 # the write was real, so it is kept). What must NEVER happen is a late transaction materializing
 # BELOW coverage the successor has already declared: that is a durable write the fold has walked past.
 LATE_PUT_EVIDENCE_NOTES = (
-    ("CasRefRecoveryEpochSealed",
+    ("CASRefRecoveryEpochSealed",
      "Epoch seals MINTED by a recovery CAS-walk, one per dead writer epoch closed. This is the "
      "fencing mechanism itself: zero over a whole chaos run means no epoch ever changed hands under "
      "recovery, so the run did not exercise the invariant at all and its silence proves nothing."),
-    ("CasRefAppendSealRejected",
+    ("CASRefAppendSealRejected",
      "Ref-log transactions conclusively rejected by a successor's epoch seal occupying the id they "
      "derived. THE late PUT losing, counted: the deposed writer's operation was never acknowledged. "
      "Expected to be nonzero under chaos and never a failure on its own."),
-    ("CasRefRecoveryStragglerAdopted",
+    ("CASRefRecoveryStragglerAdopted",
      "Stragglers a recovery CAS-walk met at the slot it tried to seal, adopted and resealed at the "
      "new T+1. The other legal order of the same race — the write won the slot fairly, so it is kept "
      "rather than fenced. Also never a failure on its own."),
@@ -96,11 +96,11 @@ LATE_PUT_VIOLATION_NOTES = (
      "A ref table whose cached state may be MISSING a durable transaction — an install failed while "
      "its ref-log object may already be durable. The LOSS half of the invariant: acknowledged work "
      "that the writer's own view no longer contains."),
-    ("CasGcUnappliedFoldedTxns",
+    ("CASGcUnappliedFoldedTxns",
      "Ref transactions a round folded and merged but whose blob deltas never reached a shard reducer. "
      "The FOLD half: the round would advance its cursor past a transaction it never applied. The "
      "product already fails such a round closed; the soak must not finish green having seen one."),
-    ("CasRefRecoveryStreamHole",
+    ("CASRefRecoveryStreamHole",
      "A 404 BELOW a durable same-epoch witness — ids are dense 1..T within (namespace, epoch) by "
      "INV-1, so this is a hole and folding what is above it would drop transactions silently. The "
      "DENSITY half."),
@@ -283,7 +283,7 @@ def preflight_signals(cluster, events=CAS_SIGNAL_EVENTS, *, timeout: float = 30.
 #   fold_ref_intake.logs_applied     — … versus logs that reached the single cursor-advance site.
 #                                      Inequality means the cursor advanced over unapplied work.
 #   fold_reduce.txns_unapplied       — folded+merged transactions whose blob deltas never reached a
-#                                      shard reducer. The fail-closed twin of CasGcUnappliedFoldedTxns.
+#                                      shard reducer. The fail-closed twin of CASGcUnappliedFoldedTxns.
 DETECTOR_METRICS = (
     ("fold_ref_intake", "logs_accounted"),
     ("fold_ref_intake", "logs_applied"),
@@ -604,7 +604,7 @@ class LatePutFencing:
     @property
     def exercised(self) -> bool:
         """True when the run actually reached the fencing path — at least one epoch seal was minted."""
-        return self.evidence_peak.get("CasRefRecoveryEpochSealed", 0) > 0
+        return self.evidence_peak.get("CASRefRecoveryEpochSealed", 0) > 0
 
     def report_lines(self) -> list:
         lines = [f"LATE-PUT FENCING: {self.reads} readings, {self.gaps} probe gaps; "
@@ -615,7 +615,7 @@ class LatePutFencing:
                      + " ".join(f"{e}={self.violation_peak[e]}" for e in LATE_PUT_VIOLATION_EVENTS))
         if not self.exercised:
             lines.append("LATE-PUT FENCING: WARNING — no epoch seal was minted in this run "
-                         "(CasRefRecoveryEpochSealed stayed 0), so the fencing path was never reached. "
+                         "(CASRefRecoveryEpochSealed stayed 0), so the fencing path was never reached. "
                          "The zero violations below are the absence of a test, not a passing one.")
         for node_name, label, v in self.violations:
             lines.append(f"LATE-PUT FENCING:   VIOLATION [{node_name}]{' ' + label if label else ''}: {v}")

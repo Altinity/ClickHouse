@@ -23,20 +23,20 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasPartFolderViewHits;
-    extern const Event CasPartFolderViewValidationMismatches;
-    extern const Event CasPartFolderViewMisses;
-    extern const Event CasPartFolderViewOversizedBypasses;
-    extern const Event CasPartFolderViewInvalidations;
-    extern const Event CasRefRollbackBestEffortDropFailed;
-    extern const Event CasPartFolderValidateSkipped;
-    extern const Event CasRefRepoint;
+    extern const Event CASPartFolderViewHits;
+    extern const Event CASPartFolderViewValidationMismatches;
+    extern const Event CASPartFolderViewMisses;
+    extern const Event CASPartFolderViewOversizedBypasses;
+    extern const Event CASPartFolderViewInvalidations;
+    extern const Event CASRefRollbackBestEffortDropFailed;
+    extern const Event CASPartFolderValidateSkipped;
+    extern const Event CASRefRepoint;
 }
 
 namespace CurrentMetrics
 {
-    extern const Metric CasPartFolderCacheBytes;
-    extern const Metric CasPartFolderCacheEntries;
+    extern const Metric CASPartFolderCacheBytes;
+    extern const Metric CASPartFolderCacheEntries;
 }
 
 namespace DB::Cas
@@ -152,7 +152,7 @@ CachedPartFolderAccess::CachedPartFolderAccess(Cas::PoolPtr store_, CacheParams 
         now_ms_fn = []() -> uint64_t { return timeInMilliseconds(std::chrono::system_clock::now()); };
     if (params.cache_bytes > 0)
         view_cache = std::make_unique<ViewCache>(
-            "LRU", CurrentMetrics::CasPartFolderCacheBytes, CurrentMetrics::CasPartFolderCacheEntries,
+            "LRU", CurrentMetrics::CASPartFolderCacheBytes, CurrentMetrics::CASPartFolderCacheEntries,
             params.cache_bytes, params.max_entries, ViewCache::DEFAULT_SIZE_RATIO);
 }
 
@@ -181,11 +181,11 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
             {
                 /// The warm hit: the retained view already reflects this exact manifest, so this access
                 /// did no real resolve work beyond a cache lookup — no `RefResolve` audit row for it.
-                ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
+                ProfileEvents::increment(ProfileEvents::CASPartFolderViewHits);
                 recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
                 return cached;
             }
-            ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
+            ProfileEvents::increment(ProfileEvents::CASPartFolderViewValidationMismatches);
             /// Rebuild below; the stale entry is superseded by the new view when retention is enabled.
         }
     }
@@ -203,8 +203,8 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
                 || (now_ms_fn() - cached->validatedAtMs()) < params.validate.age_seconds * 1000ULL;
             if (fresh_enough)
             {
-                ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
-                ProfileEvents::increment(ProfileEvents::CasPartFolderValidateSkipped);
+                ProfileEvents::increment(ProfileEvents::CASPartFolderViewHits);
+                ProfileEvents::increment(ProfileEvents::CASPartFolderValidateSkipped);
                 recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
                 emitResolveEvent(key, *resolved);
                 return cached;
@@ -232,10 +232,10 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         else
         {
             oversized = true;
-            ProfileEvents::increment(ProfileEvents::CasPartFolderViewOversizedBypasses);
+            ProfileEvents::increment(ProfileEvents::CASPartFolderViewOversizedBypasses);
         }
     }
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewMisses);
+    ProfileEvents::increment(ProfileEvents::CASPartFolderViewMisses);
     recordDecision(cache_key,
         freshness == Freshness::CachedForLoad ? (oversized ? LastDecision::OversizedBypass : LastDecision::Miss)
         : freshness == Freshness::ForceFresh  ? LastDecision::ForceFreshRead
@@ -308,7 +308,7 @@ void CachedPartFolderAccess::eraseView(const PartRefKey & key)
     const String cache_key = key.cacheKey();
     if (view_cache)
         view_cache->remove(cache_key);
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    ProfileEvents::increment(ProfileEvents::CASPartFolderViewInvalidations);
     recordDecision(cache_key, LastDecision::Invalidated, nullptr, /*retained=*/false);
 }
 
@@ -570,7 +570,7 @@ Cas::CommitOutcome CachedPartFolderAccess::repointRef(const PartRefKey & key, st
     /// Capture the exact outcome IMMEDIATELY -- before the ProfileEvent/logging below -- so it is
     /// published ahead of any further (even if non-throwing in practice) post-commit work.
     const Cas::CommitOutcome oc = publishEntries(key, entries, op, /*allow_repoint=*/true);
-    ProfileEvents::increment(ProfileEvents::CasRefRepoint);
+    ProfileEvents::increment(ProfileEvents::CASRefRepoint);
     if (resolved)
     {
         /// Repoint is the normal mechanism for effective standalone writes/removes on committed parts,
@@ -633,7 +633,7 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     {
         /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, but swallowing the
         /// exception without a diagnostic could leave a live phantom ref after a backend outage.
-        ProfileEvents::increment(ProfileEvents::CasRefRollbackBestEffortDropFailed);
+        ProfileEvents::increment(ProfileEvents::CASRefRollbackBestEffortDropFailed);
         tryLogCurrentException(getLogger("CachedPartFolderAccess"),
             fmt::format("CA best-effort rollback dropRef failed (ns={} ref={}); the ref may remain live",
                         key.ns.string(), key.ref));
@@ -695,7 +695,7 @@ bool CachedPartFolderAccess::dropRefIfMatches(const PartRefKey & key, const Cas:
         /// Best-effort rollback cleanup, like dropRefBestEffort: debris is GC-reclaimed, but swallowing
         /// without a diagnostic could leave a live phantom ref after a backend outage.
         removed = false;
-        ProfileEvents::increment(ProfileEvents::CasRefRollbackBestEffortDropFailed);
+        ProfileEvents::increment(ProfileEvents::CASRefRollbackBestEffortDropFailed);
         tryLogCurrentException(getLogger("CachedPartFolderAccess"),
             fmt::format("CA conditional rollback dropRefIfMatches failed (ns={} ref={} expected={}); "
                         "the ref may remain live", key.ns.string(), key.ref, Cas::manifestRefDebugString(expected)));
@@ -714,7 +714,7 @@ void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
         const String prefix = ns.string() + '\0';
         view_cache->remove([&](const String & k, const auto &) { return k.starts_with(prefix); });
     }
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    ProfileEvents::increment(ProfileEvents::CASPartFolderViewInvalidations);
 }
 
 void CachedPartFolderAccess::recordDecision(const String & cache_key, LastDecision decision,

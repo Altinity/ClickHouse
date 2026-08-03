@@ -25,10 +25,10 @@ namespace DB::ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasConditionalWriteAttempts;
-    extern const Event CasConditionalWriteCommitted;
-    extern const Event CasConditionalWriteDefiniteFailure;
-    extern const Event CasConditionalWriteUnresolved;
+    extern const Event CASConditionalWriteAttempts;
+    extern const Event CASConditionalWriteCommitted;
+    extern const Event CASConditionalWriteDefiniteFailure;
+    extern const Event CASConditionalWriteUnresolved;
 }
 
 #if USE_AWS_S3
@@ -169,10 +169,10 @@ TEST(CasRequestControl, UnrecognizedErrorsFailSafeToUnresolved)
 TEST(CasRequestControl, CountersHookupIncrementsPerClass)
 {
     using ProfileEvents::global_counters;
-    const auto attempts_before = global_counters[ProfileEvents::CasConditionalWriteAttempts].load();
-    const auto committed_before = global_counters[ProfileEvents::CasConditionalWriteCommitted].load();
-    const auto definite_before = global_counters[ProfileEvents::CasConditionalWriteDefiniteFailure].load();
-    const auto unresolved_before = global_counters[ProfileEvents::CasConditionalWriteUnresolved].load();
+    const auto attempts_before = global_counters[ProfileEvents::CASConditionalWriteAttempts].load();
+    const auto committed_before = global_counters[ProfileEvents::CASConditionalWriteCommitted].load();
+    const auto definite_before = global_counters[ProfileEvents::CASConditionalWriteDefiniteFailure].load();
+    const auto unresolved_before = global_counters[ProfileEvents::CASConditionalWriteUnresolved].load();
 
     recordConditionalWriteAttemptStarted();
     recordConditionalWriteOutcome(CasWriteOutcome::Committed);
@@ -182,10 +182,10 @@ TEST(CasRequestControl, CountersHookupIncrementsPerClass)
     recordConditionalWriteOutcome(CasWriteOutcome::Unresolved);
 
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteAttempts].load() - attempts_before, 3u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteCommitted].load() - committed_before, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteDefiniteFailure].load() - definite_before, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteUnresolved].load() - unresolved_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteAttempts].load() - attempts_before, 3u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteCommitted].load() - committed_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteDefiniteFailure].load() - definite_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteUnresolved].load() - unresolved_before, 1u);
 #else
     (void)attempts_before; (void)committed_before; (void)definite_before; (void)unresolved_before;
 #endif
@@ -197,16 +197,16 @@ TEST(CasRequestControl, CountersHookupIncrementsPerClass)
 TEST(CasRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
 {
     using ProfileEvents::global_counters;
-    const auto attempts_before = global_counters[ProfileEvents::CasConditionalWriteAttempts].load();
-    const auto committed_before = global_counters[ProfileEvents::CasConditionalWriteCommitted].load();
+    const auto attempts_before = global_counters[ProfileEvents::CASConditionalWriteAttempts].load();
+    const auto committed_before = global_counters[ProfileEvents::CASConditionalWriteCommitted].load();
 
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
     EXPECT_EQ(b->putIfAbsent("p/rc/one", "v1").outcome, PutOutcome::Done);
 
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteAttempts].load() - attempts_before, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteCommitted].load() - committed_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteAttempts].load() - attempts_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASConditionalWriteCommitted].load() - committed_before, 1u);
 #else
     (void)attempts_before; (void)committed_before;
 #endif

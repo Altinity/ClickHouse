@@ -140,7 +140,7 @@ class S28(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["insert_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasBlobPut", "CasBlobPutDedup", "DiskS3CreateMultipartUpload", "DiskS3UploadPart")}
+            "CASBlobPut", "CASBlobPutDedup", "DiskS3CreateMultipartUpload", "DiskS3UploadPart")}
 
         # --- scratch high-water vs sum of concurrently-staged payloads ----------------------
         scratch_peaks = smp.peak_scratch_bytes()
@@ -275,7 +275,7 @@ class S29(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["insert_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasBlobPut", "DiskS3PutObject", "DiskS3CreateMultipartUpload")}
+            "CASBlobPut", "DiskS3PutObject", "DiskS3CreateMultipartUpload")}
 
         # Best-effort: measure the on-disk skip-index file size from the RustFS pool (the secondary
         # index part file). We cannot map an exact suffix here, so record the total non-blob pool growth
@@ -376,15 +376,15 @@ class S30(Scenario):
                 per_batch.append(batch)
                 ctx.log(f"S30: batch@{i+1}: gc_wall={batch.get('gc_wall_s')}s "
                         f"root_dirs={batch.get('root_dirs')} "
-                        f"CasRootList+Get={batch.get('CasRootList')}+{batch.get('CasRootGet')}")
+                        f"CASRootList+Get={batch.get('CASRootList')}+{batch.get('CASRootGet')}")
         result.observations["per_batch"] = per_batch
 
         delta = counters().get("_total", {})
         result.observations["churn_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasRootList", "CasRootGet", "CasGcGet", "CasGcList", "CasBlobDelete", "CasGcDelete")}
+            "CASRootList", "CASRootGet", "CASGcGet", "CASGcList", "CASBlobDelete", "CASGcDelete")}
 
         # --- characterize monotone fanout: per-round cost vs number of EVER-created namespaces ------
-        # `root_dirs` (count of roots/<ns> dirs) and CasRootList/CasRootGet per batch are the
+        # `root_dirs` (count of roots/<ns> dirs) and CASRootList/CASRootGet per batch are the
         # observable GC fanout. The checklist EXPECTS these to grow with iterations (ever-created),
         # not with live tables (which return to 0 after each drop). We record this as a finding.
         if len(per_batch) >= 2:
@@ -393,9 +393,9 @@ class S30(Scenario):
             grew_dirs = (isinstance(first.get("root_dirs"), int)
                          and isinstance(last.get("root_dirs"), int)
                          and last["root_dirs"] > first["root_dirs"])
-            grew_get = (isinstance(first.get("CasRootGet"), int)
-                        and isinstance(last.get("CasRootGet"), int)
-                        and last["CasRootGet"] > first["CasRootGet"])
+            grew_get = (isinstance(first.get("CASRootGet"), int)
+                        and isinstance(last.get("CASRootGet"), int)
+                        and last["CASRootGet"] > first["CASRootGet"])
             monotone = grew_dirs or grew_get
             result.observations["fanout_first_vs_last"] = {"first": first, "last": last}
             # POST-D1 (registry removed + dropNamespace tombstones the shard + GC reclaims it): per-round
@@ -403,20 +403,20 @@ class S30(Scenario):
             # landed — see S34 (the D1 win).
             #
             # BOTH halves of D1 are asserted: `dropNamespace` tombstones the shard (so `root_dirs` stays
-            # bounded) AND GC reclaims the tombstone (so `CasRootGet` stops growing with ever-created
+            # bounded) AND GC reclaims the tombstone (so `CASRootGet` stops growing with ever-created
             # namespaces). Either one growing means per-round GC cost tracks ever-created tables again.
             result.add(Verdict.check(
                 "GC fanout bounded across ever-created namespaces (D1 registry removal)",
-                "neither root_dirs nor CasRootGet grows with ever-created (dropped) tables",
+                "neither root_dirs nor CASRootGet grows with ever-created (dropped) tables",
                 f"root_dirs {first.get('root_dirs')} -> {last.get('root_dirs')}; "
-                f"CasRootGet {first.get('CasRootGet')} -> {last.get('CasRootGet')}",
+                f"CASRootGet {first.get('CASRootGet')} -> {last.get('CASRootGet')}",
                 not monotone,
                 "" if not monotone else
                 "REGRESSION vs D1: per-round GC fanout grew across create/drop iterations even though "
                 "no table stayed live — `dropNamespace` must tombstone the shard and GC must reclaim it"))
             if monotone:
                 result.note_anomaly(
-                    "S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) "
+                    "S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) "
                     "grew across create/drop iterations though no table stayed live — the D1 registry-"
                     "removal / dropped-shard-reclaim guarantee is violated.")
         else:
@@ -433,12 +433,12 @@ class S30(Scenario):
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
         """Measure the STEADY-STATE per-round GC fanout floor: the cost of an IDLE deferred round
-        (`CasGcDelete==0 AND CasRootGet==0`), NOT a single mid-churn round.
+        (`CASGcDelete==0 AND CASRootGet==0`), NOT a single mid-churn round.
 
-        A single round's `CasRootGet` conflates reclaim-phase GETs (O(pending drop backlog) — grows
+        A single round's `CASRootGet` conflates reclaim-phase GETs (O(pending drop backlog) — grows
         with the drop burst, not the universe) with discovery. Sampling one round per checkpoint made
         this card falsely read a monotone-fanout REGRESSION (see the identical S34 fix): `root_dirs`
-        stays flat but the single-round `CasRootGet` climbs with the backlog. Drive rounds until an
+        stays flat but the single-round `CASRootGet` climbs with the backlog. Drive rounds until an
         idle deferred round and report it — its cost is the true per-round floor, which must not grow
         with ever-created namespaces."""
         last = {}
@@ -452,13 +452,13 @@ class S30(Scenario):
             last = {
                 "after_iter": after_iter, "gc_wall_s": round(wall, 3),
                 "drain_rounds": attempt + 1,
-                "CasRootList": int(delta.get("CasRootList", 0)),
-                "CasRootGet": int(delta.get("CasRootGet", 0)),
-                "CasGcGet": int(delta.get("CasGcGet", 0)),
-                "CasGcDelete": int(delta.get("CasGcDelete", 0)),
+                "CASRootList": int(delta.get("CASRootList", 0)),
+                "CASRootGet": int(delta.get("CASRootGet", 0)),
+                "CASGcGet": int(delta.get("CASGcGet", 0)),
+                "CASGcDelete": int(delta.get("CASGcDelete", 0)),
                 "root_dirs": S30._count_root_dirs(),
             }
-            if last["CasGcDelete"] == 0 and last["CasRootGet"] == 0:
+            if last["CASGcDelete"] == 0 and last["CASRootGet"] == 0:
                 break
         return last
 

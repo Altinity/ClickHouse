@@ -28,11 +28,11 @@ extern const int CORRUPTED_DATA;
 
 namespace ProfileEvents
 {
-extern const Event CasRefGlobalListPages;
-extern const Event CasRefLogBodyGets;
-extern const Event CasRefManifestBodyFoldGets;
-extern const Event CasRefEmittedEdges;
-extern const Event CasRefCleanupObjectsDeleted;
+extern const Event CASRefGlobalListPages;
+extern const Event CASRefLogBodyGets;
+extern const Event CASRefManifestBodyFoldGets;
+extern const Event CASRefEmittedEdges;
+extern const Event CASRefCleanupObjectsDeleted;
 }
 
 namespace
@@ -642,11 +642,11 @@ TEST(CasRefGcCleanupAuthority, GcFenceMoveBetweenKeysAllowsFirstAndRefusesSecond
 TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
 {
     using ProfileEvents::global_counters;
-    const auto list_pages_before = global_counters[ProfileEvents::CasRefGlobalListPages].load();
-    const auto log_gets_before   = global_counters[ProfileEvents::CasRefLogBodyGets].load();
-    const auto mf_gets_before    = global_counters[ProfileEvents::CasRefManifestBodyFoldGets].load();
-    const auto edges_before      = global_counters[ProfileEvents::CasRefEmittedEdges].load();
-    const auto cleaned_before    = global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load();
+    const auto list_pages_before = global_counters[ProfileEvents::CASRefGlobalListPages].load();
+    const auto log_gets_before   = global_counters[ProfileEvents::CASRefLogBodyGets].load();
+    const auto mf_gets_before    = global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load();
+    const auto edges_before      = global_counters[ProfileEvents::CASRefEmittedEdges].load();
+    const auto cleaned_before    = global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load();
 
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
@@ -673,11 +673,11 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
     Gc gc(store, kGc);
     runToFixpoint(store, gc);
 
-    EXPECT_GT(global_counters[ProfileEvents::CasRefGlobalListPages].load(), list_pages_before);
-    EXPECT_GT(global_counters[ProfileEvents::CasRefLogBodyGets].load(), log_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CasRefManifestBodyFoldGets].load(), mf_gets_before);
-    EXPECT_GT(global_counters[ProfileEvents::CasRefEmittedEdges].load(), edges_before);
-    EXPECT_GT(global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load(), cleaned_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefGlobalListPages].load(), list_pages_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefLogBodyGets].load(), log_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefManifestBodyFoldGets].load(), mf_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefEmittedEdges].load(), edges_before);
+    EXPECT_GT(global_counters[ProfileEvents::CASRefCleanupObjectsDeleted].load(), cleaned_before);
 }
 
 /// Task 13 e2e (in-process regression twin of the rustfs integration test): the whole snapshot+log

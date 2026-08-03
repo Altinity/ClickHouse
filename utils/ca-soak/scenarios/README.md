@@ -84,10 +84,10 @@ Collect these for every run:
   of the question, pull the top stack traces (by sample count) for `CPU`, `Real`, and `Memory` trace
   types SEPARATELY — each answers a different question (CPU = busy-spinning, Real = includes blocked/
   off-CPU waits, Memory = allocation hot paths) and must not be conflated into one combined ranking.
-- CA operation counters from `ProfileEvents`: `CasBlobPut`, `CasBlobPutDedup`, `CasBlobHead`,
-  `CasBlobHeadMiss`, `CasBlobHeadFirst`, `CasBlobBodyPutAvoided`, `CasBlobDedupCacheHit`, `CasBlobDelete`,
-  `CasBlobList`, `CasRootGet`, `CasRootHead`, `CasRootCas`, `CasRootCasConflict`, `CasRootList`, `CasGcGet`,
-  `CasGcHead`, `CasGcCas`, `CasGcDelete`, `CasGcList`, and corresponding `DiskS3*`/`S3*` counters.
+- CA operation counters from `ProfileEvents`: `CASBlobPut`, `CASBlobPutDedup`, `CASBlobHead`,
+  `CASBlobHeadMiss`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDedupCacheHit`, `CASBlobDelete`,
+  `CASBlobList`, `CASRootGet`, `CASRootHead`, `CASRootCompareSwap`, `CASRootCompareSwapConflict`, `CASRootList`, `CASGcGet`,
+  `CASGcHead`, `CASGcCompareSwap`, `CASGcDelete`, `CASGcList`, and corresponding `DiskS3*`/`S3*` counters.
 - Container samples: cgroup memory, CPU throttling, IO bytes, network bytes, and scratch-dir bytes.
 
 Each report should include a short "budget verdict" table:
@@ -95,7 +95,7 @@ Each report should include a short "budget verdict" table:
 ```text
 metric                         expected                         observed        verdict
 peak MemoryResident            < 2 * largest active part        1.3 * part      pass
-CasBlobBodyPutAvoided          second identical insert > 0      42             pass
+CASBlobBodyPutAvoided          second identical insert > 0      42             pass
 GC p95 duration                < 30s at 1M live objects         18s            pass
 fsck dangling                  0                                0              pass
 ```
@@ -117,8 +117,8 @@ They should be treated as first-class scenario targets, not as speculative notes
   Only `.bin`, mark files, and `primary.idx` go directly through the content blob path. Other part files
   use `CaInlineWriteBuffer`, accumulate bytes, and spill only after crossing `INLINE_CAP`. A large
   metadata/index file outside the direct-blob suffix set can create an unexpected memory spike.
-- Regular `GC` pays one global `LIST` of the ref area per round (`CasRefGlobalListPages`) plus a
-  body `GET` per log/snapshot not yet covered by the per-table cursors (`CasRefLogBodyGets`). The
+- Regular `GC` pays one global `LIST` of the ref area per round (`CASRefGlobalListPages`) plus a
+  body `GET` per log/snapshot not yet covered by the per-table cursors (`CASRefLogBodyGets`). The
   per-round read cost is driven by NEW logs since the last fold, not by table count — but the LIST
   itself still scales with the total number of ref objects, so snapshot lag (uncompacted logs)
   inflates every round.
@@ -163,7 +163,7 @@ Observations:
 - Peak `MemoryResident`, `MemoryTracking`, and cgroup memory during finalize and upload.
 - Scratch-dir high-water mark and cleanup after commit.
 - `DiskS3CreateMultipartUpload`, `DiskS3UploadPart`, `DiskS3CompleteMultipartUpload`,
-  `DiskS3AbortMultipartUpload`, `DiskS3PutObject`, and `CasBlobPut`.
+  `DiskS3AbortMultipartUpload`, `DiskS3PutObject`, and `CASBlobPut`.
 - `system.content_addressed_log` rows for `blob_put`, `precommit`, and `build_publish`.
 
 Expected:
@@ -190,7 +190,7 @@ Workload:
 
 Observations:
 
-- `CasBlobHeadFirst`, `CasBlobBodyPutAvoided`, `CasBlobDedupCacheHit`, `CasBlobPutDedup`, and
+- `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDedupCacheHit`, `CASBlobPutDedup`, and
   multipart counters for the second insert only.
 - Pool bytes before and after the second insert.
 - Query latency for reading both parts.
@@ -216,14 +216,14 @@ Workload:
 Observations:
 
 - `GC` duration and peak memory per round.
-- `CasRootList`, `CasRootGet`, `CasGcGet`, `CasGcPut`, `CasBlobList`, `CasBlobHead`, and `CasBlobDelete`.
+- `CASRootList`, `CASRootGet`, `CASGcGet`, `CASGcPut`, `CASBlobList`, `CASBlobHead`, and `CASBlobDelete`.
 - `system.trace_log` `CPU` samples inside `Cas::Gc::fold`, `Cas::Gc::retire`, `Cas::Gc::recheck`, and run
   decoding.
 
 Expected:
 
 - Memory is bounded by streaming buffers and reducer state, not by the number of live `blob` objects.
-- `CasBlobList` is zero for regular journal-driven `GC` rounds unless the scenario intentionally runs
+- `CASBlobList` is zero for regular journal-driven `GC` rounds unless the scenario intentionally runs
   `fsck` or an orphan sweep.
 - Unchanged root shards are skipped or cheap when backend list tokens are available.
 - `GC` duration scales with changed owner transitions, not total live blobs.
@@ -240,7 +240,7 @@ Workload:
 
 Observations:
 
-- Deleted objects per round, `duration_ms`, `CasBlobHead`, `CasBlobDelete`, `CasGcPut`, `CasGcDelete`, and
+- Deleted objects per round, `duration_ms`, `CASBlobHead`, `CASBlobDelete`, `CASGcPut`, `CASGcDelete`, and
   exact-token mismatch counts through `objects_replaced`/`objects_spared`.
 - Pool bytes and object count after every round.
 - Peak memory and CPU per round.
@@ -265,7 +265,7 @@ Workload:
 
 Observations:
 
-- `CasRefGlobalListPages`, `CasRefLogBodyGets`, `CasRefManifestBodyFoldGets`, `GC` duration, and memory.
+- `CASRefGlobalListPages`, `CASRefLogBodyGets`, `CASRefManifestBodyFoldGets`, `GC` duration, and memory.
 - Ref-object population: per-round body reads should be driven by NEW logs since the per-table
   cursors, not by table count; idle tables contribute only their share of the global `LIST`.
 - Query latency for the active and inactive tables.
@@ -289,8 +289,8 @@ Workload:
 
 Observations:
 
-- Encoded manifest size, inline-entry total, ref-append latency (`CasRefQueueWaitMicroseconds`),
-  `CasBlobPut` count, and the `kMaxManifest*` fail-closed admission limits (`CasBuild.cpp`).
+- Encoded manifest size, inline-entry total, ref-append latency (`CASRefQueueWaitMicroseconds`),
+  `CASBlobPut` count, and the `kMaxManifest*` fail-closed admission limits (`CasBuild.cpp`).
 - Query open/read latency for selecting a few columns and all columns.
 - `system.trace_log` samples in manifest encode/decode.
 
@@ -335,7 +335,7 @@ Workload:
 
 Observations:
 
-- Insert latency distribution, `CasRootCasConflict`, `CasRootCas`, `CasRootGet`, root-shard manifest sizes,
+- Insert latency distribution, `CASRootCompareSwapConflict`, `CASRootCompareSwap`, `CASRootGet`, root-shard manifest sizes,
   `system.parts` active/inactive counts, and memory.
 - `system.part_log` part create/remove rates.
 - Startup or table attach time if the scenario includes a restart.
@@ -360,7 +360,7 @@ Workload:
 
 Observations:
 
-- `CasBlobPut`, `CasBlobPutDedup`, `CasBlobBodyPutAvoided`, and pool-byte growth per mutation.
+- `CASBlobPut`, `CASBlobPutDedup`, `CASBlobBodyPutAvoided`, and pool-byte growth per mutation.
 - `system.part_log` mutation entries and `ProfileEvents` from `system.query_log`.
 - `system.content_addressed_log` `blob_reuse_adopt`, `blob_put`, and `build_publish` counts.
 
@@ -382,7 +382,7 @@ Workload:
 
 Observations:
 
-- Patch-part counts in `system.parts`, mutation queues, merge queues, `CasRootCasConflict`, and `CasBlobPut`.
+- Patch-part counts in `system.parts`, mutation queues, merge queues, `CASRootCompareSwapConflict`, and `CASBlobPut`.
 - `system.content_addressed_log` for ref drops/repoints.
 - Pool bytes before and after forced `GC`.
 
@@ -427,7 +427,7 @@ Observations:
 
 - `system.content_addressed_garbage_collection_log` by `gc_id`: successful leader rounds versus
   `NotALeader` rounds.
-- `CasGcCasConflict`, `CasRootCasConflict`, `CasBlobPutDedup`, pool bytes, and replica-local ref counts.
+- `CASGcCompareSwapConflict`, `CASRootCompareSwapConflict`, `CASBlobPutDedup`, pool bytes, and replica-local ref counts.
 - Replication queue depth and fetch traffic.
 
 Expected:
@@ -473,7 +473,7 @@ Workload:
 
 Observations:
 
-- Startup time, `MemoryResident`, `CasRootList`, `CasRootGet`, root decode cache growth, and text log
+- Startup time, `MemoryResident`, `CASRootList`, `CASRootGet`, root decode cache growth, and text log
   warnings.
 
 Expected:
@@ -505,8 +505,8 @@ Workload:
 
 Observations:
 
-- `CasRefApplyPoisoned`, `QueryMemoryLimitExceeded`, `CasRefAppendWedged`/`CasRefAppendUnwedged`/
-  `CasRefAppendDefiniteFailure`, `CasGcUnmatchedRemoveDeltas` (reported, never gating),
+- `CasRefApplyPoisoned`, `QueryMemoryLimitExceeded`, `CASRefAppendWedged`/`CASRefAppendUnwedged`/
+  `CASRefAppendDefiniteFailure`, `CASGcUnmatchedRemoveDeltas` (reported, never gating),
   `fsck` `stale_edge`/`unaccounted`, acked-vs-lost blocks, max query duration.
 
 Expected:
@@ -620,7 +620,7 @@ Observations:
 
 Expected:
 
-- Enabled clone paths move metadata only: no large `CasBlobPut` growth.
+- Enabled clone paths move metadata only: no large `CASBlobPut` growth.
 - Unsupported paths fail before partial refs are published.
 - Source and destination queries match expected data.
 
@@ -636,7 +636,7 @@ Workload:
 
 Observations:
 
-- Replication fetch logs, `CasBlobPut`, `CasBlobPutDedup`, `CasRootCas`, network bytes, and pool bytes.
+- Replication fetch logs, `CASBlobPut`, `CASBlobPutDedup`, `CASRootCompareSwap`, network bytes, and pool bytes.
 
 Expected:
 
@@ -655,7 +655,7 @@ Workload:
 
 Observations:
 
-- `CasRootHead`, `CasRootGet`, `CasBlobGet`, root decode cache behavior, query latency, and `CPU` trace
+- `CASRootHead`, `CASRootGet`, `CASBlobGet`, root decode cache behavior, query latency, and `CPU` trace
   samples.
 
 Expected:
@@ -711,7 +711,7 @@ Workload:
 
 Observations:
 
-- `CasBlobDedupCacheHit`, `CasBlobHeadFirst`, `CasBlobBodyPutAvoided`, memory, and upload counters.
+- `CASBlobDedupCacheHit`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, memory, and upload counters.
 
 Expected:
 
@@ -763,7 +763,7 @@ Workload:
 Expected:
 
 - Ambiguous keys are treated as changed and read.
-- Correctness is preserved; cost increases are visible in `CasRootGet`.
+- Correctness is preserved; cost increases are visible in `CASRootGet`.
 
 ## Report anomaly handling
 

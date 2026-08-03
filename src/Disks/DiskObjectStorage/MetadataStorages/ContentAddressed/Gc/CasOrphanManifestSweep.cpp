@@ -20,7 +20,7 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasGcEnumerationPages;
+    extern const Event CASGcEnumerationPages;
 }
 
 namespace DB::Cas
@@ -33,7 +33,7 @@ namespace
 /// It increments once per physical LIST page, never once per listed key.
 void onGcEnumerationPage()
 {
-    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+    ProfileEvents::increment(ProfileEvents::CASGcEnumerationPages);
 }
 
 /// The durable build floor is stored in the per-server mount lease together with the writer epoch. A
@@ -616,7 +616,7 @@ ManifestSweepResult planManifestCursorPage(
     const ListPage page = backend.list(layout.casManifestsPrefix(), cursor, list_budget);
     /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
     /// call), so the metric increments once per call, not once per listed key.
-    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+    ProfileEvents::increment(ProfileEvents::CASGcEnumerationPages);
 
     /// Freeze every possible destructive candidate BEFORE the later catalog cut. A same-name rebirth can
     /// replace this logical manifest key between the observations; classifying the old bytes against the

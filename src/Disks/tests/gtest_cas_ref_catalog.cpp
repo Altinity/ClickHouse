@@ -20,8 +20,8 @@ using namespace DB::Cas;
 
 namespace ProfileEvents
 {
-    extern const Event CasGcUnmatchedAdoptedParentLives;
-    extern const Event CasGcStuckRemovals;
+    extern const Event CASGcUnmatchedAdoptedParentLives;
+    extern const Event CASGcStuckRemovals;
 }
 
 namespace DB::Cas::tests
@@ -1549,7 +1549,7 @@ TEST(CasGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     ASSERT_EQ(backend->putIfAbsent(layout.gcStateKey(), encodeGcState(state)).outcome, PutOutcome::Done);
 
     const uint64_t signals_before
-        = ProfileEvents::global_counters[ProfileEvents::CasGcStuckRemovals].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGcStuckRemovals].load();
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(removing.ns, life_id);
     const String unreadable_ref_log_key = layout.refLogKey(life, RefTxnId{5, 6});
     const uint64_t append_puts_before = backend->putCount(unreadable_ref_log_key);
@@ -1559,7 +1559,7 @@ TEST(CasGcStuckRemoval, AdoptedRoundWarnsEveryRestartWithoutAppending)
     Gc restarted_process(store, gc_id);
     EXPECT_TRUE(restarted_process.runRegularRound().acquired_lease);
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcStuckRemovals].load() - signals_before, 2u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcStuckRemovals].load() - signals_before, 2u);
     EXPECT_EQ(backend->putCount(unreadable_ref_log_key), append_puts_before)
         << "the diagnostic cannot append the unreadable ref log";
     const String captured = log_capture.captured();
@@ -1594,12 +1594,12 @@ TEST(CasGcRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
         .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{9, 9}}});
 
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load();
     ScopedCasGcLogCapture log_capture;
     const RefPlan plan = tests::buildRefWalkPlanForTest(scan, cut);
 
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load() - events_before,
         1u);
     EXPECT_EQ(plan.droppedParentRows(), 1u);
     EXPECT_EQ(plan.size(), 1u);

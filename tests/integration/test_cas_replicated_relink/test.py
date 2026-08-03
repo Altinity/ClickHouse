@@ -46,7 +46,7 @@ NUM_ROWS = 10000
 #   BYTES RAN    -> the receiver's `Download of part <p> onto disk <d> finished.` from
 #                   `downloadPartToDisk`, plus the specific line naming WHY relink was declined.
 #
-# The blob-count / `CasBlobPut == 0` checks are kept as corroboration, never as the proof.
+# The blob-count / `CASBlobPut == 0` checks are kept as corroboration, never as the proof.
 # ----------------------------------------------------------------------------------------------------
 
 
@@ -173,7 +173,7 @@ def assert_no_new_blobs(before_keys):
 
 
 def cas_blob_puts(node):
-    return int(node.query("SELECT sum(value) FROM system.events WHERE event = 'CasBlobPut'") or 0)
+    return int(node.query("SELECT sum(value) FROM system.events WHERE event = 'CASBlobPut'") or 0)
 
 
 def active_part_names(node, table):
@@ -333,7 +333,7 @@ def test_relink_happy_path_proof():
     """Task 16 step 2 — the happy path, proved POSITIVELY.
 
     Taxonomy row 4 (confirm `yes` -> `promote` -> `Committed`). The proof is the receiver's
-    `... finished (no bytes transferred)` line, which no other row can reach; `CasBlobPut == 0` and the
+    `... finished (no bytes transferred)` line, which no other row can reach; `CASBlobPut == 0` and the
     flat blob count are corroboration only (see the note at the top of this file).
     """
     node1 = cluster.instances["node1"]

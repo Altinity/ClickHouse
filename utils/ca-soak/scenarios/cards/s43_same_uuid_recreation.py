@@ -30,7 +30,7 @@ then created as the control and must be empty.
 The card asserts the safety property in the form that does not depend on WHICH refusal fires:
 
   1. the recreated table never returns the previous life's rows;
-  2. the always-zero counters (`CasRefApplyPoisoned`, `CasRefRecoveryStreamHole`) stay at zero;
+  2. the always-zero counters (`CasRefApplyPoisoned`, `CASRefRecoveryStreamHole`) stay at zero;
   3. and it RECORDS, as an observation rather than a verdict, whether the touch raised or returned
      empty — because "refused loudly" and "started clean and ignored it" are both safe, and pinning
      one of them as the only acceptable outcome would make this card fail on a correct change.
@@ -76,7 +76,7 @@ _UUID = "3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
 _SURVIVOR_EPOCH = 1
 _SURVIVOR_SEQ = 2
 
-_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CasRefRecoveryStreamHole")
+_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CASRefRecoveryStreamHole")
 
 
 def _create(node, name: str, table_uuid: str) -> None:

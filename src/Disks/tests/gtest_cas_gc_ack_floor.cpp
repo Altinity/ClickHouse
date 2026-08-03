@@ -16,8 +16,8 @@
 
 namespace ProfileEvents
 {
-extern const Event CasMetaDelete;
-extern const Event CasGcCondemnMarkerUnconfirmedCarry;
+extern const Event CASMetaDelete;
+extern const Event CASGcCondemnMarkerUnconfirmedCarry;
 }
 
 using namespace DB::Cas;
@@ -330,15 +330,15 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
     Gc gc(store, kGc);
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    /// §0 introspection: the meta drop below rides `deleteMetaExact` (`CasMetaDelete` choke point).
-    const auto delete_before = ProfileEvents::global_counters[ProfileEvents::CasMetaDelete].load();
+    /// §0 introspection: the meta drop below rides `deleteMetaExact` (`CASMetaDelete` choke point).
+    const auto delete_before = ProfileEvents::global_counters[ProfileEvents::CASMetaDelete].load();
     // condemn -> graduate (round-paced) -> delete (the retired-cursor pipeline).
     ASSERT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1))) << "body gone via exact-token delete";
     EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(1)).has_value())
         << "the meta must be dropped alongside the exact-token body delete (Task 5)";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaDelete].load() - delete_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMetaDelete].load() - delete_before, 1);
 }
 
 /// GC freshness meta is ADD-ONLY (spec 2026-07-11 deposed-leader `clearSparedMeta` fix): an entry whose
@@ -1147,7 +1147,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     /// Rounds keep coming while the marker stays unwritable: without durable Condemned evidence the
     /// entry must be CARRIED — a writer reading the absent meta may have adopted this exact token.
     const auto carries_before =
-        ProfileEvents::global_counters[ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGcCondemnMarkerUnconfirmedCarry].load();
     for (int i = 0; i < 4; ++i)
     {
         runRegularRoundReclaiming(gc);
@@ -1159,7 +1159,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
     ASSERT_TRUE(e.has_value()) << "the entry must remain retired (carried), not dropped";
     EXPECT_FALSE(e->delete_pending) << "graduation must be refused without a confirmed marker";
     EXPECT_FALSE(e->marker_confirmed);
-    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry].load()
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CASGcCondemnMarkerUnconfirmedCarry].load()
                   - carries_before, 4u)
         << "every refused graduation must count one unconfirmed carry";
 

@@ -840,8 +840,8 @@ def capture_checkpoint_signals(cluster, label, *, tracker, fencing=None, log_fn=
     FAILURE propagates and the counters are never invented.
 
     MOSTLY REPORTED, NOT GATED (Task 21 step 3). The benign rates in `UNCHARACTERISED_SIGNALS` are
-    uncharacterised as of 2026-07-26: `CasRefAppendPreAttemptRefused` is EXPECTED to be nonzero under
-    chaos -- that is the availability fix working -- and `CasGcUnmatchedRemoveDeltas` should be zero in
+    uncharacterised as of 2026-07-26: `CASRefAppendPreAttemptRefused` is EXPECTED to be nonzero under
+    chaos -- that is the availability fix working -- and `CASGcUnmatchedRemoveDeltas` should be zero in
     a healthy pool but may not be for reasons nobody has enumerated. A threshold goes in once several
     runs agree on a rate, not before.
 

@@ -206,7 +206,7 @@ SETTINGS storage_policy='ca', min_bytes_for_...(74 more chars)
 - **Logged (UTC):** 2026-06-27T21:53:03
 - **Severity:** suspected-bug
 - **Run:** 20260627T215209_S30_seed20
-- **Observed:** S30 confirmed checklist #6: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations even though no table stayed live — dropNamespace leaves a permanent GC registry entry (monotone fanout). Backlog: namespace registry needs a cleanup/deregister path.
+- **Observed:** S30 confirmed checklist #6: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations even though no table stayed live — dropNamespace leaves a permanent GC registry entry (monotone fanout). Backlog: namespace registry needs a cleanup/deregister path.
 
 ## S30-20260627T215209-2: forced GC left 100 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possib
 
@@ -593,7 +593,7 @@ CLOSED/explained (no action): S16 dangling=racy-fsck FP; disk-growth=inactive-pa
 - **Implementation sketch:**
   1. Write a small Python HTTP proxy (`scenarios/proxies/list_fault_proxy.py`, ~150 lines) that sits in front of RustFS and implements the S3 `ListObjectsV2` API. On `roots/`-prefix listings it injects configurable anomalies: (a) duplicate a random key across two consecutive pages; (b) omit the `NextContinuationToken` mid-listing to simulate a truncated page; (c) return a slightly-different `ETag`/list-token for an otherwise-unchanged key. Requests for other prefixes (blobs, GC state) are forwarded transparently.
   2. Run this proxy as a Docker service (e.g. a `python:3.12-slim` container running the script) in a `docker-compose-list_fault_proxy.yml`, with the `ca` disk `endpoint` pointing at the proxy.
-  3. Register a `"listfaultproxy"` variant; implement S27's `run()` using a control knob (an environment variable or a POST to the proxy's management endpoint) to enable/disable the anomaly injection per phase, and assert that `CasRootGet` increases (conservative rereads) while `CasBlobDelete` stays safe and `fsck dangling==0`.
+  3. Register a `"listfaultproxy"` variant; implement S27's `run()` using a control knob (an environment variable or a POST to the proxy's management endpoint) to enable/disable the anomaly injection per phase, and assert that `CASRootGet` increases (conservative rereads) while `CASBlobDelete` stays safe and `fsck dangling==0`.
 - **Why deferred:** the proxy requires a small but new Python HTTP service — new Docker service, new compose, ~150-line proxy shim, new storage config, new scenario code. The proxy's S3 ListObjectsV2 re-implementation must handle authentication (or bypass it), paging tokens, and fault scheduling correctly. This is a self-contained ~3h authoring session; S27 is P2 and is lower priority than S22.
 
 ## HARNESS-DRAIN-VERDICT-CONVERGENCE: "forced GC drives unreachable -> 0" reads a mid-run transient, not the converged state
@@ -781,13 +781,13 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   elapses (`gc_fold_max_defer_rounds`, default 8), so no candidate is starved of eventual fold. Safety
   gated by the TLA+ model `CaGcRoundDeferCore` (`NoOverDelete` + `EventuallyFolded`). Verified by a
   soak-harness ops-budget assertion (`S03`, `utils/ca-soak/scenarios/cards/s03_s05_scale.py`): an
-  isolated idle round's `CasGcGet` delta must be `< 50` (was ~1362) with `fsck dangling == 0`. **Not
+  isolated idle round's `CASGcGet` delta must be `< 50` (was ~1362) with `fsck dangling == 0`. **Not
   resolved:** the large-delta case remains O(universe) per round — see Lever B below (incremental
   point-updatable in-degree), still open.
 - **Logged (UTC):** 2026-07-05 (campaign S03 full 20M rows/400 parts)
 - **Severity:** s3-budget / efficiency
-- **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CasGcGet + ~643 CasBlobHead
-  + ~457 CasRootGet PER ROUND (~2500 S3 ops/round) with nothing changing. GC memory is bounded
+- **Observed:** 161 idle-GC rounds over ~15 min on a STATIC pool: ~1362 CASGcGet + ~643 CASBlobHead
+  + ~457 CASRootGet PER ROUND (~2500 S3 ops/round) with nothing changing. GC memory is bounded
   (1.57 GB) but S3 op volume is not idle-cheap — each round re-reads the generation runs and HEADs
   candidate blobs regardless of change.
 - **Components:** (a) the fold re-reads prior-generation runs every round even when the journal has
@@ -1032,7 +1032,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Logged (UTC):** 2026-07-06T23:32:38
 - **Severity:** suspected-bug
 - **Run:** 20260706T233201_S30_seed20260707
-- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 ## S33-20260706T233703-1: GC dry-run proposed deleting 34 key(s) NOT classified unreachable by fsck: ['soa
 
@@ -1046,7 +1046,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Logged (UTC):** 2026-07-06T23:39:55
 - **Severity:** suspected-bug
 - **Run:** 20260706T233911_S34_seed20260707
-- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=32 -> last=248, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
+- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CASRootGet first=32 -> last=248, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
 
 
 ## SOAK-LONG-CHAOS-HARNESS-REMEDIATION (2026-07-07, from the 4h chaos soak) — MEDIUM, harness-only
@@ -1075,7 +1075,7 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 - **Logged (UTC):** 2026-07-07T06:14:00
 - **Severity:** suspected-bug
 - **Run:** 20260707T061202_S34_seed20260707
-- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=0 -> last=214, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
+- **Observed:** S34 D1 regression: per-round GC fanout grew across create/drop iterations (CASRootGet first=0 -> last=214, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path
 
 ## S22-20260707T064805-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 246. DB::Exception: Build:
 
@@ -1124,7 +1124,7 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 - **Logged (UTC):** 2026-07-07T07:27:19
 - **Severity:** suspected-bug
 - **Run:** 20260707T072639_S30_seed20260707
-- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 
 ## F3-single-leader-dryrun-overproposal (2026-07-07, S18/S25/S26) — RESOLVED: over-strict oracle, NOT a tool/CA defect
@@ -1179,7 +1179,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
    - **S16 (hot content cycle):** "resurrection counters not present in system.metrics/system.events on
      this build" — find the real counter names on 26.6.1.1 (grep system.events for resurrect/revive/
      recreate-ish CA counters) and wire them, or assert the property another way.
-   - **S20 (replicated fetch and relink):** follower `CasRootCas=0` — the counter may not be scoped
+   - **S20 (replicated fetch and relink):** follower `CASRootCompareSwap=0` — the counter may not be scoped
      per-node; find a per-node attribution (per-node ProfileEvents query) so "follower publishes its own
      refs" is decidable.
    - **S21 (read-heavy many-ref) / S29 (large non-direct-blob memory spike):** the blob-cache /
@@ -1241,7 +1241,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   touched this fold window with net in-degree 0, HEAD the current token and ensure a condemn entry for the
   CURRENT token, superseding any stale-token retired entry — i.e. condemn/retire keyed on `(hash, current
   token)`, matching `CaIncarnationCore`'s `GRetire`. Adds `blob_retire_replaced` CA-log event +
-  `CasGcRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
+  `CASGcRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
   TLA+-gated by `CaGcResurrectReuploadOrphan` (`_bug.cfg` violates `NoLeakForever`, `_fix.cfg` holds; see
   `docs/superpowers/cas/06-tla-models.md` §Area 12). Commits `5156d37454b`(TLA+)..`6da55fce2a0`(tests), fix
   `308360e595d`. Verified: unit `CasGcLeak.*` (RED→GREEN + idempotency + writer-side retire-view), and S30 —
@@ -1306,7 +1306,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   observability-only):** (a) `CasBlobInDegree.cpp` `closeBlob`'s supersede reuses the `head_blob` peek,
   which is the *fresh-condemn* observation hook — so a resurrect supersede emits BOTH `blob_retire` and
   `blob_retire_replaced` for the same (hash, token, round) and double-increments
-  `CasGcRetiredCondemned`+`CasGcRetireReplaced`. Give the peek a side-effect-free HEAD (or an observe-only
+  `CASGcRetiredCondemned`+`CASGcRetireReplaced`. Give the peek a side-effect-free HEAD (or an observe-only
   `head_blob` mode) so `blob_retire_replaced` is the SOLE retire event for the supersede — this pollutes
   the very audit log used to triage such leaks. (b) `blob_retire_replaced` records only the new token; the
   spec (`…resurrect-reupload-orphan-fix-design.md` §Observability) intended `{hash, old_token, new_token,
@@ -1318,7 +1318,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   per-object in `system.content_addressed_log` and "precommit created, never removed" is a visible gap. The
   dead `ManifestExpand`/`ManifestRetire`/`ManifestStrip` enum entries were deleted. Blob-audit fixes: the
   resurrect supersede in `closeBlob` now uses a side-effect-free peek (same single S3 HEAD) so it emits ONLY
-  `blob_retire_replaced` (not also `blob_retire`) with a single `CasGcRetireReplaced` increment, and records
+  `blob_retire_replaced` (not also `blob_retire`) with a single `CASGcRetireReplaced` increment, and records
   the superseded `old_token` in `detail["superseded_token"]` (a review caught + fixed a size-unit regression
   in the peek — now applies `retiredLogicalSize` like `head_blob`). Commits `ab74694aaa8`, `0f539bafc0b`,
   `99cbe199580`. Unit: `CasObservability.*`.
@@ -1454,7 +1454,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
      decision-journal snapshot, needed because dropNamespace skips per-key recording): (a) not an atomic
      snapshot with the `explain_map` read; (b) `get()` bumps LRU recency as a side effect of a "read-only"
      diagnostic. Test/log-only path — acceptable; worth a one-line comment.
-  3. **(Low)** Single-flight followers each re-run the retain/`recordDecision`/`CasPartFolderViewMisses`
+  3. **(Low)** Single-flight followers each re-run the retain/`recordDecision`/`CASPartFolderViewMisses`
      logic after `future.get()`, so k concurrent cold waiters increment `Misses` k times (not once per cold
      key). Correct + idempotent; only inflates the miss counter under concurrency. No test asserts the
      count. Consider having only the leader record.
@@ -1898,7 +1898,7 @@ The multi-node abstraction was completed between the 2026-07-03 "NOT RUN" note a
 `docker-compose-10replicas.yml` (`node_count_for=10`) and `run.py` builds `Cluster(node_count=10)` — one
 command runs it: `PYTHONPATH=$(pwd) python3 -m scenarios.run --scenario S12 --seed 20260711 --duration 480s`.
 Re-confirmed GREEN on `cas-gc-rebuild` @ `ffc993a1d85` (post-campaign): 11/11 verdicts, all 10 replicas
-byte-identical (count=10000, matching row-hash), CA dedup fired (`CasBlobBodyPutAvoided=40`), fsck
+byte-identical (count=10000, matching row-hash), CA dedup fired (`CASBlobBodyPutAvoided=40`), fsck
 dangling=0/unreachable=0, forced-GC residual=0, no Failed GC rounds. (A store-dependent RustFS S3
 read/write error rate ~14% is recorded as info, not a CA defect.) NEEDS-INFRA remaining: S22 (fault
 S3 proxy), S27 (instrumented dup-object store).
@@ -1926,7 +1926,7 @@ in isolation — a pre-existing order-dependent-flake / shared-state issue, not 
 ## S01/S07 ci/full-scale attempt 2026-07-11 — S01 memory behavior CONFIRMED good; S07 cap NOT SQL-reachable (finding)
 - **S01 (memory-materialization):** the dev-scale run already shows the resolved streaming behavior clearly —
   peak MemoryResident 0.52 GB for a 64 MiB blob, RSS growth only **51 MiB** (RSS does NOT scale with blob
-  size), CasBlobPut=5, multipart used, replicas byte-identical, fsck dangling=0. The "inconclusive" is purely
+  size), CASBlobPut=5, multipart used, replicas byte-identical, fsck dangling=0. The "inconclusive" is purely
   the dev-scale attribution threshold (blob 64 MiB < 128 MiB), NOT a defect — `Build::putBlob` streams (fix
   `S01-PUTBLOB-MEMORY-FIXED`). A clean ci/full run to formalize the "<blob size" verdict is still nice-to-have
   but the evidence is already conclusive that RSS is bounded.
@@ -2451,11 +2451,11 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
   actually queueing up concurrent committers, not just a theoretical CPU concern.
 - **Decisive quantified evidence (`system.events`, same soak run, ~90min in):**
-  `CasRefQueueWaitMicroseconds` (`ProfileEvents.cpp:772`, `"CA total time appendRefOps
+  `CASRefQueueWaitMicroseconds` (`ProfileEvents.cpp:772`, `"CA total time appendRefOps
   callers spent enqueued (sum over items)"`, incremented at `CasRefLedger.cpp:849-851`
   from `enqueued_at` to when the item's flush completes) reads **388,053,047,365 μs on
   ch1 / 387,502,949,104 μs on ch2** — i.e. ~108 cumulative hours of caller wait time.
-  Dividing by `CasRefBatchedMutations` (855,272 ops on ch1, 854,840 on ch2, the count of
+  Dividing by `CASRefBatchedMutations` (855,272 ops on ch1, 854,840 on ch2, the count of
   ref-ops that went through this exact path) gives an **average wait of ~453.7ms per
   ref-op on ch1 and ~453.25ms on ch2** — nearly identical across both replicas,
   confirming this is a stable, reproducible effect of the flush mechanism, not noise.
@@ -2624,7 +2624,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   | HEAD | 7,513,774 | 13,420,870 | 56.0% (was 56.0% — NOT improved) |
   | DELETE | 3,162,288 | 2,441,327 | 129.5% — CAS-sum EXCEEDS the S3 total |
   | LIST | 30,546 | 31,905 | 95.7% (was ~0%) |
-  `CasBlobPut` alone (746,143) already exceeds the ENTIRE query_log-attributed PUT total
+  `CASBlobPut` alone (746,143) already exceeds the ENTIRE query_log-attributed PUT total
   (567,035), confirming background blob-upload workers (not query/part-scoped) are the
   dominant PUT source — consistent with the `TaskTracker`/async-upload-pool hypothesis
   above. DELETE's >100% coverage is plausibly explained by `DiskS3DeleteObjects` counting
@@ -2896,16 +2896,16 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   COUNT + SERIALIZATION, not bandwidth. Reads (10 `clusterAllReplicas` aggregations) were 17.6%
   FASTER on CAS, consistent with the write-only nature of the regression.
 - **Measured (CAS insert ProfileEvents, one node):** `RealTimeMicroseconds` 802.6 s → avg ~4.7
-  threads; `S3WriteMicroseconds` 117.5 s (2567 PUTs, ~46 ms each); `CasRefQueueWaitMicroseconds`
+  threads; `S3WriteMicroseconds` 117.5 s (2567 PUTs, ~46 ms each); `CASRefQueueWaitMicroseconds`
   **36.2 s**; `S3ReadMicroseconds` 29.1 s (1015 `HeadObject` + 514 `GetObject`, ~19 ms each);
-  `OSCPUVirtualTimeMicroseconds` 16.8 s (compute). **Smoking gun:** `CasRefBatchFlushes` = 1026 ==
-  `CasRefBatchedMutations` = 1026 → ref-ledger batch size EXACTLY **1.0** (1026 = 513 precommit + 513
-  promote appends, each its own serial S3 round trip). `CasManifestGet` = 513 (one per part).
-  `CasBlobHeadFirst` = 498 == `CasBlobHeadMiss` = 498, `CasBlobBodyPutAvoided` = 0. Standard-S3 side:
+  `OSCPUVirtualTimeMicroseconds` 16.8 s (compute). **Smoking gun:** `CASRefBatchFlushes` = 1026 ==
+  `CASRefBatchedMutations` = 1026 → ref-ledger batch size EXACTLY **1.0** (1026 = 513 precommit + 513
+  promote appends, each its own serial S3 round trip). `CASManifestGet` = 513 (one per part).
+  `CASBlobHeadFirst` = 498 == `CASBlobHeadMiss` = 498, `CASBlobBodyPutAvoided` = 0. Standard-S3 side:
   6156 `PutObject`, 0 HEAD, 0 GET, 0 COPY.
 - **Corrections to first hypotheses (from the measured data):**
-  - **"Fewer PUTs is dedup" — WRONG here.** `CasBlobBodyPutAvoided` = 0: on this fresh insert dedup
-    avoided ZERO PUTs. Fewer PUTs is COARSER OBJECT GRANULARITY — `CasBlobPut` = 1026 ≈ 2 blobs/part
+  - **"Fewer PUTs is dedup" — WRONG here.** `CASBlobBodyPutAvoided` = 0: on this fresh insert dedup
+    avoided ZERO PUTs. Fewer PUTs is COARSER OBJECT GRANULARITY — `CASBlobPut` = 1026 ≈ 2 blobs/part
     (content-addressed coalesced chunks) vs standard S3's ~30 separate column-file objects per part.
   - **"Double write" — ruled out.** `S3CopyObject` = 0 confirms direct PUT; S3-native staging
     (stage-PUT + server-side `CopyObject`) was OFF.
@@ -2934,11 +2934,11 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   1. **Concurrent per-part commit** (biggest win, architecturally clean): drive the commit loop with
      a bounded shared thread pool so multiple parts' `precommitAdd`/`promote` arrive at the ref queue
      concurrently and the ledger's existing batching collapses ~1026 batch-size-1 flushes into a
-     handful. Targets the ~47 s serial ref-PUT + 36 s `CasRefQueueWaitMicroseconds`. Correctness: the
+     handful. Targets the ~47 s serial ref-PUT + 36 s `CASRefQueueWaitMicroseconds`. Correctness: the
      per-namespace mount-lease still holds and the queue/leader serializes the actual appends —
      concurrency only FILLS the batch; only the per-part `precommitAdd`-before-`promote` order must be
-     preserved (different parts interleave freely). Success metric: `CasRefBatchFlushes` ≪
-     `CasRefBatchedMutations`, `CasRefQueueWaitMicroseconds` drops.
+     preserved (different parts interleave freely). Success metric: `CASRefBatchFlushes` ≪
+     `CASRefBatchedMutations`, `CASRefQueueWaitMicroseconds` drops.
   2. **Parallel per-blob upload within a part** (low risk): fan a part's blob PUTs across the SAME
      bounded pool (shared with #1 so it does not explode into parts×blobs threads). Targets the
      117.5 s `S3WriteMicroseconds` currently at ~4.7× concurrency.
@@ -2950,14 +2950,14 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      removing it would be a skip-read shortcut CAS forbids). Gate on backend read-after-write
      guarantees if the GET was also meant as a durability fence for weaker stores.
   4. **Make HEAD-before-PUT adaptive** (low risk, small): track the recent head-first hit rate
-     (`CasBlobBodyPutAvoided`/`CasBlobHeadFirst`) and back off speculative HEADs when it is ~0 (fresh
+     (`CASBlobBodyPutAvoided`/`CASBlobHeadFirst`) and back off speculative HEADs when it is ~0 (fresh
      bulk load), re-enabling when hits reappear — keeps the dedup win for re-inserts, drops the tax on
      first loads. Cheaper interim: raise/zero `dedup_head_first_min_bytes` on known low-dedup ingest.
      Before dropping the size branch entirely, confirm whether the target S3 endpoint actually
      early-closes doomed conditional PUTs (if not, the branch defends against a non-existent problem).
 - **Confirming metrics (per INSERT `query_id`, `system.query_log` ProfileEvents / `system.events`):**
-  `S3HeadObject`, `S3GetObject`, `CasBlobHeadFirst`/`CasBlobBodyPutAvoided`/`CasBlobDedupCacheHit`,
-  `CasRefBatchFlushes` vs `CasRefBatchedMutations`, and `CasRefQueueWaitMicroseconds` summed vs query
+  `S3HeadObject`, `S3GetObject`, `CASBlobHeadFirst`/`CASBlobBodyPutAvoided`/`CASBlobDedupCacheHit`,
+  `CASRefBatchFlushes` vs `CASRefBatchedMutations`, and `CASRefQueueWaitMicroseconds` summed vs query
   wall time (the smoking gun for #1). The full write-path code map + evidence is in the session memory
   note `project_cas_insert_slowness_writepath`.
 
@@ -2972,7 +2972,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 
 ## Investigations closed 2026-07-21 ~14:2x (user-requested, from the mid-soak health snapshot)
 - **RESOLVED (was: single CORRUPTED_DATA tmp-fetch binding)**: NOT corruption, NOT data-loss. Mechanism from text_log + audit log: `CasOrphanManifestSweep` built its protection view CONCURRENTLY with the fetch-relink re-key; the view replay hit the tmp-fetch removal op against a state that lacked the binding (non-atomic snapshot+log-tail cut, same transient family as B141/B144 fsck races) and threw `CORRUPTED_DATA`; the sweep caught it and FAILED CLOSED — "protection view unavailable; skipping", nothing deleted (Warning at 10:35:04.135 UTC, 300 ms after the successful `ref_drop`). Two product improvements: (a) replay-for-VIEW should treat exact-removal-absent as an incoherent-cut signal (retry/skip) without minting `CORRUPTED_DATA` — writer-side strict throw stays; (b) the handled transient still lands in `ForcedCriticalErrorsLogger` + `system.errors[CORRUPTED_DATA]`, poisoning must-be-zero telemetry with a false alarm.
-- **RESOLVED (was: GC round-3 764s zero-work anomaly)**: the round's own ProfileEvents map shows it was a fold+ref-cleanup round: `CasRefLogBodyGets` 97.5k, `CasRefEmittedEdges` 89k, `CasRefCleanupObjectsDeleted` 97.8k, `CasRootDelete` 97.8k, S3 GET 187k + HEAD 376k, ~800k ops in 764s ≈ 1 ms/op — healthy. OBSERVABILITY GAP confirmed and narrowed: the Finish row's four work columns count only blob-side outcomes; fix = surface fold/cleanup work (edges, ref objects deleted, list pages) as first-class Finish columns and include them in any ms_per_item normalization.
+- **RESOLVED (was: GC round-3 764s zero-work anomaly)**: the round's own ProfileEvents map shows it was a fold+ref-cleanup round: `CASRefLogBodyGets` 97.5k, `CASRefEmittedEdges` 89k, `CASRefCleanupObjectsDeleted` 97.8k, `CASRootDelete` 97.8k, S3 GET 187k + HEAD 376k, ~800k ops in 764s ≈ 1 ms/op — healthy. OBSERVABILITY GAP confirmed and narrowed: the Finish row's four work columns count only blob-side outcomes; fix = surface fold/cleanup work (edges, ref objects deleted, list pages) as first-class Finish columns and include them in any ms_per_item normalization.
 
 ## OPTIMIZATION OPPORTUNITY — manifestAlreadyOwned linear value-scan is the residual admits/apply hotspot — Logged 2026-07-21 ~14:3x
 The 07-20 admits() O(1) rewrite (b5f448e9b41 + 13ab814869c, IN the attempt-4 binary) killed the full re-ENCODE; the f1f11 attempt-4 CPU trace shows the residual: `RefCowMap::const_iterator::operator++` now lives in `manifestAlreadyOwned` (CasRefProtocol.cpp:24-33) — a LINEAR scan of the whole committed+precommit state per add-precommit op, guarded by a comment ("the state machine is not the hot path") that predates the encode fix and is now stale. Hit 3 ways: real apply, admits() preview (per state-growing op per flush batch), and — largest — replay paths (`applyRefLogTxn`: recovery, GC fold, orphan-sweep view build — e.g. round-3's 97k-txn fold pays the scan per historical add). Fix direction: incremental reverse index (manifest_ref -> owner) on RefTableState maintained in applyOpInPlace's four arms — the exact pattern of the body-byte counters commit; BM_Admits benchmark suite already exists to gate it. Severity: perf-only (correctness unaffected).
@@ -3140,7 +3140,7 @@ than to an error.
 - **Logged (UTC):** 2026-07-29T10:56:58
 - **Severity:** suspected-bug
 - **Run:** 20260729T105335_S30_seed20260729
-- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 ## S30-20260729T105335-2: forced GC left 98 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
 
@@ -3175,7 +3175,7 @@ than to an error.
 - **Logged (UTC):** 2026-07-29T11:53:26
 - **Severity:** suspected-bug
 - **Run:** 20260729T115218_S38_seed20260729
-- **Observed:** scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefApplyPoisoned', 'CasGcUnappliedFoldedTxns', 'CasRefRecoveryStreamHole'] — the binary does not have these counters, or the query shape changed; refusing to treat absence as zero
+- **Observed:** scenario raised: counter probe on Node(localhost:8123) did not return ['CasRefApplyPoisoned', 'CASGcUnappliedFoldedTxns', 'CASRefRecoveryStreamHole'] — the binary does not have these counters, or the query shape changed; refusing to treat absence as zero
 
 ## S43-20260729T115326-1: scenario raised: name '_zstd_decompress' is not defined
 
@@ -3203,7 +3203,7 @@ than to an error.
 - **Logged (UTC):** 2026-07-29T12:00:43
 - **Severity:** suspected-bug
 - **Run:** 20260729T115708_S30_seed20260729
-- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 ## S43-20260729T120731-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
 
@@ -3224,7 +3224,7 @@ than to an error.
 - **Logged (UTC):** 2026-07-29T12:18:55
 - **Severity:** finding
 - **Run:** 20260729T121529_S30_seed20260729
-- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
+- **Observed:** S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated.
 
 ## S43-20260729T123126-1: quiescence failed: Node(localhost:8123) HTTP 400: Code: 36. DB::Exception: Table
 

@@ -182,7 +182,7 @@ public:
 
     /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
     /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
-    /// transition it emits ONE WARN and one `CasIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
+    /// transition it emits ONE WARN and one `CASIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
     /// fail-loud TERMINAL state — `remountTerminal()` reports it, so the remount observer thread self-exits
     /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
     /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
@@ -206,7 +206,7 @@ public:
     /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
     /// latch (so the keeper stops scheduling remounts and the remount loop exits at its next step
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
-    /// one `CasDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
+    /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
     /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
     /// early at step 1). `which` MUST be one of the two `Vanished*` values (`VanishedReplaced` or
     /// `VanishedForgotten`). `reason` is retained and

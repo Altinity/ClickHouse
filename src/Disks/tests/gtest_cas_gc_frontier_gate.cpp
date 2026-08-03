@@ -63,9 +63,9 @@ using namespace DB::Cas::tests;
 
 namespace ProfileEvents
 {
-extern const Event CasGcRefWalkPlansBuilt;
-extern const Event CasGcUnmatchedAdoptedParentLives;
-extern const Event CasGcNamespaceCleanupLeaks;
+extern const Event CASGcRefWalkPlansBuilt;
+extern const Event CASGcUnmatchedAdoptedParentLives;
+extern const Event CASGcNamespaceCleanupLeaks;
 }
 
 namespace
@@ -2385,7 +2385,7 @@ TEST(CasGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
 
     std::map<String, UInt64> namespace_cleanup;
     const uint64_t leaks_before
-        = ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGcNamespaceCleanupLeaks].load();
     gc.setPhaseSink([&](const GcPhaseRecord & record)
     {
         if (record.phase == "namespace_cleanup")
@@ -2408,7 +2408,7 @@ TEST(CasGcFrontierGate, PostFoldUnreadableTerminalIsCountedWithoutSuppressingPro
     ASSERT_FALSE(namespace_cleanup.empty());
     EXPECT_EQ(namespace_cleanup["leaked"], 1u);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CasGcNamespaceCleanupLeaks].load() - leaks_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGcNamespaceCleanupLeaks].load() - leaks_before,
         1u);
     const String captured = log_capture.captured();
     EXPECT_NE(captured.find(terminal_key), String::npos);
@@ -2444,12 +2444,12 @@ TEST(CasGcFrontierGate, UnmatchedAdoptedParentLifeDoesNotSuppressAuthoritativeDe
 
     dropRefTransition(*backend, layout, ns, "victim", mref);
     const uint64_t events_before =
-        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load();
+        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load();
     const RoundReport report = runRegularRoundReclaiming(gc);
 
     ASSERT_TRUE(report.acquired_lease);
     EXPECT_EQ(
-        ProfileEvents::global_counters[ProfileEvents::CasGcUnmatchedAdoptedParentLives].load() - events_before,
+        ProfileEvents::global_counters[ProfileEvents::CASGcUnmatchedAdoptedParentLives].load() - events_before,
         1u);
     EXPECT_EQ(report.manifests_deleted, 1u)
         << "an unmatched adopted-parent row is observed and dropped, not promoted to pool-wide suppression";
@@ -2966,7 +2966,7 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 
     backend->clearJournal();
     const uint64_t plans_before  /// NOLINT(clang-analyzer-deadcode.DeadStores)
-        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
     backend->releaseBlockedCatalogCas();
     leader_a.join();
 
@@ -2982,7 +2982,7 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         EXPECT_NE(e.message().find("pre-fold drain lost authority"), String::npos) << e.message();
     }
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 0u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 0u);
     EXPECT_EQ(findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0), journal.size());
     EXPECT_EQ(findJournalAfter(journal, "cas_begin " + layout.gcStateKey(), 0), journal.size());
     EXPECT_FALSE(std::any_of(journal.begin(), journal.end(), [](const String & entry)

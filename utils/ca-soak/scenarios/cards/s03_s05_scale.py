@@ -3,8 +3,8 @@
 These three cards target the scale risks called out in the README §"Code-review surprise checklist"
 for the ref snapshot-log protocol. Ref state for a table lives as one `_log` object per ref-publish
 CAS plus an occasional full-state `_snap`; regular `GC` discovers the whole ref population with a
-single global `LIST` per round (`CasRefGlobalListPages`) and each table's fold reads only the logs
-newer than its own persisted cursor (`CasRefLogBodyGets`). The cards prove that GC cost (duration,
+single global `LIST` per round (`CASRefGlobalListPages`) and each table's fold reads only the logs
+newer than its own persisted cursor (`CASRefLogBodyGets`). The cards prove that GC cost (duration,
 memory, S3 GET/LIST counts) tracks *new logs since the per-table fold cursor* rather than the total
 number of live blob objects, idle namespaces, or the removed `namespaces * root_shards` RootShard
 discovery baseline.
@@ -167,25 +167,25 @@ class S03(Scenario):
                 "GC p95 duration recorded", "scales with changed transitions",
                 "no GC finish rows captured from the GC log for this run window"))
 
-        # --- CasBlobList == 0 for journal-driven rounds -------------------------------------
-        blob_list = int(delta.get("CasBlobList", 0))
+        # --- CASBlobList == 0 for journal-driven rounds -------------------------------------
+        blob_list = int(delta.get("CASBlobList", 0))
         result.add(Verdict.check(
-            "CasBlobList == 0 for journal-driven GC",
+            "CASBlobList == 0 for journal-driven GC",
             "0 (no full blob enumeration in regular GC rounds)",
             blob_list, blob_list == 0,
             "" if blob_list == 0 else "regular idle GC listed blob objects — it should be ref-log "
                                       "driven, not an orphan sweep; investigate"))
 
-        # --- CasRefRepoint == 0: this card is pure INSERT + background merge + GC, no
+        # --- CASRefRepoint == 0: this card is pure INSERT + background merge + GC, no
         # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION anywhere — no standalone (non-transactional)
         # write/remove on an already-committed part should ever occur, so repointRef
         # (CachedPartFolderAccess.cpp) has nothing to repoint. A nonzero count here means some op in
         # this "green path" workload took the standalone-repoint route unexpectedly (all-tree Tasks
         # 4/8/9's designed trigger set is freeze/ATTACH/DETACH/MOVE/REPLACE PARTITION-shaped, none of
         # which this card exercises).
-        repoints = int(delta.get("CasRefRepoint", 0))
+        repoints = int(delta.get("CASRefRepoint", 0))
         result.add(Verdict.check(
-            "CasRefRepoint == 0 on the non-transactional profile",
+            "CASRefRepoint == 0 on the non-transactional profile",
             "0 (no standalone write/remove on a committed part in a pure insert/merge/GC workload)",
             repoints, repoints == 0,
             "" if repoints == 0 else "unexpected standalone repoint of a committed ref during idle "
@@ -202,30 +202,30 @@ class S03(Scenario):
 
         # --- ref LIST and GET counters (record; bounded by changed/new logs) ----------------
         list_counters = {k: int(delta.get(k, 0)) for k in (
-            "CasRefGlobalListPages", "CasRefLogBodyGets", "CasGcGet", "CasGcPut", "CasBlobHead",
-            "CasBlobDelete")}
+            "CASRefGlobalListPages", "CASRefLogBodyGets", "CASGcGet", "CASGcPut", "CASBlobHead",
+            "CASBlobDelete")}
         result.observations["idle_list_get_counters"] = list_counters
         result.add(Verdict(
             "ref LIST/GET driven by changed logs",
-            "per-round CasRefLogBodyGets driven by NEW logs since the per-table fold cursor; "
-            "CasRefGlobalListPages scales with total ref-object population, not per-round work",
+            "per-round CASRefLogBodyGets driven by NEW logs since the per-table fold cursor; "
+            "CASRefGlobalListPages scales with total ref-object population, not per-round work",
             list_counters, "pass",
             "recorded; the S05 card below asserts the non-vacuous per-round bound on "
-            "CasRefLogBodyGets"))
+            "CASRefLogBodyGets"))
 
         # --- ops-budget: an IDLE round (no touch) does near-zero generation-run I/O -----------
         # Phase 4 Lever A (GC round skip-unchanged; docs/superpowers/cas/ROADMAP.md): a round that
         # makes no destructive decision DEFERs and re-adopts the sealed in-degree generation instead
         # of rebuilding it from a full snapshot read. Pre-fix, BACKLOG "S3-BUDGET — idle GC has a high
-        # fixed per-round cost on a large static pool" measured ~1362 `CasGcGet` PER ROUND on a static
+        # fixed per-round cost on a large static pool" measured ~1362 `CASGcGet` PER ROUND on a static
         # pool; post-fix an isolated idle round (no touch immediately before it) should read near-zero.
         idle_round_counters = _common.counters_window(ctx)
         gc_mod.gc_drive_round(cl, log_fn=ctx.log)
         idle_round_delta = idle_round_counters().get("_total", {})
-        idle_round_cas_gc_get = int(idle_round_delta.get("CasGcGet", 0))
+        idle_round_cas_gc_get = int(idle_round_delta.get("CASGcGet", 0))
         result.observations["idle_round_ops_budget"] = {
             k: int(idle_round_delta.get(k, 0))
-            for k in ("CasGcGet", "CasRefLogBodyGets", "CasRefGlobalListPages")}
+            for k in ("CASGcGet", "CASRefLogBodyGets", "CASRefGlobalListPages")}
 
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S03 replica agreement")
@@ -235,15 +235,15 @@ class S03(Scenario):
                                  "fsck dangling==0 (live blobs not deleted by idle GC)",
                                  dangling, dangling == 0))
 
-        # Combine the isolated idle-round CasGcGet reading above with this checkpoint's fsck
+        # Combine the isolated idle-round CASGcGet reading above with this checkpoint's fsck
         # dangling==0 into the Phase 4 Lever A ops-budget acceptance check (spec §9).
         ok_idle_budget = idle_round_cas_gc_get < 50 and dangling == 0
         result.add(Verdict.check(
             "idle GC round ops budget (Phase 4 Lever A skip-unchanged)",
-            "CasGcGet < 50 for an idle round (pre-fix ~1362; BACKLOG S3-BUDGET) and fsck dangling == 0",
-            f"CasGcGet={idle_round_cas_gc_get} dangling={dangling}", ok_idle_budget,
+            "CASGcGet < 50 for an idle round (pre-fix ~1362; BACKLOG S3-BUDGET) and fsck dangling == 0",
+            f"CASGcGet={idle_round_cas_gc_get} dangling={dangling}", ok_idle_budget,
             "" if ok_idle_budget else
-            "idle round re-read the generation in full (CasGcGet not near-zero) or left dangling refs "
+            "idle round re-read the generation in full (CASGcGet not near-zero) or left dangling refs "
             "— the DEFER short-circuit may have regressed (see BACKLOG S3-BUDGET — idle GC)"))
 
 
@@ -349,8 +349,8 @@ class S04(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["drain_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasBlobHead", "CasBlobDelete", "CasGcPut", "CasGcDelete", "CasGcGet",
-            "CasBlobList", "CasRefGlobalListPages", "CasRefLogBodyGets", "CasRefRepoint")}
+            "CASBlobHead", "CASBlobDelete", "CASGcPut", "CASGcDelete", "CASGcGet",
+            "CASBlobList", "CASRefGlobalListPages", "CASRefLogBodyGets", "CASRefRepoint")}
 
         # --- deleted/round, durations, replaced/spared from the GC log --------------------
         gc_all = _gc_log_since(ctx)
@@ -393,11 +393,11 @@ class S04(Scenario):
             "" if (replaced == 0 and spared == 0) else
             "exact-token mismatch deletes happened with no live writers — investigate"))
 
-        # --- CasRefRepoint == 0: this card's drain window is DROP TABLE + forced GC, no
+        # --- CASRefRepoint == 0: this card's drain window is DROP TABLE + forced GC, no
         # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION — see S03's identical check for the rationale.
-        repoints = int(delta.get("CasRefRepoint", 0))
+        repoints = int(delta.get("CASRefRepoint", 0))
         result.add(Verdict.check(
-            "CasRefRepoint == 0 on the non-transactional profile",
+            "CASRefRepoint == 0 on the non-transactional profile",
             "0 (no standalone write/remove on a committed part during a DROP+GC-drain workload)",
             repoints, repoints == 0,
             "" if repoints == 0 else "unexpected standalone repoint of a committed ref during "
@@ -521,21 +521,21 @@ class S05(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["sparse_phase_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasRefGlobalListPages", "CasRefLogBodyGets", "CasGcGet", "CasGcPut", "CasBlobList",
-            "CasBlobHead", "CasBlobDelete")}
+            "CASRefGlobalListPages", "CASRefLogBodyGets", "CASGcGet", "CASGcPut", "CASBlobList",
+            "CASBlobHead", "CASBlobDelete")}
 
         # --- idle tables don't dominate GC CPU / GET counts ---------------------------------
         gc_all = _gc_log_since(ctx)
         durs = _finish_durations(gc_all)
         rounds = max(1, len([d for d in durs if d is not None]))
-        # CasRefLogBodyGets (src/Common/ProfileEvents.cpp:762): ref-log transaction-body GETs decoded
-        # during the GC fold. CORRECTION (2026-07-13, live-run verification): the old `CasRootGet`
+        # CASRefLogBodyGets (src/Common/ProfileEvents.cpp:762): ref-log transaction-body GETs decoded
+        # during the GC fold. CORRECTION (2026-07-13, live-run verification): the old `CASRootGet`
         # this oracle used to read is NOT dead — it survives as a backend-level counter of GETs on
         # the roots/ prefix (ProfileEvents.cpp:795), which today counts ref-log/snapshot object
         # reads by EVERY consumer (writer recovery, sweeps, folds). It was replaced here not because
         # it is vacuous but because it CONFLATES consumers: this check asserts a property of the GC
-        # FOLD specifically, and CasRefLogBodyGets isolates exactly the fold's body reads.
-        log_body_gets = int(delta.get("CasRefLogBodyGets", 0))
+        # FOLD specifically, and CASRefLogBodyGets isolates exactly the fold's body reads.
+        log_body_gets = int(delta.get("CASRefLogBodyGets", 0))
         get_per_round = log_body_gets / rounds
         result.observations["log_body_gets_per_round_avg"] = round(get_per_round, 1)
         # Each table's fold reads only the logs newer than its own persisted cursor, so an idle table
@@ -546,8 +546,8 @@ class S05(Scenario):
             ok_get = get_per_round < ntables  # not O(tables) body GETs per round
             result.add(Verdict.check(
                 "idle tables don't dominate GC GETs",
-                f"CasRefLogBodyGets/round << {ntables} (per-table fold cursors skip already-folded logs)",
-                f"{get_per_round:.0f} CasRefLogBodyGets/round over {rounds} rounds",
+                f"CASRefLogBodyGets/round << {ntables} (per-table fold cursors skip already-folded logs)",
+                f"{get_per_round:.0f} CASRefLogBodyGets/round over {rounds} rounds",
                 ok_get,
                 "" if ok_get else f"GC did ~O(tables) ref-log body GETs/round ({get_per_round:.0f} >= "
                                   f"{ntables}) — the per-table fold cursor is NOT skipping idle "
@@ -556,21 +556,21 @@ class S05(Scenario):
         else:
             result.add(Verdict.inconclusive(
                 "idle tables don't dominate GC GETs",
-                "CasRefLogBodyGets/round bounded by new logs since the per-table fold cursor",
+                "CASRefLogBodyGets/round bounded by new logs since the per-table fold cursor",
                 "no GC finish rows captured to compute per-round GET cost"))
 
-        blob_list = int(delta.get("CasBlobList", 0))
+        blob_list = int(delta.get("CASBlobList", 0))
         result.add(Verdict.check(
-            "CasBlobList == 0 for sparse-write GC",
+            "CASBlobList == 0 for sparse-write GC",
             "0 (no full blob enumeration in regular rounds)",
             blob_list, blob_list == 0,
             "" if blob_list == 0 else "GC enumerated blob objects on a sparse-write round"))
 
-        # --- CasRefRepoint == 0: sparse INSERT + background merge + GC only, no
+        # --- CASRefRepoint == 0: sparse INSERT + background merge + GC only, no
         # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION — see S03's identical check for the rationale.
-        repoints = int(delta.get("CasRefRepoint", 0))
+        repoints = int(delta.get("CASRefRepoint", 0))
         result.add(Verdict.check(
-            "CasRefRepoint == 0 on the non-transactional profile",
+            "CASRefRepoint == 0 on the non-transactional profile",
             "0 (no standalone write/remove on a committed part in a pure insert/merge/GC workload)",
             repoints, repoints == 0,
             "" if repoints == 0 else "unexpected standalone repoint of a committed ref during "

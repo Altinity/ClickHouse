@@ -165,9 +165,9 @@ class S06(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["s06_counters"] = delta
-        result.observations["s06_CasBlobPut"] = delta.get("CasBlobPut", 0)
-        result.observations["s06_CasRootCas"] = delta.get("CasRootCas", 0)
-        result.observations["s06_CasRootCasConflict"] = delta.get("CasRootCasConflict", 0)
+        result.observations["s06_CasBlobPut"] = delta.get("CASBlobPut", 0)
+        result.observations["s06_CasRootCas"] = delta.get("CASRootCompareSwap", 0)
+        result.observations["s06_CasRootCasConflict"] = delta.get("CASRootCompareSwapConflict", 0)
 
         # Encoded manifest size + inline-entry total, observed from the physical pool (_manifests).
         mshape = _manifests_shape()
@@ -220,7 +220,7 @@ class S06(Scenario):
 
         # --- Verdict: column-subset read does not fetch every blob -----------------------
         if committed:
-            # Scan a small subset of columns, then all columns; CasBlobGet for the subset must be far
+            # Scan a small subset of columns, then all columns; CASBlobGet for the subset must be far
             # below the all-column scan (a Wide part has one blob body per column .bin).
             cl.node1.command("SYSTEM DROP MARK CACHE")
             cl.node1.command("SYSTEM DROP UNCOMPRESSED CACHE")
@@ -233,7 +233,7 @@ class S06(Scenario):
             except Exception as e:
                 ctx.log(f"S06: subset scan raised: {e}")
             sub_delta = cw().get("_total", {})
-            subset_gets = sub_delta.get("CasBlobGet", 0)
+            subset_gets = sub_delta.get("CASBlobGet", 0)
 
             cl.node1.command("SYSTEM DROP MARK CACHE")
             cl.node1.command("SYSTEM DROP UNCOMPRESSED CACHE")
@@ -245,7 +245,7 @@ class S06(Scenario):
             except Exception as e:
                 ctx.log(f"S06: all-column scan raised: {e}")
             all_delta = cw2().get("_total", {})
-            all_gets = all_delta.get("CasBlobGet", 0)
+            all_gets = all_delta.get("CASBlobGet", 0)
 
             result.observations["s06_subset_CasBlobGet"] = subset_gets
             result.observations["s06_allcol_CasBlobGet"] = all_gets
@@ -255,14 +255,14 @@ class S06(Scenario):
                 ok = subset_gets < max(1, all_gets // 2)
                 result.add(Verdict.check(
                     "column-subset avoids full fetch",
-                    f"subset CasBlobGet << all-column ({subset_cols}/{n_cols} cols)",
+                    f"subset CASBlobGet << all-column ({subset_cols}/{n_cols} cols)",
                     f"subset={subset_gets} all={all_gets}", ok,
                     "" if ok else "a few-column SELECT fetched ~as many blobs as an all-column scan"))
             elif all_gets == 0:
                 # Caches/inline may serve the read entirely from metadata; record honestly.
                 result.add(Verdict.inconclusive(
                     "column-subset avoids full fetch", "subset << all-column",
-                    "all-column scan issued 0 CasBlobGet (served from cache/inline) — "
+                    "all-column scan issued 0 CASBlobGet (served from cache/inline) — "
                     "cannot compare blob-fetch counts at this scale"))
 
         _common.standard_end(ctx, result, [table])
@@ -443,11 +443,11 @@ class S08(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["s08_create_counters"] = delta
-        cas_conflict = delta.get("CasRootCasConflict", 0)
-        cas_total = delta.get("CasRootCas", 0)
+        cas_conflict = delta.get("CASRootCompareSwapConflict", 0)
+        cas_total = delta.get("CASRootCompareSwap", 0)
         result.observations["s08_CasRootCas"] = cas_total
         result.observations["s08_CasRootCasConflict"] = cas_conflict
-        result.observations["s08_CasRootGet"] = delta.get("CasRootGet", 0)
+        result.observations["s08_CasRootGet"] = delta.get("CASRootGet", 0)
 
         # Inserts must fail only for expected MergeTree part-count pressure, never CA-metadata errors.
         result.add(Verdict.check(
@@ -507,7 +507,7 @@ class S08(Scenario):
 
         # CAS contention on the per-table ref log: conflicts should be a small fraction of total CAS
         # ops. There is no root_shards fan-out any more (refs are per-table, not shard-distributed);
-        # the ref-log-append batching/flat-combining lane (CasRefBatchFlushes/CasRefBatchedMutations)
+        # the ref-log-append batching/flat-combining lane (CASRefBatchFlushes/CASRefBatchedMutations)
         # is what keeps the actual underlying CAS attempt rate — and so the conflict rate — bounded
         # even under many concurrent writers to the same table.
         if cas_total > 0:
@@ -521,7 +521,7 @@ class S08(Scenario):
         else:
             result.add(Verdict.inconclusive(
                 "CAS contention bounded", "conflict ratio bounded",
-                "no CasRootCas ops observed in the creation window"))
+                "no CASRootCompareSwap ops observed in the creation window"))
 
         # --- Convergence phase: re-enable merges and force convergence -------------------
         ctx.log("S08: re-enabling merges and forcing convergence")

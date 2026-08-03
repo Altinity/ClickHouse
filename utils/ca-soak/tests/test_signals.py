@@ -89,9 +89,9 @@ def test_sql_rejects_a_name_that_is_not_an_identifier():
 def test_parse_events_tsv_raises_on_a_malformed_row():
     """A row we cannot parse came back from a query we wrote ourselves — surface it, do not drop it."""
     with pytest.raises(ValueError):
-        parse_events_tsv("CasRefAppendWedged")
+        parse_events_tsv("CASRefAppendWedged")
     with pytest.raises(ValueError):
-        parse_events_tsv("CasRefAppendWedged\tnot-a-number")
+        parse_events_tsv("CASRefAppendWedged\tnot-a-number")
 
 
 def test_all_zero_is_a_valid_reading():
@@ -104,11 +104,11 @@ def test_missing_counter_raises_rather_than_reading_as_zero():
     """The headline case: a renamed or not-yet-existing counter must kill the run, not read as a
     permanent quiet zero for four hours."""
     values = {e: 0 for e in CAS_SIGNAL_EVENTS}
-    dropped = values.pop("CasGcUnappliedFoldedTxns")
+    dropped = values.pop("CASGcUnappliedFoldedTxns")
     assert dropped == 0
     with pytest.raises(SignalsUnsupported) as ei:
         parse_signal_events(_events_tsv(values))
-    assert "CasGcUnappliedFoldedTxns" in str(ei.value)
+    assert "CASGcUnappliedFoldedTxns" in str(ei.value)
 
 
 def test_extra_counters_in_the_answer_are_ignored():
@@ -358,14 +358,14 @@ def test_a_probe_gap_is_not_a_passing_invariant():
 
 
 def test_the_late_put_losing_is_evidence_not_a_violation():
-    """`CasRefAppendSealRejected` is a deposed writer being told so — the mechanism working. A run that
+    """`CASRefAppendSealRejected` is a deposed writer being told so — the mechanism working. A run that
     fenced a hundred stragglers is a run that tested the invariant, not one that broke it."""
     f = LatePutFencing()
-    assert f.observe("n1", {"CasRefRecoveryEpochSealed": 4, "CasRefAppendSealRejected": 100,
-                            "CasRefRecoveryStragglerAdopted": 2, "CasRefApplyPoisoned": 0,
-                            "CasGcUnappliedFoldedTxns": 0, "CasRefRecoveryStreamHole": 0}) == []
+    assert f.observe("n1", {"CASRefRecoveryEpochSealed": 4, "CASRefAppendSealRejected": 100,
+                            "CASRefRecoveryStragglerAdopted": 2, "CasRefApplyPoisoned": 0,
+                            "CASGcUnappliedFoldedTxns": 0, "CASRefRecoveryStreamHole": 0}) == []
     assert f.exercised
-    assert f.evidence_peak["CasRefAppendSealRejected"] == 100
+    assert f.evidence_peak["CASRefAppendSealRejected"] == 100
     text = "\n".join(f.report_lines())
     assert "VIOLATION" not in text and "WARNING" not in text
 

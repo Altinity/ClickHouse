@@ -41,33 +41,33 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasPartFolderManifestGets;
-    extern const Event CasRemountHeldTransient;
-    extern const Event CasRefBatchFlushes;
-    extern const Event CasRefBatchedMutations;
-    extern const Event CasRefBatchScopeCuts;
-    extern const Event CasRefQueueWaitMicroseconds;
-    extern const Event CasRefRecoveryRestarts;
-    extern const Event CasRefRecoveryRetries;
-    extern const Event CasRefAppendWedged;
-    extern const Event CasRefAppendUnwedged;
-    extern const Event CasRefAppendDefiniteFailure;
-    extern const Event CasRefSweepDeferred;
-    extern const Event CasRefSweepRearmed;
-    extern const Event CasRefStalePrecommitsReclaimed;
-    extern const Event CasRefTableEvictions;
-    extern const Event CasRefSnapshotPutBytes;
-    extern const Event CasRefSnapshotTailLogs;
-    extern const Event CasRefSnapshotPublishDispatched;
-    extern const Event CasRefSnapshotPublishBackoff;
-    extern const Event CasDedupCacheHits;
-    extern const Event CasDedupCacheMisses;
+    extern const Event CASPartFolderManifestGets;
+    extern const Event CASRemountHeldTransient;
+    extern const Event CASRefBatchFlushes;
+    extern const Event CASRefBatchedMutations;
+    extern const Event CASRefBatchScopeCuts;
+    extern const Event CASRefQueueWaitMicroseconds;
+    extern const Event CASRefRecoveryRestarts;
+    extern const Event CASRefRecoveryRetries;
+    extern const Event CASRefAppendWedged;
+    extern const Event CASRefAppendUnwedged;
+    extern const Event CASRefAppendDefiniteFailure;
+    extern const Event CASRefSweepDeferred;
+    extern const Event CASRefSweepRearmed;
+    extern const Event CASRefStalePrecommitsReclaimed;
+    extern const Event CASRefTableEvictions;
+    extern const Event CASRefSnapshotPutBytes;
+    extern const Event CASRefSnapshotTailLogs;
+    extern const Event CASRefSnapshotPublishDispatched;
+    extern const Event CASRefSnapshotPublishBackoff;
+    extern const Event CASDedupCacheHits;
+    extern const Event CASDedupCacheMisses;
 }
 
 namespace CurrentMetrics
 {
-    extern const Metric CasDedupCacheBytes;
-    extern const Metric CasDedupCacheEntries;
+    extern const Metric CASDedupCacheBytes;
+    extern const Metric CASDedupCacheEntries;
 }
 
 namespace DB::Cas
@@ -210,7 +210,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
-            "LRU", CurrentMetrics::CasDedupCacheBytes, CurrentMetrics::CasDedupCacheEntries,
+            "LRU", CurrentMetrics::CASDedupCacheBytes, CurrentMetrics::CASDedupCacheEntries,
             config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
 }
 
@@ -247,8 +247,8 @@ bool Pool::dedupCacheContains(const BlobRef & ref) const
     /// raw lookup counters on the presence cache itself, disabled
     /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
     /// probe. `PartWriteTxn::putBlob` calls this seam up to twice on a genuine hit (once to pick the
-    /// HEAD-first branch, once more just to attribute `CasBlobBodyPutAvoided` to the cache -- see
-    /// CasPartWriteTxn.cpp), so `CasDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
+    /// HEAD-first branch, once more just to attribute `CASBlobBodyPutAvoided` to the cache -- see
+    /// CasPartWriteTxn.cpp), so `CASDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
     /// does not itself skip the HEAD that follows in putBlob's HEAD-first branch -- it steers the call
     /// onto that cheap branch instead of an unconditional body stream; the body PUT is what a hit
     /// actually avoids.
@@ -256,10 +256,10 @@ bool Pool::dedupCacheContains(const BlobRef & ref) const
         return false;
     if (dedup_cache->contains(ref))
     {
-        ProfileEvents::increment(ProfileEvents::CasDedupCacheHits);
+        ProfileEvents::increment(ProfileEvents::CASDedupCacheHits);
         return true;
     }
-    ProfileEvents::increment(ProfileEvents::CasDedupCacheMisses);
+    ProfileEvents::increment(ProfileEvents::CASDedupCacheMisses);
     return false;
 }
 
@@ -1068,7 +1068,7 @@ bool Pool::tryRemountOnce()
                 /// predating the contiguous-ref-stream format floor looks like from here (`decodePoolMeta`
                 /// throws, the gate catches it), and silently retrying forever would leave that pool's
                 /// operator with a fenced mount and nothing to read. Say it, and count it.
-                ProfileEvents::increment(ProfileEvents::CasRemountHeldTransient);
+                ProfileEvents::increment(ProfileEvents::CASRemountHeldTransient);
                 LOG_WARNING(getLogger("CasPool"),
                     "content-addressed pool '{}' (prefix '{}'): remount held TRANSIENT — {}. The mount "
                     "stays fenced closed and the remount loop will retry. If this repeats, the pool "

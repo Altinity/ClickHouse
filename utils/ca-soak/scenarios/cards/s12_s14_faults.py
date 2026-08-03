@@ -154,18 +154,18 @@ class S12(Scenario):
 
         # CA CONTENT dedup across writers (the real shared-pool property, distinct from RMT row-dedup):
         # the SHARED block's payload content is byte-identical on all N replicas, so content-addressing
-        # stores it ONCE physically and the redundant body-PUTs are avoided (CasBlobBodyPutAvoided>0).
+        # stores it ONCE physically and the redundant body-PUTs are avoided (CASBlobBodyPutAvoided>0).
         # This is what "shared pool" buys: N writers of identical content pay one physical copy.
         tot = delta.get("_total", {})
         result.observations["dedup_counters"] = {
             k: int(tot.get(k, 0)) for k in
-            ("CasBlobBodyPutAvoided", "CasBlobDedupCacheHit", "CasBlobHeadFirst", "CasManifestPut")}
-        avoided = int(tot.get("CasBlobBodyPutAvoided", 0))
+            ("CASBlobBodyPutAvoided", "CASBlobDedupCacheHit", "CASBlobHeadFirst", "CASManifestPut")}
+        avoided = int(tot.get("CASBlobBodyPutAvoided", 0))
         dedup_expected = shared_rows > 0
         result.add(Verdict.check(
             "CA content dedup across 10 writers (shared payload stored once)",
             ">0 body-puts avoided" if dedup_expected else "n/a (no shared block)",
-            f"CasBlobBodyPutAvoided={avoided}",
+            f"CASBlobBodyPutAvoided={avoided}",
             (avoided > 0) if dedup_expected else True,
             "" if (avoided > 0 or not dedup_expected) else
             "shared identical content across 10 writers was NOT physically deduped in the pool"))
@@ -623,24 +623,24 @@ class S14(Scenario):
                                             "explained by required root/manifest reads",
                                             "no first-query samples collected (tables not queryable)"))
 
-        # Startup CA counters: CasRootList / CasRootGet should dominate, scaling with metadata.
+        # Startup CA counters: CASRootList / CASRootGet should dominate, scaling with metadata.
         delta = counters().get("_total", {})
         startup_counters = {k: delta.get(k, 0) for k in (
-            "CasRootList", "CasRootGet", "CasRootHead", "CasBlobList", "CasBlobHead", "CasBlobGet")}
+            "CASRootList", "CASRootGet", "CASRootHead", "CASBlobList", "CASBlobHead", "CASBlobGet")}
         result.observations["startup_ca_counters"] = startup_counters
         result.add(Verdict("startup root metadata reads recorded",
-                           "CasRootList/CasRootGet scale with table metadata, not blob count",
-                           f"RootList={startup_counters['CasRootList']} "
-                           f"RootGet={startup_counters['CasRootGet']} "
-                           f"BlobList={startup_counters['CasBlobList']}",
+                           "CASRootList/CASRootGet scale with table metadata, not blob count",
+                           f"RootList={startup_counters['CASRootList']} "
+                           f"RootGet={startup_counters['CASRootGet']} "
+                           f"BlobList={startup_counters['CASBlobList']}",
                            "pass"))
         # A startup that LISTs all blobs would defeat the design; flag it (informational verdict).
         result.add(Verdict.check(
-            "startup does not list all blobs", "CasBlobList stays bounded (not O(blobs))",
-            startup_counters["CasBlobList"],
-            startup_counters["CasBlobList"] <= max(16, len(measured_tables)),
-            "" if startup_counters["CasBlobList"] <= max(16, len(measured_tables)) else
-            "startup issued many CasBlobList ops — investigate whether attach scans the blob prefix"))
+            "startup does not list all blobs", "CASBlobList stays bounded (not O(blobs))",
+            startup_counters["CASBlobList"],
+            startup_counters["CASBlobList"] <= max(16, len(measured_tables)),
+            "" if startup_counters["CASBlobList"] <= max(16, len(measured_tables)) else
+            "startup issued many CASBlobList ops — investigate whether attach scans the blob prefix"))
 
         # MemoryResident after restart vs before (must not scale with total blob count).
         post_mem = observe.cluster_memory(cl)

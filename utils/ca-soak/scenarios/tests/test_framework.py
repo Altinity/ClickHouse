@@ -20,24 +20,24 @@ def test_parse_duration():
 
 
 def test_events_delta_basic_and_reset():
-    before = {"CasBlobPut": 10, "CasBlobHead": 5}
-    after = {"CasBlobPut": 17, "CasBlobHead": 5, "CasGcDelete": 3}
+    before = {"CASBlobPut": 10, "CASBlobHead": 5}
+    after = {"CASBlobPut": 17, "CASBlobHead": 5, "CASGcDelete": 3}
     d = observe.events_delta(before, after)
-    assert d["CasBlobPut"] == 7
-    assert "CasBlobHead" not in d  # zero delta dropped
-    assert d["CasGcDelete"] == 3
+    assert d["CASBlobPut"] == 7
+    assert "CASBlobHead" not in d  # zero delta dropped
+    assert d["CASGcDelete"] == 3
     # counter reset (after < before) -> report post-reset absolute value
-    d2 = observe.events_delta({"CasBlobPut": 100}, {"CasBlobPut": 4})
-    assert d2["CasBlobPut"] == 4
+    d2 = observe.events_delta({"CASBlobPut": 100}, {"CASBlobPut": 4})
+    assert d2["CASBlobPut"] == 4
 
 
 def test_cluster_events_delta_total():
-    before = {"ch1": {"CasBlobPut": 1}, "ch2": {"CasBlobPut": 2}}
-    after = {"ch1": {"CasBlobPut": 5}, "ch2": {"CasBlobPut": 10}}
+    before = {"ch1": {"CASBlobPut": 1}, "ch2": {"CASBlobPut": 2}}
+    after = {"ch1": {"CASBlobPut": 5}, "ch2": {"CASBlobPut": 10}}
     out = observe.cluster_events_delta(before, after)
-    assert out["ch1"]["CasBlobPut"] == 4
-    assert out["ch2"]["CasBlobPut"] == 8
-    assert out["_total"]["CasBlobPut"] == 12
+    assert out["ch1"]["CASBlobPut"] == 4
+    assert out["ch2"]["CASBlobPut"] == 8
+    assert out["_total"]["CASBlobPut"] == 12
 
 
 def test_worst_status_ordering():

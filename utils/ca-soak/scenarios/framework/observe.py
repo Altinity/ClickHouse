@@ -138,7 +138,7 @@ def events_snapshot(node) -> dict:
     try:
         txt = node.query(
             "SELECT event, value FROM system.events "
-            "WHERE event LIKE 'Cas%' OR event LIKE 'DiskS3%' OR event LIKE 'S3%' "
+            "WHERE event LIKE 'CAS%' OR event LIKE 'DiskS3%' OR event LIKE 'S3%' "
             "FORMAT TabSeparated")
     except Exception as e:
         if not _is_benign_probe_gap(e):

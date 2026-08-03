@@ -44,35 +44,35 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasRefBatchFlushes;
-    extern const Event CasRefBatchedMutations;
-    extern const Event CasRefBatchScopeCuts;
-    extern const Event CasRefQueueWaitMicroseconds;
-    extern const Event CasRefRecoveryRestarts;
-    extern const Event CasRefRecoveryRetries;
-    extern const Event CasRefAppendWedged;
-    extern const Event CasRefAppendPreAttemptRefused;
-    extern const Event CasRefAppendUnwedged;
-    extern const Event CasRefAppendDefiniteFailure;
-    extern const Event CasRefAppendSealRejected;
-    extern const Event CasRefAppendOccupantUnreadable;
-    extern const Event CasRefNeedsRecovery;
-    extern const Event CasRefSweepDeferred;
-    extern const Event CasRefSweepRearmed;
-    extern const Event CasRefStalePrecommitsReclaimed;
-    extern const Event CasRefTableEvictions;
-    extern const Event CasRefSnapshotPutBytes;
-    extern const Event CasRefSnapshotTailLogs;
-    extern const Event CasRefSnapshotPublishDispatched;
-    extern const Event CasRefSnapshotPublishBackoff;
-    extern const Event CasRefCkptPublished;
-    extern const Event CasRefCkptIdenticalSkip;
-    extern const Event CasRefCkptNotAdvanced;
-    extern const Event CasRefRecoveryEpochSealed;
-    extern const Event CasRefRecoveryEpochSealAdopted;
-    extern const Event CasRefRecoveryStragglerAdopted;
-    extern const Event CasRefRecoveryCancelled;
-    extern const Event CasRefRecoveryStreamHole;
+    extern const Event CASRefBatchFlushes;
+    extern const Event CASRefBatchedMutations;
+    extern const Event CASRefBatchScopeCuts;
+    extern const Event CASRefQueueWaitMicroseconds;
+    extern const Event CASRefRecoveryRestarts;
+    extern const Event CASRefRecoveryRetries;
+    extern const Event CASRefAppendWedged;
+    extern const Event CASRefAppendPreAttemptRefused;
+    extern const Event CASRefAppendUnwedged;
+    extern const Event CASRefAppendDefiniteFailure;
+    extern const Event CASRefAppendSealRejected;
+    extern const Event CASRefAppendOccupantUnreadable;
+    extern const Event CASRefNeedsRecovery;
+    extern const Event CASRefSweepDeferred;
+    extern const Event CASRefSweepRearmed;
+    extern const Event CASRefStalePrecommitsReclaimed;
+    extern const Event CASRefTableEvictions;
+    extern const Event CASRefSnapshotPutBytes;
+    extern const Event CASRefSnapshotTailLogs;
+    extern const Event CASRefSnapshotPublishDispatched;
+    extern const Event CASRefSnapshotPublishBackoff;
+    extern const Event CASRefCkptPublished;
+    extern const Event CASRefCkptIdenticalSkip;
+    extern const Event CASRefCkptNotAdvanced;
+    extern const Event CASRefRecoveryEpochSealed;
+    extern const Event CASRefRecoveryEpochSealAdopted;
+    extern const Event CASRefRecoveryStragglerAdopted;
+    extern const Event CASRefRecoveryCancelled;
+    extern const Event CASRefRecoveryStreamHole;
 }
 
 namespace DB::Cas
@@ -695,7 +695,7 @@ void CasRefLedger::checkRecoveryStillAdmitted(const RootNamespace & ns, RefTable
     if (rt.recovery_cancel_requested.load(std::memory_order_acquire))
     {
         cancelled = true;
-        ProfileEvents::increment(ProfileEvents::CasRefRecoveryCancelled);
+        ProfileEvents::increment(ProfileEvents::CASRefRecoveryCancelled);
         throwCasWriteRetryLater(fmt::format(
             "CAS ref-table recovery for namespace '{}' was cancelled by a self-remount before the mount "
             "fence was re-armed; nothing was written and nothing installed — the next touch recovers under "
@@ -1004,7 +1004,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 && sequence < sampled_ckpt->ckpt.last_epoch_seal->ref_sequence
                 && backend.get(layout.refLogKey(life, *sampled_ckpt->ckpt.last_epoch_seal)))
             {
-                ProfileEvents::increment(ProfileEvents::CasRefRecoveryStreamHole);
+                ProfileEvents::increment(ProfileEvents::CASRefRecoveryStreamHole);
                 hole_detail = fmt::format(
                     "id {}-{} is absent while the exact checkpoint records same-epoch seal {}-{} — the "
                     "ref-log stream is dense by construction (INV-1), so this is a hole, not the end of "
@@ -1083,7 +1083,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                     /// will read it back exactly where we put it.
                     RefLogTxn applied = seal_txn;
                     apply_one(std::move(applied), seal_bytes.size());
-                    ProfileEvents::increment(ProfileEvents::CasRefRecoveryEpochSealed);
+                    ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealed);
                     if (!publish_recovered_frontier(seal_txn))
                         return std::nullopt;
                     ++epoch;
@@ -1110,7 +1110,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                         /// its acknowledgment was lost). Either way the epoch is closed by a seal that is
                         /// as good as ours -- adopt it and continue. Contesting a peer's CORRECT write is
                         /// how two recoverers of the same table turn a designed race into an incident.
-                        ProfileEvents::increment(ProfileEvents::CasRefRecoveryEpochSealAdopted);
+                        ProfileEvents::increment(ProfileEvents::CASRefRecoveryEpochSealAdopted);
                         ++epoch;
                         sequence = 1;
                         slot_attempts_this_epoch = 0;
@@ -1122,7 +1122,7 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                         /// again at the NEW `T+1`. Never mint `T+2` around it: ids are state-derived
                         /// (INV-1/INV-2), and writing past an occupied slot puts a hole in the durable
                         /// stream that no later reader can distinguish from a lost object.
-                        ProfileEvents::increment(ProfileEvents::CasRefRecoveryStragglerAdopted);
+                        ProfileEvents::increment(ProfileEvents::CASRefRecoveryStragglerAdopted);
                         ++sequence;
                     }
                     break;
@@ -1406,7 +1406,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                             "steady state", ns.string(), attempt - 1));
                     }
                     ++rt.recovery_restarts;
-                    ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
+                    ProfileEvents::increment(ProfileEvents::CASRefRecoveryRestarts);
                 }
 
                 /// Each attempt derives its own restart reason, so a prior hole is not misreported as a
@@ -1500,7 +1500,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 ? cap_backoff
                 : std::min(cap_backoff, init_backoff << recovery_retry_num);
             ++recovery_retry_num;
-            ProfileEvents::increment(ProfileEvents::CasRefRecoveryRetries);
+            ProfileEvents::increment(ProfileEvents::CASRefRecoveryRetries);
             LOG_WARNING(getLogger("CasRefLedger"),
                 "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
                 "(code {}: {}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
@@ -1675,7 +1675,7 @@ void CasRefLedger::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
             total -= c.weight;
             evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
             ref_name_slots.erase(it);
-            ProfileEvents::increment(ProfileEvents::CasRefTableEvictions);
+            ProfileEvents::increment(ProfileEvents::CASRefTableEvictions);
         }
     }
     /// `evicted` destructs the dropped runtimes here, with no lock held.
@@ -2039,7 +2039,7 @@ RefTxnId CasRefLedger::appendRefOpsOnRuntime(
     }
     lk.unlock();
 
-    ProfileEvents::increment(ProfileEvents::CasRefQueueWaitMicroseconds,
+    ProfileEvents::increment(ProfileEvents::CASRefQueueWaitMicroseconds,
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - enqueued_at).count());
     if (item->error)
@@ -2099,7 +2099,7 @@ void CasRefLedger::requireRecovery(RefTableRuntime & rt, const RootNamespace & n
     rt.lane_state = RefLaneState::NeedsRecovery;
     if (!entering)
         return;
-    ProfileEvents::increment(ProfileEvents::CasRefNeedsRecovery);
+    ProfileEvents::increment(ProfileEvents::CASRefNeedsRecovery);
     try
     {
         LOG_ERROR(getLogger("CasPool"),
@@ -2503,7 +2503,7 @@ CasRefLedger::resolveWedgeOnce(const RootNamespace & ns, const std::shared_ptr<R
     switch (result.kind)
     {
         case WedgeResolution::Adopted:
-            ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendUnwedged);
             break;
         case WedgeResolution::Rejected:
             result.survivor_error = std::make_exception_ptr(Exception(ErrorCodes::INVALID_STATE,
@@ -2781,7 +2781,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 "Nothing legal can be written here and nothing was sent. This mount's append lane resumes "
                 "only under a later epoch",
                 ns.string(), next_id.writer_epoch, next_id.writer_epoch, next_id.ref_sequence, cause)));
-            ProfileEvents::increment(ProfileEvents::CasRefAppendSealRejected);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
             return;
         }
     }
@@ -2856,7 +2856,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
 
         /// Deferred past the plan (spec §2) so the plan phase performs no observable mutation.
         if (scope_cut)
-            ProfileEvents::increment(ProfileEvents::CasRefBatchScopeCuts);
+            ProfileEvents::increment(ProfileEvents::CASRefBatchScopeCuts);
     }
     if (batch.empty())
         return;   /// raced: everything was carved by a previous flush of this leader
@@ -3609,7 +3609,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// breach whose occupant keeps failing to read would otherwise show up as nothing but a
             /// throttled log line under load. Sustained growth on this counter is the signal that the
             /// loud path is being starved.
-            ProfileEvents::increment(ProfileEvents::CasRefAppendOccupantUnreadable);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendOccupantUnreadable);
             {
                 std::lock_guard lock(rt->state_mutex);
                 rt->append_attempt.reset();
@@ -3630,7 +3630,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             /// namespace's epoch-closing record. No anomaly, no fence -- this is the protocol working.
             /// Counted anyway: "the protocol working" here means THIS writer was deposed, and a lane that
             /// keeps landing on this arm is a mount that has lost its lease and does not know it yet.
-            ProfileEvents::increment(ProfileEvents::CasRefAppendSealRejected);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendSealRejected);
             {
                 std::lock_guard lock(rt->state_mutex);
                 rt->last_epoch_seal = id;
@@ -3821,8 +3821,8 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
             }
             if (carve_hook_for_test)
                 carve_hook_for_test(CarvePhaseForTest::PostInstallPreAck);
-            ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
-            ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, chunk_survivors.size());
+            ProfileEvents::increment(ProfileEvents::CASRefBatchFlushes);
+            ProfileEvents::increment(ProfileEvents::CASRefBatchedMutations, chunk_survivors.size());
             {
                 std::lock_guard<std::mutex> g(ref_queue_mutex);
                 for (const auto & it : chunk_survivors)
@@ -3852,7 +3852,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     rt->lane_state = RefLaneState::Ready;
                 }
             }
-            ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendDefiniteFailure);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
                 "cached state is unchanged and txn id {}-{} was never used (a retry re-derives it)",
@@ -3897,12 +3897,12 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                         rt->lane_state = RefLaneState::Ready;
                     }
                 }
-                /// Count it. Before this arm existed these refusals bumped `CasRefAppendWedged`, so
+                /// Count it. Before this arm existed these refusals bumped `CASRefAppendWedged`, so
                 /// removing the wedge also removed the only signal they were happening at all -- and a
                 /// soak oracle watching that counter fall could not tell "the fix works" from "nothing
                 /// happened". A separate event keeps both readings available: the wedge counter now means
                 /// only genuinely ambiguous appends, and this one means availability preserved.
-                ProfileEvents::increment(ProfileEvents::CasRefAppendPreAttemptRefused);
+                ProfileEvents::increment(ProfileEvents::CASRefAppendPreAttemptRefused);
                 /// The id is not consumed (INV-1): it was derived from `greatest_applied`, which this
                 /// refusal leaves exactly as it was, so the next caller on this table derives the SAME id
                 /// and the durable stream keeps no trace of the refusal. That is the free half of the
@@ -3923,7 +3923,7 @@ bool CasRefLedger::commitRefChunk(const RootNamespace & ns, const std::shared_pt
                     && rt->append_attempt->txn_id == id)
                     rt->lane_state = RefLaneState::Wedged;
             }
-            ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
+            ProfileEvents::increment(ProfileEvents::CASRefAppendWedged);
             complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN ({}) — "
                 "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
@@ -3991,7 +3991,7 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
     /// the append queue, so dispatching it onto an unrelated global-pool thread can never deadlock a flush leader.
     /// `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and hence this ledger member --
     /// alive for the thread's lifetime.
-    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishDispatched);
+    ProfileEvents::increment(ProfileEvents::CASRefSnapshotPublishDispatched);
     auto owner = pin_owner();
     try
     {
@@ -4081,7 +4081,7 @@ void CasRefLedger::advancePublishBackoff(RefTableRuntime & rt)
         ? config.snapshot_publish_backoff_initial_ms
         : std::min<uint64_t>(rt.publish_backoff_ms * 2, config.snapshot_publish_backoff_max_ms);
     rt.publish_backoff_until_ms = boot_ms_now_fn() + rt.publish_backoff_ms;
-    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishBackoff);
+    ProfileEvents::increment(ProfileEvents::CASRefSnapshotPublishBackoff);
 }
 
 void CasRefLedger::resetPublishBackoff(RefTableRuntime & rt)
@@ -4203,9 +4203,9 @@ CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId &
     const CkptPublishOutcome outcome = publishCkpt(
         backend, layout, life, contribution, admitted_generation, check_admission, deadline);
     if (outcome == CkptPublishOutcome::Published)
-        ProfileEvents::increment(ProfileEvents::CasRefCkptPublished);
+        ProfileEvents::increment(ProfileEvents::CASRefCkptPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
-        ProfileEvents::increment(ProfileEvents::CasRefCkptIdenticalSkip);
+        ProfileEvents::increment(ProfileEvents::CASRefCkptIdenticalSkip);
     return outcome;
 }
 
@@ -4328,7 +4328,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         advancePublishBackoff(*rt);
         return false;
     }
-    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPutBytes, bytes.size());   /// account published bytes
+    ProfileEvents::increment(ProfileEvents::CASRefSnapshotPutBytes, bytes.size());   /// account published bytes
 
     /// INV-4's SECOND `_ckpt` writer, at exactly the point the spec puts it: the snapshot body is
     /// durable, and it becomes CLEANUP-AUTHORITATIVE only once the checkpoint names it. Ordering the
@@ -4384,7 +4384,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
     }
     if (!ckpt_advanced)
     {
-        ProfileEvents::increment(ProfileEvents::CasRefCkptNotAdvanced);
+        ProfileEvents::increment(ProfileEvents::CASRefCkptNotAdvanced);
         std::lock_guard lock(rt->state_mutex);
         advancePublishBackoff(*rt);
         return false;
@@ -4416,7 +4416,7 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         clampedCounterSub(rt->tail_count_since_snapshot, captured_count);
         clampedCounterSub(rt->tail_bytes_since_snapshot, captured_bytes);
         /// logs-per-table-after-snapshot: the tail this publish compacted.
-        ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, captured_count);
+        ProfileEvents::increment(ProfileEvents::CASRefSnapshotTailLogs, captured_count);
         rt->newest_snapshot_id = candidate_x;
         /// The new cache-weight base is exactly the snapshot
         /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
@@ -4445,7 +4445,7 @@ void CasRefLedger::sweepStalePrecommitsForRead(const RootNamespace & ns, const s
     }
     catch (...)
     {
-        ProfileEvents::increment(ProfileEvents::CasRefSweepDeferred);
+        ProfileEvents::increment(ProfileEvents::CASRefSweepDeferred);
         tryLogCurrentException(getLogger("CasPool"),
             "CAS stale-precommit sweep deferred for namespace '" + ns.string()
                 + "' (a read-only caller observed the failure and is proceeding with its own read)");
@@ -4506,7 +4506,7 @@ void CasRefLedger::advancePrecommitSweepBackoff(RefTableRuntime & rt)
         ? config.precommit_sweep_backoff_initial_ms
         : std::min<uint64_t>(rt.precommit_sweep_backoff_ms * 2, config.precommit_sweep_backoff_max_ms);
     rt.precommit_sweep_backoff_until_ms = boot_ms_now_fn() + rt.precommit_sweep_backoff_ms;
-    ProfileEvents::increment(ProfileEvents::CasRefSweepRearmed);
+    ProfileEvents::increment(ProfileEvents::CASRefSweepRearmed);
 }
 
 void CasRefLedger::resetPrecommitSweepBackoff(RefTableRuntime & rt)
@@ -4585,7 +4585,7 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
                 if (!rt->state.getPrecommits().contains({ref_name, mref}))
                     reclaimed.emplace_back(ref_name, mref);
         }
-        ProfileEvents::increment(ProfileEvents::CasRefStalePrecommitsReclaimed, reclaimed.size());
+        ProfileEvents::increment(ProfileEvents::CASRefStalePrecommitsReclaimed, reclaimed.size());
         for (const auto & [ref_name, mref] : reclaimed)
         {
             EventEmitter{*this}.emit([&](CasEvent & e)

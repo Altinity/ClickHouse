@@ -12,8 +12,8 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasRefMaterializeInPlace;
-    extern const Event CasRefMaterializeCopy;
+    extern const Event CASRefMaterializeInPlace;
+    extern const Event CASRefMaterializeCopy;
 }
 
 namespace DB::Cas
@@ -82,7 +82,7 @@ void RefCowManifestSet::materialize()
     /// (base, overlay, net_delta) exactly coherent and a later `materialize` resumable.
     if (base.use_count() == 1)
     {
-        ProfileEvents::increment(ProfileEvents::CasRefMaterializeInPlace);
+        ProfileEvents::increment(ProfileEvents::CASRefMaterializeInPlace);
         for (auto it = overlay.begin(); it != overlay.end(); )
         {
             if (it->second)
@@ -102,7 +102,7 @@ void RefCowManifestSet::materialize()
     }
     /// A copy still shares this base, so fold into a FRESH one and swap -- strong guarantee, the shared
     /// holder stays byte-unchanged.
-    ProfileEvents::increment(ProfileEvents::CasRefMaterializeCopy);
+    ProfileEvents::increment(ProfileEvents::CASRefMaterializeCopy);
     auto fresh = std::make_shared<Base>(*base);
     for (const auto & [m, present] : overlay)
     {

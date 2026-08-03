@@ -10,8 +10,8 @@
 
 namespace ProfileEvents
 {
-extern const Event CasRefRepoint;
-extern const Event CasManifestHead;
+extern const Event CASRefRepoint;
+extern const Event CASManifestHead;
 }
 
 namespace DB::ErrorCodes
@@ -395,7 +395,7 @@ TEST(CasTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
     ASSERT_TRUE(storage->existsFile("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/checksums.txt"));
     ASSERT_TRUE(storage->existsFile("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/data.bin"));
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
 
     /// 2. New transaction: standalone write of checksums.txt onto the ALREADY-COMMITTED part.
     {
@@ -409,7 +409,7 @@ TEST(CasTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
     EXPECT_EQ(storage->getFileSize("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/checksums.txt"), 20u);
     EXPECT_EQ(storage->getFileSize("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/data.bin"), 14u)
         << "carry-forward: the untouched file must survive a standalone write on the same part";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before + 1);
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
@@ -438,7 +438,7 @@ TEST(CasTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
     }
     ASSERT_TRUE(storage->existsFile("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/txn_version.txt"));
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
 
     /// 2. ONE transaction: write checksums.txt (new bytes) AND unlink txn_version.txt (a DIFFERENT
     /// file of the same part) -- must resolve to exactly one repoint carrying both changes plus the
@@ -456,7 +456,7 @@ TEST(CasTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
     EXPECT_FALSE(storage->existsFile("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/txn_version.txt"));
     EXPECT_EQ(storage->getFileSize("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/data.bin"), 14u)
         << "carry-forward: the untouched file must survive a combined write+unlink on the same part";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before + 1)
         << "one uncommitted transaction combining a write and an unlink must resolve to exactly one repoint";
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
@@ -516,7 +516,7 @@ TEST(CasTransactionAllTree, CommittedTxnVersionStoreRepoints)
     }
     ASSERT_FALSE(storage->existsFile("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"));
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
 
     /// 2. A single-op transaction writes ONLY txn_version.txt onto the already-committed part (mirrors
     /// the MVCC one-shot autocommit shape: no other file touched in this transaction).
@@ -527,7 +527,7 @@ TEST(CasTransactionAllTree, CommittedTxnVersionStoreRepoints)
     }
 
     /// 3. Exactly one repoint; the new file is served; the original files are intact (carry-forward).
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before + 1);
     EXPECT_TRUE(storage->existsFile("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"));
     EXPECT_EQ(storage->getFileSize("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"), 56u);
     EXPECT_EQ(storage->getFileSize("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/checksums.txt"), 8u);
@@ -558,7 +558,7 @@ TEST(CasTransactionRemove, SurgicalUnlinkRepoints)
     }
     ASSERT_TRUE(storage->existsFile("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/txn_version.txt"));
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
 
     /// 2. A single-op transaction unlinks ONLY txn_version.txt on the already-committed part (mirrors
     /// ATTACH's removeVersionMetadata: no dir-drop in the same transaction).
@@ -573,7 +573,7 @@ TEST(CasTransactionRemove, SurgicalUnlinkRepoints)
     EXPECT_FALSE(storage->existsFile("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/txn_version.txt"));
     EXPECT_EQ(storage->getFileSize("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/checksums.txt"), 8u);
     EXPECT_EQ(storage->getFileSize("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/data.bin"), 14u);
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before + 1);
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
@@ -599,7 +599,7 @@ TEST(CasTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     }
     ASSERT_TRUE(storage->existsDirectory("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0"));
 
-    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load();
 
     /// 2. The MergeTree fast-removal shape (IMergeTreeDataPart::remove, B123): unlink every file
     /// one-by-one, THEN removeDirectory the part — all in one transaction.
@@ -614,7 +614,7 @@ TEST(CasTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
 
     /// 3. The whole part is gone via the single ref-drop; the storm of marks never repointed anything.
     EXPECT_FALSE(storage->existsDirectory("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0"));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefRepoint].load(), repoints_before)
         << "unlink-storm-then-dir-drop must supersede the marks, not repoint per file";
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
@@ -643,7 +643,7 @@ TEST(CasTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
     }
     ASSERT_TRUE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
 
-    const uint64_t heads_before = ProfileEvents::global_counters[ProfileEvents::CasManifestHead].load();
+    const uint64_t heads_before = ProfileEvents::global_counters[ProfileEvents::CASManifestHead].load();
 
     /// 2. The MergeTree fast-removal shape: unlink every file one-by-one, THEN removeDirectory — all
     /// in ONE transaction (mirrors UnlinkStormThenDirDropIsOneRefDrop above).
@@ -661,7 +661,7 @@ TEST(CasTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
     /// marks, so publishStaging's own (unmemoized) ForceFresh getView never fires for this ref either
     /// (see UnlinkStormThenDirDropIsOneRefDrop's zero-repoints assertion above).
     EXPECT_FALSE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasManifestHead].load(), heads_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASManifestHead].load(), heads_before + 1)
         << "unlink-storm-then-dir-drop must pay exactly one ForceFresh manifest-body HEAD, not one per file";
 }
 

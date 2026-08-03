@@ -53,10 +53,10 @@
 
 namespace ProfileEvents
 {
-extern const Event CasRefAppendSealRejected;
-extern const Event CasRefAppendOccupantUnreadable;
-extern const Event CasRefAppendWedged;
-extern const Event CasRefAppendDefiniteFailure;
+extern const Event CASRefAppendSealRejected;
+extern const Event CASRefAppendOccupantUnreadable;
+extern const Event CASRefAppendWedged;
+extern const Event CASRefAppendDefiniteFailure;
 }
 
 namespace DB::ErrorCodes
@@ -705,8 +705,8 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
     backend->s3_definite_substr = logPrefix(store, ns);
     backend->s3_definite_count = 1;
 
-    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendWedged].load();
-    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendDefiniteFailure].load();
+    const uint64_t wedged_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load();
+    const uint64_t definite_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load();
 
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
 
@@ -714,9 +714,9 @@ TEST(CasRefWedgeEveryAttempt, ADefiniteRefusalAfterAnAmbiguousAttemptOfTheSameCa
         << "one call whose first attempt is unresolved leaves an object that may become durable";
     EXPECT_EQ(store->laneStateForTest(ns), RefLaneState::Wedged)
         << "the id must NOT be declared never-used: the marker stands until the key itself resolves";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendDefiniteFailure].load(), definite_before)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendDefiniteFailure].load(), definite_before)
         << "this append was never definitively rejected -- only one of its attempts was";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendWedged].load(), wedged_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendWedged].load(), wedged_before + 1);
     EXPECT_TRUE(store->resolveRef(ns, "x").has_value()) << "nothing is applied while the lane is wedged";
     const String wedged_key = store->wedgedKeyForTest(ns);
     EXPECT_FALSE(backend->get(wedged_key).has_value()) << "and nothing became durable";
@@ -1123,7 +1123,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
     const RefTxnId next{epoch, 3};
     ASSERT_EQ(store->lastEpochSealForTest(ns), std::nullopt);
     const uint64_t remounts_before = store->scheduleRemountCallCountForTest();
-    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendSealRejected].load();
+    const uint64_t sealed_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected].load();
 
     /// The successor's seal lands at exactly the id this table's next append derives.
     backend->conflict_substr = layout.refLogKey(DB::Cas::tests::fixture::fixtureLife(ns), next);
@@ -1138,7 +1138,7 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteMeetingASuccessorSealIsAConclusiveReject
         << "the observed seal IS this namespace's epoch-closing record, whichever site observed it";
     EXPECT_TRUE(store->mayMutate()) << "the designed path must not fence the mount";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendSealRejected].load(), sealed_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendSealRejected].load(), sealed_before + 1)
         << "a deposed writer must still be COUNTED: this is the protocol working, and also the signal "
            "that this mount has lost its lease and does not know it";
 }
@@ -1357,10 +1357,10 @@ TEST(CasRefWedgeEveryAttempt, AppendSiteFaultsWhenTheOccupantCannotBeRead)
     backend->fail_get_skip = 1;
     backend->fail_get_count = 1;
 
-    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load();
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load();
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
 
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefAppendOccupantUnreadable].load(), deferred_before + 1)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRefAppendOccupantUnreadable].load(), deferred_before + 1)
         << "the deferral is the one quiet arm here -- it must be counted or a starved loud path is invisible";
     EXPECT_TRUE(store->mayMutate()) << "the table faults without guessing that the whole mount is corrupt";
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), remounts_before) << "nor schedule a remount";

@@ -288,11 +288,11 @@ TEST(CasBackendStream, StreamsBodyWindow)
 
 namespace ProfileEvents
 {
-extern const Event CasBlobPut;
-extern const Event CasBlobPutDedup;
-extern const Event CasBlobHead;
-extern const Event CasBlobHeadMiss;
-extern const Event CasGcCas;
+extern const Event CASBlobPut;
+extern const Event CASBlobPutDedup;
+extern const Event CASBlobHead;
+extern const Event CASBlobHeadMiss;
+extern const Event CASGcCompareSwap;
 }
 
 TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
@@ -310,7 +310,7 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
     /// Final opaque-life layout: both immutable streams and point/path-addressed state remain Root
     /// instrumentation, while part manifests remain Manifest. None may fall into Other (the
-    /// 2026-07-03 operator-stand CREATE storm misread as CasOtherHeadMiss=102 because of this).
+    /// 2026-07-03 operator-stand CREATE storm misread as CASOtherHeadMiss=102 because of this).
     EXPECT_EQ(classifyCasNs("pool/cas/ns/stream/00000000000000000000000000000017/_log/1-1.zst"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_ckpt.zst"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/cas/ns/state/00000000000000000000000000000017/_files/format_version.txt"), CasNs::Root);
@@ -320,11 +320,11 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     InstrumentedBackend b(inner);
 
     using ProfileEvents::global_counters;
-    const auto blob_put_before   = global_counters[ProfileEvents::CasBlobPut].load();
-    const auto blob_dedup_before = global_counters[ProfileEvents::CasBlobPutDedup].load();
-    const auto blob_head_before  = global_counters[ProfileEvents::CasBlobHead].load();
-    const auto blob_miss_before  = global_counters[ProfileEvents::CasBlobHeadMiss].load();
-    const auto gc_cas_before     = global_counters[ProfileEvents::CasGcCas].load();
+    const auto blob_put_before   = global_counters[ProfileEvents::CASBlobPut].load();
+    const auto blob_dedup_before = global_counters[ProfileEvents::CASBlobPutDedup].load();
+    const auto blob_head_before  = global_counters[ProfileEvents::CASBlobHead].load();
+    const auto blob_miss_before  = global_counters[ProfileEvents::CASBlobHeadMiss].load();
+    const auto gc_cas_before     = global_counters[ProfileEvents::CASGcCompareSwap].load();
 
     const String blob_key = "pool/blobs/ab/abcdef0123456789";
 
@@ -349,11 +349,11 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CasBlobPut].load()      - blob_put_before,   2u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasBlobPutDedup].load() - blob_dedup_before, 1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasBlobHead].load()     - blob_head_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasBlobHeadMiss].load() - blob_miss_before,  1u);
-    EXPECT_EQ(global_counters[ProfileEvents::CasGcCas].load()        - gc_cas_before,     1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load()      - blob_put_before,   2u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDedup].load() - blob_dedup_before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASGcCompareSwap].load()        - gc_cas_before,     1u);
 #else
     (void)blob_put_before; (void)blob_dedup_before; (void)blob_head_before;
     (void)blob_miss_before; (void)gc_cas_before;

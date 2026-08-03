@@ -17,7 +17,7 @@ using namespace DB::Cas::tests;
 
 namespace ProfileEvents
 {
-extern const Event CasGcRefWalkPlansBuilt;
+extern const Event CASGcRefWalkPlansBuilt;
 }
 
 namespace DB::ErrorCodes
@@ -216,10 +216,10 @@ TEST(CasGcRebuild, HealthyStateRequiresForce)
 
     backend->resetCounts();
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
     const RebuildReport forced = gc.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(forced.performed) << forced.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 1u)
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 1u)
         << "healthy FORCE REBUILD must share the same one-shot authoritative plan builder";
     EXPECT_EQ(backend->getCount(store->layout().refCatalogKey()), 2u)
         << "healthy FORCE REBUILD may read the catalog for the conclusive drain and the one post-LIST cut only";
@@ -376,12 +376,12 @@ TEST(CasGcRebuild, DamagedGenerationZeroStatePerformsNoCatalogDrainMutation)
         .last_epoch_seal = std::nullopt})).outcome, PutOutcome::Done);
     const uint64_t catalog_cas_before = backend->casPutCount(layout.refCatalogKey());
     const uint64_t plans_before
-        = ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load();
+        = ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load();
 
     Gc gc(store, kGc);
     const RebuildReport report = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(report.performed) << report.refusal;
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 1u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASGcRefWalkPlansBuilt].load() - plans_before, 1u);
     EXPECT_EQ(backend->casPutCount(layout.refCatalogKey()), catalog_cas_before);
     const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(*backend, layout);
     ASSERT_EQ(catalog.catalog.entries.size(), 1u);

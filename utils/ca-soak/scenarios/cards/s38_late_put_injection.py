@@ -16,7 +16,7 @@ because the seal makes the late PUT *lose* rather than merely *visible*.
 So the assertions are now about that seal, in three layers:
 
   1. **It exists.** An unclean restart's recovery mints one per dead epoch it closes
-     (`CasRefRecoveryEpochSealed`), and this card reads the object back out of the pool and checks it
+     (`CASRefRecoveryEpochSealed`), and this card reads the object back out of the pool and checks it
      really is an `epoch_seal` transaction sitting at the top of the dead epoch's stream. A CLEAN
      restart mints one too — sealing is decided by arithmetic (every epoch below the live one is
      closed, however its mount died), not by an unclean-boundary flag, and the clean-restart step at
@@ -35,7 +35,7 @@ So the assertions are now about that seal, in three layers:
      agree, a full restart re-recovers the namespace from the durable stream with the object sitting
      there and still returns the same data, and the counters that carry "a durable transaction went
      missing" / "the fold advanced past work" / "the stream stopped being dense"
-     (`CasRefApplyPoisoned`, `CasGcUnappliedFoldedTxns`, `CasRefRecoveryStreamHole`) all stay at zero
+     (`CasRefApplyPoisoned`, `CASGcUnappliedFoldedTxns`, `CASRefRecoveryStreamHole`) all stay at zero
      across driven GC rounds. The recovery walk reads the dead epoch by exact key, meets the seal and
      advances to the next epoch, so an id above the seal is unreachable by construction — the
      injected object is not "tolerated", it is not on any path.
@@ -82,7 +82,7 @@ _HUGE_SEQ = 0xFFFFFFFFFFFFFFFE
 # Counters that carry the violation half of the invariant. Each is documented in `ProfileEvents.cpp`
 # as always-zero; the soak driver gates on the same three (`soak/signals.py`
 # LATE_PUT_VIOLATION_NOTES), and this card asserts them around the injection specifically.
-_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CasGcUnappliedFoldedTxns", "CasRefRecoveryStreamHole")
+_VIOLATION_EVENTS = ("CasRefApplyPoisoned", "CASGcUnappliedFoldedTxns", "CASRefRecoveryStreamHole")
 
 def _render_ref_txn_id(writer_epoch: int, ref_sequence: int) -> str:
     """Mirrors `renderRefTxnId` (CasRefIds.h): two 16-digit lowercase hex fields joined by '-'."""
@@ -373,11 +373,11 @@ class S38(Scenario):
         # CAS-walk closes every epoch below the live one.
         # =====================================================================================
         pre_inject_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
-        sealed = observe.events_snapshot(cl.node1).get("CasRefRecoveryEpochSealed", 0)
-        result.observations["recovery_seal"] = {"CasRefRecoveryEpochSealed": sealed}
+        sealed = observe.events_snapshot(cl.node1).get("CASRefRecoveryEpochSealed", 0)
+        result.observations["recovery_seal"] = {"CASRefRecoveryEpochSealed": sealed}
         result.add(Verdict.check(
             "the unclean restart's recovery sealed the dead epoch",
-            "CasRefRecoveryEpochSealed > 0 (system.events, fresh since this process's start)",
+            "CASRefRecoveryEpochSealed > 0 (system.events, fresh since this process's start)",
             sealed, sealed > 0,
             "" if sealed > 0 else "no epoch seal was minted since ch1 restarted — the CAS-walk closes "
                                   "every epoch below the live one by arithmetic, so a zero here means "
@@ -541,9 +541,9 @@ class S38(Scenario):
 
         rerecovered_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
         still_unaffected = rerecovered_checksum == pre_inject_checksum
-        clean_sealed = observe.events_snapshot(cl.node1).get("CasRefRecoveryEpochSealed", 0)
+        clean_sealed = observe.events_snapshot(cl.node1).get("CASRefRecoveryEpochSealed", 0)
         result.observations["clean_restart"] = {
-            "healthy": healthy_clean, "CasRefRecoveryEpochSealed": clean_sealed,
+            "healthy": healthy_clean, "CASRefRecoveryEpochSealed": clean_sealed,
             "checksum": rerecovered_checksum}
         result.add(Verdict.check(
             "re-recovery from the durable stream still ignores the injected log",
@@ -553,7 +553,7 @@ class S38(Scenario):
                                         "seal did not cover the region above it"))
         result.add(Verdict.check(
             "a CLEAN restart seals its predecessor's epoch too",
-            "CasRefRecoveryEpochSealed > 0 on the cleanly-restarted process",
+            "CASRefRecoveryEpochSealed > 0 on the cleanly-restarted process",
             clean_sealed, clean_sealed > 0,
             "" if clean_sealed > 0 else "the cleanly-restarted process minted no seal — sealing must "
                                         "be decided by arithmetic (every epoch below the live one is "

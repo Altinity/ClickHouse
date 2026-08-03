@@ -151,7 +151,7 @@ struct FsckReport
     /// Canonical namespace-life keys whose life is absent from a catalog cut taken AFTER the physical
     /// listing (see `FsckClass::JanitorPending`). SOFT: never in `kFsckHardFindings`, never fails the
     /// report. Persistent non-convergence across authorized janitor cycles is an operational leak
-    /// question (`CasGcNamespaceCleanupLeaks`, the `namespace_cleanup` GC-log phase), not an integrity
+    /// question (`CASGcNamespaceCleanupLeaks`, the `namespace_cleanup` GC-log phase), not an integrity
     /// finding this counter can answer on its own -- one snapshot cannot prove an unbounded leak.
     uint64_t namespace_janitor_pending = 0;
     uint64_t namespace_janitor_pending_bytes = 0;

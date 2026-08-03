@@ -10,7 +10,7 @@ These cards target the clone/fetch/read claims in the README §"P1 scenario card
   (publishes its own refs/sidecars) but does NOT re-upload existing large blob bodies into the shared
   pool, so pool bytes grow by metadata, not by `replica_count * payload`.
 - S21 proves the read path (root decode cache + per-file manifest lookup) stays bounded under many
-  refs and concurrent readers: repeated point lookups do not re-`CasRootGet` the same shard per file,
+  refs and concurrent readers: repeated point lookups do not re-`CASRootGet` the same shard per file,
   and a 1-column SELECT fetches far fewer blob bodies than an all-column scan.
 - S22 needs a fault-injecting object-store proxy that is NOT wired in the current compose, so it is
   declared `needs_infra` and runs inconclusive (the runner skips `run()`); the docstring on S22
@@ -41,7 +41,7 @@ def _make_table(node, name, *, columns, order_by, partition_by=None):
 
 def _blob_body_puts(delta):
     """Large blob body uploads in a counters_window delta (excludes dedup-only / avoided puts)."""
-    return int(delta.get("CasBlobPut", 0))
+    return int(delta.get("CASBlobPut", 0))
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ class S19(Scenario):
         move_delta = counters().get("_total", {})
         result.observations["move_counters"] = {
             k: int(move_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasRootCas")}
+                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         # --- REPLACE PARTITION p FROM src (clone a partition into dst, src still holds it) --------
         replace_key = 1 if nparts > 1 else 0
@@ -128,19 +128,19 @@ class S19(Scenario):
         replace_delta = counters2().get("_total", {})
         result.observations["replace_counters"] = {
             k: int(replace_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasRootCas")}
+                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         pool_after = observe.pool_shape(timeout_s=120)
         result.observations["pool_after_clone"] = pool_after.get("_total")
 
-        # --- VERDICT: enabled clone paths move metadata only (no large CasBlobPut growth) ---------
+        # --- VERDICT: enabled clone paths move metadata only (no large CASBlobPut growth) ---------
         clone_body_puts = _blob_body_puts(move_delta) + _blob_body_puts(replace_delta)
         # One MOVE part + one REPLACE part of `rows*payload` would be ~2 full blob payloads if copied.
         copied_threshold = max(1, (ppp * rows * payload) // (2 * payload) if payload else 1)
         result.add(Verdict.check(
             "clone moves metadata only (no body re-upload)",
-            "CasBlobPut for MOVE/REPLACE PARTITION stays small (republish refs, not copy blobs)",
-            f"CasBlobPut move+replace = {clone_body_puts}",
+            "CASBlobPut for MOVE/REPLACE PARTITION stays small (republish refs, not copy blobs)",
+            f"CASBlobPut move+replace = {clone_body_puts}",
             clone_body_puts <= copied_threshold,
             "" if clone_body_puts <= copied_threshold else
             "clone re-uploaded large blob bodies — MOVE/REPLACE PARTITION should republish existing "
@@ -173,23 +173,23 @@ class S19(Scenario):
             gate_err = str(e)
         gate_delta = counters3().get("_total", {})
         result.observations["gated_move_counters"] = {
-            k: int(gate_delta.get(k, 0)) for k in ("CasBlobPut", "CasRootCas")}
+            k: int(gate_delta.get(k, 0)) for k in ("CASBlobPut", "CASRootCompareSwap")}
         if gate_err is not None:
             result.observations["gated_move_error"] = gate_err[:600]
-            # Fail-closed proof must be MOVE-ATTRIBUTABLE. `CasBlobPut` during the attempt is: the move
-            # is the only thing writing blobs here, so CasBlobPut==0 proves no partial body was
-            # published. Do NOT gate on `CasRootCas`: it is a global per-node counter and the lease-gated
+            # Fail-closed proof must be MOVE-ATTRIBUTABLE. `CASBlobPut` during the attempt is: the move
+            # is the only thing writing blobs here, so CASBlobPut==0 proves no partial body was
+            # published. Do NOT gate on `CASRootCompareSwap`: it is a global per-node counter and the lease-gated
             # BACKGROUND GC (gc_interval_sec=10) CASes root refs on its own schedule, so a GC round
             # landing inside the move's wall-clock window inflates it with ref-CASes that have nothing
-            # to do with the move (observed: UNKNOWN_DISK is rejected at PLANNING with CasBlobPut=0, yet
-            # CasRootCas=2 from a concurrent GC round). The real "no partial ref" invariant is
+            # to do with the move (observed: UNKNOWN_DISK is rejected at PLANNING with CASBlobPut=0, yet
+            # CASRootCompareSwap=2 from a concurrent GC round). The real "no partial ref" invariant is
             # dangling==0, asserted by the standard end checkpoint below.
-            blob_put = int(gate_delta.get("CasBlobPut", 0))
+            blob_put = int(gate_delta.get("CASBlobPut", 0))
             result.add(Verdict.check(
                 "gated cross-disk move fails closed",
                 "ALTER ... MOVE PARTITION TO non-CA DISK raises and writes no partial body",
                 f"raised ({gate_err.split('DB::Exception:')[-1].strip()[:60]}); "
-                f"CasBlobPut={blob_put} (CasRootCas={int(gate_delta.get('CasRootCas', 0))}, "
+                f"CASBlobPut={blob_put} (CASRootCompareSwap={int(gate_delta.get('CASRootCompareSwap', 0))}, "
                 f"background-GC-confounded, not gated)",
                 blob_put == 0,
                 "" if blob_put == 0 else
@@ -297,7 +297,7 @@ class S20(Scenario):
             cluster_boot.wait_healthy(cl, timeout_s=fetch_wait, log_fn=ctx.log)
             result.add(Verdict.inconclusive(
                 "follower fetches without re-uploading blobs",
-                "follower CasBlobPut for big bodies ~ 0 (dedup/avoided instead)",
+                "follower CASBlobPut for big bodies ~ 0 (dedup/avoided instead)",
                 f"could not stop follower {self.FOLLOWER}: rc={stop.returncode} "
                 f"{stop.stderr.strip()[:200]}"))
             return
@@ -323,7 +323,7 @@ class S20(Scenario):
         if not healthy:
             result.add(Verdict.inconclusive(
                 "follower fetches without re-uploading blobs",
-                "follower CasBlobPut for big bodies ~ 0",
+                "follower CASBlobPut for big bodies ~ 0",
                 f"follower {self.FOLLOWER} did not become healthy within {fetch_wait}s after start"))
             return
 
@@ -351,43 +351,43 @@ class S20(Scenario):
         total_delta = delta.get("_total", {})
         result.observations["follower_fetch_counters"] = {
             k: int(follower_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasRootCas",
-                "CasBlobHead", "CasBlobHeadFirst")}
+                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap",
+                "CASBlobHead", "CASBlobHeadFirst")}
         result.observations["total_fetch_counters"] = {
             k: int(total_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasRootCas")}
+                "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}
 
         # --- VERDICT: follower does NOT re-upload existing large blob bodies ----------------------
         follower_body_puts = _blob_body_puts(follower_delta)
-        follower_dedup = (int(follower_delta.get("CasBlobPutDedup", 0)) +
-                          int(follower_delta.get("CasBlobBodyPutAvoided", 0)))
-        # A re-upload of the whole table would be ~nparts full payloads worth of CasBlobPut. The
-        # follower publishes its own refs/sidecars (small CasRootCas + maybe tiny metadata puts) but
+        follower_dedup = (int(follower_delta.get("CASBlobPutDedup", 0)) +
+                          int(follower_delta.get("CASBlobBodyPutAvoided", 0)))
+        # A re-upload of the whole table would be ~nparts full payloads worth of CASBlobPut. The
+        # follower publishes its own refs/sidecars (small CASRootCompareSwap + maybe tiny metadata puts) but
         # the big bodies must be recognized as already present (dedup / body-put-avoided).
         big_body_count = nparts  # one merged part => fewer, but bounded well below this after OPTIMIZE
         ok = follower_body_puts <= big_body_count and (follower_dedup > 0 or follower_body_puts == 0)
         result.add(Verdict.check(
             "follower relinks without re-uploading big blobs",
-            "follower CasBlobPut for big bodies ~ 0; CasBlobPutDedup/BodyPutAvoided > 0",
-            f"follower CasBlobPut={follower_body_puts} dedup/avoided={follower_dedup}",
+            "follower CASBlobPut for big bodies ~ 0; CASBlobPutDedup/BodyPutAvoided > 0",
+            f"follower CASBlobPut={follower_body_puts} dedup/avoided={follower_dedup}",
             ok,
             "" if ok else
             "the follower re-uploaded large blob bodies on fetch — fetch should relink shared content "
             "(dedup), not duplicate payload per replica; investigate the fetch/relink path"))
-        follower_root_cas = int(follower_delta.get("CasRootCas", 0))
+        follower_root_cas = int(follower_delta.get("CASRootCompareSwap", 0))
         if follower_root_cas > 0:
             result.add(Verdict("follower publishes its own refs",
-                               "follower CasRootCas > 0 (own refs/sidecars) without body duplication",
+                               "follower CASRootCompareSwap > 0 (own refs/sidecars) without body duplication",
                                follower_root_cas, "pass"))
         else:
-            # CasRootCas=0 on the follower node may mean the counter is not scoped per-node
+            # CASRootCompareSwap=0 on the follower node may mean the counter is not scoped per-node
             # (the CAS is attributed to the leader node that initiated the write). This is not
             # a correctness issue; the "follower relinks without re-uploading big blobs" verdict
             # above already proves no body re-upload. Record as inconclusive (not a FAIL).
             result.add(Verdict.inconclusive(
                 "follower publishes its own refs",
-                "follower CasRootCas > 0 (own refs/sidecars)",
-                "follower CasRootCas=0 — counter may not be scoped per-node; "
+                "follower CASRootCompareSwap > 0 (own refs/sidecars)",
+                "follower CASRootCompareSwap=0 — counter may not be scoped per-node; "
                 "cannot distinguish 'no ref published' from 'ref attributed to leader node'; "
                 "correctness covered by the no-body-re-upload verdict above"))
 
@@ -474,8 +474,8 @@ class S21(Scenario):
         total_rows = nparts * rows
         result.observations["total_rows"] = total_rows
 
-        # --- repeated point lookups: CasRootGet must not scale with N * files ---------------------
-        # Warm once, then measure N identical point lookups; CasRootGet delta should be amortized
+        # --- repeated point lookups: CASRootGet must not scale with N * files ---------------------
+        # Warm once, then measure N identical point lookups; CASRootGet delta should be amortized
         # (root-shard decode cache hit), NOT ~N * files.
         warm_id = total_rows // 2
         cl.node1.query(f"SELECT * FROM {table} WHERE id = {warm_id} FORMAT Null")
@@ -485,23 +485,23 @@ class S21(Scenario):
             cl.node1.query(f"SELECT * FROM {table} WHERE id = {warm_id} FORMAT Null")
         pl_s = time.monotonic() - t_pl
         pl_delta = counters_pl().get("_total", {})
-        root_get = int(pl_delta.get("CasRootGet", 0))
-        root_head = int(pl_delta.get("CasRootHead", 0))
+        root_get = int(pl_delta.get("CASRootGet", 0))
+        root_head = int(pl_delta.get("CASRootHead", 0))
         result.observations["point_lookup_counters"] = {
-            "CasRootGet": root_get, "CasRootHead": root_head,
-            "CasBlobGet": int(pl_delta.get("CasBlobGet", 0)),
+            "CASRootGet": root_get, "CASRootHead": root_head,
+            "CASBlobGet": int(pl_delta.get("CASBlobGet", 0)),
             "lookups": point_lookups, "elapsed_s": round(pl_s, 2)}
         # Bound: a linear re-decode would be ~point_lookups * (#parts) root GETs. We assert the actual
-        # CasRootGet is well below that linear floor (decode cache amortizes repeats).
+        # CASRootGet is well below that linear floor (decode cache amortizes repeats).
         linear_floor = point_lookups * nparts
         ok_root = root_get < linear_floor
         result.add(Verdict.check(
             "repeated point lookups don't re-fetch root per file",
-            f"CasRootGet over {point_lookups} identical lookups << {linear_floor} (= N*parts)",
-            f"{root_get} CasRootGet for {point_lookups} repeated lookups across {nparts} parts",
+            f"CASRootGet over {point_lookups} identical lookups << {linear_floor} (= N*parts)",
+            f"{root_get} CASRootGet for {point_lookups} repeated lookups across {nparts} parts",
             ok_root,
             "" if ok_root else
-            "CasRootGet scaled ~linearly with repeated identical lookups — the root decode cache is "
+            "CASRootGet scaled ~linearly with repeated identical lookups — the root decode cache is "
             "not amortizing repeats; each query re-fetches+re-decodes the same root shard"))
 
         # --- column-subset vs all-column blob fetch -----------------------------------------------
@@ -509,13 +509,13 @@ class S21(Scenario):
         counters_1col = _common.counters_window(ctx)
         cl.node1.query(f"SELECT sum(length(c0)) FROM {table} FORMAT Null")
         d1 = counters_1col().get("_total", {})
-        blob_get_1col = int(d1.get("CasBlobGet", 0))
+        blob_get_1col = int(d1.get("CASBlobGet", 0))
 
         all_cols_expr = " + ".join(f"length({c})" for c in data_cols)
         counters_allcol = _common.counters_window(ctx)
         cl.node1.query(f"SELECT sum({all_cols_expr}) FROM {table} FORMAT Null")
         dall = counters_allcol().get("_total", {})
-        blob_get_all = int(dall.get("CasBlobGet", 0))
+        blob_get_all = int(dall.get("CASBlobGet", 0))
         result.observations["column_subset_blob_get"] = {
             "one_col_CasBlobGet": blob_get_1col, "all_col_CasBlobGet": blob_get_all,
             "ncols": ncols}
@@ -525,14 +525,14 @@ class S21(Scenario):
         if blob_get_1col == 0 and blob_get_all == 0:
             result.add(Verdict.inconclusive(
                 "column-subset fetches only required blobs",
-                f"1-column CasBlobGet << all-column CasBlobGet (~1/{ncols})",
+                f"1-column CASBlobGet << all-column CASBlobGet (~1/{ncols})",
                 f"1col=0 all=0 — both scans hit the blob cache entirely at this scale; "
                 "cannot compare blob-get counts (increase scale or payload to spill the cache)"))
         else:
             ok_subset = blob_get_1col < blob_get_all
             result.add(Verdict.check(
                 "column-subset fetches only required blobs",
-                f"1-column CasBlobGet << all-column CasBlobGet (~1/{ncols})",
+                f"1-column CASBlobGet << all-column CASBlobGet (~1/{ncols})",
                 f"1col={blob_get_1col} all={blob_get_all}",
                 ok_subset,
                 "" if ok_subset else

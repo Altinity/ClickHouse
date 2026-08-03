@@ -23,7 +23,7 @@
 
 namespace ProfileEvents
 {
-extern const Event CasRefSnapshotPublishDispatched;
+extern const Event CASRefSnapshotPublishDispatched;
 }
 
 namespace DB::ErrorCodes
@@ -369,7 +369,7 @@ TEST(CasRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPu
 /// `admitSnapshotPublishUnderStateLock`, `advancePublishBackoff` and `resetPublishBackoff` are private
 /// to `CasRefLedger`, so they can only be characterized through the public dispatch surface
 /// (`appendRefOps`/`resolveRef` triggering `maybeScheduleSnapshotPublish`, and
-/// `waitForSnapshotPublishSettleForTest`/`ProfileEvents::CasRefSnapshotPublishDispatched` as the
+/// `waitForSnapshotPublishSettleForTest`/`ProfileEvents::CASRefSnapshotPublishDispatched` as the
 /// observables). `CasRequestControllerBackoff` is a DIFFERENT mechanism (the request controller's
 /// per-attempt retry backoff); this characterizes ONLY the per-table snapshot-publish dispatch backoff.
 ///
@@ -418,7 +418,7 @@ TEST(CasRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     /// finds the fault disarmed and succeeds.
     backend->armPutFailure("_snap/", 3);
 
-    const auto dispatchCount = [&] { return global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(); };
+    const auto dispatchCount = [&] { return global_counters[ProfileEvents::CASRefSnapshotPublishDispatched].load(); };
 
     /// Attempt 1: admitted immediately (no backoff armed yet). Fails -> backoff armed at the initial 1000ms.
     ASSERT_EQ(publishRef(store, ns, "ref_2", 2), (RefTxnId{store->writerEpoch(), 2}));

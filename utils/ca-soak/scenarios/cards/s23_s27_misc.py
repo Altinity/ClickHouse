@@ -112,7 +112,7 @@ class S23(Scenario):
                 #   (a) S3* and DiskS3* are the same physical HTTP requests counted twice
                 #       (DiskS3* wraps S3*), so summing both would double-count every request;
                 #   (b) Cas* counters are the CA-domain level counts that map 1:1 to logical
-                #       object-store operations from GC's perspective (CasGcGet, CasGcPut, etc.)
+                #       object-store operations from GC's perspective (CASGcGet, CASGcPut, etc.)
                 #       and do not double-count.
                 # Exclude timing / retry / error variants: Cas*Microseconds / *Errors are not
                 # operation counts. Accept all Cas* that are plain integer operation counters
@@ -142,10 +142,10 @@ class S23(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["idle_window_counters"] = delta
-        # The README §"Common observations" highlights CasRootList/CasGcGet etc. as the idle-GC cost.
+        # The README §"Common observations" highlights CASRootList/CASGcGet etc. as the idle-GC cost.
         result.observations["idle_gc_op_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasRootList", "CasRootGet", "CasGcGet", "CasGcPut", "CasGcList", "CasGcHead",
-            "CasBlobList", "CasBlobHead", "CasBlobDelete")}
+            "CASRootList", "CASRootGet", "CASGcGet", "CASGcPut", "CASGcList", "CASGcHead",
+            "CASBlobList", "CASBlobHead", "CASBlobDelete")}
 
         # --- idle GC S3 ops per round below a small budget ---------------------------------
         per_round_ops = [m["s3_ops"] for m in per_minute]
@@ -274,9 +274,9 @@ class S24(Scenario):
     def run(self, ctx, result):
         """Prove the in-memory dedup-hint cache is a bound-only shortcut: with a tiny cache
         (1 MiB) a large working set of distinct blob heads evicts entries, forcing remote
-        HEAD-first probes (`CasBlobHeadFirst`) on re-insert instead of in-memory
-        `CasBlobDedupCacheHit` short-circuits.  Correctness and dedup must be preserved via the
-        remote HEAD path (CasBlobBodyPutAvoided stays positive; replica-agreement oracle holds).
+        HEAD-first probes (`CASBlobHeadFirst`) on re-insert instead of in-memory
+        `CASBlobDedupCacheHit` short-circuits.  Correctness and dedup must be preserved via the
+        remote HEAD path (CASBlobBodyPutAvoided stays positive; replica-agreement oracle holds).
         """
         cl = ctx.cluster
         p = ctx.params
@@ -319,13 +319,13 @@ class S24(Scenario):
         fill_delta = fill_counters().get("_total", {})
         result.observations["fill_counters"] = {
             k: int(fill_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobDedupCacheHit", "CasBlobHeadFirst",
-                "CasBlobBodyPutAvoided", "CasBlobPutDedup")}
+                "CASBlobPut", "CASBlobDedupCacheHit", "CASBlobHeadFirst",
+                "CASBlobBodyPutAvoided", "CASBlobPutDedup")}
 
         # --- phase 2: re-insert a hot subset with a FIXED payload (deterministic blob hash) ----
         # We use a FIXED string (not randomString) for the hot subset so the blob hash is stable.
         # The CA disk must recognize each blob as already present via either a cache hit or a
-        # remote HEAD-first probe (cache miss -> HEAD -> CasBlobBodyPutAvoided).
+        # remote HEAD-first probe (cache miss -> HEAD -> CASBlobBodyPutAvoided).
         ctx.log(f"S24: re-inserting {hot} hot blobs x {hot_reinserts} rounds")
         hot_counters = _common.counters_window(ctx)
         for round_i in range(hot_reinserts):
@@ -336,35 +336,35 @@ class S24(Scenario):
         hot_delta = hot_counters().get("_total", {})
         result.observations["hot_reinsert_counters"] = {
             k: int(hot_delta.get(k, 0)) for k in (
-                "CasBlobPut", "CasBlobDedupCacheHit", "CasBlobHeadFirst",
-                "CasBlobBodyPutAvoided", "CasBlobPutDedup")}
+                "CASBlobPut", "CASBlobDedupCacheHit", "CASBlobHeadFirst",
+                "CASBlobBodyPutAvoided", "CASBlobPutDedup")}
 
         # --- VERDICT: correctness — dedup still avoids body re-uploads despite cache misses -----
-        hot_body_puts = int(hot_delta.get("CasBlobPut", 0))
-        hot_avoided = (int(hot_delta.get("CasBlobBodyPutAvoided", 0)) +
-                       int(hot_delta.get("CasBlobPutDedup", 0)) +
-                       int(hot_delta.get("CasBlobDedupCacheHit", 0)))
-        hot_head_first = int(hot_delta.get("CasBlobHeadFirst", 0))
+        hot_body_puts = int(hot_delta.get("CASBlobPut", 0))
+        hot_avoided = (int(hot_delta.get("CASBlobBodyPutAvoided", 0)) +
+                       int(hot_delta.get("CASBlobPutDedup", 0)) +
+                       int(hot_delta.get("CASBlobDedupCacheHit", 0)))
+        hot_head_first = int(hot_delta.get("CASBlobHeadFirst", 0))
         # The hot payload is fixed (same content every re-insert), so even without a cache hit
         # the remote HEAD must detect the blob as already present and avoid the body upload.
         result.add(Verdict.check(
             "dedup avoids body re-upload despite small cache",
-            "CasBlobBodyPutAvoided/Dedup/DedupCacheHit > 0 on hot re-inserts",
+            "CASBlobBodyPutAvoided/Dedup/DedupCacheHit > 0 on hot re-inserts",
             f"body_puts={hot_body_puts} avoided={hot_avoided} head_first={hot_head_first}",
             hot_avoided > 0 or hot_body_puts == 0,
             "" if (hot_avoided > 0 or hot_body_puts == 0) else
             "hot re-inserts re-uploaded blob bodies despite the same content already being in "
             "the pool — the remote HEAD fallback path (cache miss -> HEAD -> body-put-avoided) "
-            "is not engaged; investigate CasBlobHeadFirst / CasBlobBodyPutAvoided"))
+            "is not engaged; investigate CASBlobHeadFirst / CASBlobBodyPutAvoided"))
 
         # --- VERDICT: cache misses ARE observed (the working set exceeded the 1 MiB bound) ------
         # With a 1 MiB cache and a working set of distinct * blob_b bytes >> 1 MiB, the cache must
         # have evicted entries.  We expect some hot re-inserts to go through the remote HEAD path
-        # (CasBlobHeadFirst > 0) rather than all hitting the in-memory cache (CasBlobDedupCacheHit
+        # (CASBlobHeadFirst > 0) rather than all hitting the in-memory cache (CASBlobDedupCacheHit
         # == hot * hot_reinserts would mean the cache never evicted anything, which is impossible
         # at dev-scale working set ~10 MiB >> 1 MiB cache).
-        fill_cache_hits = int(fill_delta.get("CasBlobDedupCacheHit", 0))
-        hot_cache_hits = int(hot_delta.get("CasBlobDedupCacheHit", 0))
+        fill_cache_hits = int(fill_delta.get("CASBlobDedupCacheHit", 0))
+        hot_cache_hits = int(hot_delta.get("CASBlobDedupCacheHit", 0))
         total_hot_ops = hot * hot_reinserts
         result.observations["cache_hit_rate"] = {
             "fill_CasBlobDedupCacheHit": fill_cache_hits,
@@ -372,13 +372,13 @@ class S24(Scenario):
             "hot_CasBlobHeadFirst": hot_head_first,
             "hot_total_ops": total_hot_ops,
         }
-        # Either CasBlobHeadFirst > 0 (cache evicted, remote HEAD was used) or cache hit rate is
+        # Either CASBlobHeadFirst > 0 (cache evicted, remote HEAD was used) or cache hit rate is
         # < 100 % (some ops missed).  If the cache never evicted anything at all (all ops were
         # in-memory hits and no HeadFirst), the working-set test did not exercise the intended path.
         eviction_observed = hot_head_first > 0 or hot_cache_hits < total_hot_ops
         result.add(Verdict(
             "cache eviction observed",
-            "CasBlobHeadFirst > 0 or cache-hit rate < 100% (working set > 1 MiB bound)",
+            "CASBlobHeadFirst > 0 or cache-hit rate < 100% (working set > 1 MiB bound)",
             f"HeadFirst={hot_head_first} cache_hits={hot_cache_hits}/{total_hot_ops}",
             "pass" if eviction_observed else "inconclusive",
             "" if eviction_observed else
@@ -637,10 +637,10 @@ class S26(Scenario):
         # CasRoot* (ref/metadata) vs CasBlob* (content body) — verbatim file churn should drive Root
         # and _files activity, while identical inserts must NOT keep uploading new blob bodies.
         cas_root = {k: int(delta.get(k, 0)) for k in (
-            "CasRootCas", "CasRootGet", "CasRootList", "CasRootCasConflict")}
+            "CASRootCompareSwap", "CASRootGet", "CASRootList", "CASRootCompareSwapConflict")}
         cas_blob = {k: int(delta.get(k, 0)) for k in (
-            "CasBlobPut", "CasBlobPutDedup", "CasBlobBodyPutAvoided", "CasBlobDelete",
-            "CasBlobDedupCacheHit")}
+            "CASBlobPut", "CASBlobPutDedup", "CASBlobBodyPutAvoided", "CASBlobDelete",
+            "CASBlobDedupCacheHit")}
         result.observations["s26_cas_root_counters"] = cas_root
         result.observations["s26_cas_blob_counters"] = cas_blob
 
@@ -656,13 +656,13 @@ class S26(Scenario):
                                "as content blobs"))
 
         # Identical inserts must dedup (no unbounded new blob bodies for repeated content).
-        body_puts = cas_blob["CasBlobPut"]
-        avoided = cas_blob["CasBlobBodyPutAvoided"] + cas_blob["CasBlobPutDedup"] \
-            + cas_blob["CasBlobDedupCacheHit"]
+        body_puts = cas_blob["CASBlobPut"]
+        avoided = cas_blob["CASBlobBodyPutAvoided"] + cas_blob["CASBlobPutDedup"] \
+            + cas_blob["CASBlobDedupCacheHit"]
         result.add(Verdict.check(
             "identical inserts dedup (no blob churn)",
             "repeated identical inserts avoid re-uploading the same blob body",
-            f"CasBlobPut={body_puts} avoided/dedup={avoided} over {dedup_inserts} identical inserts",
+            f"CASBlobPut={body_puts} avoided/dedup={avoided} over {dedup_inserts} identical inserts",
             avoided > 0 or body_puts <= 4,
             "" if (avoided > 0 or body_puts <= 4) else
             "identical inserts kept uploading new blob bodies — block-dedup not engaging, or content "
@@ -703,16 +703,16 @@ class S26(Scenario):
                 "" if drained else "dropping the table did not drain its table-level _files objects — "
                                    "verbatim files leaked beyond the owner-path cleanup"))
 
-        # CasBlobDelete must NOT be the mechanism that removed the verbatim _files (they are removed
+        # CASBlobDelete must NOT be the mechanism that removed the verbatim _files (they are removed
         # verbatim by their owner path, not content-addressed and deleted as blobs).
-        blob_deletes_on_drop = int(drop_delta.get("CasBlobDelete", 0))
+        blob_deletes_on_drop = int(drop_delta.get("CASBlobDelete", 0))
         result.observations["s26_blob_deletes_on_drop"] = blob_deletes_on_drop
         result.add(Verdict("regular GC not implicated for _files",
-                           "_files removed verbatim by owner path, not via CasBlobDelete blob path",
-                           f"CasBlobDelete during drop+GC = {blob_deletes_on_drop} "
+                           "_files removed verbatim by owner path, not via CASBlobDelete blob path",
+                           f"CASBlobDelete during drop+GC = {blob_deletes_on_drop} "
                            f"(these reclaim content blobs of the dropped data, not the _files entries)",
                            "pass",
-                           "informational: CasBlobDelete on drop reclaims the data blobs; the "
+                           "informational: CASBlobDelete on drop reclaims the data blobs; the "
                            "table-level _files are removed by the namespace drop, not as blobs"))
 
         # standard_end with no surviving tables: fixpoint reclaim + clean fsck.
@@ -792,7 +792,7 @@ class S27(Scenario):
         base_before = _common.counters_window(ctx)
         gc_mod.gc_drive_round(cl, log_fn=ctx.log)
         base_delta = base_before().get("_total", {})
-        result.observations["baseline_CasRootGet"] = int(base_delta.get("CasRootGet", 0))
+        result.observations["baseline_CasRootGet"] = int(base_delta.get("CASRootGet", 0))
 
         # ARM LIST anomalies on the cas/refs/ prefix, then churn + GC so discovery keeps re-listing.
         self._ctl("/config", {"list_anomaly": "duplicate", "list_prefix": "cas/refs/"})
@@ -815,7 +815,7 @@ class S27(Scenario):
             except Exception as e:
                 gc_errors.append({"op": f"gc round {r}", "err": str(e)[:150]})
         anomaly_delta = anomaly_before().get("_total", {})
-        result.observations["anomaly_CasRootGet"] = int(anomaly_delta.get("CasRootGet", 0))
+        result.observations["anomaly_CasRootGet"] = int(anomaly_delta.get("CASRootGet", 0))
 
         # DISARM before the checkpoint (fsck/GC must see ground truth).
         self._ctl("/config", {"list_anomaly": None, "rate": 0.0})
@@ -838,7 +838,7 @@ class S27(Scenario):
         # 3. Cost-of-conservatism (informational): reread cost under anomalies vs the stable baseline.
         result.add(Verdict(
             "conservative-reread cost under unstable listings (info)",
-            "recorded", f"CasRootGet baseline={result.observations['baseline_CasRootGet']} "
+            "recorded", f"CASRootGet baseline={result.observations['baseline_CasRootGet']} "
             f"anomaly-window={result.observations['anomaly_CasRootGet']}", "pass"))
 
         # 4. Surviving tables' replicas still agree despite the anomaly window.

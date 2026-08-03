@@ -4,8 +4,8 @@
 
 namespace ProfileEvents
 {
-    extern const Event CasRefMaterializeInPlace;
-    extern const Event CasRefMaterializeCopy;
+    extern const Event CASRefMaterializeInPlace;
+    extern const Event CASRefMaterializeCopy;
 }
 
 namespace DB::Cas
@@ -207,7 +207,7 @@ void RefCowMap::materialize()
     /// shadows that key in the merged view, so the partial row stays invisible until it is re-folded.)
     if (base.use_count() == 1)
     {
-        ProfileEvents::increment(ProfileEvents::CasRefMaterializeInPlace);
+        ProfileEvents::increment(ProfileEvents::CASRefMaterializeInPlace);
         for (auto it = overlay.begin(); it != overlay.end(); )
         {
             if (it->second)
@@ -228,7 +228,7 @@ void RefCowMap::materialize()
     /// A copy still shares this base, so fold into a FRESH one and swap -- the shared holder must stay
     /// byte-unchanged. Strong guarantee: a mid-fold throw discards `fresh` and leaves this container (and
     /// every sharer) exactly as it was.
-    ProfileEvents::increment(ProfileEvents::CasRefMaterializeCopy);
+    ProfileEvents::increment(ProfileEvents::CASRefMaterializeCopy);
     auto fresh = std::make_shared<Base>(*base);
     for (const auto & [key, maybe_row] : overlay)
     {
