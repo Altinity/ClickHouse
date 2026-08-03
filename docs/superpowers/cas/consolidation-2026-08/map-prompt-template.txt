@@ -17,7 +17,14 @@ Fields:
 - claim: one self-contained statement understandable without the source document
 - sources: ["<path>#<nearest heading anchor or line range>"]
 - issue_ids: e.g. ["B140"]
-- suggested_target: architecture/<page>|operations/<page>|configuration|bucket-requirements|quick-start|index|roadmap|BACKLOG|keep-in-place|none
+- suggested_target: exactly one of: architecture/index, architecture/storage-layout,
+  architecture/blob-protocol, architecture/mounts-and-leases, architecture/manifests-and-refs,
+  architecture/part-lifecycle, architecture/replication, architecture/garbage-collection,
+  architecture/read-path, architecture/correctness, architecture/design-history,
+  operations/migration, operations/monitoring, operations/troubleshooting, operations/debugging,
+  index, quick-start, configuration, bucket-requirements, roadmap, BACKLOG, keep-in-place, none.
+  Pick the closest value from this list; if torn between two, pick the more specific; if nothing
+  fits, none.
 
 Rules:
 - One claim per record. Split compound statements.
@@ -29,6 +36,7 @@ Rules:
   review sign-offs) produces NO records.
 - Preserve issue IDs (B/T/S/D-numbers, rev.N) whenever mentioned.
 - A file whose entire content is play-by-play gets zero records — that is fine.
+- No leading/trailing whitespace inside claim.
 
 After the JSONL, write {OUT_PATH}.manifest — one line per input file. The separator
 between the path and the status field is a single real TAB character (0x09), not the
