@@ -962,6 +962,76 @@ ownership-partition proof exists).
 
 ---
 
+### Task T6b (amendment 2026-08-03): destructive work-envelope budgets {#t6b}
+
+**Origin:** the independent codex T5+T6 review (`tmp/codex_t5t6_review_answer.md`) REJECTed T6's
+production work envelope while confirming its safety design clean: three work families became
+production-reachable with no per-round ceiling (its findings T6-1..T6-3). Both heavyweight arc
+reviews (opus-lane, Fable-lane) APPROVEd the flip's safety independently. User decision
+2026-08-03: adopt the **minimal fail-close version** — per-round caps that leave excess work to
+later rounds via the already-durable pipelines. Explicitly OUT of scope: new object kinds,
+protocol-step changes, chunked/resumable outcome logs, and T6-3's per-key catalog-GET
+amortization (validation semantics stay untouched). The related BACKLOG item
+`[gc-frontier-one-list]` is a SEPARATE future effort; T6b's budget primitive must merely be
+reusable by its lever (2) (bounded parallel walk), nothing more.
+
+**Worktree:** LANE-G, branch `laneg/t6b` branched from the `cas-gc-rebuild` tip that already
+contains the integrated T6 arc. Integration by cherry-pick after review.
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.{h,cpp}`,
+  `Gc/CasBlobInDegree.cpp`, `Gc/CasOrphanManifestSweep.{h,cpp}`,
+  `ContentAddressedSettings.cpp` (+ `Pool/CasPool.h` defaults)
+- Test: existing `src/Disks/tests/gtest_cas_*` counting-backend fixtures; new assertions in the
+  suites that own each family.
+
+**Slice 1 — shared budget primitive + cohort caps (codex T6-2).** A per-round work-budget
+accounting object (op counts by verb + retained/fetched bytes, per-family caps from settings;
+conservative defaults, `0` = today's unbounded for opt-out). Apply it to: graduation
+(`CasBlobInDegree.cpp` `delete_pending`→`redelete`/graduate sites) and the `redelete` drain in
+`runRegularRound`. Excess entries REMAIN in the durable pipeline — never dropped, never
+re-derived. The per-shard `GcOutcomes` body becomes bounded as a consequence; assert its encoded
+size. Tests (counting backend): cohort ≫ cap ⇒ per-round DELETE/HEAD/PUT counts ≤ cap, full
+drain over ~ceil(N/cap) rounds, convergence proven by fixpoint.
+
+**Slice 2 — orphan planner budgets (codex T6-1).** In `planManifestCursorPage`: budget check
+BEFORE body GET/retention (today: GET+retain the whole listed page, then filter); cap distinct
+namespaces per page; the recovery walk (`activeManifestKeys` →
+`recoverRefTableDetailedFromAuthority` + committed-tail exact walk) gets a budget — on
+exhaustion, fail-closed: RETAIN the namespace's candidates (retention is always safe), record a
+counted retained-cause, and leave the cursor before the first undecided key. MANDATORY liveness
+test: every round either decides ≥1 candidate or advances the cursor — a pathological namespace
+must not wedge the page for all subsequent rounds.
+
+**Slice 3 — cleanup budgets (codex T6-3).** `deletePrefixWholesale` takes a budget (callers pass
+the round's remainder, never `UINT64_MAX`); `snap_pruned_through` advances only past a FULLY
+drained prefix (verify + pin with a test); `cleanupRefObjects` capped per round. The per-key
+fail-close validation (row/life/lease before each exact delete) is NOT amortized or weakened.
+
+**Mutation demonstrations (each slice):** each cap must be shown load-bearing — with the cap
+check deleted and a large cohort, the counting backend must observe unbounded per-round ops;
+patch reverted, output preserved in the report.
+
+**Gates:** per-slice targeted suites in release AND ASan under the shared flock; at task close a
+full CA gate + the staged 20-minute smoke soak (plain, with chaos) before any longer run. Logs
+under the build dirs with unique names, summarized by subagent.
+
+**Completion semantics:** T6b answers the codex REJECT by pointing each of T6-1/T6-2/T6-3 at its
+landed cap + convergence test in the ledger. Carry to T8: the soak reads per-round op ceilings
+(per-phase timing/op rows, `d412f85f749`) and `assert_reclaimable_drained` must still converge
+under budgets.
+
+- [ ] **Slice 1** implemented, gated, committed (`ca: gc — per-round work budget: graduation and
+  redelete cohort caps`)
+- [ ] **Slice 2** implemented, gated, committed (`ca: gc — orphan planner page/byte/recovery
+  budgets, fail-closed retention`)
+- [ ] **Slice 3** implemented, gated, committed (`ca: gc — cleanup families under the round
+  budget`)
+- [ ] Full CA gate + 20m chaos smoke green; review (standard two-stage); integrate to
+  `cas-gc-rebuild`; ledger row closes the codex verdict.
+
+---
+
 ### Task T7: model lane — Task 10 closure {#t7}
 
 **Files (lane A):**
