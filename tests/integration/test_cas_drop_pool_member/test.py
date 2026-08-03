@@ -11,11 +11,11 @@ cluster = ClickHouseCluster(__file__)
 
 # Both servers mount the SAME content-addressed pool over RustFS (not MinIO -- MinIO cannot serve CA
 # pools, see memory), distinct server_root_id (node1/node2) -- exactly the shared-pool model test's
-# two-node topology (test_content_addressed_shared_pool), just on rustfs instead of minio (the model
-# test predates rustfs support; test_content_addressed_ref_snaplog is the rustfs precedent copied here).
-STORAGE_POLICY = "content_addressed_dpm"
+# two-node topology (test_cas_shared_pool), just on rustfs instead of minio (the model
+# test predates rustfs support; test_cas_ref_snaplog is the rustfs precedent copied here).
+STORAGE_POLICY = "cas_dpm"
 RO_DISK = "disk_ca_ro"
-CA_DISK = "disk_content_addressed_dpm"
+CA_DISK = "disk_cas_dpm"
 
 SRID1 = "node1"
 SRID2 = "node2"
@@ -107,7 +107,7 @@ def test_drop_dead_pool_member_heals_the_pool():
 
     assert _count(BLOBS_PREFIX) > blobs_baseline, "expected content blobs after both nodes' inserts"
 
-    # (3b) T9: system.content_addressed_mounts scopes the GC-health columns (is_leader et al.) to the
+    # (3b) T9: system.cas_mounts scopes the GC-health columns (is_leader et al.) to the
     #      row for THIS server's own server_root_id; peer rows read NULL. Background GC (1s interval)
     #      should have led at least one round on each node by now, but that is a background race, not
     #      something this test synchronizes on directly -- poll rather than assume. For every disk
@@ -118,7 +118,7 @@ def test_drop_dead_pool_member_heals_the_pool():
         for _ in range(30):
             rows = (
                 node.query(
-                    "SELECT disk, server_root_id FROM system.content_addressed_mounts "
+                    "SELECT disk, server_root_id FROM system.cas_mounts "
                     "WHERE is_leader IS NOT NULL ORDER BY disk"
                 )
                 .strip()
@@ -152,7 +152,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     aggregate to a single row for the equality assert.
     assert_eq_with_retry(
         node1,
-        "SELECT min(state != 'live') FROM system.content_addressed_mounts WHERE server_root_id = '{}'".format(
+        "SELECT min(state != 'live') FROM system.cas_mounts WHERE server_root_id = '{}'".format(
             SRID2
         ),
         "1",
@@ -212,7 +212,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     retired -- checked after PHASE 2, not right after the first, still-pending call).
     assert (
         node1.query(
-            "SELECT count() FROM system.content_addressed_mounts WHERE server_root_id = '{}'".format(SRID2)
+            "SELECT count() FROM system.cas_mounts WHERE server_root_id = '{}'".format(SRID2)
         ).strip()
         == "0"
     )
@@ -248,7 +248,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     node1.query("SYSTEM FLUSH LOGS")
     rounds = int(
         node1.query(
-            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "SELECT count() FROM system.cas_gc_log "
             "WHERE event_type = 'Finish' AND outcome = 'Success'"
         ).strip()
         or 0
@@ -257,7 +257,7 @@ def test_drop_dead_pool_member_heals_the_pool():
     deleted = int(
         node1.query(
             "SELECT sum(objects_deleted + manifests_deleted) "
-            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+            "FROM system.cas_gc_log WHERE event_type = 'Finish'"
         ).strip()
         or 0
     )

@@ -359,7 +359,7 @@ class S16(Scenario):
         result.observations["gc_summary"] = gc_all.get("summary", {})
 
         # Resurrection audit: a hot content cycle (drop -> GC-condemn -> re-insert) must surface
-        # `blob_reuse_resurrect` events in system.content_addressed_log — the CA event audit's
+        # `blob_reuse_resurrect` events in system.cas_log — the CA event audit's
         # equivalent of the removed `ContentAddressedGenerationResurrectionsTotal` /
         # `ContentAddressedDuplicateGenerationBytes` ProfileEvents (both were zero-increment husks
         # from the pre-incarnation-token "generation" GC design and were removed). Under the current

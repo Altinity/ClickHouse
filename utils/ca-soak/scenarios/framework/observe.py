@@ -6,8 +6,8 @@ Everything the README §"Common observations" asks for, gathered from a running 
 - Per-node server memory (`MemoryResident`, `MemoryTracking`) and cgroup container samples.
 - Physical pool shape: object count + bytes by prefix (`blobs`, `roots`, `_manifests`, `refs`,
   `_files`, `gc`, `_pool_meta`).
-- `system.content_addressed_garbage_collection_log` rows + per-round outcomes.
-- `system.content_addressed_log` event counts by `event_type` / `object_kind` / `outcome`.
+- `system.cas_gc_log` rows + per-round outcomes.
+- `system.cas_log` event counts by `event_type` / `object_kind` / `outcome`.
 - Raw system-table extracts written to TSV files for the run archive.
 
 All collectors are best-effort on TRANSPORT (a node unreachable under chaos, or a log table not yet
@@ -41,8 +41,8 @@ POOL_DIR = os.environ.get("CA_SOAK_POOL_DIR", "/data/test/soak_pool")
 CH_CONTAINERS = tuple(
     c for c in os.environ.get("CA_SOAK_CH_CONTAINERS", "ca-soak-ch1-1,ca-soak-ch2-1").split(",") if c)
 
-GC_LOG = "system.content_addressed_garbage_collection_log"
-CA_LOG = "system.content_addressed_log"
+GC_LOG = "system.cas_gc_log"
+CA_LOG = "system.cas_log"
 
 # Event types that must NOT appear unless a negative scenario expects the exception (README §"Common
 # hard assertions").
@@ -661,7 +661,7 @@ def _identity_from_key(key: str) -> dict:
 def dump_object_forensics(ctx, cluster, fsck_detail_res: dict, *, dangling_cap: int = 100,
                           unreachable_cap: int = 40) -> dict:
     """When a checkpoint finds suspicious objects, persist (a) the classified fsck detail keys and
-    (b) the FULL per-object lifetime from `system.content_addressed_log` for each suspicious object —
+    (b) the FULL per-object lifetime from `system.cas_log` for each suspicious object —
     the README §"Report anomaly handling" object-lifetime trace (blob_put -> ref_publish ->
     gc_retire_decision -> gc_recheck_verdict -> blob_delete -> ...). Dumped to <run>/forensics/.
 

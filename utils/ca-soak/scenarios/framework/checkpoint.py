@@ -117,7 +117,7 @@ def end_checkpoint(ctx, cluster, result, tables, *, table_filter=None, abandons=
 
     # Forensics: if any object is dangling, unaccounted (outside the whole GC view — should be
     # impossible per INV-2 once GC has run), or legacy-unreachable, capture the full per-object
-    # lifetime from system.content_addressed_log BEFORE the next run's reset wipes the pool.
+    # lifetime from system.cas_log BEFORE the next run's reset wipes the pool.
     # pending-gc / awaiting-gc rows are the deletion pipeline working as designed — NOT forensics
     # triggers (they churn nonzero on any active pool).
     try:

@@ -146,7 +146,7 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     node.query("SYSTEM FLUSH LOGS")
     rounds = int(
         node.query(
-            "SELECT count() FROM system.content_addressed_garbage_collection_log "
+            "SELECT count() FROM system.cas_gc_log "
             "WHERE event_type = 'Finish' AND outcome = 'Success'"
         ).strip()
     )
@@ -155,7 +155,7 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     deleted = int(
         node.query(
             "SELECT sum(objects_deleted + manifests_deleted) "
-            "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+            "FROM system.cas_gc_log WHERE event_type = 'Finish'"
         ).strip()
         or 0
     )

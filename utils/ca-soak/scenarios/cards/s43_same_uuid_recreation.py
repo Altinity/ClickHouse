@@ -202,14 +202,14 @@ class S43(Scenario):
                 node.command(f"SYSTEM CAS FORGET '{_DISK}'")
                 forgotten[repr(node)] = node.scalar(
                     f"SELECT lifecycle || '(' || lifecycle_reason || ')' "
-                    f"FROM system.content_addressed_mounts WHERE disk = '{_DISK}'") or "(no row)"
+                    f"FROM system.cas_mounts WHERE disk = '{_DISK}'") or "(no row)"
             except QueryError as e:
                 forgotten[repr(node)] = f"ERROR: {str(e)[:160]}"
         result.observations["forget"] = forgotten
         all_vanished = all("vanished" in v for v in forgotten.values())
         result.add(Verdict.check(
             "both mounts FORGOT the pool before its prefix was reused",
-            "system.content_addressed_mounts reports vanished(...) on every node",
+            "system.cas_mounts reports vanished(...) on every node",
             forgotten, all_vanished,
             "" if all_vanished else "a mount still holds the pool, so emptying the prefix would be "
                                     "pulling bytes out from under it rather than recreating a pool"))

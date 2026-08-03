@@ -13,14 +13,14 @@ cluster = ClickHouseCluster(__file__)
 # manifest) in the pool when the other replica needs it — so the "fetch" is a fetch-by-relink: the
 # fetching replica publishes its own ref to the existing blobs instead of downloading any bytes (the CA
 # analogue of zero-copy replication, spec §4).
-STORAGE_POLICY = "content_addressed_shared"
-CA_DISK = "disk_content_addressed_shared"
+STORAGE_POLICY = "cas_shared"
+CA_DISK = "disk_cas_shared"
 
 # A second, independent pool mounted by node2 only (configs/storage_conf_other_pool.xml). Used for the
 # cross-pool leg of B66b: relink is gated on both sides naming the same pool, so a fetch into this one
 # must degrade to bytes.
-OTHER_STORAGE_POLICY = "content_addressed_other"
-OTHER_CA_DISK = "disk_content_addressed_other"
+OTHER_STORAGE_POLICY = "cas_other"
+OTHER_CA_DISK = "disk_cas_other"
 
 # The shared pool's blob prefix inside the `test` RustFS bucket. The relink proof is that the fetch does
 # NOT create new objects under here: relink publishes a ref (per-server, under store/), never a blob.
@@ -626,22 +626,22 @@ def test_version_mix_legacy_peer_gets_bytes():
         ("endpoint", endpoint),
         ("part", part),
         ("compress", "false"),
-        ("content_addressed_pool_uuid", pool_uuid),
+        ("cas_pool_uuid", pool_uuid),
     ]
 
     # CONTROL — a confirm-capable peer: an offer, with a token, and a tiny manifest-only body.
     headers_v11, size_v11 = interserver_request(
         node2, "node1", base + [("client_protocol_version", "11")]
     )
-    assert "content_addressed_relink=part_manifest_v2" in headers_v11, headers_v11
-    assert "content_addressed_source_token=" in headers_v11, headers_v11
+    assert "cas_relink=part_manifest_v2" in headers_v11, headers_v11
+    assert "cas_source_token=" in headers_v11, headers_v11
 
     # THE CASE UNDER TEST — a peer advertising the pre-confirm version: no offer, and the part's bytes.
     headers_v10, size_v10 = interserver_request(
         node2, "node1", base + [("client_protocol_version", "10")]
     )
-    assert "content_addressed_relink" not in headers_v10, headers_v10
-    assert "content_addressed_source_token" not in headers_v10, headers_v10
+    assert "cas_relink" not in headers_v10, headers_v10
+    assert "cas_source_token" not in headers_v10, headers_v10
     assert "server_protocol_version=10" in headers_v10, headers_v10
 
     # Positive proof that bytes ACTUALLY moved rather than the request merely succeeding: the v10
@@ -891,7 +891,7 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
         n.query("SYSTEM FLUSH LOGS")
         rounds += int(
             n.query(
-                "SELECT count() FROM system.content_addressed_garbage_collection_log "
+                "SELECT count() FROM system.cas_gc_log "
                 "WHERE event_type = 'Finish' AND outcome = 'Success'"
             ).strip()
             or 0

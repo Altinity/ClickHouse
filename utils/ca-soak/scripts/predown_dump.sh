@@ -81,7 +81,7 @@ for spec in $NODES; do
     curl -sS -m 120 -X POST --data-binary "SYSTEM FLUSH LOGS" "http://localhost:${port}/" >/dev/null 2>&1
 
     # (a) the whole GC log — small, and the audit's primary table.
-    q "$port" "SELECT * FROM system.content_addressed_garbage_collection_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
+    q "$port" "SELECT * FROM system.cas_gc_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
       "$dir/gc_log.tsv"
 
     # (b) trace_log aggregates, per trace type, SPLIT BY SIDE and carrying the side per row.
@@ -144,7 +144,7 @@ for spec in $NODES; do
     #      and did a re-publish follow". Both live in the container's /var/lib/clickhouse and die with
     #      it, which is the whole reason this dump exists — omitting them defeated its purpose once.
     q "$port" "SELECT * FROM system.part_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" "$dir/part_log.tsv"
-    q "$port" "SELECT * FROM system.content_addressed_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
+    q "$port" "SELECT * FROM system.cas_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
       "$dir/content_addressed_log.tsv"
 
     # (c) every counter, including the zeros — a counter that never moved is evidence too.

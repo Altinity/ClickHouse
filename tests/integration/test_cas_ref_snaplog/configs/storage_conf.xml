@@ -7,14 +7,13 @@
             <disk_ca>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <server_root_id>itest-ref-snaplog</server_root_id>
                 <endpoint>http://rustfs1:11121/test/cas_snaplog_data/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <gc_enabled>1</gc_enabled>
                 <gc_interval_sec>1</gc_interval_sec>
-                <content_addressed_gc_grace_sec>2</content_addressed_gc_grace_sec>
             </disk_ca>
             <!-- Read-only window over the SAME pool for the read-only consumers (fsck, ca-gc-dryrun).
                  Those commands refuse a writable pool; a read-only disk takes no mount lease, so it can
@@ -22,7 +21,7 @@
             <disk_ca_ro>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <server_root_id>itest-ref-snaplog</server_root_id>
                 <endpoint>http://rustfs1:11121/test/cas_snaplog_data/</endpoint>
                 <access_key_id>clickhouse</access_key_id>

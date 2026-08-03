@@ -9,7 +9,7 @@ cluster = ClickHouseCluster(__file__)
 # Both servers mount the SAME content-addressed pool (endpoint .../root/shared_pool/). The blob pool
 # (blobs/ + parts/) is shared across servers; refs are per-server under store/<server_id>/..., so the
 # two servers dedup identical content while keeping independent ref roots.
-STORAGE_POLICY = "content_addressed_shared"
+STORAGE_POLICY = "cas_shared"
 
 # blobs/ holds content blobs, parts/ holds part footers. These are the shared pool's object prefixes
 # inside the `root` MinIO bucket. "No leftovers" means BOTH drain back to baseline.
@@ -68,7 +68,7 @@ def _gc_bookkeeping(*nodes):
         n.query("SYSTEM FLUSH LOGS")
         rounds += int(
             n.query(
-                "SELECT count() FROM system.content_addressed_garbage_collection_log "
+                "SELECT count() FROM system.cas_gc_log "
                 "WHERE event_type = 'Finish' AND outcome = 'Success'"
             ).strip()
             or 0
@@ -76,7 +76,7 @@ def _gc_bookkeeping(*nodes):
         deleted += int(
             n.query(
                 "SELECT sum(objects_deleted + manifests_deleted + entries_redeleted) "
-                "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'"
+                "FROM system.cas_gc_log WHERE event_type = 'Finish'"
             ).strip()
             or 0
         )

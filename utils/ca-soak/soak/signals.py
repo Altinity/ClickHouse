@@ -8,7 +8,7 @@ Two families:
 
 * **`system.events` counters** (`CAS_SIGNAL_EVENTS`) — the `Cas*` `ProfileEvents` that carry a
   correctness or availability verdict. Read per metrics tick and, fail-closed, at every checkpoint.
-* **The per-phase GC log** (`system.content_addressed_garbage_collection_log`, `event_type='Phase'`,
+* **The per-phase GC log** (`system.cas_gc_log`, `event_type='Phase'`,
   landed 2026-07-26 in `d412f85f749`) — eighteen rows per folding round carrying `phase_duration_us`,
   a phase-specific `phase_metrics` map and that phase's `ProfileEvents` delta. Summarised per
   checkpoint into the metrics sqlite so the load study has material that survives the run.
@@ -126,7 +126,7 @@ if len(set(CAS_SIGNAL_EVENTS)) != len(CAS_SIGNAL_EVENTS):
     _dupes = sorted({e for e in CAS_SIGNAL_EVENTS if CAS_SIGNAL_EVENTS.count(e) > 1})
     raise AssertionError(f"duplicate watched counter(s) across the signal families: {_dupes}")
 
-GC_LOG = "system.content_addressed_garbage_collection_log"
+GC_LOG = "system.cas_gc_log"
 
 # ClickHouse error code UNKNOWN_TABLE. `SystemLog<>`-backed tables are materialized lazily
 # (`SystemLog::prepareTable`), so a pool on which GC has never logged a round legitimately raises this

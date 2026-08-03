@@ -19,7 +19,7 @@ The exact entry point can change during implementation, but the contract should 
 
 - Use a fresh pool prefix per run: `<scenario>/<seed>/<run_id>`.
 - Keep system logs on a local disk, not on the `content_addressed` disk.
-- Enable `system.content_addressed_log`, `system.content_addressed_garbage_collection_log`,
+- Enable `system.cas_log`, `system.cas_gc_log`,
   `system.query_log`, `system.part_log`, `system.metric_log`, `system.asynchronous_metric_log`, and
   `system.trace_log` when the scenario requests stack attribution.
 - Drive `SYSTEM CAS GC RUN ca` explicitly at checkpoints, even when background
@@ -44,10 +44,10 @@ These assertions apply to every positive scenario unless a scenario explicitly s
 - Storage correctness: `clickhouse-disks ca-fsck --detail` reports `dangling = 0`.
 - `GC` safety: `clickhouse-disks ca-gc-dryrun` delete candidates are a subset of the `ca-fsck` unreachable
   set at quiescence.
-- Event audit: `system.content_addressed_log` contains no `read_missing`, `dangling_access`,
+- Event audit: `system.cas_log` contains no `read_missing`, `dangling_access`,
   `corrupt_dangle`, `corrupt_decode`, `snap_journal_incoherent`, or `exception` rows unless the scenario is
   a negative fail-closed test that expects the exception.
-- `GC` rounds: `system.content_addressed_garbage_collection_log` has no `Failed` finish rows. `NotALeader`
+- `GC` rounds: `system.cas_gc_log` has no `Failed` finish rows. `NotALeader`
   finish rows are expected on non-leader servers in shared-pool tests.
 - No unbounded leftovers: after forced `GC`, `unreachable` is zero for scenarios that do not deliberately
   abandon writes. If it is nonzero, the report must classify the exact object class and prove it is bounded
@@ -67,9 +67,9 @@ Collect these for every run:
   `dedup_cache_bytes`, `dedup_head_first_min_bytes`, `expect_continue_min_bytes`, replica count, object
   store version, and seed.
 - Pool shape: object count and bytes by prefix: `blobs`, `roots`, `_manifests`, `_files`, and `gc`.
-- `system.content_addressed_garbage_collection_log`: round, outcome, candidates, deleted, absent,
+- `system.cas_gc_log`: round, outcome, candidates, deleted, absent,
   replaced, spared, duration, and per-round `ProfileEvents`.
-- `system.content_addressed_log`: event counts by `event_type`, `object_kind`, `outcome`, and joins by
+- `system.cas_log`: event counts by `event_type`, `object_kind`, `outcome`, and joins by
   `object_hash`/`token` for suspicious objects.
 - `system.query_log`: elapsed time, read/write bytes, memory usage, and `ProfileEvents` for workload
   queries and explicit `GC` commands. Also check for anomalies: any query with `exception_code != 0`,
@@ -164,7 +164,7 @@ Observations:
 - Scratch-dir high-water mark and cleanup after commit.
 - `DiskS3CreateMultipartUpload`, `DiskS3UploadPart`, `DiskS3CompleteMultipartUpload`,
   `DiskS3AbortMultipartUpload`, `DiskS3PutObject`, and `CASBlobPut`.
-- `system.content_addressed_log` rows for `blob_put`, `precommit`, and `build_publish`.
+- `system.cas_log` rows for `blob_put`, `precommit`, and `build_publish`.
 
 Expected:
 
@@ -362,7 +362,7 @@ Observations:
 
 - `CASBlobPut`, `CASBlobPutDedup`, `CASBlobBodyPutAvoided`, and pool-byte growth per mutation.
 - `system.part_log` mutation entries and `ProfileEvents` from `system.query_log`.
-- `system.content_addressed_log` `blob_reuse_adopt`, `blob_put`, and `build_publish` counts.
+- `system.cas_log` `blob_reuse_adopt`, `blob_put`, and `build_publish` counts.
 
 Expected:
 
@@ -383,7 +383,7 @@ Workload:
 Observations:
 
 - Patch-part counts in `system.parts`, mutation queues, merge queues, `CASRootCompareSwapConflict`, and `CASBlobPut`.
-- `system.content_addressed_log` for ref drops/repoints.
+- `system.cas_log` for ref drops/repoints.
 - Pool bytes before and after forced `GC`.
 
 Expected:
@@ -425,7 +425,7 @@ Workload:
 
 Observations:
 
-- `system.content_addressed_garbage_collection_log` by `gc_id`: successful leader rounds versus
+- `system.cas_gc_log` by `gc_id`: successful leader rounds versus
   `NotALeader` rounds.
 - `CASGcCompareSwapConflict`, `CASRootCompareSwapConflict`, `CASBlobPutDedup`, pool bytes, and replica-local ref counts.
 - Replication queue depth and fetch traffic.
@@ -452,7 +452,7 @@ Observations:
 
 - `precommit`, `precommit_removed`, `precommit_reclaim`, `gc_lease_acquire`, `gc_lease_steal`,
   `gc_recheck_verdict`, and `blob_delete` events.
-- `system.content_addressed_garbage_collection_log` `objects_spared`, `objects_replaced`, and errors.
+- `system.cas_gc_log` `objects_spared`, `objects_replaced`, and errors.
 - Recovery time until both replicas pass `SYSTEM SYNC REPLICA` and oracle checks.
 
 Expected:
@@ -555,7 +555,7 @@ Workload:
 Observations:
 
 - `blob_reuse_resurrect`, `blob_reuse_adopt`, `blob_put`, `blob_delete`, `objects_spared` counts from
-  `system.content_addressed_log` (the CA event audit). `blob_reuse_resurrect` is the resurrection
+  `system.cas_log` (the CA event audit). `blob_reuse_resurrect` is the resurrection
   signal — it fires when a writer observes a condemned token and must re-upload from source (see
   `Build::observeAndAdmit`).
 
@@ -577,7 +577,7 @@ Workload:
 
 Observations:
 
-- `ref_publish`, `ref_drop`, namespace/ref names in `system.content_addressed_log`, `system.detached_parts`,
+- `ref_publish`, `ref_drop`, namespace/ref names in `system.cas_log`, `system.detached_parts`,
   and `fsck` detail rows for any leftovers.
 
 Expected:
@@ -772,8 +772,8 @@ When a scenario fails or exceeds budget, the report should include:
 - The first failed invariant, exact query or operation, seed, operation id, and current pool prefix.
 - System-table excerpts around the time window.
 - Top `CPU` and `Real` stacks if trace logs were enabled.
-- Object lifetime for suspicious hashes/tokens from `system.content_addressed_log`.
-- `GC` round timeline from `system.content_addressed_garbage_collection_log`.
+- Object lifetime for suspicious hashes/tokens from `system.cas_log`.
+- `GC` round timeline from `system.cas_gc_log`.
 - A root-cause section with one of:
   - confirmed implementation bug, with source references;
   - harness limitation, with a concrete missing observation;

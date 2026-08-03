@@ -6,7 +6,7 @@
             <disk_ca_s3>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <server_root_id>itest-cas-file-cache</server_root_id>
                 <endpoint>http://rustfs1:11121/test/cas_cache_data/</endpoint>
                 <access_key_id>clickhouse</access_key_id>

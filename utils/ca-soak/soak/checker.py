@@ -122,9 +122,8 @@ def fixpoint_timeout_s(initial_unreachable: int, *, gc_interval_s: float, floor_
     therefore needs many rounds: ~initial/reclaim_per_round_guess rounds * gc_interval_s seconds,
     times a slack factor, with a generous floor so small backlogs still get plenty of time.
 
-    There is NO core retire-grace throttle (the XML `content_addressed_gc_grace_sec` key is inert —
-    not read by the core; candidates are derived statelessly per round). The ONLY pacing knob is the
-    GC interval, so the bound is interval-and-backlog-based, not grace-based.
+    There is NO core retire-grace throttle (candidates are derived statelessly per round). The ONLY
+    pacing knob is the GC interval, so the bound is interval-and-backlog-based, not grace-based.
 
     Examples (gc_interval_s=2, floor 300): backlog 100 -> 300 (floor); backlog 5000 ->
     5 * (5000/50) * 2 = 1000s."""

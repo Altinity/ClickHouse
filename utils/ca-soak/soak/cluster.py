@@ -233,8 +233,8 @@ _DEFAULTS = {
     # Background GC tick period, in seconds. MUST mirror gc_interval_sec in
     # configs/storage_conf.xml (currently 2) — the servers' CasGcScheduler makes one reclaim round
     # per tick (only the lease holder progresses), so this is the sole pacing knob the GC-fixpoint
-    # poll uses to scale its bound to the backlog. There is NO core retire-grace throttle:
-    # content_addressed_gc_grace_sec is inert (not read by the core), so no gc_grace_sec here.
+    # poll uses to scale its bound to the backlog. There is NO core retire-grace throttle, so no
+    # gc_grace_sec here.
     "gc_interval_s": 2,
 }
 

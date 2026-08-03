@@ -4,7 +4,7 @@
             <disk_cas_gc_sharded>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <!-- A single shared bucket path; BOTH replicas mount the SAME content-addressed pool
                      (one source of truth — shared-pool mode, spec §6). This is what makes a two-replica
                      disjoint-shard GC scenario possible: both nodes see the same gc/state key and
@@ -23,7 +23,6 @@
                 <gc_shards>2</gc_shards>
                 <!-- Fast GC for the integration soak: grace 3s, interval 1s. -->
                 <gc_enabled>1</gc_enabled>
-                <content_addressed_gc_grace_sec>3</content_addressed_gc_grace_sec>
                 <gc_interval_sec>1</gc_interval_sec>
             </disk_cas_gc_sharded>
         </disks>

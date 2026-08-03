@@ -7,7 +7,7 @@ from helpers.cluster import ClickHouseCluster
 cluster = ClickHouseCluster(__file__)
 
 # Two replicas of one ReplicatedMergeTree on a SHARED content-addressed pool.
-STORAGE_POLICY = "content_addressed_shared"
+STORAGE_POLICY = "cas_shared"
 
 
 @pytest.fixture(scope="module", autouse=True)

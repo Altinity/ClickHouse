@@ -1,10 +1,10 @@
 <clickhouse>
     <storage_configuration>
         <disks>
-            <disk_content_addressed_shared>
+            <disk_cas_shared>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
-                <metadata_type>content_addressed</metadata_type>
+                <metadata_type>cas</metadata_type>
                 <!-- A single shared bucket path. BOTH replicas load this same config, so they mount
                      the SAME content-addressed pool (the bucket is the single source of truth). The
                      shared pool is what makes fetch-by-relink possible: a part written by one replica
@@ -17,22 +17,20 @@
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Two replicas mounting one pool: mandatory, else the second mounter refuses to
                      attach (PoolMeta ownership check). This is the N-mounter enablement (spec §6). -->
-                <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
                 <!-- Background reachability GC enabled on BOTH replicas. The relink's pin-before-publish
                      (spec §4) protects the blobs against a concurrent sweep in the fetch window. -->
                 <gc_enabled>1</gc_enabled>
-                <content_addressed_gc_grace_sec>3</content_addressed_gc_grace_sec>
                 <gc_interval_sec>1</gc_interval_sec>
-            </disk_content_addressed_shared>
+            </disk_cas_shared>
         </disks>
         <policies>
-            <content_addressed_shared>
+            <cas_shared>
                 <volumes>
                     <main>
-                        <disk>disk_content_addressed_shared</disk>
+                        <disk>disk_cas_shared</disk>
                     </main>
                 </volumes>
-            </content_addressed_shared>
+            </cas_shared>
         </policies>
     </storage_configuration>
 </clickhouse>

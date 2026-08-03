@@ -117,10 +117,10 @@ echo "$relink_evidence" > "$OUT_DIR/relink_evidence.txt"
 if echo "$relink_evidence" | grep -qi "relink"; then
     echo "PASS: Relink path evidence found in ch2 log"
 else
-    echo "WARN: No 'relink' keyword in ch2 log — checking system.content_addressed_log..."
+    echo "WARN: No 'relink' keyword in ch2 log — checking system.cas_log..."
     # Try via system table if available
-    ca_log_rows=$(Q2 "SELECT count() FROM system.content_addressed_log WHERE event_type='ManifestAdopt' LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
-    echo "  system.content_addressed_log ManifestAdopt count: $ca_log_rows"
+    ca_log_rows=$(Q2 "SELECT count() FROM system.cas_log WHERE event_type='ManifestAdopt' LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
+    echo "  system.cas_log ManifestAdopt count: $ca_log_rows"
 fi
 
 echo ""
@@ -140,8 +140,8 @@ echo "$ca_metrics" > "$OUT_DIR/ch2_ca_events.txt"
 echo ""
 echo "--- Step 8: Assertion 4 - Distinct ManifestId on ch2 vs ch1 ---"
 # Query the content_addressed_log for manifest info on both nodes
-ch1_manifests=$(Q1 "SELECT part_id, manifest_id FROM system.content_addressed_log WHERE table='b7_relink_test' ORDER BY event_time DESC LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
-ch2_manifests=$(Q2 "SELECT part_id, manifest_id FROM system.content_addressed_log WHERE table='b7_relink_test' ORDER BY event_time DESC LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
+ch1_manifests=$(Q1 "SELECT part_id, manifest_id FROM system.cas_log WHERE table='b7_relink_test' ORDER BY event_time DESC LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
+ch2_manifests=$(Q2 "SELECT part_id, manifest_id FROM system.cas_log WHERE table='b7_relink_test' ORDER BY event_time DESC LIMIT 10 FORMAT TabSeparated" 2>/dev/null || echo "N/A")
 
 echo "ch1 manifests: $ch1_manifests"
 echo "ch2 manifests: $ch2_manifests"
@@ -156,7 +156,7 @@ if [ "$ch1_manifests" != "N/A" ] && [ "$ch2_manifests" != "N/A" ]; then
         echo "PASS: ch1 and ch2 have distinct manifest IDs (each published own local manifest)"
     fi
 else
-    echo "INFO: system.content_addressed_log not queryable or empty; checking via log search..."
+    echo "INFO: system.cas_log not queryable or empty; checking via log search..."
     # Alternative: look for adoptPartFromManifest in the log
     adopt_evidence=$(tail -n "+$log_pos_before" "$CH2_LOG" 2>/dev/null | grep -i "adopt\|manifest\|ManifestAdopt" | head -10 || echo "")
     if [ -n "$adopt_evidence" ]; then

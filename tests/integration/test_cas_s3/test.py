@@ -4,7 +4,7 @@ from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 
-STORAGE_POLICY = "content_addressed_s3"
+STORAGE_POLICY = "cas_s3"
 NUM_ROWS = 1000
 
 
@@ -24,7 +24,7 @@ def start_cluster():
         cluster.shutdown()
 
 
-def test_content_addressed_s3():
+def test_cas_s3():
     node = cluster.instances["node"]
 
     node.query("DROP TABLE IF EXISTS cas_test SYNC")

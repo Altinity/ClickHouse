@@ -6,7 +6,7 @@ from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 
-STORAGE_POLICY = "content_addressed_shared"
+STORAGE_POLICY = "cas_shared"
 
 
 @pytest.fixture(scope="module", autouse=True)

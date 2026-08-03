@@ -6,7 +6,7 @@ from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 
-STORAGE_POLICY = "content_addressed_gc_s3"
+STORAGE_POLICY = "cas_gc_s3"
 
 # Endpoint is http://rustfs1:11121/test/cas_gc_data/, so the pool's blobs and part footers live
 # under these key prefixes inside the `test` RustFS bucket. The authoritative "no S3 leftovers"
@@ -149,7 +149,7 @@ def test_gc_reclaims_dropped_blobs():
     #     (a) Rounds actually ran and completed as the leader.
     rounds = gc_log_scalar(
         node,
-        "SELECT count() FROM system.content_addressed_garbage_collection_log "
+        "SELECT count() FROM system.cas_gc_log "
         "WHERE event_type = 'Finish' AND outcome = 'Success'",
     )
     assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
@@ -158,7 +158,7 @@ def test_gc_reclaims_dropped_blobs():
     deleted = gc_log_scalar(
         node,
         "SELECT sum(objects_deleted + manifests_deleted) "
-        "FROM system.content_addressed_garbage_collection_log WHERE event_type = 'Finish'",
+        "FROM system.cas_gc_log WHERE event_type = 'Finish'",
     )
     assert deleted > 0, "the pool shrank but no round reported deleting anything"
 
@@ -168,7 +168,7 @@ def test_gc_reclaims_dropped_blobs():
     #         the gate.
     fully_proven_rounds = gc_log_scalar(
         node,
-        "SELECT count() FROM system.content_addressed_garbage_collection_log "
+        "SELECT count() FROM system.cas_gc_log "
         "WHERE phase = 'fold_ref_intake' "
         "  AND phase_metrics['frontier_namespaces'] > 0 "
         "  AND phase_metrics['frontier_proven'] = phase_metrics['frontier_namespaces']",
@@ -181,7 +181,7 @@ def test_gc_reclaims_dropped_blobs():
     #     (d) And no destructive phase reported itself suppressed — the gate really did open.
     suppressed_phases = gc_log_scalar(
         node,
-        "SELECT uniqExact(phase) FROM system.content_addressed_garbage_collection_log "
+        "SELECT uniqExact(phase) FROM system.cas_gc_log "
         "WHERE phase IN {} AND phase_metrics['suppressed'] = 1".format(DESTRUCTIVE_PHASES),
     )
     assert suppressed_phases == 0, (

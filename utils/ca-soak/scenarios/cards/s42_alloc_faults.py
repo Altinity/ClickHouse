@@ -174,7 +174,7 @@ class S42(Scenario):
     title = "allocation-fault soak (query-thread): exception safety of the CAS post-durable window"
     priority = "P0"
     # Injected `MEMORY_LIMIT_EXCEEDED` throws land inside CAS publishes, so `exception` rows in
-    # `system.content_addressed_log` are EXPECTED here. Every other bad event type still gates.
+    # `system.cas_log` are EXPECTED here. Every other bad event type still gates.
     expect_exception = True
 
     # `fault_probability` is per TRACKED ALLOCATION, and `max_untracked_memory=0` makes every
