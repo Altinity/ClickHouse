@@ -298,32 +298,37 @@ TEST(CasRefSnapshotPublishOrdering, AdoptionHappensLastAndOnlyAfterBothDurableEf
 }
 
 /// ---------------------------------------------------------------------------------------------
-/// 3. `NeedsRecovery` ("Poisoned") forces re-recovery before any publish effect can occur
+/// 3. `NeedsRecovery` ("Poisoned") lane: recovery precedes any snapshot publication
 /// ---------------------------------------------------------------------------------------------
 
-/// There is no `Poisoned` state literally named in `CasRefLedger`; `RefLaneState::NeedsRecovery` is the
+/// `Poisoned` is this task's plan's name for what the code spells `RefLaneState::NeedsRecovery` -- the
 /// state the header documents as "a transaction is known durable but cannot be installed in this cache
-/// ... a hard write and certification fence until replay completes", which is exactly the predicate this
-/// task's plan describes as `Poisoned`. It is reached here the same way
-/// `gtest_cas_ref_writer.cpp`'s `RefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall`
-/// reaches it: a mutation's ref-log body commits durably while its OWN checkpoint-frontier CAS
-/// (`commitRefChunk`'s `commit_contribution`, not the snapshot publisher's) conflicts persistently.
+/// ... a hard write and certification fence until replay completes". Recorded here as the vocabulary
+/// correction for later tasks: there is no state literally named `Poisoned` anywhere in `CasRefLedger`.
+/// This test is the plan's `PoisonedRefusesPublicationAndTriggersReRecovery`, renamed to state the actual
+/// pinned behavior precisely (recovery precedes publication, rather than an outright refusal).
 ///
-/// LIMITATION discovered while writing this test, which changed its shape from the plan's original
-/// "assert zero writes and a refusal" sketch: `tryPublishSnapshotAndAdvanceCheckpointOnce` calls
-/// `ensureRefTableRecovered` unconditionally, and that function re-walks the durable stream whenever the
-/// lane is `NeedsRecovery`, REGARDLESS of `recovered`. Reaching `NeedsRecovery` this way necessarily
-/// leaves a real durable gap between the committed log and the checkpoint (that is what `NeedsRecovery`
-/// means), so the SAME call's re-recovery closes that gap with its own `_ckpt` CAS, and -- because this
-/// table has never published a snapshot at all -- the very same call then finds a real, uncovered
-/// candidate and goes on to publish one. So a request against a poisoned lane does not return `false`
-/// here: it returns `true`, having recovered first. There is no `*ForTest` seam that installs
-/// `NeedsRecovery` without creating this reconcilable gap, so "poisoned refuses publication" cannot be
-/// pinned as "this call reports failure" -- what IS true, and IS what this test pins, is that no
-/// publish-primitive effect (the new snapshot's OWN body PUT, its OWN checkpoint-advance CAS) can occur
-/// before recovery's reconciliation CAS has already landed: recovery-then-publish is the only order this
-/// call can ever produce, never publish-around-a-still-poisoned-lane.
-TEST(CasRefSnapshotPublishOrdering, PoisonedRefusesPublicationAndTriggersReRecovery)
+/// It is reached here the same way `gtest_cas_ref_writer.cpp`'s
+/// `RefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` reaches it: a
+/// mutation's ref-log body commits durably while its OWN checkpoint-frontier CAS (`commitRefChunk`'s
+/// `commit_contribution`, not the snapshot publisher's) conflicts persistently.
+///
+/// The INVARIANT this pins (not a raw write count): a snapshot must never be published FROM AN
+/// UNRECOVERED CACHE -- a durable transaction may be missing from the cached view, and advancing `_ckpt`
+/// onto a snapshot built from that stale view is the data-loss shape `NeedsRecovery` exists to prevent.
+/// `tryPublishSnapshotAndAdvanceCheckpointOnce` calls `ensureRefTableRecovered` unconditionally, and that
+/// function re-walks the durable stream whenever the lane is `NeedsRecovery`, regardless of `recovered`.
+/// Recovery's own `_ckpt` catch-up write is NOT a violation of this invariant -- it is the remedy: it is
+/// how the cache stops being stale before anything is allowed to read it for a snapshot. So a request
+/// against a poisoned lane recovers first and MAY legitimately go on to publish (this table had never
+/// published a snapshot, so once recovered it has a real, uncovered candidate) -- "inert refusal with
+/// zero writes" is NOT what production implements, and recover-then-proceed is the correct behavior, not
+/// a deviation from it. What this test pins is: (a) no snapshot-publish effect (body PUT, publisher's own
+/// checkpoint-advance CAS) can ever appear in the journal before recovery's reconciliation CAS; (b)
+/// re-recovery is an observable state transition, never a silent skip; (c) if a snapshot IS published, it
+/// reflects the RECOVERED frontier -- the durable transaction the stale cache was missing is actually
+/// covered by it, not merely "some snapshot, from whichever view".
+TEST(CasRefSnapshotPublishOrdering, NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication)
 {
     auto backend = std::make_shared<OrderedFaultBackend>();
     auto store = openPool(backend);
@@ -332,12 +337,14 @@ TEST(CasRefSnapshotPublishOrdering, PoisonedRefusesPublicationAndTriggersReRecov
     ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
     const NamespaceLifeId life = *store->refTableLifeForTest(ns);
     const String ckpt_key = store->layout().refCkptKey(life);
-    const RefTxnId candidate{store->writerEpoch(), 2};
-    const String next_snapshot_key = store->layout().refSnapshotKey(life, candidate);
+    /// The durable transaction the stale cache will be missing: `dropRef`'s removal, sequence 2.
+    const RefTxnId missing_durable_txn{store->writerEpoch(), 2};
+    const String next_snapshot_key = store->layout().refSnapshotKey(life, missing_durable_txn);
 
     /// Drive the very next mutation's OWN checkpoint-frontier CAS into persistent conflict: the log PUT
-    /// for `candidate` commits durably, but its checkpoint never advances within this call, and the lane
-    /// is left `NeedsRecovery` rather than installing an uncertain result.
+    /// for `missing_durable_txn` commits durably, but its checkpoint never advances within this call, and
+    /// the lane is left `NeedsRecovery` rather than installing an uncertain result -- so the cached view
+    /// still reflects `ref_1` present, while the durable log already reflects it removed.
     backend->armCasConflict(ckpt_key, 100);
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "ref_1"); });
     ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
@@ -348,7 +355,7 @@ TEST(CasRefSnapshotPublishOrdering, PoisonedRefusesPublicationAndTriggersReRecov
 
     EXPECT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns))
         << "recovery reconciles the durable gap and this table has never published a snapshot, so the "
-           "same call goes on to publish one -- see the LIMITATION note above the test";
+           "same call legitimately goes on to publish one -- see the invariant note above the test";
 
     /// Re-recovery WAS triggered as an observable state transition (not a silent skip): the lane left
     /// `NeedsRecovery`, and `recoveryInstallCountForTest` -- a counter of exact recovery-result
@@ -358,20 +365,31 @@ TEST(CasRefSnapshotPublishOrdering, PoisonedRefusesPublicationAndTriggersReRecov
     EXPECT_GT(store->recoveryInstallCountForTest(), recovery_installs_before)
         << "a re-recovery install must be observable, not indistinguishable from never having run";
 
-    /// The ordering invariant this poisoned-lane scenario actually supports: recovery's OWN checkpoint
-    /// catch-up CAS lands strictly before the snapshot-publish primitive's body PUT, which lands strictly
-    /// before the publish primitive's OWN checkpoint-advance CAS. No publish effect ever precedes or
-    /// substitutes for recovery's reconciliation.
+    /// ORDER, not a global zero: recovery's OWN checkpoint catch-up CAS is the boundary marker. NO
+    /// snapshot-publish effect (the new snapshot's body PUT, nor the publisher's own checkpoint-advance
+    /// CAS) may appear at or before it.
     const auto ckpt_cas_indices = backend->indicesFrom(OrderedFaultBackend::Op::Cas, ckpt_key, offset);
-    const auto body_index = backend->firstIndexFrom(OrderedFaultBackend::Op::Put, next_snapshot_key, offset);
+    const auto snap_put_indices = backend->indicesFrom(OrderedFaultBackend::Op::Put, next_snapshot_key, offset);
     ASSERT_GE(ckpt_cas_indices.size(), 2u)
         << "expected one checkpoint CAS from recovery's catch-up and one from the snapshot publisher";
-    ASSERT_TRUE(body_index.has_value());
-    EXPECT_LT(ckpt_cas_indices.front(), *body_index)
-        << "recovery's checkpoint catch-up must land before any snapshot-publish effect";
-    EXPECT_LT(*body_index, ckpt_cas_indices.back())
+    const size_t recovery_catchup_index = ckpt_cas_indices.front();
+    const size_t publisher_ckpt_index = ckpt_cas_indices.back();
+    ASSERT_FALSE(snap_put_indices.empty()) << "the recovered, uncovered candidate must have been published";
+    for (const size_t snap_put_index : snap_put_indices)
+        EXPECT_GT(snap_put_index, recovery_catchup_index)
+            << "no snapshot-publish body PUT may precede recovery's own checkpoint reconciliation";
+    EXPECT_LT(snap_put_indices.front(), publisher_ckpt_index)
         << "the snapshot publisher's own checkpoint CAS still runs after ITS OWN body PUT (INV-4), even "
            "immediately following recovery";
+
+    /// STRONGEST form: the published snapshot is not merely "some snapshot from whichever view" -- it
+    /// covers EXACTLY the recovered, previously-missing-from-cache frontier. Its id names the durable
+    /// removal transaction, and the recovered cache (which the snapshot was built from) no longer
+    /// resolves the removed ref.
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), std::make_optional(missing_durable_txn))
+        << "the published snapshot's frontier IS the durable transaction the stale cache was missing";
+    EXPECT_FALSE(store->resolveRef(ns, "ref_1").has_value())
+        << "the recovered (and now snapshotted) cache reflects the durable removal the stale view lacked";
 }
 
 /// ---------------------------------------------------------------------------------------------

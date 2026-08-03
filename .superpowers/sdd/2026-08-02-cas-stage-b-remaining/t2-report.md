@@ -6,23 +6,40 @@ New file: `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp`, suite
 `CasRefSnapshotPublishOrdering`, 5 tests (4 requested + 1 sensitivity-check test). No production code
 changed.
 
-## Deviation from the brief, disclosed up front
+## Vocabulary correction, and how test 3's scope was resolved
 
-The plan's sketch for test 3 (`PoisonedRefusesPublicationAndTriggersReRecovery`) asked to assert "zero
-body PUTs and zero `_ckpt` writes" when a publish is requested against a poisoned lane. I flagged this to
-the dispatcher before implementing (see message log) and, receiving no correction, proceeded on the
-documented alternative: `tryPublishSnapshotAndAdvanceCheckpointOnce` calls `ensureRefTableRecovered`
-unconditionally, and that function re-walks the durable stream whenever the lane is `NeedsRecovery`
-regardless of `recovered`. Every reachable way to reach `NeedsRecovery` (there is no `*ForTest` seam that
-installs it directly) leaves a real durable gap between the log and the checkpoint — that is what
-`NeedsRecovery` means — so the SAME call's re-recovery closes that gap with its own `_ckpt` CAS, and
-because the test's table had never published a snapshot at all, the same call then finds a real,
-uncovered candidate and successfully publishes one. Empirically confirmed (see the sensitivity-check
-mutation run below): the call returns `true`, not `false`. The test as written instead pins what IS true:
-recovery's own checkpoint catch-up CAS lands strictly before any snapshot-publish effect, and the
-snapshot publisher's own body PUT lands strictly before its own checkpoint CAS — i.e. recovery-then-publish
-is the only order this call can ever produce, never publish-around-a-still-poisoned-lane. The test name is
-kept as the brief specified; the doc comment above it explains the finding in full.
+`Poisoned` (the plan's name) is `RefLaneState::NeedsRecovery` (the code's name) — there is no state
+literally named `Poisoned` anywhere in `CasRefLedger`. This should be corrected in the plan's vocabulary
+for later tasks.
+
+I flagged a scope question before implementing test 3: the plan's sketch asked to assert "zero body PUTs
+and zero `_ckpt` writes" when a publish is requested against a poisoned lane, but
+`tryPublishSnapshotAndAdvanceCheckpointOnce` calls `ensureRefTableRecovered` unconditionally, and that
+function re-walks the durable stream whenever the lane is `NeedsRecovery` regardless of `recovered`. Every
+reachable way to reach `NeedsRecovery` (there is no `*ForTest` seam that installs it directly) leaves a
+real durable gap between the log and the checkpoint — that is what `NeedsRecovery` means — so the SAME
+call's re-recovery closes that gap with its own `_ckpt` CAS, and, because the test's table had never
+published a snapshot at all, the same call then finds a real, uncovered candidate and successfully
+publishes one (empirically confirmed: the call returns `true`, not `false`).
+
+The team lead's response confirmed the direction and sharpened the requirement to state the actual
+INVARIANT rather than a write count: a snapshot must never be published from an unrecovered cache — a
+durable transaction may be missing from the cached view, and advancing `_ckpt` onto a snapshot built from
+that stale view is the data-loss shape `NeedsRecovery` exists to prevent. Recovery issuing its own `_ckpt`
+catch-up write is not a violation of that invariant — it is the remedy. Recover-then-proceed is the
+correct, intended behavior, not a deviation from the brief.
+
+The test (renamed `NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication`, noting the equivalence to the
+plan's original `PoisonedRefusesPublicationAndTriggersReRecovery` in its doc comment) now asserts, per
+the sharpened directive:
+1. Recovery is triggered and observably completes (lane leaves `NeedsRecovery`; `recoveryInstallCountForTest`
+   advances) — never a silent skip.
+2. ORDER, not a global zero: no snapshot-publish effect (the new snapshot's body PUT, nor the publisher's
+   own checkpoint-advance CAS) appears in the journal at or before recovery's own checkpoint catch-up CAS.
+3. If a snapshot IS published (it is, here), it reflects the RECOVERED frontier in the strongest testable
+   form: `newestPublishedSnapshotIdForTest` equals the durable removal transaction the stale cache was
+   missing, and `resolveRef` on the removed ref now correctly returns absent — the published snapshot is
+   not "some snapshot from whichever view" but exactly the reconciled one.
 
 ## Per-test record
 
@@ -54,19 +71,27 @@ kept as the brief specified; the doc comment above it explains the finding in fu
      patch and failing output preserved: flipped the "adoption must NOT happen" `EXPECT_FALSE` to
      `EXPECT_TRUE`; it failed (`build/t2_sensitivity_1.log`, line 284); reverted, reconfirmed green.
 
-3. **`PoisonedRefusesPublicationAndTriggersReRecovery`** — see the deviation note above for the full
-   finding. Reaches `NeedsRecovery` the same way `gtest_cas_ref_writer.cpp`'s
+3. **`NeedsRecoveryLaneRecoversBeforeAnySnapshotPublication`** (plan's name:
+   `PoisonedRefusesPublicationAndTriggersReRecovery`) — see the vocabulary/scope section above for the
+   full finding and the sharpened invariant. Reaches `NeedsRecovery` the same way
+   `gtest_cas_ref_writer.cpp`'s
    `RefWriterAppendLane.CheckpointConflictAfterLogCommitRequiresRecoveryWithoutInstall` does (persistent
-   conflict on a mutation's own commit-time `_ckpt` CAS). Asserts: (a) the call succeeds (recovers, then
-   publishes); (b) the lane is `Ready` afterward and `recoveryInstallCountForTest` advanced (re-recovery
-   is observable, not a silent skip); (c) recovery's own checkpoint catch-up CAS index precedes the new
-   snapshot's body-PUT index, which precedes the publisher's own checkpoint-CAS index.
+   conflict on a mutation's own commit-time `_ckpt` CAS, via `dropRef`). Asserts: (a) the call succeeds
+   (recovers, then legitimately publishes); (b) the lane is `Ready` afterward and
+   `recoveryInstallCountForTest` advanced (re-recovery is observable, not a silent skip); (c) every
+   snapshot-body-PUT index is strictly after recovery's own checkpoint catch-up CAS index, which is
+   strictly before the publisher's own checkpoint-CAS index; (d) the published snapshot's id equals the
+   durable removal transaction the stale cache was missing, and a post-recovery `resolveRef` for the
+   removed ref correctly returns absent.
    - No genuine red-first run exists for this predicate — the plan itself anticipated this ("genuine
      red-first is likely impossible... a coverage pin with a sensitivity check"). It IS a coverage pin
-     with no prior test naming this ordering triple.
-   - Sensitivity: load-bearing mutation demonstration performed after implementation; mutation reverted;
-     patch and failing output preserved: changed the expected post-recovery lane state from `Ready` to
-     `NeedsRecovery`; it failed (`build/t2_sensitivity_1.log`, line 356); reverted, reconfirmed green.
+     with no prior test naming this ordering/frontier set.
+   - Sensitivity (two independent mutations, one combined build+run cycle, `build/t2_sensitivity_3.log`):
+     load-bearing mutation demonstration performed after implementation; mutation reverted; patch and
+     failing output preserved. (i) flipped the "no snapshot-publish body PUT may precede recovery's own
+     checkpoint reconciliation" `EXPECT_GT` to `EXPECT_LT` — failed at line 379; (ii) flipped the
+     post-recovery `resolveRef` "must be absent" `EXPECT_FALSE` to `EXPECT_TRUE` — failed at line 391.
+     Both reverted, reconfirmed green (`build/t2_run.log`).
 
 4. **`PublishBackoffDecisionsAreCharacterized`** — characterizes `admitSnapshotPublishUnderStateLock`,
    `advancePublishBackoff`, `resetPublishBackoff` through the public dispatch surface, using
@@ -115,10 +140,14 @@ identity), not direct return values of the private methods.
 ## Build logs
 
 `build/t2_build.log` (first attempt, failed on an unused-member-function `-Werror`), `build/t2_build2.log`
-through `build/t2_build4.log` (iterative fixes), `build/t2_build_final.log` (final, after mutation
-revert), `build_asan/t2_build.log`.
+through `build/t2_build6.log` (iterative fixes, including the test-3 rework after the team lead's
+sharpening), `build/t2_build_final2.log` (final, after the last mutation revert), `build_asan/t2_build.log`
+(final ASan rebuild).
 
-## Commit
+## Commits
 
-One commit: new test file only (report and this file added via `git add -f` where needed — the report
-lives under `.superpowers/sdd/`, already tracked as a project directory).
+Two commits on `cas-gc-rebuild`:
+- `404b6ecbe3a` — initial landing (4 tests + 1 sensitivity test, new file + report).
+- follow-up commit reworking test 3 per the team lead's sharpened directive (invariant-based assertions,
+  rename, vocabulary correction recorded in this report and in the test's doc comment) plus this report
+  update.
