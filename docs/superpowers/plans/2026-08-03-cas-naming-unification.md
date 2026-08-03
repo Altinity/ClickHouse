@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **NEVER touch compare-and-swap identifiers.** These contain `Cas`/`cas` meaning *compare-and-swap*, not the feature, and MUST NOT be renamed: `casPut`, `CasOutcome`, `CasResult`, `CasOp::Cas`, `CasOp::CasConflict`, `GcMaintenanceCasOutcome`, `GcMaintenanceCasResult`, `casGcMaintenanceState`, `kMaxCatalogCasAttempts`, `cas_result`, and the whole `CasRequestControl.h` family (`CasWriteOutcome`, `CasUnresolvedReason`, `CasRequestBudget`, `CasRequestController`, `CasCreateOutcome`, `CasCreateResult`, `CasOverwriteOutcome`, `CasOverwriteResult`, `throwCasWriteRetryLater`, `throwCasTransientUnavailable`, `classifyConditionalWriteResult`, `recordConditionalWriteOutcome`, `validateCasRequestBudget`, `cas_request_budget`).
-- **Internal C++ identifiers stay.** Do not rename: namespace `DB::Cas`, production classes (`CasPool`, `CasGc`, `CasLayout`, `CasMountRuntime`, `ContentAddressedLog`, `StorageSystemContentAddressedMounts`, …), source file names (`ContentAddressedLog.cpp`, `gtest_cas_*.cpp`, …), the AST field `content_addressed_gc_rebuild_force`, the string key `"cas_owner"` (already canonical).
+- **Internal C++ identifiers stay.** Do not rename: namespace `DB::Cas`, production classes (`CasPool`, `CasGc`, `CasLayout`, `CasMountRuntime`, `ContentAddressedLog`, `StorageSystemContentAddressedMounts`, …), source file names (`ContentAddressedLog.cpp`, `gtest_cas_*.cpp`, …), the string key `"cas_owner"` (already canonical). Exception: the AST field `content_addressed_gc_rebuild_force` → `cas_gc_rebuild_force` (Task 2) — it sits next to the renamed enum constants and would otherwise be a permanent gate exclusion.
 - **Replication wire protocol IS renamed** (user decision 2026-08-03): the `DataPartsExchange.cpp` HTTP parameter/cookie literals become `cas_pool_uuid`, `cas_relink`, `cas_confirm`, `cas_source_token`, `cas_confirm_answer` (Task 3), and the integration test assertions follow (Task 6). No compatibility fallback — a mixed-build cluster silently degrades CAS fetches to full copies, so soak clusters must run a single build after this lands. The C++ constant names (`CA_POOL_UUID_PARAM`, …) stay.
 - **`docs/superpowers/**` is out of scope** (internal artifacts). So are `utils/ca-soak` / `utils/cas-gate` *directory names* (contents ARE updated where they reference renamed user-facing names). Untracked run debris (`*.stdout`, `*.stderr`, `_instances-gw*/`, `ci/tmp/`, `logs_archive/`) is ignored.
 - **Per-disk CAS settings stay unprefixed** (`scratch_path`, `gc_enabled`, `server_root_id`, … in `ContentAddressedSettings.cpp`) — they are scoped by the disk block by design.
@@ -140,6 +140,10 @@ git ls-files 'src/*.cpp' 'src/*.h' | xargs grep -l 'CONTENT_ADDRESSED_' \
   | xargs sed -i 's/\bCONTENT_ADDRESSED_\(GC_RUN\|GC_REBUILD\|DROP_POOL_MEMBER\|FSCK\|FORGET\|GC_STOP\|GC_START\)\b/CAS_\1/g'
 git ls-files 'src/*.cpp' 'src/*.h' | xargs grep -l 'SYSTEM_CONTENT_ADDRESSED_' \
   | xargs sed -i 's/\bSYSTEM_CONTENT_ADDRESSED_/SYSTEM_CAS_/g'
+# the AST field holding the FORCE modifier follows the enum rename (4 uses: ASTSystemQuery.h:189,
+# ASTSystemQuery.cpp:269, ParserSystemQuery.cpp:484, InterpreterSystemQuery.cpp:1036):
+git ls-files 'src/*.cpp' 'src/*.h' | xargs grep -l 'content_addressed_gc_rebuild_force' \
+  | xargs sed -i 's/\bcontent_addressed_gc_rebuild_force\b/cas_gc_rebuild_force/g'
 ```
 Then fix `src/Access/Common/AccessType.h:351-357` alias strings by hand: each row becomes e.g. `M(SYSTEM_CAS_GC_RUN, "SYSTEM CAS GC RUN", GLOBAL, SYSTEM)`. Do NOT keep old aliases (branch unreleased, spec says no back-compat).
 
@@ -235,7 +239,7 @@ In `src/Storages/MergeTree/DataPartsExchange.cpp:117-141` change the five string
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
 git ls-files 'src/*' 'programs/*' | xargs grep -n 'content_addressed' \
-  | grep -vE 'ContentAddressed|content_addressed_gc_rebuild_force'
+  | grep -vE 'ContentAddressed'
 # expect: no output (only the allowed internal identifiers remain)
 ninja -C build clickhouse unit_tests_dbms 2>&1 | tail -5
 ./build/src/unit_tests_dbms --gtest_filter='Cas*' --gtest_brief=1 2>&1 | tail -5
