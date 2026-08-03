@@ -60,9 +60,9 @@ def test_a_clean_read_still_works():
 
 
 def test_it_takes_the_peak_across_nodes():
-    hot = dict(_all_zero(), CasRefApplyPoisoned=3)
+    hot = dict(_all_zero(), CASRefNeedsRecovery=3)
     cl = _Cluster(_Node("n1", _all_zero()), _Node("n2", hot))
-    assert _violation_counters(cl, _VIOLATION_EVENTS)["CasRefApplyPoisoned"] == 3
+    assert _violation_counters(cl, _VIOLATION_EVENTS)["CASRefNeedsRecovery"] == 3
 
 
 def test_total_probe_failure_raises_instead_of_reporting_zeros():

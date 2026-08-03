@@ -6,8 +6,8 @@ window: a ref-log transaction whose PUT has already succeeded, where the in-memo
 throws. That window leaves the writer cache MISSING a durable transaction — a data-loss class,
 because a snapshot published from a poisoned cache can hide the transaction permanently (design
 `docs/superpowers/specs/2026-07-23-cas-fetch-handoff-publish-confirm-design.md`
-§[Problem 2](#problem-ledger)). §A1 made the three install regions allocation-free, and §A2's poison
-state machine (`RefApplyState`, `ProfileEvents::CasRefApplyPoisoned`) is what must catch anything
+§[Problem 2](#problem-ledger)). §A1 made the three install regions allocation-free, and §A2's lane
+state machine (`RefLaneState`, `ProfileEvents::CASRefNeedsRecovery`) is what must catch anything
 that still slips through.
 
 Legs (leg B is deliberately ABSENT — see below):
@@ -41,11 +41,11 @@ delta) is `inconclusive`. Only the WINDOW-SPECIFIC targeting was dropped as a ga
 
 **The targeted signal is reported, not gating.**
 
-  targeted = CasRefApplyPoisoned transitions + post-PUT apply failpoint hits
+  targeted = CASRefNeedsRecovery transitions + post-PUT apply failpoint hits
 
 is structurally 0 today: the §A1 seam is the gtest-only `CasRefLedger::setInstallRegionProbeForTest`
-with no `src/Common/FailPoint.cpp` registration, and `CasRefApplyPoisoned` is correctly 0 while §A1
-holds. The card records it and says so. If poison ever DOES fire, the `CasRefApplyPoisoned == 0`
+with no `src/Common/FailPoint.cpp` registration, and `CASRefNeedsRecovery` is correctly 0 while §A1
+holds. The card records it and says so. If poison ever DOES fire, the `CASRefNeedsRecovery == 0`
 verdict is a real `check` and the run fails — that half is unchanged.
 
 **Oracle (queries ARE allowed to fail; invariants are not):** zero `LOGICAL_ERROR`/abort; every ACKED
@@ -71,22 +71,22 @@ from . import _common
 _TABLE = "s42_alloc"
 
 # Events read straight from `system.events`: the shared `observe.events_snapshot` filter keeps only
-# `Cas*`/`DiskS3*`/`S3*`, and the generic-vs-targeted distinction this card is built on needs
+# `CAS*`/`DiskS3*`/`S3*`, and the generic-vs-targeted distinction this card is built on needs
 # `QueryMemoryLimitExceeded` (the injected-fault counter) next to the CAS ones.
 _EVENTS_OF_INTEREST = (
-    "CasRefApplyPoisoned",            # TARGETED: Clean/ApplyPending -> Poisoned transitions
+    "CASRefNeedsRecovery",            # TARGETED: transitions into `RefLaneState::NeedsRecovery`
     "QueryMemoryLimitExceeded",       # generic: every injected allocation fault that threw
     "CASRefAppendWedged", "CASRefAppendUnwedged", "CASRefAppendDefiniteFailure",
     "CASRefBatchFlushes", "CASRefBatchedMutations",
     "CASRefSnapshotPublishDispatched", "CASRefSnapshotPublishBackoff",
-    "CasRefRecoverySealPublished",
+    "CASRefRecoveryEpochSealed",
     "CASGcUnmatchedRemoveDeltas",     # reported only, never gating (benign rate uncharacterised)
 )
 
-# The poison marker's log line (`CasRefLedger::poisonApplyState`). Corroboration only: the LOG_ERROR
+# The transition's log line (`CasRefLedger::requireRecovery`). Corroboration only: the LOG_ERROR
 # allocates and is wrapped in a swallow-everything catch precisely because it may fail under memory
 # pressure, so the ProfileEvent — incremented BEFORE it — is the authoritative transition count.
-_POISON_LOG_NEEDLE = "is POISONED at"
+_POISON_LOG_NEEDLE = "NEEDS RECOVERY at"
 
 
 def _events(node) -> dict:
@@ -458,14 +458,14 @@ class S42(Scenario):
         result.observations["events_after_restart_absolute"] = ev_post
         # `system.events` is per-process, so the restart resets it: the armed-window delta and the
         # post-restart absolutes are two disjoint measurements, summed rather than differenced.
-        poison_armed = int(armed_delta.get("CasRefApplyPoisoned", 0))
-        poison_post = _event_total(ev_post, "CasRefApplyPoisoned")
+        poison_armed = int(armed_delta.get("CASRefNeedsRecovery", 0))
+        poison_post = _event_total(ev_post, "CASRefNeedsRecovery")
         poison_total = poison_armed + poison_post
         poison_log_lines = _text_log_count(node, since, _POISON_LOG_NEEDLE)
         failpoint_hits, failpoint_why = _post_put_failpoint_hits()
 
         result.add(Verdict.check(
-            "CasRefApplyPoisoned == 0 (no durable transaction lost from a writer cache)",
+            "CASRefNeedsRecovery == 0 (no durable transaction lost from a writer cache)",
             "0 poison transitions",
             f"armed_window={poison_armed} post_restart={poison_post} log_lines={poison_log_lines}",
             poison_total == 0,
@@ -503,7 +503,7 @@ class S42(Scenario):
         if targeted == 0:
             result.add(Verdict.reported(
                 "post-durable install window traversal (reported, not gating)",
-                "> 0 targeted signals (CasRefApplyPoisoned transitions or post-PUT failpoint hits)",
+                "> 0 targeted signals (CASRefNeedsRecovery transitions or post-PUT failpoint hits)",
                 f"targeted=0 with {generic} generic allocation failures",
                 f"the window was NOT proven traversed: a nonzero MEMORY_LIMIT_EXCEEDED count proves "
                 f"only that SOME allocation failed, never that the few-instruction post-durable "
@@ -514,7 +514,7 @@ class S42(Scenario):
         else:
             result.add(Verdict.reported(
                 "post-durable install window traversal (reported, not gating)",
-                "> 0 targeted signals (CasRefApplyPoisoned transitions or post-PUT failpoint hits)",
+                "> 0 targeted signals (CASRefNeedsRecovery transitions or post-PUT failpoint hits)",
                 f"targeted={targeted} (poison={poison_total}, failpoint={failpoint_hits})",
                 "the window WAS reached — the poison verdict above is a conclusive statement about "
                 "§A1 for this run, not a vacuous zero"))

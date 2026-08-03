@@ -92,7 +92,7 @@ LATE_PUT_EVIDENCE_NOTES = (
 # each is a distinct way the invariant could break: a durable transaction missing from a writer's
 # view, a fold cursor advanced past work, a stream that is no longer dense.
 LATE_PUT_VIOLATION_NOTES = (
-    ("CasRefApplyPoisoned",
+    ("CASRefNeedsRecovery",
      "A ref table whose cached state may be MISSING a durable transaction — an install failed while "
      "its ref-log object may already be durable. The LOSS half of the invariant: acknowledged work "
      "that the writer's own view no longer contains."),

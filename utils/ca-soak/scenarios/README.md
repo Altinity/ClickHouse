@@ -505,17 +505,17 @@ Workload:
 
 Observations:
 
-- `CasRefApplyPoisoned`, `QueryMemoryLimitExceeded`, `CASRefAppendWedged`/`CASRefAppendUnwedged`/
+- `CASRefNeedsRecovery`, `QueryMemoryLimitExceeded`, `CASRefAppendWedged`/`CASRefAppendUnwedged`/
   `CASRefAppendDefiniteFailure`, `CASGcUnmatchedRemoveDeltas` (reported, never gating),
   `fsck` `stale_edge`/`unaccounted`, acked-vs-lost blocks, max query duration.
 
 Expected:
 
-- Zero `LOGICAL_ERROR`, zero `CasRefApplyPoisoned`, every acked insert present, replicas agree,
+- Zero `LOGICAL_ERROR`, zero `CASRefNeedsRecovery`, every acked insert present, replicas agree,
   `fsck` `dangling=0`/`unaccounted=0`/`stale_edge=0` in detail mode, `GC`
   rounds succeed after disarm, no permanently wedged ref lane, no query hung past its bound.
 - Soundness guard: the run is `inconclusive` unless a TARGETED signal is nonzero (a
-  `CasRefApplyPoisoned` transition or a post-PUT apply failpoint hit). A nonzero
+  `CASRefNeedsRecovery` transition or a post-PUT apply failpoint hit). A nonzero
   `MEMORY_LIMIT_EXCEEDED` count is NOT such a signal. Because the only post-durable-install seam
   today is the gtest-only `setInstallRegionProbeForTest` hook and §A1 made the region
   allocation-free, this card currently returns either `inconclusive` (window traversal unproven) or

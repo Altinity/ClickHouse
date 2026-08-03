@@ -362,7 +362,7 @@ def test_the_late_put_losing_is_evidence_not_a_violation():
     fenced a hundred stragglers is a run that tested the invariant, not one that broke it."""
     f = LatePutFencing()
     assert f.observe("n1", {"CASRefRecoveryEpochSealed": 4, "CASRefAppendSealRejected": 100,
-                            "CASRefRecoveryStragglerAdopted": 2, "CasRefApplyPoisoned": 0,
+                            "CASRefRecoveryStragglerAdopted": 2, "CASRefNeedsRecovery": 0,
                             "CASGcUnappliedFoldedTxns": 0, "CASRefRecoveryStreamHole": 0}) == []
     assert f.exercised
     assert f.evidence_peak["CASRefAppendSealRejected"] == 100
@@ -382,12 +382,12 @@ def test_each_violation_counter_is_reported_by_name():
 def test_an_inherited_counter_is_not_charged_to_this_run():
     """Soak stands reuse containers. The counters are cumulative per process, so a value carried in
     from an earlier run would otherwise red this one before it did anything."""
-    baseline = {"n1": {"CasRefApplyPoisoned": 7}}
-    assert check_late_put_fencing({"CasRefApplyPoisoned": 7}, baseline=baseline["n1"]) == []
+    baseline = {"n1": {"CASRefNeedsRecovery": 7}}
+    assert check_late_put_fencing({"CASRefNeedsRecovery": 7}, baseline=baseline["n1"]) == []
     f = LatePutFencing(baseline)
-    assert f.observe("n1", {"CasRefApplyPoisoned": 7}) == []
-    found = f.observe("n1", {"CasRefApplyPoisoned": 8})
-    assert len(found) == 1 and "CasRefApplyPoisoned=1" in found[0]
+    assert f.observe("n1", {"CASRefNeedsRecovery": 7}) == []
+    found = f.observe("n1", {"CASRefNeedsRecovery": 8})
+    assert len(found) == 1 and "CASRefNeedsRecovery=1" in found[0]
 
 
 def test_a_run_that_never_sealed_an_epoch_says_so_rather_than_passing():
