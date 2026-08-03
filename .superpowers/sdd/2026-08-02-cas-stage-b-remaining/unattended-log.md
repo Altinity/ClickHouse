@@ -693,3 +693,59 @@ dispatched (lane-g, no pushes, fix prepared locally per standing order). Rest of
 - ci-rca: freshly dispatched on the PR-2073 sanitizer unit-test pair; no output yet (artifact fetch
   phase). lane-g clean.
 - CI PR 2073: unchanged since :11 tick (the two unit-test lane fails; rest green/queued).
+
+### CI RCA {#ci-rca-unit-sans}
+Both failures are the SAME class of bug, not two distinct ones, and neither is a sanitizer-detected
+defect: a test doing CPU-bound encode work against a real-wall-clock deadline, which a slow enough
+sanitizer build can outrun regardless of how wide the deadline is set.
+
+`CASRefCheckpointJoin.EncodedCkptSizeIsIndependentOfCardinality` (asan_ubsan 33.3s, tsan 35.0s,
+msan 68.3s) threw a `mount fence tripped` exception from ordinary product code
+(`CasMountRuntime::checkFenceOrThrow`) mid-test: it commits `MANY_REFS`=2000 ref ops through ONE
+`appendRefOps` call, against a pool opened with the default 30000 ms `mount_lease_ttl_ms` — measured
+against the REAL wall clock (`openPool` in `gtest_cas_ref_ckpt_join.cpp` passed no `boot_ms_fn`) —
+and the encode step alone took long enough under msan/tsan/asan+ubsan combined instrumentation to
+cross that deadline before the transaction finished.
+
+`CASRefWriterStalePrecommitSweep.BoundedBatchesAndInterruptionResumeAcrossMounts` (asan_ubsan 135.9s,
+tsan 117.2s, msan 232.1s) failed `EXPECT_TRUE(successor->refLaneWedgedForTest(ns))` (Actual: false) at
+`gtest_cas_ref_writer.cpp:3199`. This exact signature was already fixed once in `8f9e63c7a19`
+(widened `operation_deadline_ms` from 100 ms to `kSingleAttemptDeadlineMs`=5000 ms after it failed
+5/6 sanitizer-lane runs pre-fix) — the CI report referenced in that commit is from an EARLIER PR-2073
+round (`sha=834c9517f5...`), so this is a recurrence, not the same failure re-surfacing unfixed. The
+5000 ms budget is still measured against the real wall clock around encoding the removal chunk (up
+to `ref_txn_max_ops`=5000 ops), and msan's own overhead pushed the whole test to 232 s this round —
+wide enough that the fixed constant alone stopped being reliable headroom on the slowest lane.
+
+Root cause for both, traced through production code rather than assumed: `PoolConfig::boot_ms_fn`
+already feeds BOTH clocks that matter here — `CasMountRuntime::bootMsNow()` (the mount fence) directly,
+and `CasRequestController::now_ms` indirectly via `CasRefLedger`'s `controller_boot_ms_fn` constructor
+argument, which `CasPool.cpp` wires straight from `config.boot_ms_fn`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:186-199`). Neither
+failing test used that seam; a THIRD pool later in the very same writer test (the `resumer`) already
+does, with a comment crediting it as the deliberate alternative to widening a deadline ("must be
+driven deterministically with a frozen clock ... never by racing the wall clock").
+
+Fix (test-only, committed on `laneg/ci-fix-unit-sans` at `023396e0fc2`, NOT pushed): freeze
+`boot_ms_fn` for the pool doing the CPU-bound work in both tests, instead of widening the deadline
+again. `gtest_cas_ref_ckpt_join.cpp`'s `openPool` gained an optional `boot_ms_fn` parameter (default
+empty = real clock, so every other call site in that file is unaffected — there is currently only
+one other caller); the failing test now opens its pool with a frozen clock. The writer test's
+`successor` pool gained `config.boot_ms_fn = [] { return uint64_t{0}; };` alongside its existing
+budget config. This removes the race rather than giving it more room, matching the codebase's own
+stated preference.
+
+Verification: NOT build-verified end-to-end. The shared dev box was at 63 GB free disk (existing full
+sanitizer builds run 43-51 GB each) and near swap exhaustion (7.9/8.0 GiB used) at RCA time, so no
+fresh build of `unit_tests_dbms` was attempted — starting one risked the box for every other agent's
+concurrent build. Instead: (1) traced the exact wiring cited above by reading the source, confirming
+`config.boot_ms_fn` is the right and only seam needed; (2) `clang++ -fsyntax-only` against both edited
+files using `build_debug`'s recorded compile flags (src/base include paths redirected to the lane-g-ci-fix
+tree, contrib left pointed at master's checked-out submodules since the diff never touches them) —
+both files parse and type-check clean, exit 0. This is real evidence the edit compiles; it is not
+evidence the tests pass — that still wants a real sanitizer run, ideally the next PR-2073 CI round or
+a build on a box with headroom.
+
+Per-test classification: (c) build-shape/timing assumption broken under sanitizer instrumentation —
+same class as `8f9e63c7a19`, not (a) a real CAS bug, not (b) a CI-infra assumption unrelated to the
+product, not (d) flake (3-for-3 deterministic on the failing commit rules that out).
