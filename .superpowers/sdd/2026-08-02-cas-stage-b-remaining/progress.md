@@ -90,10 +90,15 @@ per commit; full CA gate at lane closures.
   corrected enumeration + NEW T6→T8 carry (post-flip healthy rounds also show ZERO
   no-usable-checkpoint anomalies); three dead frontier-walk arms placed with T6 Step 1.
 - T6 (destruction enablement): BLOCKED on T1 + T5 + T6a verdict. MAIN.
-- T7 (model lane): IN PROGRESS on LANE-G (laneg/t7). A1 COMMITTED `a19066a7893` — verdict:
-  `listedTok` skip premise RETIRED (model/configs reworked). A2 ninth-family battery running
-  (nohup; runner rewrite taken from MAIN's preserved uncommitted copy with controller approval).
-  Lane B (10c) not started.
+- T7 (model lane): **COMPLETE**. Lane B: aab2a21d699 + e1599389f93 (10c runners pinned/recorded;
+  10f disclosure; shared temporal-smoke regex hardened). Lane A: integrated as afed91f65d2 (A1:
+  listedTok RETIRED, 4 configs removed) + e05a62a7b17 (A2: ninth battery — 42/44 immediate, live
+  GREEN@extended-bound reproducing historical counts, stage5_lazytrim UNPROVEN-BY-TIMEOUT).
+  Review APPROVE-WITH-NONBLOCKING (t7-laneA-review.md; retirement argument verified stronger than
+  stated; no coverage dropped). TWO NAMED MODEL DEBTS carried to T8 residual row: Phase-4
+  sharding-arm KNOWN (UnchangedCompositeVars) + stage5_lazytrim UNPROVEN-BY-TIMEOUT (4h, 233M
+  distinct states). MAIN's uncommitted runner copy reconciled (checkout --, equivalence verified
+  by the review).
 - T8 (Stage B gates): early pieces may start anytime; battery/soaks BLOCKED on T1–T7. MAIN.
 - T9 (perf research): BLOCKED on T8. Stage B is COMPLETE only when T9's commit lands; T8 issues
   the technical verdict.
