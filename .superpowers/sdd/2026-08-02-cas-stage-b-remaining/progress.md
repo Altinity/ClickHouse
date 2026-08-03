@@ -92,7 +92,13 @@ per commit; full CA gate at lane closures.
   settlement ordering pinned (already correct). T4 debts placed in T8 residual row: TEST-1
   (real-round applied-byte-stability needs a seam). Gate-tooling defects found by the review
   fixed by controller (runner: parameterized-name log path; SUITE_TIMEOUT).
-- T5 (probe A deletion): NOT STARTED. MAIN after T3 integration.
+- T5 (probe A deletion): **COMPLETE** (draft pick 5b775616c36 + closure 857b5af19f2 + review
+  follow-ups 6c9dd39c1e0). Exact −3/0 delta proven by direct pre/post measurement; enumeration
+  anchor real (1 stream-LIST/round × 5 rounds, janitor page counted separately); phase numbering
+  consistent across 4 surfaces; review APPROVE-WITH-NONBLOCKING (t5-review.md). C1 fixed: the
+  soak DETECTOR_METRICS phase key was dead (fold_ref_list vs emitted fold_ref_group) — 290/290
+  pytest after fix. USER DIRECTIVE added to plan: post-final-tidy → parallel codex review + 20m
+  plain chaos soak.
 - T6a: **COMPLETE** — verdict BENIGN-TRANSIENT, structurally closed by `357cf7b963f`; commit
   `477fe702a7a` (laneg/t6a) integrated as `096b3611988`; review APPROVE-WITH-NONBLOCKING with the
   corrected enumeration + NEW T6→T8 carry (post-flip healthy rounds also show ZERO
