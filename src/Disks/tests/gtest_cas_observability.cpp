@@ -267,7 +267,7 @@ TEST(CASObservability, CaInspectDecodesRefSnapshotToJson)
     const String json = caInspectToJson(
         layout, key, encodeRefTableSnapshot(snap), DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_snapshot")"), String::npos) << json;
-    EXPECT_NE(json.find(R"("ns":"srv/tbl@cas@")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("namespace":"srv/tbl@cas@")"), String::npos) << json;
     EXPECT_NE(json.find(R"("snapshot_id":{"writer_epoch":1,"ref_sequence":7})"), String::npos) << json;
     EXPECT_NE(json.find(R"("ref_name":"all_0_0_0")"), String::npos) << json;
     EXPECT_NE(json.find(R"("precommits":[])"), String::npos) << json;

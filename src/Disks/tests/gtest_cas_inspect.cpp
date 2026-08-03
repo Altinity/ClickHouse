@@ -174,7 +174,7 @@ TEST(CASInspect, RendersRefCkptWithEveryFieldPresent)
         DB::Cas::tests::fixture::fixtureLife(ns));
     EXPECT_NE(json.find(R"("object":"ref_ckpt")"), String::npos) << json;
     /// The namespace comes from the KEY: a `_ckpt` body does not name it.
-    EXPECT_NE(json.find(R"("ns":"srv1/db/tbl")"), String::npos) << json;
+    EXPECT_NE(json.find(R"("namespace":"srv1/db/tbl")"), String::npos) << json;
     EXPECT_NE(json.find(R"("life_epoch":7)"), String::npos) << json;
     EXPECT_NE(json.find(R"("committed_through":{"writer_epoch":7,"ref_sequence":9})"), String::npos) << json;
     EXPECT_NE(json.find(R"("writer_epoch":7,"ref_sequence":9)"), String::npos) << json;
