@@ -7,6 +7,8 @@ cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 MODULE=CaB140DangleMerge
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
 
 # These configs intentionally use the historical `m_*.cfg` names, not `<Model>_*.cfg`.
 # Enumerate them explicitly: a conventional model-prefixed glob silently misses this whole proof.

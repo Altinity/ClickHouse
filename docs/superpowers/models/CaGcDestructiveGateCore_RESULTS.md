@@ -196,6 +196,14 @@ ordering, stale-leader race, conclusive resolution, and all-row rescan are
 consumed from `CaRefPreFoldDrainCore` and
 `CaRefPreFoldDrainAllRowsCore`, rather than duplicated here.
 
+`UniverseAuthoritative` is pinned `TRUE` throughout this model: it gates only the post-flip
+posture, where the catalog is trusted as the complete namespace universe. Coverage of the
+opposite posture — where the universe is not yet knowable and every round must suppress
+destruction regardless of the other three gate conjuncts — is the production default today and is
+asserted directly in C++ by
+`CasGcFrontierGate.HiddenPlusOneInAnUnknownNamespaceIsRefusedByTheProductionDefault`, not modelled
+here.
+
 ## Verdict {#verdict}
 
 All 13 expected rows passed under a smoke-capable pinned TLC jar. The four

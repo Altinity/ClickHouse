@@ -52,6 +52,10 @@ ASSUME
     /\ SabotageGateAcceptsEmptyUniverse \in BOOLEAN
     /\ SabotageLifecycleUsesGlobalSuppression \in BOOLEAN
 
+\* Pinned TRUE: this model gates only the POST-FLIP posture, where the catalog is trusted as
+\* the complete namespace universe. The opposite posture (universe not yet knowable, so every
+\* round suppresses destruction outright) is production's current default and is covered by a
+\* dedicated C++ test rather than by varying this constant.
 UniverseAuthoritative == TRUE
 
 FrontierComplete ==

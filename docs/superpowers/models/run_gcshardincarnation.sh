@@ -7,6 +7,8 @@ cd "$(dirname "$0")"
 JAR=../../../tmp/tla2tools.jar
 MODULE=CaGcShardIncarnationCore
 [[ -f "$JAR" ]] || { echo "jar not found: $JAR" >&2; exit 3; }
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
 
 # Sabotages run first; each must break the invariant that its removed coordinate protects.
 # name                     expectation  expected-invariant

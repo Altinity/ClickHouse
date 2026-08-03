@@ -481,10 +481,13 @@ expectations for those configs currently live in the shell loops of
 [`cas/06-tla-models.md` § Running the models](../cas/06-tla-models.md#running-models); after this
 round's sweep none of them gates a sabotage on a bare nonzero exit code any more, but the surviving
 loops assert nothing at all (expectations live in comments only) — that doc is where the work starts.
-Three further models have no runner at all (`CaGcLeaseCore`, `CaGcRoundDeferCore`,
-`CaGcShardIncarnationCore`) plus `CaB140DangleMerge`, whose four configs use an `m_*.cfg` prefix
-instead of the usual `<Model>_*.cfg` one (so a conventional glob misses them). Recorded as the
-follow-up, not silently skipped.
+`CaGcLeaseCore`, `CaGcRoundDeferCore`, `CaGcShardIncarnationCore`, and `CaB140DangleMerge` (whose
+four configs use an `m_*.cfg` prefix instead of the usual `<Model>_*.cfg` one, so a conventional
+glob misses them) now have their own asserted whole-suite runners
+(`run_gclease.sh`, `run_gcrounddefer.sh`, `run_gcshardincarnation.sh`, `run_b140danglemerge.sh`),
+each pinned to the official checker via `check_tlc_pin`. Their results are recorded in
+`CaGcLeaseCore_RESULTS.md`, `CaGcRoundDeferCore_RESULTS.md`, `CaGcShardIncarnationCore_RESULTS.md`,
+and `CaB140DangleMerge_RESULTS.md` respectively.
 
 #### First whole-suite conversion: condemn-marker gate {#condemn-marker-whole-suite}
 

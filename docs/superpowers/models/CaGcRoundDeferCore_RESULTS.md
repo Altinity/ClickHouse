@@ -90,3 +90,30 @@ permanently skipped — the exact leak class the bound exists to prevent.
   TLC can exhibit the liveness lasso.
 - **Ref removal via `unfolded` (not immediate)** unlike `CaGcAckFloorCore`; here the deferred-delta
   timing is the subject under test, so removals are carried through the same defer/fold pipeline.
+
+## 2026-08-03 — runner-suite run {#2026-08-03-runner-suite-run}
+
+`run_gcrounddefer.sh` re-run whole-suite, checker: TLC `2026.07.18.145032` (rev `30cc360`), SHA-256
+`cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`, `-workers 1`.
+
+| Config | Expect | Result | Seconds | States generated / distinct |
+| --- | --- | --- | ---: | ---: |
+| `sab_graduate_on_stale` | violation | `NoOverDelete` violated | 0 | 6,394 / 2,102 |
+| `sab_unbounded_defer` | temporal | `EventuallyFolded` violated | 1 | 402 / 102 |
+| `stage1` | green | green | 0 | 31,041 / 8,445 |
+| `witness_deferthenfold` | violation | `W_DeferThenFold` violated | 1 | 159 / 65 |
+
+`stage1`'s green count (31,041 / 8,445) is identical to the original run above — BFS explores the
+full reachable space regardless of search order. The two sabotage counterexamples' counts differ
+from the original run because each seeds a fresh random exploration order and BFS reports the
+first-found (not the shortest overall) counterexample; the violated property/invariant name is the
+stable fact.
+
+This run surfaced a genuine classifier bug: the pinned official jar prints
+`Temporal property EventuallyFolded was violated.` (naming the one declared `PROPERTY`) where the
+runner's classifier only recognized the generic `Temporal properties were violated.` — the form
+every other recorded `tmp/tlc_*.log` in this tree used, because those were produced by the older,
+no-longer-accepted TLC 2.19 jar. Under the pinned jar the row misclassified as `error` on first
+run; widening the classifier's pattern to accept both the generic and the named-property form
+(`run_gcrounddefer.sh`) fixed it, and the row now resolves to its declared `temporal` expectation.
+Reproduction: `docs/superpowers/models/run_gcrounddefer.sh`.

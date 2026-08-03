@@ -100,13 +100,13 @@ of `CaGcRootLocalPartManifestCore`.
 |---|---|---|---|
 | `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
 | `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | `run_buildrootprecommit.sh` |
-| `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | (inline TLC) |
+| `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | `run_gclease.sh` |
 | `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim, and the v9 recovery-generation layer (a generation captured at admission and rechecked post-I/O before every publication; a successor's `EpochSeal` as a conclusive rejection; the acked-then-lost byte comparison) | CURRENT (v9 extension 2026-07-28; gates the ref-chain implementation's `slot-occupy` / `_ckpt` / install changes) | `run_mount.sh` |
 | `CaGcRootLocalPartManifestCore.tla` | root-local part-manifest GC: fold, manifest cleanup, orphan sweep, attempt scoping | CURRENT (partial: fence/recheck phases superseded by the ack-floor round) | `run_gc_partmanifest.sh` |
 | `CaGcAckFloorCore.tla` | one-pass GC round, clamp suppression, disaster-recovery rebuild | MIXED: graduation gate (writer-ack floor) superseded by round-only pacing; `GRebuild` + clamp-suppression still match | `run_ackfloor.sh` |
 | `CaGcAckFloorZombie.tla` | two-leader `delete_pending` two-phase graduation | CURRENT (partial: same caveat) | `run_ackfloor_zombie.sh` |
-| `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | (inline TLC) |
-| `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
+| `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | `run_gcshardincarnation.sh` |
+| `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | `run_gcrounddefer.sh` |
 | `CaGcDestructiveGateCore.tla` | authoritative non-empty frontier plus anomaly/hold physical gate; proved lifecycle erasure remains independent | CURRENT | `run_destructive_gate.sh` |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT for order + K1; K3Head/K3AdoptCheck drifted (tokenless leaf now manifest-trusted) | `run_ebo.sh` |
@@ -125,7 +125,7 @@ of `CaGcRootLocalPartManifestCore`.
 | `CaRelinkConfirmCore.tla` | publish-then-confirm relink: gate 1 (exact-`ManifestRef` equality, lane quiescence, poison, mount fence) and the publish-before-confirm order, each proven load-bearing — **plus the finding that the theorem is violable independently of the protocol under an honest fold cursor** | CURRENT (gates unlanded Part B; `_main` is CONDITIONAL on `LIST` completeness) | `run_relinkconfirm.sh` |
 | `CaErasureProof.tla` | rev.7 natural `Vanished(erased)` proof soundness: writer paths closed by op-gate + guard counter + LIST-reset + grace ([D1] grace proven load-bearing); two GC-side windows found — evidence in the decision to excise the natural-erasure stack from v1 | HISTORICAL (design excised before activation) | `run_erasureproof.sh` |
 | `CaDiskLifecycle.tla` | rev.8 FORGET-only v1 lifecycle: one-way-ness, the as-built `FORGET` protocol (trip#2 sufficiency, earned farewell, first-terminal-wins), the [C1] GC self-exit-on-Vanished, the [M1] intent-bail; Task-15 gate | CURRENT | `run_disklifecycle.sh` |
-| `CaB140DangleMerge.tla` (+ `m_*.cfg`) | journal-trim dangle across a lease handoff: trim-gate + cursor-in-snap jointly necessary | HISTORICAL | (inline TLC) |
+| `CaB140DangleMerge.tla` (+ `m_*.cfg`) | journal-trim dangle across a lease handoff: trim-gate + cursor-in-snap jointly necessary | HISTORICAL | `run_b140danglemerge.sh` |
 
 ## Model groups {#model-groups}
 

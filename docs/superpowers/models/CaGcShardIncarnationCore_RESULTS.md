@@ -49,3 +49,24 @@ Each of the three deliberate breaks yields a counterexample against the exact in
 - Concurrent GC leaders (`Leaders={L1}` here) — proven separately in `CaGcRootLocalPartManifestCore` (attempt-scoped generation) and orthogonal to the registry-removal question.
 - The precommit fold-barrier (body-not-yet-present) — abstracted: `WPublish` is atomic (shard present + committed ref together), which is the stronger/worse case for the create race, so the safety result is conservative.
 - Backend LIST consistency is assumed (discovery == present shards); the implementation must confirm strongly-consistent LIST per backend (spec §2, LIST-CONSISTENCY).
+
+## 2026-08-03 — runner-suite run {#2026-08-03-runner-suite-run}
+
+`run_gcshardincarnation.sh` re-run whole-suite (previously exercised only by hand), checker: TLC
+`2026.07.18.145032` (rev `30cc360`), SHA-256
+`cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`, `-workers 1`.
+
+| Config | Expect | Result | Seconds | States generated / distinct |
+| --- | --- | --- | ---: | ---: |
+| `sab_deletebeforefold` | violation | `INV_NO_ORPHAN_EDGE` violated | 1 | 409 / 181 |
+| `sab_incarnationreuse` | violation | `INV_NO_DANGLING` violated | 2 | 554,257 / 173,568 |
+| `sab_newbornnofloor` | violation | `INV_NO_DANGLING` violated | 2 | 377,667 / 115,483 |
+| `sab_pathkeyedcursor` | violation | `INV_NO_DANGLING` violated | 2 | 553,159 / 172,019 |
+| `design` | green | green | 85 | 26,001,635 / 5,872,030 |
+
+`design`'s distinct-state count (5,872,030) is identical to the table above, produced under the
+prior TLC 2.19 jar — the reachable state space is the same regardless of checker version or worker
+count. The four sabotage counterexample counts are not directly comparable to a prior run (none is
+recorded above): BFS reports the first-found counterexample, so its count depends on exploration
+order, while the violated invariant name is the stable fact. Reproduction:
+`docs/superpowers/models/run_gcshardincarnation.sh`.
