@@ -611,7 +611,7 @@ Purpose: prove clone-like operations republish refs rather than copy blobs, and 
 Workload:
 
 - `MOVE PARTITION ... TO TABLE`, `REPLACE PARTITION FROM`, table clone paths that are enabled for
-  `content_addressed`, and a deliberately unsupported cross-disk move if still gated.
+  `cas`, and a deliberately unsupported cross-disk move if still gated.
 
 Observations:
 

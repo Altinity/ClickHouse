@@ -20,7 +20,7 @@ namespace ErrorCodes
     extern const int NO_ELEMENTS_IN_CONFIG;
 }
 
-/// The `content_addressed` disk block is shared with the generic object-storage/disk layer, whose
+/// The `cas` disk block is shared with the generic object-storage/disk layer, whose
 /// keys are consumed elsewhere (`ObjectStorageFactory`, `S3Settings`, `MetadataStorageFactory`'s
 /// `getObjectKeyCompatiblePrefix`, `IDisk`, `DiskFromAST` for the inline SQL `disk(...)` form,
 /// `RegisterDiskObjectStorage`'s fake-transaction gate) and must be skipped here rather than rejected
@@ -35,10 +35,10 @@ namespace ErrorCodes
 ///      (`git ls-files 'tests/integration/*/test.py' | xargs grep -l
 ///      'metadata_type.*content_addressed'`) confirmed EMPTY: no integration test builds a CAS disk
 ///      via inline SQL `disk(...)`, only via these XML configs.
-///   3) every CAS disk config under `tests/config/config.d/content_addressed_*.xml` (the
+///   3) every CAS disk config under `tests/config/config.d/cas_*.xml` (the
 ///      stateless-lane XML configs) -- these are the only place in the tree with a LOCAL
 ///      `object_storage_type` CAS disk, so they are the only source of the generic `path` key below.
-///   4) every inline `disk(...)` SQL construct across ALL `content_addressed`/`ca_gc`/`cas_*`
+///   4) every inline `disk(...)` SQL construct across ALL `cas_*`
 ///      stateless tests, `04278`-`04300` (pre-dating this settings struct) through `05002`-`05015`
 ///      (current) -- these supply `name` (read by `DiskFromAST` to derive the ad-hoc disk's name)
 ///      and `use_fake_transaction` (validated generically in `RegisterDiskObjectStorage.cpp` against
@@ -57,7 +57,7 @@ static const std::set<std::string> non_cas_keys = {
     "readonly", "expect_continue_min_bytes", "http_client", "key_compatibility_prefix",
 };
 
-/// Config-key convention: the `content_addressed` block already scopes every key to this disk, so no
+/// Config-key convention: the disk block already scopes every key to this disk, so no
 /// key below carries a redundant `cas_`/`ca_` prefix (e.g. `part_folder_cache_bytes`, not
 /// `cas_part_folder_cache_bytes`).
 #define LIST_OF_CONTENT_ADDRESSED_SETTINGS(DECLARE, ALIAS) \

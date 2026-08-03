@@ -38,7 +38,7 @@ using MacroExpander = std::function<std::string(const std::string &)>;
 
 CONTENT_ADDRESSED_SETTINGS_SUPPORTED_TYPES(ContentAddressedSettings, DECLARE_SETTING_TRAIT)
 
-/// Declarative settings for the `content_addressed` disk metadata storage, mirroring the
+/// Declarative settings for the `cas` disk metadata storage, mirroring the
 /// `FileCacheSettings` pimpl/traits shape (`Core/BaseSettings.h`). Replaces the ~25 inline
 /// `config.getX` calls that used to live in `MetadataStorageFactory.cpp`'s
 /// `registerContentAddressedMetadataStorage` lambda; that lambda's key names, defaults, and

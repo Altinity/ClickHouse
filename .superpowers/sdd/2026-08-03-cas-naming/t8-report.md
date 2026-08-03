@@ -93,3 +93,26 @@ No stateless or integration suites were executed — the spec excludes them. The
 builds clean in two configurations, every CAS gtest suite passes in both, the ca-soak tooling suite passes,
 and no configuration names a key or value the server rejects. It is not evidence that the stateless or
 integration lanes pass.
+
+---
+
+## Addendum — the standalone backticked value form
+A follow-up sweep (lead-flagged one instance) found the pattern my Step-1 seds could not reach: the
+retired `metadata_type` value written as a **standalone** `` `content_addressed` ``. My seds matched
+`` `content_addressed` disk `` / `` pool ``, so a bare backticked value slipped through.
+
+Fixed in six places, found by grepping that exact form tree-wide rather than by fixing only the reported line:
+- `utils/ca-soak/scenarios/README.md:614` — a live scenario workload instruction (the reported one).
+- `ContentAddressedSettings.h:41`, `.cpp:23`, `.cpp:60` — the disk metadata storage / disk block. `:60`
+  also repeated the fictional-nesting phrasing corrected in `storing-data.md`: "the `content_addressed`
+  block already scopes every key" -> "the disk block already scopes every key".
+- `ContentAddressedSettings.cpp:38` cited `tests/config/config.d/content_addressed_*.xml`, renamed in Task 5.
+- `ContentAddressedSettings.cpp:41` enumerated the stateless test families as
+  `` `content_addressed`/`ca_gc`/`cas_*` ``; Task 5 renamed both older prefixes, so all tracked CAS
+  stateless tests are now `cas_*` and the enumeration collapses to one entry. (The `content_addressed`-named
+  files still on disk are untracked `.stdout`/`.stderr` run debris, not tests.)
+
+Confirmed generic English and kept, as the lead classified: `scenarios/README.md:732,738`
+("Part files are content-addressed", "get content-addressed accidentally").
+
+Re-verified after: `ninja` `NINJA_EXIT=0` with 0 `error:` lines; ca-soak **336 passed**.
