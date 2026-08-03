@@ -600,3 +600,27 @@ Three findings from `t1a-review.md`, all in slice documents under
 
 **Fix:** slice records are historical once the lane closes — carry the F2 qualification into any
 future prose that quotes the zero-GET claim; no retro-editing round.
+
+### D40 — T1-lane and T6a-review prose batch {#d40-t1-lane-prose}
+
+From the T6a review (`t6a-review.md`): (1) the verdict artifact's "only unproven exit" enumeration
+was incomplete (walk-never-starts silent exit; also structurally closed by `357cf7b963f`) — the
+artifact stands on the corrected argument recorded in the review; (2) `checkpoint_unusable` bucket
+counts the no-cursor mechanism, not the cause (unreadable-`_ckpt`-with-cursor reports as `held`);
+(3) the `FrontierDeficit` doc paragraph is attached to `enum FrontierUnproven` rather than the
+struct/member; (4) the artifact's table lists `no_catalog_entry` and `append_above_frozen_tail`
+as live causes though both buckets are unfireable dead arms today.
+
+From the T1b review (`t1b-review.md`): (5) the Task 9 re-check reached the right verdict on a
+wrong ground (dedup-log rotation does NOT reach `listNamespaceFiles`; the correct caller set is
+recorded in the review); (6) the closure note's `{#read-and-delayed-write-aliasing}` sentence
+carries a pre-existing imprecision noted there.
+
+From the fence-race RCA (`rca-fence-race.md`): (7) `Gc/CasGc.cpp` carries a stale comment ("a
+namespace has no `_ckpt` until its first snapshot publication commits") — false since
+`completeCreation` publishes `_ckpt` at creation; executor: F2 sweep (keep the fail-safe reason,
+fix the invariant claim).
+
+Dead-arm REMOVAL (three unreachable arms in the frontier walk, confirmed by the T6a review) is
+CODE, not prose: placed with plan task T6 Step 1 (same file/region, mechanical, under that
+review).
