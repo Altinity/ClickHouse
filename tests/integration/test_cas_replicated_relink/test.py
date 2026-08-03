@@ -873,30 +873,18 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
         summary = fsck(node)
         assert summary["dangling"] == "0", "{} fsck: {}".format(node.name, summary)
 
-    # ##################################################################################
-    # ###  STAGE-A CONTRACT.  RESTORE THE SOUNDNESS GUARD AT STAGE B TASK 7b.        ###
-    # ##################################################################################
-    # This USED to be a soundness guard: with the part gone from both replicas and the stalled attempt
-    # abandoned, its unique blobs are unreachable, so GC reclaiming at least one of them proved that
-    # their survival DURING the stall was the pin and not GC inactivity.
-    #
-    # That guard cannot run under Stage A, and the honest thing is to say what is lost rather than to
-    # quietly drop it. `UniversePolicy::kDefault` is `StageA_Suppressed` (`Gc/CasGc.h`), so GC reclaims
-    # nothing for any reason — which means NO observation in this configuration can distinguish
-    # "the blobs survived because the relink pin held them" from "the blobs survived because
-    # destruction is globally off". **While Stage A is in force, this test's stall-pin claim is
-    # unproven, and the assertions that remain above are the ones that still carry weight**: nothing
-    # was committed by the stalled attempt, no dangling reference exists from either mounter, and the
-    # replicas agree on the row count.
-    #
-    # AT TASK 7b: delete this block and restore the reclaim-at-least-one loop verbatim; it is the thing
-    # that makes the rest of the test mean what it says.
-    #
-    # What CAN still be asserted is that GC ran and declined, rather than never running — the failure
-    # mode that would make even a Stage-B guard misleading.
-    for _ in range(3):
+    # THE SOUNDNESS GUARD, and it is what makes the survival asserted earlier mean anything: with the
+    # part gone from both replicas and the stalled attempt abandoned, its unique blobs are unreachable,
+    # so GC reclaiming them proves their survival DURING the stall was the relink pin and not GC
+    # inactivity. Without this, "the blobs were still there" would also be what a GC that never ran
+    # produces.
+    reclaimed = set()
+    for _ in range(8):
         gc_round(node1)
         gc_round(node2)
+        reclaimed = part_blobs - blob_keys()
+        if reclaimed == part_blobs:
+            break
     # Pool-wide: the GC lease is held by ONE server and it need not be node1.
     rounds = 0
     for n in (node1, node2):
@@ -908,11 +896,10 @@ def test_stalled_publish_protects_source_blobs_and_commits_nothing():
             ).strip()
             or 0
         )
-    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
-    assert not (part_blobs - blob_keys()), (
-        "Stage A must reclaim NOTHING, but {} of the abandoned attempt's blobs were deleted".format(
-            len(part_blobs - blob_keys())
-        )
+    assert rounds > 0, "no successful GC round ran at all"
+    assert reclaimed, (
+        "none of the abandoned attempt's {} blob(s) were reclaimed, so their survival during the "
+        "stall does not distinguish the relink pin from an inactive GC".format(len(part_blobs))
     )
 
     drop_everywhere(table)

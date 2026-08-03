@@ -1435,16 +1435,12 @@ TEST(CasWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
     const DB::Cas::FsckReport after = DB::Cas::runFsck(*storage->store(), /*detail=*/false);
     EXPECT_EQ(after.dangling, 0u) << "displacement must never lose a reachable object (manifestB stays live)";
     EXPECT_GT(after.reachable, 0u) << "the live ref points at manifestB; manifestB's closure is reachable";
-    /// STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b). This is
-    /// the REAL path -- `runOneGcRoundForTest` drives the production scheduler, the one caller that can
-    /// never assert a closed universe -- so in Stage A the displaced closure is correctly RECOGNIZED as
-    /// unreachable and then deliberately not reclaimed. B199's safety half is what still holds and is
-    /// asserted above: the displacement loses nothing reachable. When Task 7b flips the constant,
-    /// restore `EXPECT_EQ(after.unreachable, 0u)` here. The reclamation itself is not going untested
-    /// meanwhile -- `CasGcLeak.DisplacedPartBlobsReclaimed*` prove it on authoritative rounds.
-    EXPECT_GT(after.unreachable, 0u)
-        << "B199 real-path: manifestA's unique blobs (data-A / mark-A) must at least be recognized as "
-        << "unreachable once the displacement folds; unreachable=" << after.unreachable;
+    /// The REAL path: `runOneGcRoundForTest` drives the production scheduler, so the displaced closure
+    /// is not merely recognized as unreachable but actually reclaimed -- recognition alone would leave
+    /// every displacement leaking one part's unique blobs forever.
+    EXPECT_EQ(after.unreachable, 0u)
+        << "manifestA's unique blobs (data-A / mark-A) must be RECLAIMED once the displacement folds, "
+        << "not just recognized as unreachable; unreachable=" << after.unreachable;
 }
 
 /// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v2) ====

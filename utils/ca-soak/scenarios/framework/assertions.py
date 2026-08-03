@@ -215,21 +215,14 @@ def _classify_residual(fsck_detail_res: dict) -> dict:
 
 def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_after_gc=None,
                         fsck_detail_res: dict = None):
-    """After forced GC, no reclaimable content is a genuine ORPHAN — narrowed, for Stage A only, by one
-    permitted family.
+    """After forced GC, no reclaimable content is a genuine ORPHAN.
 
     The residual is split by fsck class. `dangling` FAILS unconditionally and is checked separately,
     because a missing referenced object is data loss and no posture excuses it. `pipeline` (condemned
     `pending-gc`/`awaiting-gc` awaiting ack-floor graduation) PASSES — a create/insert/DROP at the
     quiesced fixpoint always leaves the last drop's condemned blobs there. `bookkeeping` (GC state,
-    root/namespace-registry objects) PASSES.
-
-    Of the leak classes, EXACTLY ONE is permitted while `UniversePolicy::kDefault` is
-    `StageA_Suppressed`: `unreachable` on `_manifests`, the gated-delete family — manifest bodies are
-    deleted at a suppressed site and never condemned first, so they can only accumulate. It is counted
-    and reported in the verdict, never silent. Every other leak still FAILS, including blob leaks of
-    any class (the class this assertion was written for, and the one that catches
-    GC-CONCURRENT-LEADER-LEAK). AT TASK 7b the permitted family goes away and zero tolerance returns.
+    root/namespace-registry objects) PASSES. Every LEAK class FAILS, of any prefix — blob leaks are the
+    class this assertion was written for and the one that catches GC-CONCURRENT-LEADER-LEAK.
 
     Abandoning scenarios relax to recorded+classified (their own bound assertion governs).
 
@@ -256,26 +249,7 @@ def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_aft
 
     pipeline_n = sum(parts["pipeline"].values())
 
-    # ##########################################################################################
-    # ###  STAGE-A CONTRACT.  RESTORE ZERO-TOLERANCE AT STAGE B TASK 7b.                     ###
-    # ##########################################################################################
-    # `UniversePolicy::kDefault` is `StageA_Suppressed`, so every destructive site reachable from GC is
-    # gated and NOTHING is reclaimed. Manifest bodies are deleted at such a gated site and are never
-    # condemned first, so under Stage A they can only accumulate as `unreachable` — which this
-    # assertion used to call a leak, failing every card that drops a table.
-    #
-    # The contract is NARROWED, not disabled. Exactly one class is permitted: `unreachable` on
-    # `_manifests`, i.e. the gated-delete family. It is COUNTED and REPORTED in the verdict, never
-    # silent. Everything else still fails: blob leaks of any class (the class this assertion was
-    # written for, and the one that catches GC-CONCURRENT-LEADER-LEAK), `dangling` and `unaccounted`
-    # anywhere, and `unreachable` on `blobs`.
-    #
-    # AT TASK 7b: delete `_suppressed`/`_hard` below and restore `if leak_n > 0` — when `kDefault`
-    # flips, reclamation resumes and zero tolerance is correct again.
-    _suppressed = {k: v for k, v in parts["leak_by_class"].items() if k == "unreachable:_manifests"}
-    _hard = {k: v for k, v in parts["leak_by_class"].items() if k != "unreachable:_manifests"}
-    suppressed_n = sum(_suppressed.values())
-    hard_n = sum(_hard.values())
+    leak_n = sum(parts["leak_by_class"].values())
 
     # `dangling` is data loss, not retention, and is asserted independently of the classifier so a
     # future change to the buckets cannot quietly stop checking it.
@@ -284,32 +258,19 @@ def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_aft
         return [result.add(Verdict.check(
             "no unbounded leftovers", "dangling == 0 (a referenced object is missing)",
             f"dangling={dangling_n}", False,
-            "dangling is data loss and is NEVER excused by Stage-A suppression"))]
+            "dangling is data loss and is never excused by a retention posture"))]
 
-    if hard_n > 0:
+    if leak_n > 0:
         v = result.add(Verdict.check(
-            "no unbounded leftovers",
-            "no leak outside the Stage-A gated-delete family (unreachable:_manifests)",
-            f"{hard_n} orphan outside the permitted family (hard={_hard}, "
-            f"suppressed={_suppressed}, pipeline={parts['pipeline']})", False,
-            "uncondemned orphan objects remain that Stage-A suppression does NOT explain — a real "
-            "GC leak"))
+            "no unbounded leftovers", "no leak of any class",
+            f"{leak_n} orphan object(s) (leak_by_class={parts['leak_by_class']}, "
+            f"pipeline={parts['pipeline']})", False,
+            "uncondemned orphan objects remain after forced GC — a real GC leak"))
         result.note_anomaly(
-            f"forced GC left {hard_n} orphan object(s) OUTSIDE the Stage-A gated-delete family: "
-            f"{_hard}. Suppression explains `unreachable:_manifests` and nothing else, so this is not "
-            f"the posture — if explicit GC was driven concurrently with background GC (or on both "
-            f"replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG).")
+            f"forced GC left {leak_n} orphan object(s): {parts['leak_by_class']}. If explicit GC was "
+            f"driven concurrently with background GC (or on both replicas), this is likely the known "
+            f"GC-CONCURRENT-LEADER-LEAK (see BACKLOG).")
         return [v]
-
-    if suppressed_n > 0:
-        return [result.add(Verdict(
-            "no unbounded leftovers",
-            "residual is the Stage-A gated-delete family, the condemned pipeline, and/or bookkeeping",
-            f"residual={val}: {suppressed_n} retained by Stage-A suppression ({_suppressed}), "
-            f"pipeline={parts['pipeline']}, bookkeeping={parts['bookkeeping']}", "pass",
-            f"STAGE-A CONTRACT: {suppressed_n} unreachable manifest object(s) retained because their "
-            f"deletion site is gated (`UniversePolicy::kDefault = StageA_Suppressed`). Counted and "
-            f"reported, never silent. AT TASK 7b this becomes a FAILURE again."))]
 
     if abandons:
         return [result.add(Verdict("leftovers (abandoning scenario)", "bounded+classified",
@@ -358,24 +319,6 @@ def assert_reclaimable_drained(result, verdict_name, residual, fsck_detail_res: 
     result.observations.setdefault("reclaimable_drain_check", {})[verdict_name] = {
         "residual_total": residual, "reclaimable": reclaimable,
         "by_prefix": buckets, "bookkeeping": bookkeeping}
-
-    # ##########################################################################################
-    # ###  STAGE-A CONTRACT.  RESTORE DRAIN-TO-ZERO AT STAGE B TASK 7b.                      ###
-    # ##########################################################################################
-    # Same narrowing, and the same reason, as `assert_no_leftovers`: manifest bodies are deleted at a
-    # site `UniversePolicy::kDefault = StageA_Suppressed` gates, and are never condemned first, so
-    # under Stage A `_manifests` CANNOT drain — while `blobs` still must, and a blob residual is still
-    # the leak this assertion was written to catch. The permitted count is reported in the verdict,
-    # never silent. AT TASK 7b: delete this block and let `reclaimable` speak for itself again.
-    _blobs_left = buckets.get("blobs", 0)
-    _manifests_left = buckets.get("_manifests", 0)
-    if _blobs_left == 0 and _manifests_left > 0:
-        return [result.add(Verdict(
-            verdict_name, "blobs drained; manifests retained by Stage-A suppression",
-            f"blobs=0, _manifests={_manifests_left} retained (by_prefix={buckets})", "pass",
-            f"STAGE-A CONTRACT: {_manifests_left} unreachable manifest object(s) cannot drain because "
-            f"their deletion site is gated. Blobs DID drain to 0, which is the half this assertion "
-            f"still proves. AT TASK 7b this becomes a FAILURE again."))]
 
     if residual == 0 or reclaimable == 0:
         note = ""

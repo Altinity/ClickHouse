@@ -78,12 +78,10 @@ std::vector<Rec> roundRowsOnly(const std::vector<Rec> & rows)
 /// Start, then its phase rows, then one Finish, with `disk_name`/`gc_id` set and `duration_ms`
 /// populated on the Finish.
 ///
-/// STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test
-/// drives the PRODUCTION scheduler, which is the one path that can never assert a closed universe -- so
-/// no round it drives deletes anything, and the deletion half of this test cannot run in Stage A. What
-/// it asserts instead is the Stage-A contract itself: `objects_deleted` stays 0 on every Finish while
-/// marking still happens. When Task 7b flips the constant, RESTORE the deletion half -- a `saw_deleted`
-/// round, `deleting_finish_idx >= marking_finish_idx`, and the pass-through of the deleted count.
+/// It drives the PRODUCTION scheduler, so it covers both halves of the pipeline: a MARKING round
+/// (candidates condemned, nothing deleted) and, some rounds later once the mount's ack floor graduates
+/// them, a DELETING round whose Finish carries the count through. The ordering is asserted, because a
+/// deletion reported before its marking would mean the row is not describing the round it names.
 TEST(CasGcLog, EmitsStartFinishWithCounts)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -113,7 +111,9 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
     /// (renewWatermarkOnce runs the beat) and give the pipeline a generous round budget. Each
     /// runOneRoundNow call appends a Start, the round's phase rows, and a Finish.
     bool saw_marked = false;
+    bool saw_deleted = false;
     size_t marking_finish_idx = 0;
+    size_t deleting_finish_idx = 0;
     uint64_t total_deleted = 0;
     constexpr size_t max_rounds = 16;
     for (size_t round = 0; round < max_rounds; ++round)
@@ -138,18 +138,22 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
             saw_marked = true;
             marking_finish_idx = finish_idx;
         }
+        if (!saw_deleted && fin.objects_deleted > 0)
+        {
+            saw_deleted = true;
+            deleting_finish_idx = finish_idx;
+        }
         total_deleted += fin.objects_deleted;
     }
 
     ASSERT_TRUE(saw_marked) << "expected a round that marked at least one candidate";
     EXPECT_GT(rows[marking_finish_idx].candidates_marked, 0u);
-    /// Marking is NOT destructive, so a suppressed round still condemns and the pipeline still moves --
-    /// it just never reaches its irreversible step.
     EXPECT_GT(rows[marking_finish_idx].entries_condemned, 0u);
-    /// The Stage-A contract on the production path (see this test's header comment): no round the
-    /// scheduler drives may delete anything. Restore the deletion half at Task 7b.
-    EXPECT_EQ(total_deleted, 0u)
-        << "the production scheduler cannot assert a closed universe, so no round it drives may delete";
+    ASSERT_TRUE(saw_deleted) << "expected a round that physically deleted at least one object";
+    EXPECT_GE(deleting_finish_idx, marking_finish_idx)
+        << "an object cannot be reported deleted before the round that condemned it";
+    EXPECT_GT(total_deleted, 0u)
+        << "the deleted count must reach the Finish row, not stop inside the round";
 
     /// Identity + timing fields are set on every record.
     for (const Rec & r : rows)

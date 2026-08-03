@@ -173,24 +173,18 @@ def test_two_servers_share_one_pool():
 
     at_drop = count_pool_objects()
 
-    # ##################################################################################
-    # ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.  ###
-    # ##################################################################################
-    # This USED to poll until the pool drained and assert `final <= baseline`. It cannot, and must not,
-    # assert that today: a GC round may destroy only while holding a frontier proof for EVERY namespace
-    # that can hold a live edge, Stage A cannot enumerate that set, so `UniversePolicy::kDefault` is
-    # `StageA_Suppressed` (`Gc/CasGc.h`) and production GC reclaims NOTHING for the whole of Stage A,
-    # by design. AT TASK 7b: restore the early-exit poll and the `final <= baseline` assertion, and delete
-    # the suppression-evidence block below. Until then this asserts the Stage-A truth WITH EVIDENCE
-    # rather than by observing an absence — a wedged GC, a lost lease or a crashed background thread
-    # also reclaim nothing, and those are bugs. Same treatment as Task 9's
-    # `test_content_addressed_gc_s3.py::test_stage_a_gc_is_suppressed_and_says_so` (`afa08749a47`).
-    for _ in range(RECLAIM_RETRIES):
-        time.sleep(RECLAIM_SLEEP)
+    # THE RECLAMATION: both servers' content goes. Polled with an early exit, then cross-checked
+    # against GC's own bookkeeping so a pool that shrank for some other reason cannot pass for a round
+    # that reclaimed it.
     final = count_pool_objects()
+    for _ in range(RECLAIM_RETRIES):
+        if final <= baseline:
+            break
+        time.sleep(RECLAIM_SLEEP)
+        final = count_pool_objects()
 
-    assert final >= at_drop, (
-        "Stage A must reclaim NOTHING, but the shared pool shrank after both servers dropped: "
+    assert final <= baseline, (
+        "the shared pool did not drain after both servers dropped: "
         "baseline={}, after_insert={}, at_drop={}, final={} (blobs={}, parts={})".format(
             baseline,
             after_insert,
@@ -201,18 +195,12 @@ def test_two_servers_share_one_pool():
         )
     )
 
-    # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
-    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease". Counted
-    # POOL-WIDE: exactly one server holds the GC lease for a shared pool, and it need not be node1 —
-    # asking only node1 yields 0 rounds whenever node2 is the leader, which is how this assertion first
-    # failed.
+    # Counted POOL-WIDE: exactly one server holds the GC lease for a shared pool, and it need not be
+    # node1 — asking only node1 yields 0 rounds whenever node2 is the leader, which is how this
+    # assertion first failed.
     rounds, deleted = _gc_bookkeeping(node1, node2)
-    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
-    assert deleted == 0, (
-        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
-            deleted
-        )
-    )
+    assert rounds > 0, "no successful GC round ran at all"
+    assert deleted > 0, "the shared pool drained but GC's own bookkeeping reports no deletion"
 
 
 # Crash-resilience uses a SMALLER, DISTINCT dataset per node. Distinct content => node1's blobs are
@@ -330,20 +318,18 @@ def test_pool_survives_node_crash():
 
     at_drop = count_pool_objects()
 
-    # ##################################################################################
-    # ###  STAGE-A CONTRACT.  RESTORE THE RECLAMATION ASSERTIONS AT STAGE B TASK 7b.  ###
-    # ##################################################################################
-    # Same reasoning as the first test in this file: `UniversePolicy::kDefault` is `StageA_Suppressed`,
-    # so GC reclaims nothing for the whole of Stage A. What this test still pins, and what it was
-    # really about, is that the hard kill left nothing EXTRA behind: the pool does not keep growing
-    # once both tables are dropped and the orphaned write-session's lease expires. AT TASK 7b: restore
-    # the early-exit poll and `assert final <= baseline`.
-    for _ in range(RECLAIM_RETRIES):
-        time.sleep(RECLAIM_SLEEP)
+    # THE RECLAMATION, and the point of this test: the hard kill left nothing behind that survives the
+    # drop. Once both tables are gone and the orphaned write-session's lease expires, nothing pins the
+    # content and the pool returns to baseline.
     final = count_pool_objects()
+    for _ in range(RECLAIM_RETRIES):
+        if final <= baseline:
+            break
+        time.sleep(RECLAIM_SLEEP)
+        final = count_pool_objects()
 
-    assert final >= at_drop, (
-        "Stage A must reclaim NOTHING, but the shared pool shrank after the crash + both DROPs: "
+    assert final <= baseline, (
+        "the shared pool did not drain after the crash + both DROPs: "
         "baseline={}, after_both_inserts={}, at_drop={}, "
         "final={} (blobs={}, parts={})".format(
             baseline,
@@ -355,15 +341,7 @@ def test_pool_survives_node_crash():
         )
     )
 
-    # …AND THE SUPPRESSION IS EVIDENCED: rounds ran and deleted nothing, which is what separates
-    # "GC declined, by design" from "GC was wedged, crashed, or never held the lease". Counted
-    # POOL-WIDE: exactly one server holds the GC lease for a shared pool, and it need not be node1 —
-    # asking only node1 yields 0 rounds whenever node2 is the leader, which is how this assertion first
-    # failed.
+    # Counted POOL-WIDE, for the same leader-may-be-either-node reason as the first test in this file.
     rounds, deleted = _gc_bookkeeping(node1, node2)
-    assert rounds > 0, "no successful GC round ran at all — this is not suppression, it is a wedge"
-    assert deleted == 0, (
-        "GC's own bookkeeping reports {} deletion(s) while Stage A suppression is in force".format(
-            deleted
-        )
-    )
+    assert rounds > 0, "no successful GC round ran at all"
+    assert deleted > 0, "the shared pool drained but GC's own bookkeeping reports no deletion"

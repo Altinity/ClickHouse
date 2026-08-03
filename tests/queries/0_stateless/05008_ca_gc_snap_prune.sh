@@ -15,13 +15,6 @@
 # (Deleted/Absent/Replaced), so this inequality is a structural identity of the pipeline and an ad-hoc
 # delete that bypassed the graduate->redelete path would break it. This proves deletion fires
 # end-to-end through the real SystemLog path.
-#
-# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
-# KNOWN-RED under suppression — see the `05008_ca_gc_snap_prune` entry in `tests/broken_tests.yaml`. No
-# round driven through the production scheduler path (`SYSTEM CONTENT ADDRESSED GC RUN`) may physically
-# delete anything while `StageA_Suppressed` holds, so the poll below for `objects_deleted > 0` never
-# terminates and the test exhausts its bounded retries and fails. Remove that `broken_tests.yaml` entry
-# once Task 7b flips `UniversePolicy::kDefault`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

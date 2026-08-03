@@ -22,14 +22,6 @@
 # Teardown is fail-closed (spec rev.8 §5/§9): `SYSTEM CONTENT ADDRESSED FORGET` the disk (force-Vanish,
 # node-local), verify it reads `vanished(forgotten)` in system.content_addressed_mounts, and only then
 # `rm -rf` — FORGET stopped and joined every CAS background thread for this disk.
-#
-# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
-# KNOWN-RED under suppression — see the `04290_content_addressed_no_leftovers` entry in
-# `tests/broken_tests.yaml`. Step (5) drives the production scheduler path
-# (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never assert a closed universe, so
-# graduation and the physical delete never fire; the drain-to-0 loop below never terminates (condemned
-# entries are re-emitted every round) and the test exhausts its bounded retries and fails. Remove that
-# `broken_tests.yaml` entry once Task 7b flips `UniversePolicy::kDefault`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

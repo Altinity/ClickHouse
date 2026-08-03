@@ -13,14 +13,6 @@
 # running disk (T13) reads back zero `unreachable`/`dangling` objects (no mutated-away or patch-part
 # blobs left behind), and that `_pool_meta` survives. Teardown is fail-closed (spec rev.8 §5/§9): FORGET
 # the disk, verify `vanished(forgotten)`, then rm.
-#
-# STAGE-A RETURN ITEM (`UniversePolicy::kDefault == StageA_Suppressed`, Stage B Task 7b): this test is
-# KNOWN-RED under suppression — see the `04295_content_addressed_mutation_no_leftovers` entry in
-# `tests/broken_tests.yaml`. The drain loop below drives the production scheduler path
-# (`SYSTEM CONTENT ADDRESSED GC RUN`), the one caller that can never assert a closed universe, so
-# graduation and the physical delete never fire; the drain-to-0 loop never terminates (condemned
-# entries are re-emitted every round) and the test exhausts its bounded retries and fails. Remove that
-# `broken_tests.yaml` entry once Task 7b flips `UniversePolicy::kDefault`.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
