@@ -31,7 +31,7 @@ String toString(CasEventType type)
         case CasEventType::RootAdd:               return "root_add";
         case CasEventType::RootRemove:            return "root_remove";
         case CasEventType::RootRepoint:           return "root_repoint";
-        case CasEventType::IndegZero:             return "indeg_zero";
+        case CasEventType::IndegZero:             return "indegree_zero";
         case CasEventType::GcFoldBegin:           return "gc_fold_begin";
         case CasEventType::GcFoldEnd:             return "gc_fold_end";
         case CasEventType::GcRetireObserve:       return "gc_retire_observe";
@@ -84,7 +84,7 @@ String toString(CasEventObjectKind kind)
         case CasEventObjectKind::Blob: return "blob";
         case CasEventObjectKind::Manifest: return "manifest";
         case CasEventObjectKind::Root: return "root";
-        case CasEventObjectKind::Snap: return "snap";
+        case CasEventObjectKind::Snap: return "snapshot";
     }
     throw DB::Exception(
         DB::ErrorCodes::LOGICAL_ERROR,

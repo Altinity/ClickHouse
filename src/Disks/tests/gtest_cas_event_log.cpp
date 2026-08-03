@@ -39,7 +39,7 @@ TEST(CASEvent, ConstructAndCopyAndName)
     EXPECT_EQ(c.object_hash, "abcd");
     EXPECT_EQ(c.detail.at("freed"), "10");
     EXPECT_EQ(toString(CasEventType::BlobDelete), "blob_delete");
-    EXPECT_EQ(toString(CasEventType::IndegZero), "indeg_zero");
+    EXPECT_EQ(toString(CasEventType::IndegZero), "indegree_zero");
     EXPECT_EQ(toString(CasEventType::GcRecheckVerdict), "gc_recheck_verdict");
     EXPECT_EQ(toString(CasEventObjectKind::Manifest), "manifest");
 }
@@ -232,7 +232,7 @@ TEST(CASEvent, LifecycleReconstructionFromRows)
     const int i_indeg = firstIndexOf(CasEventType::IndegZero);
     const int i_observe = firstIndexOf(CasEventType::GcRetireObserve);
     const int i_delete = firstIndexOf(CasEventType::BlobDelete);
-    ASSERT_GE(i_indeg, 0) << "the blob's indeg_zero must be in its chain";
+    ASSERT_GE(i_indeg, 0) << "the blob's indegree_zero must be in its chain";
     ASSERT_GE(i_observe, 0) << "the blob's gc_retire_observe must be in its chain";
     ASSERT_GE(i_delete, 0) << "the blob's blob_delete must be in its chain";
     EXPECT_LT(i_indeg, i_observe) << "in-degree hit 0 before GC observed it";

@@ -22,21 +22,21 @@ which only records one `Start`/`Finish` row per GC round.
 - `event_date` ([Date](/sql-reference/data-types/date)) — Event date.
 - `event_time` ([DateTime](/sql-reference/data-types/datetime)) — Event time.
 - `event_time_microseconds` ([DateTime64(6)](/sql-reference/data-types/datetime64)) — Event time with microseconds precision.
-- `event_type` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The CAS decision/event, e.g. `blob_put`, `blob_reuse_adopt`, `root_remove`, `indeg_zero`, `gc_retire_decision`, `gc_recheck_verdict`, `blob_delete`, `dangling_access`, `corrupt_dangle`.
+- `event_type` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The CAS decision/event, e.g. `blob_put`, `blob_reuse_adopt`, `root_remove`, `indegree_zero`, `gc_retire_decision`, `gc_recheck_verdict`, `blob_delete`, `dangling_access`, `corrupt_dangle`.
 - `disk_name` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — The content-addressed disk / pool the event belongs to.
 - `namespace` ([String](/sql-reference/data-types/string)) — `roots/<namespace>` (server/table); empty if not applicable.
 - `ref_name` ([String](/sql-reference/data-types/string)) — Part name / ref the event concerns; empty if not applicable.
-- `object_kind` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — One of `none`, `blob`, `manifest`, `root`, `snap`.
+- `object_kind` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — One of `none`, `blob`, `manifest`, `root`, `snapshot`.
 - `object_hash` ([String](/sql-reference/data-types/string)) — Content hash (lowercase hex) of the object; empty if not applicable.
 - `token` ([String](/sql-reference/data-types/string)) — Incarnation token (`ETag`) involved; empty if not applicable.
 - `round` ([UInt64](/sql-reference/data-types/int-uint)) — GC round (`0` if not applicable).
-- `gen` ([UInt64](/sql-reference/data-types/int-uint)) — GC snapshot generation (`0` if not applicable).
+- `generation` ([UInt64](/sql-reference/data-types/int-uint)) — GC snapshot generation (`0` if not applicable).
 - `at_version` ([UInt64](/sql-reference/data-types/int-uint)) — Manifest `shard_version` of the driving journal record (`0` if not applicable).
 - `outcome` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Decision outcome, e.g. `ok`, `adopt`, `resurrect`, `deleted`, `replaced`, `spared`, `absent`, `zeroed`, `skipped`.
 - `reason` ([LowCardinality(String)](/sql-reference/data-types/lowcardinality)) — Human-readable rationale for the decision. Templated across rows, so it is `LowCardinality`.
 - `thread_id` ([UInt64](/sql-reference/data-types/int-uint)) — OS thread that emitted the event.
 - `query_id` ([String](/sql-reference/data-types/string)) — Query id for correlation with [`system.query_log`](/operations/system-tables/query_log); empty if not applicable.
-- `detail` ([Map(LowCardinality(String), String)](/sql-reference/data-types/map)) — Structured event-specific facts, e.g. `prev_indeg`, `dropped_by`, `freed`, `cursor`, `code`, `site`.
+- `detail` ([Map(LowCardinality(String), String)](/sql-reference/data-types/map)) — Structured event-specific facts, e.g. `condemn_round`, `superseded_token`, `code`, `site`.
 
 ## Example {#example}
 
