@@ -269,7 +269,7 @@ def assert_no_leftovers(result, fsck: dict, abandons: bool = False, residual_aft
         result.note_anomaly(
             f"forced GC left {leak_n} orphan object(s): {parts['leak_by_class']}. If explicit GC was "
             f"driven concurrently with background GC (or on both replicas), this is likely the known "
-            f"GC-CONCURRENT-LEADER-LEAK (see BACKLOG).")
+            f"GC-CONCURRENT-LEADER-LEAK.")
         return [v]
 
     if abandons:
