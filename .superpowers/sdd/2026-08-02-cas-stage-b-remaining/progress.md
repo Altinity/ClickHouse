@@ -69,9 +69,14 @@ per commit; full CA gate at lane closures.
     recurrence #6 of the abort class), a046ad621a1 (3-site heap-use-after-free: dangling pointer
     into the destroyed CasRefCatalog::read temporary). All three defects were pre-existing and
     previously INVISIBLE (prefix-filter gap, no full ASan gate since the tests' birth).
-- T2 (Task 6b remainder): IN PROGRESS on MAIN (t2-impl; 4 ordering/poison/backoff tests;
-  vocabulary ruling: plan's "Poisoned" = code's `RefLaneState::NeedsRecovery`, production is
-  recover-then-proceed — test pins the recover-before-publish invariant).
+- T2 (Task 6b remainder): **COMPLETE** (404b6ecbe3a + ecc638f8861 + tautology-test removal;
+  review APPROVE-WITH-NONBLOCKING in t2-review.md). Vocabulary ruling recorded: plan's "Poisoned"
+  = `RefLaneState::NeedsRecovery`; production is recover-then-proceed; test pins
+  recover-before-publish + published-snapshot-contains-missing-txn. Positive contract property
+  corroborated: `resolveRef` also recovers unconditionally — no seam exposes an un-recovered
+  read. Nonblocking T2 debts placed in T8's residual row: F1 (reset assertion holds even if
+  reset were no-op), F2 (4000ms cap unpinned from below), F4 (`settleSnapshotPublish`
+  uncharacterized).
 - T3 (Task 7 closure): NOT STARTED. LANE-G.
 - T4 (Task 8 closure): NOT STARTED. Tests LANE-G / production steps MAIN.
 - T5 (probe A deletion): NOT STARTED. MAIN after T3 integration.

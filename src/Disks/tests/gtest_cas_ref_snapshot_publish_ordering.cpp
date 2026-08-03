@@ -227,36 +227,6 @@ TEST(CasRefSnapshotPublishOrdering, SnapshotBodyIsDurableBeforeCheckpointAdvance
         << "INV-4's second `_ckpt` writer runs strictly after the immutable body is durable";
 }
 
-/// Sensitivity check for the ordering assertion above: swap the comparison direction and confirm it
-/// fails, proving the index comparison actually discriminates the real order rather than passing
-/// vacuously. Mutation reverted immediately below; output preserved to `build/t2_sensitivity_1.log`.
-TEST(CasRefSnapshotPublishOrdering, SensitivityCheckOrderingComparisonDiscriminates)
-{
-    auto backend = std::make_shared<OrderedFaultBackend>();
-    auto store = openPool(backend);
-    const RootNamespace ns{"srv1/order_sensitivity"};
-
-    ASSERT_EQ(publishRef(store, ns, "ref_1", 1), (RefTxnId{store->writerEpoch(), 1}));
-    const NamespaceLifeId life = *store->refTableLifeForTest(ns);
-    const String snapshot_key = store->layout().refSnapshotKey(life, RefTxnId{store->writerEpoch(), 1});
-    const String ckpt_key = store->layout().refCkptKey(life);
-    const size_t offset = backend->journalSize();
-    ASSERT_TRUE(store->tryPublishSnapshotAndAdvanceCheckpointOnce(ns));
-
-    const auto body_index = backend->firstIndexFrom(OrderedFaultBackend::Op::Put, snapshot_key, offset);
-    const auto ckpt_index = backend->firstIndexFrom(OrderedFaultBackend::Op::Cas, ckpt_key, offset);
-    ASSERT_TRUE(body_index.has_value());
-    ASSERT_TRUE(ckpt_index.has_value());
-
-    /// The deliberately WRONG expectation (body after ckpt) must fail -- EXPECT_FALSE wraps the check so
-    /// this test itself stays green while proving the assertion is load-bearing rather than tautological.
-    EXPECT_FALSE(*body_index > *ckpt_index)
-        << "load-bearing mutation demonstration performed after implementation; mutation reverted; "
-           "patch and failing output preserved: asserting the swapped (wrong) order here fails, which is "
-           "what proves the true-order assertion in "
-           "CasRefSnapshotPublishOrdering.SnapshotBodyIsDurableBeforeCheckpointAdvances actually observes "
-           "the real sequence rather than passing vacuously";
-}
 
 /// ---------------------------------------------------------------------------------------------
 /// 2. Adoption happens last, and only once both durable effects landed
