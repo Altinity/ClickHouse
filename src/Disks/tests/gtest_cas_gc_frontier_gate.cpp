@@ -22,6 +22,11 @@
 #include <stdexcept>
 #include <thread>
 
+namespace DB::ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+}
+
 /// THE DESTRUCTIVE-ROUND FRONTIER PROOF (spec 2026-07-27 "ref chain complete cut" §5).
 ///
 /// Reachability is a property of the WHOLE POOL. A blob is unreferenced only if no namespace anywhere
@@ -2752,10 +2757,21 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
     const CasRefCatalog::Snapshot observed = CasRefCatalog::read(*backend, layout);
     RefCatalog winner_catalog;
     if (GetParam() == CompetingCatalogOutcome::Replacement)
+    {
         winner_catalog.entries.push_back(CatalogEntry{
             .ns = fixture.ns,
             .state = NsState::Live,
             .incarnation = UInt128{178}});
+        /// Mirror production's publish-then-flip order: the successor life needs a readable `_ckpt`
+        /// before its catalog row can read `Live`, or `chooseRecoveryGrounding` rejects it.
+        const NamespaceLifeId successor_life = NamespaceLifeId::fromCatalogEntry(fixture.ns, UInt128{178});
+        backend->putIfAbsent(layout.refCkptKey(successor_life), encodeRefCkpt(RefCkpt{
+            .life_epoch = 1,
+            .committed_through = std::nullopt,
+            .checkpoint_snapshot_id = std::nullopt,
+            .last_epoch_seal = std::nullopt,
+        }));
+    }
     ASSERT_EQ(backend->casPut(
         layout.refCatalogKey(), encodeRefCatalog(winner_catalog), observed.token).outcome,
         CasOutcome::Committed);
@@ -2768,6 +2784,16 @@ TEST_P(CasGcCompletedRemovalFenceRace, FencedLeaderStopsAfterWinnerRemovesOrRepl
 
     const std::vector<String> journal = backend->journalSnapshot();
     ASSERT_TRUE(leader_a_failure);
+    try
+    {
+        std::rethrow_exception(leader_a_failure);
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.message().find("pre-fold drain lost authority"), String::npos) << e.message();
+    }
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasGcRefWalkPlansBuilt].load() - plans_before, 0u);
     EXPECT_EQ(findJournalAfter(journal, "list " + layout.casRefsPrefix(), 0), journal.size());
     EXPECT_EQ(findJournalAfter(journal, "cas_begin " + layout.gcStateKey(), 0), journal.size());

@@ -236,11 +236,6 @@ TEST(CasRefCatalogFormat, RemovalStartedRoundIsRequiredExactlyForRemoving)
     EXPECT_NE(encoded.find("\"rsr\":\"19\""), String::npos);
     EXPECT_EQ(decodeRefCatalog(encoded), catalog);
 
-    CatalogEntry live_with_round = liveEntry("live", 8);
-    live_with_round.removal_started_round = 20;
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); });
-
     const String inc = "00000000000000000000000000000009";
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { (void)decodeRefCatalog(rawCatalog({rawEntLine("missing", "removing", inc)})); });
@@ -375,6 +370,16 @@ TEST(CasRefCatalogFormat, EncodeRejectsEmptyNamespace)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { encodeRefCatalog(c); });
 }
 
+/// Mutation caught: making removal age caller-local or optional would let an adopted `Removing` row
+/// lose the immutable round from which stuck-removal diagnostics measure.
+TEST(CasRefCatalogFormat, EncodeRejectsLiveWithRemovalStartedRound)
+{
+    CatalogEntry live_with_round = liveEntry("live", 8);
+    live_with_round.removal_started_round = 20;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); });
+}
+
 #endif
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
@@ -429,6 +434,14 @@ TEST(CasRefCatalogFormatDeathTest, EncodeRejectsEmptyNamespaceAborts)
     RefCatalog c;
     c.entries.push_back(liveEntry("", 1));
     EXPECT_DEATH({ (void)encodeRefCatalog(c); }, "namespace must not be empty");
+}
+
+TEST(CasRefCatalogFormatDeathTest, EncodeRejectsLiveWithRemovalStartedRoundAborts)
+{
+    CatalogEntry live_with_round = liveEntry("live", 8);
+    live_with_round.removal_started_round = 20;
+    EXPECT_DEATH(
+        { (void)encodeRefCatalog(RefCatalog{.entries = {live_with_round}}); }, "removal_started_round");
 }
 
 #endif
@@ -763,6 +776,12 @@ TEST(CasRefCatalog, CasUpdateAppliesOnTopOfExistingState)
     EXPECT_EQ(updated.entries[0].state, NsState::Removing);
 }
 
+/// `CasRefCatalog::casUpdate`'s identity-preserving refusal throws `LOGICAL_ERROR`, which aborts the
+/// whole process in debug/sanitizer builds (`Common/Exception.cpp`'s `handle_error_code`) instead of
+/// behaving like a catchable exception -- so the throw-and-catch form below runs only on a plain
+/// release build, and `CasRefCatalogDeathTest.GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts`
+/// proves the abort positively on debug/sanitizer builds instead.
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
 {
     const Layout layout("p");
@@ -791,6 +810,38 @@ TEST(CasRefCatalog, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentity)
         });
     }
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasRefCatalogDeathTest, GenericCasUpdateCannotDeleteOrReplaceCatalogIdentityAborts)
+{
+    const Layout layout("p");
+    {
+        InMemoryBackend backend;
+        CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
+        EXPECT_DEATH(
+            { (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog &) { return RefCatalog{}; }); },
+            "cannot add or delete catalog entries");
+    }
+
+    {
+        InMemoryBackend backend;
+        CasRefCatalog::initializeEmptyForNewPool(backend, layout);
+        CasRefCatalog::casAdmitEntry(backend, layout, 1, liveEntry("a", 1));
+        EXPECT_DEATH(
+            {
+                (void)CasRefCatalog::casUpdate(backend, layout, [](const RefCatalog & current)
+                {
+                    RefCatalog next = current;
+                    next.entries[0] = liveEntry("b", 2);
+                    return next;
+                });
+            },
+            "cannot replace catalog identity");
+    }
+}
+#endif
 
 TEST(CasRefCatalog, CasUpdateRetriesOnConflictAgainstFreshState)
 {
