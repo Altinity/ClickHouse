@@ -731,3 +731,15 @@ theirs and were deliberately left out of the T6b cleanup to keep that commit sco
 `gtest_cas_ref_snapshot_format.cpp:129` ("codex round-2, finding 3"),
 `gtest_cas_upload_fanout.cpp:975` ("Test 6c (codex stage-1 review, Critical)"). Keep each sentence's
 constraint, drop the citation.
+
+### D48 — T6b-review prose batch {#d48-t6b-review-prose}
+
+From `t6b-review.md`: (P1, IMPRECISE) commit `5295d6c54ae`'s subject and the plan's Slice-2
+checklist line say "page/byte/recovery budgets" — no byte budget exists; the correct spelling is
+"page/namespace/recovery" (the report's heading already says so; the commit subject is immutable
+history, the plan line is fixed separately); (P2, FALSE) the report's Slice-1 claim "each
+`redelete`/`spared`/`graduated` entry maps to exactly one `OutcomeEntry` … bounded by construction"
+— `graduated` maps to none and `spared` was uncapped (prose form of finding C1, closed by the C-fix
+slice); (P3, IMPRECISE) `GcRoundWorkBudget::max_sweep_namespaces` comments describe a per-PAGE cap
+while the counter is per-round cumulative — equivalent only while the sweep takes one page per
+round; the comment states more than the field guarantees.
