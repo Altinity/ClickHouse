@@ -1,7 +1,7 @@
 """Standalone content-addressed adversarial scenario suite.
 
 Each scenario is an independent, focused run that stresses one hard condition of a
-`metadata_type = content_addressed` object-storage disk and produces a detailed report. The suite
+`metadata_type = cas` object-storage disk and produces a detailed report. The suite
 reuses the `utils/ca-soak` cluster machinery (docker compose: two ClickHouse replicas + RustFS +
 Keeper) but is otherwise a separate driver from the mixed deterministic soak in `soak/`.
 

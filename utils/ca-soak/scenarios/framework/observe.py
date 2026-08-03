@@ -58,7 +58,7 @@ POOL_PREFIXES = ("blobs", "_manifests", "refs", "roots", "_files", "gc", "_pool_
 
 
 # ClickHouse error code UNKNOWN_TABLE (Common/ErrorCodes.cpp). `SystemLog<>`-backed tables
-# (`content_addressed_garbage_collection_log`, `content_addressed_log`, ...) are materialized lazily —
+# (`cas_gc_log`, `cas_log`, ...) are materialized lazily —
 # `SystemLog::prepareTable` (src/Interpreters/SystemLog.cpp) only runs once there is something to
 # flush — so a freshly-reset cluster, or a log that has genuinely never had an entry, can legitimately
 # raise UNKNOWN_TABLE on the very first probe. That is "nothing has happened yet", the same class as

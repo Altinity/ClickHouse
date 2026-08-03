@@ -1,6 +1,6 @@
 # Content-Addressed (CAS) metadata storage
 
-This directory implements the `content_addressed` metadata storage for
+This directory implements the `cas` metadata storage for
 `DiskObjectStorage`: a "git for `MergeTree`" content-addressed pool over
 S3-family object storage. Instead of per-part metadata files pointing at
 randomly-named remote objects, every unique payload is stored **once** in a
@@ -129,25 +129,25 @@ is enforced by convention (README rule) — there is no CI check.
 ## Configuration
 
 A CAS disk is an `object_storage` disk with `metadata_type` =
-`content_addressed`. Minimal example (see
-`tests/config/config.d/content_addressed_storage_policy_for_merge_tree_by_default.xml`
+`cas`. Minimal example (see
+`tests/config/config.d/cas_storage_policy_for_merge_tree_by_default.xml`
 and its `_s3_` sibling for the lane configs used in CI):
 
 ```xml
 <disks>
-    <content_addressed>
+    <cas>
         <type>object_storage</type>
         <object_storage_type>s3</object_storage_type> <!-- or local -->
-        <metadata_type>content_addressed</metadata_type>
+        <metadata_type>cas</metadata_type>
         <!-- Required, validated identity of the layout subtree this server owns.
              Must be unique per server sharing the pool. -->
         <server_root_id>replica-1</server_root_id>
-        <path>content_addressed_pool/</path>
+        <path>cas_pool/</path>
         <!-- Real server-local scratch dir for the write-buffer spill. -->
-        <scratch_path>content_addressed_scratch/</scratch_path>
+        <scratch_path>cas_scratch/</scratch_path>
         <gc_enabled>1</gc_enabled>
         <gc_interval_sec>60</gc_interval_sec>
-    </content_addressed>
+    </cas>
 </disks>
 ```
 
@@ -179,8 +179,8 @@ GC sharding, hash algorithm, request budgets) is parsed in
   CAS suite that does not match, so a new suite cannot silently sit outside the
   filter; `utils/cas-gate/run_cas_gate_per_suite.sh` runs them one process per
   suite, so an abort cannot hide the suites after it.
-- **Stateless lanes**: the functional-test jobs "`content_addressed storage`"
-  (local object storage) and "`content_addressed s3 storage`" run the whole
+- **Stateless lanes**: the functional-test jobs "`cas storage`"
+  (local object storage) and "`cas s3 storage`" run the whole
   stateless suite with `MergeTree` defaulting to a CAS disk. Tests that
   legitimately cannot run there carry the `no-cas-storage` tag.
 - **Soak / chaos**: `utils/ca-soak/` — multi-replica docker-compose

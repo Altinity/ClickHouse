@@ -105,7 +105,7 @@ public:
         /// protocol-produced interval between a fenced GC exact-deleting a `Removing` row and the
         /// perpetual namespace janitor reaching it on a later bounded page (its own deletes are
         /// suppressed for the whole of Stage A). Persistent non-convergence is a leak/liveness question
-        /// for `CasGcNamespaceCleanupLeaks` and the `namespace_cleanup` GC-log phase, not this scan.
+        /// for `CASGcNamespaceCleanupLeaks` and the `namespace_cleanup` GC-log phase, not this scan.
         if (report.namespace_janitor_pending > 0)
             std::cout << "note: " << report.namespace_janitor_pending
                       << " namespace-life object(s) (" << report.namespace_janitor_pending_bytes

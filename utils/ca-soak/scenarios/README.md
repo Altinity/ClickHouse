@@ -1,6 +1,6 @@
 # Content-addressed adversarial scenario suite
 
-This directory is for standalone scenario tests for `metadata_type = content_addressed` object-storage
+This directory is for standalone scenario tests for `metadata_type = cas` object-storage
 disks. The existing `utils/ca-soak` driver is a mixed deterministic soak; this suite should be a set of
 independent, focused runs where each scenario stresses one hard condition and produces a detailed report.
 
@@ -18,7 +18,7 @@ python3 -m scenarios.run --scenario <name> --seed <seed> --duration 15m
 The exact entry point can change during implementation, but the contract should not:
 
 - Use a fresh pool prefix per run: `<scenario>/<seed>/<run_id>`.
-- Keep system logs on a local disk, not on the `content_addressed` disk.
+- Keep system logs on a local disk, not on the `cas` disk.
 - Enable `system.cas_log`, `system.cas_gc_log`,
   `system.query_log`, `system.part_log`, `system.metric_log`, `system.asynchronous_metric_log`, and
   `system.trace_log` when the scenario requests stack attribution.
@@ -258,7 +258,7 @@ Purpose: prove that many namespaces do not make `GC` traverse every table on eve
 
 Workload:
 
-- Create 10000 small tables on the `content_addressed` disk.
+- Create 10000 small tables on the `cas` disk.
 - Insert once into every table during prefill.
 - During the measured phase, insert into only 10 to 100 tables and leave the rest idle.
 - Run explicit `GC` rounds every minute.
@@ -419,7 +419,7 @@ Purpose: prove shared-pool coordination, leader election, and data-size amplific
 
 Workload:
 
-- 10 `ReplicatedMergeTree` replicas share one `content_addressed` pool.
+- 10 `ReplicatedMergeTree` replicas share one `cas` pool.
 - Insert concurrently into every replica, with a mix of unique and intentionally duplicate blocks.
 - Run background `GC` on every server and explicit `GC` on the cluster.
 

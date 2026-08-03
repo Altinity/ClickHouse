@@ -26,7 +26,7 @@ namespace ErrorCodes
 /// `RegisterDiskObjectStorage`'s fake-transaction gate) and must be skipped here rather than rejected
 /// as unknown. As of 2026-07-21 this list covers ALL in-repo CAS disk configs and inline `disk(...)`
 /// definitions, enumerated from four sources, each filtered down to the keys that are direct
-/// children of an actual `metadata_type=content_addressed` disk block (the raw `rg -o` output below
+/// children of an actual `metadata_type=cas` disk block (the raw `rg -o` output below
 /// also contains disk-name and policy/volume wrapper tags, which are not config keys at all):
 ///   1) `rg -o "<([a-z_0-9]+)>" -r '$1' utils/ca-soak/configs/storage_conf*.xml utils/ca-soak/configs/storage_overrides*.xml`
 ///   2) every CAS integration-test disk config, both the `storage_conf.xml` bodies and the

@@ -10,7 +10,7 @@
       <s3>
         <type>object_storage</type>
         <object_storage_type>s3</object_storage_type>
-        <metadata_type>content_addressed</metadata_type>
+        <metadata_type>cas</metadata_type>
         <endpoint>http://s3.us-west-2.amazonaws.com/tenant-a-eovqf642-chi-clickhouse-data/clickhouse/{cluster}/{shard}/cas_pool/</endpoint>
         <region>us-west-2</region>
         <skip_access_check>true</skip_access_check>

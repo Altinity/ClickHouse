@@ -44,7 +44,7 @@ echo "errors last 20m (ch1): $(q1 "SELECT name, sum(value) FROM system.errors WH
 echo "ca_stress rows ch1/ch2: $(q1 'SELECT count() FROM ca_stress FORMAT TSV' 2>/dev/null) / $(q2 'SELECT count() FROM ca_stress FORMAT TSV' 2>/dev/null)"
 echo "active parts ch1: $(q1 "SELECT count(), round(sum(bytes_on_disk)/1048576) FROM system.parts WHERE active AND table='ca_stress' FORMAT TSV")"
 echo "---- event-log (ch1) ----"
-q1 "SYSTEM FLUSH LOGS content_addressed_log" >/dev/null
+q1 "SYSTEM FLUSH LOGS cas_log" >/dev/null
 echo "rows/types: $(q1 'SELECT count(), uniqExact(event_type) FROM system.cas_log FORMAT TSV')"
 echo "reclaim-so-far (del/root_rm/strip/retire): $(q1 "SELECT countIf(event_type IN ('blob_delete','tree_delete')), countIf(event_type='root_remove'), countIf(event_type='tree_strip'), countIf(event_type='gc_retire_decision') FROM system.cas_log FORMAT TSV")"
 echo "anomalies (fail_closed/incoherent/corrupt/read_missing): $(q1 "SELECT countIf(event_type='fail_closed'), countIf(event_type='snap_journal_incoherent'), countIf(event_type='corrupt_decode'), countIf(event_type='read_missing') FROM system.cas_log FORMAT TSV")"

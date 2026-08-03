@@ -139,13 +139,13 @@ for spec in $NODES; do
 
     # (a2) part_log and the CA event log — added 2026-07-29 after an RCA needed exactly these two and
     #      found them gone. `part_log` carries the per-part remediation timeline (event types,
-    #      durations, error codes); `content_addressed_log` carries mount/lease lifecycle and the
+    #      durations, error codes); `cas_log` carries mount/lease lifecycle and the
     #      ref-plane events, which is the only way to answer "did a remove-broken path drop CAS refs,
     #      and did a re-publish follow". Both live in the container's /var/lib/clickhouse and die with
     #      it, which is the whole reason this dump exists — omitting them defeated its purpose once.
     q "$port" "SELECT * FROM system.part_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" "$dir/part_log.tsv"
     q "$port" "SELECT * FROM system.cas_log WHERE 1 ${WINDOW} FORMAT TSVWithNames" \
-      "$dir/content_addressed_log.tsv"
+      "$dir/cas_log.tsv"
 
     # (c) every counter, including the zeros — a counter that never moved is evidence too.
     q "$port" "SELECT event, value, description FROM system.events ORDER BY event FORMAT TSVWithNames SETTINGS system_events_show_zero_values = 1" \

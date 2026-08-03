@@ -17,7 +17,7 @@ def test_render_injects_overrides_into_ca_block():
         xml = _tuned_xml(node)
         assert "<dedup_cache_bytes>268435456</dedup_cache_bytes>" in xml
         assert "<part_folder_validate>age 5</part_folder_validate>" in xml
-        assert "<metadata_type>content_addressed</metadata_type>" in xml  # base block preserved
+        assert "<metadata_type>cas</metadata_type>" in xml  # base block preserved
 
 
 def test_render_twice_with_different_value_replaces_not_duplicates():

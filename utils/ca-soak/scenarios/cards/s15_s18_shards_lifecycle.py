@@ -368,7 +368,7 @@ class S16(Scenario):
         # `CasBuild.cpp`); its count is already computed above in `reuse_events`.
         resurrect_count = result.observations["reuse_events"].get("blob_reuse_resurrect", 0)
         result.add(Verdict.check(
-            "resurrection events recorded (content_addressed_log)",
+            "resurrection events recorded (cas_log)",
             "blob_reuse_resurrect fires for the drop/GC-condemn/re-insert cycle",
             f"blob_reuse_resurrect={resurrect_count}", resurrect_count > 0,
             "" if resurrect_count > 0 else

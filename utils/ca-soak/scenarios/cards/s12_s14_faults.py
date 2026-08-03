@@ -1,7 +1,7 @@
 """S12 ten-replica shared pool, S13 process loss during write+GC, S14 restart with many refs (P0).
 
 S12 ("ten replicas, shared pool, parallel inserts") runs a 10-`ReplicatedMergeTree`-replica cluster
-sharing one `content_addressed` pool, via `docker-compose-10replicas.yml` (ch1..ch10 over one RustFS
+sharing one `cas` pool, via `docker-compose-10replicas.yml` (ch1..ch10 over one RustFS
 pool + Keeper) + the N-node `Cluster` abstraction (`Cluster(node_count=10)`). All ten replicas write
 CONCURRENTLY: a SHARED block (identical ids+payload on every replica — must dedup to one copy under a
 10-way race) plus a per-replica UNIQUE block. It proves the shared pool + 10-way replication stay
