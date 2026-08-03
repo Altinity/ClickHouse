@@ -18,6 +18,11 @@ on:
         required: false
         type: string
         default: 'master'
+      branches:
+        description: 'Comma-separated target branches (default: the branch this workflow is run from)'
+        required: false
+        type: string
+        default: ''
       create_pr:
         description: 'Cherry-pick missing commits and open a backport PR'
         required: false
@@ -37,7 +42,12 @@ jobs:
       - id: set_branches
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "branches=[\"${{ github.ref_name }}\"]" >> $GITHUB_OUTPUT
+            BRANCHES="${{ inputs.branches }}"
+            if [ -z "$BRANCHES" ]; then
+              BRANCHES="${{ github.ref_name }}"
+            fi
+            JSON=$(echo "$BRANCHES" | tr ',' '\n' | jq -Rsc 'split("\n") | map(gsub("^\\s+|\\s+$";"") | select(length > 0))')
+            echo "branches=$JSON" >> $GITHUB_OUTPUT
           else
             echo "branches=[\"antalya-26.3\", \"stable-26.3\", \"antalya-26.6\"]" >> $GITHUB_OUTPUT
           fi
@@ -97,7 +107,8 @@ jobs:
 
   backport:
     needs: [check, setup]
-    if: ${{ always() && !cancelled() && (github.event_name == 'schedule' || github.event.inputs.create_pr == true) }}
+    # inputs.create_pr is a real boolean; github.event.inputs.create_pr is the string "true"/"false".
+    if: ${{ always() && !cancelled() && (github.event_name == 'schedule' || inputs.create_pr) }}
     strategy:
       fail-fast: false
       matrix:
