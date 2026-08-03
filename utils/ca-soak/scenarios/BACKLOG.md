@@ -1027,7 +1027,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Run:** 20260706T232811_S26_seed20260707
 - **Observed:** GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/0c/0cb03f16cfebaccc7750d4ca40ebc188', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/14/14174d2098c21591e0d4781382e7ce35', 'soak_pool/blobs/17/17147dcd91c5dcccb77fc50fe576ada1', 'soak_pool/blobs/1f/1fe03c0fb542471b31f32b62a54917c4', 'soak_pool/blobs/20/200d0e4f3db020618ce4eaca85fa3006', 'soak_pool/blobs/20/20225823b00d4d034be7ed1125075e28', 'soak_pool/blobs/21/21d8e7ce195f9b2f875908e0746e800b', 'soak_pool/blobs/25/25892a5e81965b3a3c2e9e17868966c1']
 
-## S30-20260706T233201-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+## S30-20260706T233201-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGe
 
 - **Logged (UTC):** 2026-07-06T23:32:38
 - **Severity:** suspected-bug
@@ -1041,7 +1041,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
 - **Run:** 20260706T233703_S33_seed20260707
 - **Observed:** GC dry-run proposed deleting 34 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/07/070323332e252eb0620007c0728aa372', 'soak_pool/blobs/10/1000348b3e9635e7adef8c91774d6747', 'soak_pool/blobs/19/19fe4b0496717c2cd3cdbe977451fd62', 'soak_pool/blobs/1a/1a742de0de639e55306b48fba511985d', 'soak_pool/blobs/20/200961efba8a14242a2d97a83c2fdfb2', 'soak_pool/blobs/24/24a908bed8ddfacfc5aaf7cc96a8f01d', 'soak_pool/blobs/2f/2f5e04d458d0eebfeea76204b7228ea2', 'soak_pool/blobs/35/35cb2108cb4974f86801b513f7e33b08', 'soak_pool/blobs/3a/3ac9f384f1f74e0a14be1aa360c192a4', 'soak_pool/blobs/44/440730c92b5561bda171664ea355263a']
 
-## S34-20260706T233911-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRo
+## S34-20260706T233911-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CASRo
 
 - **Logged (UTC):** 2026-07-06T23:39:55
 - **Severity:** suspected-bug
@@ -1070,7 +1070,7 @@ needs (independent, ranked):
 Also: the soak's own `pool_objects` probe returned None the entire run and `pool_bytes` None ~half the ticks
 (telemetry-robustness gap; the throttle fail-closes on None, resmon du is ground truth).
 Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md#chaos-soak-result`.
-## S34-20260707T061202-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRo
+## S34-20260707T061202-1: S34 D1 regression: per-round GC fanout grew across create/drop iterations (CASRo
 
 - **Logged (UTC):** 2026-07-07T06:14:00
 - **Severity:** suspected-bug
@@ -1119,7 +1119,7 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 - **Run:** 20260707T072518_S26_seed20260707
 - **Observed:** GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/04/040fa185ea949400f8f8f13f41e7a6eb', 'soak_pool/blobs/09/09eceded07bc90a7a9c054998a757811', 'soak_pool/blobs/0a/0a2c77daea60b234a72cd951fecf1fc3', 'soak_pool/blobs/0a/0a8b602963ffd45c68488dbe0db13ee1', 'soak_pool/blobs/0b/0b7d1c9998e7f02fcd3abb72bdf4094a', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/11/118b5356bdf4d4b87fc1feab72929d4a', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/16/160493b5223359bae725615333faff0e', 'soak_pool/blobs/18/182467fb900cf2494daae8acee7eab48']
 
-## S30-20260707T072639-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+## S30-20260707T072639-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGe
 
 - **Logged (UTC):** 2026-07-07T07:27:19
 - **Severity:** suspected-bug
@@ -2631,7 +2631,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   HTTP *requests* (each potentially a batched multi-key delete) while `Cas*Delete` counts
   logical *objects* — not yet confirmed, but a benign-looking explanation, not alarming.
   **HEAD remains the one persistently unexplained gap** (44% missing either way, and
-  there is no `CasMetaHead` counter at all in the CAS-kind breakdown) — worth a follow-up
+  there is no `CASMetaHead` counter at all in the CAS-kind breakdown) — worth a follow-up
   look at whether generic `DiskObjectStorage`/`MergeTreePrefetchedReadPool` existence
   checks bypass `Cas::InstrumentedBackend`'s own instrumentation entirely.
 - **Independent cross-validation, and the gap is now architecturally explained, not just
@@ -3135,7 +3135,7 @@ than to an error.
 - **Run:** 20260729T105013_S33_seed20260729
 - **Observed:** forced GC left 87 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible GC leak; full residual by prefix: {'_manifests': 87}. bookkeeping-only residual (other=0) is expected and bounded.
 
-## S30-20260729T105335-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+## S30-20260729T105335-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGe
 
 - **Logged (UTC):** 2026-07-29T10:56:58
 - **Severity:** suspected-bug
@@ -3198,7 +3198,7 @@ than to an error.
 - **Run:** 20260729T115342_S33_seed20260729
 - **Observed:** forced GC left 84 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible GC leak; full residual by prefix: {'_manifests': 84}. bookkeeping-only residual (other=0) is expected and bounded.
 
-## S30-20260729T115708-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+## S30-20260729T115708-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGe
 
 - **Logged (UTC):** 2026-07-29T12:00:43
 - **Severity:** suspected-bug
@@ -3219,7 +3219,7 @@ than to an error.
 - **Run:** 20260729T121208_S33_seed20260729
 - **Observed:** S33 REGRESSION of fixed BACKLOG GC-CONCURRENT-LEADER-LEAK: 84 RECLAIMABLE unreachable object(s) (blobs/_manifests) permanently orphaned by concurrent explicit GC leaders (safety held: dangling=0); full residual by_prefix={'_manifests': 84}. The attempt-scoped generation fix should make a deposed leader's fold seal invisible and let the next honest round drain — a nonzero reclaimable residual means that invariant broke.
 
-## S30-20260729T121529-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGe
+## S30-20260729T121529-1: S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CASRootGe
 
 - **Logged (UTC):** 2026-07-29T12:18:55
 - **Severity:** finding

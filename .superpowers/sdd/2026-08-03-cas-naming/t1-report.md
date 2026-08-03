@@ -136,3 +136,47 @@ The "Poisoned" vocabulary around the event was stale plan-language throughout:
   records above.
 - Cross-check re-run after the edits: no unresolved name remains except the four rows justified in the table.
 - `python3 -m pytest tests/ scenarios/tests/ -q` in `utils/ca-soak`: **336 passed**.
+
+---
+
+## Close-out — the two soak history files
+
+### `RUN_HISTORY.md` — deliberate survivor
+One `CasRefApplyPoisoned` remains, in the dated row for the S38 run that failed on it. Left as-is per the
+dated-history rule: the row records what that run reported.
+
+**Correction to my own earlier sweep:** Step 2's file glob (`utils/ca-soak/*`, straight from the plan)
+already rewrote the 165 registry names inside BOTH `RUN_HISTORY.md` and `BACKLOG.md` in commit `bd12384c7ed`,
+*before* the leave-history-alone rule was stated. That is not undone here — reverting it would leave the soak
+docs in a third, mixed state — but the rule was applied from this point on, and the exception is recorded
+rather than left to be rediscovered.
+
+### `BACKLOG.md` — what was actually there
+The instruction was "update metric names inside still-open items only". Two premises did not hold, so the
+edit is narrower than that and is justified on different grounds:
+
+1. **There is no open/closed partition to key on.** 223 entries; the per-entry fields are `Logged (UTC)`,
+   `Severity`, `Observed`, `Run`, `Proposed action` — no status field. Open/closed is expressed ad-hoc in
+   prose and in a dated triage preamble covering id-*classes*, not entries. Any "still-open" split would have
+   been 223 judgement calls by me, unreviewable and wrong in an unknown fraction.
+2. **Almost nothing left in the file is a metric name.** Classifying every surviving `Cas[A-Z]` token by
+   whether it is a real symbol in `src/`: the bulk are production C++ classes and headers the Global
+   Constraints explicitly protect (`CasRefLedger`, `CasGc`, `CasPool`, `CasBlobInDegree`, `CasRefProtocol`,
+   `CasServerRoot`, `CasStore.h`, …), and most of the rest are **gtest suite names**
+   (`CasBuild`, `CasProtocolScenarios`, `CasMountLease`, `CasShardQueue`, `CasStoreBackpressure`,
+   `CasDanglingPrecommit`, …) — Task 4's surface, not Task 1's.
+
+**What was changed (7 lines).** The real defect Task 1 left in this file: the `##` entry titles are
+*truncated copies* of their own `Observed:` text, cut mid-token, so `\bCasRootGet\b` could not match them.
+Every one of those headers ended up contradicting the body directly beneath it (`CasRootGe…` over
+`CASRootGet`). Fixed 7 header truncations (`CasRootGe`->`CASRootGe`, `CasRo`->`CASRo`), each verified against
+the body it titles. Plus one open follow-up item that proposes a counter which does not exist
+(`CasMetaHead` -> `CASMetaHead`) so it names the counter in the family a future executor would create it in.
+
+**Deliberately left:**
+- The S38 entry (`CasRefApplyPoisoned`, header + `Observed:`). The `Observed:` line is a *verbatim quotation*
+  of the probe's output. Rewriting it would falsify the evidence — and this record is the proof, cited above,
+  that the stale name was live breakage.
+- `CasPartFolderViewEvictions`: no event of that name exists in the registry under EITHER spelling
+  (`grep PartFolderViewEvictions src/` is empty), so a `CAS` spelling would invent a counter.
+- All gtest suite names and all production C++ identifiers, per the Global Constraints and Task 4's scope.
