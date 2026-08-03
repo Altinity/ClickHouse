@@ -30,7 +30,10 @@ check_tlc_temporal_gate() {
   /usr/bin/java -XX:+UseParallelGC ${TLC_JAVA_OPTS:-} -cp "$jar" tlc2.TLC \
     -metadir "$metadir" -workers 1 -config TlcTemporalSmoke.cfg TlcTemporalSmoke.tla >"$log" 2>&1
 
-  if grep -q "Temporal properties were violated" "$log"; then
+  # Both message forms: the pinned jar prints the singular "Temporal property <Name> was violated."
+  # for a single declared PROPERTY; older builds print only the generic plural. Matching one form
+  # would let a broken checker slip past this refusal fail-open.
+  if grep -qE 'Temporal propert(y|ies)( [A-Za-z0-9_]+)? (was|were) violated' "$log"; then
     echo "refusing temporal verdicts: $jar violates the <> TRUE smoke test ($log)" >&2
     return 1
   fi
