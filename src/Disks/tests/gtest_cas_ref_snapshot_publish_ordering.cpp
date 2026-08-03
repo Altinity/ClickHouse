@@ -452,10 +452,20 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 2) << "past the doubled deadline, exactly one more retry dispatches";
 
+    /// Pin the 4000ms cap FROM BELOW: without this probe, a regression that stopped doubling at
+    /// 2000ms, or that read `initial` where it means `max`, would still pass -- the only check so far
+    /// is AT the +4000 crossing below. 2000ms past the doubled deadline is still short of the capped
+    /// 4000ms backoff, so no third retry may dispatch yet.
+    fake_now += 2000;
+    store->resolveRef(ns, "ref_1");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(dispatchCount(), d1 + 2)
+        << "2000ms past the doubled deadline is still short of the capped 4000ms backoff";
+
     /// Cross the (capped) 4000ms deadline: the retry's fault budget is exhausted, so this attempt
     /// succeeds, and `resetPublishBackoff` clears the cooldown -- proved by the NEXT trigger dispatching
     /// with no wait at all.
-    fake_now += 4000;
+    fake_now += 2000;
     store->resolveRef(ns, "ref_1");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(dispatchCount(), d1 + 3) << "past the second (capped) deadline, the retry dispatches and succeeds";
@@ -467,4 +477,25 @@ TEST(CASRefSnapshotPublishOrdering, PublishBackoffDecisionsAreCharacterized)
     EXPECT_EQ(dispatchCount(), d1 + 4)
         << "resetPublishBackoff must have cleared the cooldown: the very next over-threshold trigger, at "
            "the SAME clock reading as the successful publish, dispatches immediately with no wait";
+
+    /// The assertion just above cannot tell a real reset from a no-op: the successful publish and this
+    /// next trigger share one `fake_now`, so `now >= until` would still hold even with the stale
+    /// (pre-reset) deadline in place. Arm one more failure and check that the schedule restarts from
+    /// the INITIAL 1000ms interval rather than continuing from the 4000ms cap -- refused short of
+    /// 1000ms, admitted at 1000ms -- which a no-op reset cannot produce (it would refuse both probes,
+    /// since the stale deadline is still far in the future).
+    backend->armPutFailure("_snap/", 1);
+    ASSERT_EQ(publishRef(store, ns, "ref_4", 4), (RefTxnId{store->writerEpoch(), 4}));
+    store->waitForSnapshotPublishSettleForTest(ns);
+    const uint64_t d2 = dispatchCount();
+    fake_now += 500;
+    store->resolveRef(ns, "ref_1");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(dispatchCount(), d2) << "short of 1000ms since the reset, no retry may dispatch yet";
+    fake_now += 500;
+    store->resolveRef(ns, "ref_1");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(dispatchCount(), d2 + 1)
+        << "resetPublishBackoff must have restarted the schedule at the INITIAL 1000ms interval, not "
+           "left it continuing from the 4000ms cap";
 }

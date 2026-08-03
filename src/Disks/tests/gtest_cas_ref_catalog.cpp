@@ -147,6 +147,35 @@ private:
     bool fence_moved = false;
 };
 
+class CasPutThrowsOnceBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    using CountingBackend::casPut;
+
+    void armCasPutThrow(const String & key)
+    {
+        throw_key = key;
+        armed = true;
+    }
+
+    CasResult casPut(
+        const String & key, const String & bytes, const std::optional<Token> & expected,
+        const ObjectMeta & meta) override
+    {
+        if (armed && key == throw_key)
+        {
+            armed = false;
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR,
+                "injected casPut failure during completed-removal erase");
+        }
+        return CountingBackend::casPut(key, bytes, expected, meta);
+    }
+
+private:
+    String throw_key;
+    bool armed = false;
+};
+
 class ScopedCasGcLogCapture
 {
 public:
@@ -1306,6 +1335,43 @@ TEST(CASRefCatalogRemoval, NonFenceAuthorityExceptionPropagatesAfterEraseResolut
     });
     EXPECT_EQ(authority_checks, 2u);
     EXPECT_TRUE(CasRefCatalog::read(backend, layout).catalog.entries.empty());
+}
+
+/// Mutation caught: swallowing a synchronous `casPut` exception raised during the erase attempt
+/// itself (as opposed to the authority/fence check) and treating it as ordinary non-convergence
+/// would hide a real backend fault behind ProofRefused/EntryChanged, and would skip the mandatory
+/// resolution read that this branch's siblings above already prove runs before any conclusion.
+TEST(CASRefCatalogRemoval, CasPutExceptionPropagatesAfterMandatoryResolution)
+{
+    CasPutThrowsOnceBackend backend;
+    const Layout layout("cas-put-throw");
+    const CatalogEntry removing{
+        .ns = RootNamespace{"a"},
+        .state = NsState::Removing,
+        .incarnation = UInt128{7},
+        .removal_started_round = 13};
+    ASSERT_EQ(backend.putIfAbsent(
+        layout.refCatalogKey(), encodeRefCatalog(RefCatalog{.entries = {removing}})).outcome,
+        PutOutcome::Done);
+    CasFoldSeal ready_parent;
+    ready_parent.ref_lives.emplace(UInt128{7}, RefLifeFoldState{
+        .coverage = RefCoverage{.classification = 2, .last_folded_ref_id = RefTxnId{1, 2}},
+        .cleanup_evidence = RefCleanupEvidence{.remove_txn_id = RefTxnId{1, 2}}});
+
+    backend.armCasPutThrow(layout.refCatalogKey());
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        (void)CasRefCatalog::deleteCompletedRemoving(
+            backend, layout, removing, ready_parent, 5, [](uint64_t)
+            {
+                return CasRefCatalog::LeaderFenceStatus::Held;
+            });
+    });
+    /// The mandatory resolution read ran before the rethrow: the exact old row is still present,
+    /// unchanged by the failed attempt.
+    const RefCatalog current = CasRefCatalog::read(backend, layout).catalog;
+    EXPECT_EQ(current.entries, std::vector<CatalogEntry>{removing});
 }
 
 TEST(CASRefCatalogRemoval, CancelStalledCreatingRequiresExactRowAndTerminalCreatorFence)

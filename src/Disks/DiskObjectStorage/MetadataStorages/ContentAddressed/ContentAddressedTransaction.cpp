@@ -812,8 +812,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         {
             /// The LIFE is resolved once, here at buffer-open time, and captured by value below, so a
             /// finalize that runs later writes to the incarnation this open was admitted under -- never
-            /// into whatever life the namespace name happens to denote when the callback fires
-            /// (directive §namespace-file-requirements).
+            /// into whatever life the namespace name happens to denote when the callback fires.
             const Cas::NamespaceLifeId life
                 = metadata_storage.store()->namespaceLife(metadata_storage.liveNamespace(tf->table_uuid));
             const std::string name = tf->tail;

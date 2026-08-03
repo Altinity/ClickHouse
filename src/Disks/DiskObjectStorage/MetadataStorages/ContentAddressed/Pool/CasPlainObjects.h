@@ -47,9 +47,8 @@ public:
     /// exhausted conflict-retry bound is propagated as an exception.
     ///
     /// `life` is supplied by the caller and never re-derived here, so this surface issues no catalog
-    /// request of its own (directive §namespace-file-requirements: hot reads and writes use an
-    /// already-held life handle). A stale writer therefore targets its own old incarnation's key and
-    /// cannot write into a newer life's prefix.
+    /// request of its own. A stale writer therefore targets its own old incarnation's key and cannot
+    /// write into a newer life's prefix.
     void putNamespaceFile(const NamespaceLifeId & life, const String & name, const String & bytes);
 
     /// Reads a namespace file of ONE LIFE without interpreting its body. Returns `nullopt` when the

@@ -79,9 +79,11 @@ class Layout;
 /// say `.ns`, and are visible in review because they say it.
 ///
 /// Permanent logical/physical pairs come only from `fromCatalogEntry` (recovery, fold, fsck and the
-/// sweeps) or the reader-handle factory Stage B Task 6 adds. `Layout` parsers deliberately return only
-/// an untrusted `NamespaceLifePhysicalId`; a listed key can name any physical id, including one no
-/// longer in the catalog, and only one immutable catalog cut may attach a logical name to it.
+/// sweeps). A held reader (e.g. `RefTableRuntime`) keeps the `NamespaceLifeId` it resolved this way
+/// at table-open time and threads it through, rather than re-deriving it. `Layout` parsers
+/// deliberately return only an untrusted `NamespaceLifePhysicalId`; a listed key can name any
+/// physical id, including one no longer in the catalog, and only one immutable catalog cut may
+/// attach a logical name to it.
 struct NamespaceLifeId
 {
     RootNamespace ns;
@@ -96,10 +98,6 @@ struct NamespaceLifeId
     {
         return NamespaceLifeId{std::move(ns), incarnation};
     }
-
-    /// Stage B Task 6 adds the second permanent factory, `fromLiveHandle`: a live reader carries the
-    /// id its table was opened under and never re-derives it, so the read side pays no catalog
-    /// request (spec §2). It is absent here because the handle type does not exist yet.
 
 private:
     /// Kept private so only the explicit factories above can construct a logical/physical pair.
