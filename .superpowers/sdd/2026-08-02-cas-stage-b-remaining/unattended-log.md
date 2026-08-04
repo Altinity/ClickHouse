@@ -799,3 +799,57 @@ an existing Creating entry (designed route: reconcileStaleCreator+completeCreati
 fails likely downstream of the abort. rca-createns dispatched (artifacts -> stack -> call-path
 trace -> classify race shape -> local fix if non-protocol). Other cas lanes still RUNNING;
 non-CAS flake set unchanged. Unit-pair fix still awaiting next push.
+
+### CI RCA 2 — createNamespace {#ci-rca-2-createns}
+Root cause found and fixed. Downloaded `stateless_tests_amd_tsan_cas_s3_storage_parallel_2_2`'s
+`clickhouse-server.log`: the aborting query is `03611_freeze_partition_parallel_verbose`'s
+`ALTER TABLE table_for_freeze FREEZE WITH NAME 'test_c85cp97z' ... max_threads = 3`. Log timestamps
+show three threads (3333, 17141, 15901) concurrently freezing parts 0/1/2 of the SAME table, all
+needing the table's ONE shadow-store namespace `shadow/test_c85cp97z/store/f72/f72d8856-...`. Thread
+15901 won; thread 3333 hit the `createNamespace` `LOGICAL_ERROR` ("already carries a catalog entry,
+state 'creating'"); thread 17141 simultaneously hit a SECOND, different `LOGICAL_ERROR` from
+`casAdmitEntry`'s own canonical-order grammar check — both are the SAME race, caught at two different
+points.
+
+Actor A vs actor B: sibling per-part FREEZE threads of one query share one mount's `CreatorFence`
+(same `server_root_id`+`writer_epoch`) and race `CasRefLedger::resolveNamespaceLife`'s own "no entry"
+catalog read for the SAME namespace (`CasRefLedger.cpp:1225` region) before either lands step 1. The
+loser's own `CasRefCatalog::createNamespace` (`CasRefCatalog.cpp:497`) does a SECOND, later read; if
+that lands after the winner's `casAdmitEntry`, it observes the entry already `Creating` and — before
+this fix — threw `LOGICAL_ERROR` unconditionally, contradicting the function's OWN header doc
+(`CasRefCatalog.h:246-249`), which already names "`Creating` is not this function's problem to solve
+-- reconcileStaleCreator + completeCreation are for" as the documented resume path
+`resolveNamespaceLife`'s loop is built to take. The guard just never returned control to that loop for
+this case.
+
+Classification: REAL product race (not a test-environment artifact, not flaky — 3-thread FREEZE
+parallelism is by design). Blast radius: any concurrent-CREATE path into a shared namespace under one
+mount's fence can hit this — `ALTER TABLE ... FREEZE` with `max_threads > 1` on a fresh (never-yet-
+frozen) table is the concrete trigger; a production server under that load pattern can abort the same
+way, not only a tsan-timing artifact (the LOGICAL_ERROR fires on any interleaving where the loser's
+inner read lands after the winner's step 1, tsan just widens the window enough to observe it in CI).
+The three sibling test-suite failures in that lane are downstream of this one `Server died` — no
+independent CAS defect found in their own logs.
+
+Fix (non-protocol, pure control-flow inside `CasRefCatalog::createNamespace`): when the pre-check
+finds an existing entry in state `Creating`, return `NamespaceCreationOutcome::Superseded` (the
+outcome the loop already handles by re-reading and taking the "own fence -> completeCreation" branch)
+instead of throwing. `Live`/`Removing` still throw `LOGICAL_ERROR` — unchanged, and still exercised by
+the existing `CreateNamespaceRejectsAnAlreadyExistingEntry(Aborts)` tests. New regression test
+`CASNsCreationLifecycle.CreateNamespaceRacingASiblingsStillCreatingEntryReportsSupersededNotAbort`
+(`gtest_cas_ns_creation_lifecycle.cpp`) reproduces the exact shape deterministically (no threads): use
+`admittedOnceThenFenced()` to leave an entry `Creating` without reaching `Live`, then call
+`createNamespace` again with the SAME fence and assert `Superseded`, not a throw.
+
+Committed `68759dbd66e` on `laneg/ci-fix-createns` in a FRESH worktree
+`/home/mfilimonov/workspace/ClickHouse/lane-g-createns` (lane-g itself was occupied by
+`laneg/t8-soaks` with uncommitted state, per standing instruction to spin a new worktree in that
+case). No usable build directory exists in the new worktree — `lane-g`'s `build`/`build_asan` are
+pinned via `CMAKE_HOME_DIRECTORY` to the occupied `lane-g` checkout and cannot safely target a
+different worktree's source — so the fix is syntax-reviewed (brace/paren balance checked, test
+helper ordering verified) but NOT build-verified; no pushes made.
+
+Process note: the fix was FIRST written by mistake directly against the shared `master` worktree
+(no build was run there, no commit made) before being caught, diffed out, reverted with
+`git checkout --`, and reapplied via `git apply` in the correct `lane-g-createns` worktree. `master`
+was confirmed clean afterward.
