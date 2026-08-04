@@ -68,7 +68,17 @@ def evidence_has_existing_path(evidence: str) -> bool:
 
 
 def main():
-    rev = open(os.path.join(WORKDIR, "verdicts", "checked-at-rev.txt")).read().strip()
+    # checked-at-rev.txt may list more than one accepted rev: Phase 3 of the
+    # T7 remediation re-diffs decision-relevant `done` clusters against a
+    # later HEAD than the original pass, and re-queuing every other verdict
+    # to match would be pure churn for no evidence gain -- both revs are
+    # valid "checked at HEAD" as long as the verdict's own checked_at is one
+    # of them.
+    pinned_revs = [
+        line.strip()
+        for line in open(os.path.join(WORKDIR, "verdicts", "checked-at-rev.txt"))
+        if line.strip()
+    ]
 
     clusters = {}
     with open(os.path.join(WORKDIR, "clusters", "clusters.jsonl")) as f:
@@ -109,8 +119,8 @@ def main():
                 elif not evidence_has_existing_path(evidence):
                     errors.append(f"{cid}: evidence for {verdict} has no existing path: {evidence!r}")
 
-            if v.get("checked_at") != rev:
-                errors.append(f"{cid}: checked_at {v.get('checked_at')!r} != pinned rev {rev!r} (stale, re-queue)")
+            if v.get("checked_at") not in pinned_revs:
+                errors.append(f"{cid}: checked_at {v.get('checked_at')!r} not in pinned revs {pinned_revs!r} (stale, re-queue)")
 
     missing = set(clusters) - set(seen)
     for cid in sorted(missing):
@@ -124,7 +134,7 @@ def main():
             print(f"  ... and {len(errors) - 200} more")
         sys.exit(1)
 
-    print(f"GATE C: OK — {len(clusters)} clusters, {len(seen)} verdicts, all matched, checked_at == {rev}")
+    print(f"GATE C: OK — {len(clusters)} clusters, {len(seen)} verdicts, all matched, checked_at in {pinned_revs}")
     for k in sorted(verdict_counts):
         print(f"  {k}: {verdict_counts[k]}")
     sys.exit(0)

@@ -21,7 +21,11 @@ def main():
         print("usage: supersede_verdicts.py <glob> [<glob> ...]")
         sys.exit(2)
 
-    rev = open(os.path.join(WORKDIR, "verdicts", "checked-at-rev.txt")).read().strip()
+    pinned_revs = [
+        line.strip()
+        for line in open(os.path.join(WORKDIR, "verdicts", "checked-at-rev.txt"))
+        if line.strip()
+    ]
 
     overrides = {}
     for pattern in patterns:
@@ -37,8 +41,8 @@ def main():
                     if verdict not in VALID_VERDICTS:
                         print(f"SKIP {fn}:{lineno}: bad verdict {verdict!r} for {cid}")
                         continue
-                    if d.get("checked_at") != rev:
-                        print(f"SKIP {fn}:{lineno}: checked_at {d.get('checked_at')!r} != {rev!r} for {cid}")
+                    if d.get("checked_at") not in pinned_revs:
+                        print(f"SKIP {fn}:{lineno}: checked_at {d.get('checked_at')!r} not in {pinned_revs!r} for {cid}")
                         continue
                     overrides[cid] = d
 

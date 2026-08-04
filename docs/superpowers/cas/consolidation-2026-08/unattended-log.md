@@ -272,3 +272,22 @@ Watchdog: session cron fe033cd7, every 20 min (:13/:33/:53). Ledger of record:
 ## 2026-08-04 14:15
 - T11 line fully closed (7 commits; user fixes: zero-copy motivation, design-history language, arch-index consistency).
 - Active: T12 runbooks (research done, pages authoring); T6 deep tail (wake-up sent for batches 17-35).
+
+## 2026-08-04 14:03 (watchdog)
+- T6 deep pass COMPLETE: 35/35 batches (t6 self-ran 027-035 around the 200-agent cap). Merge+gate_c+final report ordered.
+- T12: throttling-row fix committed (c201c4a), scoped re-review in flight. All page tasks (T9-T12,T14) otherwise done.
+- Next: Gate C report -> T7 (via existing agents, no new spawns) -> T13 (codex-heavy) -> T15 Gate D packet.
+
+## 2026-08-04 14:43 (watchdog)
+- T7: slices 3/4/5 done (19 false-opens corrected; naming group 126/135 upheld); slices 1/2/6 with repurposed implementer agents, results pending.
+- design-history.md cleaned by controller per user (7527a539358): major turns only.
+- Next: T7 consolidation + gate-c-audit-report -> T13.
+
+## 2026-08-04 14:50
+- T7 audit: STOP tripped (13-14% on done/stale slices; 73-80% false-opens from search-scope gaps; 30% on self-executed slice). User approved option C.
+- Remediation running at t6-verify: corrections merge -> codex scope+casing re-sweeps -> targeted done re-check (todo/bug + deletion-relevant). T13/T15 blocked until green.
+
+## 2026-08-04 14:43 (watchdog)
+- T7 remediation phase 1 done (corrections applied, commit 917411c). Phase 2 (codex re-sweeps) starting at t6; no codex process this instant — likely between prep and launch, not yet stall-aged.
+- t12 cache-example lane: live validation dir already populated (migration-validate-cache/ with config+server data) — progressing.
+- Next: phase-2 sweeps -> phase-3 targeted done re-check -> T13.

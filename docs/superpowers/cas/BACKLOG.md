@@ -3609,3 +3609,60 @@ rule — that rule is what keeps a live twin from being decommissioned across tw
 
 Falsification: if a rerun passes on unchanged code, it is a cadence race rather than a deterministic
 gap, which changes the fix but not the mismatch.
+
+## `[gc-round-budgets-are-not-backpressure]` Round budgets throttle the consumer while the producer is unaware — four defaults changed, the real fix is a time deadline {#gc-round-budgets-not-backpressure}
+
+A per-round count cap is not backpressure. It bounds what GC does in one round while inserts and
+merges — the producers of the work — know nothing about it. If arrival exceeds `budget × rounds/sec`,
+the deficit is not smoothed, it accumulates. Whether that is harmless, degrading, or a leak depends
+entirely on **what happens to the excess**, which turns out to differ per budget. Classified against
+the code, not the names:
+
+**A. Feedback loop (was capped, now unbounded).** `gc_round_graduation_budget`,
+`gc_round_redelete_budget`. Excess is pushed back into `still_retired` "carry UNCHANGED"
+(`CasBlobInDegree.cpp:472`), and the next round reads that list in full — `CasGc.h` marks the cost
+`O(retired)`. So the round's cost grows with the debt while its useful work stays capped: rounds
+lengthen, their rate drops, throughput drops, the debt grows faster. Worse than linear lag.
+
+**B. Genuinely cursor-paced (unchanged, these caps are correct).** `manifest_sweep_list_budget_keys`,
+`manifest_sweep_delete_budget_keys`, `gc_round_sweep_namespace_budget`,
+`gc_round_sweep_recovery_op_budget`, `gc_round_prefix_wholesale_budget`. A cursor advances and never
+regresses; a partially drained page or generation is simply finished next round. Nothing is
+re-read, nothing accumulates. `gc_round_ref_cleanup_budget` is adjacent: it keeps no cursor but
+`planRefCleanup` recomputes the same remaining candidates from durable state, so work is deferred,
+not lost.
+
+**C. A cap on one-shot work, i.e. a leak (was capped, now unbounded).**
+`gc_round_handoff_prefix_wholesale_budget`. The struct's own comment says the hand-off "is a ONE-SHOT
+event with no reclaimer behind it besides `fsck`: a generation it cannot fully reclaim this round is
+never revisited (the parent-seal difference that triggers it does not recur)". This is the same shape
+as the manifest-cleanup cap that was removed outright after a soak proved it leaked permanently.
+
+**D. Audit loss (was capped, now unbounded).** `gc_round_outcome_entry_budget`. Nothing is retried on
+exhaustion because the decision already happened; the only casualty is the audit row explaining it —
+and it is dropped precisely on the busiest rounds, the ones an investigation would need.
+
+**E. Not a throttle at all — an off switch (raised to effectively unbounded).**
+`gc_frontier_probe_budget`. Exhaustion does not defer work: unprobed namespaces are simply unproven,
+and one unproven namespace suppresses ALL destruction for the round (`CasGc.cpp:2047-2048`). It scales
+with namespace count, i.e. with table count, so a value that is ample for ten namespaces becomes a
+permanent GC stop for a large enough pool. **Its `0` cannot be redefined as "unbounded"**: unlike
+every other budget here, `0` means "probe nothing", and the tests drive that exhaustion path
+deliberately — so the default is spelled as a maximum instead. That inconsistency is itself an
+operator trap and wants a proper sentinel.
+
+**F. Memory bound, must stay capped.** `rebuild_edge_budget` — its comment is explicit that memory is
+`O(budget)`, never `O(edges)`.
+
+### What is still missing, and it is the real fix {#gc-budgets-need-a-deadline}
+
+**A GC round has no time deadline anywhere in the code.** The count budgets have been serving as a
+surrogate for one. That is why removing them is not free: a round holds the GC lease, and a round
+that outruns the lease TTL gets fenced — the wedge class already fixed once in P3.1. The correct shape
+is a per-round WALL-CLOCK deadline plus a cursor everywhere class A currently carries a list: the
+round then does as much as it can inside its lease, stops cleanly, and resumes where it stopped
+without re-reading the debt. Until that exists, the unbounded defaults above trade a silent
+accumulation risk for a round-length risk, deliberately and with the user's decision.
+
+Falsification for class A: with the caps off, a sustained-load soak should show round wall time
+tracking arrival rate rather than climbing while `pending_condemned` climbs.
