@@ -31,7 +31,7 @@ compressed). Issue IDs are never renumbered.
 | [`BACKLOG/testing-and-ci.md`](BACKLOG/testing-and-ci.md) | 38 | Test coverage & harness, gate-filter/gate-suite gaps, soak/chaos hygiene, standing testing-methodology rules. Top items: `[gate-filter-gap-3-backend-contract]`, `[rule-no-chassert-over-handled-branch]`, `[4h continuous chaos soak]`. |
 | [`BACKLOG/operability-and-introspection.md`](BACKLOG/operability-and-introspection.md) | 24 | Operability & release gates, disk-error audit follow-ups, fsck/introspection surfaces, the `lazy_load_tables` decision. Top items: `[B197]` SYSTEM control surface, `lazy_load_tables` USER DECISION, `[fsck-partial-degrade-false-consistency]`. |
 | [`BACKLOG/performance.md`](BACKLOG/performance.md) | 26 | Read/write path, write-path optimization candidates, stage 2 (postponed), scalability findings from the full-scale campaign. Top items: `[ckpt-read-policy]`, `[ref-catalog-write-hotspot]`, stage-2 concurrent commitPart (postponed). |
-| [`BACKLOG/docs-and-cleanup.md`](BACKLOG/docs-and-cleanup.md) | 22 | Architecture/refactoring (no behavior change), minor/polish, source-layout residue, standing hygiene checklist items. Top items: `[refactor: CasGc split]`, `[Group G]` upstream carve-outs, `[phase4-blob-uploader-descoped]`. |
+| [`BACKLOG/docs-and-cleanup.md`](BACKLOG/docs-and-cleanup.md) | 23 | Architecture/refactoring (no behavior change), minor/polish, source-layout residue, standing hygiene checklist items. Top items: `[refactor: CasGc split]`, `[Group G]` upstream carve-outs, `[phase4-blob-uploader-descoped]`. |
 
 Priority legend: **GATE** = release gate; **HARD** = agreed-necessary, not yet done; **DESIRABLE** =
 valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validation/harness/CI;
