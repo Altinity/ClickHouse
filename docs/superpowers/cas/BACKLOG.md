@@ -3570,3 +3570,42 @@ what the real win would be, is unmeasured. **Falsification:** if the size-probe 
 for correctness on every generic S3 disk consumer (e.g. detecting a truncated/resized object
 mid-read), this is a ClickHouse-wide question and does not belong on this CAS backlog at all. Full
 measurement: `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-fold-head-successor`.
+
+## `[decommission-waits-on-the-wrong-predicate]` `cas_mounts` liveness and `NoWait` decommission disagree about what "dead" means {#decommission-wrong-predicate}
+
+`SYSTEM CAS DROP POOL MEMBER` under the `NoWait` policy refused a genuinely dead node in CI
+(`test_cas_drop_pool_member::test_drop_dead_pool_member_heals_the_pool`, PR 2073, integration
+amd_tsan 4/6), 15.5 seconds AFTER the target's lease wall-clock expiry:
+
+```
+CAS decommission 'node2': pool member is alive or contended -- mount lease held by
+uuid=... epoch=1 pid=10 hostname=node2 (expires_at_ms=1785811895007). Refusing ...
+```
+
+This is not a stuck lease. The two sides use different definitions of dead, and each is right on its
+own terms:
+
+- **The observable one** is wall-clock: `CasServerRoot.cpp:236` computes `live = !gc_fenced &&
+  expires_at_ms > now_ms`, and that is what a `cas_mounts` reader sees. The same file's own operator
+  text carries a `CLOCK SKEW CAVEAT` about precisely this comparison.
+- **The one reclaim requires** refuses that comparison outright. `claimMount`'s comment
+  (`CasServerRoot.cpp:410-424`) says a same-uuid/different-epoch lease is reclaimed "ONLY on a
+  certificate of death that needs no fresh wall-clock trust -- never by comparing `expires_at_ms`
+  against `now_ms`": `gc_fenced`, the clean marker, or a `proven_dead_token`. A `kill=True` stop
+  leaves none of the three, and `NoWait` passes an empty `proven_dead_token` (`CasPool.cpp:668`),
+  skipping the observation wait that would mint one.
+
+So the only route to `NoWait` success for a hard-killed node is a GC round fencing the dead mount
+first. In the failing run GC rounds were executing on their ~1s cadence but reporting
+`deferred`/`candidates=0` — the fence had not happened yet. The test's precondition polls
+`cas_mounts.state != 'live'` for up to 90s, which the wall-clock definition satisfies on its own, so
+passing that gate does not establish what the call it guards actually needs.
+
+**Not yet decided, and the decision is the work here:** whether this is a test that waits on the wrong
+predicate (fix: wait for the fence, or use the waiting policy), or a product gap (fix: `NoWait`
+decommission should accept a hard-killed member without requiring GC to get there first, or say in
+its refusal what the operator must wait for). Do not "fix" it by weakening the certificate-of-death
+rule — that rule is what keeps a live twin from being decommissioned across two clocks.
+
+Falsification: if a rerun passes on unchanged code, it is a cadence race rather than a deterministic
+gap, which changes the fix but not the mismatch.
