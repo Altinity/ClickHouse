@@ -332,16 +332,12 @@ group cas-wiring-system-logs \
     'src/Common/SystemLogBase.cpp' 'src/Common/SystemLogBase.h' \
     'src/Interpreters/Context.cpp' 'src/Interpreters/Context.h' \
     'src/Interpreters/ServerAsynchronousMetrics.cpp' \
-    'src/Interpreters/ServerAsynchronousMetrics.h' \
-    'tests/queries/0_stateless/04328_reader_executor_kpi_async_metric.sql' \
-    'tests/queries/0_stateless/04328_reader_executor_kpi_async_metric.reference' \
     'src/Storages/System/*' <<'MSG'
 CAS integration: system logs and introspection
 
 The CAS system logs (definitions, SystemLog registration, Context
-getters), the CAS mounts system table, and asynchronous metrics. Also
-drops the ReaderExecutor modeled-cost async metric (raw counters stay)
-together with its stateless test.
+getters), the CAS mounts system table, and the per-disk GC-health
+asynchronous metrics.
 MSG
 
 group cas-wiring-system-commands \
