@@ -16,7 +16,7 @@ Read this before touching the branch. It is deliberately short; every entry is o
 | What | Where |
 |---|---|
 | Implementation (almost all of it) | `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/{Primitives,Formats,Backend,Pool,Parts,Gc,Tools}` |
-| Live pending work (single source of truth) | `docs/superpowers/cas/BACKLOG.md` — issue IDs are never renumbered |
+| Live pending work (single source of truth) | `docs/superpowers/cas/BACKLOG.md` is the index; the items live in `docs/superpowers/cas/BACKLOG/*.md` by topic, plus an `## Inbox` in `BACKLOG.md` for un-triaged quick adds — issue IDs are never renumbered |
 | User/ops documentation | `docs/en/antalya/cas/` (architecture, runbooks, roadmap) |
 | Audit trail of the 2026-08 docs consolidation | `docs/superpowers/cas/consolidation-2026-08/COVERAGE-MATRIX.md` |
 | System tables | `system.cas_log`, `system.cas_gc_log`, `system.cas_mounts` |

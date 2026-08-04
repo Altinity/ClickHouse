@@ -1,0 +1,132 @@
+---
+description: 'Live backlog — read/write path performance, insert/write-path optimization candidates, and scalability findings from the full-scale campaign.'
+sidebar_label: 'Performance'
+sidebar_position: 8
+slug: /superpowers/cas/backlog/performance
+title: 'CAS Backlog — Performance'
+doc_type: 'guide'
+---
+
+# CAS Backlog — Performance {#performance}
+
+Part of the [CAS live backlog](/superpowers/cas/backlog). Topic file for read/write-path performance,
+insert/write-path optimization candidates, and scalability findings from the full-scale campaign.
+
+## Read / write path {#read-write}
+
+- **[ckpt-read-policy] Modular `_ckpt` first-attempt view: conservative / cached / prefetch** — DESIRABLE — USER-DIRECTED design shape, 2026-08-03: `_ckpt` handling must be modular/replaceable. Protocol-adjacent (touches the commit path); ships as an explicit reviewed decision with before/after numbers, per the `HEAD`-before-`PUT` protocol-step veto.
+
+  Cost being addressed: every committed ref-log chunk pays `GET _ckpt` + token-CAS serially after the log `PUT`, so a lone `INSERT` pays +4 serial RTTs. A pluggable policy chooses only where `publishCkpt`'s first attempt gets its `{body, token}` view — the invariant core (retry-after-conflict always does a whole-body exact re-read, `lifeEpochWouldDecrease` re-checked after any re-read, durability order `log PUT → _ckpt CAS → ack`) is shared and policy-independent.
+
+  Policies: (1) **conservative** = today, fresh GET per publish; (2) **cached** = seed with one GET on first touch, then serve from the writer's own last winning CAS and go straight to PUT-if-match (expected to almost always hit, since lease exclusivity excludes cross-process writers — a miss is a signal, not noise); (3) **prefetch** = one paginated LIST at mount seeds all `_ckpt` views, then memory-only + PUT-if-match (LIST is a pure hint here, correctness still rides the conditional write). Mandatory cache-invalidation edges for (2)/(3): fence-generation change, wedge, remount supersession, `catalog_life_invalidated`. Always-exact-read, out of the policy seam: recovery's `_ckpt` sample and GC-fold's frontier GET.
+
+  Effect: +4 → +2 RTTs per lone insert. MEASUREMENT PRECONDITION: the stage-1 1.59x figure predates `_ckpt` (measured before it landed) — re-run the wide-insert baseline on current HEAD before benching policies against it.
+- **[write-path stage 1] parallel intra-part blob upload — LANDED (2026-07-24)** — Fanned out a part's blob PUTs/dedup-HEADs (`CasBlobUploadPool`/`fanOutBlobUploads`): CA wide-insert wall 58.41s → 30.26s, CA-vs-plain 3.0x → 1.59x. Residual gap = the serial cross-part commit (stage 2, `{#stage2-concurrent-commitpart-postponed}`, POSTPONED by user decision) plus the CAS-only dedup HEAD/GET traffic (`[B121 / B202 / one-GET-open]` below).
+- **[TXN-ONE-PIPELINE] complete the "staging ops never defer" invariant** — HARD (small, structural) — `DiskObjectStorageTransaction`'s two dispatch pipelines (eager staging ops vs. deferred-to-commit durable ops) caused the `01603` column-TTL abort ordering inversion; the correct invariant is per-state-domain, not a total order. Target shape approved by the user and superseding earlier staged-intents wording: an everything-immediate model with a single `dispatch` funnel (no CA subclass), a two-phase `IDiskTransaction::precommit()`/`commit()` contract (CA precommit = the entire publish; CA commit = durable-intent materialization only), `commit` implicitly running `precommit` when not called (with `CasImplicitPrecommitInCommit` observability), plus a de-patching pass removing accumulated eager-dispatch/read-your-writes workarounds from non-CA files (`docs/superpowers/cas/upstream-patch-inventory.md`). SPEC: `docs/superpowers/specs/2026-07-15-cas-txn-one-pipeline-design.md` — lands before codecs v3 and the source-layout refactoring.
+- **[B121 / B202 / one-GET-open] read request-count reduction** — DESIRABLE (design pass) — B202 inline-by-size (drop the file-type predicate, inline < ~512 KiB, weigh the wide-part-medium-column regression, `.bin` carve-out) + a per-blob-GET read-cost reduction (B121) + one-GET part open (pack small files). Pure perf/request-count; no safety dimension. Companion to the (landed, opt-in) file-cache disk for re-read-heavy workloads.
+- **[B98] Streaming `putOverwrite` (condemned-displacement)** — DESIRABLE — The rare INV-1 revival/displacement path still materializes the whole body; not a blocker.
+- **[promote-recreate] promote-time in-place recreate of a condemned SOURCED (tokened) blob** — DESIRABLE — The tokened promote gate stays fail-closed `ABORTED`; recreate happens on the retried build via `putBlob` cold-reuse. The tokenless-evidence copy-forward case is DONE. Ideal root-cause fix (writer-triggered synchronous fold-barrier at promote) is blocked by the lack of a writer↔GC synchronous-fold API — deferred behind the landed bounded resurrect.
+- **[R1/X1] ephemeral reader pin (cross-node GC fence)** — DESIRABLE / VERIFY — Per-server-owned namespaces narrow the window and a live ref resolving to an absent object surfaces `FILE_DOESNT_EXIST` (INV-NO-DANGLE), so for normal MergeTree this is covered by DataPart lifetime; the ephemeral-pin mechanism is design-only. Audit whether any ref-less/cross-node reader path exists before implementing.
+- **[ch128ctx] slot-bound blob-hash middle tier** — DESIRABLE (small spec) — New `BlobHashAlgo` variant: `cityHash128(content) ∥ xxh3_64(part_name, file_name) ∥ size` (256-bit; variable-width `BlobDigest` already supports it). Binds blob identity to its minting slot, so *cross-slot* collisions (the realistic adversarial dedup vector: attacker-crafted content deduped into a victim's future blob) become useless, at ~zero CPU cost over `cityHash128`. Every load-bearing dedup survives: relink/carry-forward are reference-based; retry idempotency, same-name replica writes, and snapshot-upload→TTL-move prepayment are same-slot; only cross-slot content coincidence is lost (an explicit non-goal, `01 §what-it-does-not-buy`). Middle tier of `cityHash128` → `ch128ctx` → `sha256`. Main touch: the hasher interface needs `(part_name, file_name)` context injection into `putBlob`. Origin: backup manifest-reuse discussion, `10-backups.md §multi-disk` (2026-07-14).
+- **[codex-26] `casAppendObject` needed before any concurrent appender** — LOW (latent) — `CasPlainObjects::casPutObject`'s CAS loop re-reads only the TOKEN on conflict, retrying with the SAME frozen `bytes` payload the caller froze at buffer-open (`ContentAddressedTransaction::writeFile`'s Append branch) — a fresh-token/stale-payload lost-update shape (2026-07-17 codex-review triage, finding №26). Not reachable today: the only production appender is the mutation-entry CSN write (`MergeTreeMutationEntry::writeCSN`), one append per mutation-unique key under the per-table single-writer lease, so there is no second appender to lose. Required before any future concurrent appender lands: a real `casAppendObject` that re-reads the base content (not just the token) inside the retry loop. See the single-appender invariant comment at `casPutObject`.
+
+## Write-path optimization candidates after stage 1 (2026-07-24) {#writepath-candidates-post-stage1}
+
+Context: stage 1 (parallel intra-part blob upload) took the wide 10M×30col×500part CA-S3 `INSERT` from
+58.41 s to 30.26 s (3.0× → 1.59× vs plain S3); the workload is still ~87% network-bound. Reports:
+`docs/superpowers/reports/2026-07-23-cas-wide-insert-baseline.md` (baseline),
+`docs/superpowers/reports/2026-07-24-cas-wide-insert-stage1-effect.md` (stage-1 effect). The residual
+splits between the serial cross-part commit (stage 2's target, program point 7 — active, NOT a backlog
+item) and the items below. STANDING USER VETO: the `HEAD`-before-`PUT` dedup gate (~12% of wall,
+268.8 `HEAD`/part) and any change to the durable-op protocol are NOT candidates.
+
+- (1) **Enable S3-native staging on the wide-insert profile and measure** — the feature exists
+  (opt-in, write-once conditional server-side copy; validated e2e). Local staging then upload moves
+  every blob's bytes twice; native staging may cut wall on S3 backends. Zero new code: flip the
+  setting in an s41 variant leg and compare. Status: MEASURE.
+- (2) **S3 client concurrency/connection tuning for the upload pool** — with 16-33 threads now
+  issuing PUTs concurrently, client-side limits (connections, per-request concurrency) may cap
+  overlap. Config-level experiment on s41. Status: MEASURE.
+- (3) **Inline-placement threshold tuning** — small part files inline into the manifest
+  (`CaInlinePlacement` machinery). The wide profile pays ~239 `PUT`/part (~8 objects/column);
+  raising the inline threshold could fold the small tail (marks, minor streams) into the manifest.
+  First verify the threshold is a setting (not a pinned format constant), then measure PUT-count and
+  wall deltas on s41. Status: INVESTIGATE THEN MEASURE.
+- (4) **Repoint waste on part removal** — known class (`project_part_removal_repoint_waste`):
+  repoints against `delete_tmp_*` refs ≈ 22% of the writer `PUT` class. Eliminating them changes
+  WHICH ledger ops are issued — protocol-adjacent, needs an explicit user decision with a risk
+  analysis before any work. Status: DECISION NEEDED (present risk analysis to user).
+- (5) **Unconditional manifest `GET` on promote** — part of the 108.7 `GET`/part during insert;
+  separate long-standing item. Verification semantics of the write path → under the spirit of the
+  protocol veto; do not touch without an explicit user go-ahead. Status: DECISION NEEDED (present
+  risk analysis to user).
+
+## Stage 2 (concurrent commitPart) — research notes; POSTPONED by user decision (2026-07-24) {#stage2-concurrent-commitpart-postponed}
+
+USER DECISION: postponed — "слишком сильное / малопредсказуемое влияние на upstream / generic code". Recorded
+here so the research is not lost; revisit only with an explicit user go-ahead.
+
+Motivation (measured): after stage 1 the wide CA-S3 `INSERT` residual is 1.59× vs plain S3, dominated by the
+serial cross-part commit (`ReplicatedMergeTreeSink::finishDelayed` iterates partitions one at a time; ref-ledger
+batch size = exactly 1.0, so per-part manifest/ledger round-trips never batch). Stage 2 = bounded concurrent
+dispatch of the per-partition commit; the CAS ledger then batches emergently and blobs multiplex on the stage-1
+pool.
+
+Agreed scoping (before postponement): (a) start with `ReplicatedMergeTreeSink` ONLY (the measured path);
+(b) then re-run s41 with a non-replicated leg; (c) then the `MergeTreeSink` counterpart as a separate follow-up.
+
+Path anatomy + hazard inventory (from code reading, 2026-07-24):
+- Replicated loop body per partition: `finalize` → dedup hashes/block-ids → `commitPart` (Keeper block-number
+  alloc → `renameParts` disk txn [the whole CAS write path lives here] → Keeper multi ~`:995-1011` → rollback
+  machinery) → dedup-conflict retry loop (`deduplicateBlock` filters the block, then `writeNewTempPart`
+  RE-SERIALIZES AND RE-UPLOADS the part, then retries commit) → `resolveQuorum` WAITS inside the iteration →
+  `PartLog::addNewPart`.
+- Concurrency hazards found: `deduplication_async_inserts_cache_version = 0` reset per iteration is a SHARED
+  member (`ReplicatedMergeTreeSink.cpp:455`) — race under fan-out, must become per-task; shared Keeper session
+  via `ZooKeeperWithFaultInjection` (raw client is thread-safe; the fault-injection wrapper needs verification);
+  shared caches `deduplication_hashes_cache` / `async_block_ids_cache` `triggerCacheUpdate` from multiple
+  threads needs verification; quorum ordering semantics change (today partition N+1 does not commit until N's
+  quorum resolves) — recommendation was to force serial when quorum is enabled; a FULL shared-state inventory
+  of `commitPart` (storage counters, rollback checkpoints) was identified as the main design work and was NOT
+  completed.
+- Plain `MergeTreeSink::finishDelayedChunk`: simpler loop (finalize → `deduplication_log->addPart` →
+  `renameTempPartAndAdd` → PartLog); hazards: non-replicated dedup-log append concurrency, too-many-parts
+  delays. Unmeasured (s41 is Replicated).
+- Patch shape (approach 1 of 3, recommended at the time): private `processDelayedPartition(partition)` +
+  bounded `ThreadPoolCallbackRunnerLocal` fan-out + setting `max_concurrent_part_commits_per_insert`
+  DEFAULT 1 (feature dormant = today's serial behavior; minimal fork-rebase risk), all-drain + first-error,
+  per-task `ProfileEventsScope`, B90 capture discipline. Estimated diff ~100-150 lines. Rejected alternatives:
+  commit-only fan-out with caller-side retry queue (async state machine, NOT compact); window-2 pipeline
+  (complexity without the win).
+- Expected effect calibration: even a perfect stage 2 does not reach 1.0× — ~12% of wall is the vetoed
+  `HEAD`-before-`PUT` dedup cost; realistic target ~1.2×.
+
+## Write-path allocation and ref-table commit-path cost (2026-07-16, TXN-Final campaign) {#writepath-cost-txn-final}
+
+- **[write-path-alloc-audit] CA write-path allocation / memory audit** — During the TXN-Final full CA-default stateless run, `system.trace_log` showed the CA write path dominates the Memory (allocation-sampling) trace: `ContentAddressedTransaction::tryCreateWriteBuffer` (~489k samples) + `writeFile` (~488k), then `CaInlineWriteBuffer` (~322k) and `CaContentWriteBuffer` (~165k). CPU was clean (NO CAS symbol in the top-15 CPU stacks) — so this is NOT a CPU or correctness issue, purely an allocation-volume observation. TODO — a deliberate alloc-profile pass on the CA write path: is `tryCreateWriteBuffer` allocating more than necessary per file (write buffer + `std::function` finalize closure + captured `owner shared_ptr<IDiskTransaction>`)? Confirm `CaInlineWriteBuffer` isn't growing its buffer inefficiently; `Cas::ObjectStorageBackend::emuWrite`/`putIfAbsent` take header maps BY VALUE (pass by const-ref, emulated test path only); establish a pre-/post-TXN-ONE-PIPELINE baseline to confirm the write-hook refactor didn't add per-write allocation overhead. Not correctness-blocking.
+- **[ref-table-copy-commit-path] CA ref-table copy on the commit/ref-op path** — The #1 CPU stack in the TXN-Final soak (pure-CA workload) was deep copy-construct + destroy of the whole committed-ref map (`RefTableState`) via `Cas::Store::appendRefOps`/`flushRefBatch` → `ContentAddressedTransaction::commit` → `publishStaging`. Overall CPU is low (I/O-bound), so not a current hog, but a scalability smell: every ref op on the commit path appears to copy the entire ref-table state by value, cost growing ~O(refs) per commit, ~O(refs·commits) over a workload — compounds under insert/mutation-heavy loads. TODO (perf, likely pre-existing ref machinery, not a TXN regression): investigate whether the `RefTableState` snapshot in `appendRefOps`/`flushRefBatch` can be passed by const-ref / diffed incrementally / copy-on-write instead of full-copied per ref batch; confirm pre-existing via git blame; alloc-profile the commit path together with the write-buffer note above. Not correctness-blocking (soak green, dangling=0).
+
+## The pool-wide catalog is a write hot spot, measured on the CA-s3 lane {#ref-catalog-write-hotspot}
+
+Measured 2026-07-31: every table creation in a pool writes the same catalog object
+(`cas/ref_catalog`), so a lane creating thousands of tables serializes them all through one CAS loop
+— 137/250 S3 timeout lines on the CA-s3 stateless lane named this one key. Not evidence the catalog
+design is wrong (it exists because pool `LIST` is unreliable), and the measurement is from a lane
+that creates tables far faster than any real deployment — but a genuine cost the design didn't
+expose before. **Open questions before a fix**: does the write rate come from creation only, or also
+from read-mints; is the retry deadline just too short for the contention it now sees; can the object
+be sharded/batched without giving up the single-object atomicity the GC universe snapshot needs.
+
+## Scalability findings from the full-scale campaign (S3 budget) {#scale-findings}
+
+These are real scale/budget findings; most are variants of "O(N) GC / per-op amplification". Track for the capacity model + a future S3-budget push.
+
+- **[idle-scratch-debris] idle GC leaves scratch files uncollected on an empty pool** — MINOR — S23 (2026-07-18 secondary finding): `scratch_bytes` on local staging grew 1→21 MiB over an idle window with ZERO inserts and an empty pool — idle GC rounds appear to create scratch files and not clean them. Local-disk debris, not tracked memory; needs its own check + cleanup path look.
+- **[scratch=full-part] CAS write spills the whole object to local scratch for hash-before-upload** — DESIRABLE — 100 GiB merge → 93 GiB scratch; a part larger than local free scratch cannot be written. Largely addressed by the (opt-in) S3-native staging; make the local path stream-hash too, or document the staging requirement for very large parts.
+- **[replicated double-spill] shared-pool replica re-merges + re-spills its own full scratch** — DESIRABLE — A replica could adopt the leader's uploaded blob instead of re-merging locally (186 GiB scratch for one deduped 100 GiB blob).
+- **[wide-part O(columns)] merge issues O(columns) S3 ops → ephemeral TCP port exhaustion** — DESIRABLE — S07 20000-col `OPTIMIZE FINAL` stalled in an S3 retry storm.
+- **[partitioned-INSERT O(partitions)] O(partitions) CAS commits per insert** — DESIRABLE — ~10s per 256-partition insert.
+- **[startup O(refs)] server startup S3-op cost scales with #tables/refs** — WATCH — ~152k S3 ops to start a 10k-table server (LISTs/GETs, not blob enumeration); recovery still fast.
+- **[S11 capacity] deferred-GC disk accumulation under delete-churn** — WATCH — GC does not reclaim during the delete phase (interval-driven); same O(N)-GC-lag family.
+- **[Capacity model] GC cadence + snapshot size under typical load** — DOC/DESIRABLE — Estimate GC frequency + per-shard in-degree run / fold-seal sizes at typical production load; validate against a soak's GC log; feeds the `gc_interval_sec` default and trim gates. Live-AWS data point: a round is 30–40s.
+- **[physical-footprint amplification]** — VERIFY — 1h soak: `pool_bytes` ~400× `logical_bytes` (rustfs#3231 overwrite-version retention vs CA debris); should collapse under full GC / a compacting store. Not a safety issue (dangling=0).
