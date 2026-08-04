@@ -3504,3 +3504,69 @@ The durable fix is not a one-off sweep: a sweep fixes today's sites and the next
 reintroduces the class. What would actually close it is making the deref fail loudly at the point of
 use — a checked accessor the CA test helpers use in place of `->` — so the shape is unavailable
 rather than merely discouraged.
+
+## `[gc-multidelete-conditional-gap]` batch `DeleteObjects` cannot replace GC's exact-token deletes as-is {#gc-multidelete-conditional-gap}
+
+T9's destructive-baseline soak measured **944,155** individual `DiskS3DeleteObjects` calls across a
+single 90-minute specimen's four destructive families (`pending_deletes`, `manifest_deletes`,
+`ref_object_cleanup`, generation pruning inside `round_commit`) — every one a single-key
+`removeObjectIfTokenMatches` call (`Backend::deleteExact`, `Backend/CasObjectStorageBackend.cpp:955`)
+carrying an `If-Match` ETag precondition, the exact-token-match safety property that stops GC from
+deleting a body a writer has already displaced (the CAS resurrection-safety invariant). ClickHouse
+already has a working batch-delete path — `deleteFilesFromS3` (`IO/S3/deleteFileFromS3.cpp:80`,
+default batch 1000, `IO/S3Defines.h:48`), reachable via `S3ObjectStorage::removeObjectsImpl` — but
+no CAS delete-family call site uses it, including `deletePrefixWholesale`, which already LISTs a
+whole prefix in pages and still deletes each listed key one at a time
+(`Gc/CasGc.cpp:3563-3570`). The reason is not an oversight: the batch `DeleteObjects` request only
+sets `Key` per `Aws::S3::Model::ObjectIdentifier` (`deleteFileFromS3.cpp:118-122`) — AWS's batch API
+has no per-key conditional precondition, so wiring GC's existing calls to it as-is means dropping
+the exact-token check, which is a correctness regression, not an optimization.
+
+**Ceiling, if the conditional gap is ever closed** (e.g. a design that proves a delete cohort
+collision-free at round-commit time without a per-key check): `944,155 → ⌈944,155/1000⌉ = 945`
+batch requests, a >99.9% cut in delete request count. This is a REQUEST-COUNT ceiling, not a
+wall-time prediction — the soak's backend (RustFS) measures ~650–700µs mean per-delete latency
+(`DiskS3WriteMicroseconds`/`DiskS3DeleteObjects` ≈ 645µs for `pending_deletes` alone), far below
+real S3 RTT, so the wall-time win against AWS S3 is unmeasured by this specimen and likely larger
+than what RustFS would show.
+
+**Falsification:** if no design can prove a cohort of exact-token deletes collision-free without a
+per-key conditional (i.e. the safety property is fundamentally incompatible with a keys-only batch
+API), this item stays permanently blocked and the correct scope is delete-side concurrency
+(`[gc-delete-concurrency-serial]`) instead. Full measurement:
+`docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-multidelete`.
+
+## `[gc-delete-concurrency-serial]` GC's destructive deletes run with almost no overlap {#gc-delete-concurrency-serial}
+
+The same T9 baseline measured `pending_deletes` and `manifest_deletes` running near-serially
+despite already dispatching through a thread pool: `pending_deletes` wall (208.77s, ch1) is 87% of
+the SUM of its individual requests' `DiskS3WriteMicroseconds` (181.3s) — the requests overlap very
+little. `manifest_deletes` shows the same shape (409.52s wall vs. 368.56s summed, 90%). Together
+these two phases are 618.29s of ch1's 4352.1s total phase wall (14.2%) in this specimen. A bounded
+worker pool issuing K concurrent conditional deletes (same shape as the existing `meta_pool`) could
+plausibly cut this toward `wall/K`, independent of `[gc-multidelete-conditional-gap]` — the two
+levers compose (concurrent batch calls) rather than compete, once/if the conditional gap closes.
+
+**Falsification:** if concurrent deletes against the same backend/prefix trigger throttling
+(RustFS or S3 `SlowDown`/503) at a K nobody has tried yet, the real win is smaller than linear —
+this baseline never issued concurrent deletes and cannot rule that out. Full measurement:
+`docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-delete-concurrency`.
+
+## `[gc-fold-intake-readbuffer-head]` `fold_ref_intake`'s HEAD/GET pairing is the generic read-buffer size probe, not the HEAD Task 15 already removed {#gc-fold-intake-readbuffer-head}
+
+T9's baseline found `fold_ref_intake` — the single largest wall-time phase in a destructive round
+(2303.0s of ch1's 4352.1s phase wall, 52.9%) — issuing `DiskS3GetObject` and `DiskS3HeadObject` in
+an exact 1:1 pairing (1,183,381 each). This is NOT a regression of the predecessor's
+`{#opp-fold-head}` (drop the HEAD in `foldManifestEdges`), which is confirmed delivered — the
+source comment at `Gc/CasGc.cpp:1301-1312` states the HEAD was removed because the following GET
+already carries the absence signal. The HEAD still visible here is a different, generic one:
+`ReadBufferFromS3::getObjectSizeFromS3` (`IO/ReadBufferFromS3.cpp:463-469`) issues a `HeadObject`
+to learn `Content-Length` before every ranged `GetObject`, for every S3 disk read in ClickHouse —
+not CAS-specific.
+
+**Not yet sized.** This entry only establishes that the pairing exists and where it comes from;
+whether an existing known-size read-buffer constructor already avoids it on some call paths, and
+what the real win would be, is unmeasured. **Falsification:** if the size-probe HEAD is required
+for correctness on every generic S3 disk consumer (e.g. detecting a truncated/resized object
+mid-read), this is a ClickHouse-wide question and does not belong on this CAS backlog at all. Full
+measurement: `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md#opp-fold-head-successor`.
