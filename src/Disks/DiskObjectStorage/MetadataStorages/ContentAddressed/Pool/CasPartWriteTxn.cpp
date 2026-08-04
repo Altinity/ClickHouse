@@ -745,8 +745,9 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// resurrection is the fresh tag — it makes this body's ETag differ from the condemned one, so every
     /// already-queued exact-token delete of that incarnation misses.
     ///
-    /// The payload STREAMS from the source reader and is never materialized. Blob bodies have no size
-    /// cap, so a body larger than memory has to remain writable here.
+    /// Blob bodies have no size cap, so a body larger than memory has to remain writable here: a
+    /// Native backend streams the payload from the reader; the emulated (local) backend materializes
+    /// one body at a time, serialized inside `Backend::resurrect`.
     auto payload = source.open();
     /// rev.7 [C2]: a raw, uncoupled backend call; fence-checked against the displacement-decision
     /// generation immediately before the durable write.

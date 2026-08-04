@@ -164,7 +164,7 @@ a dangling manifest entry.
 
 **One asymmetry worth flagging:** on a local (emulated) disk the resurrect path materializes the
 full `[header][payload]` in memory; resurrections are serialized, so at most one body is held whole
-in RAM at a time. On object-storage backends the resurrect streams and holds nothing.
+in RAM at a time. On remote object storage the resurrect streams and holds nothing.
 
 ### The `.meta` sidecar {#meta-sidecar}
 

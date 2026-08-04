@@ -419,8 +419,9 @@ continuing the ID series, not renumbering anything above.
 ## `[gcs-conditional-overwrite-rethink]` GCS conditional overwrite needs re-thinking from the premise, not a bigger cap {#gcs-conditional-overwrite-rethink}
 
 **SCOPE NARROWED (2026-08-04): the resurrect path no longer has this problem.** The condemned-blob
-resurrect is now an UNCONDITIONAL streaming write (`Backend::resurrect`), takes multipart on every
-backend, and is size-unlimited on GCS too. What remains capped is the CONDITIONAL write-once
+resurrect is now an UNCONDITIONAL write (`Backend::resurrect`): on remote object storage it streams
+and takes multipart -- size-unlimited on GCS too; the local emulated mode materializes one body at a
+time (see the spill-to-disk debt below). What remains capped is the CONDITIONAL write-once
 CREATE (`If-None-Match`), still forced single-part under `gcs_max_conditional_put_bytes` -- so this
 item is now only about creating a blob larger than the cap on GCS, and everything below about the
 overwrite/resurrect shape is historical context.

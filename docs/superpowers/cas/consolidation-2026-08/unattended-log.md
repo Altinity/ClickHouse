@@ -296,3 +296,67 @@ Watchdog: session cron fe033cd7, every 20 min (:13/:33/:53). Ledger of record:
 - T7 COMPLETE (Gate C green post-remediation; 0.4% drift on decision-relevant set). debugging.md restructure under scoped review.
 - PIPELINE BLOCKED ON USER: T13 needs the BACKLOG stop-the-world window (user must pause the concurrent agent's appends). Request sent; waiting.
 - No stalls; no codex; page set stable at 21 pages + AGENTS.md.
+
+## 2026-08-04 16:03 (watchdog)
+- T13 both commits in (BACKLOG regroom 967849c + roadmap 23a1192); window released; review at t1-review.
+- User-directive stream all applied: cache in quick-start (b901862), deployment guidance (294bcc8), settings safety annotations (65923f5), design-history/index cleanups.
+- Next: T13 review verdict -> T15 (consistency + coverage matrix = Gate D packet).
+
+## 2026-08-04 16:43 (watchdog)
+- Active lanes: t11 aggressive BACKLOG prune (window open, file in edit); t1-review legacy-5-files audit. Roadmap user-fix committed (cc6a2f3).
+- No stalls; next: prune commit -> release window -> T15 Gate D packet assembly.
+
+## 2026-08-04 16:23 (watchdog)
+- BACKLOG prune round 3 in progress at t11 (file in edit, hit-list of giant narratives). Legacy-docs line fully closed (ada2908 + 8730147).
+- No stalls. Next: prune final -> release window -> T15 Gate D packet.
+
+## 2026-08-04 16:40
+- BACKLOG prune COMPLETE: -51%, every anchor dispositioned, window can close for good.
+- T15 both parts running (matrix @ t6; whole-set consistency @ t1-review). Next: Gate D packet to the user.
+
+## 2026-08-04 16:23 (watchdog)
+- T15 both parts in flight ~20 min: matrix (t6) and whole-set consistency (t1-review) — neither artifact on disk yet, within normal duration for their scope. No wake-ups this cycle; next sweep escalates if still nothing.
+
+## 2026-08-04 17:00
+- T15 COMPLETE. GATE D PACKET READY. Pipeline HARD-BLOCKED on user approval (by design). Nothing deleted.
+
+## 2026-08-04 17:23 (watchdog)
+- PIPELINE BLOCKED ON USER CHECKPOINT (Gate D, by design): coverage matrix final (c580c6b23ae, 376 delete / 45 keep / 421 total), consistency review clean, all 15 pre-deletion tasks complete. Nothing deleted.
+- Awaiting: user OK for T16 deletion groups + deferred-docs-fixes.md stopped-appending confirmation. No agent work in flight; no wake-ups needed.
+
+## 2026-08-04 17:03 (watchdog)
+- Still blocked on Gate D user approval (by design). No agent activity, nothing to unstick.
+
+## 2026-08-04 17:23 (watchdog)
+- T16 deletion groups (a),(b),(c) committed (71ab45b, f5c01e8, 85c9583); (d)+sanity+workdir reduction remaining at t6.
+- BACKLOG final normalization pass in progress at t11 (file at 1688 lines, uncommitted).
+- Old sdd dirs still listed — checking residuals (may be non-corpus leftovers); t6's sanity phase will account.
+
+## 2026-08-04 17:43 (watchdog)
+- Post-incident state: workdir reduced to audit artifacts (matrix, gate reports, tools, manifest) + verdicts/ partially retained; T16 groups a-d + dangler fix committed.
+- Active: t6 (index-race reconciliation + orphaned-open triage — the user-surfaced leak), t11 (holds reformat until t6 confirms).
+- Next: orphaned-open numbers -> t11 adds items + reformat -> T16 final report -> pipeline close.
+
+## 2026-08-04 18:10 (watchdog)
+- Orphan triage: 3 of 4 slices reported (t6/t9/t10); t12's slice + merge pending. HIGH-severity trio at t1-review.
+- t11: reformat part 1 committed; holds for triage-final + folder restructure.
+
+## 2026-08-04 18:35 (watchdog)
+- Orphan triage COMPLETE: 367 -> 51 superseded / 35 fold / 57 new / 224 not-tracked; t1-review closed the HIGH trio (C-1506/1549/1580) as CLOSED-BY-DESIGN; t11 caught 2 more duplicates -> 52 effective new items.
+- BACKLOG folder restructure committed by t11 (0f266066bef): 9 topic files (170 items) + index + Inbox; moot doc-debt items removed; AGENTS.md orientation updated.
+- All lanes idle BY DESIGN: pipeline blocked on USER CHECKPOINT — explicit OK to insert 52 items. t11 holds prepared mapping; no codex running; nothing to unstick.
+- Next after OK: t11 insertion commit -> T16 final report -> final whole-branch review -> close.
+
+## 2026-08-04 18:43 (watchdog)
+- USER OK received; orphan insertion committed by t11 (f08734d17df): 47 new + 35 folds, BACKLOG 170->217 items, all 54 effective clusters accounted; T13-extension + T16 CLOSED.
+- Active lane: t1-review running the FINAL whole-branch review (dispatched ~18:40, report due at .superpowers/sdd/.../final-review.md) — not stalled, just started; no codex running.
+- Next: final-review verdict -> fix dispatch if needed -> triage parked minors -> pipeline close. Outstanding user items: deferred-docs-fixes.md deletion confirmation; task-5-report.md deferred deletion.
+
+## 2026-08-04 19:03 (watchdog)
+- Final whole-branch review: SHIP (0 Critical, 0 CODE/TEST; 2 Important PROSE + minors) — all fixed by t11 in one batch (fb570ae6d2d, check_page clean, 0 dangling anchors).
+- Active lane: t1-review scoped re-review of fb570ae6d2d (dispatched 18:53) — within window, not stalled; no codex.
+- Next: clean verdict -> ledger close + pipeline DONE. Outstanding user items unchanged (deferred-docs-fixes.md, task-5-report.md deletions).
+
+## 2026-08-04 19:12 (final)
+- Scoped re-check round 2: CLEAN. Final review verdict stands at HEAD 5eaf4bc693a; residual 3 stale comment sites tracked in BACKLOG (552253e017f).
+- PIPELINE CLOSED. All 16 tasks + orphan remediation + final review complete. Watchdog retired.

@@ -396,7 +396,6 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_free_size;
     extern const ServerSettingsUInt64 format_parsing_thread_pool_queue_size;
     extern const ServerSettingsUInt64 cas_blob_upload_pool_size;
-    extern const ServerSettingsUInt64 cas_condemned_upload_memory_bytes;
     extern const ServerSettingsUInt64 page_cache_history_window_ms;
     extern const ServerSettingsString page_cache_policy;
     extern const ServerSettingsDouble page_cache_size_ratio;

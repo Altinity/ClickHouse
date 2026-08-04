@@ -331,8 +331,9 @@ private:
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true.
     BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr) const;
     /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
-    /// OWN re-readable source without reading the dying object (no backend().get). The source is STREAMED
-    /// into the put sink (header + `source.open`), never materialized into a full in-memory copy;
+    /// OWN re-readable source without reading the dying object (no backend().get). On a Native backend the
+    /// source is STREAMED into the put sink (header + `source.open`); the emulated backend materializes
+    /// one body at a time inside `Backend::resurrect`;
     /// `source.open` may be re-invoked on each conditional-write attempt (it re-reads the staged
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed. Build-neutral:
     /// RETURNS the complete `BlobUploadResult` (dep + branch outcome); it folds nothing into `deps`.
