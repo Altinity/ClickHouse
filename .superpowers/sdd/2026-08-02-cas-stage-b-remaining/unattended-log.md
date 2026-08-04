@@ -948,3 +948,10 @@ but "recovery did not observably clear after byte-identical restore" is a NAMED 
 (single observation, injected fault). The failed run is forensic only — archived as
 failed_injected_run/; the SPECIMEN is a fresh clean 90m (seed 20260807, fresh cluster, no
 injections). The hold arm moves to a separate short dedicated run after the specimen.
+
+### CI check 09:11 {#ci-0911}
+Two more cas lanes fell to the SAME admission race (canonical-order encode catch-point):
+asan_ubsan cas-s3 2/2 (5006 passed then Server died) and msan cas-s3 3/3 (2526 passed, Server died
++ scraping failure). That makes SIX of six cas stateless lanes killed by finding #1 — its fix
+(68759dbd66e, parked) is now the single highest-value item for the branch's CI health. No new
+defect classes. Non-CAS failures unchanged. PR still RUNNING (3 jobs).
