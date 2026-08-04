@@ -162,10 +162,9 @@ Why this closes the race in both directions:
 Both directions degrade to a spurious re-upload or a no-op delete. Neither can lose data or leave
 a dangling manifest entry.
 
-**One asymmetry worth flagging:** the local-staging resurrect path materializes the full
-`[header][payload]` in memory, bounded by a byte-weighted admission semaphore (with oversized
-bodies running exclusively so they cannot starve smaller uploads). It is the one place a large
-blob is held whole in RAM rather than streamed.
+**One asymmetry worth flagging:** on a local (emulated) disk the resurrect path materializes the
+full `[header][payload]` in memory; resurrections are serialized, so at most one body is held whole
+in RAM at a time. On object-storage backends the resurrect streams and holds nothing.
 
 ### The `.meta` sidecar {#meta-sidecar}
 

@@ -105,14 +105,14 @@ public:
     /// Return a page after `cursor`; the next cursor is the last returned key and is empty at the end.
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
-    /// S3-native staging promote seams. Native mode only —
-    /// EmulatedSingleProcess (LocalObjectStorage) has no server-side conditional copy and is never
-    /// selected for S3 staging, so both throw `NOT_IMPLEMENTED` there (fail closed).
-    /// `promoteStaged`: WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
-    /// `resurrect`: prepends `fresh_header` and UNCONDITIONALLY writes `[fresh_header][payload]` to
-    /// `blob_key`, streaming the payload from the caller's reader (fresh tag ⇒ distinct ETag from the
-    /// condemned incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag. Plain `WriteSettings`, so
-    /// no forced single part and no size ceiling on any dialect.
+    /// `promoteStaged` (S3-native staging, Native mode only — EmulatedSingleProcess has no server-side
+    /// conditional copy and is never selected for S3 staging, so it throws `NOT_IMPLEMENTED` there):
+    /// WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
+    /// `resurrect` (every mode): prepends `fresh_header` and UNCONDITIONALLY writes
+    /// `[fresh_header][payload]` to `blob_key` (fresh tag ⇒ distinct ETag from the condemned
+    /// incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag. Native streams with plain
+    /// `WriteSettings` — no forced single part, no size ceiling on any dialect; EmulatedSingleProcess
+    /// materializes and SERIALIZES resurrections process-wide, bounding the peak to one body.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
     Token resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override;
 

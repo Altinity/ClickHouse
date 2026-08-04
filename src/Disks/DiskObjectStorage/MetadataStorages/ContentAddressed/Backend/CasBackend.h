@@ -334,7 +334,9 @@ public:
     /// UNCONDITIONAL re-upload of the writer's OWN payload over `blob_key` under a FRESH-tagged
     /// envelope header — the sanctioned condemned-object resurrection overwrite. Writes
     /// `[fresh_header][payload]`, streaming `payload` from `reader`, and returns the fresh incarnation's
-    /// token. Blob bodies have no size cap, so the payload is never materialized.
+    /// token. Blob bodies have no size cap, so a Native backend streams the payload and never
+    /// materializes it; the emulated backend materializes (its conditional ops are whole-`String` by
+    /// design) and serializes resurrections to bound the peak to one body at a time.
     ///
     /// The reader is the caller's: it is ALWAYS the writer's own source (a staging object or a local
     /// staged file), NEVER a read of the condemned `blob_key`, and the caller has already skipped any

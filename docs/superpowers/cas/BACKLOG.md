@@ -476,3 +476,24 @@ Two independent contributors, each with its own fix:
    never torn down on `DROP TABLE`), here given a price for the first time: leaked 1 Hz schedulers
    from completed tests kept scanning for the rest of the run. The lifecycle redesign
    (`UNMOUNT` stops background work and ejects the disk) subsumes this half.
+
+## `[emulated-resurrect-should-spill-to-disk]` The emulated resurrect sits ON a local disk and still builds the body in RAM {#emulated-resurrect-spill-to-disk}
+
+The emulated (local object storage) resurrect materializes the whole `[header][payload]` in a
+`String` before installing it. Today this is bounded by serializing resurrections process-wide — one
+body at a time, so the peak is the largest single body — which restored the guarantee the deleted
+byte-weighted admission used to give. But the bound is the wrong SHAPE for this backend: the whole
+point of the emulated mode is that the storage IS a local disk, so the natural staging area for a
+body of any size is a scratch file next to the destination, not gigabytes of RAM.
+
+The debt: stream the reader into a temp file under the emulated root (or the pool scratch path),
+then install it under `emu_mutex` — rename where the object layout allows it, read-back+`emuWrite`
+where it does not. That removes both the materialization AND the serialization (no reason to run
+resurrections one at a time once they stop competing for RAM), and the size guard moves to the spill
+loop, still refusing before anything becomes current. Temp-file lifecycle must be airtight on every
+exit path: success, size mismatch, exception mid-drain — no residue in any outcome.
+
+Not urgent: the emulated mode serves CI lanes, local development, and tests — no production
+deployment runs CAS over local paths, and a single materialized body was this path's behaviour for
+its whole life. It is recorded because the current shape is a contradiction (a disk-backed backend
+buffering in memory), not because anything is on fire.

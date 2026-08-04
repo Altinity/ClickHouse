@@ -1048,10 +1048,15 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
 {
     if (mode != Mode::Native)
     {
-        /// EmulatedSingleProcess (local object storage): same unconditional semantics, serialized by
-        /// the emulation's own mutex inside `emuWrite`. The body is drained first -- bounded-memory is
-        /// a Native-path property; the emulated path exists for local disks and tests, and its
-        /// conditional ops materialize bodies anyway.
+        /// EmulatedSingleProcess (local object storage): same unconditional semantics. The body is
+        /// materialized -- the emulated conditional ops are whole-`String` by design -- so resurrections
+        /// are SERIALIZED process-wide by their own mutex: the fan-out may run N resurrect tasks at
+        /// once, and without this the peak would be the SUM of the bodies. One at a time bounds the
+        /// peak to the largest single body, the same guarantee the byte-weighted admission's exclusive
+        /// arm used to give. A dedicated mutex, not `emu_mutex`: the drain may read through the same
+        /// store, and `emu_mutex` guards individual ops inside it.
+        static std::mutex emulated_resurrect_mutex;
+        std::lock_guard resurrect_lock(emulated_resurrect_mutex);
         String body = fresh_header;
         {
             WriteBufferFromString out(body, AppendModeTag{});
