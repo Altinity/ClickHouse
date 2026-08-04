@@ -879,3 +879,11 @@ post-abort cascade. Same race family as the parked fix 68759dbd66e. Task #5 upgr
 must prove BOTH catch-points closed (casAdmitEntry conflict-retry trace + admit-conflict regression
 interleaving). Non-CAS side: two integration lanes failed (db-disk old-analyzer 8/8, msan 9/10) —
 not yet triaged, likely unrelated; will classify when the unit/cas story is closed. PR still RUNNING.
+
+### Watchdog 05:44 {#wd-0544}
+- Soaks (a)(b)(c) closed ((b) provisional); S44 stuck-Removing discrimination stalled mid-tree
+  after its disposable run (04:17) — runner dormant ~85 min, woken with step-by-step resume.
+- CI 06:11 upgrade stands: admission race killed all four cas lanes; fix verification (task #5)
+  queued right after the soak slot frees, must cover the encode-time catch-point.
+- Remaining: discrimination verdict -> general pair (20m smoke + 90m specimen) -> 3c/3d/3e ->
+  STAGE B verdict. Then #5.
