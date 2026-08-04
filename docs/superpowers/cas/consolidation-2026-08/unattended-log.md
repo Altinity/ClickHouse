@@ -291,3 +291,8 @@ Watchdog: session cron fe033cd7, every 20 min (:13/:33/:53). Ledger of record:
 - T7 remediation phase 1 done (corrections applied, commit 917411c). Phase 2 (codex re-sweeps) starting at t6; no codex process this instant — likely between prep and launch, not yet stall-aged.
 - t12 cache-example lane: live validation dir already populated (migration-validate-cache/ with config+server data) — progressing.
 - Next: phase-2 sweeps -> phase-3 targeted done re-check -> T13.
+
+## 2026-08-04 15:23 (watchdog)
+- T7 COMPLETE (Gate C green post-remediation; 0.4% drift on decision-relevant set). debugging.md restructure under scoped review.
+- PIPELINE BLOCKED ON USER: T13 needs the BACKLOG stop-the-world window (user must pause the concurrent agent's appends). Request sent; waiting.
+- No stalls; no codex; page set stable at 21 pages + AGENTS.md.
