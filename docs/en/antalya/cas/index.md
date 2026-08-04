@@ -11,19 +11,28 @@ doc_type: 'guide'
 
 `ReplicatedMergeTree` on object storage has two unattractive options today: every replica stores
 its own byte-identical copy of every part (storage cost multiplies with the replication factor), or
-replicas share objects through zero-copy replication, whose bookkeeping lives in `Keeper` and grows
-with **data volume** rather than cluster size — on a large cluster this is the component that melts.
+replicas share objects through zero-copy replication. Zero-copy's `Keeper` load is only the
+in-flight coordination, not a ledger proportional to data — what actually grows with data volume is
+the **local-disk** state on every replica, which stores a reference to each shared S3 object it
+uses. The structural cost is elsewhere: a commit spans three independent systems (local disk, S3,
+and `Keeper`) whose interleaving is easy to get subtly wrong; a failure in any one of the three can
+cause worse availability trouble than a single-system design would; the sharing accounting is a
+numeric refcount, so a lost or duplicated retry can corrupt the count; and `Keeper` usage is
+implemented with varying care across a large number of `MergeTree` special-case branches
+accumulated over time.
 
 Content-addressed storage (`CAS`) is a `MetadataStorage` back-end for object-storage disks
-(`metadata_type = cas`) that stores every `MergeTree` part file once, keyed by the hash of its
-content. Many servers then share one object-storage pool with no byte duplication and no
-replication bookkeeping proportional to data volume.
+(`metadata_type = cas`) that takes the same sharing goal and collapses it onto one system: every
+`MergeTree` part file is stored once, keyed by the hash of its content, in the object-storage pool
+itself. There is no `CAS` state in `Keeper` at all — a commit is one conditional write against a
+single object in the pool — and the reachability accounting is a derived in-degree edge set folded
+from append-only deltas, not a mutable refcount a lost message can corrupt.
 
 ```mermaid
 graph LR
     subgraph today["Today: zero-copy replication"]
-        R1["Replica 1"] -->|"reads/writes<br/>part refcounts"| K["Keeper<br/>(grows with data volume)"]
-        R2["Replica 2"] -->|"reads/writes<br/>part refcounts"| K
+        R1["Replica 1<br/>local disk: object refs<br/>(grows with data)"] -->|"in-flight ops only"| K["Keeper"]
+        R2["Replica 2<br/>local disk: object refs<br/>(grows with data)"] -->|"in-flight ops only"| K
         R1 -.->|"shares bytes"| S1["S3"]
         R2 -.->|"shares bytes"| S1
     end
@@ -33,12 +42,10 @@ graph LR
     end
 ```
 
-`CAS` takes the sharing property of zero-copy replication and moves the bookkeeping into the object
-store itself: refs, mount leases, GC leadership, and fencing tokens are all objects in the bucket.
-The only mutual exclusion it needs anywhere is a conditional write — create-if-absent, or
-compare-and-swap on a token — against a single object. There is no external coordinator, and no
-`Keeper` usage inside the pool protocol; `Keeper` stays exactly where `ReplicatedMergeTree` already
-used it, for replication log and part-set consensus, and its load does not grow with pool size.
+Every CAS bookkeeping object — refs, mount leases, GC leadership, fencing tokens — lives in the
+bucket. There is no external coordinator, and no `Keeper` usage inside the pool protocol; `Keeper`
+stays exactly where `ReplicatedMergeTree` already used it, for replication log and part-set
+consensus, and its load does not grow with pool size.
 
 ## Status {#status}
 
