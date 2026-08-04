@@ -1083,3 +1083,17 @@ launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.m
   0508e724dcb. Full CA gate rerunning.
 - NEXT: full gate verdict -> rerun 05023 (must reach pending_condemned=0) -> [cas-tests-unchecked-
   optional-deref] BACKLOG entry -> hold-arm short soak -> T9.
+
+### Watchdog 17:44 {#wd-1744}
+- Full CA gate on the integrated tree: 2027/2027 PASSED (after the three stale standstill assertions
+  were rewritten). Finding #3 arc is green on units.
+- 05023 rerun exposed MY error first: I had rebuilt only unit_tests_dbms, so praktika ran a 09:37
+  server WITHOUT the gate fix. Rebuilt `clickhouse` (12:16) and reran: the drain now passes (fails at
+  4.4s instead of 38s) — the standstill is gone.
+- Remaining blocker is log noise, not behaviour: the harness fails any test whose server writes to
+  stderr, and GC emits one `<Warning> CAS GC dropped adopted-parent ref-life row absent from the
+  current catalog cut` per completed removal. That message cannot discriminate "removal completed"
+  (expected) from "row vanished illegitimately" — the merge site has no evidence either way — so the
+  proposal on the table is to DELETE the log line and keep the observability that already exists:
+  ProfileEvent CASGCUnmatchedAdoptedParentLives + the per-round phase metric
+  walk_plan_dropped_parent_rows in system.cas_gc_log. Awaiting user's go-ahead.
