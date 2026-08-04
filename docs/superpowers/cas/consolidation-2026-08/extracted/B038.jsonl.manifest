@@ -1,0 +1,12 @@
+docs/superpowers/reports/2026-07-26-list-incompleteness-proof/README.md	records:8
+src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/README.md	records:11
+src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md	records:16
+utils/ca-soak/README.md	records:2
+utils/ca-soak/scenarios/README.md	records:25
+docs/superpowers/RESUME-2026-07-15.md	records:7
+docs/superpowers/cas/ROADMAP.md	records:32
+utils/ca-soak/scenarios/RUN_HISTORY.md	ephemeral:entire file is an appended scenario run-status and chronology table, with no standalone durable claim
+docs/superpowers/Structurizr.md	ephemeral:artifact-preparation and local Structurizr usage instructions, with no durable CAS claim
+docs/superpowers/reports/2026-07-26-list-incompleteness-proof/append_ordering_measured.txt	records:2
+docs/superpowers/reports/2026-07-26-list-incompleteness-proof/blob_storage_log_three_keys.txt	records:2
+.superpowers/sdd/2026-08-02-cas-stage-b-remaining/c2-revert-report.md	records:8
