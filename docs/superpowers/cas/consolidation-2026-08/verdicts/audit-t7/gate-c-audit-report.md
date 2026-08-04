@@ -195,3 +195,28 @@ decision-relevant subset Gate D actually depends on for deletion justification. 
 proceed on the current verdict set, with the caveat that the broader (non-decision-relevant)
 `done`/`stale` population beyond this 245-cluster set has not been re-audited at the same rev and
 carries whatever residual class-1/2/3 risk the original audit's 5%-random-sample rates imply.
+
+### Phase 2a — completion update
+
+Per team-lead direction, finished the `*_RESULTS.md` high-signal subclass in full (the generic-
+prose `docs/` pool remains an accepted, documented residual -- not reviewed, per the noise-ratio
+evidence above). The controller's initial hand-verified sample (~30 of 155) found 6 corrections;
+the remaining 145 were split across 5 slices (controller + t9 + t10 + t11 + t12, ~29 each) and
+fully reviewed. Result: **21 more genuine corrections**, all near-verbatim matches against the
+actual committed RESULTS.md text rather than incidental term co-occurrence -- overwhelmingly
+TLA+-model-only claims (design rationale, sabotage-config proofs, model-additions sections) that
+the original mechanical search, scoped only to `src/tests/programs/utils/ca-soak/`, could never
+have found. Combined `*_RESULTS.md`-subclass total: 27 corrections out of ~155 candidates (17%
+yield), confirming this was the right subclass to prioritize.
+
+A shared-file hazard surfaced during this pass and is worth recording for future waves: t11
+observed that a concurrent plain `>>`-append from another lane briefly clobbered (not merged with)
+an earlier append to the same output file -- a race, not an interleaving-order quirk. Caught by
+re-verifying file content after write rather than trusting the append succeeded; a final
+reconciliation pass (sum of each lane's self-reported flip count vs. actual unique line count in
+the merged file: 4+4+3+10 = wait, self-reported 4(t10)+4(t11)+3(t9)+10(t12)+0(controller) = 21,
+matching the merged file's 21 unique lines with zero duplicates) confirmed no writes were lost in
+the final state.
+
+Updated final histogram (after Phase 2a completion, commit `d9da444a5f5`): `done` 1716, `stale`
+714, `doc-fact` 973, `open` 441, `rejected` 21, `unverifiable` 622, `ephemeral` 146.
