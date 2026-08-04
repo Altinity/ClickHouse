@@ -13,10 +13,18 @@ Checks:
 - every cluster's target is one of the 23 known suggested_target values
 - cluster_id values are unique
 - every member's own suggested_target equals its cluster's target
+- identifier preservation: every backtick-quoted identifier
+  (`` `like_this` ``) in a member's raw claim must appear verbatim in its
+  cluster's canonical_claim. This is a narrow, high-precision proxy for "loses
+  no specifics" -- it does not flag paraphrasing, only identifiers, settings,
+  hashes, or function/class names that are entirely dropped or altered
+  (originally found by review: task-5-review.md).
 
 Exit 0 and silent on success; exit 1 with one ERR line per problem otherwise.
 """
-import glob, json, os, sys
+import glob, json, os, re, sys
+
+BACKTICK_RE = re.compile(r"`([^`]+)`")
 
 TARGETS = set("""architecture/index architecture/storage-layout architecture/blob-protocol
 architecture/mounts-and-leases architecture/manifests-and-refs architecture/part-lifecycle
@@ -30,6 +38,7 @@ def main():
     errors = []
 
     record_target = {}
+    record_claim = {}
     for jf in sorted(glob.glob(os.path.join(wd, "extracted", "*.jsonl"))):
         if os.path.basename(jf).startswith("PROBE."):
             continue
@@ -44,6 +53,7 @@ def main():
             if r["id"] in record_target:
                 errors.append(f"{jf}:{i}: duplicate extracted id {r['id']} (also in another extracted file)")
             record_target[r["id"]] = r["suggested_target"]
+            record_claim[r["id"]] = r["claim"]
 
     clusters_path = os.path.join(wd, "clusters", "clusters.jsonl")
     try:
@@ -73,10 +83,12 @@ def main():
         if c.get("target") not in TARGETS:
             errors.append(f"{cid}: bad target {c.get('target')!r}")
 
+    id_loss_count = 0
     seen = {}
     for c in clusters:
         cid = c.get("cluster_id")
         target = c.get("target")
+        canonical_claim = c.get("canonical_claim", "")
         for mid in c.get("member_ids", []):
             seen.setdefault(mid, []).append(cid)
             member_target = record_target.get(mid)
@@ -84,6 +96,11 @@ def main():
                 errors.append(f"{cid}: member_id {mid} not found in extracted/*.jsonl")
             elif member_target != target:
                 errors.append(f"{cid}: member {mid} has suggested_target={member_target!r} != cluster target {target!r}")
+            member_claim = record_claim.get(mid, "")
+            for ident in BACKTICK_RE.findall(member_claim):
+                if ident not in canonical_claim:
+                    errors.append(f"{cid}: member {mid} identifier `{ident}` missing from canonical_claim")
+                    id_loss_count += 1
 
     missing = set(record_target) - set(seen)
     dupes = {mid: cids for mid, cids in seen.items() if len(cids) > 1}
@@ -92,7 +109,7 @@ def main():
     for mid, cids in sorted(dupes.items()):
         errors.append(f"CLUSTERED TWICE: {mid} -> {cids}")
 
-    print(f"records={len(record_target)} clusters={len(clusters)} errors={len(errors)}")
+    print(f"records={len(record_target)} clusters={len(clusters)} errors={len(errors)} identifier_loss_instances={id_loss_count}")
     for e in errors:
         print("ERR", e)
     sys.exit(1 if errors else 0)
