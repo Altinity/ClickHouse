@@ -243,24 +243,6 @@ public:
     {
         return putOverwrite(key, bytes, expected, {});
     }
-    /// Streaming variant of putOverwrite, with the same contract: the object is replaced only when its
-    /// token equals `expected`, and a mismatch leaves it unchanged with `PreconditionFailed` reported
-    /// from `finalize()`. Blob bodies have NO size cap, so a caller writing one must use this rather
-    /// than the whole-`String` form above -- that form holds the entire body in memory, which for a
-    /// body larger than RAM is not a slow path but an impossible one.
-    ///
-    /// `declared_size` is the total the caller will write, header included, and it is required rather
-    /// than advisory: a generation-token store cannot condition a multipart completion at all, so it
-    /// must refuse from the size BEFORE the first byte leaves rather than after the whole body has
-    /// crossed the network. Backends that do not need it ignore it. The sink does not police it
-    /// against what is actually written -- the storage's own size accounting already covers a caller
-    /// that lies, and a second check here would only be a second thing to keep in agreement.
-    virtual WriteSinkPtr putOverwriteStream(const String & key, const Token & expected,
-                                            uint64_t declared_size, const ObjectMeta & meta) = 0;
-    WriteSinkPtr putOverwriteStream(const String & key, const Token & expected, uint64_t declared_size)
-    {
-        return putOverwriteStream(key, expected, declared_size, {});
-    }
     /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
     /// A non-null expected token conditionally replaces that exact current incarnation. Conflicts
     /// leave the object unchanged and are returned as an outcome rather than an exception.

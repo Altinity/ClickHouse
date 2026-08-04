@@ -37,12 +37,6 @@ public:
         return inner->putIfAbsentStream(k, meta);
     }
 
-    WriteSinkPtr putOverwriteStream(const String & k, const Token & expected,
-                                    uint64_t declared_size, const ObjectMeta & meta) override
-    {
-        return inner->putOverwriteStream(k, expected, declared_size, meta);
-    }
-
     std::optional<GetResult> get(const String & k, Range r) override { return inner->get(k, r); }
     std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
     ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }

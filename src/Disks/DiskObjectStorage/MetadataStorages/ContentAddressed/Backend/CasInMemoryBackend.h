@@ -33,7 +33,6 @@ public:
     using Backend::putIfAbsent;
     using Backend::putIfAbsentStream;
     using Backend::putOverwrite;
-    using Backend::putOverwriteStream;
     using Backend::casPut;
 
     // ---- Backend interface ----
@@ -65,11 +64,6 @@ public:
     /// be disabled with `setEnforceTokens` to model a backend that incorrectly ignores this condition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
                            const ObjectMeta & meta) override;
-
-    /// Streaming counterpart of `putOverwrite`: the finalized body is published with the same
-    /// token-exact replace semantics. Cancelling or destroying the sink publishes nothing.
-    WriteSinkPtr putOverwriteStream(const String & key, const Token & expected,
-                                    uint64_t declared_size, const ObjectMeta & meta) override;
 
     /// Performs create-if-absent when `expected` is empty, or replace-if-current-token otherwise.
     /// Conflicts leave the store unchanged and are returned as an outcome rather than an exception.

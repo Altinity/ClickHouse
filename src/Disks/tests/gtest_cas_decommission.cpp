@@ -1201,12 +1201,6 @@ public:
     {
         return inner->putIfAbsentStream(key, meta);
     }
-
-    WriteSinkPtr putOverwriteStream(const String & key, const Token & expected,
-                                    uint64_t declared_size, const ObjectMeta & meta) override
-    {
-        return inner->putOverwriteStream(key, expected, declared_size, meta);
-    }
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
     {
         return inner->putOverwrite(key, bytes, expected, meta);
