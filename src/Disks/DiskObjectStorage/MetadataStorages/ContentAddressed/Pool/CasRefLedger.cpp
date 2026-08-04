@@ -4752,6 +4752,75 @@ std::optional<NamespaceLifeId> CasRefLedger::namespaceFilesLifeIfReadable(const 
     return rt->life;
 }
 
+bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
+{
+    /// O(1) fast path: a resident runtime already proven `Live` under an unbroken fence answers without
+    /// any catalog fetch -- the common case (`existsDirectory` on a warm, ordinary table). Anything
+    /// short of that falls through to the exact cold-path observation below.
+    if (const auto current = lookupRefTableRuntime(ns))
+    {
+        check_fence_or_throw(current->admitted_fence_generation);
+        bool closed = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(ref_queue_mutex);
+            closed = current->removal_admission_closed;
+        }
+        if (!closed
+            && !current->catalog_life_invalidated.load(std::memory_order_acquire)
+            && !current->superseded_by_remount.load(std::memory_order_acquire))
+        {
+            std::lock_guard<std::mutex> state_lock(current->state_mutex);
+            if (current->recovered && current->state.getLifecycle() == RefLifecycle::Live)
+                return true;
+        }
+    }
+
+    /// Cold path: an exact catalog observation. `Creating` and `Live` both answer present immediately --
+    /// `true` is always the safe direction, so no revalidation is needed for either. A missing row is
+    /// the one answer that must never be manufactured by a race, so it alone is re-confirmed against a
+    /// second read before being trusted (mirroring `acquireReadableRefTableRuntime`'s own token/value
+    /// revalidation).
+    const uint64_t admitted_generation = fence_generation_fn();
+    check_fence_or_throw(admitted_generation);
+    const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(backend, layout);
+    check_fence_or_throw(admitted_generation);
+    const auto find_entry = [&ns](const CasRefCatalog::Snapshot & snap) -> const CatalogEntry *
+    {
+        const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
+            [&](const CatalogEntry & entry) { return entry.ns == ns; });
+        return it == snap.catalog.entries.end() ? nullptr : &*it;
+    };
+
+    const CatalogEntry * entry = find_entry(first_catalog);
+    if (!entry)
+    {
+        const CasRefCatalog::Snapshot second_catalog = CasRefCatalog::read(backend, layout);
+        check_fence_or_throw(admitted_generation);
+        if (second_catalog.token != first_catalog.token || second_catalog.catalog != first_catalog.catalog)
+            throwCasWriteRetryLater(fmt::format(
+                "CAS namespace '{}': its catalog changed while probing table-root cleanup completeness; "
+                "retry from a fresh observation", ns.string()));
+        return false;   /// no catalog row, twice-confirmed: proven absent
+    }
+
+    if (entry->state == NsState::Creating || entry->state == NsState::Live)
+        return true;
+
+    /// `Removing`: only the exact incarnation's own durable ref-log proves the terminal
+    /// `remove_namespace` transaction actually landed -- the catalog row alone cannot distinguish a
+    /// completed removal from one whose terminal append is still outstanding after a crash. This is the
+    /// same load-bearing distinction `dropNamespaceImpl` makes before returning early, and it needs no
+    /// further revalidation: once durably proven for this exact incarnation, the terminal can never be
+    /// un-proven.
+    const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
+    const auto rt = acquireRefTableRuntime(life, admitted_generation);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard<std::mutex> lock(rt->state_mutex);
+    if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
+        return false;   /// terminal durably proven: the logical namespace is gone
+    return true;         /// removal admitted but not yet terminal: cleanup work remains
+}
+
 
 DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
 {
@@ -4982,7 +5051,9 @@ DropNamespaceStats CasRefLedger::dropNamespaceImpl(
     /// operations to memory, cancels local builds, and rejects further ordinary mutations." Reaching here
     /// means the removal is durable (this call's, or a concurrent caller's whose durable result the append
     /// lane observed) -- a FAILED append would have thrown above, so cancellation is only ever reached
-    /// after durability (a failed append leaves the namespace `Live` and propagates). Cancel
+    /// after durability (a failed append leaves the namespace `Removing`, not `Live`, and propagates;
+    /// the catalog CAS above already made that transition durable before this append was attempted).
+    /// Cancel
     /// every in-flight build TARGETING this namespace so its next op fails closed (`requireAlive`),
     /// preventing it from promoting/precommitting a fresh owner into (or staging more debris in) the
     /// just-removed namespace. The append lane is the real linearization authority (an `owner_transition`

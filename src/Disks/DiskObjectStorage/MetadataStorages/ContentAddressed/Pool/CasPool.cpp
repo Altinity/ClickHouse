@@ -1688,6 +1688,11 @@ std::optional<NamespaceLifeId> Pool::namespaceFilesLifeIfReadable(const RootName
     return ref_ledger.namespaceFilesLifeIfReadable(ns);
 }
 
+bool Pool::namespaceStillLogicallyPresent(const RootNamespace & ns)
+{
+    return ref_ledger.namespaceStillLogicallyPresent(ns);
+}
+
 void Pool::invalidateRemovedCatalogLife(const NamespaceLifeId & life)
 {
     ref_ledger.invalidateRemovedCatalogLife(life);

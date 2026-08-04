@@ -527,10 +527,10 @@ public:
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPublishedAt(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RefPublishedAtUpdate &)> mutator);   /// one set_published_at txn
-    /// One ref-log transaction naming every owner's exact removal followed by `remove_namespace`, then
-    /// the catalog transition to `Removing`. Performs no physical deletion: GC records folded terminal
-    /// evidence and later removes the exact catalog row, while the perpetual janitor reclaims dead-life
-    /// stream, checkpoint, and namespace-file bytes independently.
+    /// The catalog transition to `Removing` happens first, then one ref-log transaction naming every
+    /// owner's exact removal followed by `remove_namespace`. Performs no physical deletion: GC records
+    /// folded terminal evidence and later removes the exact catalog row, while the perpetual janitor
+    /// reclaims dead-life stream, checkpoint, and namespace-file bytes independently.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
     /// Decommission-only exact-life overload; never re-resolves by namespace name.
     DropNamespaceStats dropNamespace(const NamespaceLifeId & life);
@@ -550,6 +550,11 @@ public:
     /// pair one with the other's stale answer, and an unreadable namespace yields no life to read with
     /// rather than a wrong one. See `CasRefLedger`'s declaration.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
+
+    /// Thin forward to `CasRefLedger::namespaceStillLogicallyPresent`, whose declaration carries the
+    /// state matrix. The sole caller is `ContentAddressedMetadataStorage::existsDirectory`'s
+    /// `DirShape::TableDir` case.
+    bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
     /// GC callback after a proved exact catalog deletion; see `CasRefLedger` for the in-place cached
     /// runtime invalidation contract.

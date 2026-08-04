@@ -162,7 +162,8 @@ public:
                           std::function<void(RefPublishedAtUpdate &)> mutator);
 
     /// Durably removes the complete namespace, including its current ref/precommit state, then performs
-    /// the associated cancellation work. A failed append leaves the namespace live and propagates.
+    /// the associated cancellation work. The catalog transition to `Removing` happens first; a failed
+    /// terminal append after that leaves the namespace `Removing` (not `Live`) and propagates.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
 
     /// Decommission-only exact-life form. Pins recovery to the immutable catalog cut selected by the
@@ -197,6 +198,22 @@ public:
     /// every failure mode of the underlying reads throws rather than degrading to `nullopt`, so "no life"
     /// is only ever reached for a namespace whose absence is durable knowledge.
     std::optional<NamespaceLifeId> namespaceFilesLifeIfReadable(const RootNamespace & ns);
+
+    /// Table-root cleanup-completeness probe: whether this logical namespace still has foreground
+    /// removal work outstanding, or has never proven that none remains. `true` for `Creating`, every
+    /// `Live` row (including zero refs and zero namespace files), and `Removing` before its terminal
+    /// `remove_namespace` transaction is durable; `false` for no catalog row at all, or for `Removing`
+    /// whose terminal is durably proven (a non-`Live` `RefLifecycle` WITH a `remove_txn_id` -- the same
+    /// distinction `dropNamespaceImpl` makes before returning early, because a files-only life that
+    /// never emitted a ref transaction can otherwise look `Removed` without ever having been removed).
+    ///
+    /// NEVER creates or mutates a catalog entry -- a probe is the wrong event to birth a namespace on --
+    /// and NEVER answers `false` for an unreadable, ambiguous, or changing observation: every such case
+    /// throws instead, because the caller (`existsDirectory`) uses `false` as permission to physically
+    /// remove a directory tree. A resident runtime already proven `Live` is trusted as an O(1) fast
+    /// path so an ordinary warm table does not pay a `ref_catalog` fetch per probe; every other shape
+    /// re-reads the exact catalog row.
+    bool namespaceStillLogicallyPresent(const RootNamespace & ns);
 
     /// Called after a complete catalog observation proves an exact resident life absent or replaced.
     /// It does not

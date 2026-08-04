@@ -1542,8 +1542,16 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         case DirShape::AtomicShard:
             return liveTreeDirHasChildren(path);
         case DirShape::TableDir:
-            /// A table directory exists iff it has at least one committed part.
-            return store()->hasAnyRefWithPrefix(liveNamespace(*dr.uuid), "");
+            /// A table directory exists iff its logical namespace still has foreground removal work
+            /// outstanding, or has never proven completion: present while `Creating`, for every `Live`
+            /// row (even zero parts and zero namespace files -- an empty live table is still a table),
+            /// and while `Removing` before its terminal `remove_namespace` transaction is durable;
+            /// absent only once no catalog row exists at all, or the terminal is durably proven. This is
+            /// deliberately NOT "has a committed ref": a table that removed its last part, or that never
+            /// wrote one, must stay present until an actual namespace-drop admits and completes removal
+            /// -- otherwise `DROP TABLE` on such a table would silently skip physical cleanup and leak
+            /// its catalog row forever.
+            return store()->namespaceStillLogicallyPresent(liveNamespace(*dr.uuid));
         case DirShape::DetachedContainer:
             /// Exists iff it has at least one reference.
             return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kDetachedRefPrefix);
