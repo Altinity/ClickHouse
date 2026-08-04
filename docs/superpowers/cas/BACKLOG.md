@@ -446,3 +446,39 @@ temp-key debris is acceptable given that every other CAS object is either write-
 deleted; whether GCS should instead be documented as supporting CAS only below a stated blob size;
 and whether the upstream change is worth it for one backend. The answer may legitimately be "cap it,
 document it, and refuse bigger blobs" — that is a design decision, and it has not been made.
+
+## `[condemned-displacement-delete-then-reupload]` Model the delete-then-re-upload alternative in TLA+ before dismissing it {#condemned-displacement-delete-then-reupload}
+
+The condemned-blob displacement currently REPLACES the dying incarnation with a conditional write
+against its exact token. The alternative — `deleteExact(key, condemned_token)` followed by an ordinary
+write-once `putIfAbsentStream` — is attractive: it needs no conditional-overwrite streaming form at
+all, and the "object absent → re-stream" path it lands in already exists and is exercised
+(`CasPartWriteTxn.cpp`, the `!hr.exists` arm, which handles a concurrent GC delete).
+
+It was set aside on three arguments, and those arguments are exactly what a model should either
+confirm or destroy:
+
+1. **The absence window is the whole upload.** Between the delete and the completed re-upload the key
+   does not exist, and for a multi-gigabyte blob that is minutes, not milliseconds. The conditional
+   overwrite has no such window: the key is populated at every instant.
+2. **Readers address blobs by CONTENT, not by incarnation.** `ManifestEntry` carries a `BlobRef`, not a
+   token, so a reader that resolves a live reference during the window gets a 404 on a blob it has
+   every right to read. Live references to a condemned blob are possible by construction: condemnation
+   is decided from a snapshot, and a reference can be admitted after it — our own dedup is that case.
+3. **It converts a recoverable failure into data loss.** Today a failed displacement (lost lease,
+   crash, refused precondition) changes nothing and can be retried. With delete-first, a crash between
+   the two steps destroys the body permanently, and every part that had deduplicated onto it loses
+   data.
+
+Argument 1 is arithmetic and argument 3 is a crash-ordering claim — both are precisely what TLA+
+settles. **Argument 2 is the one worth modelling first**, because it is a reachability question, not
+an intuition: is there an interleaving in which a reader holds a live reference to a condemned blob
+whose body is absent? If the model says no such state is reachable, the delete-then-re-upload shape
+becomes strictly simpler than what we are building and the seam addition should be reconsidered.
+
+The GC analogy does NOT transfer, and the model should encode why: GC deletes only what it has proven
+unreachable and creates nothing in its place, so it never occupies a state where a key must exist but
+does not.
+
+Existing models to extend rather than start from scratch: the resurrect/condemn specs under
+`docs/superpowers/models/` that already carry INV-NO-RETURN and the condemn-marker ordering.
