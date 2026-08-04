@@ -102,7 +102,7 @@ tolerated anomaly — `CaGcAckFloorCore`/T6a review, `096b3611988`).
 | 1 | Healthy rounds really perform destructive work | per-family delete counts per round in `system.content_addressed_garbage_collection_log` | every family with work nonzero on healthy rounds; no family silently inert | *(fill — battery stage)* |
 | 2 | `ca-fsck --detail` finds no dangling / stale-edge | fsck at soak end AND a mid-soak checkpoint | zero dangling, zero stale-edge, both runs | *(fill)* |
 | 3 | Backlog reaches zero STABLY | `pending_condemned` + cleanup backlog sampled per round to fixpoint | reaches zero and STAYS zero across ≥3 further rounds | *(fill)* |
-| 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family; round still completes; ZERO "no usable checkpoint" anomalies on healthy post-flip rounds (T6a carry) | *(fill)* |
+| 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family; round still completes; ZERO "no usable checkpoint" anomalies on healthy post-flip rounds (T6a carry) | **ANOMALY ARM: SATISFIED** (`{#criterion-4-evidence}`). HOLD ARM: deferred to a separate short dedicated run per the controller's ruling (not injected into the specimen) — recorded as owed, not failed |
 | 5 | No second full stream LIST after probe-A removal | LIST counts per round attributed by prefix and phase | exactly ONE full `cas/ns/stream/` enumeration per round, EVERY round; the bounded `cas/ns/` janitor page reported separately | *(fill)* |
 | 6 | Phase timings + S3 op counts give the baseline | the Step-3c inventory (below) | recorded as the explicit `MultiDelete`/concurrency baseline, un-timed spans named | *(fill)* |
 
@@ -121,6 +121,52 @@ un-measurable line is NAMED as un-timed, never estimated.
 | `namespace_cleanup` | `attempted`/`deleted`/`leaked`/`suppressed` + `janitor_pages`/`janitor_keys`/`janitor_deleted` | `SELECT round, phase_duration_us, phase_metrics FROM system.content_addressed_garbage_collection_log WHERE disk_name = '<disk>' AND phase = 'namespace_cleanup' AND event_time >= '<soak_start>' ORDER BY round` | *(fill)* | *(fill)* | *(fill)* | *(fill)* |
 | Generation pruning (exception — no phase row of its own; runs inside `round_commit`) | `generations_visited`/`pruned_through`/`generations_referenced` (on the `round_commit` phase row) + the shared `deletePrefixWholesale` primitive's own ProfileEvents | `SELECT round, phase_duration_us, phase_metrics, ProfileEvents FROM system.content_addressed_garbage_collection_log WHERE disk_name = '<disk>' AND phase = 'round_commit' AND event_time >= '<soak_start>' ORDER BY round` | *(fill)* | *(fill — if `deletePrefixWholesale`'s cost cannot be separated from the rest of `round_commit`, name it un-timed here, do not estimate)* | *(fill)* | *(fill)* |
 | Rounds-to-fixpoint | round sequence (Start/Finish rows, `outcome`) | `SELECT round, outcome, duration_ms FROM system.content_addressed_garbage_collection_log WHERE disk_name = '<disk>' AND event_type IN ('Start','Finish') AND event_time >= '<soak_start>' ORDER BY round` | *(fill: round count to first all-zero backlog)* | — | *(fill: sum duration_ms)* | — |
+
+## Criterion 4 — anomaly-arm injection evidence {#criterion-4-evidence}
+
+Executed against the general soak's own live table (`ca_soak.ca_stress`, ch1 incarnation
+`081d0652ad0e0fee565484707cf30dfd`) during the seed-`20260805` 90-minute run, at approximately
+minute 40. Mechanism verified safe on a scratch key first (byte-exact overwrite/restore round-trip
+via ClickHouse's own `s3()` table function with `s3_truncate_on_insert=1`); the target `_ckpt`
+object's original 94 bytes were backed up before injection and restored afterward, verified
+byte-identical via a hex diff.
+
+**Injection**: `soak_pool/cas/ns/state/081d0652ad0e0fee565484707cf30dfd/_ckpt` overwritten with
+garbage bytes at 03:39:42 UTC.
+
+**Detection — GC round 56** (`round_id=026949b3faed12ff26bd503f6f26f219`, Finish at 03:51:45 UTC,
+`outcome=Success`, `anomalies=1`). Server log, verbatim: `"CAS GC fold: destructive work
+SUPPRESSED this pass — 1 anomaly(ies), 1 held namespace(s), frontier INCOMPLETE (9 of 10
+namespace(s) proven; unproven: held=1). Graduations and pending deletes are carried; nothing
+irreversible runs until a pass that clears all three."`
+
+**Full phase evidence, ruling out a budget-skip** (the round genuinely read the corrupted object,
+not merely skipped it under a probe budget): `fold_ref_intake` phase —
+`frontier_namespaces=10, frontier_proven=9, frontier_unprobed_budget=0, tables_scanned=10,
+tables_held=1, tables_clamped=1`. `fold_reduce` phase — `condemned=6636, graduated=0,
+frontier_complete=0, suppress_destructive=1`. Every later destructive phase carried an explicit
+`suppressed=1` with zero actual work: `manifest_deletes {attempted:0, deleted:0, suppressed:1}`,
+`handoff_reclaim {suppressed:1}`, `ref_object_cleanup {suppressed:1}`, `orphan_sweep
+{suppressed:1}`. The round still completed (`outcome=Success`).
+
+**Verdict: anomaly arm SATISFIED.** All delete families inert for this round (zero deletes across
+every destructive phase, every one explicitly tagged suppressed), the round still completed, and
+the frontier-incompleteness/held-namespace signal is exactly what triggered the suppression —
+precisely the criterion's requirement.
+
+**Consequence, disclosed in full**: this injection also caused the 90-minute run (seed `20260805`)
+to fail at ~59 minutes (`CASRefNeedsRecovery` went nonzero and did not clear after the byte-exact
+restore, followed by fsck timeouts and a hard transport failure). That run is preserved as forensic
+evidence, NOT the Stage-B specimen — see
+`utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/failed_injected_run/README.md`. Ruling:
+corrupting a durable object under a live writer is outside CAS's supported fault model (the store
+is trusted for durability; the design defends against LIST lies and races, not byte-rot under an
+active lane), so this does not fail Stage B. The unresolved recovery-clearing question is carried
+as a named post-B residual (below). The Stage-B specimen is the CLEAN rerun, seed `20260807`, no
+injections.
+
+**Hold arm**: NOT executed against the specimen run, per the controller's ruling (a separate, short,
+dedicated run after the specimen, to keep the specimen pristine) — recorded as owed, not failed.
 
 ## Executable-prose sweep (Step E2) {#e2-executable-prose-sweep}
 
@@ -398,6 +444,16 @@ finding).
 - Items 1a–1f above, recorded unlocatable-counts-as-fixed (no further archaeology per the plan).
 - T4 TEST-1 (design sketched above, not landed — the real-round fold-site split).
 - T2-F4: no action, already covered elsewhere (`gtest_cas_ref_chunked_flush.cpp`).
+- Checkpoint corruption under a live lane (criterion-4 anomaly-arm injection, `{#criterion-4-evidence}`):
+  `CASRefNeedsRecovery` did not observably clear after a byte-identical `_ckpt` restore during the
+  seed-`20260805` run — a single observation, under a deliberately injected fault outside CAS's
+  trusted-store model (byte-rot under an active lane, not LIST lies or races), not investigated
+  further per the controller's ruling. Whether the ref-table lane can self-heal from transient
+  checkpoint damage once the bytes are good again is a legitimate robustness question for a
+  dedicated follow-up. Artifact:
+  `utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/failed_injected_run/`.
+- Hold-arm injection (criterion 4, second half): not executed against the Stage-B specimen by
+  design (kept the specimen pristine); owed as a separate, short, dedicated run.
 - T6b named residuals: C3 byte-axis (retained-BYTE axis reduced 1000→100, not bounded);
   `recoverRefTableDetailedFromAuthority` internal cost is one coarse unit, not bounded by design
   (fsck/rebuild need the complete table); capped spared entries lose their audit outcome record
