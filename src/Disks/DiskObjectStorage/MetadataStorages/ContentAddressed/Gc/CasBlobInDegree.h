@@ -259,7 +259,8 @@ struct GcRoundWorkBudget
     bool redeleteAvailable() const { return max_redeletes == 0 || redeletes_used < max_redeletes; }
 
     /// Orphan-manifest planner (`planManifestCursorPage` / `activeManifestKeys`): how many DISTINCT
-    /// namespaces one page may build a fresh protection view for, and how many ref-log GET/decode
+    /// namespaces the sweep may build a fresh protection view for in total this round (cumulative
+    /// across pages, not per page), and how many ref-log GET/decode
     /// operations the committed-tail recovery walk may spend in total across every namespace this
     /// round. Both caps exist because building a namespace's protection view (a catalog-authoritative
     /// table recovery plus a committed-tail walk) is the expensive, potentially-unbounded step the

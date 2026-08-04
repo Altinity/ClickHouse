@@ -621,7 +621,7 @@ int DisksApp::main(const std::vector<String> & /*args*/)
         log_file->close();
 
     /// Non-interactive runs surface a failing command as a nonzero process exit (CI/cron gating,
-    /// e.g. `fsck` reporting dangling objects). Interactive sessions are unaffected.
+    /// e.g. `cas-fsck` reporting dangling objects). Interactive sessions are unaffected.
     if (query.has_value() && last_command_exit_code != 0)
         return last_command_exit_code;
     return Application::EXIT_OK;

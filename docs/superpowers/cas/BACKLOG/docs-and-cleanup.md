@@ -58,6 +58,8 @@ Ranked by value-per-risk, each backed by real defects it would have prevented.
 - **[C2-followups] more pagination loops for `forEachListedKey`** — MINOR — Three more identical loops in `CasRefIntake.cpp`/`CasServerRoot.cpp`; `forEachListedKey` also lacks a stop-on-true/page-boundary hook to let `deletePrefixWholesale` + ns-cleanup migrate (interface addition, design first).
 
 - **[stale-recover-ref-table-comments] 3 comments still name the dead `recoverRefTableDetailed`/`recoverRefTable` functions** — MINOR — `Gc/CasOrphanManifestSweep.cpp:32`, `:167`, `Gc/CasGc.cpp:80`; the functions were replaced by `recoverRefTableDetailedFromAuthority`; comment-only fix.
+- **[fsck-short-keys-spell-out] short keys `ns`/`me`/`p`/`ha` in `CasEvent::detail` / fsck-report maps: spell out or keep** — MINOR, USER DECISION — user-facing abbreviations in `CasFsck`/`CasGc` detail maps were deliberately left outside the obscure-names rename; decide spell-out vs keep, then a small follow-up rename if spelling out.
+- **[prev-indeg-rename-never-happened] correction of record: commit `60691b11e7f`'s message claims a `prev_indeg` → `prev_indegree` rename that did not happen** — MINOR — the key had no emitter (it existed only in two description strings, which were replaced with really-emitted keys); commit messages are immutable, this entry is the durable pointer; no action.
 
 ## Source-layout refactoring residue (2026-07-16) {#source-layout-residue}
 
