@@ -199,7 +199,38 @@ i.e. a change to shared upstream code in `src/IO/S3/`. It also introduces a new 
 (temporary keys orphaned by a crash between upload and compose) that GC or fsck must reclaim. That is
 its own design, with its own risks, and does not belong in this one.
 
-## 10. Testing
+## 10. User-facing documentation (GCS)
+
+`docs/en/antalya/cas/` already describes the GCS dialect mechanically and correctly — the header
+rewriting, and that a conditional `CompleteMultipartUpload` throws rather than silently dropping the
+precondition. What it does NOT state is the operational consequence, which is what an operator
+choosing a backend actually needs:
+
+**On a generation-token store, a conditional overwrite is bounded by
+`gcs_max_conditional_put_bytes`.** A blob whose body exceeds it cannot be resurrected from a condemned
+incarnation at all. On ETag stores there is no such bound.
+
+Pages to update, and what each must say:
+
+- `architecture/backend.md` — after the existing sentence about the rejected conditional
+  `CompleteMultipartUpload`, state the size consequence and that the body is buffered whole in one
+  part (so the setting bounds memory as well as size on that path). Today the page explains the
+  mechanism and stops short of what it costs.
+- `architecture/blob-protocol.md` — the settings table lists `gcs_max_conditional_put_bytes` with no
+  indication that it is a hard functional ceiling rather than a tuning knob. Say so in the
+  description.
+- `configuration.md` — same row, same fix. A reader who only reads this page must not conclude the
+  default is a performance default.
+- `bucket-requirements.md` — the support table marks GCS `✓` unqualified. It needs the qualifier:
+  supported, with conditional overwrites capped, and a pointer to the backend page.
+
+Where the new failure of §6 is raised, its message text and the documentation must agree; the message
+is the thing an operator sees first, so the docs follow it rather than the reverse.
+
+This documentation change ships WITH the code change, not after it: the failure introduced in §6 is
+the first thing an operator will search for.
+
+## 11. Testing
 
 The point to prove is the ABSENCE of materialization, not the ability to write a large object. A test
 that streams tens of gigabytes through CI proves the same thing far more expensively and becomes the

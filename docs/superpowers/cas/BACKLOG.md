@@ -415,3 +415,34 @@ continuing the ID series, not renumbering anything above.
 - **[part-folder-validate-never-gating] `part_folder_validate=never` needs a gate, not a silent accept** — HARD (user settings-policy direction) — `PartFolderAccess.h:135-138` accepts `never` (skip the `ForceFresh` body re-proof entirely) with no acknowledgment of the risk. Either remove the `never` value or require an explicit risk-acknowledgment setting alongside it. Docs already carry a strong warning on this value (`configuration.md`); the code should not make it this easy to select silently.
 - **[gc-enabled-false-silent] `gc_enabled=false` accumulates garbage silently** — HARD (user settings-policy direction) — Disabling the background GC scheduler produces no ongoing signal that reclamation has stopped. Add a periodic warning log line plus a metric while `gc_enabled=false` and the pool has reclaimable debris, so an operator who disabled GC for a legitimate reason (or by mistake) finds out before the pool grows unbounded.
 - **[dedup-presence-only-window-recheck] re-verify the deduplication presence-only-admit corruption window** — VERIFY (user-flagged from memory, re-derive from the disk-error audit) — The 2026-07-21 disk-error audit (operability-and-introspection.md, disk-error-audit-followups) identified a presence-only dedup admit as a corruption-window class; re-verify against HEAD whether this window is still open post the format/staging changes since that audit, and either close it out or fold it back into an active item with current evidence.
+
+## `[gcs-conditional-overwrite-rethink]` GCS conditional overwrite needs re-thinking from the premise, not a bigger cap {#gcs-conditional-overwrite-rethink}
+
+GCS honours no preconditions on multipart completion — Google's own XML API documentation says
+"Preconditions are not supported in the requests", and it was measured independently on 2026-07-03
+(`0a3bc2f1fc6`). A lost precondition there does not fail the write, it **silently overwrites**, which
+is the one outcome CAS's whole token protocol exists to prevent. Hence `s3_force_single_part_upload`
+for generation-token stores, and `gcs_max_conditional_put_bytes` (1 GiB) as its forced companion: with
+multipart off, the body must go in ONE part, buffered whole in RAM.
+
+The consequences are larger than a settings row suggests, and they are worth re-deriving rather than
+patching:
+
+- **A conditional overwrite of a body above the cap is impossible on GCS**, not slow. Blob bodies have
+  no size cap, so a large-enough blob simply cannot be resurrected from a condemned incarnation there.
+- **Raising the cap does not help**, it just moves the memory ceiling: one part means one RAM buffer.
+- The streaming design (`docs/superpowers/specs/2026-08-04-cas-streaming-conditional-overwrite-design.md`)
+  fixes S3 and deliberately does NOT fix this — it only makes the limit fail early and legibly.
+
+The mechanism named when the limit was introduced is: unconditional multipart to a TEMPORARY key, then
+a CONDITIONAL `Compose` onto the target. ClickHouse already carries `S3::ComposeObjectRequest` and
+`Client::ComposeObject` (added for GCS copy), but the request exposes no precondition — it would need
+`x-goog-if-generation-match` through `GetRequestSpecificHeaders`, i.e. a change to SHARED UPSTREAM code
+in `src/IO/S3/`. It also creates a debris class that does not exist today: temporary keys orphaned by a
+crash between the upload and the compose, which GC or fsck must then own.
+
+**What to re-think, before designing that.** Whether `Compose` is even the right primitive; whether the
+temp-key debris is acceptable given that every other CAS object is either write-once or exactly-token
+deleted; whether GCS should instead be documented as supporting CAS only below a stated blob size;
+and whether the upstream change is worth it for one backend. The answer may legitimately be "cap it,
+document it, and refuse bigger blobs" — that is a design decision, and it has not been made.
