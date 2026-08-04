@@ -116,3 +116,7 @@ get reclaimed once nothing references them anymore.
 
 This exact configuration and SQL were run against a live server before publication: `CREATE
 TABLE`, `INSERT`, `SELECT`, and the `system.cas_mounts` query above all completed with zero errors.
+
+For production use, layer a local filesystem cache over the `CAS` disk — see the recommended
+example in [Configuration](/antalya/cas/configuration).
+
