@@ -964,26 +964,56 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     Gc gc(store, kGc);
     backend->resetCounts();
 
-    /// Round 1: `injectRetire`'s condemn_round (1) is already behind current_round (2), so this round
-    /// graduates -- publishes delete_pending against the observed token -- without deleting anything
-    /// yet (the physical delete is a LATER round's pre-CAS phase).
-    const GateVerdict graduate = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
-    ASSERT_TRUE(graduate.saw_fold);
-    EXPECT_EQ(graduate.frontier_namespaces, 0u);
-    EXPECT_EQ(graduate.frontier_proven, 0u);
-    EXPECT_TRUE(graduate.catalog_proved_empty)
-        << "the catalog cut itself must be the proof, not the bare 0==0 equality";
-    EXPECT_TRUE(graduate.frontier_complete);
-    EXPECT_FALSE(graduate.suppress_destructive);
-    EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists)
-        << "graduation only PUBLISHES delete_pending; nothing is deleted yet";
+    /// `injectRetire` seeds the condemned entry WITHOUT the durable per-hash `Condemned` meta a real
+    /// condemn round writes (`fold`'s own `scheduleCondemnMarkerWrite` side effect) -- so this fixture's
+    /// round cadence is longer than the textbook condemn->graduate->delete: the lease is UNCLAIMED
+    /// (`injectRetire` writes `gc/state` directly, never through a real acquire), so the first round
+    /// only arms `acquireOrRenewLease`'s two-tick steal-safety window; the graduation gate's own
+    /// `confirm_condemned_marker` then fails its first sighting, schedules the meta write, and CARRIES
+    /// the entry (not yet delete_pending) while `meta_pool_wait` lands it durably by that round's end;
+    /// only the round after that sees the durable meta and actually graduates; and the physical delete
+    /// is the round after THAT. None of this is a round count this fixture can promise -- it depends on
+    /// the confirm/retry cadence, not on this gate -- so drive generously and inspect the LAST round's
+    /// verdict plus the final state, the same way `runRoundsUntilAbsent` does for the graduating
+    /// production path, rather than asserting a hand-counted round number.
+    ASSERT_TRUE(backend->head(layout.blobKey(blob_ref)).exists)
+        << "the scenario starts with the condemned blob present, or the loop below measures nothing";
 
-    /// Round 2: the pre-CAS phase executes the exact-token delete round 1's graduation queued.
-    const GateVerdict deleted = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
-    ASSERT_TRUE(deleted.saw_fold);
-    EXPECT_TRUE(deleted.catalog_proved_empty);
-    EXPECT_TRUE(deleted.frontier_complete);
-    EXPECT_FALSE(deleted.suppress_destructive);
+    /// Drive generously rather than hand-count rounds (the confirm/retry cadence above is not a
+    /// promise this fixture can make), but still observe the TWO-PHASE PIPELINE explicitly: an open,
+    /// unsuppressed gate while the blob was still present (the graduate side), and only a STRICTLY
+    /// LATER round removing it (the delete side). Asserting only the final state and the last verdict
+    /// would pass just as readily if the blob vanished by some other path entirely.
+    int round_gate_opened_while_present = -1;   /// the graduate side: FIRST round that folded, unsuppressed,
+                                                 /// with the blob still present
+    int round_blob_vanished = -1;               /// the delete side
+    GateVerdict last;
+    int rounds_run = 0;
+    for (int i = 0; i < 10 && backend->head(layout.blobKey(blob_ref)).exists; ++i)
+    {
+        last = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+        ++rounds_run;
+        const bool still_present = backend->head(layout.blobKey(blob_ref)).exists;
+        if (round_gate_opened_while_present < 0 && last.saw_fold && !last.suppress_destructive && still_present)
+            round_gate_opened_while_present = rounds_run;
+        if (round_blob_vanished < 0 && !still_present)
+            round_blob_vanished = rounds_run;
+    }
+
+    ASSERT_GT(rounds_run, 0) << "the loop must actually run, or every assertion below is vacuous";
+    ASSERT_TRUE(last.saw_fold);
+    EXPECT_EQ(last.frontier_namespaces, 0u);
+    EXPECT_EQ(last.frontier_proven, 0u);
+    EXPECT_TRUE(last.catalog_proved_empty)
+        << "the catalog cut itself must be the proof, not the bare 0==0 equality";
+    EXPECT_TRUE(last.frontier_complete);
+    EXPECT_FALSE(last.suppress_destructive);
+    ASSERT_GT(round_gate_opened_while_present, 0)
+        << "the gate must have opened (folded, unsuppressed) at least one round BEFORE the blob was "
+           "gone -- the graduate side of the two-phase pipeline -- not just at the round that deleted it";
+    ASSERT_GT(round_blob_vanished, round_gate_opened_while_present)
+        << "the delete must be a round STRICTLY LATER than the one that opened the gate, never the same "
+           "round -- a round that both graduates and deletes in one step would hide the two-phase split";
     EXPECT_FALSE(backend->head(layout.blobKey(blob_ref)).exists)
         << "a proved-empty universe is a COMPLETE frontier, not a suppressed one -- the condemned blob "
            "must drain through the ordinary two-phase pipeline instead of leaking forever";
@@ -1019,6 +1049,11 @@ TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedE
 
     Gc gc(store, kGc);
     backend->resetCounts();
+    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
+    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
+    /// and folds nothing, so it is spent here rather than counted among the assertions below.
+    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
@@ -1158,6 +1193,11 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
 
     Gc gc(store, kGc);
     backend->resetCounts();
+    /// `injectRetire` leaves `gc/state`'s lease unclaimed (owner 0); the first round only arms the
+    /// steal-safety window (see `ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork`)
+    /// and folds nothing, independent of policy -- lease acquisition precedes the destructive gate.
+    const GateVerdict warm_up = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
+    EXPECT_FALSE(warm_up.saw_fold);
     for (int i = 0; i < 6; ++i)
     {
         const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
