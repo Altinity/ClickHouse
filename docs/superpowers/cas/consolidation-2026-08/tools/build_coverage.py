@@ -216,17 +216,24 @@ def build_file_to_clusters(manifest_rows, records, record_to_cluster):
 # ---------------------------------------------------------------------------
 
 def backlog_survives(cluster, backlog_text):
-    """A cluster's BACKLOG-target item 'survives' the T13 prune if any of its
-    issue_ids appear as a bracketed ID in the live BACKLOG.md, or a
-    distinctive substring of its canonical_claim appears verbatim."""
+    """A cluster's BACKLOG-target item 'survives' the T13 prune only if one of
+    its issue_ids appears as a bracketed ID in the live BACKLOG.md.
+
+    A prior version of this check also accepted a distinctive quoted
+    substring of the canonical_claim appearing anywhere in BACKLOG.md. That
+    fallback was removed: at BACKLOG.md's actual size (1811 lines of dense
+    technical prose) generic terms and symbol names it flagged as
+    "distinctive" (e.g. `existsFile`, `CasGc.cpp`, `Cas::Store`, `Removing`)
+    recur incidentally throughout the document, so a substring hit is not
+    evidence the specific item survived -- the same incidental-hit failure
+    mode the T7 audit already measured at 83-96% for unscoped prose citation
+    (see gate-c-audit-report.md). The bracketed-ID check has no such failure
+    mode: BACKLOG.md's own header states IDs are never renumbered, so a
+    bracket match names the exact live item, not merely nearby vocabulary.
+    """
     for iid in cluster.get("issue_ids", []):
         if re.search(r"\[" + re.escape(iid) + r"\b", backlog_text):
             return True, f"issue_id [{iid}] present in BACKLOG.md"
-    # fall back: look for a long distinctive quoted fragment from the claim
-    claim = cluster.get("canonical_claim", "")
-    for frag in re.findall(r"`([^`]{8,60})`", claim):
-        if frag in backlog_text:
-            return True, f"claim fragment `{frag}` present in BACKLOG.md"
     return False, None
 
 

@@ -381,7 +381,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/c2-revert-report.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-2040: claim fragment `gc_round_manifest_cleanup_budget` present in BACKLOG.md; C-0065: claim fragment `[gc-mf-cleanup-durable-retry]` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B038-102",
       "B038-103",
@@ -497,7 +497,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/hygiene-report.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-3849: claim fragment `--gtest_list_tests` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "B043-052",
       "B043-053",
@@ -587,7 +587,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/soak-t6b-report.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-4354: claim fragment `unreachable=0` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "B044-049",
       "B044-050",
@@ -783,7 +783,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/t2-review.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0078: issue_id [F1] present in BACKLOG.md; C-0080: issue_id [F4] present in BACKLOG.md; C-0079: issue_id [F2] present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0080: issue_id [F4] present in BACKLOG.md; C-0078: issue_id [F1] present in BACKLOG.md; C-0079: issue_id [F2] present in BACKLOG.md)",
     "record_ids": [
       "B046-010",
       "B046-011",
@@ -1090,7 +1090,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/t6-review-opus.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md; -> BACKLOG (C-0007: claim fragment ` asserts ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md",
     "record_ids": [
       "B048-001",
       "B048-002",
@@ -1116,7 +1116,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/t6-review.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md; -> BACKLOG (C-0007: claim fragment ` asserts ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md",
     "record_ids": [
       "B047-034",
       "B047-035",
@@ -1136,7 +1136,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/t6a-review.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0008: claim fragment `Removing` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "B048-010",
       "B048-011",
@@ -1243,7 +1243,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/t7-laneA-review.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-0010: claim fragment `ShardCoverage` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B048-044",
       "B048-045",
@@ -1320,7 +1320,7 @@
     "path": ".superpowers/sdd/2026-08-02-cas-stage-b-remaining/unattended-log.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3832: claim fragment `CasPool.cpp` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B050-093",
       "B050-094",
@@ -1349,7 +1349,7 @@
     "path": ".superpowers/sdd/2026-08-03-cas-naming/t1-report.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0077: claim fragment `utils/ca-soak` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B045-020",
       "B045-021",
@@ -1856,7 +1856,7 @@
     "path": ".superpowers/sdd/tla-rev7-report.md",
     "group": ".superpowers",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md; -> BACKLOG (C-0908: claim fragment `Vanished` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md",
     "record_ids": [
       "B050-066",
       "B050-067",
@@ -1890,7 +1890,7 @@
     "path": "cas_disks_architecture_analysis.md",
     "group": "other",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-4565: claim fragment `CasGc.cpp` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "B039-104",
       "B039-105",
@@ -1958,7 +1958,7 @@
     "path": "cas_disks_consistency_review.md",
     "group": "other",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-3122: claim fragment `PartPathParser` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md",
     "record_ids": [
       "B039-132",
       "B039-133",
@@ -2179,7 +2179,7 @@
     "path": "docs/superpowers/RESUME-2026-07-15.md",
     "group": "other",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-4516: claim fragment `no-content-addressed-storage` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "B038-063",
       "B038-064",
@@ -2345,7 +2345,7 @@
     "path": "docs/superpowers/cas/03-writer-protocol.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-0097: claim fragment `data_parts` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M2-012",
       "AUDIT-M2-013",
@@ -2548,7 +2548,7 @@
     "path": "docs/superpowers/cas/05-formats-and-backend.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-4589: claim fragment `max_content_addressable_pool_format` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-033",
       "B002-080",
@@ -2625,7 +2625,7 @@
     "path": "docs/superpowers/cas/06-tla-models.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-0567: claim fragment `delete_pending` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M2-034",
       "AUDIT-M2-035",
@@ -2800,7 +2800,7 @@
     "path": "docs/superpowers/cas/08-testing-and-soak.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0001: claim fragment `ca-gc-dryrun` present in BACKLOG.md; C-4369: claim fragment `S3GetObject` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-047",
       "AUDIT-M2-048",
@@ -3038,7 +3038,7 @@
     "path": "docs/superpowers/cas/11-walkthrough.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0026: claim fragment `04-gc-protocol.md` present in BACKLOG.md; C-0003: claim fragment `RENAME TABLE` present in BACKLOG.md; C-1968: claim fragment `dropNamespace` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-076",
       "AUDIT-M2-077",
@@ -3302,7 +3302,7 @@
     "path": "docs/superpowers/cas/2026-07-28-stage-a-RESULTS.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-2014: claim fragment `CasGcRefScanDisagreements` present in BACKLOG.md; C-4291: issue_id [PROBE-A-CADENCE-UNIT] present in BACKLOG.md; C-0492: claim fragment `ReplicatedMergeTreePartCheckThread` present in BACKLOG.md +2 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-4291: issue_id [PROBE-A-CADENCE-UNIT] present in BACKLOG.md; C-0056: issue_id [RECOVER-REF-TABLE-LIST-RESIDUAL] present in BACKLOG.md; C-4176: issue_id [FSCK-SCALE-TIMEOUT] present in BACKLOG.md)",
     "record_ids": [
       "B029-001",
       "B029-002",
@@ -3463,7 +3463,7 @@
     "path": "docs/superpowers/cas/2026-08-02-stage-b-midpoint-audit.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-4559: claim fragment ` before ` present in BACKLOG.md; C-4613: claim fragment `CasRefLedger.cpp` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md",
     "record_ids": [
       "B032-020",
       "B032-021",
@@ -4036,7 +4036,7 @@
     "path": "docs/superpowers/cas/ROADMAP.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-4624: issue_id [B13] present in BACKLOG.md; C-4623: issue_id [B165] present in BACKLOG.md; C-4069: claim fragment `system.content_addressed_garbage_collection_log` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-4623: issue_id [B165] present in BACKLOG.md; C-4624: issue_id [B13] present in BACKLOG.md)",
     "record_ids": [
       "B038-070",
       "B038-071",
@@ -4110,7 +4110,7 @@
     "path": "docs/superpowers/cas/cache.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-3257: claim fragment `Cas::Store` present in BACKLOG.md; C-0992: claim fragment `promoteBuild` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "B039-028",
       "B039-029",
@@ -4550,7 +4550,7 @@
     "path": "docs/superpowers/cas/datapartstorage-content-addressed-design-concern.md",
     "group": "docs/superpowers/cas",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-3122: claim fragment `PartPathParser` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md",
     "record_ids": [
       "B041-108",
       "B041-109",
@@ -4849,7 +4849,7 @@
     "path": "docs/superpowers/cas/refactoring-ideas.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/bucket-requirements.md; -> BACKLOG (C-1170: claim fragment `CasGc.cpp` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/bucket-requirements.md",
     "record_ids": [
       "B043-075",
       "B043-076",
@@ -4871,7 +4871,7 @@
     "path": "docs/superpowers/cas/review1.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-3125: claim fragment `existsFile` present in BACKLOG.md; C-4069: claim fragment `system.content_addressed_garbage_collection_log` present in BACKLOG.md; C-0074: claim fragment `Mode::Native` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M-030",
       "AUDIT-M-031",
@@ -4955,7 +4955,7 @@
     "path": "docs/superpowers/cas/upstream-patch-inventory.md",
     "group": "docs/superpowers/cas",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-4628: claim fragment `precommit` present in BACKLOG.md; C-4629: claim fragment `precommit` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B051-051",
       "B051-052",
@@ -5072,7 +5072,7 @@
     "path": "docs/superpowers/cas/upstream.md",
     "group": "docs/superpowers/cas",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-0088: claim fragment `DROP REPLICA` present in BACKLOG.md; C-0089: claim fragment `lazy_load_tables` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "B051-001",
       "B051-002",
@@ -5790,7 +5790,7 @@
     "path": "docs/superpowers/plans/2026-07-01-cas-shard-incarnation-and-registry-removal.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/bucket-requirements.md; -> BACKLOG (C-4166: issue_id [D3] present in BACKLOG.md; C-4593: claim fragment `CaBuildRootPrecommit` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/bucket-requirements.md; -> BACKLOG (C-4166: issue_id [D3] present in BACKLOG.md)",
     "record_ids": [
       "B004-083",
       "B004-084",
@@ -5820,7 +5820,7 @@
     "path": "docs/superpowers/plans/2026-07-02-cas-docs-consolidation.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/index.md; -> BACKLOG (C-3664: claim fragment `REJECTED` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/index.md",
     "record_ids": [
       "B004-131",
       "B004-132",
@@ -5836,7 +5836,7 @@
     "path": "docs/superpowers/plans/2026-07-02-cas-gc-ack-floor-fence.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-2632: claim fragment `Store::open` present in BACKLOG.md; C-2631: claim fragment `gc/state` present in BACKLOG.md; C-2630: claim fragment `observed_gc_round` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M2-386",
       "AUDIT-M2-387",
@@ -6216,7 +6216,7 @@
     "path": "docs/superpowers/plans/2026-07-08-cas-part-folder-cache-phase2.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md; -> BACKLOG (C-2163: claim fragment `Cas::Store` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md",
     "record_ids": [
       "B008-020",
       "B008-021",
@@ -6252,7 +6252,7 @@
     "path": "docs/superpowers/plans/2026-07-08-cas-part-folder-cache-phase3.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-4213: claim fragment `ProfileEvents` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "B008-033",
       "B008-034",
@@ -6677,7 +6677,7 @@
     "path": "docs/superpowers/plans/2026-07-12-cas-ref-table-snapshot-log-phase1.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-1696: claim fragment ` and terminal ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M2-411",
       "B012-001",
@@ -6785,7 +6785,7 @@
     "path": "docs/superpowers/plans/2026-07-12-cas-stabilization-cleanup.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-3125: claim fragment `existsFile` present in BACKLOG.md; C-0092: claim fragment `ReadBufferFromFileView` present in BACKLOG.md; C-0260: claim fragment `Generation` present in BACKLOG.md +1 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M-039",
       "AUDIT-M-040",
@@ -7094,7 +7094,7 @@
     "path": "docs/superpowers/plans/2026-07-15-cas-codecs-v3-phase1-formats-bootstrap.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/index.md; -> BACKLOG (C-0272: claim fragment `CasStore.h` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/index.md",
     "record_ids": [
       "B016-038",
       "B016-039",
@@ -7130,7 +7130,7 @@
     "path": "docs/superpowers/plans/2026-07-15-cas-codecs-v3-phase2-control-plane.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-4607: claim fragment `CasInspect` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "B016-051",
       "B016-052",
@@ -7411,7 +7411,7 @@
     "path": "docs/superpowers/plans/2026-07-16-cas-source-layout-refactoring.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-0392: claim fragment `CasBlobUploader` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/storage-layout.md",
     "record_ids": [
       "AUDIT-M2-388",
       "B018-027",
@@ -7450,7 +7450,7 @@
     "path": "docs/superpowers/plans/2026-07-16-cas-txn-one-pipeline.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-1118: claim fragment `pending_ref_ops` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M2-395",
       "B018-054",
@@ -7567,7 +7567,7 @@
     "path": "docs/superpowers/plans/2026-07-17-codex-triage-fix-wave.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-2574: claim fragment `DROP POOL MEMBER` present in BACKLOG.md; C-0048: claim fragment `casAppendObject` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-412",
       "B019-096",
@@ -7718,7 +7718,7 @@
     "path": "docs/superpowers/plans/2026-07-20-umbrella-review-fixes.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-3110: claim fragment `ContentAddressedMetadataStorage` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-425",
       "B022-019",
@@ -7876,7 +7876,7 @@
     "path": "docs/superpowers/plans/2026-07-22-cas-parallel-write-path.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0964: claim fragment ` rather than ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "B023-092",
       "B023-093",
@@ -7998,7 +7998,7 @@
     "path": "docs/superpowers/plans/2026-07-24-cas-publish-confirm-and-ref-lane-safety.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-0486: claim fragment `eraseView` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M2-389",
       "AUDIT-M2-390",
@@ -8097,7 +8097,7 @@
     "path": "docs/superpowers/plans/2026-07-25-cas-followups-detector-introspection-s42-forceclaim.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-1493: claim fragment `LIST(cas/refs/)` present in BACKLOG.md; C-2168: issue_id [B1] present in BACKLOG.md; C-2736: claim fragment `claimOwnerOrThrow` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-2168: issue_id [B1] present in BACKLOG.md)",
     "record_ids": [
       "B026-001",
       "B026-002",
@@ -8172,7 +8172,7 @@
     "path": "docs/superpowers/plans/2026-07-26-overnight-s42-and-gc-perf-study.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-2009: claim fragment `fold_ref_intake` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-402",
       "B027-001",
@@ -8207,7 +8207,7 @@
     "path": "docs/superpowers/plans/2026-07-28-cas-fence-observability-and-write-grace.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-2750: claim fragment `CasWriteRetryLater` present in BACKLOG.md; C-3635: claim fragment `ContentAddressedSettings` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-413",
       "AUDIT-M2-414",
@@ -8345,7 +8345,7 @@
     "path": "docs/superpowers/plans/2026-07-28-cas-ref-chain-stage-b-catalog.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/migration.md; -> BACKLOG (C-0129: claim fragment `ApplyPending` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/migration.md",
     "record_ids": [
       "AUDIT-M2-426",
       "AUDIT-M2-427",
@@ -8473,7 +8473,7 @@
     "path": "docs/superpowers/plans/2026-07-29-cas-relink-seam-tla-gate.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md; -> BACKLOG (C-3332: claim fragment `unrelated` present in BACKLOG.md; C-0794: claim fragment `Unresolved` present in BACKLOG.md; C-2989: claim fragment `Poisoned` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md",
     "record_ids": [
       "AUDIT-M2-436",
       "AUDIT-M2-437",
@@ -8639,7 +8639,7 @@
     "path": "docs/superpowers/plans/2026-08-03-cas-docs-map-reduce-consolidation.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/index.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/quick-start.md; -> BACKLOG (C-2175: claim fragment `ephemeral` present in BACKLOG.md; C-0020: claim fragment `rejected` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/index.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/quick-start.md",
     "record_ids": [
       "B033-001",
       "B033-002",
@@ -8723,7 +8723,7 @@
     "path": "docs/superpowers/plans/2026-08-03-cas-obscure-names-cleanup.md",
     "group": "docs/superpowers/plans",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-3669: claim fragment `Deduplication` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "B033-055",
       "B033-056",
@@ -8749,7 +8749,7 @@
     "path": "docs/superpowers/random_notes.md",
     "group": "other",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-2890: claim fragment `writeFile` present in BACKLOG.md; C-4016: issue_id [B13] present in BACKLOG.md; C-0075: issue_id [B13] present in BACKLOG.md +1 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-0075: issue_id [B13] present in BACKLOG.md; C-4016: issue_id [B13] present in BACKLOG.md; C-3580: issue_id [B13] present in BACKLOG.md)",
     "record_ids": [
       "B043-064",
       "B043-065",
@@ -8811,7 +8811,7 @@
     "path": "docs/superpowers/reports/2026-07-02-d2-scenario-triage.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-4074: claim fragment `CasRootCas` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-166",
       "AUDIT-M2-167",
@@ -8865,7 +8865,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/00-REPORT.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-1574: claim fragment `cas/refs/` present in BACKLOG.md; C-0111: claim fragment `root_shards` present in BACKLOG.md; C-0112: claim fragment `fence_seq` present in BACKLOG.md +3 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-229",
       "AUDIT-M2-230",
@@ -8970,7 +8970,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/01-frontend.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-2488: claim fragment `uuid.txt` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M2-285",
       "AUDIT-M2-286",
@@ -9054,7 +9054,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/03-gc-refs.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-0016: claim fragment `CasInspect` present in BACKLOG.md; C-0018: claim fragment `suppress_destructive` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M2-259",
       "AUDIT-M2-260",
@@ -9109,7 +9109,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/04-ops-mounts.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0034: claim fragment `GC REBUILD` present in BACKLOG.md; C-0033: claim fragment `GC REBUILD` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-306",
       "AUDIT-M2-307",
@@ -9172,7 +9172,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/05-integration.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0092: claim fragment `ReadBufferFromFileView` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-224",
       "AUDIT-M2-225",
@@ -9234,7 +9234,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/06-tests.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0035: claim fragment `CasSingleWriterSlot` present in BACKLOG.md; C-0115: issue_id [P3.1] present in BACKLOG.md; C-0116: claim fragment `ContentAddressedMetadataStorage` present in BACKLOG.md +1 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0115: issue_id [P3.1] present in BACKLOG.md)",
     "record_ids": [
       "AUDIT-M2-315",
       "AUDIT-M2-316",
@@ -9328,7 +9328,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-archaeology/07-history.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md; -> BACKLOG (C-0040: claim fragment `folded_cursor` present in BACKLOG.md; C-0041: claim fragment `retired_refs` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md",
     "record_ids": [
       "B003-001",
       "B003-002",
@@ -9389,7 +9389,7 @@
     "path": "docs/superpowers/reports/2026-07-12-cas-refsnaplog-coverage-audit.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md; -> BACKLOG (C-0031: claim fragment `PoolConfig` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md",
     "record_ids": [
       "B012-050",
       "B012-051",
@@ -9431,7 +9431,7 @@
     "path": "docs/superpowers/reports/2026-07-13-cas-soak-metrics-audit.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-4395: claim fragment `ProfileEvents` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-309",
       "AUDIT-M2-310",
@@ -9621,7 +9621,7 @@
     "path": "docs/superpowers/reports/2026-07-17-codex-review-triage.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-2574: claim fragment `DROP POOL MEMBER` present in BACKLOG.md; C-0470: claim fragment `CORRUPTED_DATA` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M2-352",
       "B019-057",
@@ -9706,7 +9706,7 @@
     "path": "docs/superpowers/reports/2026-07-17-dataloss-traced-root-cause.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-4252: claim fragment `build/dl_probe.py` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-208",
       "B019-116",
@@ -9789,7 +9789,7 @@
     "path": "docs/superpowers/reports/2026-07-18-logical-error-asan-abort-triage.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-3962: claim fragment `LOGICAL_ERROR` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M-061",
       "AUDIT-M-062",
@@ -9819,7 +9819,7 @@
     "path": "docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md; -> BACKLOG (C-0117: claim fragment `SlowDown` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md",
     "record_ids": [
       "AUDIT-M2-351",
       "B020-016",
@@ -9894,7 +9894,7 @@
     "path": "docs/superpowers/reports/2026-07-18-s31-dryrun-shards-rca.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-2005: claim fragment `previewDeletes` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B020-031",
       "B020-032"
@@ -10028,7 +10028,7 @@
     "path": "docs/superpowers/reports/2026-07-20-umbrella-review-cas-vs-antalya-26.6.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-3110: claim fragment `ContentAddressedMetadataStorage` present in BACKLOG.md; C-0024: claim fragment `DROP POOL MEMBER` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-368",
       "AUDIT-M2-369",
@@ -10075,7 +10075,7 @@
     "path": "docs/superpowers/reports/2026-07-20-umbrella-review-fixes-deferred.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md; -> BACKLOG (C-0114: claim fragment `content_addressed_log` present in BACKLOG.md; C-2574: claim fragment `DROP POOL MEMBER` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md",
     "record_ids": [
       "AUDIT-M2-303",
       "AUDIT-M2-304",
@@ -10192,7 +10192,7 @@
     "path": "docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/read-path.md; -> BACKLOG (C-3113: claim fragment `StorageProxy` present in BACKLOG.md; C-3112: claim fragment `MergeTree` present in BACKLOG.md; C-3111: claim fragment `MergeTree` present in BACKLOG.md +1 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/read-path.md",
     "record_ids": [
       "B023-001",
       "B023-002",
@@ -10314,7 +10314,7 @@
     "path": "docs/superpowers/reports/2026-07-26-list-incompleteness-investigation.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-1493: claim fragment `LIST(cas/refs/)` present in BACKLOG.md; C-2014: claim fragment `CasGcRefScanDisagreements` present in BACKLOG.md; C-2009: claim fragment `fold_ref_intake` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-353",
       "AUDIT-M2-354",
@@ -10891,7 +10891,7 @@
     "path": "docs/superpowers/reports/2026-07-28-ref-rework-reviews/codex_r7_findings.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/migration.md; -> BACKLOG (C-2119: claim fragment `Removing` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/migration.md",
     "record_ids": [
       "AUDIT-M2-213",
       "B041-034",
@@ -11060,7 +11060,7 @@
     "path": "docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-1501: claim fragment `CasGc.cpp:718` present in BACKLOG.md; C-1569: claim fragment `CasBlobInDegree.cpp:289` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-214",
       "AUDIT-M2-215",
@@ -11094,7 +11094,7 @@
     "path": "docs/superpowers/reports/2026-07-29-gc-perf-audit-soak.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-4291: issue_id [PROBE-A-CADENCE-UNIT] present in BACKLOG.md; C-0060: claim fragment `system.content_addressed_log` present in BACKLOG.md; C-0059: issue_id [Lever B] present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0059: issue_id [Lever B] present in BACKLOG.md; C-4291: issue_id [PROBE-A-CADENCE-UNIT] present in BACKLOG.md)",
     "record_ids": [
       "B030-046",
       "B030-047",
@@ -11173,7 +11173,7 @@
     "path": "docs/superpowers/reports/2026-07-30-stage-b-critical-checkpoint-review.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md; -> BACKLOG (C-0495: claim fragment `CasFsck.cpp` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md",
     "record_ids": [
       "AUDIT-M2-221",
       "AUDIT-M2-222",
@@ -11205,7 +11205,7 @@
     "path": "docs/superpowers/reports/2026-07-30-stage-b-increment-review.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-0496: claim fragment `cas/refs/` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B031-009",
       "B031-010",
@@ -11226,7 +11226,7 @@
     "path": "docs/superpowers/reports/2026-07-31-removalready-review-fable.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3083: claim fragment `Removing` present in BACKLOG.md; C-1779: claim fragment `Removing` present in BACKLOG.md; C-0497: claim fragment `_cleanup` present in BACKLOG.md +2 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-280",
       "AUDIT-M2-281",
@@ -11304,7 +11304,7 @@
     "path": "docs/superpowers/reports/2026-07-31-stage-b-strategic-review-codex.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-2518: claim fragment `CasRefCatalog` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M2-209",
       "AUDIT-M2-210",
@@ -11386,7 +11386,7 @@
     "path": "docs/superpowers/reports/2026-07-31-stage-b-strategic-review-fable.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md; -> BACKLOG (C-1206: claim fragment `casAdmitEntry` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/read-path.md",
     "record_ids": [
       "AUDIT-M2-299",
       "AUDIT-M2-300",
@@ -11412,7 +11412,7 @@
     "path": "docs/superpowers/reports/2026-07-31-task5-critique-codex.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/migration.md; -> BACKLOG (C-1580: claim fragment `Removing` present in BACKLOG.md; C-0497: claim fragment `_cleanup` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/migration.md",
     "record_ids": [
       "AUDIT-M2-345",
       "AUDIT-M2-346",
@@ -11438,7 +11438,7 @@
     "path": "docs/superpowers/reports/2026-07-31-task5-removalready-proposal.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-1785: claim fragment `blob_target_runs` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-335",
       "AUDIT-M2-336",
@@ -11494,7 +11494,7 @@
     "path": "docs/superpowers/reports/20260717_codex_review.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-1506: claim fragment `If-Match` present in BACKLOG.md; C-2574: claim fragment `DROP POOL MEMBER` present in BACKLOG.md; C-3119: claim fragment `getStream` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "B033-080",
       "B033-081",
@@ -11566,7 +11566,7 @@
     "path": "docs/superpowers/reports/reviews-todo.md",
     "group": "docs/superpowers/reports",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0076: claim fragment `aws-global` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-218",
       "AUDIT-M2-219",
@@ -11596,7 +11596,7 @@
     "path": "docs/superpowers/reports/reviews.md",
     "group": "docs/superpowers/reports",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3124: issue_id [R1] present in BACKLOG.md; C-2600: claim fragment `writer_epoch` present in BACKLOG.md; C-0107: issue_id [R1] present in BACKLOG.md +4 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3380: issue_id [RPL-5] present in BACKLOG.md; C-0920: issue_id [R1] present in BACKLOG.md; C-3124: issue_id [R1] present in BACKLOG.md +1 more)",
     "record_ids": [
       "AUDIT-M2-177",
       "AUDIT-M2-178",
@@ -11722,7 +11722,7 @@
     "path": "docs/superpowers/specs/2026-07-01-cas-shard-incarnation-and-registry-removal-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-0435: claim fragment `folded_cursor` present in BACKLOG.md; C-1969: claim fragment `LIST(cas/refs/)` present in BACKLOG.md; C-0028: issue_id [D3] present in BACKLOG.md +1 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-0028: issue_id [D3] present in BACKLOG.md)",
     "record_ids": [
       "B004-093",
       "B004-094",
@@ -11837,7 +11837,7 @@
     "path": "docs/superpowers/specs/2026-07-02-cas-gc-ack-floor-fence-redesign.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0125: claim fragment `root_shards` present in BACKLOG.md; C-0124: claim fragment `process_epoch` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-403",
       "AUDIT-M2-404",
@@ -12275,7 +12275,7 @@
     "path": "docs/superpowers/specs/2026-07-07-cas-dangling-precommit-manifest-orphan-fix-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-2234: claim fragment ` prevents ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B007-069",
       "B007-070",
@@ -12375,7 +12375,7 @@
     "path": "docs/superpowers/specs/2026-07-08-cas-part-folder-cache-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-2163: claim fragment `Cas::Store` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-418",
       "B008-052",
@@ -12860,7 +12860,7 @@
     "path": "docs/superpowers/specs/2026-07-11-cas-mixed-algo-pools-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-0448: claim fragment `RunFileReader::seek` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "B011-042",
       "B011-043",
@@ -12945,7 +12945,7 @@
     "path": "docs/superpowers/specs/2026-07-11-cas-ref-table-snapshot-log-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-1696: claim fragment ` and terminal ` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B011-075",
       "B011-076",
@@ -13155,7 +13155,7 @@
     "path": "docs/superpowers/specs/2026-07-12-cas-stabilization-cleanup-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-3125: claim fragment `existsFile` present in BACKLOG.md; C-0045: claim fragment `Cas::Probe` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M2-449",
       "B013-001",
@@ -13490,7 +13490,7 @@
     "path": "docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md; -> BACKLOG (C-0270: claim fragment `CasBlobDigest` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/index.md",
     "record_ids": [
       "B016-020",
       "B016-021",
@@ -13537,7 +13537,7 @@
     "path": "docs/superpowers/specs/2026-07-15-cas-fetch-handoff-retention-pin-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md; -> BACKLOG (C-2691: claim fragment `min_active` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md",
     "record_ids": [
       "B017-075",
       "B017-076",
@@ -13577,7 +13577,7 @@
     "path": "docs/superpowers/specs/2026-07-15-cas-source-layout-refactoring-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/configuration.md; -> BACKLOG (C-0120: claim fragment `SingleWriterSlot` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/index.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/configuration.md",
     "record_ids": [
       "AUDIT-M2-397",
       "B017-090",
@@ -13629,7 +13629,7 @@
     "path": "docs/superpowers/specs/2026-07-15-cas-txn-one-pipeline-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md; -> BACKLOG (C-0126: claim fragment `commitTransaction` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md",
     "record_ids": [
       "AUDIT-M2-406",
       "AUDIT-M2-407",
@@ -14005,7 +14005,7 @@
     "path": "docs/superpowers/specs/2026-07-21-reftablestate-closed-class-experiments-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0959: claim fragment `chassert` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M-070",
       "AUDIT-M-071",
@@ -14118,7 +14118,7 @@
     "path": "docs/superpowers/specs/2026-07-22-cas-disk-lifecycle-problem-and-constraints.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3115: claim fragment `MergeTreeData` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B023-034",
       "B023-035",
@@ -14279,7 +14279,7 @@
     "path": "docs/superpowers/specs/2026-07-23-cas-fetch-handoff-publish-confirm-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md; -> BACKLOG (C-2384: claim fragment `Poisoned` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md",
     "record_ids": [
       "B024-036",
       "B024-037",
@@ -14343,7 +14343,7 @@
     "path": "docs/superpowers/specs/2026-07-24-cas-mount-lease-self-race-fix-proposal.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0130: claim fragment `superseded` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-433",
       "B024-099",
@@ -14405,7 +14405,7 @@
     "path": "docs/superpowers/specs/2026-07-25-cas-gc-observability-and-mount-force-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-2736: claim fragment `claimOwnerOrThrow` present in BACKLOG.md; C-4121: claim fragment `CasEvent` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-439",
       "AUDIT-M2-440",
@@ -14446,7 +14446,7 @@
     "path": "docs/superpowers/specs/2026-07-25-cas-tool-read-without-ownership-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3116: claim fragment `CORRUPTED_DATA` present in BACKLOG.md; C-0327: claim fragment `ca-gc-rebuild` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "B026-034",
       "B026-035",
@@ -14719,7 +14719,7 @@
     "path": "docs/superpowers/specs/2026-07-29-cas-part-write-release-seam.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-4294: claim fragment `CasPrecommitReleaseUnproven` present in BACKLOG.md; C-0972: claim fragment `noexcept` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "B029-055",
       "B029-056",
@@ -14768,7 +14768,7 @@
     "path": "docs/superpowers/specs/2026-07-29-cas-relink-reoffer-redesign.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0788: claim fragment `disk_name` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-393",
       "B029-075",
@@ -15032,7 +15032,7 @@
     "path": "docs/superpowers/specs/2026-08-03-cas-docs-map-reduce-consolidation-design.md",
     "group": "docs/superpowers/specs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/index.md; -> BACKLOG (C-2180: claim fragment `BACKLOG.md` present in BACKLOG.md; C-0022: claim fragment `BACKLOG.md` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/index.md",
     "record_ids": [
       "AUDIT-M2-416",
       "B033-024",
@@ -15102,7 +15102,7 @@
     "path": "docs/superpowers/worklogs/2026-07-03-real-s3-validation.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0013: claim fragment `UNKNOWN_DISK` present in BACKLOG.md; C-4596: claim fragment `gcp_oauth` present in BACKLOG.md; C-3612: claim fragment `endpoint` present in BACKLOG.md +2 more)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/migration.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-108",
       "AUDIT-M2-109",
@@ -15155,7 +15155,7 @@
     "path": "docs/superpowers/worklogs/2026-07-03-scenarios-full-scale-campaign.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0136: claim fragment `cas_scratch` present in BACKLOG.md; C-3271: claim fragment `OPTIMIZE FINAL` present in BACKLOG.md; C-0014: claim fragment `OPTIMIZE FINAL` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/part-lifecycle.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-143",
       "AUDIT-M2-144",
@@ -15271,7 +15271,7 @@
     "path": "docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md; -> BACKLOG (C-4036: claim fragment `ci/tmp/rustfs` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/bucket-requirements.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md, docs/en/antalya/cas/roadmap.md",
     "record_ids": [
       "AUDIT-M-072",
       "AUDIT-M-073",
@@ -15407,7 +15407,7 @@
     "path": "docs/superpowers/worklogs/2026-07-12-unattended-refsnaplog-stabilization.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-4599: claim fragment `detached` present in BACKLOG.md; C-1481: claim fragment `gc_scheduler` present in BACKLOG.md; C-2237: issue_id [rev.6] present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-2237: issue_id [rev.6] present in BACKLOG.md)",
     "record_ids": [
       "AUDIT-M2-147",
       "AUDIT-M2-148",
@@ -15474,7 +15474,7 @@
     "path": "docs/superpowers/worklogs/2026-07-13-unattended-optimization-round.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-1567: claim fragment `appendRefOps` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M2-137",
       "AUDIT-M2-138",
@@ -15506,7 +15506,7 @@
     "path": "docs/superpowers/worklogs/2026-07-15-all-tree-part-files-t12-validation-gate.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0098: claim fragment `REPLACE PARTITION` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-099",
       "AUDIT-M2-100",
@@ -15530,7 +15530,7 @@
     "path": "docs/superpowers/worklogs/2026-07-16-unattended-codecs-txn-sourcelayout-part1.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "N",
-    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md; -> BACKLOG (C-0023: claim fragment `CasMountRuntime` present in BACKLOG.md; C-0012: claim fragment `CMakeLists.txt` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/design-history.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/monitoring.md",
     "record_ids": [
       "AUDIT-M2-104",
       "AUDIT-M2-105",
@@ -15635,7 +15635,7 @@
     "path": "docs/superpowers/worklogs/2026-07-17-unattended-r5-r6-round.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-2574: claim fragment `DROP POOL MEMBER` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/storage-layout.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M-080",
       "AUDIT-M-081",
@@ -15720,7 +15720,7 @@
     "path": "docs/superpowers/worklogs/2026-07-17-unattended-stabilization-resume.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md; -> BACKLOG (C-3891: claim fragment `localize_rust_c_*` present in BACKLOG.md; C-3541: claim fragment `ci/tmp/rustfs` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/configuration.md, docs/en/antalya/cas/operations/debugging.md",
     "record_ids": [
       "AUDIT-M2-096",
       "B020-052",
@@ -15738,7 +15738,7 @@
     "path": "docs/superpowers/worklogs/2026-07-21-unattended-consistency-f1-f11.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-0099: claim fragment `CORRUPTED_DATA` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-102",
       "AUDIT-M2-103",
@@ -15818,7 +15818,7 @@
     "path": "docs/superpowers/worklogs/CURRENT.md",
     "group": "docs/superpowers/worklogs",
     "tracked": "Y",
-    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md; -> BACKLOG (C-3853: claim fragment `LOGICAL_ERROR` present in BACKLOG.md; C-4450: claim fragment `--partial` present in BACKLOG.md; C-0105: claim fragment `[CA-GTEST-TMP-SCRATCH-LEAK]` present in BACKLOG.md)",
+    "fate": "-> docs/en/antalya/cas/architecture/blob-protocol.md, docs/en/antalya/cas/architecture/correctness.md, docs/en/antalya/cas/architecture/garbage-collection.md, docs/en/antalya/cas/architecture/manifests-and-refs.md, docs/en/antalya/cas/architecture/mounts-and-leases.md, docs/en/antalya/cas/architecture/read-path.md, docs/en/antalya/cas/architecture/replication.md, docs/en/antalya/cas/operations/debugging.md, docs/en/antalya/cas/operations/monitoring.md, docs/en/antalya/cas/operations/troubleshooting.md",
     "record_ids": [
       "AUDIT-M2-152",
       "AUDIT-M2-153",
