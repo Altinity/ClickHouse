@@ -34,7 +34,7 @@ Plan: `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md` (`{#t8}`). Le
 | Soak (a) churn — 20m smoke | SURVIVED | S34 9/9, S35 14/14 verdicts pass, exit 0, no crash/exception, both cards ran cleanly to completion (`logs_archive/2026-08-03-stage-b-specimen/smoke/churn_s34_s35_smoke.log`) | pre-qualification only, not a PASS criterion. Honest note: actual wall time ~2 min, not the requested 20m — S34/S35 at `scale=dev` run a fixed cycle count, not a duration-scaled loop; `--duration` had no effect on either card |
 | Soak (a) churn — 30m full | **PASS (loop shape)** | A single `--scale full` pass ran only ~14 min real churn, short of the plan's "≥30 min" — looped 3× back-to-back with distinct seeds (20260805, 20260806, 20260807), cumulative ~42 min continuous full-scale churn (1000 S34 iterations / 600 S35 cycles each pass). Judged at the LAST iteration's end state: `fsck dangling=0`, `dryrun ⊆ deletable: 0/0`, `event audit (no bad rows)=0`, `GC no Failed rounds=0`, `no unbounded leftovers=0`, `dropped content reclaimed to 0`, S34 9/9; S35 `no bad CA-log events=0`, `create/insert_errors=0`, final-table replica agreement equal, `no dangling after rapid same-name rotation=0`, 14/14. All 3 loop iterations independently PASS, `SCENARIO_EXIT=0` each (`churn_s34_s35.log`, `churn_s34_s35_loop2.log`, `churn_s34_s35_loop3.log`) | Maps onto the plan's (a) criterion — catalog entry count returns to baseline (`no unbounded leftovers`), zero alias reads (`event audit`/`no bad CA-log events`), fsck clean — now genuinely exercised at the written duration via the loop. The initial dev-scale ~1.5min run and the first `--scale full` ~14min single pass were both premature judgments, retracted before this row was finalized |
 | Soak (b) rebirth adversarial (S44) — 20m smoke | SURVIVED | 5/5 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/rebirth_s44_smoke2.log`); dev scale (6 cycles), same fixed-cycle-count pattern as (a) — actual wall time well under 20m | pre-qualification only, not a PASS criterion |
-| Soak (b) rebirth adversarial (S44) — 30m full | **PASS** | Two `--scale full` passes (seeds 20260805, 20260806), 40 cycles / 2000 rows-per-cycle each = 80 cycles total, 5/5 verdicts each, `SCENARIO_EXIT=0` each (`rebirth_s44.log`, `rebirth_s44_loop2.log`). Half (i), zero reads resolving to a newer incarnation: `no unexpected mutation errors across incarnation boundaries=0` (after the card fix), `recreate latency does not grow`, `CASRefNeedsRecovery=0`, `CASRefRecoveryStreamHole=0`, `fsck dangling=0` — all pass, both runs. Half (ii), debris trends to zero without blocking rebirth: a post-run drain-window observation (script + evidence below) against the standing cluster after the second full pass — `ca-fsck --detail`'s own authoritative counters (the tool the plan names for this criterion) read `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` | Maps onto the plan's (b) criterion, which — unlike (a) — carries NO duration text; judged by event/cycle coverage (80 full-scale cycles across 2 passes) plus an explicit post-run drain observation, not a synthetic 30-minute wall-clock. Cycle-bound card: `--duration` has no effect at any scale, disclosed honestly rather than padded |
+| Soak (b) rebirth adversarial (S44) — 30m full | **PASS half (i); PROVISIONAL half (ii)** — see `{#s44-drain-observation}` | Two `--scale full` passes (seeds 20260805, 20260806), 40 cycles / 2000 rows-per-cycle each = 80 cycles total, 5/5 verdicts each, `SCENARIO_EXIT=0` each (`rebirth_s44.log`, `rebirth_s44_loop2.log`). Half (i), zero reads resolving to a newer incarnation: `no unexpected mutation errors across incarnation boundaries=0` (after the card fix), `recreate latency does not grow`, `CASRefNeedsRecovery=0`, `CASRefRecoveryStreamHole=0`, `fsck dangling=0` — all pass, both runs. Half (ii), debris trends to zero without blocking rebirth: a post-run drain-window observation (script + evidence below) against the standing cluster after the second full pass — `ca-fsck --detail`'s own authoritative counters (the tool the plan names for this criterion) read `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` | Maps onto the plan's (b) criterion, which — unlike (a) — carries NO duration text; judged by event/cycle coverage (80 full-scale cycles across 2 passes) plus an explicit post-run drain observation, not a synthetic 30-minute wall-clock. Cycle-bound card: `--duration` has no effect at any scale, disclosed honestly rather than padded |
 | Soak (c) decommission (S45) — 20m smoke | SURVIVED | 3/3 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/decommission_s45_smoke.log`); dev scale, fixed cycle count | pre-qualification only, not a PASS criterion |
 | Soak (c) decommission (S45) — 30m full | **PASS** | One `--scale full` pass (seed 20260805, 12 victim tables): `ca-drop-member exits cleanly`, `hidden Removing rows are accounted for (namespaces_removed=12)`, `fsck dangling=0`, 3/3 verdicts, `SCENARIO_EXIT=0` (`decommission_s45.log`). Post-run drain-window observation (`{#s45-drain-observation}`) closes both GC/janitor halves unambiguously: `janitor_pending_lives` 12→0 (t0 vs every later sample), `system.cas_gc_log`'s `namespace_cleanup` phase shows `janitor_deleted=300` matching the initial `janitor_pending=300` exactly, and ordinary GC `Finish` rows show `condemned=16 graduated=16 redeleted=16 deleted=16` — real destructive work, not suppression | Maps onto the plan's (c) criterion — hidden `Removing` recovered under the claimed fence, completed rows deleted only by GC, leftover checkpoints reclaimed by the janitor — all three legs directly evidenced, no ambiguity (unlike S44's drain finding). Cycle/event-bound card like S44; no duration text in the plan's (c) criterion either |
 | Soak (d) general — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
@@ -289,26 +289,25 @@ verdict still rests on the fsck-authoritative reading (zero at every checkpoint 
 plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question, but the
 mechanism question itself is carried to the post-B residual list rather than closed here.
 
-**RESOLVED — not a CAS/GC defect.** The original drain window drove GC to a stable fixpoint (17
-rounds) with the 40 objects still standing, which the two-stage catalog explanation above did not
-fully account for — so a targeted discrimination traced the actual code path. It is standard,
-documented ClickHouse `Atomic`-database behavior, unrelated to CAS: `DROP TABLE ... SYNC` only
-synchronously detaches the table's METADATA (`system.tables` correctly shows zero rows
-immediately); physical directory removal — which is what triggers
-`ContentAddressedTransaction::removeRecursive` → `Cas::parseTableUuid` → `dropNamespace`
-(`ContentAddressedTransaction.cpp:1090-1093`) — fires from a SEPARATE background cleanup thread on
-its own schedule, gated by `database_atomic_delay_before_drop_table_sec`
-(`ServerSettings.cpp:437`, default `8 * 60` = 480 seconds; see `DatabaseAtomic.cpp`'s own doc
-comment). Driving CAS's own GC to a fixpoint has no effect on this timer — it is a ClickHouse-core
-database-engine mechanism, not a CAS one. This also explains why S34/S35 (the same create/drop
-pattern, up to 1000 iterations) passed cleanly: their own scenario runtime (measured ~14 minutes at
-full scale) comfortably exceeds 480s by the time their end-checkpoint samples, while S44 at dev
-scale runs only ~30-50s total, guaranteeing its own end-of-scenario checkpoint always samples
-before the delay elapses — regardless of anything CAS does. Confirmed by code trace and the
-documented default, not by a confirming 8-minute wait run (time-budgeted out); no residual doubt
-judged worth spending that wait on. The (b)-full row's PASS is CONFIRMED, not provisional. This is
-a card-design gap (S44's drain expectations didn't account for the standard Atomic-drop delay), not
-a product defect, and not Stage-B-relevant.
+**RETRACTED — the 480s-delay explanation does not survive a closer trace.** A first pass concluded
+`database_atomic_delay_before_drop_table_sec` (default 480s) explained the flat, dead-but-live
+catalog entries. That is WRONG for this card: the card uses `DROP TABLE ... SYNC` throughout, and
+`SYNC` bypasses this delay entirely, by design —
+`InterpreterDropQuery::executeToTable` blocks the client on `waitTableFinallyDropped` until the
+table is FULLY, physically gone; `DatabaseCatalog::enqueueDroppedTableCleanup`'s `ignore_delay`
+branch (which `sync=true` maps to) sets `drop_time = now()` with NO delay term added (the
+`+ database_atomic_delay_before_drop_table_sec` addend is only in the OTHER, non-sync branch); and
+`rescheduleDropTableTask` schedules the cleanup task with `scheduleAfter(0)` when a sync entry
+leads the queue. So `DROP TABLE ... SYNC` is fully synchronous end-to-end: by the time each S44
+cycle's DROP statement returns, the standard `DatabaseCatalog::dropTableFinally` cleanup — which
+calls `table.table->drop()`, expected to route through the CA transaction's
+`removeDirectory`/`removeRecursive` chain into `dropNamespace` — has already run. **The finding is
+open again, with priority.** The (b)-full row's PASS verdict has reverted to PROVISIONAL. Current
+lead, not yet confirmed: `dropTableFinally`'s storage-level cleanup may only walk PART-shaped paths
+(routing to `dropRefIfPresent`) and never issue the final `removeRecursive` on the table's own ROOT
+directory (the call that actually matches `Cas::parseTableUuid` and fires `dropNamespace`) — still
+tracing, and a direct empirical check (drop one table, read the catalog immediately after the SYNC
+statement returns) is queued for the gap between this soak stage's smoke and its full leg.
 
 ## S45 post-run drain-window observation {#s45-drain-observation}
 
@@ -381,14 +380,13 @@ finding).
   throughput watch item; the manifest-cleanup cap (`gc_round_manifest_cleanup_budget`) was REVERTED
   entirely (leaks under a one-shot pipeline — see `soak-t6b-report.md`), tracked as
   `[gc-mf-cleanup-durable-retry]` in `BACKLOG.md`.
-- S44 drain-observation, RESOLVED (`{#s44-drain-observation}`): the flat, nonzero `_files` count
-  in the S44 drain window is standard `Atomic`-database `DROP TABLE` behavior
-  (`database_atomic_delay_before_drop_table_sec`, default 480s) — the CA namespace's physical
-  removal (`dropNamespace`) is only triggered by a background cleanup thread on that delay, wholly
-  independent of CAS's own GC. Not a CAS defect, not Stage-B-relevant; a card-design gap (S44's
-  drain window was too short to span the standard delay) rather than product debris. No further
-  follow-up needed beyond, optionally, widening the card's own drain expectations if it is
-  revisited outside Stage B.
+- S44 drain-observation, OPEN with priority (`{#s44-drain-observation}`): the flat, nonzero
+  `_files` count in the S44 drain window is NOT explained by
+  `database_atomic_delay_before_drop_table_sec` — that explanation was drafted, then RETRACTED
+  once the trace showed `DROP TABLE ... SYNC` (what the card uses throughout) bypasses that delay
+  entirely and is fully synchronous by design. The dead-incarnation catalog entries staying `live`
+  after a SYNC drop returns is unexplained and under active investigation; the (b)-full row's PASS
+  is PROVISIONAL pending it.
 - `[gc-frontier-one-list]` (`BACKLOG.md:136`), deferred to a separate focused session after Stage B.
 - The four ex-known-red stateless tests, to be run green in the integration-lane battery stage
   under their current post-rename names: `05008_cas_gc_snapshot_prune`, `04290`/`04295`
