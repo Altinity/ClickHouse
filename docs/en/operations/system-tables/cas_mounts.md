@@ -37,6 +37,17 @@ rows.
 - `pending_reclaim` ([Nullable(Int64)](/sql-reference/data-types/nullable)) — Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes).
 - `last_success_age_seconds` ([Nullable(UInt64)](/sql-reference/data-types/nullable)) — Seconds since this disk's GC last led a round (`0` if it has never led or GC is not running here).
 - `wedged_namespace_count` ([Nullable(UInt64)](/sql-reference/data-types/nullable)) — Ref-append lanes currently wedged on this disk (an uncertain `PUT` exhausted its retry budget).
+- `lifecycle` ([String](/sql-reference/data-types/string)) — This server's content-addressed pool lifecycle for the disk (a non-gated snapshot, always populated so a not-live disk stays visible): one of `live`, `not_live`, `identity_lost`, `vanished`, `constructing` (never started), or `shutdown` (torn down).
+- `lifecycle_reason` ([String](/sql-reference/data-types/string)) — The enum-clean sub-state word for a `vanished` disk: `replaced` or `forgotten`. Empty for every other lifecycle, so `lifecycle || '(' || lifecycle_reason || ')'` reads e.g. `vanished(forgotten)`.
+- `lifecycle_detail` ([String](/sql-reference/data-types/string)) — The full typed reason text naming the actual cause when not live: the vanish diagnosis (a data root replaced by a foreign pool, or decommissioned by `SYSTEM CAS FORGET` at a given time) or the identity-loss message. Empty when live.
+- `lifecycle_since` ([Nullable(DateTime)](/sql-reference/data-types/nullable)) — When this server entered the current non-live lifecycle state. `NULL` when live, or when the state has no backing pool to date from.
+
+`lifecycle`/`lifecycle_reason`/`lifecycle_detail`/`lifecycle_since` are the SQL surface for
+diagnosing an identity-lost or forgotten disk without reading server logs — see the
+`IdentityLost`/`VanishedReplaced`/`VanishedForgotten` states on the
+[mount-slot behavioral model](/antalya/cas/architecture/mounts-and-leases#mount-state-machines) for
+what each lifecycle value means, and [`SYSTEM CAS FORGET`](/antalya/cas/operations/debugging#sql-forget)
+for the command that produces `vanished(forgotten)`.
 
 :::note Local-only GC-health columns
 `is_leader`, `pending_reclaim`, `last_success_age_seconds`, and `wedged_namespace_count` are process-local

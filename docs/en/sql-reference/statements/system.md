@@ -469,7 +469,9 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.cas_gc_log`](/operations/system-tables/cas_gc_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
-The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, and `anomalies`, describing the outcome of that round.
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`, `pending_candidates`, `pending_condemned`, and `pending_retired`, describing the outcome of that round. The `pending_*` columns are the retire pipeline's remaining backlog sizes read from the `gc/state` this round's own commit just published (not this round's own delta, unlike the columns before them) — `0` on a non-authoritative row (`acquired_lease = 0` or `deferred = 1`), same as every other counter.
+
+A manual run always executes, regardless of [`SYSTEM CAS GC STOP`](#system-cas-gc-stop-start): `STOP` pauses only the background scheduler on that disk.
 
 ### SYSTEM CAS GC REBUILD {#system-cas-gc-rebuild}
 
@@ -497,8 +499,77 @@ command also refuses (regardless of `FORCE`) when another GC leader currently ho
 lease. In both refusal cases it raises an exception instead of returning a row.
 
 On success it returns one row with columns `disk`, `performed`, `round`, `generation`, `namespaces`,
-`shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`, and
-`clamped_shards`, describing the freshly rebuilt baseline.
+`shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`,
+`clamped_shards`, `virgin_by_enumeration`, and `adopted_seal_generation`, describing the freshly
+rebuilt baseline. `virgin_by_enumeration = 1` means the rebuild found no fold seal at all and
+carried no durable hold forward, concluding from enumeration alone that the pool never sealed a
+baseline — on a pool that has ever completed a GC round this means the object listing lied.
+`adopted_seal_generation` names which generation's fold seal the rebuild carried holds from; `0`
+when it carried none.
+
+### SYSTEM CAS GC STOP / SYSTEM CAS GC START {#system-cas-gc-stop-start}
+
+Pause or resume the background GC scheduler on one content-addressed disk, without affecting reads
+or writes on that disk. This is granular operator control of GC alone — for example to pause
+reclamation during an incident — not a lifecycle transition; the disk stays fully usable throughout.
+
+```sql
+SYSTEM CAS GC STOP [ON CLUSTER cluster_name] disk_name
+SYSTEM CAS GC START [ON CLUSTER cluster_name] disk_name
+```
+
+`disk_name` is **required** for both — unlike `SYSTEM CAS GC RUN`, there is no fan-out form, since
+each command targets exactly one disk's scheduler.
+
+`GC STOP` stops in place: the scheduler object is retained, so a later `GC START` resumes the *same*
+instance, preserving its `gc_id` and lease-observation history. It is idempotent, and works even on
+a disk that is not currently live (stopping GC on a sick disk is a legitimate operation). It does
+not stop a manual [`SYSTEM CAS GC RUN`](#system-cas-gc-run) on the same disk.
+
+`GC START` re-enters that same scheduler instance rather than creating a new one; leadership is
+**not** automatically restored — the scheduler re-acquires the durable `gc/state` lease through the
+next round's normal acquisition, the same as any other contender. It is idempotent (a no-op on an
+already-running scheduler), and refuses with a typed error on a decommissioned or uncertain pool,
+since restarting GC there would only spin failing rounds.
+
+Neither command returns a result set.
+
+### SYSTEM CAS FSCK {#system-cas-fsck}
+
+Independently verifies content-addressed pool reachability against a **running, mounted** disk — the
+scan re-validates every finding against a fresh authoritative read, so unlike the offline
+`clickhouse-disks cas-fsck` tool it needs no quiesce and no read-only mount.
+
+```sql
+SYSTEM CAS FSCK [ON CLUSTER cluster_name] disk_name
+```
+
+`disk_name` is **required**. The command returns one row with columns `disk`, `reachable`,
+`dangling`, `unreachable`, `pending_gc`, `awaiting_gc`, `unaccounted`, `stale_edge`,
+`corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`, `namespace_janitor_pending`,
+`namespace_janitor_pending_bytes`, `namespace_janitor_pending_lives`, `ref_records_walked`,
+`physical_bytes`, `referenced_logical_bytes`, `distinct_blobs`, and `total_blob_refs`. `dangling` is
+the one column that means data loss; `unreachable`, `pending_gc`, and `awaiting_gc` are objects
+still moving through the normal condemn/graduate/delete pipeline, not a problem on their own. This
+is a summary-only scan; per-object detail requires the offline `clickhouse-disks cas-fsck --detail`.
+
+### SYSTEM CAS FORGET {#system-cas-forget}
+
+Node-local operator assertion that a content-addressed disk is permanently gone — the "fire marshal"
+verb for a stuck disk (a transient or identity-lost pool, or an operator-asserted decommission).
+Unlike the other `SYSTEM CAS` commands, it deliberately works on a disk that is **not** live, since
+that is its whole purpose.
+
+```sql
+SYSTEM CAS FORGET [ON CLUSTER cluster_name] disk_name
+```
+
+`disk_name` is **required**. It is an assertion, not a proof of erasure: the disk stays registered
+and answers further store-class access with a typed error, and a server restart re-registers the
+name. Returns no result set. This is different from
+[`SYSTEM CAS DROP POOL MEMBER`](#system-cas-drop-pool-member), which permanently retires one pool
+*member's* identity across the whole shared pool — `FORGET` only affects this node's own local view
+of one disk.
 
 ### SYSTEM CAS DROP POOL MEMBER {#system-cas-drop-pool-member}
 

@@ -463,7 +463,9 @@ background garbage collector reclaims objects once no part references them anymo
 [`SYSTEM CAS DROP POOL MEMBER`](/sql-reference/statements/system#system-cas-drop-pool-member),
 and the [`system.cas_gc_log`](/operations/system-tables/cas_gc_log),
 [`system.cas_mounts`](/operations/system-tables/cas_mounts), and
-[`system.cas_log`](/operations/system-tables/cas_log) system tables.
+[`system.cas_log`](/operations/system-tables/cas_log) system tables. See the
+[content-addressed storage documentation](/antalya/cas) for the architecture, operations
+runbooks, and a live-validated quick start.
 
 Configuration:
 
@@ -502,6 +504,9 @@ disk, none of the keys below carry a redundant `cas_`/`ca_` prefix.
 
 #### Optional parameters {#optional-parameters-content-addressed}
 
+These are the commonly used settings; see [Configuration](/antalya/cas/configuration) for the full
+disk-level and server-level settings surface.
+
 - `scratch_path` — a real, server-local filesystem directory used to spill the write buffer before it
   is committed to the pool (never the object-storage key prefix). Defaults to
   `<clickhouse-path>/disks/<disk_name>/cas_scratch/`. A relative override is anchored to the server
@@ -509,9 +514,11 @@ disk, none of the keys below carry a redundant `cas_`/`ca_` prefix.
 - `staging_backend` — `local` (default) or `s3`. Selects where in-flight part data is staged before
   being committed into the pool; `local` is byte-for-byte the original write path, `s3` enables
   S3-native staging.
-- `blob_hash` — `cityhash128` (default) or `sha256`. Selects the pool's blob content-hash function.
-  The choice is fixed at pool creation; a reopen whose `blob_hash` disagrees with the pool's recorded
-  algorithm fails closed.
+- `blob_hash` — `cityhash128` (default), `xxh3-128`, or `sha256`. Selects the pool's blob
+  content-hash function. The choice is fixed at pool creation; a reopen whose `blob_hash` disagrees
+  with the pool's recorded algorithm fails closed. See
+  [choosing `blob_hash`](/antalya/cas/configuration#choosing-blob-hash) for the trade-offs between
+  the three.
 - `blob_hash_allow_new` — `false` by default. Admits a new hash algorithm into an existing pool's set
   of recorded algorithms; without it, a `blob_hash` that disagrees with what the pool already recorded
   fails closed instead of silently turning the pool mixed-algorithm.
