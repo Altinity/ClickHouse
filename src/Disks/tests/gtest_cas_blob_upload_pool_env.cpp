@@ -19,8 +19,7 @@
 /// -- but a lingering blob-pool worker never returns until the blob pool itself is destroyed, so leaving
 /// the pool up at exit deadlocks the whole binary (main joins a std::thread that is running a blob-pool
 /// worker that waits for the blob pool to shut down). Draining it here, before `RUN_ALL_TESTS` returns,
-/// releases those std::threads first. The admission has no threads, but shutting it down here keeps the
-/// pair symmetric with the bring-up.
+/// releases those std::threads first.
 namespace
 {
 
@@ -30,11 +29,6 @@ public:
     void OnTestStart(const ::testing::TestInfo &) override
     {
         DB::Cas::tests::ensureBlobUploadPoolForTest();
-        /// The condemned-local resurrection branch also reaches a fail-loud getter
-        /// (`Cas::condemnedUploadAdmission()`), so bring the byte-weighted admission up before every test
-        /// for the same reason -- any CA commit that resurrects a condemned incarnation from a local
-        /// source would otherwise abort the process on an uninitialized admission.
-        DB::Cas::tests::ensureCondemnedUploadAdmissionForTest();
     }
 
     void OnTestProgramEnd(const ::testing::UnitTest &) override
@@ -42,7 +36,6 @@ public:
         /// Release the pool's GlobalThreadPool-backed workers BEFORE `gtest_main` joins the GlobalThreadPool
         /// at exit (see the class comment) -- otherwise the binary deadlocks at exit. Idempotent.
         DB::Cas::shutdownBlobUploadPool();
-        DB::Cas::shutdownCondemnedUploadAdmission();
     }
 };
 

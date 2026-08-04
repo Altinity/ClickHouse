@@ -735,70 +735,35 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
 
     /// CRITICAL: we re-read the writer's OWN source (NOT backend().get) — no GET of the dying object.
     /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
-    /// putOverwrite is whole-body only (no streaming variant), so this rare condemned-displacement path
-    /// materializes the header+payload on-demand by re-invoking `source.open` (re-reading the
-    /// staged temp file). This is the only path that holds a full in-memory copy, and only when a
-    /// condemned incarnation must actually be displaced — not the common fresh-upload path.
     ///
-    /// Stage-1 §1 (condemned-local resurrection memory cap): under the fan-out N such displacements can
-    /// run at once, so N full bodies would sit in memory where the serial path held one. A byte-weighted
-    /// admission caps the aggregate. The weight is the checked header+payload size, known HERE before
-    /// materialization: `buildHeader` encodes to the pool's fixed `blob_header_len`, and `source.size` is
-    /// the payload length verified below, so `overwrite_weight` equals the materialized body size exactly.
-    /// A body heavier than the whole cap is admitted alone (exclusive), never waiting forever. The permit
-    /// covers materialization + putOverwrite ONLY: `admit` is declared before `overwrite_body`, so on scope
-    /// exit the body's destructor frees the bytes FIRST and the permit is released immediately after —
-    /// before the event/meta work below (`makeDepAndEmit`, `writeResurrectMetaClean`), per the spec order.
-    const uint64_t overwrite_weight = meta.blob_header_len + source.size;
-    PutResult overwrite_res{};
-    {
-        ByteWeightedSemaphoreLock admit(condemnedUploadAdmission(), overwrite_weight);
-        String overwrite_body;
-        {
-            WriteBufferFromString wb{overwrite_body};
-            writeString(buildHeader(), wb);
-            const size_t before = wb.count();
-            copyData(*source.open(), wb);
-            wb.finalize();
-            const size_t written = wb.count() - before;
-            if (written != source.size)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
-        }
-        /// rev.7 [C2]: same as `resurrect` above -- a raw, uncoupled backend call; fence-checked against
-        /// the displacement-decision generation before the durable write.
-        store->checkFenceOrThrow(displace_admitted_generation);
-        overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);
-    }
-    if (overwrite_res.outcome == PutOutcome::Done)
-    {
-        const BlobDepRecord dep = makeDepAndEmit(overwrite_res.token);
-        writeResurrectMetaClean(lm);
-        return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedLocal};
-    }
-    /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
-    /// before us (their fresh token doesn't match hr.token), OR GC deleted the object between our
-    /// HEAD and the putOverwrite (absent → If-Match always fails). HEAD again to disambiguate.
-    {
-        const HeadResult hr2 = store->backend().head(key);
-        if (!hr2.exists)
-        {
-            /// Object deleted in the window — try fresh If-None-Match upload (it is now absent).
-            const PutResult res3 = streamIfAbsent();
-            if (res3.outcome == PutOutcome::Done)
-            {
-                const BlobDepRecord dep = makeDepAndEmit(res3.token);
-                writeFreshMetaClean();
-                return BlobUploadResult{ref, dep, fresh_outcome};
-            }
-            /// Still 412 — a racing writer re-created it. Observe their token.
-            /// reviveObserve converts FILE_DOESNT_EXIST (deleted again in the window) → ABORTED (retryable).
-            return BlobUploadResult{ref, reviveObserve(key), BlobUploadOutcome::HeadMissAdopted};
-        }
-        /// Present with a different token — a racing writer displaced the condemned incarnation.
-        /// Adopt their token (or throw ABORTED if it too is condemned — bounded by caller loop).
-        return BlobUploadResult{ref, observeAndAdmit(kind, ref, key, hr2), BlobUploadOutcome::HeadMissAdopted};
-    }
+    /// UNCONDITIONAL, exactly like the staging arm above. An `If-Match` on the condemned token would
+    /// save a redundant re-upload when another writer resurrects the same blob first, and would prevent
+    /// nothing: two racing resurrections write payload-identical bodies, no consumer reads a dep token's
+    /// VALUE, and durable references name content hashes rather than incarnations. What protects the
+    /// resurrection is the fresh tag — it makes this body's ETag differ from the condemned one, so every
+    /// already-queued exact-token delete of that incarnation misses.
+    ///
+    /// The payload STREAMS from the source reader and is never materialized. Blob bodies have no size
+    /// cap, so a body larger than memory has to remain writable here.
+    auto payload = source.open();
+    /// rev.7 [C2]: a raw, uncoupled backend call; fence-checked against the displacement-decision
+    /// generation immediately before the durable write.
+    store->checkFenceOrThrow(displace_admitted_generation);
+    const Token resurrected = store->backend().resurrect(*payload, key, buildHeader());
+
+    /// The whole-body path used to compare what the source produced against `source.size` before
+    /// writing. Streaming moves that check after the fact: HEAD the incarnation just written and
+    /// compare its length. A source that lies about its size would otherwise publish a body whose
+    /// length disagrees with the manifest entry that names it.
+    const HeadResult written = store->backend().head(key);
+    if (!written.exists || written.size != meta.blob_header_len + source.size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "uploadFromSource: resurrected blob {} has size {} (exists={}), expected {}",
+            blobIdOf(ref), written.size, written.exists, meta.blob_header_len + source.size);
+
+    const BlobDepRecord dep = makeDepAndEmit(resurrected);
+    writeResurrectMetaClean(lm);
+    return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedLocal};
 }
 
 void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
