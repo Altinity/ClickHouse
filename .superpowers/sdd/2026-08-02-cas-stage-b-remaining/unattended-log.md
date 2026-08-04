@@ -936,3 +936,15 @@ dropns-fix draft writer running on lane-g. 90m specimen mid-run.
   no-ops). Hold arm gated on the clock (skip if past minute ~70; would become an owed item).
 - dropns-fix draft COMPLETE on lane-g (probe + 10 unit shapes + stateless 05023 + UNVERIFIED-DRAFT
   report); waiting for the build slot. tsan heal-test fix committed on master (needs a verify run).
+
+### 06:0x — criterion-4 anomaly SATISFIED; injected 90m run failed; clean rerun ordered {#crit4-and-rerun}
+Round 56 (03:51:45Z) is the criterion-4 anomaly evidence: anomalies=1, held=1, frontier INCOMPLETE
+(9/10 proven), objects_deleted=0, entries_graduated=0, entries_condemned=6636 — every irreversible
+family inert while safe marking continued, round completed. THEN the run failed at ~59 min (rc=1):
+CASRefNeedsRecovery went 1 at the injection window and stayed nonzero even after byte-identical
+restore; entry-gate fsck timed out; TRANSPORT FAILURE. CONTROLLER RULING: corrupting a durable
+object under a live lane is OUTSIDE the trusted-store fault model, so this does not fail Stage B;
+but "recovery did not observably clear after byte-identical restore" is a NAMED post-B residual
+(single observation, injected fault). The failed run is forensic only — archived as
+failed_injected_run/; the SPECIMEN is a fresh clean 90m (seed 20260807, fresh cluster, no
+injections). The hold arm moves to a separate short dedicated run after the specimen.
