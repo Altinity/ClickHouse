@@ -972,24 +972,26 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     /// `confirm_condemned_marker` then fails its first sighting, schedules the meta write, and CARRIES
     /// the entry (not yet delete_pending) while `meta_pool_wait` lands it durably by that round's end;
     /// only the round after that sees the durable meta and actually graduates; and the physical delete
-    /// is the round after THAT. None of this is a round count this fixture can promise -- it depends on
-    /// the confirm/retry cadence, not on this gate -- so drive generously and inspect the LAST round's
-    /// verdict plus the final state, the same way `runRoundsUntilAbsent` does for the graduating
-    /// production path, rather than asserting a hand-counted round number.
+    /// is the round after THAT. MEASURED (phase-sink instrumentation, not a guess): round 1 arms
+    /// (`saw_fold == false`), round 2 is the first to fold with the gate open while the blob is still
+    /// present (the carry round), round 3 graduates, round 4 executes the delete -- four rounds exactly.
+    /// Bound the drive at that plus one (5): enough slack for the fixture's own cadence to be measured
+    /// without hand-counting rounds against this gate, but tight enough that a real regression in the
+    /// confirm/retry cadence still fails loudly instead of silently absorbing into a generous loop.
     ASSERT_TRUE(backend->head(layout.blobKey(blob_ref)).exists)
         << "the scenario starts with the condemned blob present, or the loop below measures nothing";
 
-    /// Drive generously rather than hand-count rounds (the confirm/retry cadence above is not a
-    /// promise this fixture can make), but still observe the TWO-PHASE PIPELINE explicitly: an open,
-    /// unsuppressed gate while the blob was still present (the graduate side), and only a STRICTLY
-    /// LATER round removing it (the delete side). Asserting only the final state and the last verdict
-    /// would pass just as readily if the blob vanished by some other path entirely.
+    constexpr int kMaxRounds = 5;   /// measured cadence (4) + 1; see the comment above
+    /// Observe the TWO-PHASE PIPELINE explicitly: an open, unsuppressed gate while the blob was still
+    /// present (the graduate side), and only a STRICTLY LATER round removing it (the delete side).
+    /// Asserting only the final state and the last verdict would pass just as readily if the blob
+    /// vanished by some other path entirely.
     int round_gate_opened_while_present = -1;   /// the graduate side: FIRST round that folded, unsuppressed,
                                                  /// with the blob still present
     int round_blob_vanished = -1;               /// the delete side
     GateVerdict last;
     int rounds_run = 0;
-    for (int i = 0; i < 10 && backend->head(layout.blobKey(blob_ref)).exists; ++i)
+    for (int i = 0; i < kMaxRounds && backend->head(layout.blobKey(blob_ref)).exists; ++i)
     {
         last = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
         ++rounds_run;
@@ -1001,6 +1003,9 @@ TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndD
     }
 
     ASSERT_GT(rounds_run, 0) << "the loop must actually run, or every assertion below is vacuous";
+    ASSERT_LE(rounds_run, kMaxRounds)
+        << "the drain took more than the measured cadence -- this is a real regression in the "
+           "confirm/retry pacing, not something to hide by bumping the bound; re-derive the cadence";
     ASSERT_TRUE(last.saw_fold);
     EXPECT_EQ(last.frontier_namespaces, 0u);
     EXPECT_EQ(last.frontier_proven, 0u);
@@ -2662,11 +2667,33 @@ TEST(CASGCFrontierGate, CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanito
     for (const String & key : backend->touchedKeys())
         EXPECT_EQ(key.find("/_cleanup/"), String::npos) << key;
 
+    /// Round 2 drops `removed`'s catalog row (the pre-fold drain, using round 1's `cleanup_evidence`),
+    /// which makes THIS round's own hot-scan catalog cut genuinely, provably empty -- so its destructive
+    /// gate opens for the first time (`catalog_cut_proved_empty`), and the namespace janitor -- a
+    /// separate `namespace_cleanup` phase the SAME round call also runs -- reclaims the now-orphaned
+    /// checkpoint. Reclaiming a removed namespace's `_ckpt` once the pool empties is exactly the
+    /// standstill this gate exists to fix, so the janitor running here is the fix working, not a
+    /// regression. What this test still pins is the DISCRIMINATION the title promises: the FOLD stage
+    /// itself performs no lifecycle-specific physical cleanup (asserted above, unchanged), and the
+    /// janitor is attributed the delete via its OWN phase counters -- never inferred from end-state
+    /// absence, which would not distinguish "the janitor did it" from "something else did".
+    std::map<String, UInt64> janitor_metrics;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "namespace_cleanup")
+            janitor_metrics = rec.metrics;
+    });
     ASSERT_TRUE(runRegularRoundReclaiming(gc).acquired_lease);
+    gc.setPhaseSink({});
+
     EXPECT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty());
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, removed));
-    EXPECT_TRUE(backend->head(ckpt_key).exists);
-    EXPECT_EQ(backend->deleteCount(ckpt_key), 0);
+    ASSERT_FALSE(janitor_metrics.empty()) << "the namespace_cleanup phase must have run this round";
+    EXPECT_GE(janitor_metrics.at("janitor_deleted"), 1u)
+        << "the janitor's OWN counter must show the delete -- now that the proved-empty gate has "
+           "opened, not because some other site happened to remove the key";
+    EXPECT_FALSE(backend->head(ckpt_key).exists);
+    EXPECT_EQ(backend->deleteCount(ckpt_key), 1);
 }
 
 /// Once a terminal has folded, a later physical read failure is janitor debt, not lifecycle evidence
@@ -3162,10 +3189,23 @@ TEST(CASGCFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListi
     transferGcLease(*backend, layout, leader_b);
     RoundReport report_b;
     std::exception_ptr leader_b_failure;
+    /// `fixture.ns` is Removing with a durable `_ckpt`, same shape as
+    /// `CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor`: once leader_b's round drops its
+    /// catalog row, the resulting cut is genuinely, provably empty, the destructive gate opens, and the
+    /// namespace janitor -- a separate `namespace_cleanup` phase within this SAME round -- reclaims the
+    /// checkpoint. Captured so the assertions below can attribute the delete to the janitor rather than
+    /// assume survival.
+    std::map<String, UInt64> janitor_metrics_b;
     try
     {
         Gc gc_b(store, leader_b);
+        gc_b.setPhaseSink([&](const GcPhaseRecord & rec)
+        {
+            if (rec.phase == "namespace_cleanup")
+                janitor_metrics_b = rec.metrics;
+        });
         report_b = runRegularRoundReclaiming(gc_b);
+        gc_b.setPhaseSink({});
     }
     catch (...)
     {
@@ -3197,23 +3237,42 @@ TEST(CASGCFrontierGate, StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListi
     const size_t successor_seal_put = findJournalAfter(
         before_a_release, "put_end " + successor_seal_key, fresh_catalog_cut + 1);
     ASSERT_LT(successor_seal_put, before_a_release.size());
-    const size_t redundant_plan_cut = findJournalAfter(
-        before_a_release, "get " + layout.refCatalogKey(), fresh_catalog_cut + 1);
     const size_t successor_adoption = findJournalAfter(
         before_a_release, "cas_end " + layout.gcStateKey(), successor_seal_put + 1);
     ASSERT_LT(successor_adoption, before_a_release.size());
     EXPECT_LT(catalog_cas_end, conclusive_rescan);
     EXPECT_LT(conclusive_rescan, stream_list);
     EXPECT_LT(stream_list, fresh_catalog_cut);
+    /// The invariant this ordering must still prove: the fold's OWN walk plan is built from the single
+    /// hot-scan cut, taken immediately after the ref-object LIST, with no earlier catalog read sneaking
+    /// into that construction. `fresh_catalog_cut` is defined as the FIRST catalog `get` after
+    /// `stream_list` (the `findJournalAfter` search above), so that already holds by construction --
+    /// the walk plan physically cannot have consumed an earlier one.
+    ///
+    /// What this test used to also assert -- no SECOND catalog read anywhere before the seal PUT -- is
+    /// no longer the right claim once the destructive gate can open on a proved-empty cut: other
+    /// destructive families this SAME round now also runs (the orphan-manifest sweep, the namespace
+    /// janitor) take their OWN separate catalog cuts by design, each after its own candidate listing,
+    /// to resolve authority against a fresh read rather than the fold's frozen one -- exactly the shape
+    /// measured here (`list p/cas/manifests/` immediately followed by a second `get
+    /// p/cas/ref_catalog`, before the seal PUT, from the orphan sweep). That is expected, not redundant,
+    /// so it is not asserted against; the fold's own single-cut plan construction is what remains pinned.
     EXPECT_LT(fresh_catalog_cut, successor_seal_put);
-    EXPECT_TRUE(redundant_plan_cut == before_a_release.size() || successor_seal_put < redundant_plan_cut)
-        << "the fold must consume the one post-LIST catalog cut instead of reading a second plan cut";
     EXPECT_LT(successor_seal_put, successor_adoption);
 
     ASSERT_TRUE(leader_a_failure);
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
-    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, fixture.checkpoint_bytes);
-    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
+    /// Same discrimination as `CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor`: leader_b's
+    /// round both drops `fixture.ns`'s catalog row AND, because the resulting cut is genuinely,
+    /// provably empty, opens the destructive gate -- so the namespace janitor reclaims the checkpoint
+    /// in this SAME round. Attribute the delete to the janitor's own counter rather than assume either
+    /// survival (the old expectation) or absence (which an unchecked dereference here cannot
+    /// distinguish from "never existed").
+    ASSERT_FALSE(janitor_metrics_b.empty()) << "the namespace_cleanup phase must have run this round";
+    EXPECT_GE(janitor_metrics_b.at("janitor_deleted"), 1u)
+        << "the janitor's OWN counter must show the delete, now that the proved-empty gate has opened";
+    EXPECT_FALSE(backend->get(fixture.checkpoint_key).has_value());
+    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 1);
 }
 
 TEST(CASGCFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
@@ -3225,8 +3284,20 @@ TEST(CASGCFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
     backend->clearJournal();
     backend->loseNextCatalogCasResponse(layout.refCatalogKey());
 
+    /// Same shape as `StaleIssuedCatalogCasLosesAfterNewLeaderHelpsBeforeListing`: `fixture.ns` is
+    /// Removing with a durable `_ckpt`, so this round both drops its catalog row and, because the
+    /// resulting cut is genuinely, provably empty, opens the destructive gate -- the namespace janitor
+    /// (a separate `namespace_cleanup` phase within this SAME round) reclaims the checkpoint. Captured
+    /// so the assertions below attribute the delete to the janitor's own counter.
+    std::map<String, UInt64> janitor_metrics;
     Gc gc(store, kGc);
+    gc.setPhaseSink([&](const GcPhaseRecord & rec)
+    {
+        if (rec.phase == "namespace_cleanup")
+            janitor_metrics = rec.metrics;
+    });
     const RoundReport report = runRegularRoundReclaiming(gc);
+    gc.setPhaseSink({});
     ASSERT_TRUE(report.acquired_lease);
     ASSERT_FALSE(report.deferred);
 
@@ -3248,8 +3319,15 @@ TEST(CASGCFrontierGate, LostCatalogCasResponseIsResolvedBeforeListing)
     EXPECT_LT(stream_list, fresh_catalog_cut);
 
     EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(*backend, layout, fixture.ns));
-    EXPECT_EQ(backend->get(fixture.checkpoint_key)->bytes, fixture.checkpoint_bytes);
-    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 0);
+    /// See the discrimination comment in `CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor`:
+    /// attribute the delete to the janitor's own counter, never to end-state absence alone, and never
+    /// assume survival -- both would be indistinguishable from a bug on this exact line (the old
+    /// unchecked `->bytes` here is what aborted the whole binary once the janitor started reclaiming).
+    ASSERT_FALSE(janitor_metrics.empty()) << "the namespace_cleanup phase must have run this round";
+    EXPECT_GE(janitor_metrics.at("janitor_deleted"), 1u)
+        << "the janitor's OWN counter must show the delete, now that the proved-empty gate has opened";
+    EXPECT_FALSE(backend->get(fixture.checkpoint_key).has_value());
+    EXPECT_EQ(backend->deleteCount(fixture.checkpoint_key), 1);
 }
 
 /// A stale leader may learn from its mandatory resolution read that the old life is gone, and must
@@ -3379,15 +3457,28 @@ TEST(CASGCFrontierGate, CompletedRemovalDrainUsesNPlusOneCatalogReads)
         deletes + 1);
     const size_t walk_plan_cut = findJournalAfter(journal, catalog_get, stream_list);
     ASSERT_LT(walk_plan_cut, journal.size());
+    /// Between the hot walk-plan cut and the janitor's own page, the orphan-manifest sweep -- ANOTHER
+    /// destructive family the now-open gate also unlocks (the batch drain above empties the catalog, so
+    /// this round's frontier is proved empty and the sweep's own `!suppress_destructive` gate opens
+    /// too) -- lists its own manifest candidates and takes its OWN separate catalog cut to resolve
+    /// authority, exactly as the janitor does. Located explicitly so the final read count below states
+    /// what it counts rather than drifting silently the next time a family is unlocked.
+    const size_t orphan_sweep_list = findJournalAfter(journal, "list " + layout.casManifestsPrefix(), walk_plan_cut);
+    ASSERT_LT(orphan_sweep_list, journal.size());
+    const size_t orphan_sweep_cut = findJournalAfter(journal, catalog_get, orphan_sweep_list);
+    ASSERT_LT(orphan_sweep_cut, journal.size());
     const size_t janitor_list
-        = findJournalAfter(journal, "list " + layout.namespaceRootPrefix(), walk_plan_cut);
+        = findJournalAfter(journal, "list " + layout.namespaceRootPrefix(), orphan_sweep_cut);
     ASSERT_LT(janitor_list, journal.size());
     const size_t janitor_cut = findJournalAfter(journal, catalog_get, janitor_list);
     ASSERT_LT(janitor_cut, journal.size());
     EXPECT_EQ(findJournalAfter(journal, catalog_get, janitor_cut + 1), journal.size())
-        << "one hot walk-plan cut and one janitor page cut are the only post-drain catalog reads";
+        << "one hot walk-plan cut, one orphan-sweep cut, and one janitor page cut are the only "
+           "post-drain catalog reads";
     EXPECT_EQ(backend->listCount(layout.namespaceStreamRootPrefix()), 1u);
     EXPECT_EQ(backend->listCount(layout.namespaceRootPrefix()), 1u);
-    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), deletes + 3)
-        << "N+1 drain reads, one post-hot-LIST cut, and one separate post-janitor-page cut";
+    EXPECT_EQ(backend->getCount(layout.refCatalogKey()), deletes + 4)
+        << "N+1 drain reads, one post-hot-LIST walk-plan cut, one orphan-manifest-sweep cut (now that "
+           "the proved-empty gate has opened, unlocking that destructive family too), and one separate "
+           "post-janitor-page cut";
 }
