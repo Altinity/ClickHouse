@@ -1097,3 +1097,42 @@ launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.m
   proposal on the table is to DELETE the log line and keep the observability that already exists:
   ProfileEvent CASGCUnmatchedAdoptedParentLives + the per-round phase metric
   walk_plan_dropped_parent_rows in system.cas_gc_log. Awaiting user's go-ahead.
+
+## PRE-COMPACT STATE OF RECORD — 2026-08-04 ~18:00 {#pre-compact-2}
+
+READ THIS FIRST after a context reset.
+
+**Branch `cas-gc-rebuild` (master worktree) contains, all integrated and gated:**
+- T6 + T6b (destruction flip, work-envelope budgets, C2 mf-cleanup cap REMOVED after the soak pair).
+- Both naming plans, the altinity/antalya-26.6 merge (4950cb23446), PR-2073 CI review fixes.
+- FINDING #1 (namespace-admission race, BOTH catch-points: 454597196fd, 7da8f7c4019, 4b8a018215e,
+  2d15bb2c1e2, 38c73f57f36).
+- FINDING #2 (dropAllData/existsDirectory namespace leak: 34af81e1bdb + tests + stateless 05023).
+- FINDING #3 (proved-empty catalog completes the frontier: 27a41a0cf05, 5440c0278c4, 6be51656992)
+  plus the three stale standstill assertions rewritten (0508e724dcb).
+- Revert of the upstream ReaderExecutor metric deletion (9edc80179f2).
+- UNCOMMITTED at compact time: removal of the per-drop `LOG_WARNING` in CasGc.cpp's adopted-parent
+  merge (counter CASGCUnmatchedAdoptedParentLives + phase metric walk_plan_dropped_parent_rows keep
+  the signal; no test asserts the text — verified). Build green (NB_EXIT=0); targeted suites
+  131/131 green.
+
+**Last full CA gate: 2027/2027 PASSED** (release, `Cas*:CA*`).
+
+**IMMEDIATE NEXT STEP (not yet done):** rerun the stateless test
+`python3 -m ci.praktika run "Stateless tests (amd_binary, cas storage, parallel)" --test
+"05023_cas_dropns_leaked_namespace"` — it must now reach `pending_condemned = 0` AND leave stderr
+clean. Its two earlier failures were (1) a stale server binary (only unit_tests_dbms had been
+rebuilt) and (2) the log noise being removed above. Then commit the log-noise change.
+
+**Then, in order:** BACKLOG entry `[cas-tests-unchecked-optional-deref]` (16 sites in
+gtest_cas_gc_frontier_gate.cpp, ~143 tree-wide; aborts hide every later test in the binary — three
+recurrences tonight) → the criterion-4 HOLD-arm short soak (owed; the anomaly arm is satisfied) →
+T9 (perf report off the preserved specimen at
+utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/general_soak_90m_run3_seed20260808_specimen/,
+then ledger `Stage B COMPLETE`).
+
+**Stage B verdict stands as PASS, conditioned** on findings #1/#2 landing — both now integrated, so
+the condition is met on the branch; FINDING #3 was found after the verdict and is also in.
+
+**Standing rules:** two live worktrees only (master + lane-g); one heavy stage at a time; no pushes;
+execute in-turn rather than announcing; monitors do not wake me — poll.
