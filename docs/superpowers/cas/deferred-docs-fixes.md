@@ -754,3 +754,9 @@ round; the comment states more than the field guarantees.
 2. UNDECIDED (user decision pending): `CasEvent::detail` / fsck-report short keys `ns`, `me`, `p`,
    `ha` in `CasFsck`/`CasGc` maps are user-facing abbreviations outside the Decisions list of the
    obscure-names plan; deliberately not renamed. Decide spell-out vs keep, then a small follow-up.
+
+### D50 — `DisksApp` exit-code comment names a command that no longer exists {#d50-disksapp-fsck-comment}
+
+STALE: the comment above the non-interactive exit-code return in `DisksApp::main` gives its example as
+"`fsck` reporting dangling objects". The bare `fsck` alias was dropped when the applets were renamed;
+the command is `cas-fsck`. One-word fix, batched here rather than opened as its own round.

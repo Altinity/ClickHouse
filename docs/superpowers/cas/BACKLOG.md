@@ -3407,3 +3407,50 @@ no lever.
 
 **Note on scope.** Items 1, 2 and 4 are operability work and need no protocol change. Item 3 may reveal
 a real recovery-path defect; treat its outcome as its own item if so.
+
+## [disks-exit-code-upstream] `clickhouse-disks --query` now exits nonzero on a failing command — carve as its own upstream PR {#disks-exit-code-upstream}
+
+**What changed.** `DisksApp` records `last_command_exit_code` while it executes a `--query` batch and,
+for non-interactive runs only, returns it as the process exit code. Before, `clickhouse-disks --query
+<cmd>` exited 0 no matter what the command did; the error was printed to stderr and to the log, and
+nothing else. Interactive REPL runs are unaffected.
+
+**Why it is right.** The CAS applets are the reason it was noticed — `cas-fsck` signals INV-NO-LOSS
+violations (`dangling`, `chain_broken`, `corrupted_runs`, `lifeless_keys`) by throwing, and the soak
+harness and the CAS integration tests gate on that exit code — but the argument is general: a
+non-interactive invocation is by definition something a script, a cron job or a CI step is driving, and
+a tool that always exits 0 cannot be gated on. That is a hole for every `clickhouse-disks` user, not a
+CAS-specific one.
+
+**It is a behavior change for every user of the tool**, including out-of-tree scripts that today rely
+on the swallowing. That is exactly why it must travel as its OWN upstream PR carrying this rationale,
+not ride inside the CAS series where it would be invisible to a reviewer who cares about the tool.
+
+Two details a reviewer needs. First, within one `--query` batch of several semicolon-separated
+commands, `processQueryText` resets the code once at entry and each failure overwrites it, so a later
+success does NOT clear an earlier failure — the exit code reports "something in this batch failed",
+not "the last command failed". Second, `remove` throws on an absent path while `list` does not
+(`DiskWithPath::listAllFilesByPath` returns an empty vector for a non-directory), so `remove` is the
+verb most likely to newly fail a caller.
+
+**It exposed a latent test defect.** `test_replicated_database.py::test_replicated_table_structure_alter`
+read `metadata_path` for `table_structure.mem` out of `system.tables` on `competing_node` AFTER that
+node had already run `DETACH DATABASE table_structure`. A detached database has no rows in
+`system.tables`, so the SELECT returned the empty string, and the `--query "remove "` that followed
+failed with a missing mandatory `path` argument. The metadata file the test meant to delete was never
+deleted, and the test passed anyway because the exit code was swallowed — so the corruption-recovery
+scenario it claims to exercise had not been exercised. Fixed here by reading the path before the
+DETACH and asserting it is non-empty. The fix belongs in the same upstream PR: the file is upstream's
+and unmodified by us otherwise.
+
+**Blast radius (swept 2026-08-03).** Every `clickhouse-disks` / `clickhouse disks` invocation with
+`--query`/`-q` in `tests/`, `ci/` and `utils/` was enumerated and classified; the audit found exactly
+one victim, the one above. Stateless `.sh` tests are structurally insulated: none of them set `-e` or
+`pipefail`, so only the script's LAST command decides the exit status, and in all ten disks-using
+tests that last command is either a `CLICKHOUSE_CLIENT` call or a `remove` of a path an immediately
+preceding assertion proved present. Integration tests are the exposed surface, because
+`exec_in_container` raises on a nonzero exit by default. The CAS integration tests and
+`utils/ca-soak/soak/fsck.py` already read the exit code deliberately, and the ca-soak harness is the
+consumer the change exists for. `ci/jobs/scripts/clickhouse_proc.py` reads output through
+`Shell.get_output` and validates it (`is_valid_uuid`) rather than trusting the exit code.
+
