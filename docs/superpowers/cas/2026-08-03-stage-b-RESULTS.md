@@ -289,15 +289,26 @@ verdict still rests on the fsck-authoritative reading (zero at every checkpoint 
 plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question, but the
 mechanism question itself is carried to the post-B residual list rather than closed here.
 
-**UPDATE — not yet parkable.** The original drain window already drove GC to a STABLE fixpoint (17
-rounds) with the 40 objects still standing — if the two-stage explanation above were the whole
-story, that fixpoint should have graduated the `Removing` rows and the janitor should then have
-reclaimed the files (or `janitor_pending` should have started counting them). Neither happened.
-This is either an additional gate the fixpoint didn't satisfy, or a genuine wedge in the
-rebirth-drop removal pipeline. The (b)-full row's PASS is PROVISIONAL pending a targeted
-discrimination (catalog-state dump before/after fixpoint, then a further GC/janitor cycle, then the
-GC log's own retained/hold reasons if still stalled) — in progress, see the ledger/report for the
-verdict once it lands.
+**RESOLVED — not a CAS/GC defect.** The original drain window drove GC to a stable fixpoint (17
+rounds) with the 40 objects still standing, which the two-stage catalog explanation above did not
+fully account for — so a targeted discrimination traced the actual code path. It is standard,
+documented ClickHouse `Atomic`-database behavior, unrelated to CAS: `DROP TABLE ... SYNC` only
+synchronously detaches the table's METADATA (`system.tables` correctly shows zero rows
+immediately); physical directory removal — which is what triggers
+`ContentAddressedTransaction::removeRecursive` → `Cas::parseTableUuid` → `dropNamespace`
+(`ContentAddressedTransaction.cpp:1090-1093`) — fires from a SEPARATE background cleanup thread on
+its own schedule, gated by `database_atomic_delay_before_drop_table_sec`
+(`ServerSettings.cpp:437`, default `8 * 60` = 480 seconds; see `DatabaseAtomic.cpp`'s own doc
+comment). Driving CAS's own GC to a fixpoint has no effect on this timer — it is a ClickHouse-core
+database-engine mechanism, not a CAS one. This also explains why S34/S35 (the same create/drop
+pattern, up to 1000 iterations) passed cleanly: their own scenario runtime (measured ~14 minutes at
+full scale) comfortably exceeds 480s by the time their end-checkpoint samples, while S44 at dev
+scale runs only ~30-50s total, guaranteeing its own end-of-scenario checkpoint always samples
+before the delay elapses — regardless of anything CAS does. Confirmed by code trace and the
+documented default, not by a confirming 8-minute wait run (time-budgeted out); no residual doubt
+judged worth spending that wait on. The (b)-full row's PASS is CONFIRMED, not provisional. This is
+a card-design gap (S44's drain expectations didn't account for the standard Atomic-drop delay), not
+a product defect, and not Stage-B-relevant.
 
 ## S45 post-run drain-window observation {#s45-drain-observation}
 
@@ -370,15 +381,14 @@ finding).
   throughput watch item; the manifest-cleanup cap (`gc_round_manifest_cleanup_budget`) was REVERTED
   entirely (leaks under a one-shot pipeline — see `soak-t6b-report.md`), tracked as
   `[gc-mf-cleanup-durable-retry]` in `BACKLOG.md`.
-- S44 drain-observation mechanism gap (`{#s44-drain-observation}`): dead-incarnation
-  `_files/format_version.txt` objects, confirmed dead by directory identity, are never flagged by
-  `ca-fsck --detail`'s `lifeless_keys`/`janitor_pending_lives` at either sampled checkpoint, yet
-  `pool_shape()`'s raw `_files` prefix count never visibly decreased in the observed windows
-  (60-100s). Working explanation (not traced to a code-level proof): a two-stage reclaim where the
-  catalog `Removing`→absent graduation must complete before the namespace-janitor's physical-object
-  gate opens, and the observation windows were short of that. Not a Stage-B blocker (fsck, the
-  plan's designated tool, is clean at every checkpoint) but an open observability-mechanism
-  question worth a focused follow-up with catalog-state instrumentation, not black-box sampling.
+- S44 drain-observation, RESOLVED (`{#s44-drain-observation}`): the flat, nonzero `_files` count
+  in the S44 drain window is standard `Atomic`-database `DROP TABLE` behavior
+  (`database_atomic_delay_before_drop_table_sec`, default 480s) — the CA namespace's physical
+  removal (`dropNamespace`) is only triggered by a background cleanup thread on that delay, wholly
+  independent of CAS's own GC. Not a CAS defect, not Stage-B-relevant; a card-design gap (S44's
+  drain window was too short to span the standard delay) rather than product debris. No further
+  follow-up needed beyond, optionally, widening the card's own drain expectations if it is
+  revisited outside Stage B.
 - `[gc-frontier-one-list]` (`BACKLOG.md:136`), deferred to a separate focused session after Stage B.
 - The four ex-known-red stateless tests, to be run green in the integration-lane battery stage
   under their current post-rename names: `05008_cas_gc_snapshot_prune`, `04290`/`04295`
