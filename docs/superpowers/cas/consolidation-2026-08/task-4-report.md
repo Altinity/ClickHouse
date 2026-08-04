@@ -5,34 +5,31 @@ Scope: mechanical accounting/integrity gate only. The sampled "what was missed" 
 
 ## Verdict
 
-**FAIL** (exit 1) — 6 errors, all the same class: `bad kind roadmap` in `extracted/B016.jsonl`
-(ids `B016-071` .. `B016-076`). Everything else is clean: coverage is complete, JSONL is
-well-formed, source paths resolve, and record ids are unique.
+**PASS** (exit 0). Coverage is complete, JSONL is well-formed, source paths resolve, and record
+ids are unique.
 
 ```
-corpus=421 accounted=421 records=5550 errors=6
-ERR B016-071: bad kind roadmap
-ERR B016-072: bad kind roadmap
-ERR B016-073: bad kind roadmap
-ERR B016-074: bad kind roadmap
-ERR B016-075: bad kind roadmap
-ERR B016-076: bad kind roadmap
+corpus=421 accounted=421 records=5550 errors=0
 ```
 
-### Content problem, not fixed here
+### Content problem found, then fixed under controller ruling
 
-The six `B016-0NN` records (all citing
+On the first run, 6 errors surfaced — all `bad kind roadmap` in `extracted/B016.jsonl` (ids
+`B016-071` .. `B016-076`, citing
 `docs/superpowers/plans/2026-07-15-cas-codecs-v3-phase2-control-plane.md#dag-phase3` through
-`#dag-phase8`) were tagged `kind:"roadmap"`, a value outside the closed taxonomy
-(`contract`, `design-decision`, `rejected-alternative`, `bug`, `todo`, `runbook-fact`,
-`user-fact`, `metric`, `setting`, `history`). This is an extraction-content defect from the
-Task 3 map step, not an accounting/bookkeeping bug, so per instructions I did not edit the
-jsonl or silently widen the gate's allowed-kind list — that would be a taxonomy decision, not
-mine to make unilaterally. Options for whoever picks this up: re-run `run_map.sh` for `B016`
-after deleting its outputs so the batch is re-extracted with a valid kind, or explicitly decide
-these six claims belong to a kind already in the list (closest candidates are
-`design-decision` or `history`, since they describe planned/ordered phases of an accepted
-design, not open questions). **Gate M must be re-run to green before Task 5 starts.**
+`#dag-phase8`). `roadmap` is outside the closed taxonomy (`contract`, `design-decision`,
+`rejected-alternative`, `bug`, `todo`, `runbook-fact`, `user-fact`, `metric`, `setting`,
+`history`) — an extraction-content defect from the Task 3 map step, not an accounting/bookkeeping
+bug, so I reported it rather than silently editing content or widening the gate's allowed-kind
+list.
+
+The controller ruled these six records are plan work items (codecs-v3 phases 3-8) and their
+correct kind is `todo`; the verification phase will verdict them done/stale later. Under that
+ruling, `tools/reclassify_kind.py` was added: it hardcodes the exact 6 ids and rewrites only
+their `"kind"` field from `"roadmap"` to `"todo"`, byte-identical otherwise (verified by diff —
+each of the 6 lines changes only the `kind` value; claim text, sources, and
+`suggested_target:"roadmap"` are untouched). Gate M was re-run afterward and is green
+(`errors=0`); the two accounting identities below were re-verified unchanged.
 
 ## PROBE exclusion
 
@@ -97,8 +94,9 @@ files, 101 records) separate from these.
 
 ## Concerns
 
-1. **Gate is currently RED** — do not start Task 5 until the `B016` `kind:"roadmap"` issue above
-   is resolved and a clean re-run is committed.
-2. The per-group table counts (record, file) pairs, not distinct records — a record citing two
+1. The per-group table counts (record, file) pairs, not distinct records — a record citing two
    files is counted once in each of that file's groups. This matches the pairs identity (5667)
    by construction but is not the same denominator as `records=5550`.
+2. `suggested_target:"roadmap"` on the 6 reclassified records was intentionally left untouched
+   (the ruling scoped the fix to the `kind` field only) — it's a separate field feeding a later
+   clustering/placement step, not part of the kind taxonomy.
