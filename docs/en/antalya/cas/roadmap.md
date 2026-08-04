@@ -63,6 +63,10 @@ positioning.
   yet implemented.
 - **Backup and restore.** See [Backups](#backups) below — this is further along as a design than as
   an implementation.
+- **First-class local-disk pools.** Today a pool over local paths runs a minimal best-effort
+  emulation of the conditional-write dialect (single-process, serialized resurrections). Making the
+  local mode efficient in its own right is under consideration: a local CAS tier is a natural target
+  for backups, pinned snapshots, and moving data between CAS tiers.
 
 ## Known limitations {#known-limitations}
 
