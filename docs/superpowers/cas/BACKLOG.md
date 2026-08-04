@@ -3408,6 +3408,48 @@ no lever.
 **Note on scope.** Items 1, 2 and 4 are operability work and need no protocol change. Item 3 may reveal
 a real recovery-path defect; treat its outcome as its own item if so.
 
+## [cas-join-set-truncate] `StorageJoin`/`StorageSet::truncate` throw retry-later, self-healing, on a CAS disk {#cas-join-set-truncate}
+
+`StorageJoin::truncate` and `StorageSet::truncate` call `disk->removeRecursive(path)` then immediately
+`disk->createDirectories(path)`. On a content-addressed disk `createDirectories` is a pure admission
+no-op (`ContentAddressedTransaction::createDirectory` never touches the catalog), so the real re-mint
+happens lazily on the first write after `TRUNCATE` returns — that write resolves the namespace through
+`CasRefLedger::namespaceLife`.
+
+**Verdict: TRANSIENT, not permanent.** A unit-level test
+(`CASRefWriterNamespaceRemoval.FilesOnlyNamespaceTruncateThrowsRetryLaterUntilGcReclaimsThenRebirths` in
+`src/Disks/tests/gtest_cas_ref_writer.cpp`) reproduces the exact sequence — birth a files-only
+namespace life (the shape `StorageJoin`/`StorageSet` tables use, no MergeTree part ever published),
+`dropNamespace` it (the `removeRecursive`-shaped call), then immediately call `namespaceLife` again on
+the same name. It throws a typed `NETWORK_ERROR` ("CAS namespace … is Removing: creation waits for its
+terminal fold and catalog removal to complete; retry later"), because the catalog row is still
+`Removing` until a GC round actually deletes it. After draining GC (two rounds, same shape used
+throughout this test file), the identical call mints a fresh incarnation and writes succeed normally —
+self-healing, no operator action required.
+
+Practically: `TRUNCATE` on a `StorageJoin`/`StorageSet` table backed by a CAS disk completes without
+error (`removeRecursive`/`createDirectories` do not themselves touch `namespaceLife`), but the very next
+write to that table (the next `INSERT`, or backup rewrite) throws a retry-later error until the
+background GC round reclaims the just-removed row — a window bounded by GC round latency, not by
+anything the client controls. A client without retry-on-`NETWORK_ERROR` will see the write it issues
+right after `TRUNCATE` fail; retrying it (or simply waiting for the next GC round) succeeds.
+
+**Before the `existsDirectory` fix** (the `DirShape::TableDir` cleanup-completeness probe), the same
+`TRUNCATE` was silently a no-op on these engines: `existsDirectory` never reported the directory present
+in the first place (it only answered "has at least one committed part", and these engines never publish
+one), so `removeRecursive` was skipped entirely and the table kept its old contents. This is a change of
+which wrong thing happens on `TRUNCATE`, not a newly introduced break: the old behavior silently ignored
+the user's `TRUNCATE`; the new one executes it and imposes a bounded retry-later window on the following
+write.
+
+**Direction, not a fix here.** A real fix belongs in the CAS layer's rebirth semantics — either give
+`namespaceLife` a fast, non-error path for "predecessor is provably terminal, just needs its row
+folded" instead of forcing every caller through the GC-latency retry-later window, or have
+`StorageJoin`/`StorageSet::truncate` itself wait for the removal to fully settle before returning
+(mirroring `DROP TABLE ... SYNC`'s own synchronous-completion contract) rather than leaving the very next
+write to discover the window. Out of scope for the fix-verify pass that found this; tracked here as a
+usability rough edge, not a correctness defect.
+
 ## [disks-exit-code-upstream] `clickhouse-disks --query` non-interactive exit code — carve-out obligation {#disks-exit-code-upstream}
 
 `DisksApp::main` now returns a failing command's error code as the process exit code for
