@@ -240,9 +240,12 @@ in-memory state advances only after a durable `PUT`, and a caller's `appendRefOp
 after the durable install. In-flight precommits are visible only through the precommit set, never
 through an ordinary ref resolve.
 
-Two cross-process readers see a different, colder view: `GC` and `ca-fsck` do their own `LIST`-and-
-replay, staleness-bounded by whatever was durable at `LIST` time, so an unpublished tail is
-invisible to them. The relink-confirm handshake (see the
+Two cross-process readers see a different, colder view, but only at the discovery boundary: `GC`
+and `ca-fsck` `LIST` once to discover which namespaces exist, staleness-bounded by whatever was
+durable at `LIST` time, so a namespace born after that `LIST` is invisible to this pass. Within
+each discovered namespace, the replay itself is not `LIST`-driven — it is the same exact-`GET`,
+`_ckpt`-grounded arithmetic walk described above, just called from a caller-supplied catalog entry
+instead of a live mount. The relink-confirm handshake (see the
 [replication page](/antalya/cas/architecture/replication#relink-gates)) does zero object-store I/O
 and answers `Yes` only against the resident, warm, fence-live in-memory table — `No` is not proof
 of the negative, only `Yes` is fence-gated.
