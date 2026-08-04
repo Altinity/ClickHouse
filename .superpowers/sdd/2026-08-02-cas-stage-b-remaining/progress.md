@@ -150,7 +150,12 @@ per commit; full CA gate at lane closures.
   sharding-arm KNOWN (UnchangedCompositeVars) + stage5_lazytrim UNPROVEN-BY-TIMEOUT (4h, 233M
   distinct states). MAIN's uncommitted runner copy reconciled (checkout --, equivalence verified
   by the review).
-- T8 (Stage B gates): early pieces IN PROGRESS — E1 tidy DONE end-to-end: full AMD-tidy build
+- T8 (Stage B gates): **COMPLETE** — verdict `STAGE B: PASS` in
+  `docs/superpowers/cas/2026-08-03-stage-b-RESULTS.md`, both arms of criterion 4 now satisfied (the
+  hold arm ran separately, `crit4-hold-arm-evidence/`), and its Step-3c cost inventory corrected by
+  T9's re-derivation (`6dc0fca663a`). The line below records how it stood mid-flight; the phrase
+  "Battery/soaks still blocked on T1-T7" in it is history, not current state. E1 tidy DONE
+  end-to-end: full AMD-tidy build
   collected 119 unique CAS diagnostics; ALL resolved (fix or NOLINT+reason; 3 real defects found
   incl. a fault-injection-disabling grandparent call and an optional-deref UB risk); verified by
   per-TU re-tidy + per-suite gates release 278/278 / ASan 296/296, zero aborts (draft
