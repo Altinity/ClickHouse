@@ -173,4 +173,13 @@ WriteSinkPtr InstrumentedBackend::putIfAbsentStream(const String & key, const Ob
     return std::make_unique<InstrumentedWriteSink>(std::move(sink), classifyCasNs(key));
 }
 
+WriteSinkPtr InstrumentedBackend::putOverwriteStream(const String & key, const Token & expected,
+                                                     uint64_t declared_size, const ObjectMeta & meta)
+{
+    WriteSinkPtr sink = inner->putOverwriteStream(key, expected, declared_size, meta);
+    if (!sink)
+        return sink;
+    return std::make_unique<InstrumentedWriteSink>(std::move(sink), classifyCasNs(key));
+}
+
 }

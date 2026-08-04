@@ -62,6 +62,49 @@ private:
     bool done_ = false;
 };
 
+/// Streaming counterpart of `InMemoryWriteSink`: identical in shape, differing only in which
+/// conditional publish it delegates to at finalize.
+class InMemoryOverwriteSink final : public WriteSink
+{
+public:
+    InMemoryOverwriteSink(InMemoryBackend & backend, String key, Token expected, ObjectMeta meta)
+        : backend_(backend)
+        , key_(std::move(key))
+        , expected_(std::move(expected))
+        , meta_(std::move(meta))
+    {
+    }
+
+    WriteBuffer & buffer() override { return buf_; }
+
+    PutResult finalize() override
+    {
+        chassert(!done_);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
+        done_ = true;
+        return backend_.putOverwrite(key_, buf_.str(), expected_, meta_);
+    }
+
+    void cancel() noexcept override
+    {
+        done_ = true;
+        buf_.cancel();
+    }
+
+    ~InMemoryOverwriteSink() override
+    {
+        if (!done_)
+            cancel();
+    }
+
+private:
+    InMemoryBackend & backend_;
+    String key_;
+    Token expected_;
+    ObjectMeta meta_;
+    WriteBufferFromOwnString buf_;
+    bool done_ = false;
+};
+
 /// The windowed slice of `data` for `range`, with the same clamping `get` documents: an offset at or
 /// past EOF yields an empty result; an open-ended length runs to EOF. Shared by `get` and `getStream`
 /// so the two stay in lockstep.
@@ -163,6 +206,12 @@ PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes,
 WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
 {
     return std::make_unique<InMemoryWriteSink>(*this, key, meta);
+}
+
+WriteSinkPtr InMemoryBackend::putOverwriteStream(const String & key, const Token & expected,
+                                                 uint64_t /*declared_size*/, const ObjectMeta & meta)
+{
+    return std::make_unique<InMemoryOverwriteSink>(*this, key, expected, meta);
 }
 
 PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)

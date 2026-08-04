@@ -246,6 +246,112 @@ TEST_P(CASBackendContract, StreamPutLargeBody)
     EXPECT_EQ(got->token, tok);
 }
 
+/// The conditional-overwrite counterpart of the streaming create above. Blob bodies have no size
+/// cap, so the whole-`String` `putOverwrite` cannot serve the one caller that writes one: a body
+/// larger than memory is not a slow path there, it is an impossible one.
+TEST_P(CASBackendContract, StreamOverwriteReplacesOnMatchingToken)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/ovw1", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    auto sink = b->putOverwriteStream("k/ovw1", created.token, /*declared_size=*/8);
+    sink->buffer().write("replaced", 8);
+    const auto res = sink->finalize();
+
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
+    EXPECT_NE(res.token, created.token);   /// a replacement is a new incarnation, so a new token
+    auto got = b->get("k/ovw1");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "replaced");
+    EXPECT_EQ(got->token, res.token);
+}
+
+TEST_P(CASBackendContract, StreamOverwriteWrongTokenLeavesObjectIntact)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/ovw2", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    auto sink = b->putOverwriteStream("k/ovw2", Token{"wrong", TokenType::Emulated}, /*declared_size=*/8);
+    sink->buffer().write("replaced", 8);
+    EXPECT_EQ(sink->finalize().outcome, PutOutcome::PreconditionFailed);
+
+    auto got = b->get("k/ovw2");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "original");
+    EXPECT_EQ(got->token, created.token);
+}
+
+TEST_P(CASBackendContract, StreamOverwriteCancelPublishesNothing)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/ovw3", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+    {
+        auto sink = b->putOverwriteStream("k/ovw3", created.token, /*declared_size=*/8);
+        sink->buffer().write("replaced", 8);
+        sink->cancel();
+    }
+    auto got = b->get("k/ovw3");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "original");
+    EXPECT_EQ(got->token, created.token);
+}
+
+TEST_P(CASBackendContract, StreamOverwriteDestructionWithoutFinalizePublishesNothing)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/ovw4", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+    {
+        auto sink = b->putOverwriteStream("k/ovw4", created.token, /*declared_size=*/8);
+        sink->buffer().write("replaced", 8);
+        /// no finalize, no cancel — the destructor must behave as cancel, exactly as the create sink does
+    }
+    auto got = b->get("k/ovw4");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "original");
+}
+
+TEST_P(CASBackendContract, StreamOverwriteAbsentKeyIsRefused)
+{
+    auto b = GetParam()();
+    auto sink = b->putOverwriteStream("k/ovw_absent", Token{"any", TokenType::Emulated}, /*declared_size=*/4);
+    sink->buffer().write("body", 4);
+    EXPECT_EQ(sink->finalize().outcome, PutOutcome::PreconditionFailed);
+    EXPECT_FALSE(b->head("k/ovw_absent").exists);
+}
+
+/// Chunked ~1 MB through the conditional-overwrite sink: the case the whole-`String` form could not
+/// express without holding the body.
+TEST_P(CASBackendContract, StreamOverwriteLargeBody)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/ovw_large", "seed");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    String chunk(4096, '\0');
+    for (size_t i = 0; i < chunk.size(); ++i)
+        chunk[i] = static_cast<char>('a' + i % 26);
+
+    String expected;
+    auto sink = b->putOverwriteStream("k/ovw_large", created.token, /*declared_size=*/1 << 20);
+    for (size_t written = 0; written < (1 << 20); written += chunk.size())
+    {
+        sink->buffer().write(chunk.data(), chunk.size());
+        expected += chunk;
+    }
+    const auto res = sink->finalize();
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
+
+    auto got = b->get("k/ovw_large");
+    ASSERT_TRUE(got.has_value());
+    ASSERT_EQ(got->bytes.size(), expected.size());
+    EXPECT_EQ(got->bytes, expected);
+    EXPECT_EQ(got->token, res.token);
+}
+
 INSTANTIATE_TEST_SUITE_P(CASInMemory, CASBackendContract,
     ::testing::Values(+[]() -> BackendPtr { return std::make_shared<InMemoryBackend>(); }));
 

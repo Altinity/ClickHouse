@@ -55,6 +55,12 @@ struct NullBackend final : Backend
         return nullptr;   /// trivial default — streaming behavior is pinned by the CASBackendContract suite
     }
 
+    WriteSinkPtr putOverwriteStream(const String & /*key*/, const Token & /*expected*/,
+                                    uint64_t /*declared_size*/, const ObjectMeta & /*meta*/) override
+    {
+        return nullptr;   /// trivial default — streaming behavior is pinned by the CASBackendContract suite
+    }
+
     PutResult putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, const ObjectMeta & /*meta*/) override
     {
         return {PutOutcome::PreconditionFailed, {}};

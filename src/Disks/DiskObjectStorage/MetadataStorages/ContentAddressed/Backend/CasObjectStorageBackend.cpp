@@ -250,7 +250,16 @@ public:
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
         if (finalizeConditionalWriteInstrumented(*write_buf) == PutOutcome::PreconditionFailed)
+        {
+            /// Losing the condition is an ORDINARY outcome, not an error: another writer may
+            /// legitimately have taken the slot, and the conditional-overwrite caller races a
+            /// displacement it fully expects to lose sometimes. Abort the upload HERE rather than
+            /// leaving it to the buffer's destructor, which warns "was neither finished nor aborted"
+            /// on every occurrence -- and any test whose server writes that to stderr fails -- while
+            /// the uploaded parts stay billable until a lifecycle rule reaps them.
+            write_buf->cancel();
             return {PutOutcome::PreconditionFailed, {}};
+        }
 
         /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
         /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
@@ -326,6 +335,86 @@ private:
     Backend & backend;
     const String key;
     const ObjectMeta meta;
+    WriteBufferFromOwnString buf;
+    bool done = false;
+};
+
+/// EmulatedSingleProcess counterpart of `EmulatedBufferedSink` for the CONDITIONAL-OVERWRITE form:
+/// accumulates, then delegates the atomic publish to `putOverwrite`, which takes `emu_mutex` and so
+/// keeps the emulation's serialization point exactly where it already was.
+class EmulatedOverwriteBufferedSink final : public WriteSink
+{
+public:
+    EmulatedOverwriteBufferedSink(Backend & backend_, String key_, Token expected_, ObjectMeta meta_)
+        : backend(backend_)
+        , key(std::move(key_))
+        , expected(std::move(expected_))
+        , meta(std::move(meta_))
+    {
+    }
+
+    WriteBuffer & buffer() override { return buf; }
+
+    PutResult finalize() override
+    {
+        chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
+        done = true;
+        return backend.putOverwrite(key, buf.str(), expected, meta);
+    }
+
+    void cancel() noexcept override
+    {
+        done = true;
+        buf.cancel();
+    }
+
+    ~EmulatedOverwriteBufferedSink() override
+    {
+        if (!done)
+            cancel();
+    }
+
+private:
+    Backend & backend;
+    const String key;
+    const Token expected;
+    const ObjectMeta meta;
+    WriteBufferFromOwnString buf;
+    bool done = false;
+};
+
+/// Accepts writes and refuses at finalize. It exists so a refusal decided BEFORE any byte is written
+/// still reaches the caller through the ordinary `finalize()` result, instead of making every call
+/// site handle a null sink.
+class RefusingSink final : public WriteSink
+{
+public:
+    explicit RefusingSink(PutOutcome outcome_) : outcome(outcome_) { }
+
+    WriteBuffer & buffer() override { return buf; }
+
+    PutResult finalize() override
+    {
+        chassert(!done);
+        done = true;
+        buf.cancel();
+        return {outcome, {}};
+    }
+
+    void cancel() noexcept override
+    {
+        done = true;
+        buf.cancel();
+    }
+
+    ~RefusingSink() override
+    {
+        if (!done)
+            cancel();
+    }
+
+private:
+    const PutOutcome outcome;
     WriteBufferFromOwnString buf;
     bool done = false;
 };
@@ -869,6 +958,29 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
     }
 
     return std::make_unique<EmulatedBufferedSink>(*this, key, meta);
+}
+
+WriteSinkPtr ObjectStorageBackend::putOverwriteStream(const String & key, const Token & expected,
+                                                      uint64_t /*declared_size*/, const ObjectMeta & meta)
+{
+    /// A wrong-dialect expected token can never match, and letting it reach the wire would spend the
+    /// whole body to learn that — the same up-front check `putOverwrite` makes.
+    if (!mintingTypeMatches(expected.type))
+        return std::make_unique<RefusingSink>(PutOutcome::PreconditionFailed);
+
+    if (mode == Mode::Native)
+    {
+        WriteSettings ws = conditionalWriteSettings();
+        ws.object_storage_write_if_match = expected.value;
+        std::optional<ObjectAttributes> attrs;
+        if (!meta.empty())
+            attrs.emplace(meta.begin(), meta.end());   /// ObjectMeta is the same map type as ObjectAttributes
+        auto buf = object_storage->writeObject(
+            StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
+        return std::make_unique<NativeStreamingSink>(*this, key, std::move(buf));
+    }
+
+    return std::make_unique<EmulatedOverwriteBufferedSink>(*this, key, expected, meta);
 }
 
 PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)

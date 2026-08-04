@@ -55,6 +55,7 @@ public:
     using Backend::putIfAbsent;
     using Backend::putIfAbsentStream;
     using Backend::putOverwrite;
+    using Backend::putOverwriteStream;
     using Backend::casPut;
 
     enum class Mode { Native, EmulatedSingleProcess };
@@ -96,6 +97,8 @@ public:
     /// existing incarnation untouched. Storage exceptions propagate instead of being reported as a
     /// successful or failed precondition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override;
+    WriteSinkPtr putOverwriteStream(const String & key, const Token & expected,
+                                    uint64_t declared_size, const ObjectMeta & meta) override;
     /// Perform a compare-and-set: `expected == nullopt` means create-if-absent. A conflict leaves the
     /// object untouched; a committed result carries the new incarnation token.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override;

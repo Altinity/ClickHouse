@@ -84,6 +84,7 @@ public:
     using Backend::putIfAbsent;
     using Backend::putIfAbsentStream;
     using Backend::putOverwrite;
+    using Backend::putOverwriteStream;
     using Backend::casPut;
 
     explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
@@ -136,6 +137,8 @@ public:
 
     /// Return a sink that records the create outcome when its `finalize` is called.
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
+    WriteSinkPtr putOverwriteStream(const String & key, const Token & expected,
+                                    uint64_t declared_size, const ObjectMeta & meta) override;
 
     /// Count a successful token-conditional overwrite as `Overwrite`; a precondition conflict is
     /// counted as `CasConflict`.
