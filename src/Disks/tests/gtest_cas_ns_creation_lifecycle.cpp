@@ -213,6 +213,42 @@ TEST(CASNsCreationLifecycle, FencedOutBetweenTheCkptPublishAndGoLiveRefusesAndLe
     EXPECT_TRUE(readCkpt(backend, layout, NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation)).has_value());
 }
 
+/// Regression (CI PR#2073, `03611_freeze_partition_parallel_verbose` under `amd_tsan, cas s3 storage`):
+/// sibling openers of the SAME namespace race `resolveNamespaceLife`'s "no entry" read the same way
+/// concurrent per-part `ALTER TABLE ... FREEZE` threads race the table's one shadow-store namespace.
+/// The loser's own `createNamespace` read lands AFTER the winner's step 1, observing `Creating` -- that
+/// must send the loser back through the resume loop (`Superseded`), never abort the server.
+TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsStillCreatingEntryReportsSupersededNotAbort)
+{
+    InitializedCatalogBackend backend;
+    Layout layout("p");
+    const RootNamespace ns{"a"};
+    const CreatorFence winner = creatorFence("srv1", 1);
+
+    /// Leaves the entry in `Creating` without reaching `Live` -- the same shape `resolveNamespaceLife`
+    /// observes when a sibling thread's `casAdmitEntry` has landed but its `completeCreation` has not.
+    const auto winner_outcome = CasRefCatalog::createNamespace(
+        backend, layout, 1, ns, winner, /*admitted_generation=*/1, admittedOnceThenFenced(), generousDeadline());
+    ASSERT_EQ(winner_outcome, CasRefCatalog::NamespaceCreationOutcome::FencedOut);
+    ASSERT_EQ(CasRefCatalog::read(backend, layout).catalog.entries.at(0).state, NsState::Creating);
+
+    /// The loser: a second call, as if a sibling thread's own outer "no entry" read had raced ahead of
+    /// this one. Same fence as the winner (sibling threads of one query share a mount's fence) --
+    /// exercising exactly the case `resolveNamespaceLife`'s "own fence -> completeCreation" branch is
+    /// built to resume, never a `LOGICAL_ERROR` abort.
+    const auto loser_outcome = CasRefCatalog::createNamespace(
+        backend, layout, 1, ns, winner, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
+    EXPECT_EQ(loser_outcome, CasRefCatalog::NamespaceCreationOutcome::Superseded);
+
+    /// Nothing about the winner's own still-`Creating` entry was disturbed by the loser's refused call.
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
+    const CatalogEntry * entry = findEntryForTest(snap.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->state, NsState::Creating);
+    ASSERT_TRUE(entry->creator.has_value());
+    EXPECT_EQ(*entry->creator, winner);
+}
+
 /// ---------------------------------------------------------------------------------------------
 /// Token-stale: the observed entry no longer matches at the `Creating -> Live` CAS
 /// ---------------------------------------------------------------------------------------------

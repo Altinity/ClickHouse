@@ -497,12 +497,26 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
     const Snapshot snap = read(backend, layout);
     const auto existing = findEntry(snap.catalog, ns);
     if (existing != snap.catalog.entries.end())
+    {
+        /// `Creating` is not this function's problem to solve (the class-level doc above says so) --
+        /// it is exactly the race `resolveNamespaceLife`'s own loop is built to absorb: sibling openers
+        /// of the SAME namespace (e.g. concurrent per-part freeze threads of one query, which share one
+        /// mount's fence) can all observe "no entry" before any of them lands step 1, then race into
+        /// this call. Reporting `Superseded` sends the loser back through the loop, where it re-reads
+        /// and takes the documented resume path (its own fence: `completeCreation`; a foreign one:
+        /// `reconcileStaleCreator`) instead of aborting the server for an outcome the design already
+        /// names and handles. `Live`/`Removing` stay a `LOGICAL_ERROR`: `namespaceLife`'s caller filters
+        /// `Live` before ever reaching here and refuses `Removing` outright, so seeing either here means
+        /// a caller bypassed that dispatch, not a race.
+        if (existing->state == NsState::Creating)
+            return NamespaceCreationOutcome::Superseded;
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CasRefCatalog::createNamespace: namespace '{}' already carries a catalog entry (state "
             "'{}') -- a stalled Creating entry is resumed through reconcileStaleCreator + "
             "completeCreation, never a fresh createNamespace call; an existing Live or Removing "
             "namespace must complete its current lifecycle before a fresh creation can be admitted",
             ns.string(), nsStateToWord(existing->state));
+    }
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
                               .incarnation = mintFreshIncarnation(), .creator = creator};

@@ -241,12 +241,14 @@ public:
     ///
     /// Per the Task 2 review's own note on `casAdmitEntry` ("a namespace `entry.ns` already carries an
     /// entry is a bug in the caller -- Task 3's creation lifecycle owns checking that first"): this
-    /// function reads the catalog FIRST and throws `LOGICAL_ERROR` naming the existing entry's state if
-    /// `ns` already has one, rather than handing `casAdmitEntry` a doomed insert and letting its own
-    /// grammar check report a confusing duplicate-namespace message. A namespace already `Creating` is
-    /// not this function's problem to solve -- that is exactly what `reconcileStaleCreator` +
-    /// `completeCreation` are for; a namespace already `Live`/`Removing` is a caller bug (recreating an
-    /// existing name is Task 5's -- removal's -- business, not creation's).
+    /// function reads the catalog FIRST rather than handing `casAdmitEntry` a doomed insert and letting
+    /// its own grammar check report a confusing duplicate-namespace message. A namespace already
+    /// `Creating` is not this function's problem to solve -- that is exactly what `reconcileStaleCreator`
+    /// + `completeCreation` are for, so this reports `Superseded` (never `LOGICAL_ERROR`) and sends the
+    /// caller back through its own resume loop: sibling openers of the same namespace that all observed
+    /// "no entry" before any of them landed step 1 race in here exactly this way. A namespace already
+    /// `Live`/`Removing` IS a caller bug (recreating an existing name is Task 5's -- removal's --
+    /// business, not creation's) and still throws `LOGICAL_ERROR` naming the observed state.
     static NamespaceCreationOutcome createNamespace(
         Backend & backend, const Layout & layout, uint64_t gc_shards,
         const RootNamespace & ns, const CreatorFence & creator,
