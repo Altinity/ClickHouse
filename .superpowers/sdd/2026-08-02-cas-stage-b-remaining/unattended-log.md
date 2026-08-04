@@ -899,3 +899,12 @@ drop)? RCA directed (trace wiring -> discriminate -> one disposable repro), NO f
 controller+codex (protocol-adjacent: removal admission under held lifetimes). General pair launches
 at the 60-min RCA checkpoint regardless. (b) row stays provisional; evidence:
 s44_discrimination.json in the specimen dir.
+
+### 06:4x — FINDING #2 REVIVED: the 480s explanation was wrong {#finding2-revived}
+Controller pushback on the SYNC contradiction was decisive: full trace shows DROP TABLE SYNC is
+synchronous end-to-end (waitTableFinallyDropped blocks the client until fully dropped;
+ignore_delay=true; scheduleAfter(0)) — no Atomic delay applies. The premature RESOLVED commit is
+being reverted; (b) provisional again. New lead: dropTableFinally's storage drop() may clean only
+part-shaped paths and never removeRecursive the table ROOT (the dropNamespace trigger). Added to
+the tree: the TWO-REPLICA dimension (was system.tables checked on both nodes? does the card's DROP
+fan out to both?). Empirical confirm queued for the smoke->90m gap. General (d) smoke running.
