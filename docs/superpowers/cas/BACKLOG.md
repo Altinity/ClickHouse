@@ -3347,3 +3347,19 @@ converts a bounded burst into a permanent leak, which is worse than no cap.
 the delete succeeds (durable retry), not before it, so a cap-declined entry stays discoverable by the next
 round's intake instead of being silently dropped. This is a natural fit for a future
 `gc-frontier-one-list` focused session (post-Stage-B), since it touches the same intake/cursor machinery.
+
+## `[soak-predown-textlog-scope]` `predown_dump.sh` only captures error-shaped `text_log` rows {#soak-predown-textlog-scope}
+
+**Found by the T8 criterion-4 anomaly-arm injection** (Stage-B soak, `2026-08-03-stage-b-RESULTS.md`
+`{#criterion-4-evidence}`): the GC round's own `INFORMATION`-level narration line — the exact text
+explaining why destructive work was suppressed for that round, plus phase narration and hold-cause
+detail generally — is not captured anywhere `predown_dump.sh` writes, because its `text_log` extract
+(`text_log_error_shapes.tsv`) is scoped to error-shaped rows only. Once the cluster is torn down (or, as
+here, simply reset for the next run), that narration is gone for good; the round's own structured
+`system.content_addressed_garbage_collection_log` phase rows survived and carried the criterion, but the
+human-readable confirmation did not.
+
+**Fix direction:** `predown_dump.sh` should also capture `system.text_log` rows from the CAS loggers at
+`Information` level, bounded by a time window and/or row cap (an unbounded dump risks turning the predown
+step itself into the next `cas_log.tsv`-sized artifact). Not attempted here — recorded as a tooling gap
+so the next investigation that needs this evidence doesn't rediscover the gap the hard way.
