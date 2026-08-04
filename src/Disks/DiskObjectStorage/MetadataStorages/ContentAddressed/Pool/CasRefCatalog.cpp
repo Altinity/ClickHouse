@@ -171,6 +171,53 @@ std::vector<CatalogEntry>::const_iterator findEntry(const RefCatalog & catalog, 
         [&](const CatalogEntry & e) { return e.ns.string() == ns.string(); });
 }
 
+/// Thrown from `createNamespaceStep1`'s own `mutate` (below) when a FRESH read -- the first one, or
+/// any `Conflict` retry's re-read -- already carries an entry for the namespace being admitted. Never
+/// thrown by the public `casAdmitEntry`: that function keeps its documented "already-present is a
+/// caller bug, let `encodeRefCatalog` abort" contract for its many single-namespace-per-catalog
+/// callers (production and test). `createNamespace` alone needs the other answer, because ITS
+/// "already present" can be a sibling opener's OWN in-flight step 1 landing between createNamespace's
+/// pre-check read and this loop's read -- a race the design already names and resumes through
+/// `Superseded`, not a caller bug.
+struct CatalogEntryAlreadyPresentMarker : std::exception {};
+
+/// Fires once, synchronously, right before `createNamespaceStep1`'s own first catalog read -- i.e.
+/// after `createNamespace`'s pre-check read already observed no entry. Lets a test land a sibling
+/// opener's full `createNamespace` call in that exact window, driving the interleaving
+/// `CatalogEntryAlreadyPresentMarker` exists to catch instead of relying on real thread scheduling.
+/// Empty (no-op) in production, mirroring every other `*_hook_for_test` in this tree.
+std::function<void()> create_namespace_step1_pre_read_hook_for_test;
+
+/// Step 1 of `createNamespace`, split out so it can recheck presence on EVERY catalog read this loop
+/// performs (the first one, and any `Conflict` retry's re-read), not only the snapshot-in-time read
+/// `createNamespace` itself already did before calling in. That single upfront read cannot see a
+/// sibling opener's OWN step 1 landing between it and this loop's read; without the recheck here, this
+/// loop would blindly insert a second row for the same namespace and let `encodeRefCatalog`'s
+/// canonical-order/no-duplicate grammar check abort the process with `LOGICAL_ERROR` for what is, at
+/// this call site only, an ordinary race outcome.
+RefCatalog createNamespaceStep1(
+    Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
+{
+    if (create_namespace_step1_pre_read_hook_for_test)
+        create_namespace_step1_pre_read_hook_for_test();
+
+    const auto mutate = [&entry](const RefCatalog & cur) -> RefCatalog
+    {
+        if (findEntry(cur, entry.ns) != cur.entries.end())
+            throw CatalogEntryAlreadyPresentMarker{};
+        RefCatalog next = cur;
+        const auto it = std::lower_bound(next.entries.begin(), next.entries.end(), entry,
+            [](const CatalogEntry & a, const CatalogEntry & b) { return a.ns.string() < b.ns.string(); });
+        next.entries.insert(it, entry);
+        return next;
+    };
+    return casUpdateImpl(backend, layout, mutate,
+        [&entry, gc_shards, &layout](const RefCatalog & c)
+        {
+            return checkCatalogAdmission(c, gc_shards, layout, entry.ns);
+        });
+}
+
 }
 
 RefCatalog CasRefCatalog::casUpdate(
@@ -520,8 +567,27 @@ CasRefCatalog::NamespaceCreationOutcome CasRefCatalog::createNamespace(
 
     const CatalogEntry entry{.ns = ns, .state = NsState::Creating,
                               .incarnation = mintFreshIncarnation(), .creator = creator};
-    casAdmitEntry(backend, layout, gc_shards, entry);   /// step 1
+    /// The read above is a snapshot in time, not a lock: a sibling opener of the SAME namespace that
+    /// also observed "no entry" can land its own step 1 between that read and this one. `casAdmitEntry`
+    /// itself cannot be the backstop for that shape -- it retries its own `Conflict`s by blindly
+    /// re-inserting `entry` into whatever it freshly reads, and a duplicate-namespace insert reaches
+    /// `encodeRefCatalog`'s grammar check as an unconditional `LOGICAL_ERROR` abort. `createNamespaceStep1`
+    /// is the same admission, but rechecks presence on every read this loop performs (not just the one
+    /// above) and reports the race as `Superseded` instead.
+    try
+    {
+        createNamespaceStep1(backend, layout, gc_shards, entry);   /// step 1
+    }
+    catch (const CatalogEntryAlreadyPresentMarker &)
+    {
+        return NamespaceCreationOutcome::Superseded;
+    }
     return completeCreation(backend, layout, entry, admitted_generation, check_fence_or_throw, deadline);
+}
+
+void CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook)
+{
+    create_namespace_step1_pre_read_hook_for_test = std::move(hook);
 }
 
 CasRefCatalog::ReconcileCreatorOutcome CasRefCatalog::reconcileStaleCreator(

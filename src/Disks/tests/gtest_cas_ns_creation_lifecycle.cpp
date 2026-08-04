@@ -249,6 +249,54 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsStillCreatingEntryRep
     EXPECT_EQ(*entry->creator, winner);
 }
 
+/// Second catch-point of the same CI PR#2073 race, distinct from the test above. That test starts the
+/// winner FIRST, so the loser's own outer pre-check read (`createNamespace`'s `read(...)` before step
+/// 1) already observes `Creating` and takes the fast top-of-function refusal. This test instead lands
+/// the winner's ENTIRE `createNamespace` call inside the window between the loser's pre-check read
+/// (which observes NOTHING) and the loser's own step 1 read -- the shape CI actually hit as an
+/// encode-time `LOGICAL_ERROR` ("entries are not canonically ordered ... no duplicate namespace"), not
+/// the top-of-function one: both openers pass the pre-check, so both proceed to admit a row for the
+/// same namespace, and only `createNamespaceStep1`'s own per-read recheck (not `createNamespace`'s
+/// single upfront read) can catch it.
+TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsFullCreateBetweenPreCheckAndStep1ReportsSupersededNotAbort)
+{
+    InitializedCatalogBackend backend;
+    Layout layout("p");
+    const RootNamespace ns{"a"};
+    const CreatorFence winner = creatorFence("srv1", 1);
+    const CreatorFence loser = creatorFence("srv1", 2);
+
+    /// Fires exactly once, inside the LOSER's `createNamespace` call, after its pre-check read already
+    /// observed no entry -- synchronously runs the winner's own full `createNamespace` to completion
+    /// (all the way to `Live`) before the loser's step 1 performs its own first read. Cleared before
+    /// this closure returns so the winner's own nested call, and every later call in the test, run
+    /// hook-free.
+    CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest([&]
+    {
+        CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(nullptr);
+        const auto winner_outcome = CasRefCatalog::createNamespace(
+            backend, layout, 1, ns, winner, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
+        ASSERT_EQ(winner_outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
+    });
+
+    const auto loser_outcome = CasRefCatalog::createNamespace(
+        backend, layout, 1, ns, loser, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
+    EXPECT_EQ(loser_outcome, CasRefCatalog::NamespaceCreationOutcome::Superseded);
+
+    /// Exactly one row for `ns`, owned by the winner, at `Live` -- the loser's refused admission left
+    /// no trace and did not disturb it.
+    const CasRefCatalog::Snapshot snap = CasRefCatalog::read(backend, layout);
+    size_t rows_for_ns = 0;
+    for (const CatalogEntry & e : snap.catalog.entries)
+        if (e.ns.string() == ns.string())
+            ++rows_for_ns;
+    EXPECT_EQ(rows_for_ns, 1u);
+    const CatalogEntry * entry = findEntryForTest(snap.catalog, ns);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->state, NsState::Live);
+    EXPECT_FALSE(entry->creator.has_value()) << "Live entries carry no creator fence";
+}
+
 /// ---------------------------------------------------------------------------------------------
 /// Token-stale: the observed entry no longer matches at the `Creating -> Live` CAS
 /// ---------------------------------------------------------------------------------------------

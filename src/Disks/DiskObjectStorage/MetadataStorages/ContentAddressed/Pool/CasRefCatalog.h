@@ -255,6 +255,14 @@ public:
         uint64_t admitted_generation, const std::function<void(uint64_t)> & check_fence_or_throw,
         const CkptDeadline & deadline);
 
+    /// Fires once, synchronously, right after `createNamespace`'s own pre-check read observed no
+    /// entry and right before its step 1 performs its own (first) catalog read -- the exact window a
+    /// sibling opener of the same namespace can land its own step 1 in. Lets a test drive that
+    /// interleaving deterministically instead of relying on real thread scheduling. Empty (no-op) hook
+    /// in production; a stateless class-scope hook (rather than an instance member) because
+    /// `CasRefCatalog` itself carries no state.
+    static void setCreateNamespaceStep1PreReadHookForTest(std::function<void()> hook);
+
     /// Steps 2 (`_ckpt` publish) + 3 (`Creating -> Live` CAS) alone, given an entry the caller already
     /// owns as `observed` -- either the entry `createNamespace`'s own step 1 just inserted, or one a
     /// caller just reconciled onto itself via `reconcileStaleCreator`. Exposed separately (rather than
