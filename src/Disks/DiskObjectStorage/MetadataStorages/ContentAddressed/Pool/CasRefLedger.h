@@ -421,6 +421,14 @@ public:
         namespace_presence_probe_after_first_read_hook_for_test = std::move(hook);
     }
 
+    /// Pauses `namespaceStillLogicallyPresent`'s `Removing` branch after it has proven the observed
+    /// incarnation's terminal (the exact-life recovery/lock section is done) but before its
+    /// post-terminal catalog revalidation read.
+    void setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::function<void()> hook)
+    {
+        namespace_presence_probe_after_terminal_proven_hook_for_test = std::move(hook);
+    }
+
     /// Pauses a wedge retry after it captured the exact predecessor attempt but before the request
     /// controller is allowed to send a retry.
     void setWedgeBeforeSlotOccupyHookForTest(std::function<void()> hook)
@@ -967,6 +975,7 @@ private:
     std::function<void()> read_before_state_lock_hook_for_test;
     std::function<void()> readable_catalog_after_observation_hook_for_test;
     std::function<void()> namespace_presence_probe_after_first_read_hook_for_test;
+    std::function<void()> namespace_presence_probe_after_terminal_proven_hook_for_test;
     std::function<void()> wedge_before_slot_occupy_hook_for_test;
     std::function<void()> snapshot_after_capture_hook_for_test;
     std::function<void()> snapshot_before_ckpt_cas_hook_for_test;

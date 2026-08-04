@@ -4811,16 +4811,38 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     /// `Removing`: only the exact incarnation's own durable ref-log proves the terminal
     /// `remove_namespace` transaction actually landed -- the catalog row alone cannot distinguish a
     /// completed removal from one whose terminal append is still outstanding after a crash. This is the
-    /// same load-bearing distinction `dropNamespaceImpl` makes before returning early, and it needs no
-    /// further revalidation: once durably proven for this exact incarnation, the terminal can never be
-    /// un-proven.
+    /// same load-bearing distinction `dropNamespaceImpl` makes before returning early. Once durably
+    /// proven for this EXACT incarnation, that incarnation's own terminal can never be un-proven -- but
+    /// the recovery call above (`acquireRefTableRuntime`/`ensureRefTableRecovered`) is real I/O with no
+    /// upper bound on wall time, and GC deleting this incarnation's now-terminal catalog row plus a
+    /// same-name rebirth (an explicitly supported sequence -- see `CASRefWriterNamespaceRemoval`'s own
+    /// same-name-rebirth tests) can both land inside that window. Proving THIS incarnation terminal is
+    /// therefore not proof that the CURRENT logical namespace `ns` is absent; a fresh catalog read is
+    /// required before answering `false` for the name.
     const NamespaceLifeId life = NamespaceLifeId::fromCatalogEntry(entry->ns, entry->incarnation);
     const auto rt = acquireRefTableRuntime(life, admitted_generation);
     ensureRefTableRecovered(ns, *rt);
-    std::lock_guard<std::mutex> lock(rt->state_mutex);
-    if (rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value())
-        return false;   /// terminal durably proven: the logical namespace is gone
-    return true;         /// removal admitted but not yet terminal: cleanup work remains
+    bool this_incarnation_terminal = false;
+    {
+        std::lock_guard<std::mutex> lock(rt->state_mutex);
+        this_incarnation_terminal = rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
+    }
+    if (!this_incarnation_terminal)
+        return true;   /// removal admitted but not yet terminal: cleanup work remains
+
+    if (namespace_presence_probe_after_terminal_proven_hook_for_test)
+        namespace_presence_probe_after_terminal_proven_hook_for_test();
+
+    check_fence_or_throw(admitted_generation);
+    const CasRefCatalog::Snapshot post_terminal_catalog = CasRefCatalog::read(backend, layout);
+    const CatalogEntry * post_terminal_entry = find_entry(post_terminal_catalog);
+    if (!post_terminal_entry || post_terminal_entry->incarnation == entry->incarnation)
+        return false;   /// terminal durably proven and nothing has since occupied `ns` under a new life
+    /// A successor incarnation now occupies `ns` -- `Creating`, `Live`, or a fresh `Removing` all mean
+    /// the name is not the proven-absent predecessor this call observed. `true` is always the safe
+    /// direction; a caller that acts on it retries against the successor's own (correct) state rather
+    /// than being told the namespace is gone while something already occupies its name.
+    return true;
 }
 
 

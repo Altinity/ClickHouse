@@ -4148,10 +4148,10 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->stageManifest({}); });
 }
 
-/// FINDING #2 (dropns fix) unit prescription item 6: `namespaceStillLogicallyPresent` must stay `true`
-/// for the entire window between the catalog's durable `Live -> Removing` transition and the terminal
-/// `remove_namespace` append actually landing -- the crash-shaped case the fix exists for. Reuses the
-/// injected stream-write fault shape from `RemovalAppendFailureLeavesRemovingAndRetryCompletes`.
+/// `namespaceStillLogicallyPresent` must stay `true` for the entire window between the catalog's
+/// durable `Live -> Removing` transition and the terminal `remove_namespace` append actually landing --
+/// the crash-shaped case the fix exists for. Reuses the injected stream-write fault shape from
+/// `RemovalAppendFailureLeavesRemovingAndRetryCompletes`.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTerminalRetrySucceeds)
 {
     CasRequestBudget budget;
@@ -4181,9 +4181,9 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTer
         << "the retried removal's terminal is now durable";
 }
 
-/// Item 7: a `Creating` row is conservative in both directions -- present, and removal refuses to
-/// cancel it while its creator fence cannot be proven dead, then succeeds once a terminal certificate
-/// (here, a GC-fenced lease for the same server root) makes the fence provably terminal.
+/// A `Creating` row is conservative in both directions -- present, and removal refuses to cancel it
+/// while its creator fence cannot be proven dead, then succeeds once a terminal certificate (here, a
+/// GC-fenced lease for the same server root) makes the fence provably terminal.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaitsForCreatorFenceTerminality)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -4220,9 +4220,9 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaits
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
 }
 
-/// Item 8: a "no catalog row" observation must never be turned into `false` by a race. Pausing the
-/// probe right after its first catalog read and admitting a fresh `Creating` row before it resumes
-/// must surface as a typed retry, not a stale absent answer; an unchanged catalog across both reads
+/// A "no catalog row" observation must never be turned into `false` by a race. Pausing the probe
+/// right after its first catalog read and admitting a fresh `Creating` row before it resumes must
+/// surface as a typed retry, not a stale absent answer; an unchanged catalog across both reads
 /// legitimately settles on absent.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeNoRowObservationRevalidatesRatherThanRacingToAbsent)
 {
@@ -4283,9 +4283,10 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeNoRowObservationRevalidatesRathe
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(stable));
 }
 
-/// Item 9 (partial -- see the dropns-fix draft report for the two sub-cases NOT covered here): every
-/// unreadable or ambiguous observation must throw, never answer `false`. Covers a catalog `GET`
-/// failure on the probe's very first read, and a lost mount fence discovered mid-probe.
+/// Every unreadable or ambiguous observation must throw, never answer `false`. Covers a catalog `GET`
+/// failure on the probe's very first read, and a lost mount fence discovered mid-probe. Not covered
+/// here: a missing checkpoint for a `Removing` row, and an ambiguous incarnation -- both would need a
+/// raw-catalog-write test helper this suite does not currently expose.
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeCatalogReadFailurePropagatesRatherThanAnsweringAbsent)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -4317,7 +4318,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAns
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceStillLogicallyPresent(ns); });
 }
 
-/// Item 10: pin all three facade states against each other on one namespace -- `Live` (present, content
+/// Pin all three facade states against each other on one namespace -- `Live` (present, content
 /// readable), incomplete `Removing` (present, content deliberately unreadable), and terminal `Removing`
 /// (absent, immediately, no GC).
 TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLifecycle)
@@ -4349,6 +4350,172 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLi
     EXPECT_NO_THROW(store->dropNamespace(ns));
     EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
     EXPECT_FALSE(store->namespaceFilesLifeIfReadable(ns).has_value());
+}
+
+/// Fix-verify review finding: `namespaceStillLogicallyPresent`'s `Removing` branch proved the OBSERVED
+/// incarnation's terminal and returned `false` for the name without re-checking whether the catalog had
+/// moved on since. Proving one incarnation terminal is not proof the CURRENT logical namespace is
+/// absent: GC can delete the now-terminal row and a successor can be born under the same name while the
+/// probe's own recovery call (real I/O, no upper bound) is still in flight. Drives that exact
+/// interleaving deterministically via the terminal-proven hook: pause right after the predecessor's
+/// terminal is proven, drain GC to actually delete its row, birth a successor under the same name, then
+/// resume and require `true` (present) -- never the stale `false` the unfixed probe would answer.
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeRevalidatesAfterTerminalProvenRatherThanRacingToStaleAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.gc_fold_max_defer_rounds = 8;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/presence_terminal_revalidate"};
+    const UInt128 gc_id = hexToU128("00000000000000000000000000000001");
+
+    const auto catalog_entry = [&]() -> std::optional<CatalogEntry>
+    {
+        const RefCatalog catalog = CasRefCatalog::read(*backend, layout).catalog;
+        const auto it = std::find_if(catalog.entries.begin(), catalog.entries.end(), [&](const CatalogEntry & entry)
+        {
+            return entry.ns == ns;
+        });
+        return it == catalog.entries.end() ? std::nullopt : std::optional<CatalogEntry>{*it};
+    };
+
+    /// `publishEmptyPart` pins its catalog entry to `fixture::fixtureLife(ns)`, a life derived from
+    /// `ns` alone -- the SAME value every time for the same name, which is exactly wrong for a test
+    /// whose whole point is that the successor's incarnation must differ from the predecessor's.
+    /// `publishWithProductionBirth` goes through the real birth path (`resolveNamespaceLife`'s random
+    /// mint), so both incarnations below are independently random.
+    publishWithProductionBirth(store, ns, "predecessor");
+    const std::optional<CatalogEntry> predecessor = catalog_entry();
+    ASSERT_TRUE(predecessor.has_value());
+
+    Gc gc(store, gc_id);
+    store->dropNamespace(ns);   /// terminal durable; catalog row still Removing until GC deletes it
+
+    /// Pause the probe right after it proves the predecessor's terminal, before its revalidation read.
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false;
+    bool resume = false;
+    store->setNamespacePresenceProbeAfterTerminalProvenHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+    });
+
+    std::optional<bool> probe_result;
+    std::exception_ptr probe_error;
+    std::thread prober([&]
+    {
+        try
+        {
+            probe_result = store->namespaceStillLogicallyPresent(ns);
+        }
+        catch (...)
+        {
+            probe_error = std::current_exception();
+        }
+    });
+    /// A fatal assertion below (predecessor/successor state, GC round shape) must not skip joining
+    /// `prober` -- it is still blocked on `cv` at that point, and destructing a joinable `std::thread`
+    /// calls `std::terminate`, aborting the whole binary and hiding every test queued after this one.
+    bool prober_joined = false;
+    SCOPE_EXIT({
+        if (!prober_joined)
+        {
+            {
+                std::lock_guard lock(mutex);
+                resume = true;
+            }
+            cv.notify_all();
+            prober.join();
+            store->setNamespacePresenceProbeAfterTerminalProvenHookForTest(nullptr);
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return paused; });
+    }
+
+    /// While the probe is paused: drain GC to actually delete the predecessor's catalog row (fold the
+    /// terminal, then a drain-only round to adopt the evidence and delete the row -- same two-round
+    /// shape `SameNameSameWriterEpochRebirth...` uses), then birth a successor under the SAME name. The
+    /// row must be gone before a fresh creation is admitted at all, so this also proves the row really
+    /// was deleted, not merely that the test raced ahead of production's own invariants.
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred) << "the terminal delta must fold";
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).deferred) << "the drain-only round must adopt the evidence seal";
+    ASSERT_FALSE(catalog_entry().has_value()) << "control: the predecessor's row is really gone before rebirth";
+    publishWithProductionBirth(store, ns, "successor");
+    const std::optional<CatalogEntry> successor = catalog_entry();
+    ASSERT_TRUE(successor.has_value());
+    ASSERT_NE(successor->incarnation, predecessor->incarnation);
+
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    cv.notify_all();
+    prober.join();
+    store->setNamespacePresenceProbeAfterTerminalProvenHookForTest(nullptr);
+    prober_joined = true;
+
+    ASSERT_FALSE(probe_error) << "a successor born under the same name must never surface as an error";
+    ASSERT_TRUE(probe_result.has_value());
+    EXPECT_TRUE(*probe_result)
+        << "the predecessor's proven terminal must not answer false once a successor occupies its name";
+}
+
+/// `StorageJoin`/`StorageSet::truncate` call `disk->removeRecursive(path)` then `disk->createDirectories
+/// (path)`. `createDirectories` is a CAS no-op (`ContentAddressedTransaction::createDirectory` only
+/// checks write admission, it never touches the catalog), so the actual re-mint happens lazily on the
+/// FIRST subsequent write, which resolves through `namespaceLife` exactly like this test does directly.
+/// Right after `TRUNCATE` the catalog row is still `Removing` -- GC has not yet folded and deleted it --
+/// so that first write throws a typed retry-later error rather than silently wedging or corrupting
+/// anything: the same self-healing window the presence-probe revalidation above depends on. Before the
+/// `existsDirectory` fix, the directory never reported as present in the first place, so `TRUNCATE`
+/// silently skipped `removeRecursive` entirely and the table kept its OLD contents -- a different,
+/// quieter wrong answer than this one, not a newly introduced break.
+TEST(CASRefWriterNamespaceRemoval, FilesOnlyNamespaceTruncateThrowsRetryLaterUntilGcReclaimsThenRebirths)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    PoolConfig config;
+    config.gc_fold_threshold = 1;
+    config.gc_fold_max_defer_rounds = 8;
+    config.ref_table_cache_bytes = 0;
+    auto store = openPoolWithConfig(backend, config);
+    const RootNamespace ns{"srv1/truncate_retry_then_rebirth"};
+    const UInt128 gc_id = hexToU128("00000000000000000000000000000002");
+
+    /// Birth a files-only namespace: `StorageJoin`/`StorageSet` never publish a MergeTree part, their
+    /// table root only ever carries plain table files (`putNamespaceFile`'s shape, not a manifest ref).
+    const NamespaceLifeId predecessor_life = store->namespaceLife(ns);
+    store->putNamespaceFile(predecessor_life, "data.bin", "predecessor-contents");
+
+    Gc gc(store, gc_id);
+    store->dropNamespace(ns);   /// the TRUNCATE-shaped removeRecursive: terminal durable, row still Removing
+
+    /// The very next write CAS would attempt (the `createDirectories` no-op already ran; this is the
+    /// first real write) must not be told the namespace is gone, and must not silently mint into a
+    /// row still occupied by the predecessor -- it throws retry-later.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceLife(ns); });
+
+    /// Drain GC (fold the terminal, then a drain-only round to delete the now-evidenced row) -- same
+    /// two-round shape the presence-probe revalidation test above uses.
+    ASSERT_FALSE(runRegularRoundReclaiming(gc).deferred) << "the terminal delta must fold";
+    ASSERT_TRUE(runRegularRoundReclaiming(gc).deferred) << "the drain-only round must adopt the evidence seal";
+
+    /// Self-healed: the same logical name now mints a fresh incarnation and accepts writes again,
+    /// exactly what a retried `INSERT` (or a retried `TRUNCATE`) after the CAS write's retry-later gets.
+    const NamespaceLifeId successor_life = store->namespaceLife(ns);
+    EXPECT_NE(successor_life.incarnation, predecessor_life.incarnation);
+    store->putNamespaceFile(successor_life, "data.bin", "successor-contents");
+    const auto successor_contents = store->getNamespaceFile(successor_life, "data.bin");
+    ASSERT_TRUE(successor_contents.has_value());
+    EXPECT_EQ(*successor_contents, "successor-contents");
 }
 
 /// Cancellation is namespace-scoped: dropping namespace N must not cancel an in-flight build targeting a

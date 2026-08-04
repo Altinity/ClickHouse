@@ -938,6 +938,10 @@ public:
     {
         ref_ledger.setNamespacePresenceProbeAfterFirstReadHookForTest(std::move(hook));
     }
+    void setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setNamespacePresenceProbeAfterTerminalProvenHookForTest(std::move(hook));
+    }
     uint64_t recoveryInstallCountForTest() const { return ref_ledger.recoveryInstallCountForTest(); }
 
     /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to
