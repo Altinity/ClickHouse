@@ -730,12 +730,11 @@ TEST(CASWiringRead, VerbatimNamespaceFiles)
     EXPECT_FALSE(storage->existsFile("clickhouse_access_check_other"));
 }
 
-/// FINDING #2 (dropns fix): DirShape::TableDir's existsDirectory used to answer "has at least one
-/// committed part", so an Atomic table that only ever wrote its namespace-level format_version.txt
-/// (no part published yet) reported its own root as absent. `existsDirectory` is the precheck
-/// `MergeTreeData::dropAllData` uses to decide whether `removeRecursive`/`dropNamespace` needs to run
-/// at all -- a false negative here means `DROP TABLE` on such a table never admits removal, leaking a
-/// `Live` catalog row forever.
+/// `DirShape::TableDir`'s `existsDirectory` used to answer "has at least one committed part", so an
+/// Atomic table that only ever wrote its namespace-level `format_version.txt` (no part published yet)
+/// reported its own root as absent. `existsDirectory` is the precheck `MergeTreeData::dropAllData`
+/// uses to decide whether `removeRecursive`/`dropNamespace` needs to run at all -- a false negative
+/// here means `DROP TABLE` on such a table never admits removal, leaking a `Live` catalog row forever.
 TEST(CASWiringRead, TableRootExistsWithNamespaceFilesButNoCommittedRef)
 {
     auto storage = openWiringStorage();
@@ -1042,10 +1041,10 @@ TEST(CASWiringOps, RemovalsDropRefsAndNamespaces)
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"));
 }
 
-/// The negative test that forbids hooking last-part removal as table-drop admission (FINDING #2's
-/// direction B, rejected by the consult): removing a table's ONLY part is indistinguishable, from that
-/// call alone, from a merge, a TTL cleanup, or a `TRUNCATE` that leaves the table usable. The root must
-/// stay present, and a fresh part must still be publishable into it.
+/// The negative test that forbids hooking last-part removal as table-drop admission: removing a
+/// table's ONLY part is indistinguishable, from that call alone, from a merge, a TTL cleanup, or a
+/// `TRUNCATE` that leaves the table usable. The root must stay present, and a fresh part must still be
+/// publishable into it.
 TEST(CASWiringOps, LastRefRemovalIsNotNamespaceRemoval)
 {
     auto storage = openWiringStorage();
