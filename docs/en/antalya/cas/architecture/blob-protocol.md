@@ -226,7 +226,7 @@ prefix.
 | `deduplication_head_first_min_bytes` | Minimum blob size to try a `HEAD` before uploading the body | 1 MiB |
 | `staging_backend` | Blob staging backend (`local` \| `s3`); `s3` is opt-in | `local` |
 | `scratch_path` | Server-local scratch directory for the local-staging write-buffer spill; a relative value is anchored to the server data path | `""` |
-| `gcs_max_conditional_put_bytes` | Largest CONDITIONAL write on a generation-token store (GCS): preconditions are dropped on multipart completion there, so conditional writes are forced into one part. Bounds the write-once create; the unconditional resurrect is not affected | 1 GiB |
+| `gcs_max_conditional_put_bytes` | Largest conditional write on a generation-token store (GCS forces those single-part); does not bound the unconditional resurrect | 1 GiB |
 
 `GC`-round budgets that gate condemnation and reclaim of these same blobs (graduation, redelete,
 sweep budgets) live on the GC architecture page, not here — they govern the `GC` side of the race

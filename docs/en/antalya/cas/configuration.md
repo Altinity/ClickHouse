@@ -94,7 +94,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `deduplication_head_first_min_bytes` | 1 MiB | Minimum blob size to try a `HEAD` before uploading the body |
 | `gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
-| `gcs_max_conditional_put_bytes` | 1 GiB | Largest CONDITIONAL write on a generation-token store (GCS): preconditions are dropped on multipart completion there, so conditional writes are forced into one part. Bounds the write-once create; the unconditional resurrect is not affected |
+| `gcs_max_conditional_put_bytes` | 1 GiB | Largest conditional write on a generation-token store (GCS forces those single-part); does not bound the unconditional resurrect |
 | `part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
 | `part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
 | `part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
