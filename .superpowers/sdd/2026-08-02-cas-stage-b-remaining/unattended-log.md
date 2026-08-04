@@ -1216,3 +1216,28 @@ fault lit all three gate terms), and `CasGc.cpp` says so at the gate. The arm th
 term 2 and now says so in both INDEX.md and RESULTS.md (`185b96dce7f`).
 
 **Lane free** — cluster torn down, object restored. **Next: T9**, the last item before Stage B closes.
+
+## STAGE B CLOSED — 2026-08-04 14:15 {#stage-b-closed}
+
+**T9 landed and the ledger reads `Stage B: COMPLETE`.** Report
+`docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md` (`fdbc062bfd0`), three BACKLOG
+entries (`[gc-multidelete-conditional-gap]`, `[gc-delete-concurrency-serial]`,
+`[gc-fold-intake-readbuffer-head]`), T8 correction `6dc0fca663a`, ledger `dee0cf4dba0`, T8 row
+consistency `ac6f617079b`.
+
+**T9's re-derivation found a WRONG MEASUREMENT in T8's published inventory**, which is exactly the
+case the plan says must be recorded in both documents. Verified independently by me from the archive
+before accepting: ch1 `round_commit` has 63 rows, `pruned_through` max **60**, sum **exactly 1830** —
+so RESULTS's "a per-node high-water mark, not summable ... reached 1830 (ch1)" contradicted its own
+parenthetical in the same sentence. Separate mechanism on ch2: archive max round 101 (T8 cited rounds
+105-108), 38 phase occurrences (T8: 45), 76 `namespace_cleanup` (T8: 102) — consistent with live SQL
+run after the dump was taken. Two causes, now named separately. The six-criteria PASS is unaffected:
+criteria 1 and 3 hold on evidence inside the archive, just not via the cited rounds.
+
+**Headline finding:** `MultiDelete` is BLOCKED, not merely unwired — every CAS delete site uses the
+single-key CONDITIONAL `deleteExact`/`removeObjectIfTokenMatches`, and batch `DeleteObjects` has no
+per-key precondition, so wiring the existing batch path as-is would discard the exact-token check.
+The 944,155 -> ~945 ceiling is a REQUEST-count ceiling; this specimen's RustFS backend cannot honestly
+measure the real-S3 wall-time win.
+
+**Stage B is closed.** Remaining named non-blockers live in the RESULTS residual list and BACKLOG.
