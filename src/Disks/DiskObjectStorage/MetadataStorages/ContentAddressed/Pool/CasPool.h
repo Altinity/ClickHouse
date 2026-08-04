@@ -95,8 +95,12 @@ struct PoolConfig
     /// (condemned -> delete_pending) and redelete (exact-token delete of a prior delete_pending row)
     /// arms move out of the durable retired pipeline in one round. Excess entries are carried
     /// unchanged in `still_retired` and retried next round (never dropped). 0 = unbounded.
-    uint64_t gc_round_graduation_budget = 5000;
-    uint64_t gc_round_redelete_budget = 5000;
+    /// Default UNBOUNDED. A count cap here is not backpressure: it throttles the consumer while the
+    /// producer (inserts, merges) is unaware of it, and the excess is carried in `still_retired`, which
+    /// the next round reads in full -- so a round's cost grows with the debt while its useful work stays
+    /// capped. Under sustained load that is a feedback loop, not a delay.
+    uint64_t gc_round_graduation_budget = 0;
+    uint64_t gc_round_redelete_budget = 0;
     /// Orphan-manifest sweep: caps on the expensive step the LIST/nomination budgets never covered —
     /// building a namespace's protection view (catalog-authoritative table recovery + committed-tail
     /// walk). `sweep_namespace_budget` bounds how many DISTINCT namespaces one page may build a view
@@ -116,11 +120,18 @@ struct PoolConfig
     /// above: the prune safely under-serves and retries next round via its cursor, but the hand-off is a
     /// one-shot event with no reclaimer besides `fsck`, so a prune-heavy round must never be able to
     /// starve it to zero.
-    uint64_t gc_round_handoff_prefix_wholesale_budget = 5000;
+    /// Default UNBOUNDED, and this one is not a tuning choice. The hand-off is one-shot: a generation it
+    /// cannot fully reclaim in its round is never revisited, because the parent-seal difference that
+    /// triggers it does not recur. A cap on work that has no second chance does not defer the work, it
+    /// leaks it -- the same shape as the manifest-cleanup cap that was removed outright.
+    uint64_t gc_round_handoff_prefix_wholesale_budget = 0;
     /// `GcOutcomes` per-round entry cap across the redelete/spared audit log, cumulative for the round.
     /// Bounds only the audit-log write -- the settlement decision it records already happened
     /// unconditionally in the fold. 0 = unbounded.
-    uint64_t gc_round_outcome_entry_budget = 5000;
+    /// Default UNBOUNDED: nothing is retried on exhaustion because there is nothing left to retry -- the
+    /// decision already happened -- so the only thing a cap drops is the audit row explaining it, and it
+    /// drops exactly the rows of the busiest rounds, which are the ones an investigation needs.
+    uint64_t gc_round_outcome_entry_budget = 0;
     /// Frontier probes: how many KNOWN-BUT-UNHINTED namespaces one round may walk to prove their
     /// frontier. A namespace this round's LIST hint still mentions is walked regardless (the round owes
     /// its edges anyway), and a HELD one is always walked (its hold must be retried by exact key, spec
@@ -129,7 +140,16 @@ struct PoolConfig
     /// unprobed namespaces are simply unproven, which
     /// suppresses all destruction for the round. 0 => probe none (the exhaustion path, which tests
     /// drive directly).
-    uint64_t gc_frontier_probe_budget = 1024;
+    ///
+    /// Default effectively unbounded, and it must be spelled as a huge number rather than `0`: unlike
+    /// every other budget here, `0` means "probe nothing", not "no cap" -- the tests drive that path
+    /// deliberately, so the sentinel cannot simply be redefined. Exhaustion is the worst failure shape
+    /// of any budget in this struct, because it does not defer work: unprobed namespaces are unproven,
+    /// and one unproven namespace suppresses ALL destruction for the round. A count that is fine for ten
+    /// namespaces silently becomes a permanent GC stop for a pool with enough tables.
+    /// The cost of removing the cap is round LENGTH (extra exact `GET`s, normally zero because active
+    /// namespaces stay hinted) -- which is bounded by nothing today, since rounds have no time deadline.
+    uint64_t gc_frontier_probe_budget = std::numeric_limits<uint64_t>::max();
     /// skip-unchanged: a GC round may DEFER
     /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
     /// shards changed since the last fold AND no destructive decision is due. Default 1 = fold as soon
