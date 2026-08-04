@@ -247,10 +247,16 @@ RefPlan buildRefWalkPlan(RoundInput && round_input)
         const auto it = plan.rows.find(life_id);
         if (it == plan.rows.end())
         {
+            /// The ordinary end of a namespace's life: its removal completed, GC deleted the catalog
+            /// row, and the parent seal still carries the fold state of a life the current cut no
+            /// longer names. There is nothing to attach it to and nothing for anyone to do, so this
+            /// is counted, not narrated -- a per-drop log line would be pure noise, and it could not
+            /// discriminate the expected case from an illegitimately vanished row anyway: this site
+            /// sees only the absence, never the evidence. The signal lives in
+            /// `CASGCUnmatchedAdoptedParentLives` and in the round's own
+            /// `walk_plan_dropped_parent_rows` phase metric; proving that a row disappeared WITHOUT a
+            /// completed removal belongs to fsck, which can compare against the removal evidence.
             ProfileEvents::increment(ProfileEvents::CASGCUnmatchedAdoptedParentLives);
-            LOG_WARNING(getLogger("CasGc"),
-                "CAS GC dropped adopted-parent ref-life row absent from the current catalog cut: life_id={}",
-                u128ToHex(life_id));
             ++plan.dropped_parent_rows;
             continue;
         }
