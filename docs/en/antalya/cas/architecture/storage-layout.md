@@ -10,7 +10,13 @@ doc_type: 'reference'
 # CAS architecture — storage layout {#storage-layout}
 
 Every key in a pool is built by one class, `Cas::Layout` (`Formats/CasLayout.h`), which owns
-exactly the pool prefix. Every persisted object is text (`Formats/README.md`).
+exactly the pool prefix. Every persisted object opens with a one-line JSON envelope header, and
+control-plane bodies are JSON Lines — one JSON object per line, sorted where the object is a log
+or a set of entries (`Formats/README.md`; see [Envelope format](#envelope-format) below for which
+parts are a single JSON object versus JSON Lines versus raw payload bytes). The format is
+deliberately this plain: any object can be fetched and read with ordinary line-oriented tools
+while debugging, and a new field is additive — a tolerant reader skips it — so the format evolves
+without a migration.
 
 ## Key table {#key-table}
 
