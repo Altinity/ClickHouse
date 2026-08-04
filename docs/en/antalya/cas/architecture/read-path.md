@@ -45,7 +45,7 @@ means a cache hit still costs one object-store round trip:
 ```mermaid
 flowchart TD
     A["readManifestShared(ManifestId)"] --> B["HEAD the manifest key"]
-    B -->|"absent"| C["throw FILE_DOESNT_EXIST -- INV-NO-DANGLE,<br/>a live ref must never name a missing object"]
+    B -->|"absent"| C["throw FILE_DOESNT_EXIST --<br/>a live ref must never name a missing object"]
     B -->|"present, token t"| D{"cache lookup (ManifestId, t)"}
     D -->|hit| E["return the cached decode -- no GET"]
     D -->|miss| F["GET the body"]

@@ -244,7 +244,7 @@ Alongside it, `system.cas_log` carries the audit trail: the condemn chain, fence
 (capped per round, each carrying the true total), and manifest deletes.
 
 `ca-fsck` distinguishes two classes that are easy to conflate: `dangling` — referenced but missing,
-the `INV-NO-LOSS` data-loss class — versus `unreachable`/`awaiting-gc` — present, unreferenced, and
+data loss — versus `unreachable`/`awaiting-gc` — present, unreferenced, and
 simply waiting for graduation.
 
 ## Operational surface {#operational-surface}

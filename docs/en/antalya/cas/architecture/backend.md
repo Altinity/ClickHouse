@@ -26,7 +26,7 @@ every present key has exactly one current incarnation identified by an opaque `T
 | `deleteExact` | Delete only the incarnation named by `token`; a token mismatch (`TokenMismatch`) leaves the object untouched and is distinguished from `NotFound` |
 | `list` | One page of keys under a prefix, resumed by the backend's own cursor |
 | `supportsListTokens` | Whether `list` can surface a per-key incarnation token, letting GC discovery skip an unchanged root shard without a `GET` |
-| `promoteStaged` / `resurrect` | `promoteStaged`: write-once server-side copy from S3 staging (optional, defaults to `NOT_IMPLEMENTED`). `resurrect`: unconditional streaming re-upload displacing a condemned incarnation from a caller-supplied reader; size-checked in-stream, fresh-tagged (`INV-NO-RETURN`) |
+| `promoteStaged` / `resurrect` | `promoteStaged`: write-once server-side copy from S3 staging (optional, defaults to `NOT_IMPLEMENTED`). `resurrect`: unconditional streaming re-upload displacing a condemned incarnation from a caller-supplied reader; size-checked in-stream, and fresh-tagged so pending deletes of the old incarnation cannot remove it |
 
 `deleteExact`, `putIfAbsent`/`putIfAbsentStream`, and `putOverwrite`/`casPut` are safety-critical:
 they are what makes exact-token deletes, write-once creation, and mutual exclusion hold. Every

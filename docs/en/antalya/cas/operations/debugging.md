@@ -115,7 +115,7 @@ Returns one row: `disk`, `reachable`, `dangling`, `unreachable`, `pending_gc`, `
 `unaccounted`, `stale_edge`, `corrupted_runs`, `chain_broken`, `unchecked`, `lifeless_keys`,
 `namespace_janitor_pending` (+`_bytes`/`_lives`), `ref_records_walked`, `physical_bytes`,
 `referenced_logical_bytes`, `distinct_blobs`, `total_blob_refs`. `dangling` is the one column that
-means data loss (`INV-NO-LOSS`) — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
+means data loss — `unreachable`, `pending_gc`, and `awaiting_gc` are objects still
 moving through the normal condemn/graduate/delete pipeline, not a problem on their own.
 `chain_broken` and `corrupted_runs` are the other two hard findings: a hole in a ref-log stream and a
 GC source-edge run that failed its checksum, respectively. This summary-only form has no
