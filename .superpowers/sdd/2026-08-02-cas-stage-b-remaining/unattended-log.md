@@ -1241,3 +1241,27 @@ The 944,155 -> ~945 ceiling is a REQUEST-count ceiling; this specimen's RustFS b
 measure the real-S3 wall-time win.
 
 **Stage B is closed.** Remaining named non-blockers live in the RESULTS residual list and BACKLOG.
+
+## Tick — 2026-08-04 14:45 {#tick-pr2073-triage-closed}
+
+**PR 2073 CI triage closed.** 25 failing checks against SHA `9ad3e15b688` (2026-08-03 22:20, which
+predates F1): **14 EXPLAINED** by fixes already on the branch (3 unit-test jobs, 2 integration, 9
+stateless CAS lanes), **10 UNATTRIBUTED** (Altinity's own regression suite, plus SQLStorm failing on an
+apt-mirror 404), **1 LIVE**. Triage file `pr2073-ci-triage-2026-08-04.md`, corrections `abb6ef799df`,
+BACKLOG entry `bcb52a2b2a1`. Nothing pushed; the run was never restarted, by design.
+
+**The headline "LIVE" finding was withdrawn, and the reason is reusable.** Nine lanes were filed as a
+live server-killing defect on the reading that `createNamespace` hit its `Live`/`Removing` branch —
+which would have meant the admission-race fix was incomplete. The `'A'`/`'B'` in the quoted message
+are the HARNESS MASKING the report's test-NAME line, not values and not placeholders; the log body of
+the same failure reads `state 'creating'`, which is exactly what F1 converts to `Superseded`. Saved as
+memory `reference_ci_report_masks_test_name_values`.
+
+**The one live defect is a definitional mismatch, not a stuck lease.** `cas_mounts` liveness is a
+wall-clock comparison (`CasServerRoot.cpp:236`); reclaim refuses wall-clock and demands a certificate
+of death (`:410-424`); a `kill=True` stop leaves none, and `NoWait` skips the observation that would
+mint one. The test polls the former and guards a call needing the latter. Recorded as a decision, with
+an explicit warning not to "fix" it by weakening the certificate rule.
+
+**Process note:** three delegated agents in a row reported idle without doing the work; two of those
+tasks I finished myself, which was cheaper than another round of waking them.
