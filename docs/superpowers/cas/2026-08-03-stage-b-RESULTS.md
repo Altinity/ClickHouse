@@ -36,7 +36,7 @@ Plan: `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md` (`{#t8}`). Le
 | Soak (b) rebirth adversarial (S44) — 20m smoke | SURVIVED | 5/5 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/rebirth_s44_smoke2.log`); dev scale (6 cycles), same fixed-cycle-count pattern as (a) — actual wall time well under 20m | pre-qualification only, not a PASS criterion |
 | Soak (b) rebirth adversarial (S44) — 30m full | **PASS** | Two `--scale full` passes (seeds 20260805, 20260806), 40 cycles / 2000 rows-per-cycle each = 80 cycles total, 5/5 verdicts each, `SCENARIO_EXIT=0` each (`rebirth_s44.log`, `rebirth_s44_loop2.log`). Half (i), zero reads resolving to a newer incarnation: `no unexpected mutation errors across incarnation boundaries=0` (after the card fix), `recreate latency does not grow`, `CASRefNeedsRecovery=0`, `CASRefRecoveryStreamHole=0`, `fsck dangling=0` — all pass, both runs. Half (ii), debris trends to zero without blocking rebirth: a post-run drain-window observation (script + evidence below) against the standing cluster after the second full pass — `ca-fsck --detail`'s own authoritative counters (the tool the plan names for this criterion) read `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` | Maps onto the plan's (b) criterion, which — unlike (a) — carries NO duration text; judged by event/cycle coverage (80 full-scale cycles across 2 passes) plus an explicit post-run drain observation, not a synthetic 30-minute wall-clock. Cycle-bound card: `--duration` has no effect at any scale, disclosed honestly rather than padded |
 | Soak (c) decommission (S45) — 20m smoke | SURVIVED | 3/3 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/decommission_s45_smoke.log`); dev scale, fixed cycle count | pre-qualification only, not a PASS criterion |
-| Soak (c) decommission (S45) — 30m full | — | *(fill)* | S45 already validated live once (2026-08-03, seed 4) as a separate scenario-suite run — that pass does NOT satisfy this row |
+| Soak (c) decommission (S45) — 30m full | **PASS** | One `--scale full` pass (seed 20260805, 12 victim tables): `ca-drop-member exits cleanly`, `hidden Removing rows are accounted for (namespaces_removed=12)`, `fsck dangling=0`, 3/3 verdicts, `SCENARIO_EXIT=0` (`decommission_s45.log`). Post-run drain-window observation (`{#s45-drain-observation}`) closes both GC/janitor halves unambiguously: `janitor_pending_lives` 12→0 (t0 vs every later sample), `system.cas_gc_log`'s `namespace_cleanup` phase shows `janitor_deleted=300` matching the initial `janitor_pending=300` exactly, and ordinary GC `Finish` rows show `condemned=16 graduated=16 redeleted=16 deleted=16` — real destructive work, not suppression | Maps onto the plan's (c) criterion — hidden `Removing` recovered under the claimed fence, completed rows deleted only by GC, leftover checkpoints reclaimed by the janitor — all three legs directly evidenced, no ambiguity (unlike S44's drain finding). Cycle/event-bound card like S44; no duration text in the plan's (c) criterion either |
 | Soak (d) general — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
 | Soak (d) general — 90m full (sequential-baseline destructive workload) | — | *(fill)* | — |
 
@@ -288,6 +288,40 @@ and not yet flagged as wrong"), not as resolved and not as proven-stuck debris �
 verdict still rests on the fsck-authoritative reading (zero at every checkpoint sampled), per the
 plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question, but the
 mechanism question itself is carried to the post-B residual list rather than closed here.
+
+**UPDATE — not yet parkable.** The original drain window already drove GC to a STABLE fixpoint (17
+rounds) with the 40 objects still standing — if the two-stage explanation above were the whole
+story, that fixpoint should have graduated the `Removing` rows and the janitor should then have
+reclaimed the files (or `janitor_pending` should have started counting them). Neither happened.
+This is either an additional gate the fixpoint didn't satisfy, or a genuine wedge in the
+rebirth-drop removal pipeline. The (b)-full row's PASS is PROVISIONAL pending a targeted
+discrimination (catalog-state dump before/after fixpoint, then a further GC/janitor cycle, then the
+GC log's own retained/hold reasons if still stalled) — in progress, see the ledger/report for the
+verdict once it lands.
+
+## S45 post-run drain-window observation {#s45-drain-observation}
+
+Same pattern as S44's (`{#s44-drain-observation}`), against the cluster still standing after the
+`--scale full` S45 pass (seed 20260805) — a read-only script,
+`utils/ca-soak/scripts/t8_s45_drain_observation.py`, output in
+`logs_archive/2026-08-03-stage-b-specimen/s45_drain_observation.json` and
+`s45_gc_log_summary.json`. This time leaning on `ca-fsck --detail` and `system.cas_gc_log` from the
+start (the S44 lesson: a raw `pool_shape()` prefix count is not reliably authoritative for this
+class of question) — no discrepancy this time:
+
+| Checkpoint | `janitor_pending` | `janitor_pending_lives` | `dangling` |
+|---|---|---|---|
+| t0 (immediately after scenario) | 300 | 12 | 0 |
+| t1 (after `forced_gc_to_fixpoint`) | 0 | 0 | 0 |
+| t2/t3/t4 (+20s/+40s/+60s) | 0 | 0 | 0 |
+
+`system.cas_gc_log`'s `namespace_cleanup` phase over the same window: `janitor_deleted=300` —
+exactly the `janitor_pending` count observed at t0. Ordinary GC `Finish` rows over the window:
+`candidates_marked=16 objects_deleted=16 entries_condemned=16 entries_graduated=16
+entries_redeleted=16` — the full condemn→graduate→redelete→delete pipeline ran for real, not
+suppressed. Both halves of the plan's (c) criterion (completed rows deleted only by GC; leftover
+checkpoints reclaimed by the janitor) are directly evidenced with a clean before/after, no
+unreconciled discrepancy.
 
 ## Residual gate row {#residual-gate-row}
 
