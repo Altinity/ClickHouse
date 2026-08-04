@@ -250,7 +250,15 @@ public:
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
         if (finalizeConditionalWriteInstrumented(*write_buf) == PutOutcome::PreconditionFailed)
+        {
+            /// Losing the condition is an ORDINARY outcome, not an error: another writer legitimately
+            /// took the slot. Abort HERE rather than leaving it to the buffer's destructor, which warns
+            /// "was neither finished nor aborted" on every occurrence -- and a server that writes that
+            /// to stderr fails the test around it -- while the uploaded parts stay billable until a
+            /// lifecycle rule reaps them.
+            write_buf->cancel();
             return {PutOutcome::PreconditionFailed, {}};
+        }
 
         /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
         /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
