@@ -1000,3 +1000,15 @@ that this exit-code change is upstream-affecting and needs its own PR + rational
 Lesson recorded: never classify a CI red as "not ours" by test name — check it against the PR's
 NON-CAS surfaces (src/Disks 300 files/+136k incl. DiskObjectStorageTransaction, S3ObjectStorage,
 IDiskTransaction, IMetadataStorage, AsynchronousBoundedReadBuffer).
+
+### 12:4x — T8 COMPLETE: STAGE B: PASS (conditioned) {#t8-complete}
+Verdict committed (801712397cd). Battery fully green with measured evidence: full CA gate both
+builds, 10/10 integration lanes, the four ex-known-red stateless, all four soaks, all six Step-3d
+criteria, Step-3c cost inventory, T6b watch, Step-3e executable baseline (8/8 pinned counts).
+PASS is CONDITIONED on two findings landing: (a) namespace-admission race (both catch-points fixed
++ red-proven on laneg/fix-verify: f86ad603791, 00f5e4475e4), (b) FINDING #2 existsDirectory/
+dropAllData namespace leak (8042f221be7, codex-ruled design). Specimen preserved (run3 seed
+20260808 dir + git-tracked cost-inventory evidence pack); cluster torn down only after every RESULTS
+figure was confirmed re-derivable. Carried named: hold-arm injection owed, 4 unverifiable T6b caps,
+checkpoint-corruption recovery residual, 05023 deferral. NEXT: codex verdict on fix-verify ->
+integrate both fixes -> 05023 via praktika -> hold-arm short run -> T9.
