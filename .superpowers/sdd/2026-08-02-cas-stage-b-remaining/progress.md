@@ -157,9 +157,28 @@ per commit; full CA gate at lane closures.
   b0f87e8aaf1 + closure c0d2cad0dfd). E2-E4 + residual tests drafted on draft/t8. Battery/soaks
   still blocked on T1–T7. SCHEDULED ADDITIONS (user directives): Cas-prefix suite normalization
   post-T6; ONE final incremental tidy re-run after all C++ tasks; staged 20-min smoke soaks.
-- T9 (perf research): BLOCKED on T8. Stage B is COMPLETE only when T9's commit lands; T8 issues
-  the technical verdict.
+- T9 (perf research): **COMPLETE.** Report `docs/superpowers/reports/2026-08-04-gc-destructive-baseline-perf.md`
+  (commit `fdbc062bfd0`), three BACKLOG entries added
+  (`[gc-multidelete-conditional-gap]`, `[gc-delete-concurrency-serial]`,
+  `[gc-fold-intake-readbuffer-head]`). MultiDelete verdict: blocked on the missing per-key
+  conditional in AWS's batch `DeleteObjects` API, not on unwired plumbing — every CAS delete-family
+  call site uses `Backend::deleteExact`'s exact-token conditional delete; ceiling if the gap closes
+  is a >99.9% REQUEST-count cut (944,155 → ~945), explicitly not a wall-time promise (the specimen's
+  RustFS backend cannot measure real-S3 RTT). Re-deriving every figure at write time (plan Step 3)
+  surfaced a real correction to T8's Step-3c cost inventory — two distinct mechanisms (ch2's live
+  query outrunning the predown snapshot; `pruned_through` reported as a sum on ch1 despite its own
+  "not summable" caveat) — corrected in both `2026-08-03-stage-b-RESULTS.md` (criterion-1 row,
+  criterion-3 row, Step-3c table) and T9's own report (commit `6dc0fca663a`), confirmed
+  independently by the team lead before the correction landed. Neither correction changes the
+  six-criteria PASS verdict.
 - F1/F2: follow-ups after T9, outside the Stage-B verdict.
+
+## Stage B: COMPLETE (2026-08-04) {#stage-b-complete}
+
+T9 was the mandatory closeout (plan `{#t9}`); its commit has landed and the correction to T8's
+cost-inventory figures it surfaced is recorded in both `2026-08-03-stage-b-RESULTS.md` and T9's own
+report. T1–T9 are all done per their entries above. F1 (mechanical file split) and F2 (sanitation
+sweep) remain as named follow-ups outside the Stage-B verdict, per the plan.
 
 Historical-unrecoverable items (Task-1 minors verbatim list; NITs C–F) are recorded once in the
 midpoint audit `{#historical-unrecoverable}`; T8 performs no archaeology.
