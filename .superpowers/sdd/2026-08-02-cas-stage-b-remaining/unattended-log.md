@@ -1023,3 +1023,22 @@ integrate both fixes -> 05023 via praktika -> hold-arm short run -> T9.
 - Nine `codex exec -m gpt-5.6-luna` processes on the box are NOT ours — batch-NNN wrappers from the
   neighbouring docs-consolidation session; left alone deliberately.
 - NEXT: fix-verify triage -> integrate both fixes -> 05023 via praktika -> hold-arm short run -> T9.
+
+### 14:2x — FINDING #3: an emptied pool stops reclaiming (empty-universe floor) {#finding3-empty-universe}
+05023 (the FINDING #2 regression test) PASSES its core assertions on a live server — empty table and
+one-part table both go `live -> removing` on DROP TABLE SYNC, `cycle_leaks_after_sync_drop 0` over six
+cycles, negative controls (TRUNCATE, reinsert) still `live`. It then FAILS its drain step, and the
+cause is a THIRD finding, one layer below: after the drops, GC deletes the `Removing` rows, the catalog
+becomes EMPTY, and the T6 gate's `frontier_namespaces > 0` floor (R11, added precisely so `0 == 0`
+cannot read as a proof) makes `frontier_complete` false FOREVER -> `suppress_destructive=1` on every
+subsequent round -> the three already-condemned blobs can never graduate. Evidence: per-round
+`SYSTEM CAS GC RUN` rows (round 1 condemns 3, rounds 2-60 all zeros, deferred=0) and
+`system.cas_gc_log` phase rows (`fold_reduce.suppress_destructive=1`,
+`fold_ref_intake.frontier_namespaces=0`). NOTE the causality: the floor is pre-existing (T6/R11), but
+our FINDING #2 fix made the state REACHABLE — before it, dropped namespaces stayed `live` forever, so
+the catalog never emptied. Also note the CAS system tables do NOT survive the stateless server (no
+FLUSH LOGS in-test) — evidence required an instrumented rerun; instrumentation reverted after capture.
+USER SANCTION given for the candidate direction: under `universe_authoritative` a SUCCESSFUL empty
+authoritative catalog read is positive proof of no live edge (unlike a LIST-shaped nothing), so a
+proven-empty universe may complete the frontier while an inconclusive one still refuses. Codex consult
+launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.md) before any code.
