@@ -3465,3 +3465,42 @@ the G-item section below it (site, rationale, the two reviewer-facing details, t
 `test_replicated_table_structure_alter` defect it exposed with its mechanism, and the blast-radius
 conclusion). Listed as Workstream A1 in
 `docs/superpowers/specs/2026-07-28-cas-merge-layout-preparation-design.md`.
+
+## `[cas-tests-unchecked-optional-deref]` A test that dereferences a disengaged optional takes every later test in the binary with it {#cas-tests-unchecked-optional-deref}
+
+A gtest that dereferences a disengaged `std::optional` does not fail — it aborts the process, and
+every test scheduled after it in the same binary never runs. The gate then reports a smaller total
+that still reads as green, so the regression that emptied the optional is invisible twice over: once
+as its own missing failure, once as the suites it silently deleted from the run. This bit three times
+in one night, each time presenting as "a suite disappeared" rather than as a failure.
+
+The shape to write instead depends on the enclosing function's return type, and this is the part that
+makes a blind `EXPECT_TRUE` → `ASSERT_TRUE` sweep wrong:
+
+- **`void` test body** — `ASSERT_TRUE(x.has_value())` is correct and sufficient; `ASSERT_*` returns.
+- **non-`void` helper** — `ASSERT_*` does not compile there (it expands to a bare `return;`). The
+  helper must expect and then bail on its own: `EXPECT_TRUE(x.has_value()); if (!x) return {};`, or
+  fold the guard into the value expression, `return x ? x->field : Field{};`. Both shapes already
+  exist in the suite — `sealedCursorOf` and `holdOf` in `gtest_cas_gc_hold_grammar.cpp`, and
+  `relinkTokenOf` in `gtest_cas_confirm_exact_ref.cpp` — and their comments state the reason.
+
+**Measured on the branch at the time of writing**, not recalled: a scan for `const auto x = …`
+followed within four lines by `x->` or `x.value()` with no intervening guard reports **13 candidate
+sites** across 9 files, the largest groups being `gtest_ca_wiring.cpp`,
+`gtest_cas_gc_frontier_gate.cpp`, `gtest_cas_orphan_nomination.cpp` and `gtest_cas_ref_writer.cpp`
+(2 each). A first, naive version of the same scan reported 52 — the difference is entirely false
+positives from shapes that ARE guarded: `if (const auto got = backend.get(…))`, and
+`pending = e && e->delete_pending`. Any sweep must therefore be eyeballed per site, and the 13 are
+candidates rather than confirmed defects; three were confirmed by reading
+(`gtest_cas_lifecycle_condition.cpp:40`, `gtest_cas_orphan_nomination.cpp:180` and `:184`, each an
+`EXPECT_TRUE` immediately followed by an unguarded `->`).
+
+Separately, `EXPECT_TRUE(x.has_value())` appears 9 times against 401 `ASSERT_TRUE(x.has_value())`.
+The `EXPECT` form is not wrong by itself — in a non-`void` helper it is the only option — but it is
+the marker worth grepping for, because it is exactly where the author needed a guard and may have
+stopped at the expectation.
+
+The durable fix is not a one-off sweep: a sweep fixes today's sites and the next test written
+reintroduces the class. What would actually close it is making the deref fail loudly at the point of
+use — a checked accessor the CA test helpers use in place of `->` — so the shape is unavailable
+rather than merely discouraged.
