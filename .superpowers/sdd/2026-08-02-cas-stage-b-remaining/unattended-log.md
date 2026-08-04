@@ -955,3 +955,13 @@ asan_ubsan cas-s3 2/2 (5006 passed then Server died) and msan cas-s3 3/3 (2526 p
 + scraping failure). That makes SIX of six cas stateless lanes killed by finding #1 — its fix
 (68759dbd66e, parked) is now the single highest-value item for the branch's CI health. No new
 defect classes. Non-CAS failures unchanged. PR still RUNNING (3 jobs).
+
+### 07:0x — specimen run #2 died: DISK FULL (infra) {#specimen2-diskfull}
+Clean specimen (seed 20260807) aborted at ~55 min with
+`sqlite3.OperationalError: database or disk is full` in the harness metrics writer; root fs was at
+100% (1.8T). The trailing UNCERTAIN/wedged INSERT lines are downstream of the exhaustion, NOT a CAS
+defect. Freed 321 GB: removed the superseded pre_srclayout_20260716 soak archive (17G), lane-g's
+ASan build (42G, rebuildable), stale ci/tmp object-store data (minio_data 35G + rustfs_data 25G),
+tore down the dead soak stack + pruned volumes, pruned docker images >72h (162G). Now 82% used /
+321G free. LESSON for the rerun: the box needs a disk-headroom precheck before any long soak, and
+soak archives need a retention policy (logs_archive was 31G before cleanup).
