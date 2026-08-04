@@ -791,3 +791,11 @@ already in branch (aacc233dc13) awaiting next push.
   default dev silently shrank runs (caught by smoke staging).
 - t8-lead post-finish dormancy recurred (3rd time) — poll-then-ACT reminder issued.
 - CI PR 2073: no change since 03:11 tick. Next: churn loop -> S44 pair -> S45 pair -> general pair.
+
+### CI check 04:11 — REAL CAS SIGNAL {#ci-0411}
+cas-tsan lane 2/2 FAIL: Server died on LOGICAL_ERROR `CasRefCatalog::createNamespace: namespace
+'shadow/.../f72d8856...' already carries a catalog entry (state 'creating')` — a fresh create hit
+an existing Creating entry (designed route: reconcileStaleCreator+completeCreation). 3 sibling test
+fails likely downstream of the abort. rca-createns dispatched (artifacts -> stack -> call-path
+trace -> classify race shape -> local fix if non-protocol). Other cas lanes still RUNNING;
+non-CAS flake set unchanged. Unit-pair fix still awaiting next push.
