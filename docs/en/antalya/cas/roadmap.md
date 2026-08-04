@@ -58,12 +58,9 @@ positioning.
 
 - **Azure real-store validation.** AWS and GCS are live-validated; Azure is not — see
   [known limitations](#known-limitations) below.
-- **Per-object `system.*` introspection.** GC and event logs plus mount introspection exist today;
-  per-part and per-ref reference-count views (a lower-level decode/traversal surface than
-  `ca-inspect`) do not yet.
-- **A migration path for existing non-CAS tables.** Moving an existing table onto a CAS disk works
-  through the ordinary `ALTER TABLE ... MOVE PARTITION` machinery (which re-packs the data); a
-  dedicated, rollout-safety-aware migration path is not yet designed.
+- **WORM deployments.** A read-only disk mode exists today; a fuller write-once story — a pool
+  served immutably, with pinned snapshots for read-only replicas — has a draft design and is not
+  yet implemented.
 - **Backup and restore.** See [Backups](#backups) below — this is further along as a design than as
   an implementation.
 
