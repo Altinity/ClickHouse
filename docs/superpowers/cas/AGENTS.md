@@ -21,7 +21,8 @@ Read this before touching the branch. It is deliberately short; every entry is o
 | Audit trail of the 2026-08 docs consolidation | `docs/superpowers/cas/consolidation-2026-08/COVERAGE-MATRIX.md` |
 | System tables | `system.cas_log`, `system.cas_gc_log`, `system.cas_mounts` |
 | Disk registration | `metadata_type = cas` (`MetadataStorageFactory.cpp`, literal `"cas"`) |
-| SQL surface | `SYSTEM CAS GC RUN/STOP/START/REBUILD`, `SYSTEM CAS FORGET`, `SYSTEM CAS DROP POOL MEMBER '<id>' FROM DISK '<disk>'` |
+| SQL surface | `SYSTEM CAS GC RUN/STOP/START/REBUILD`, `SYSTEM CAS FSCK`, `SYSTEM CAS FORGET`, `SYSTEM CAS DROP POOL MEMBER '<id>' FROM DISK '<disk>'` |
+| System-table naming caveat | table names are `cas_log`/`cas_gc_log` (via the `SystemLog.h` registration macro + `<cas_log>` config blocks), while the C++ classes remain `ContentAddressedLog`/`ContentAddressedGarbageCollectionLog` — grep the macro, not `attachSystemTables.cpp`, when verifying log tables |
 | CLI tools | `clickhouse-disks`: `cas-fsck`, `cas-gc-dryrun`, `cas-inspect`, `cas-gc-rebuild`, `cas-drop-member` |
 | Soak/chaos harness | `utils/ca-soak/` (compose variants per backend/shard-count), scenario suite in `utils/ca-soak/scenarios/` |
 
