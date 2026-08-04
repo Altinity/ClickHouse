@@ -301,8 +301,25 @@ sanitizer aborts child-isolated).
 ## Specimen directory {#specimen-directory}
 
 `utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/` — created (with a `smoke/` subdirectory
-for pre-qualification logs). Empty at this point in T8; the battery/soak stage populates it. Not
-torn down until T9 has sampled it.
+for pre-qualification logs), populated through the battery/soak stage. Not torn down until T9 has
+sampled it.
+
+**Soak (d) general — 90m clean specimen (Step 3f):**
+`utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/general_soak_90m_run3_seed20260808_specimen/`
+(README inside) — the full predown dumps for both nodes (`predown_ch{1,2}/`: `cas_log.tsv`,
+`gc_log.tsv`, `part_log.tsv`, `events.tsv`, `errors.tsv`, trace extracts), the harness's own run
+log (`general_soak_90m_run3.log`), its metrics database (`metrics.sqlite`, `soak.db` at capture
+time — `metrics` + `gc_phases` tables), and the Step-3e baseline gtest output
+(`step3e_ns_file_profile.log`). ~8.3 GB, gitignored soak output — the small, high-value slice
+behind the six-criteria table, the Step-3c cost inventory, and the T6b budget watch is additionally
+tracked in git at `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/step3c-cost-inventory-evidence/`
+(raw `system.cas_gc_log` `Phase`/`Start`/`Finish` rows per node, plus a final pre-teardown
+`cas-fsck` summary confirming `dangling=0 stale_edge=0 unreachable=0` on both nodes). The two
+earlier related specimens (`failed_injected_run/` — the seed-`20260805` criterion-4 injection run;
+its own evidence extract at `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-injection-evidence/`)
+sit alongside this one in the same parent directory. The cluster was torn down (`docker compose
+down -v --remove-orphans`) only after this preservation step completed and every RESULTS.md figure
+in this document was confirmed re-derivable from what was captured here.
 
 ## Soak command pinning (Step E4) {#e4-soak-commands}
 
@@ -578,8 +595,58 @@ no design note — it is already covered; T4 TEST-1's design sketch is the table
 
 ## Verdict {#verdict}
 
-**Not yet issued.** This document covers T8's early-phase steps (E1–E4, the residual row, and the
-Step-1 gate run) only. The full battery (integration lanes, the four soaks, the cost inventory, the
-six result criteria) has not run; T8's actual verdict (`STAGE B: PASS`/`FAIL`) is written after that
-stage completes, per the plan's `{#global-constraints}` Stage-B completion semantics (T8 issues the
-technical verdict; the ledger stays short of COMPLETE until T9's commit).
+**STAGE B: PASS**, conditioned on two named product findings landing before this branch merges.
+
+The gate battery itself is green: the full CA gate (both release and ASan), all ten integration
+lanes, the four ex-known-red stateless tests, all four required soaks (churn, rebirth, decommission,
+the 90-minute general soak), all six Step-3d result criteria, the Step-3c cost inventory, the T6b
+budget watch, and the Step-3e insert-path guard all measured PASS with real evidence, not asserted.
+The destruction pipeline this stage exists to gate — GC's condemn/graduate/redelete/prune sequence,
+its hold/anomaly suppression, its budget caps, the namespace-file operation profile — works, and
+this stage's gates measure exactly that pipeline. Neither of the two findings below is a failure of
+that pipeline or of any of the six criteria; both were found BY this stage's own battery and soak
+work exercising code paths the gates do not themselves check.
+
+**Condition (a) — the namespace-admission race.** `createNamespace` could `LOGICAL_ERROR`-abort on
+a sibling's still-`Creating` entry landing between this call's pre-check and its own read (a
+server-killing exception under `DEBUG_OR_SANITIZER_BUILD`, an aborted request otherwise). Root-caused
+and fixed on `laneg/fix-verify`, two commits closing both catch-points: `f86ad603791`
+("`createNamespace` no longer `LOGICAL_ERROR`-aborts on a sibling's still-`Creating` entry") and
+`00f5e4475e4` ("`createNamespace` also resists a sibling's step-1 landing between the pre-check and
+its own read"). Red-proven (failing test before the fix, passing after) this session. Integration
+into `master` is pending.
+
+**Condition (b) — FINDING #2, the `existsDirectory(TableDir)` / `dropAllData` namespace leak.**
+`ContentAddressedMetadataStorage::existsDirectory`'s `TableDir` case checks only committed-part refs
+(`store()->hasAnyRefWithPrefix`), never table-level verbatim namespace files (`format_version.txt`,
+mutation entries) — so once `MergeTreeData::dropAllData` removes a table's last part, this check
+incorrectly reports the directory already gone, and the rest of the drop's cleanup (including the
+`removeRecursive` call that reaches `dropNamespace`) is skipped. Confirmed via `system.text_log`
+during this stage's S44 soak investigation (`{#s44-drain-observation}`), root-caused with a
+codex-ruled design, fixed on the same `laneg/fix-verify` line (`8042f221be7`, "table-root
+`existsDirectory` probes catalog lifecycle, not ref presence") with unit-test and stateless-test
+coverage (`f2bfa8478ac`, `7fd15a34786`, the `05023` regression test — deferred to run after this
+stage's cluster teardown, per the residual gate row). Verified this session on that branch.
+Integration into `master` is pending.
+
+**If these two do not land**, the branch carries a server-killing exception on a live namespace-
+creation race and an unbounded namespace leak on every table drop whose last part was already gone
+— both real, both found, neither hidden in only the residual list: this verdict line is where they
+must be visible.
+
+**Carried forward, named, not blocking this PASS:**
+- The hold-arm injection (criterion 4, second half) — not executed against any specimen by design;
+  owed as a separate, short, dedicated run.
+- The four unverifiable T6b budget caps (`{#t6b-budget-watch}`): one confirmed not exercised this
+  run (`gc_round_sweep_recovery_op_budget`), three genuinely unmeasurable from the metrics captured
+  (`gc_round_prefix_wholesale_budget`, `gc_round_handoff_prefix_wholesale_budget`,
+  `gc_round_outcome_entry_budget`).
+- The checkpoint-corruption recovery residual (`CASRefNeedsRecovery` not observably clearing after
+  a byte-identical `_ckpt` restore under a live lane, single observation, injected fault outside
+  CAS's trusted-store model).
+- The `05023` stateless regression test, deferred to run after this stage's cluster teardown.
+- Everything already on the post-B residual list above (R4 registry, head-CAS north star, the
+  `ApplyPending` debug-only evaluation, the 10b sharding-arm debt, T6b's other named residuals).
+
+Per the plan's `{#global-constraints}` Stage-B completion semantics: T8 issues this technical
+verdict; the ledger stays short of COMPLETE until T9's commit.
