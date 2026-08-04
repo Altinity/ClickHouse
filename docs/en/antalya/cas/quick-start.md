@@ -26,12 +26,18 @@ nothing beyond a `ClickHouse` binary — no bucket, no credentials:
                 <server_root_id>quickstart-demo</server_root_id>
                 <path>cas_pool/</path>
             </cas>
+            <cas_cache>
+                <type>cache</type>
+                <disk>cas</disk>
+                <path>cas_cache/</path>
+                <max_size>10Gi</max_size>
+            </cas_cache>
         </disks>
         <policies>
             <cas>
                 <volumes>
                     <main>
-                        <disk>cas</disk>
+                        <disk>cas_cache</disk>
                     </main>
                 </volumes>
             </cas>
@@ -39,6 +45,10 @@ nothing beyond a `ClickHouse` binary — no bucket, no credentials:
     </storage_configuration>
 </clickhouse>
 ```
+
+The `cas_cache` disk layers a local filesystem cache over `cas`: it absorbs repeated reads of the
+same blob while `cas` stays the source of truth, and the policy's volume points at the cached disk
+— see [configuration](/antalya/cas/configuration#disk-config) for the sizing note.
 
 `server_root_id` must be unique per server sharing a pool. On a single, non-replicated server a
 literal string, as above, is enough; on a replicated cluster where every replica shares one config,
@@ -60,8 +70,10 @@ connection keys; nothing else in this config changes:
 </cas>
 ```
 
-See [bucket requirements](/antalya/cas/bucket-requirements) for what the target bucket needs to
-support, and [configuration](/antalya/cas/configuration) for the full settings surface.
+`cas_cache` is unaffected by this swap — it wraps `disk cas` regardless of which object-storage
+backend `cas` itself uses. See [bucket requirements](/antalya/cas/bucket-requirements) for what the
+target bucket needs to support, and [configuration](/antalya/cas/configuration) for the full
+settings surface.
 
 ## First table {#first-table}
 
@@ -88,22 +100,33 @@ exactly as on any other `MergeTree` — the content-addressing is invisible at t
 ## Checking the mount {#checking-the-mount}
 
 ```sql
-SELECT server_root_id, state, is_leader FROM system.cas_mounts;
+SELECT disk, server_root_id, state, is_leader FROM system.cas_mounts;
 ```
 
 ```text
 Row 1:
 ──────
+disk:           cas
+server_root_id: quickstart-demo
+state:          live
+is_leader:      0
+
+Row 2:
+──────
+disk:           cas_cache
 server_root_id: quickstart-demo
 state:          live
 is_leader:      0
 ```
 
-`system.cas_mounts` shows every server currently sharing this pool, not just the local one.
-`is_leader` is `0` here because `GC` leader election is asynchronous and had not yet run at query
-time on this freshly mounted disk — see [mounts and leases](/antalya/cas/architecture/mounts-and-leases)
-for the full column reference and [garbage collection](/antalya/cas/architecture/garbage-collection)
-for leadership.
+`system.cas_mounts` shows every server currently sharing this pool, not just the local one. With a
+cache layered in front, the same mount shows up **twice** — once under each configured disk name
+(`cas` and `cas_cache`), both reporting the one underlying `server_root_id` — because the table
+lists a row per configured disk, not per mount; this is the one visible change the cache layer adds
+to this page's output. `is_leader` is `0` on both rows because `GC` leader election is asynchronous
+and had not yet run at query time on this freshly mounted disk — see
+[mounts and leases](/antalya/cas/architecture/mounts-and-leases) for the full column reference and
+[garbage collection](/antalya/cas/architecture/garbage-collection) for leadership.
 
 ## What just happened {#what-happened}
 
@@ -114,9 +137,9 @@ without re-uploading a single byte; see
 [garbage collection](/antalya/cas/architecture/garbage-collection) for how a dropped part's blobs
 get reclaimed once nothing references them anymore.
 
-This exact configuration and SQL were run against a live server before publication: `CREATE
-TABLE`, `INSERT`, `SELECT`, and the `system.cas_mounts` query above all completed with zero errors.
-
-For production use, layer a local filesystem cache over the `CAS` disk — see the recommended
-example in [Configuration](/antalya/cas/configuration).
+This exact cache-layered configuration and SQL were run against a live server before publication:
+`CREATE TABLE`, `INSERT`, `SELECT`, and the `system.cas_mounts` query above all completed with zero
+errors, with the two-row `system.cas_mounts` output shown above captured from that run. The
+`INSERT`/`SELECT` output is unaffected by the cache — the one visible difference the cache layer
+adds anywhere on this page is that second `system.cas_mounts` row.
 
