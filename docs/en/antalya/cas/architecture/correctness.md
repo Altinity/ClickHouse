@@ -68,3 +68,13 @@ implied. What it does buy: every safety rule in the GC core has an explicit coun
 record for the world where that rule is missing, and the corpus is itself periodically re-audited
 for faithfulness to the code — a model whose guarantee the code no longer needs is deleted rather
 than kept as false comfort.
+
+## The whole test suite, on CAS by default {#stateless-suite-on-cas}
+
+Beyond the model corpus and the soak harness, the standard ClickHouse **stateless test suite runs
+green with `CAS` as the default `MergeTree` storage**: dedicated CI lanes
+(`stateless_tests_*_cas_storage_*`) run every stateless test against a server whose default disk is
+a `CAS` pool. A small set of tests carries the `no-cas-storage` tag and is skipped in those lanes —
+tests that exercise a mechanism a content-addressed disk deliberately does not have (for example,
+`s3_plain` layouts or deliberately corrupted on-disk part chains). Everything else — the thousands
+of tests that define what `MergeTree` is supposed to do — passes unchanged on top of `CAS`.
