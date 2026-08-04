@@ -20,7 +20,11 @@ without a migration.
 
 ## Key table {#key-table}
 
-All key patterns are shown under the pool prefix.
+All key patterns are shown under the pool prefix. A **namespace** is the opaque per-table string
+under which one `MergeTree` table's part manifests and ref history live: for a live table it is
+the table's canonical disk path (`store/<xx>/<uuid>`, `@cas@`-marked) prefixed by the owning
+server's `server_root_id`, and a backup gets its own `shadow/…` namespace instead; `Cas::Layout`
+only validates a namespace's shape and never interprets its contents.
 
 | Key pattern | Object | Codec | Writer |
 |---|---|---|---|
