@@ -14,7 +14,7 @@ refactoring work (no behavior change), documentation debt, and minor/polish item
 
 ## Architecture / refactoring (deferred, no behavior change) {#refactoring}
 
-- **[refactor: CasGc split] break `CasGc.cpp` into workflow units** — DESIRABLE — Split scan / reachability / deletion / cursor / budget out of the 2.3k-line file; keep `Gc` as orchestration (pure extraction). Author's second-highest-value refactor.
+- **[refactor: CasGc split] break `CasGc.cpp` into workflow units** — DESIRABLE — Split scan / reachability / deletion / cursor / budget out of the 2.3k-line file; keep `Gc` as orchestration (pure extraction). Author's second-highest-value refactor. (An orphaned 2026-08-04-triage finding covers the same split, plus a separate "centralize backend token policy" half that already landed as C1/C2 above — folded in as confirmation.)
 - **[refactor: Store de-god-classing] extract remount-thread / caches / ref-append-lane out of `Cas::Store`** — DESIRABLE — 8-responsibility god class; friend-triangle with `Build`/`Gc`.
 - **[refactor: Store::open modes] split into create / open-rw / open-ro** — MINOR (real bug behind it) — Read-only `Store::open` can still write `_pool_meta` on an empty pool (`PoolMeta::createOrValidate`); make read-only semantics visible (`createOrLoad` vs `loadExisting`) or pass `create_if_missing=false` when `read_only`.
 - **[DiskSelector per-disk isolation]** — HARD / upstream — `DiskSelector::initialize()` has no per-disk try/catch; one unreachable disk aborts disk-selector init server-wide. Pre-existing upstream gap; carve to an upstream PR (Group G).
@@ -70,3 +70,8 @@ Ranked by value-per-risk, each backed by real defects it would have prevented.
 - **[CLEANUP-dead-prerev6-keys] delete dead pre-rev.6 config keys** — From F4a review 2026-07-21: delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
 - **[CLEANUP-srid-naming-unify] unify `srid`/`server_root_id` naming** — From final-review polish 2026-07-21: unify `content_addressed_garbage_collection_log`'s own `srid` column (and the `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` input-arg shorthand docs) with the spelled-out `server_root_id` naming F3 landed for `system.content_addressed_mounts`.
 - **[CHANGELOG-unknown-config-key-rejection] changelog line owed for unknown-CAS-config-key rejection** — From final-review polish 2026-07-21: write the release-note/changelog line for the now-live unknown-CAS-config-key rejection (fails disk startup on a typo'd key; was previously a silent no-op) once the feature ships.
+
+## New findings from the 2026-08-04 orphaned-open triage {#orphan-triage-2026-08-04}
+
+- **[partpathparser-duplicated-path-constants] `PartPathParser` duplicating canonical ClickHouse path constants instead of deriving them** — MINOR — Concrete maintainability/consistency risk: a drift between the duplicated constants and the canonical ones would silently misparse part paths.
+- **[behavior-preserving-refactor-sequence] behavior-preserving refactor sequence (remove `CasDbg*` instrumentation, centralize event emission/cursor keys, introduce `RefId`/`ObjectId`)** — DESIRABLE — A genuine but broad refactor-candidate list; low urgency, real value.

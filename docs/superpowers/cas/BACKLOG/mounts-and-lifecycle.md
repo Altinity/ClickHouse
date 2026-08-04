@@ -14,8 +14,8 @@ and CA disk lifecycle: startup, decommission, and pool bootstrap.
 
 ## Mount-lease / fence recovery {#mount-fence}
 
-- **[P3.1 Task 6 / S13] live validation of fence-recovery** — TEST — TLA+ gate PASSED and the correctness paths landed (self-remount on GC fence-out is DONE); the gtest sweep + S13 3×-green live gate remain. **Task 5** (decouple renewal from the retired-view sync beat) is likely **MOOT** — freshness-v3 deleted `RetireView`/syncer/`observed_gc_round`; confirm and close.
-- **[A7-residual] gc_scheduler lifetime vs manual rounds** — VERIFY — Believed addressed by `89845c2a544` (shutdown serializes gc_scheduler teardown with health reads; wedged-lane count pinned) on top of the stabilization A7 fix. Confirm no residual: (a) a manual round on a raw pointer captured outside the lock, (b) lazy creation resurrecting a scheduler after shutdown.
+- **[P3.1 Task 6 / S13] live validation of fence-recovery** — TEST — TLA+ gate PASSED and the correctness paths landed (self-remount on GC fence-out is DONE); the gtest sweep + S13 3×-green live gate remain. **Task 5** (decouple renewal from the retired-view sync beat) is likely **MOOT** — freshness-v3 deleted `RetireView`/syncer/`observed_gc_round`; confirm and close. (An orphaned 2026-08-04-triage finding tracks this same live-validation-under-induced-latency gap — folded in as confirmation.)
+- **[A7-residual] gc_scheduler lifetime vs manual rounds** — VERIFY — Believed addressed by `89845c2a544` (shutdown serializes gc_scheduler teardown with health reads; wedged-lane count pinned) on top of the stabilization A7 fix. Confirm no residual: (a) a manual round on a raw pointer captured outside the lock, (b) lazy creation resurrecting a scheduler after shutdown. (An orphaned 2026-08-04-triage finding covers exactly residual (b), lazy-scheduler-resurrection-after-shutdown — folded in as confirmation.)
 - **[STID-3982-3b48 part 2] mount-lease self-race Gate 3 re-run still owed** — {#stid-3982-3b48-part-2} — TEST — A third variant of the mount-lease renewal self-race (ambiguous client-side timeout on the renewal `PUT` misdiagnosed as a foreign-writer collision, SIGABRT under ASan) is fixed and landed 2026-07-24 (fence-not-rescue redesign, spec `specs/2026-07-24-cas-mount-lease-self-race-fix-v2-design.md` rev.4, TLA+-gated, full `Cas*:CA*` green). Open: Gate 3, the live CAS-s3 stateless-lane validation that originally caught the crash, has not been re-run post-fix — rides the next CI push of `cas-gc-rebuild`.
 - **[fence-window observability] mount-lease keeper is silent at default log level** — GAP (found 2026-07-28, fence-cascade RCA) — During the msan CA-s3 fence window (run for `07f8398acddff2c`) the server log contains ZERO `CasMountLease*` lines for the whole ~7-minute episode: renewal failures, the fence arming, remount start/phases/completion are all invisible; the episode had to be reconstructed from `executeQuery` error timestamps. The keeper's messages exist (the STID-3982 entry above quotes them from an ASan run) but evidently sit below the effective level or fire only on classifier paths. Fix: log at `Information` (rate-limited) — renewal confirm failure with the underlying error, fence armed (with deadline), remount begin, remount recovery milestones, remount complete with duration. Cheap, pure logging, closes gap #3 of `reference_cas_ci_observability_gaps`.
 - **[fence-window blast radius] durable writes fail instantly for the whole fence→remount window** — DESIGN QUESTION (2026-07-28 RCA) — During fence→remount (~2 min core window + straggler tails on the msan lane), every durable write returns `668`/`210` immediately; user queries (test INSERTs) get hard errors while an internal `CasWriteRetryLater` lane already exists for system-table flushes. A bounded wait-for-remount on the query write path (block up to N seconds while the self-remount is in flight, then fail) would turn short fence windows into latency instead of failures — the same contract RMT gives during a Keeper reconnect. Behavior change on the write path — needs a design decision, do NOT slip it in as a patch. Related: the remount itself took ~2 min under msan; once the keeper logging (entry above) lands, measure WHERE remount time goes (lease-expiry wait vs recovery replay) before tuning anything.
@@ -35,7 +35,7 @@ cached forever in the disk registry (`Context::getOrCreateDisk`) with no teardow
 there is no runtime re-use of the same disk after a stop (G6 is met only node-locally via `FORGET`; G7
 abandoned). The Dormant/UNMOUNT/MOUNT reuse machinery that pursued this was rolled back (spec rev.8 §9);
 `FORGET` is the node-local decommission story. Full eject-on-`DROP` is future work (the disk-lifecycle
-redesign; v2 door in git history).
+redesign; v2 door in git history). Three orphaned 2026-08-04-triage findings describe the same disk-registry-caches-forever-after-DROP-TABLE class (including a manual-GC/rebuild-vs-shutdown race variant) — folded in here as confirmation, no new content.
 
 **Accepted residuals / watch items (each a pointer into this round):**
 - (a) **`search_orphaned_parts_disks=ANY` × a transient CA disk strands an unrelated table's load** —
@@ -69,6 +69,12 @@ or adopt the pool's existing owner uuid and mount as it (`Pool::openForDecommiss
 `CasPool.cpp:720-776`, already does exactly this — the reading that looks strictly better). Not the
 read-only-mount task, which is separate and unimplemented.
 
+Three orphaned 2026-08-04-triage findings target this same open design question: one proposes a
+concrete `force_owner_claim` mechanism (not found anywhere in `src/` — a proposal, not a partial
+implementation); one asks for an audit record on any force-claim path; one asks the design to
+distinguish post-mortem recovery from live-server misuse. None change the open status above — folded
+in as detail on the same unimplemented design choice.
+
 ## `life_epoch` monotonicity holds PER SERVER ROOT — decommission must not break it {#life-epoch-monotone-per-server-root}
 
 Recorded 2026-07-31 from Task 4c, which made a decreasing `_ckpt.life_epoch` contribution `CORRUPTED_DATA`
@@ -90,3 +96,9 @@ roots is exactly the shape. Whoever owns that work must either keep a namespace'
 one root for its whole life, or replace the monotonicity argument with something that survives two counters —
 and must not discover this by hitting the refusal. The limit is stated at `joinLifeEpoch` in the code as well,
 so the constraint is visible where it is relied upon rather than only here.
+
+## New findings from the 2026-08-04 orphaned-open triage {#orphan-triage-2026-08-04}
+
+- **[decommission-successor-mount-race] decommission can delete a successor's fresh mount/epoch objects after releasing an impersonated lease** — HARD — Review finding №9: a durable epoch-monotonicity violation. No evidence this specific race was closed — distinct from the general decommission two-phase-heal flow (verified separately), which does not address this successor-race angle.
+- **[gc-scheduler-lazy-init-race] `gc_scheduler` lazily created without a mutex in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`** — MINOR — Concurrent `SYSTEM GC` calls could race construction; a plausible narrow concurrency bug, distinct from `[A7-residual]` above (which is about post-shutdown resurrection, not concurrent first-construction).
+- **[fence-costs-epoch-distinct-mint] mint `epochCeiling + 1` instead of literal `1` in `RemintEpoch`'s honest branch** — DESIRABLE — Its own source (`CaCasMountCore_RESULTS.md`) explicitly flags this as "NOT implemented... a candidate refinement for a later task/round" that would close the documented `FenceCostsEpoch` gap.
