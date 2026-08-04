@@ -17,7 +17,9 @@ disk and its data are untouched until a partition is explicitly moved.
 ## Add a CAS disk alongside an existing one {#add-disk}
 
 A storage policy can carry both an ordinary disk and a `CAS` disk as separate volumes. `ALTER TABLE
-... MOVE PARTITION ... TO DISK` then moves data between them without an `INSERT`/`DROP` cycle:
+... MOVE PARTITION ... TO DISK` then moves data between them without an `INSERT`/`DROP` cycle. As on
+the [configuration](/antalya/cas/configuration#disk-config) page, the recommended shape layers a
+`type=cache` disk over the `CAS` disk, and the policy's volume references the **cached** disk name:
 
 ```xml
 <clickhouse>
@@ -36,6 +38,12 @@ A storage policy can carry both an ordinary disk and a `CAS` disk as separate vo
                 <access_key_id>...</access_key_id>
                 <secret_access_key>...</secret_access_key>
             </cas>
+            <cas_cache>
+                <type>cache</type>
+                <disk>cas</disk>
+                <path>/var/lib/clickhouse/cas_cache/</path>
+                <max_size>10Gi</max_size>
+            </cas_cache>
         </disks>
         <policies>
             <tiered>
@@ -44,7 +52,7 @@ A storage policy can carry both an ordinary disk and a `CAS` disk as separate vo
                         <disk>local_disk</disk>
                     </hot>
                     <cas_volume>
-                        <disk>cas</disk>
+                        <disk>cas_cache</disk>
                     </cas_volume>
                 </volumes>
             </tiered>
@@ -87,10 +95,13 @@ disk_name: local_disk
 The partition starts on `local_disk`, the first volume in the policy. Moving it onto `CAS` uploads
 each part's files as content-addressed blobs, writes a part manifest, and publishes a ref — the same
 write path an `INSERT` directly onto `CAS` takes (see
-[what just happened](/antalya/cas/quick-start#what-happened) in the quick start):
+[what just happened](/antalya/cas/quick-start#what-happened) in the quick start). `TO DISK` names the
+disk actually listed in the policy's volume — with a cache layered in front, that is the **cache**
+disk's name (`cas_cache`), not the raw `CAS` disk's name (`cas`) underneath it; naming the raw disk
+is refused, because it is not a member of the table's storage policy:
 
 ```sql
-ALTER TABLE events MOVE PARTITION '2026-08-04' TO DISK 'cas';
+ALTER TABLE events MOVE PARTITION '2026-08-04' TO DISK 'cas_cache';
 
 SELECT name, partition, disk_name FROM system.parts WHERE table = 'events' AND active;
 ```
@@ -100,7 +111,7 @@ Row 1:
 ──────
 name:      20260804_1_1_0
 partition: 2026-08-04
-disk_name: cas
+disk_name: cas_cache
 ```
 
 ```sql
@@ -111,6 +122,11 @@ SELECT * FROM events ORDER BY event_id;
 2026-08-04	1	hello
 2026-08-04	2	world
 ```
+
+`system.parts.disk_name` reports the cache disk's name, not the underlying `CAS` disk's — this is
+the ordinary `type=cache` disk behavior (the same happens layering a cache over any other disk type)
+and is not `CAS`-specific. `system.filesystem_cache` shows the part's files populated into the
+`cas_cache` cache on this read-through.
 
 ## Roll back {#rollback}
 
@@ -135,10 +151,14 @@ Moving a partition off `CAS` does not itself delete the blobs it stops referenci
 old ref makes them eligible for reclamation by the next
 [GC round](/antalya/cas/architecture/garbage-collection), the same as dropping a part.
 
-This exact two-disk configuration and the forward/rollback `ALTER TABLE ... MOVE PARTITION`
-sequence above were run against a live server before publication, using the `local` object-storage
-backend for the `cas` disk: `CREATE TABLE`, `INSERT`, both `MOVE PARTITION` directions, the
-`system.parts` checks, and the `SELECT` all completed with zero errors and the shown output.
+This exact three-disk, cache-over-`CAS` configuration and the forward/rollback `ALTER TABLE ... MOVE
+PARTITION` sequence above were run against a live server before publication, using the `local`
+object-storage backend for the `cas` disk: `CREATE TABLE`, `INSERT`, both `MOVE PARTITION`
+directions, the `system.parts` checks, the `system.filesystem_cache` check, and the `SELECT` all
+completed with zero errors and the shown output. A prior attempt to move onto `TO DISK 'cas'`
+directly (the raw disk, not the cache) was refused with `All parts of partition '20260804' are
+already on disk 'cas_cache'. (UNKNOWN_DISK)` — a real error message from the run, kept here because
+it is exactly what an operator sees after guessing the wrong disk name.
 
 ## Permanently removing a pool member {#decommission}
 

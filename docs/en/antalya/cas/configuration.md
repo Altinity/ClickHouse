@@ -12,7 +12,10 @@ doc_type: 'reference'
 ## The disk config block {#disk-config}
 
 A `CAS` disk is an `object_storage` disk with `metadata_type` set to `cas` and an explicit
-`server_root_id`:
+`server_root_id`. The recommended shape layers a `type=cache` disk in front of it — the local
+filesystem cache absorbs repeated reads of the same blob, while the `CAS` disk underneath stays the
+single source of truth the pool's other members and GC also read from. The storage policy references
+the **cached** disk, not the raw `CAS` disk directly:
 
 ```xml
 <clickhouse>
@@ -27,12 +30,18 @@ A `CAS` disk is an `object_storage` disk with `metadata_type` set to `cas` and a
                 <access_key_id>...</access_key_id>
                 <secret_access_key>...</secret_access_key>
             </cas>
+            <cas_cache>
+                <type>cache</type>
+                <disk>cas</disk>
+                <path>/var/lib/clickhouse/cas_cache/</path>
+                <max_size>10Gi</max_size>
+            </cas_cache>
         </disks>
         <policies>
             <cas>
                 <volumes>
                     <main>
-                        <disk>cas</disk>
+                        <disk>cas_cache</disk>
                     </main>
                 </volumes>
             </cas>
@@ -41,11 +50,29 @@ A `CAS` disk is an `object_storage` disk with `metadata_type` set to `cas` and a
 </clickhouse>
 ```
 
-`type`, `object_storage_type`, `metadata_type`, `endpoint`, `access_key_id`, `secret_access_key`,
-and the other generic object-storage/disk keys (`path`, `name`, `region`,
-`use_environment_credentials`, `readonly`, `use_fake_transaction`, and a handful more) belong to the
-shared disk layer, not to `CAS` — they are accepted inside the same block but are not `CAS`
-settings. Every key below this line, and every key not in that shared set, is rejected as unknown.
+`path` and `max_size` are ordinary `type=cache` disk settings (see
+[external disk cache](/operations/storing-data#using-local-cache)), not `CAS`-specific — size the
+cache to the working set of blobs a node reads repeatedly, not to the pool's total size. `type`,
+`object_storage_type`, `metadata_type`, `endpoint`, `access_key_id`, `secret_access_key`, and the
+other generic object-storage/disk keys (`path`, `name`, `region`, `use_environment_credentials`,
+`readonly`, `use_fake_transaction`, and a handful more) belong to the shared disk layer, not to
+`CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. Every key
+below this line, and every key not in that shared set, is rejected as unknown.
+
+The bare, uncached form — a storage policy pointing directly at the `CAS` disk, as used by
+[quick start](/antalya/cas/quick-start) — remains valid and is the minimal way to try `CAS` out:
+
+```xml
+<policies>
+    <cas>
+        <volumes>
+            <main>
+                <disk>cas</disk>
+            </main>
+        </volumes>
+    </cas>
+</policies>
+```
 
 ## Disk-level settings {#disk-settings}
 
