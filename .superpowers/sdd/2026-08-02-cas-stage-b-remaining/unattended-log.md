@@ -965,3 +965,22 @@ ASan build (42G, rebuildable), stale ci/tmp object-store data (minio_data 35G + 
 tore down the dead soak stack + pruned volumes, pruned docker images >72h (162G). Now 82% used /
 321G free. LESSON for the rerun: the box needs a disk-headroom precheck before any long soak, and
 soak archives need a retention policy (logs_archive was 31G before cleanup).
+
+### CI FINAL — PR 2073 @ 9ad3e15b688 (run terminal, 10:11) {#ci-final}
+Verdict: PR FAIL. 73 OK / 20 failed-or-errored jobs / 35 skipped; nothing left RUNNING.
+Failures by cause, not by count:
+1. THE admission race (finding #1) — SEVEN cas stateless lanes dead with `Server died`
+   (binary cas-s3, asan_ubsan cas-s3 1/2 + 2/2, tsan cas-s3 1/2 + 2/2, msan cas-s3 1/3 + 2/3 + 3/3,
+   binary cas-local): both catch-points seen (`createNamespace ... already carries a catalog entry`
+   and the encode-time `entries are not canonically ordered`). Thousands of tests pass in each lane
+   before the abort; the sibling UNKNOWN test rows are post-abort cascade. FIX PARKED, in
+   verification now (laneg/fix-verify).
+2. Sanitizer wall-clock races in two unit tests — 3 unit lanes (`fail: 2` each). FIXED in branch
+   (aacc233dc13), locally green.
+3. Not ours / flaky — `test_replicated_database::test_replicated_table_structure_alter` fails in
+   THREE independent integration lanes (asan db-disk, tsan, msan): non-CAS, reproduces across
+   sanitizers, treat as pre-existing until proven otherwise; TPC-DS q14/q45/q75/q92 timeouts and
+   `02205_HTTP_user_agent` (harness itself reports 0/3 reruns reproduced); `SQLStorm test` ERRORed
+   with an empty info field (infra-shaped, no test data).
+4. Ours, fixed inline: `test_cas_drop_pool_member` lease-window (predicate divergence, tsan).
+Next CI round is only meaningful after the fixes land, so the hourly cron is retired here.
