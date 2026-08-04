@@ -267,9 +267,14 @@ TEST(CASTruncateReclaim, DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep)
         const size_t rounds = runGcToFixpoint(s, gc);
         const FsckReport after = runFsck(*s, /*detail=*/false);
         EXPECT_EQ(after.dangling, 0u);
-        EXPECT_GT(after.unreachable, 0u)
-            << "generation-7 removal performs no lifecycle-specific physical cleanup; the perpetual "
-               "sweep owns orphaned blobs after " << rounds << " GC rounds";
+        /// Removal still performs no lifecycle-specific physical cleanup -- the perpetual sweep and the
+        /// janitor own the orphaned bytes. What changed is that they can now FINISH: dropping the last
+        /// namespace leaves an authoritative catalog that decodes to zero entries, which is a positive
+        /// proof of no live edge rather than the vacuous 0 == 0, so the round's frontier completes and
+        /// the sweep is no longer suppressed on an emptied pool.
+        EXPECT_EQ(after.unreachable, 0u)
+            << "an emptied pool must drain instead of standing still; the sweep owned these blobs and "
+               "reclaimed them within " << rounds << " GC rounds";
         EXPECT_EQ(after.reachable, 0u);
         EXPECT_FALSE(CasRefCatalog::lifeIfCataloged(s->backend(), s->layout(), ns))
             << "physical debris must not keep the logical namespace life cataloged";

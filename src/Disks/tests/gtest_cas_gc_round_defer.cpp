@@ -202,8 +202,15 @@ TEST(CASGCRoundDefer, ListedLifeAbsentFromThePostListCatalogCutIsInertDebris)
     Gc gc(store, kGc);
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_FALSE(report.deferred);
-    EXPECT_EQ(backend->getCount(log_key), 0u);
-    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->getCount(log_key), 0u)
+        << "inert means the body is never read: the life is absent from the authoritative cut, so no "
+           "admission and no fold intake can touch it";
+    /// The debris IS reclaimed in this round, and that is the janitor's designed job, not the fold's:
+    /// a life id absent from the catalog cut is a dead life, and the namespace janitor deletes its
+    /// objects by exact token behind the same fence. A round over a proved-empty catalog completes its
+    /// frontier, so nothing suppresses that reclaim any more -- the object is dropped without ever
+    /// being read or admitted, which is exactly what "inert debris" means here.
+    EXPECT_EQ(backend->deleteCount(log_key), 1u);
 }
 
 /// The post-LIST cut classifies every immutable stream kind, not only logs. A snapshot belonging to a
@@ -221,8 +228,11 @@ TEST(CASGCRoundDefer, SnapshotLifeAbsentFromThePostListCatalogCutIsInertDebris)
     Gc gc(store, kGc);
     const RoundReport report = gc.runRegularRound({}, /*allow_steal=*/true, UniversePolicy::Authoritative);
     EXPECT_FALSE(report.deferred);
-    EXPECT_EQ(backend->getCount(snapshot_key), 0u);
-    EXPECT_EQ(backend->deleteTotal(), 0u);
+    EXPECT_EQ(backend->getCount(snapshot_key), 0u)
+        << "inert means the body is never read, whatever immutable stream kind it is";
+    /// As for the log above: the dead life's snapshot is reclaimed by the janitor by exact token,
+    /// never read and never admitted.
+    EXPECT_EQ(backend->deleteCount(snapshot_key), 1u);
 }
 
 /// ---- Task 4: the DEFER short-circuit wired into runRegularRound ----
