@@ -211,6 +211,29 @@ LOADING PARTS, PREWARM, ...) cast the storage directly and missed tables
 behind a proxy; unwrap the proxy before the cast.
 MSG
 
+group upstream-disks-exit-code \
+    'programs/disks/DisksApp.cpp' \
+    'programs/disks/DisksApp.h' \
+    'tests/integration/test_disks_app_func/test.py' \
+    'tests/integration/test_replicated_database/test.py' <<'MSG'
+clickhouse-disks: non-interactive runs exit nonzero on a failed command
+
+clickhouse-disks --query always exited 0 and reported failures only on
+stderr, so scripts, cron jobs and CI could not gate on it at all. Record
+each command's error code in processQueryText and return it as the
+process exit code for non-interactive runs; interactive REPL sessions
+keep exiting 0. Within one semicolon-separated batch a later success does
+not clear an earlier failure.
+
+Carries the two test fixes the contract exposed: a 2024 typo in
+test_disks_app_func ("d/a" instead of "a/d/a" always failed inside the
+tool and was swallowed), and test_replicated_table_structure_alter
+reading metadata_path from system.tables after DETACH DATABASE (empty
+path, the remove never ran, the recovery scenario was never exercised).
+Mixed-file note: DisksApp.cpp also carries the cas-* command registration
+and CA pool initialization, wired by the later CAS integration commits.
+MSG
+
 # ==================== Phase 2: CAS subsystem, bottom-up ======================
 CA=src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed
 
@@ -309,12 +332,16 @@ group cas-wiring-system-logs \
     'src/Common/SystemLogBase.cpp' 'src/Common/SystemLogBase.h' \
     'src/Interpreters/Context.cpp' 'src/Interpreters/Context.h' \
     'src/Interpreters/ServerAsynchronousMetrics.cpp' \
+    'src/Interpreters/ServerAsynchronousMetrics.h' \
+    'tests/queries/0_stateless/04328_reader_executor_kpi_async_metric.sql' \
+    'tests/queries/0_stateless/04328_reader_executor_kpi_async_metric.reference' \
     'src/Storages/System/*' <<'MSG'
 CAS integration: system logs and introspection
 
-system.content_addressed_log and system.content_addressed_garbage_collection_log
-(definitions, SystemLog registration, Context getters), the
-system.content_addressed_mounts table, and asynchronous metrics.
+The CAS system logs (definitions, SystemLog registration, Context
+getters), the CAS mounts system table, and asynchronous metrics. Also
+drops the ReaderExecutor modeled-cost async metric (raw counters stay)
+together with its stateless test.
 MSG
 
 group cas-wiring-system-commands \
