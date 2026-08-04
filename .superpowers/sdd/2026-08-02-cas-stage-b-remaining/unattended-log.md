@@ -984,3 +984,19 @@ Failures by cause, not by count:
    with an empty info field (infra-shaped, no test data).
 4. Ours, fixed inline: `test_cas_drop_pool_member` lease-window (predicate divergence, tsan).
 Next CI round is only meaningful after the fixes land, so the hourly cron is retired here.
+
+### 11:04 — clickhouse-disks exit-code change explains a "foreign" CI red {#disks-exitcode-blastradius}
+USER CATCH (correct; my earlier "not ours" was wrong): this PR's DisksApp change —
+`if (query.has_value() && last_command_exit_code != 0) return last_command_exit_code;` — makes
+`clickhouse-disks --query` propagate command failures as the PROCESS exit code, globally, for every
+command (not just CAS ones). That is what turned test_replicated_database::
+test_replicated_table_structure_alter red in three lanes: its `--query "remove {metadata_path}"`
+runs with an EMPTY path (the SELECT for metadata_path executes AFTER `DETACH DATABASE` on the same
+node, so system.tables has no row), the command fails BAD_ARGUMENTS(36), and the failure is no
+longer swallowed. Proximate cause OURS, defect in the TEST (latent, hidden while exit codes were
+discarded). Queued: (1) blast-radius grep of every `clickhouse-disks --query` call in tests, (2)
+honest test fix (capture metadata_path BEFORE the detach + assert non-empty), (3) carve-plan note
+that this exit-code change is upstream-affecting and needs its own PR + rationale.
+Lesson recorded: never classify a CI red as "not ours" by test name — check it against the PR's
+NON-CAS surfaces (src/Disks 300 files/+136k incl. DiskObjectStorageTransaction, S3ObjectStorage,
+IDiskTransaction, IMetadataStorage, AsynchronousBoundedReadBuffer).
