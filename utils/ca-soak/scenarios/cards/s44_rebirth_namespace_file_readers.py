@@ -15,7 +15,12 @@ because a mutation's entry is itself a namespace file appended via the life-keye
 the table is dropped and recreated under the SAME name is exactly the "reader/writer captured against
 an old life" hazard this scenario probes. A live smoke run (2026-08-03, 6 cycles, seed 1) confirms the
 mechanism itself is sound: the mutation writer ran concurrently through every drop/recreate cycle,
-applied 54 mutations, and raised nothing beyond the expected drop-window `UNKNOWN_TABLE`. Whether this
+applied 54 mutations, and raised nothing beyond the expected drop-window race (a mutation refused
+outright while `DROP TABLE ... SYNC` is in flight -- either as `UNKNOWN_TABLE` once the catalog entry
+is gone, or as `StorageReplicatedMergeTree::mutate`'s own "shutdown called" refusal while the table's
+per-storage shutdown is in progress but the catalog entry has not yet been removed; a faster full-scale
+cycle rate shifts more attempts into the second, narrower window -- both are a clean refusal before any
+mutation entry is created, never a partial apply). Whether this
 SQL-level proxy is a fully faithful stand-in for a raw namespace-file reader/writer (as opposed to only
 exercising the same `writeFile` code path from one call site) is a design judgment still open to
 whoever signs off on T8 Step 3 -- this validation pass confirms the card RUNS and its assertions
@@ -46,8 +51,12 @@ _VIOLATION_EVENTS = ("CASRefNeedsRecovery", "CASRefRecoveryStreamHole")
 
 def _mutation_writer(node, stop_flag, errors, applied_counter):
     """Continuously issues `ALTER TABLE ... UPDATE` against `_TABLE` -- a namespace-file (mutation
-    entry) writer. Tolerates "table does not exist" (the recreate window) as expected, not an error;
-    anything else is recorded."""
+    entry) writer. Tolerates two shapes of the SAME drop-window race, both a clean outright refusal
+    rather than a partial apply: "table does not exist" (the catalog entry is already gone) and
+    "Cannot assign mutation because shutdown called" (`StorageReplicatedMergeTree::mutate` refuses
+    before creating any mutation entry once the table's own per-storage shutdown -- triggered by
+    `DROP TABLE ... SYNC` -- has started, so nothing is applied and nothing can leak into a
+    different incarnation). Anything else is recorded."""
     i = 0
     while not stop_flag["stop"]:
         i += 1
@@ -59,7 +68,8 @@ def _mutation_writer(node, stop_flag, errors, applied_counter):
             applied_counter[0] += 1
         except Exception as e:
             msg = str(e)
-            if "doesn't exist" not in msg and "UNKNOWN_TABLE" not in msg:
+            if ("doesn't exist" not in msg and "UNKNOWN_TABLE" not in msg
+                    and "shutdown called" not in msg):
                 errors.append(msg)
         time.sleep(0.2)
 
@@ -110,7 +120,7 @@ class S44(Scenario):
 
         result.add(Verdict.check(
             "no unexpected mutation errors across incarnation boundaries",
-            "errors == 0 (besides the expected drop-window UNKNOWN_TABLE)",
+            "errors == 0 (besides the expected drop-window refusals, UNKNOWN_TABLE / shutdown called)",
             f"errors={len(mutation_errors)}", not mutation_errors,
             "any OTHER exception from the mutation writer suggests a mutation entry (a namespace file) "
             "was applied against, or leaked into, the wrong incarnation"))
