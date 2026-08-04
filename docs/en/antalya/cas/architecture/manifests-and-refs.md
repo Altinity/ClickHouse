@@ -210,19 +210,27 @@ by the successor's stale-precommit sweep, described above.
 
 ## Recovery {#recovery}
 
-Recovery is lazy per table, on first touch (`Pool/CasRefLedger.cpp`):
+Recovery is lazy per table, on first touch (`Pool/CasRefLedger.cpp`), and reads only named,
+authoritative objects — there is no `LIST` anywhere in this path:
 
-1. One paginated `LIST` of `cas/ns/stream/<life_id>/`; every key is strictly re-parsed and
-   re-matched against the catalog-resolved life and namespace carried in the object body.
-2. Take the greatest snapshot; `GET` and decode with key-to-body binding validation.
-3. Stream every log strictly greater than it, one transaction resident at a time: `GET`, decode,
-   apply, discard.
-4. **Vanish-restart.** An object that disappears between the `LIST` and the `GET` is a concurrent
-   `GC` cleanup, not corruption; restart with a fresh `LIST`, bounded at three attempts.
-5. **Recovery seal.** On an unclean boundary, publish a snapshot at the synthetic id
-   `{my_epoch - 1, UINT64_MAX}` before exposing the table — an id that dominates any straggler the
-   dead epoch could still materialize. A failed seal leaves the table unrecovered, so the next
-   touch retries everything.
+1. **Exact `GET` of `_ckpt`.** The durable checkpoint is the sole source of the recovery grounding:
+   `chooseRecoveryGrounding` derives the base (a snapshot id, or genesis if there is none) and the
+   exact transaction to walk from purely from the checkpoint's own fields
+   (`committed_through`/`checkpoint_snapshot_id`/`life_epoch`) — recovery never enumerates its own
+   stream to find them.
+2. If the grounding names a snapshot, `GET` and decode it as the replay base.
+3. Walk forward by exact key from there, one transaction resident at a time: `GET`
+   `cas/ns/stream/<life_id>/<epoch>-<sequence>`, decode, apply, discard, advance to the next
+   arithmetic id. Every key this walk touches is a dense, deterministic successor of the last —
+   never a listed or guessed one.
+4. **Absence is a decision point, not an error.** Finding a slot empty is either the live epoch's
+   stream legitimately ending there, or — for a dead predecessor epoch — the exact slot where its
+   closing `EpochSeal` must be written before the table may be trusted; the two cases are
+   distinguished by whether the epoch being walked is still live, not by retrying a listing.
+5. Recovery may itself advance `_ckpt` as it replays, each time via a conditional write against the
+   checkpoint it last read; the write is re-verified with a fresh exact `GET` afterward, and a
+   concurrent winner's farther frontier is honored by restarting from that newer checkpoint rather
+   than trusting the write blindly.
 6. Transient network errors retry the whole attempt with capped backoff; corruption and logic
    errors fail fast.
 

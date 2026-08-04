@@ -17,8 +17,7 @@ Checks:
   (`` `like_this` ``) in a member's raw claim must appear verbatim in its
   cluster's canonical_claim. This is a narrow, high-precision proxy for "loses
   no specifics" -- it does not flag paraphrasing, only identifiers, settings,
-  hashes, or function/class names that are entirely dropped or altered
-  (originally found by review: task-5-review.md).
+  hashes, or function/class names that are entirely dropped or altered.
 
 Exit 0 and silent on success; exit 1 with one ERR line per problem otherwise.
 """

@@ -35,7 +35,11 @@ compressed). Issue IDs are never renumbered.
 
 Priority legend: **GATE** = release gate; **HARD** = agreed-necessary, not yet done; **DESIRABLE** =
 valuable, not committed; **DOC** = documentation debt; **TEST/INFRA** = validation/harness/CI;
-**MINOR** = small concrete improvement; **VERIFY** = believed open, confirm before working.
+**MINOR** = small concrete improvement; **VERIFY** = believed open, confirm before working. These
+seven are the canonical set; individual items also carry more specific free-form qualifiers where an
+item's author wanted to say something the seven don't capture (`QUESTION`, `DESIGN QUESTION`, `WATCH`,
+`GAP`, `INFRA`, `LOW`/`LOW-PRI`, `PARTIAL`, `MEASURED`, `IN PROGRESS`, `TRACKED, by design`, and
+similar) — read those as elaborating one of the seven, not as a competing taxonomy.
 
 **2026-08-04 orphaned-open triage merge:** 367 open-verdict clusters from the docs-consolidation
 corpus were 4-way classified; 54 effective new/still-open findings (57 minus 3 rechecked and closed
@@ -194,8 +198,7 @@ upstream PR together with the integration-test fix it forces.
 The record lives with the carve inventory, not here: `docs/superpowers/cas/upstream.md`, §G list plus
 the G-item section below it (site, rationale, the two reviewer-facing details, the latent
 `test_replicated_table_structure_alter` defect it exposed with its mechanism, and the blast-radius
-conclusion). Listed as Workstream A1 in
-`docs/superpowers/specs/2026-07-28-cas-merge-layout-preparation-design.md`.
+conclusion).
 
 ## `[cas-tests-unchecked-optional-deref]` A test that dereferences a disengaged optional takes every later test in the binary with it {#cas-tests-unchecked-optional-deref}
 

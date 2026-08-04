@@ -67,9 +67,9 @@ Ranked by value-per-risk, each backed by real defects it would have prevented.
 
 ## Standing hygiene / prose-review rules {#hygiene-rules}
 
-- **[CLEANUP-dead-prerev6-keys] delete dead pre-rev.6 config keys** — From F4a review 2026-07-21: delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
-- **[CLEANUP-srid-naming-unify] unify `srid`/`server_root_id` naming** — From final-review polish 2026-07-21: unify `content_addressed_garbage_collection_log`'s own `srid` column (and the `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` input-arg shorthand docs) with the spelled-out `server_root_id` naming F3 landed for `system.content_addressed_mounts`.
-- **[CHANGELOG-unknown-config-key-rejection] changelog line owed for unknown-CAS-config-key rejection** — From final-review polish 2026-07-21: write the release-note/changelog line for the now-live unknown-CAS-config-key rejection (fails disk startup on a typo'd key; was previously a silent no-op) once the feature ships.
+- **[CLEANUP-dead-prerev6-keys] delete dead pre-rev.6 config keys** — MINOR — From F4a review 2026-07-21: delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
+- **[CLEANUP-srid-naming-unify] unify `srid`/`server_root_id` naming** — MINOR — From final-review polish 2026-07-21: unify `content_addressed_garbage_collection_log`'s own `srid` column (and the `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` input-arg shorthand docs) with the spelled-out `server_root_id` naming F3 landed for `system.content_addressed_mounts`.
+- **[CHANGELOG-unknown-config-key-rejection] changelog line owed for unknown-CAS-config-key rejection** — MINOR — From final-review polish 2026-07-21: write the release-note/changelog line for the now-live unknown-CAS-config-key rejection (fails disk startup on a typo'd key; was previously a silent no-op) once the feature ships.
 
 ## New findings from the 2026-08-04 orphaned-open triage {#orphan-triage-2026-08-04}
 

@@ -24,9 +24,7 @@ and CA disk lifecycle: startup, decommission, and pool bootstrap.
 
 ## CAS disk lifecycle rev.8 round (FORGET-only) — residuals {#disk-lifecycle-rev8-closure}
 
-Round: spec `docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.8,
-FORGET-only); plan `docs/superpowers/plans/2026-07-22-cas-disk-lifecycle-rev7.md` (17 tasks); problem framing
-`docs/superpowers/specs/2026-07-22-cas-disk-lifecycle-problem-and-constraints.md` (goals G1–G7). G1-G5
+Round: rev.8 (FORGET-only), problem framing goals G1–G7. G1-G5
 resolved this round (isolation fix, throw-not-abort, GC self-exit on Vanished/IdentityLost, generic-code
 correctness, FSCK-on-running advisory).
 
