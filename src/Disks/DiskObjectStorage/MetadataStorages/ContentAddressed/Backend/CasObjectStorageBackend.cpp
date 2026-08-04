@@ -1042,12 +1042,28 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};
 }
 
-Token ObjectStorageBackend::resurrect(ReadBuffer & payload, const String & blob_key,
+Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key,
                                       const String & fresh_header)
 {
     if (mode != Mode::Native)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::resurrect is Native-mode only");
+    {
+        /// EmulatedSingleProcess (local object storage): same unconditional semantics, serialized by
+        /// the emulation's own mutex inside `emuWrite`. The body is drained first -- bounded-memory is
+        /// a Native-path property; the emulated path exists for local disks and tests, and its
+        /// conditional ops materialize bodies anyway.
+        String body = fresh_header;
+        {
+            WriteBufferFromString out(body, AppendModeTag{});
+            copyData(payload, out);
+            out.finalize();
+        }
+        if (body.size() - fresh_header.size() != payload_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "resurrect: source yielded {} payload bytes for {}, declared {} -- nothing was published",
+                body.size() - fresh_header.size(), blob_key, payload_size);
+        std::lock_guard lock(emu_mutex);
+        return emuWrite(blob_key, body, /*meta=*/{});
+    }
 
     /// Unconditional overwrite of the condemned body (plain WriteSettings — no If-Match/If-None-Match).
     /// This is safe by three independent structural properties, not merely "no time to add a
@@ -1067,7 +1083,20 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, const String & blob_
     auto out = object_storage->writeObject(
         StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, WriteSettings{});
     out->write(fresh_header.data(), fresh_header.size());
+    const size_t before = out->count();
     copyData(payload, *out);
+    const size_t streamed = out->count() - before;
+    if (streamed != payload_size)
+    {
+        /// Abort BEFORE finalize: the incomplete multipart upload is discarded and nothing becomes
+        /// current. This is what keeps the unconditional write fail-closed against a source truncated
+        /// after hashing -- a post-write check would run only after the short body had displaced the
+        /// condemned incarnation.
+        out->cancel();
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "resurrect: source yielded {} payload bytes for {}, declared {} -- upload aborted, nothing published",
+            streamed, blob_key, payload_size);
+    }
     out->finalize();
 
     /// The plain write does not reliably surface the destination ETag across dialects, so HEAD the

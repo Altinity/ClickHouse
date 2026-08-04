@@ -704,7 +704,9 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
         /// incarnation by re-uploading OUR OWN staging PAYLOAD under a FRESHLY-tagged envelope header —
         /// NEVER a read/copy of the condemned `key` (`feedback_ca_resurrect_invariant`). We reach here
         /// ONLY after the per-hash meta point-read observed `Condemned` just above, so this overwrites a
-        /// condemned body, never a live blob (INV: never overwrite a live blob).
+        /// condemned body -- or, on a lost race, an equivalent FRESH resurrection of it, which is
+        /// accepted: payloads are content-identical, so the overwrite rotates only envelope and token.
+        /// A live incarnation of DIFFERENT content is unreachable here by the content address itself.
         ///
         /// CRITICAL — a VERBATIM server-side copy of the create-time staging object would reproduce the
         /// condemned incarnation's exact bytes ⇒ identical ETag ⇒ the queued exact-token delete of the
@@ -727,7 +729,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "CAS resurrect: staging object {} is absent", *source.server_side_copy_from);
         staged->stream->ignore(meta.blob_header_len);
-        tok = store->backend().resurrect(*staged->stream, key, fresh_header);
+        tok = store->backend().resurrect(*staged->stream, source.size, key, fresh_header);
         const BlobDepRecord dep = makeDepAndEmit(tok);
         writeResurrectMetaClean(lm);
         return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedS3};
@@ -749,17 +751,11 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// rev.7 [C2]: a raw, uncoupled backend call; fence-checked against the displacement-decision
     /// generation immediately before the durable write.
     store->checkFenceOrThrow(displace_admitted_generation);
-    const Token resurrected = store->backend().resurrect(*payload, key, buildHeader());
-
-    /// The whole-body path used to compare what the source produced against `source.size` before
-    /// writing. Streaming moves that check after the fact: HEAD the incarnation just written and
-    /// compare its length. A source that lies about its size would otherwise publish a body whose
-    /// length disagrees with the manifest entry that names it.
-    const HeadResult written = store->backend().head(key);
-    if (!written.exists || written.size != meta.blob_header_len + source.size)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "uploadFromSource: resurrected blob {} has size {} (exists={}), expected {}",
-            blobIdOf(ref), written.size, written.exists, meta.blob_header_len + source.size);
+    /// `source.size` rides into the write, which counts while streaming and aborts WITHOUT publishing
+    /// on a mismatch -- with an unconditional overwrite, a post-write check would fire only after a
+    /// truncated body had already displaced the condemned incarnation (and could even inspect a racing
+    /// writer's fresh incarnation instead of ours).
+    const Token resurrected = store->backend().resurrect(*payload, source.size, key, buildHeader());
 
     const BlobDepRecord dep = makeDepAndEmit(resurrected);
     writeResurrectMetaClean(lm);

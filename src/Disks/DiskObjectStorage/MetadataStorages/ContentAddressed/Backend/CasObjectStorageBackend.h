@@ -114,7 +114,7 @@ public:
     /// condemned incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag. Plain `WriteSettings`, so
     /// no forced single part and no size ceiling on any dialect.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
-    Token resurrect(ReadBuffer & payload, const String & blob_key, const String & fresh_header) override;
+    Token resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override;
 
     /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool if the
     /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.

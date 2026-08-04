@@ -349,9 +349,21 @@ public:
     /// durable references name content hashes rather than incarnations.
     ///
     /// The caller MUST have observed the current incarnation as `Condemned` (per-hash meta point-read)
-    /// before calling this, so it overwrites a condemned body, never a live blob.
+    /// before calling this. That observation is NOT re-checked at the write: two racing resurrections
+    /// of the same blob may both run, and the loser overwrites the winner's FRESH incarnation. That is
+    /// accepted, not prevented -- the payloads are content-identical by construction and durable
+    /// references name content hashes, so the overwrite rotates the envelope and token of an
+    /// equivalent body. What must never be overwritten is a live incarnation of DIFFERENT content,
+    /// and that is guaranteed by the content address itself, not by this call.
     /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
-    virtual Token resurrect(ReadBuffer & /*payload*/, const String & /*blob_key*/,
+    /// `payload_size` is the payload byte count the caller verified at staging time. The write COUNTS
+    /// while streaming and MUST abort -- publishing nothing -- when the reader yields a different
+    /// number of bytes. With an unconditional write this is the last line of defence: a source
+    /// truncated after hashing would otherwise displace the condemned incarnation with a short body
+    /// that the content address does not match, and a post-write check can only detect it AFTER the
+    /// malformed incarnation became current (and can even inspect a racing writer's incarnation
+    /// instead of its own).
+    virtual Token resurrect(ReadBuffer & /*payload*/, uint64_t /*payload_size*/, const String & /*blob_key*/,
                             const String & /*fresh_header*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,

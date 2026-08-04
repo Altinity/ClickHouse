@@ -144,7 +144,7 @@ public:
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
     DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -174,7 +174,7 @@ public:
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
     DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -691,7 +691,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -765,7 +765,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -872,7 +872,7 @@ TEST(CASPartWriteTxn, PutBlobVanishDuringRevivalReUploadsNotFatal)
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -1350,7 +1350,7 @@ TEST(CASPartWriteTxn, AdoptEvidenceNoBackendOp)
         ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        Token resurrect(DB::ReadBuffer & payload, const String & k, const String & fresh_header) override { return inner->resurrect(payload, k, fresh_header); }
+        Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }

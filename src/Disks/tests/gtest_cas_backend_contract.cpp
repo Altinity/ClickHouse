@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <IO/ReadBufferFromString.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -255,3 +256,46 @@ INSTANTIATE_TEST_SUITE_P(CASLocal, CASBackendContract,
         return std::make_shared<ObjectStorageBackend>(
             DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
     }));
+
+/// The unconditional resurrect counts while streaming and aborts WITHOUT publishing when the reader
+/// yields a different byte count than declared. With no precondition on the write, this is the last
+/// line of defence against a source truncated after hashing: a post-write check would fire only after
+/// the short body had displaced the condemned incarnation.
+TEST_P(CASBackendContract, ResurrectWrongSizePublishesNothing)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/res_short", "condemned-body");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    DB::ReadBufferFromOwnString in{String("short")};
+    EXPECT_THROW(b->resurrect(in, /*payload_size=*/1000, "k/res_short", String("HDR")), DB::Exception);
+
+    const auto got = b->get("k/res_short");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "condemned-body") << "a size-mismatched resurrect must publish nothing";
+    EXPECT_EQ(got->token, created.token);
+}
+
+/// The resurrect works on EVERY mode of every backend -- the emulated (local object storage) mode
+/// included. The former conditional putOverwrite supported local disks, and losing that would make a
+/// condemned blob unrepairable on a local content-addressed disk.
+TEST_P(CASBackendContract, ResurrectReplacesBodyAndMintsFreshToken)
+{
+    auto b = GetParam()();
+    const auto created = b->putIfAbsent("k/res_ok", "condemned-body");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    const String payload = "resurrected-payload";
+    DB::ReadBufferFromOwnString in{payload};
+    const Token fresh = b->resurrect(in, payload.size(), "k/res_ok", String("HDR"));
+    EXPECT_FALSE(fresh.empty());
+    EXPECT_NE(fresh, created.token);
+
+    const auto got = b->get("k/res_ok");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "HDR" + payload);
+
+    /// INV-NO-RETURN: the queued exact-token delete of the condemned incarnation misses the fresh one.
+    EXPECT_EQ(b->deleteExact("k/res_ok", created.token).kind, DeleteOutcome::Kind::TokenMismatch);
+    EXPECT_TRUE(b->head("k/res_ok").exists);
+}

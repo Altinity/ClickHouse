@@ -183,7 +183,7 @@ public:
         return DB::Cas::InMemoryBackend::promoteStaged(staging_key, blob_key);
     }
 
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & blob_key,
+    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & blob_key,
                              const String & fresh_header) override
     {
         /// The source is no longer an argument -- the caller opens the reader -- so `from` is recorded
@@ -191,7 +191,7 @@ public:
         /// below, which counts what was actually READ. That is the stronger check: it observes the I/O
         /// rather than a parameter the backend was told about.
         copy_calls.push_back({String{}, blob_key, /*conditional=*/false});
-        return DB::Cas::InMemoryBackend::resurrect(payload, blob_key, fresh_header);
+        return DB::Cas::InMemoryBackend::resurrect(payload, payload_size, blob_key, fresh_header);
     }
 
     /// Every key READ AS A STREAM, with a count. The resurrect opens its source with `getStream`, so

@@ -155,10 +155,10 @@ public:
         return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
     }
 
-    Token resurrect(DB::ReadBuffer & payload, const String & blob_key, const String & fresh_header) override
+    Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override
     {
         ++resurrect_staged_calls;
-        return InMemoryBackend::resurrect(payload, blob_key, fresh_header);
+        return InMemoryBackend::resurrect(payload, payload_size, blob_key, fresh_header);
     }
 
     std::function<void()> trigger;

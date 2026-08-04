@@ -123,7 +123,7 @@ TEST(CASBackendGeneration, ResurrectIsNotBoundByTheSinglePutCap)
 
     const String payload(1024, 'x');   /// far above the 16-byte cap
     DB::ReadBufferFromOwnString in{payload};
-    const Token tok = b->resurrect(in, "p/gen/res", String("HDR"));
+    const Token tok = b->resurrect(in, payload.size(), "p/gen/res", String("HDR"));
     EXPECT_FALSE(tok.empty());
 
     auto got = b->get("p/gen/res");

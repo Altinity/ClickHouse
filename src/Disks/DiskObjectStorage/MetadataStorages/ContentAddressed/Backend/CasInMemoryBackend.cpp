@@ -307,7 +307,7 @@ PutResult InMemoryBackend::promoteStaged(const String & staging_key, const Strin
     return {PutOutcome::Done, t};
 }
 
-Token InMemoryBackend::resurrect(ReadBuffer & payload, const String & blob_key,
+Token InMemoryBackend::resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key,
                                  const String & fresh_header)
 {
     /// Drain the reader BEFORE taking the lock: the reader may be backed by another object in this
@@ -318,6 +318,11 @@ Token InMemoryBackend::resurrect(ReadBuffer & payload, const String & blob_key,
         copyData(payload, out);
         out.finalize();
     }
+
+    if (body.size() - fresh_header.size() != payload_size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "InMemoryBackend::resurrect: source yielded {} payload bytes for {}, declared {} -- nothing was published",
+            body.size() - fresh_header.size(), blob_key, payload_size);
 
     /// The fresh header makes the resurrected body differ from the condemned incarnation for the same
     /// payload, so a delayed exact-token delete for the old incarnation cannot remove the resurrection

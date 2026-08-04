@@ -454,3 +454,25 @@ deleted; whether GCS should instead be documented as supporting CAS only below a
 and whether the upstream change is worth it for one backend. The answer may legitimately be "cap it,
 document it, and refuse bigger blobs" — that is a design decision, and it has not been made.
 
+
+## `[gc-deferred-round-pays-full-list]` A Deferred GC round still pays the full ref-prefix listing — measured at 23% of server CPU under the parallel stateless lane {#gc-deferred-round-pays-full-list}
+
+Measured live (2026-08-04, `system.trace_log` type=CPU, 10-minute window, evidence in the run's
+`build/cpu_trace_diagnosis.md`): `CasGcScheduler::loop` appeared in 479/2097 (22.8%) of all sampled
+CPU stacks and 70% of background-thread CPU. The single chain
+`runRegularRound → enumerateRefPrefix → Backend::list → LocalObjectStorage::listObjects`
+(`readdir`/`lstat`) was 11.7% — larger than any individual test query. Four test disks each ran a GC
+round at ~1 Hz, and ~89% of those rounds finished `Deferred`: the full directory walk was paid every
+second with no payoff.
+
+Two independent contributors, each with its own fix:
+
+1. **The listing is eager even when the round will defer.** The defer decision (fold threshold /
+   nothing changed) is made AFTER enumerating. A cheap staleness probe before the walk — or feeding
+   the defer decision from the previous round's cursor instead of a fresh enumeration — would make a
+   quiet pool cost near nothing per round. This is the durable fix and applies to production pools,
+   not just tests.
+2. **The disks belonged to finished tests.** This is the known disk-lifecycle leak (custom disks are
+   never torn down on `DROP TABLE`), here given a price for the first time: leaked 1 Hz schedulers
+   from completed tests kept scanning for the rest of the run. The lifecycle redesign
+   (`UNMOUNT` stops background work and ejects the disk) subsumes this half.

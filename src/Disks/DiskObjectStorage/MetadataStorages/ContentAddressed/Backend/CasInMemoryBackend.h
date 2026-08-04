@@ -91,7 +91,7 @@ public:
     /// the resurrection (`INV-NO-RETURN`). The caller must already have established that the
     /// destination is condemned.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
-    Token resurrect(ReadBuffer & payload, const String & blob_key, const String & fresh_header) override;
+    Token resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override;
 
     // ---- Fault-injection controls ----
 
