@@ -136,7 +136,7 @@ the reason was this, not the fix. The test was then narrowed to assert only what
 
 - **[P3.1 Task 6 / S13] live validation of fence-recovery** — TEST — TLA+ gate PASSED and the correctness paths landed (self-remount on GC fence-out is DONE); the gtest sweep + S13 3×-green live gate remain. **Task 5** (decouple renewal from the retired-view sync beat) is likely **MOOT** — freshness-v3 deleted `RetireView`/syncer/`observed_gc_round`; confirm and close.
 - **[A7-residual] gc_scheduler lifetime vs manual rounds** — VERIFY — Believed addressed by `89845c2a544` (shutdown serializes gc_scheduler teardown with health reads; wedged-lane count pinned) on top of the stabilization A7 fix. Confirm no residual: (a) a manual round on a raw pointer captured outside the lock, (b) lazy creation resurrecting a scheduler after shutdown.
-- **[STID-3982-3b48 part 2] mount-lease renewal self-race on an ambiguous client-side timeout aborts the server (SIGABRT/`LOGICAL_ERROR` under ASan)** — HARD — CI-confirmed 2026-07-24 (Altinity PR #2073, run 30019911967, `Stateless tests (amd_asan_ubsan, content_addressed s3 storage, parallel)`, report SHA `0ff1cbf`; that SHA already contains both STID 3982-3b48 fixes — part 1a `8742d746d4e` "vanished mount slot stops renewal without LOGICAL_ERROR" and part 1b `cafb64652d0` "absent mount lease at clean release is a no-op" — so this is a **third, still-open variant** of the same family). Server log timeline: `23:29:53.575 <Error> CasMountLeaseKeeper: background renewal failed transiently, retrying while the lease is still valid: Code 499 ... Code 1000, e.code()=0, Timeout` (a CLIENT-side timeout on the renewal PUT — ambiguous, may have applied server-side) → `23:30:03.613 <Fatal>: Logical error: 'CAS mount-lease: key '.../mount' was touched by a foreign writer — failing closed, never re-minting'` (SIGABRT). Stack: `MountLeaseKeeper::onRenewMismatch` (`CasServerRoot.cpp:879`) falls through all three classified branches (`fenced_by_gc`, `superseded`, `foreign_writer` — none matched) into the base class's generic throw (`SingleWriterSlot::onRenewMismatch`, `CasServerRoot.cpp:1011`), which aborts debug/ASan builds at exception construction (same abort hazard part 1a/1b were written to avoid). Root cause: the timed-out renewal PUT #1 likely SUCCEEDED server-side (bumping the lease body's token/seq) despite the client not observing the ack; the soft "transient, retry" path then re-sends renewal PUT #2 with the STALE pre-timeout token, which mismatches against the (self-)bumped body; the read-back body has `server_uuid == ours`, `writer_epoch == ours`, NOT `gc_fenced` — i.e. it is provably OUR OWN live claim, but none of the three classifier cases models "differs only because of our own in-flight ambiguous retry", so it is misdiagnosed as an unclassifiable/foreign-writer collision. Fix direction: add a 4th classifier case — same-uuid + same-epoch + unfenced + token-differs — recoverable (adopt the newer token as our own successful renewal), not fatal; or make the renewal PUT idempotent/replay-safe (e.g. carry a client-generated request token so a retried request that already landed is recognized rather than conflicting with itself). Also: `amd_msan`/`amd_tsan` CAS-s3 stateless jobs in the SAME run hit the 6h hard job timeout with zero artifacts (no `result_*.json`, no logs, even `gh run view --log` truncates ~seconds into the run) — unknown whether they hit the same crash in a restart loop or hung some other way; see the CI observability-gap note (`reference_cas_ci_observability_gaps.md` #6, a project-memory doc, not yet ported into this backlog's doc set) for the "6h hang leaves no forensic trail" gap this also exposed. **FIXED 2026-07-24** — landed as the fence-not-rescue redesign, spec `specs/2026-07-24-cas-mount-lease-self-race-fix-v2-design.md` rev.4, now Status `IMPLEMENTED`: TLA+ gate `8451222bb14` + `f39f2070bbd`; Phase A classifier `2e5b2df7397` + e2e test `07c8770eb0b`; Phase B keeper anchoring `e6b1d90acc0`, startup-arm `e0ee7af7564` + remount-arm addendum `25e3e34413c` + regression test `683579789c7`; Phase C guard `6094c1473ea` + follow-up `d00cc114af8`. Full `Cas*:CA*` gtest gate green post-landing. Two items from this entry's scope stay open, spec-noted: (a) the `amd_msan`/`amd_tsan` 6h-hang question above (Task F) is still unanswered — unknown whether it was this same crash looping or an unrelated hang; (b) Gate 3 (live CAS-s3 stateless-lane validation, the lane that originally caught the crash) has not been re-run post-fix — lane validation rides the next CI push of `cas-gc-rebuild`.
+- **[STID-3982-3b48 part 2] mount-lease self-race Gate 3 re-run still owed** — {#stid-3982-3b48-part-2} — TEST — A third variant of the mount-lease renewal self-race (ambiguous client-side timeout on the renewal `PUT` misdiagnosed as a foreign-writer collision, SIGABRT under ASan) is fixed and landed 2026-07-24 (fence-not-rescue redesign, spec `specs/2026-07-24-cas-mount-lease-self-race-fix-v2-design.md` rev.4, TLA+-gated, full `Cas*:CA*` green). Open: Gate 3, the live CAS-s3 stateless-lane validation that originally caught the crash, has not been re-run post-fix — rides the next CI push of `cas-gc-rebuild`.
 
 - **[fence-window observability] mount-lease keeper is silent at default log level** — GAP (found 2026-07-28, fence-cascade RCA) — During the msan CA-s3 fence window (run for `07f8398acddff2c`) the server log contains ZERO `CasMountLease*` lines for the whole ~7-minute episode: renewal failures, the fence arming, remount start/phases/completion are all invisible; the episode had to be reconstructed from `executeQuery` error timestamps. The keeper's messages exist (the STID-3982 entry above quotes them from an ASan run) but evidently sit below the effective level or fire only on classifier paths. Fix: log at `Information` (rate-limited) — renewal confirm failure with the underlying error, fence armed (with deadline), remount begin, remount recovery milestones, remount complete with duration. Cheap, pure logging, closes gap #3 of `reference_cas_ci_observability_gaps`.
 - **[fence-window blast radius] durable writes fail instantly for the whole fence→remount window** — DESIGN QUESTION (2026-07-28 RCA) — During fence→remount (~2 min core window + straggler tails on the msan lane), every durable write returns `668`/`210` immediately; user queries (test INSERTs) get hard errors while an internal `CasWriteRetryLater` lane already exists for system-table flushes. A bounded wait-for-remount on the query write path (block up to N seconds while the self-remount is in flight, then fail) would turn short fence windows into latency instead of failures — the same contract RMT gives during a Keeper reconnect. Behavior change on the write path — needs a design decision, do NOT slip it in as a patch. Related: the remount itself took ~2 min under msan; once the keeper logging (entry above) lands, measure WHERE remount time goes (lease-expiry wait vs recovery replay) before tuning anything.
@@ -607,22 +607,13 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
   answers the mutation-possibility check from its nested storage rather than the `IStorage` default) — sound,
   but call it out explicitly (codex F5).
 
-## CAS disk lifecycle rev.8 round (FORGET-only) — closure + residuals (2026-07-23) {#disk-lifecycle-rev8-closure}
+## CAS disk lifecycle rev.8 round (FORGET-only) — residuals {#disk-lifecycle-rev8-closure}
 
 Round: spec `docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md` (rev.8,
 FORGET-only); plan `docs/superpowers/plans/2026-07-22-cas-disk-lifecycle-rev7.md` (17 tasks); problem framing
-`docs/superpowers/specs/2026-07-22-cas-disk-lifecycle-problem-and-constraints.md` (goals G1–G7).
-
-**Resolved this round:**
-- **G4 / `05020` test isolation** — `05020_content_addressed_fsck` (+ the `04290`/`04295` family) now use a
-  unique per-run disk name + pool path (plan Tasks 1–2). The old fixed-name registry entry that made a
-  same-server retry reuse a stale disk and trip `throwNotMounted` on `GC RUN` is gone; the Dormant/UNMOUNT
-  husk state it depended on was also rolled back (Task 15), so that failure mode no longer exists at all.
-- **G1 abort / G2 zombie-spam (terminal case)** — the lease-loss six-class gate throws instead of aborting
-  (G1's no-abort was Part 1, landed earlier); the GC scheduler now self-exits on `Vanished`/`IdentityLost`
-  (whole-increment-review C1 fix, `1fe585ea078`), closing the eternal `CORRUPTED_DATA`-every-tick class.
-- **G3 generic-code correctness** — the throw-when-uncertain gate + the empty-proof rule kill the
-  silent-empty ATTACH (plan Tasks 5/8/9); **G5 FSCK-on-running** with the `meta_without_body` advisory (Task 13).
+`docs/superpowers/specs/2026-07-22-cas-disk-lifecycle-problem-and-constraints.md` (goals G1–G7). G1-G5
+resolved this round (isolation fix, throw-not-abort, GC self-exit on Vanished/IdentityLost, generic-code
+correctness, FSCK-on-running advisory).
 
 **NOT resolved (deliberately deferred):** the underlying **disk-lifecycle-leak** proper — a CA disk is still
 cached forever in the disk registry (`Context::getOrCreateDisk`) with no teardown/eject on `DROP TABLE`, and
@@ -791,36 +782,9 @@ or adopt the pool's existing owner uuid and mount as it (`Pool::openForDecommiss
 `CasPool.cpp:720-776`, already does exactly this — the reading that looks strictly better). Not the
 read-only-mount task, which is separate and unimplemented.
 
-## Part B pre-merge review — RESOLVED except one residual window {#partb-review-findings}
+- **[partb-review-findings] `eraseView`/`publishStaging` no-throw-after-commit residual** — {#partb-review-findings} — MINOR — The 2026-07-25 publish-confirm protocol review's two blockers and two majors are fixed (`8e6fe6ef0af`); the one residual window: `eraseView` still runs after the durable commit and can throw, and `ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after `promoteBuild` returns — closing it means extending the no-throw-after-commit discipline one frame outward.
 
-The 2026-07-25 codex review of the publish-confirm protocol (23-file diff) found two blockers and
-two majors; fixed in `8e6fe6ef0af` (gate 1373/1373, five new tests each seen red first, integration
-11/11). Blocker 2 (uncertain `precommitAdd` losing its cleanup owner), major 3 (promote reported as
-fallback after a real commit), and major 4 (move assignment discarding a terminal duty) are closed.
-Blocker 1 ("a completed recovery can expose a stale row and authorize `Yes`") was downgraded, not
-fixed: the user correctly identified it inherits the mount's own trust rather than introducing a new
-one — it is the same [`{#list-as-journal-dataloss-2026-07-25}`](#list-as-journal-dataloss-2026-07-25)
-finding through the confirm lens, and that finding is itself now resolved by the v9 redesign. **One
-residual window remains, flagged not fixed:** `eraseView` still runs after the durable commit and can
-throw, and `ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after
-`promoteBuild` returns — closing it means extending the no-throw-after-commit discipline one frame
-outward.
-
-## fsck large-pool reporting: three residuals left after the 2026-07-26 fix {#fsck-large-pool-fixed}
-
-Task #13 fixed `corrupted_runs` visibility/fatality, the inverted timeout budgets that made
-`--partial` unreachable, and the fabricated-clean-on-partial hazard (all landed, tested). Three
-residuals remain open:
-- **The `M-F debris, B140` mislabel** (`checker.py`/`run.py`/`plot.py` docstrings) is still printed;
-  the product classifies these as `AwaitingGc`, not the old B140 rationale. Docstring cleanup only.
-- **`FsckTimeout` still substitutes fabricated `{"dangling": 0, ...}` zeros** on the remaining
-  timeout path (`{#fsck-fabricated-clean-on-timeout}`). Not a live defect (every consumer is guarded
-  by `not _detail_fsck_skipped`), but a landmine — fixing it needs auditing every downstream
-  `f.get(...)`, deliberately not bolted onto the task #13 fix.
-- **The GC-checkpoint entry-gate fsck still does not finish** on a pool as small as 5.5 GB within
-  its 180 s budget — task #13 made the timeout degrade honestly (a logged skip, not a fake OK), but
-  the gate still does not run. Options not yet chosen: scale the budget with pool size, use
-  `--partial` deliberately as a lower bound, or make fsck itself cheaper.
+- **[fsck-large-pool-fixed] fsck large-pool reporting: three residuals after the 2026-07-26 fix** — {#fsck-large-pool-fixed} — MINOR — `corrupted_runs` visibility/fatality, inverted timeout budgets, and fabricated-clean-on-partial are fixed. Open: (a) `checker.py`/`run.py`/`plot.py` still print the old `M-F debris, B140` label for what the product now classifies as `AwaitingGc` (docstring cleanup only); (b) `FsckTimeout` still substitutes fabricated `{"dangling": 0, ...}` zeros on the remaining timeout path — landmine, not a live defect (every consumer guards on `not _detail_fsck_skipped`), fixing it needs auditing every downstream `f.get(...)`; (c) the GC-checkpoint entry-gate fsck still does not finish on a 5.5 GB pool within its 180s budget — options not yet chosen (scale the budget, use `--partial` as a lower bound, or make fsck cheaper).
 
 - **[S42-ci-verdict] S42 memory-exhaustion card needs a clean re-run to certify** — {#s42-ci-verdict} — TEST — `ci`-scale S42 passed every safety signal (2,184 injected allocation faults fired, `CasRefApplyPoisoned=0`, both wedged ref lanes recovered, `CasGcUnmatchedRemoveDeltas=0`, 11,960 acked blocks survived) but failed 2/28 of its own strict verdicts on request-timeout cascades traced to a compromised host (still recovering from a prior `--scale full` attempt, load average 22-48). Not evidence of a defect, but not a certification either — re-run on a quiet host before calling S42 green.
 
@@ -1067,36 +1031,7 @@ Ranked by value-per-risk, each backed by real defects it would have prevented.
    (`FsckReport::clean` from a `static_assert`-guarded list; the gtest suite-list generator failing
    loud on any unclaimed suite) — every remaining "whenever X, also do Y" code comment is a candidate.
 
-## A GC-level backstop for never-born `_ckpt` debris — and Task 3's closure of it was unsound {#ckpt-neverborn-gc-backstop}
-
-Filed 2026-07-30 when Task 4-C removed all three `cleanupOrphanedBirthCkptBestEffort` call sites. **This
-reopens `{#ckpt-failed-birth-debris}`, whose CLOSED marker from Task 3 must not be trusted** — the closure
-shipped a delete whose safety argument contradicted its own trigger conditions.
-
-**Why the delete had to go, not be guarded.** All three call sites sit inside the `CORRUPTED_DATA` path,
-which by `putIfAbsentControlled`'s own doc means *a different object already occupies this transaction's
-derived key*. So every trigger condition **proves the ref-log is non-empty at that key**, while the comment
-justifying the delete rests on "reachable only while the namespace's ref-log has never durably held
-anything". Contradictory, and contradictory on every branch that calls it — not in a corner case. A
-successor that observed the seal and adopted the live incarnation could have its current `_ckpt` deleted, and
-`_ckpt` has no repair path.
-
-Binding the delete to a token captured at publish time does **not** fix it either: a successor that only
-READ `_ckpt` leaves the token matching, so the delete still succeeds against a record that successor's
-recovery already leaned on. And a partial guard standing beside a removed operation reads as a licence to
-reinstate it, which is the shape that has already cost this campaign a "fix" that made a correct change look
-like a regression.
-
-**The trade, stated as a trade.** We exchanged *may delete a live successor's `_ckpt`, unrecoverable* for
-*debris survives until a backstop exists, operator-visible*. The cost is real: permanent debris makes a
-drained server root REFUSE decommission (`claimOwnerOrThrow` → `CORRUPTED_DATA`), which is exactly what the
-original entry described. Accepted, because a fallback path must never take a destructive action — skip it
-and surface the problem.
-
-**What the backstop must do**, mirroring the existing REMOVED-namespace `_ckpt` backstop in `CasGc.cpp`:
-reclaim a never-born namespace's `_ckpt` only after **independently re-verifying emptiness with a real
-LIST**, never by inferring it from one attempt's own conflict. That independence is the entire difference
-between the backstop and the thing that was removed.
+- **[ckpt-neverborn-gc-backstop] GC-level backstop needed for never-born `_ckpt` debris** — {#ckpt-neverborn-gc-backstop} — HARD — Task 4-C removed all three `cleanupOrphanedBirthCkptBestEffort` call sites: each sat on the `CORRUPTED_DATA` path, which by `putIfAbsentControlled`'s own contract means the ref-log at that key is non-empty — contradicting the delete's own "never durably held anything" justification, so a successor's live `_ckpt` could be deleted unrecoverably. Correctly removed rather than guarded (a fallback must never take a destructive action). Traded for: permanent debris that makes a drained server root refuse decommission (`claimOwnerOrThrow` → `CORRUPTED_DATA`), operator-visible. The needed backstop, mirroring the existing REMOVED-namespace `_ckpt` backstop in `CasGc.cpp`: reclaim a never-born namespace's `_ckpt` only after independently re-verifying emptiness with a real LIST, never by inferring it from one attempt's own conflict.
 
 ## The uniform catalog-admission pin removed the suite's ability to test the un-admitted case {#uniform-pin-removed-testability}
 
