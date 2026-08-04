@@ -77,13 +77,14 @@ The implementation was built test-first (TDD), and the coverage is corresponding
 |---|---|
 | Unit tests (`gtest`, `CAS*` suites) | ~1,900 test cases across ~130 files, covering formats, the write and read paths, the ref machinery, `GC`, recovery, and the backend contract |
 | Integration tests | 10 dedicated `test_cas_*` suites (shared pools, `GC` on S3, sharded `GC`, relink replication, fault-injected `INSERT` recovery, member decommission, and more) |
-| Stateless tests | over 200 `CAS`-specific tests, in addition to the whole standard suite running on a `CAS`-default server (below) |
+| Stateless tests | dozens of dedicated `CAS` tests (pool integrity, leftovers, fsck, GC), in addition to the whole standard suite running on a `CAS`-default server (below) |
 
 ## The whole test suite, on CAS by default {#stateless-suite-on-cas}
 
 Beyond the model corpus and the soak harness, the standard ClickHouse **stateless test suite runs
 green with `CAS` as the default `MergeTree` storage**: dedicated CI lanes
-(`stateless_tests_*_cas_storage_*`) run every stateless test against a server whose default disk is
+(the `cas storage` and `cas s3 storage` job families — the latter covering ASan/TSan/MSan/UBSan
+and ARM against a real S3-compatible store) run every stateless test against a server whose default disk is
 a `CAS` pool. A small set of tests carries the `no-cas-storage` tag and is skipped in those lanes —
 tests that exercise a mechanism a content-addressed disk deliberately does not have (for example,
 `s3_plain` layouts or deliberately corrupted on-disk part chains). Everything else — the thousands
