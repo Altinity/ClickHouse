@@ -4148,6 +4148,209 @@ TEST(CASRefWriterNamespaceRemoval, RemovalAppendFailureLeavesRemovingAndRetryCom
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->stageManifest({}); });
 }
 
+/// FINDING #2 (dropns fix) unit prescription item 6: `namespaceStillLogicallyPresent` must stay `true`
+/// for the entire window between the catalog's durable `Live -> Removing` transition and the terminal
+/// `remove_namespace` append actually landing -- the crash-shaped case the fix exists for. Reuses the
+/// injected stream-write fault shape from `RemovalAppendFailureLeavesRemovingAndRetryCompletes`.
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeStaysTrueThroughRemovingUntilTerminalRetrySucceeds)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/presence_removing_no_terminal"};
+
+    publishEmptyPart(store, ns, "committed");
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+
+    ASSERT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Removing);
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
+        << "the catalog transitioned but the terminal append never landed -- cleanup is unproven";
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns))
+        << "the retried removal's terminal is now durable";
+}
+
+/// Item 7: a `Creating` row is conservative in both directions -- present, and removal refuses to
+/// cancel it while its creator fence cannot be proven dead, then succeeds once a terminal certificate
+/// (here, a GC-fenced lease for the same server root) makes the fence provably terminal.
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaitsForCreatorFenceTerminality)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/presence_still_creating"};
+
+    CatalogEntry entry;
+    entry.ns = ns;
+    entry.state = NsState::Creating;
+    entry.incarnation = UInt128(99);
+    entry.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, entry);
+
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+
+    /// The creator fence names an unmounted server root: `isCreatorFenceTerminal` cannot certify it
+    /// dead (absence proves nothing), so removal fails closed rather than cancelling a `Creating` row a
+    /// live writer might still publish into.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+    EXPECT_EQ(catalogEntryOrThrow(*backend, layout, ns).state, NsState::Creating);
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+
+    /// Publish a GC-fenced lease for the SAME server root -- one of `isCreatorFenceTerminal`'s accepted
+    /// certificates -- and removal now cancels the row outright (no `Removing` transition for a
+    /// namespace that never reached `Live`).
+    MountLease dead;
+    dead.writer_epoch = store->liveWriterEpoch();
+    dead.gc_fenced = true;
+    dead.seq = 1;
+    backend->putIfAbsent(layout.mountKey("srv1"), encodeMountLease(dead));
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+}
+
+/// Item 8: a "no catalog row" observation must never be turned into `false` by a race. Pausing the
+/// probe right after its first catalog read and admitting a fresh `Creating` row before it resumes
+/// must surface as a typed retry, not a stale absent answer; an unchanged catalog across both reads
+/// legitimately settles on absent.
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeNoRowObservationRevalidatesRatherThanRacingToAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace racing{"srv1/presence_no_row_races_birth"};
+    const RootNamespace stable{"srv1/presence_no_row_stays_absent"};
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool paused = false;
+    bool resume = false;
+    store->setNamespacePresenceProbeAfterFirstReadHookForTest([&]
+    {
+        std::unique_lock lock(mutex);
+        paused = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return resume; });
+    });
+
+    std::exception_ptr raced_error;
+    std::thread racer([&]
+    {
+        try
+        {
+            (void)store->namespaceStillLogicallyPresent(racing);
+        }
+        catch (...)
+        {
+            raced_error = std::current_exception();
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return paused; });
+    }
+
+    CatalogEntry born;
+    born.ns = racing;
+    born.state = NsState::Creating;
+    born.incarnation = UInt128(1234);
+    born.creator = CreatorFence{.server_root_id = "srv1", .writer_epoch = store->liveWriterEpoch(), .fence_generation = 1};
+    CasRefCatalog::casAdmitEntry(*backend, layout, 1, born);
+
+    {
+        std::lock_guard lock(mutex);
+        resume = true;
+    }
+    cv.notify_all();
+    racer.join();
+    store->setNamespacePresenceProbeAfterFirstReadHookForTest(nullptr);
+
+    ASSERT_TRUE(raced_error) << "a namespace born after the first read must never resolve to a stale absent";
+    EXPECT_THROW(std::rethrow_exception(raced_error), DB::Exception);
+
+    /// Negative control: an unraced, genuinely absent namespace settles on `false`.
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(stable));
+}
+
+/// Item 9 (partial -- see the dropns-fix draft report for the two sub-cases NOT covered here): every
+/// unreadable or ambiguous observation must throw, never answer `false`. Covers a catalog `GET`
+/// failure on the probe's very first read, and a lost mount fence discovered mid-probe.
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeCatalogReadFailurePropagatesRatherThanAnsweringAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/presence_catalog_read_fault"};
+
+    backend->catalog_fault_key = store->layout().refCatalogKey();
+    backend->catalog_gets_before_fault = 0;
+    backend->catalog_get_fault_count = 1;
+    EXPECT_THROW((void)store->namespaceStillLogicallyPresent(ns), std::runtime_error);
+}
+
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeFenceLossPropagatesRatherThanAnsweringAbsent)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/presence_fence_loss"};
+    publishEmptyPart(store, ns, "x");
+
+    const String mount_key = store->layout().mountKey("test");
+    const auto got = backend->get(mount_key);
+    ASSERT_TRUE(got);
+    MountLease foreign = decodeMountLease(got->bytes);
+    foreign.server_uuid = foreign.server_uuid + UInt128{1};
+    foreign.seq += 1;
+    ASSERT_EQ(backend->putOverwrite(mount_key, encodeMountLease(foreign), got->token).outcome, PutOutcome::Done);
+    store->tripMountLost();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { (void)store->namespaceStillLogicallyPresent(ns); });
+}
+
+/// Item 10: pin all three facade states against each other on one namespace -- `Live` (present, content
+/// readable), incomplete `Removing` (present, content deliberately unreadable), and terminal `Removing`
+/// (absent, immediately, no GC).
+TEST(CASRefWriterNamespaceRemoval, PresenceProbeFacadeConsistencyAcrossRemovalLifecycle)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = kSingleAttemptDeadlineMs;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/presence_facade_consistency"};
+
+    publishEmptyPart(store, ns, "committed");
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns));
+    EXPECT_FALSE(store->listRefs(ns).empty());
+
+    backend->fault_key_substr = layout.namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
+
+    EXPECT_TRUE(store->namespaceStillLogicallyPresent(ns))
+        << "present for cleanup, even though content below is about to prove unreadable";
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(ns).has_value());
+    EXPECT_FALSE(store->resolveRef(ns, "committed").has_value());
+
+    EXPECT_NO_THROW(store->dropNamespace(ns));
+    EXPECT_FALSE(store->namespaceStillLogicallyPresent(ns));
+    EXPECT_FALSE(store->namespaceFilesLifeIfReadable(ns).has_value());
+}
+
 /// Cancellation is namespace-scoped: dropping namespace N must not cancel an in-flight build targeting a
 /// DIFFERENT namespace M -- that build promotes normally.
 TEST(CASRefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespaces)

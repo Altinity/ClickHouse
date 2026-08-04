@@ -730,6 +730,40 @@ TEST(CASWiringRead, VerbatimNamespaceFiles)
     EXPECT_FALSE(storage->existsFile("clickhouse_access_check_other"));
 }
 
+/// FINDING #2 (dropns fix): DirShape::TableDir's existsDirectory used to answer "has at least one
+/// committed part", so an Atomic table that only ever wrote its namespace-level format_version.txt
+/// (no part published yet) reported its own root as absent. `existsDirectory` is the precheck
+/// `MergeTreeData::dropAllData` uses to decide whether `removeRecursive`/`dropNamespace` needs to run
+/// at all -- a false negative here means `DROP TABLE` on such a table never admits removal, leaking a
+/// `Live` catalog row forever.
+TEST(CASWiringRead, TableRootExistsWithNamespaceFilesButNoCommittedRef)
+{
+    auto storage = openWiringStorage();
+    storage->store()->putNamespaceFile(wiringLife(*storage), "format_version.txt", "1\n");
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
+}
+
+/// Same defect, non-Atomic fallback shape (`parseTableUuid` folds the whole leading path into the
+/// "uuid"): a files-only table under `data/<db>/<table>` must be present too.
+TEST(CASWiringRead, TableRootExistsWithNamespaceFilesButNoCommittedRefNonAtomic)
+{
+    auto storage = openWiringStorage();
+    const auto ns = storage->liveNamespace("data/memory_01069/mt");
+    storage->store()->putNamespaceFile(storage->store()->namespaceLife(ns), "format_version.txt", "1\n");
+    EXPECT_TRUE(storage->existsDirectory("data/memory_01069/mt"));
+}
+
+/// A cataloged `Live` life with ZERO refs and ZERO namespace files -- not just zero refs -- must still
+/// report present. `namespaceLife` is the write-side resolution that mints a `Live` catalog row on
+/// first touch; calling it alone (no ref, no namespace file written afterward) is the minimal way to
+/// reach this state, and it prevents a future regression from "catalog OR files" back to "files only".
+TEST(CASWiringRead, EmptyCatalogedLiveTableRootExists)
+{
+    auto storage = openWiringStorage();
+    (void)storage->store()->namespaceLife(storage->liveNamespace("a55a55a5-5555-4555-8555-555555555555"));
+    EXPECT_TRUE(storage->existsDirectory("a55/a55a55a5-5555-4555-8555-555555555555"));
+}
+
 /// C4: the fixed dispatch order is the invariant. Pins the two ambiguous early guards that make the
 /// order load-bearing: store/<u3> (AtomicShard, ambiguous with the non-Atomic table fallback) and a
 /// shadow table dir (which also satisfies parseTableUuid). existsDirectory/listDirectory must agree.
@@ -1006,6 +1040,50 @@ TEST(CASWiringOps, RemovalsDropRefsAndNamespaces)
     tx2->removeRecursive("a11/a11a11a1-1111-4111-8111-111111111111", {});
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"));
+}
+
+/// The negative test that forbids hooking last-part removal as table-drop admission (FINDING #2's
+/// direction B, rejected by the consult): removing a table's ONLY part is indistinguishable, from that
+/// call alone, from a merge, a TTL cleanup, or a `TRUNCATE` that leaves the table usable. The root must
+/// stay present, and a fresh part must still be publishable into it.
+TEST(CASWiringOps, LastRefRemovalIsNotNamespaceRemoval)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "a66/a66a66a6-6666-4666-8666-666666666666/all_1_1_0/data.bin", "only-part");
+    tx->commit(DB::NoCommitOptions{});
+    storage->store()->putNamespaceFile(
+        storage->store()->namespaceLife(storage->liveNamespace("a66a66a6-6666-4666-8666-666666666666")),
+        "format_version.txt", "1\n");
+
+    auto tx2 = storage->createTransaction();
+    tx2->removeDirectory("a66/a66a66a6-6666-4666-8666-666666666666/all_1_1_0");
+    EXPECT_FALSE(storage->existsDirectory("a66/a66a66a6-6666-4666-8666-666666666666/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("a66/a66a66a6-6666-4666-8666-666666666666"))
+        << "removing the table's last part must not be treated as DROP TABLE admission";
+
+    auto tx3 = storage->createTransaction();
+    writeThroughTransaction(*tx3, "a66/a66a66a6-6666-4666-8666-666666666666/all_2_2_0/data.bin", "new-part");
+    tx3->commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(storage->existsDirectory("a66/a66a66a6-6666-4666-8666-666666666666/all_2_2_0"))
+        << "the namespace never transitioned to Removing, so a fresh part publishes normally";
+}
+
+/// A files-only table root (no part ever published) becomes logically absent IMMEDIATELY once
+/// `removeRecursive` durably completes the removal -- no GC round required. This is the same-call
+/// synchronous half of the fix: `DROP TABLE ... SYNC` must not depend on GC latency to observe removal.
+TEST(CASWiringOps, FilesOnlyTableRootRemovalIsImmediatelyAbsentWithoutGc)
+{
+    auto storage = openWiringStorage();
+    const auto ns = storage->liveNamespace("a77a77a7-7777-4777-8777-777777777777");
+    storage->store()->putNamespaceFile(storage->store()->namespaceLife(ns), "format_version.txt", "1\n");
+    EXPECT_TRUE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777"));
+
+    auto tx = storage->createTransaction();
+    tx->removeRecursive("a77/a77a77a7-7777-4777-8777-777777777777", {});
+    EXPECT_FALSE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777"))
+        << "the terminal remove_namespace transaction is durable synchronously";
+    EXPECT_FALSE(storage->existsFile("a77/a77a77a7-7777-4777-8777-777777777777/format_version.txt"));
 }
 
 /// REMOVED (all-tree-part-files Task 6, spec 2026-07-14-cas-all-tree-part-files-design.md §4):

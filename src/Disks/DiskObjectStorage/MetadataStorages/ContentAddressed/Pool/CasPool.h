@@ -934,6 +934,10 @@ public:
     {
         ref_ledger.setWedgeBeforeSlotOccupyHookForTest(std::move(hook));
     }
+    void setNamespacePresenceProbeAfterFirstReadHookForTest(std::function<void()> hook)
+    {
+        ref_ledger.setNamespacePresenceProbeAfterFirstReadHookForTest(std::move(hook));
+    }
     uint64_t recoveryInstallCountForTest() const { return ref_ledger.recoveryInstallCountForTest(); }
 
     /// Test-only: fault seam for the ref-flush two-phase carve/validation protocol; forwards to

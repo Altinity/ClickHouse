@@ -4784,6 +4784,8 @@ bool CasRefLedger::namespaceStillLogicallyPresent(const RootNamespace & ns)
     check_fence_or_throw(admitted_generation);
     const CasRefCatalog::Snapshot first_catalog = CasRefCatalog::read(backend, layout);
     check_fence_or_throw(admitted_generation);
+    if (namespace_presence_probe_after_first_read_hook_for_test)
+        namespace_presence_probe_after_first_read_hook_for_test();
     const auto find_entry = [&ns](const CasRefCatalog::Snapshot & snap) -> const CatalogEntry *
     {
         const auto it = std::find_if(snap.catalog.entries.begin(), snap.catalog.entries.end(),
