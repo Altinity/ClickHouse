@@ -11,6 +11,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
 }
 }
@@ -320,7 +321,7 @@ Token InMemoryBackend::resurrect(ReadBuffer & payload, uint64_t payload_size, co
     }
 
     if (body.size() - fresh_header.size() != payload_size)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
             "InMemoryBackend::resurrect: source yielded {} payload bytes for {}, declared {} -- nothing was published",
             body.size() - fresh_header.size(), blob_key, payload_size);
 

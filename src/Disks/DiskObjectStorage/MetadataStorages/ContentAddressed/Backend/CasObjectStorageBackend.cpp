@@ -31,6 +31,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
 }
@@ -1058,7 +1059,7 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
             out.finalize();
         }
         if (body.size() - fresh_header.size() != payload_size)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "resurrect: source yielded {} payload bytes for {}, declared {} -- nothing was published",
                 body.size() - fresh_header.size(), blob_key, payload_size);
         std::lock_guard lock(emu_mutex);
@@ -1093,7 +1094,7 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
         /// after hashing -- a post-write check would run only after the short body had displaced the
         /// condemned incarnation.
         out->cancel();
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
             "resurrect: source yielded {} payload bytes for {}, declared {} -- upload aborted, nothing published",
             streamed, blob_key, payload_size);
     }
