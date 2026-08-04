@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBuffer.h>
@@ -493,7 +494,8 @@ TEST(CASPartWriteTxn, PutBlobWrongSizeFailsClosed)
 
     BlobSource lying;
     lying.size = 11;   /// declares 11 but writes 5
-    lying.write_payload = [](DB::WriteBuffer & out) { DB::writeString(std::string_view("short"), out); };
+    lying.open = []() -> std::unique_ptr<DB::ReadBuffer>
+    { return std::make_unique<DB::ReadBufferFromOwnString>(String("short")); };
 
     const BlobRef id = idOf("does-not-matter");
     EXPECT_DEATH(
@@ -507,10 +509,10 @@ TEST(CASPartWriteTxn, PutBlobWrongSizeFailsClosed)
 }
 
 /// The happy-path upload STREAMS the source directly into the put sink — it does NOT pre-materialize the
-/// whole blob into an in-memory String before the I/O. We assert this by counting `write_payload`
+/// whole blob into an in-memory String before the I/O. We assert this by counting `open`
 /// invocations: a single fresh upload must invoke it EXACTLY ONCE (streamed straight into the sink). The
 /// previous implementation buffered the whole blob into a `String source_bytes` first (a full in-memory
-/// copy whose peak grew ~linearly with the blob size — the OOM); that pass would invoke `write_payload`
+/// copy whose peak grew ~linearly with the blob size — the OOM); that pass would invoke `open`
 /// before the sink write. One invocation here is the streaming-not-materializing guarantee.
 TEST(CASPartWriteTxn, PutBlobStreamsSourceOnceNoFullMaterialization)
 {
@@ -522,10 +524,10 @@ TEST(CASPartWriteTxn, PutBlobStreamsSourceOnceNoFullMaterialization)
     int invocations = 0;
     BlobSource source;
     source.size = payload.size();
-    source.write_payload = [&invocations, &payload](DB::WriteBuffer & out)
+    source.open = [&invocations, &payload]() -> std::unique_ptr<DB::ReadBuffer>
     {
         ++invocations;
-        DB::writeString(payload, out);
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
     };
 
     auto ref = build->putBlob(idOf(payload), std::move(source));
@@ -2231,7 +2233,7 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 /// controller — the BLOB body `putIfAbsentStream` create and `promoteStaged`'s conditional
 /// server-side copy (both issued inside `PartWriteTxn::uploadFromSource`'s streamIfAbsent) — now ride the
 /// same budgeted-attempts machinery. Reissue re-streams from the writer's REPLAYABLE source
-/// (`BlobSource::write_payload` re-reads the staged temp file / re-issues the copy from the intact
+/// (`BlobSource::open` re-reads the staged temp file / re-issues the copy from the intact
 /// staging object — INV-1, never a GET-revive); ambiguity resolves by exact-key OCCUPANCY (the key
 /// embeds the content hash, so any occupant IS the intended content — the same trust model as the
 /// plain 412-adopt path).
@@ -2328,10 +2330,10 @@ BlobSource countingSource(const String & payload, int & payload_streams)
 {
     BlobSource source;
     source.size = payload.size();
-    source.write_payload = [payload, &payload_streams](DB::WriteBuffer & out)
+    source.open = [payload, &payload_streams]() -> std::unique_ptr<DB::ReadBuffer>
     {
         ++payload_streams;
-        DB::writeString(payload, out);
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
     };
     return source;
 }

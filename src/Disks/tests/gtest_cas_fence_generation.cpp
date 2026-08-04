@@ -167,7 +167,7 @@ public:
     int resurrect_staged_calls = 0;
 };
 
-/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `write_payload`) -- mirrors
+/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `open`) -- mirrors
 /// `serverSideCopySource` in gtest_cas_s3_staging.cpp.
 BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
 {

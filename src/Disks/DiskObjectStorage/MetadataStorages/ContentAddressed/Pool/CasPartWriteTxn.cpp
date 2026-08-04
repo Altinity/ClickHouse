@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -91,7 +92,11 @@ BlobSource BlobSource::fromString(String bytes)
 {
     BlobSource source;
     source.size = bytes.size();
-    source.write_payload = [b = std::move(bytes)](WriteBuffer & out) { writeString(b, out); };
+    /// Owning reader: `ReadBufferFromString` only borrows, and this factory outlives no single call
+    /// -- an owning copy per attempt removes the question entirely for a source that is small by
+    /// construction (this helper exists for tests and inline payloads).
+    source.open = [b = std::move(bytes)]() -> std::unique_ptr<ReadBuffer>
+    { return std::make_unique<ReadBufferFromOwnString>(b); };
     return source;
 }
 
@@ -181,7 +186,7 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
     const String key = store->layout().blobKey(req.ref);
     const BlobSource & source = req.source;
 
-    /// The source is RE-READABLE (the caller's `write_payload` re-reads a staged temp file, or re-emits a
+    /// The source is RE-READABLE (the caller's `open` re-reads a staged temp file, or re-emits a
     /// captured String): it can be invoked MULTIPLE times — the primary streaming PUT plus any INV-1
     /// re-upload — so we never materialize the whole blob into memory here. The byte count is verified
     /// against `source.size` at each streaming write site (via the sink buffer's `count()`), not by a
@@ -447,8 +452,8 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
     /// incarnation_tag and this build's build_id so the new incarnation is owned by THIS live build
     /// (the source-based resurrection rule closes the prior ownership gap). The payload is STREAMED into the put sink
-    /// (`source.write_payload`), never materialized into a full in-memory copy on the common
-    /// If-None-Match path; `source.write_payload` is re-invoked on each attempt (it re-reads the staged
+    /// (`source.open`), never materialized into a full in-memory copy on the common
+    /// If-None-Match path; `source.open` is re-invoked on each attempt (it re-reads the staged
     /// temp file), which is exactly what preserves INV-1 across retries.
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
@@ -563,7 +568,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     };
 
     /// Stream header + payload into a fresh putIfAbsentStream sink WITHOUT materializing the whole blob.
-    /// `source.write_payload` re-reads the staged temp file (INV-1: the writer's own source, never the
+    /// `source.open` re-reads the staged temp file (INV-1: the writer's own source, never the
     /// dying object). The payload byte count is verified against `source.size` via the sink buffer's
     /// `count()` (total bytes written so far) — the streaming equivalent of the old pre-materialized
     /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
@@ -573,7 +578,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// controller-bypassing conditional-write call site"): budgeted attempts + fence-gated backoff +
     /// exact-key OCCUPANCY resolve, replacing the old bare single attempt whose whole S3-blip tolerance
     /// was ONE ~3s adaptive-timeout attempt. Reissue is sound for BOTH primitives: the streaming PUT
-    /// re-invokes `source.write_payload` (the REPLAYABLE source contract — a fresh re-upload, never a
+    /// re-invokes `source.open` (the REPLAYABLE source contract — a fresh re-upload, never a
     /// GET-revive), and the server-side copy re-reads the intact staging object. Each re-stream mints a
     /// fresh incarnation_tag (W-FRESH-TAG), so byte-exact resolve is impossible by design and the
     /// controller resolves by occupancy instead: an occupant at this content-addressed key IS the
@@ -607,7 +612,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
             WriteBuffer & out = sink->buffer();
             writeString(buildHeader(), out);
             const size_t before = out.count();
-            source.write_payload(out);
+            copyData(*source.open(), out);
             const size_t written = out.count() - before;
             if (written != source.size)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -725,7 +730,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// CRITICAL: we re-read the writer's OWN source (NOT backend().get) — no GET of the dying object.
     /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
     /// putOverwrite is whole-body only (no streaming variant), so this rare condemned-displacement path
-    /// materializes the header+payload on-demand by re-invoking `source.write_payload` (re-reading the
+    /// materializes the header+payload on-demand by re-invoking `source.open` (re-reading the
     /// staged temp file). This is the only path that holds a full in-memory copy, and only when a
     /// condemned incarnation must actually be displaced — not the common fresh-upload path.
     ///
@@ -747,7 +752,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
             WriteBufferFromString wb{overwrite_body};
             writeString(buildHeader(), wb);
             const size_t before = wb.count();
-            source.write_payload(wb);
+            copyData(*source.open(), wb);
             wb.finalize();
             const size_t written = wb.count() - before;
             if (written != source.size)

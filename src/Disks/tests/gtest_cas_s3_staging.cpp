@@ -227,7 +227,7 @@ DB::Cas::PartWriteTxnPtr precommittedBuildFor(
     return build;
 }
 
-/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `write_payload`).
+/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `open`).
 DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
 {
     DB::Cas::BlobSource source;

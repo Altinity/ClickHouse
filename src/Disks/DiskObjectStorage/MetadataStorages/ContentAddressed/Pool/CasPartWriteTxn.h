@@ -17,21 +17,22 @@ namespace DB::Cas
 
 /// Re-readable source for one content-addressed blob upload.
 ///
-/// `write_payload` supplies exactly `size` logical bytes and may be invoked more than once: a conditional
+/// `open` returns a FRESH reader over exactly `size` logical bytes and may be called more than once: an
 /// upload can race with another writer or with GC, in which case the transaction retries from the writer's
-/// own source. `server_side_copy_from` is set only for an S3 staging object; the backend then copies from
-/// that object instead of streaming through ClickHouse. The staging object must remain available through a
-/// condemned-object resurrection.
+/// own source and each attempt must read from the beginning. `server_side_copy_from` is set only for an S3
+/// staging object; the ordinary create then promotes it by a server-side copy instead of streaming through
+/// ClickHouse, and `open` reads that same staging object when a resurrection has to stream it. The staging
+/// object must remain available through a condemned-object resurrection.
 struct BlobSource
 {
     uint64_t size = 0;
-    std::function<void(WriteBuffer &)> write_payload;   /// must write exactly `size` bytes
+    std::function<std::unique_ptr<ReadBuffer>()> open;   /// yields exactly `size` bytes, from the start
     /// When set, the blob's bytes already live in an S3 staging object with this key, and `putBlob` promotes it by a
     /// WRITE-ONCE conditional SERVER-SIDE COPY (`Backend::promoteStaged`) instead of streaming
-    /// `write_payload` — and resurrects a condemned incarnation by an unconditional server-side copy
+    /// `open` — and resurrects a condemned incarnation by an unconditional server-side copy
     /// from the SAME staging object (`Backend::resurrectStaged`), never a read of the condemned blob
     /// (revival must always be a fresh write from the source). Unset (the default, `StagingBackend::Local`) ⇒ the local
-    /// streaming path is byte-for-byte unchanged and `write_payload` is the source.
+    /// streaming path is byte-for-byte unchanged and `open` is the source.
     std::optional<String> server_side_copy_from;
     /// Build a re-readable source backed by an owned string; intended for small payloads and tests.
     static BlobSource fromString(String bytes);
@@ -331,8 +332,8 @@ private:
     BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr) const;
     /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
     /// OWN re-readable source without reading the dying object (no backend().get). The source is STREAMED
-    /// into the put sink (header + `source.write_payload`), never materialized into a full in-memory copy;
-    /// `source.write_payload` may be re-invoked on each conditional-write attempt (it re-reads the staged
+    /// into the put sink (header + `source.open`), never materialized into a full in-memory copy;
+    /// `source.open` may be re-invoked on each conditional-write attempt (it re-reads the staged
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed. Build-neutral:
     /// RETURNS the complete `BlobUploadResult` (dep + branch outcome); it folds nothing into `deps`.
     BlobUploadResult uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source) const;

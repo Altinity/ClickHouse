@@ -268,13 +268,13 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
     /// a copy of the record) are collapsed by `fanOutBlobUploads`' grouping, which SUBSUMES the former
     /// duplicate-membership filter here — the fan-out launches one task per unique ref and merges one
     /// dep. The upload primitive differs by staging backend exactly as before:
-    ///   - `Cas::StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
+    ///   - `Cas::StagingBackend::Local`: `open` re-reads the local staged temp file and streams
     ///     it into a write-once `putIfAbsentStream` create; the local-staging path remains byte-for-byte
     ///     compatible with its previous behavior.
     ///   - `Cas::StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
     ///     `server_side_copy_from` drives a WRITE-ONCE conditional SERVER-SIDE COPY (and an unconditional
     ///     resurrect copy FROM the staging object for a condemned incarnation). No local read-back —
-    ///     `write_payload` is left unset.
+    ///     `open` is left unset.
     std::vector<Cas::BlobUploadRequest> requests;
     requests.reserve(st.pending_blobs.size());
     for (const auto & pb : st.pending_blobs)
@@ -290,10 +290,9 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         else
         {
             const std::string staging_key = pb.staging_key;
-            source.write_payload = [staging_key](WriteBuffer & out)
+            source.open = [staging_key]() -> std::unique_ptr<ReadBuffer>
             {
-                ReadBufferFromFile in(staging_key);
-                copyData(in, out);
+                return std::make_unique<ReadBufferFromFile>(staging_key);
             };
         }
         /// `declared_size` mirrors `source.size` (both are `pb.size`); the fan-out fail-closes if they
