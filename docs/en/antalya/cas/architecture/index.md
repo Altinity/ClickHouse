@@ -95,3 +95,20 @@ That is deliberately not a coordinator or a serializable metadata service: there
 coordinator, and no `ZooKeeper`/`Keeper` usage inside the pool protocol itself. `Keeper` stays
 exactly where `ReplicatedMergeTree` already used it — replication log and part-set consensus —
 and its load does not grow with pool size, because the pool's own bookkeeping never touches it.
+
+## The subsystem pages {#subsystem-pages}
+
+| Page | Covers |
+|---|---|
+| [Storage layout](/antalya/cas/architecture/storage-layout) | Every S3 key shape, the object envelope, codecs, a worked example tree |
+| [Namespaces](/antalya/cas/architecture/namespaces) | Namespaces, `life_id`, the catalog, and their lifetime |
+| [Blob protocol](/antalya/cas/architecture/blob-protocol) | Conditional writes, deduplication, the writer-vs-GC race |
+| [Part lifecycle](/antalya/cas/architecture/part-lifecycle) | Build, precommit, upload, promote; crash points and their cleaners |
+| [Manifests and refs](/antalya/cas/architecture/manifests-and-refs) | Part manifests and the ref machinery: publish, fold, recovery |
+| [Mounts and leases](/antalya/cas/architecture/mounts-and-leases) | Server identity, the owner claim, the mount lease, fencing |
+| [Replication](/antalya/cas/architecture/replication) | Fetch-by-relink between replicas sharing one pool |
+| [Read path](/antalya/cas/architecture/read-path) | Ref resolution, manifest reads, ranged blob reads, the caches |
+| [Garbage collection](/antalya/cas/architecture/garbage-collection) | Leadership, the round, sharding, cost, observability |
+| [Backend abstraction](/antalya/cas/architecture/backend) | Provider dialects for conditional writes, the capability probe |
+| [Correctness](/antalya/cas/architecture/correctness) | TLA+ models, counterexamples, soak methodology, test coverage |
+| [Design history](/antalya/cas/architecture/design-history) | The rejected designs and the major pivots |
