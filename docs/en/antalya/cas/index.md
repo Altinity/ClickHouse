@@ -9,17 +9,14 @@ doc_type: 'guide'
 
 # Content-addressed storage {#content-addressed-storage}
 
-`ReplicatedMergeTree` on object storage has two unattractive options today: every replica stores
-its own byte-identical copy of every part (storage cost multiplies with the replication factor), or
-replicas share objects through zero-copy replication. Zero-copy's `Keeper` load is only the
-in-flight coordination, not a ledger proportional to data — what actually grows with data volume is
-the **local-disk** state on every replica, which stores a reference to each shared S3 object it
-uses. The structural cost is elsewhere: a commit spans three independent systems (local disk, S3,
-and `Keeper`) whose interleaving is easy to get subtly wrong; a failure in any one of the three can
-cause worse availability trouble than a single-system design would; the sharing accounting is a
-numeric refcount, so a lost or duplicated retry can corrupt the count; and `Keeper` usage is
-implemented with varying care across a large number of `MergeTree` special-case branches
-accumulated over time.
+`ReplicatedMergeTree` on object storage has two unattractive options today. Plain replication
+stores a byte-identical copy of every part on every replica, so storage cost multiplies with the
+replication factor. Zero-copy replication shares the bytes, but at a structural price: every
+replica keeps local metadata referencing each shared S3 object, and that state grows with the
+data; a commit spans three independent systems — local disk, S3, and `Keeper` — whose interleaving
+is easy to get subtly wrong, and a failure in any one of the three hurts availability; sharing is
+tracked by a numeric refcount, so a lost or duplicated retry can corrupt the count; and the
+special cases supporting all of this are scattered widely through the `MergeTree` code.
 
 Content-addressed storage (`CAS`) is a `MetadataStorage` back-end for object-storage disks
 (`metadata_type = cas`) that takes the same sharing goal and collapses it onto one system: every
