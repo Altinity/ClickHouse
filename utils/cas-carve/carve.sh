@@ -234,6 +234,11 @@ Mixed-file note: DisksApp.cpp also carries the cas-* command registration
 and CA pool initialization, wired by the later CAS integration commits.
 MSG
 
+group upstream-iceberg-msan-include \
+    'src/Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.cpp' <<'MSG'
+Fix MSan build: include DataTypesDecimal.h in IcebergWrites.cpp
+MSG
+
 # ==================== Phase 2: CAS subsystem, bottom-up ======================
 CA=src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed
 
