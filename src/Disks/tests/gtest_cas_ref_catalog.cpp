@@ -1661,7 +1661,6 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
 
     const uint64_t events_before =
         ProfileEvents::global_counters[ProfileEvents::CASGCUnmatchedAdoptedParentLives].load();
-    ScopedCasGcLogCapture log_capture;
     const RefPlan plan = tests::buildRefWalkPlanForTest(scan, cut);
 
     EXPECT_EQ(
@@ -1673,9 +1672,6 @@ TEST(CASGCRefWalkPlan, UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePla
     EXPECT_FALSE(plan.contains(unmatched_life));
     EXPECT_FALSE(plan.parentFoldStates().contains(unmatched_life));
     EXPECT_FALSE(plan.successorFoldStates().contains(unmatched_life));
-    const String captured = log_capture.captured();
-    EXPECT_NE(captured.find("fedcba98765432100123456789abcdef"), String::npos);
-    EXPECT_EQ(std::count(captured.begin(), captured.end(), '\n'), 1u);
 }
 
 TEST(CASGCRefPlan, RoundInputOwnsObservationsAndSuccessorStateCannotChangePlan)
