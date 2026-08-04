@@ -109,12 +109,12 @@ public:
     /// EmulatedSingleProcess (LocalObjectStorage) has no server-side conditional copy and is never
     /// selected for S3 staging, so both throw `NOT_IMPLEMENTED` there (fail closed).
     /// `promoteStaged`: WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
-    /// `resurrectStaged`: reads the staging PAYLOAD (skipping its `staging_payload_offset` header),
-    /// prepends `fresh_header`, and UNCONDITIONALLY writes `[fresh_header][payload]` to `blob_key` (fresh
-    /// tag ⇒ distinct ETag from the condemned incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag.
+    /// `resurrect`: prepends `fresh_header` and UNCONDITIONALLY writes `[fresh_header][payload]` to
+    /// `blob_key`, streaming the payload from the caller's reader (fresh tag ⇒ distinct ETag from the
+    /// condemned incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag. Plain `WriteSettings`, so
+    /// no forced single part and no size ceiling on any dialect.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
-    Token resurrectStaged(const String & staging_key, const String & blob_key,
-                          const String & fresh_header, uint64_t staging_payload_offset) override;
+    Token resurrect(ReadBuffer & payload, const String & blob_key, const String & fresh_header) override;
 
     /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool if the
     /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.

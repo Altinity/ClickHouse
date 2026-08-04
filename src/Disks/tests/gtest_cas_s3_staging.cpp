@@ -161,7 +161,7 @@ private:
 /// `BlobSource::server_side_copy_from` set) drives a WRITE-ONCE conditional server-side copy through
 /// the SAME condemn/resurrect gate the streaming path uses. This backend is a `DB::Cas::InMemoryBackend`
 /// (which models conditional create, so it honors both the write-once `promoteStaged` and the
-/// unconditional `resurrectStaged` contracts) that RECORDS every server-side-copy call so a test can
+/// unconditional `resurrect` contracts) that RECORDS every server-side-copy call so a test can
 /// assert the copy source/destination and the conditional-vs-unconditional distinction — in particular
 /// that a condemned-blob RESURRECT copies FROM the staging key, NEVER from the condemned blob key
 /// (`feedback_ca_resurrect_invariant`), and that a live blob is NEVER unconditionally overwritten.
@@ -172,7 +172,7 @@ public:
     {
         std::string from;
         std::string to;
-        bool conditional;   /// true = promoteStaged (write-once); false = resurrectStaged (unconditional)
+        bool conditional;   /// true = promoteStaged (write-once); false = resurrect (unconditional)
     };
 
     std::vector<CopyCall> copy_calls;
@@ -183,12 +183,29 @@ public:
         return DB::Cas::InMemoryBackend::promoteStaged(staging_key, blob_key);
     }
 
-    DB::Cas::Token resurrectStaged(const String & staging_key, const String & blob_key,
-                                   const String & fresh_header, uint64_t staging_payload_offset) override
+    DB::Cas::Token resurrect(DB::ReadBuffer & payload, const String & blob_key,
+                             const String & fresh_header) override
     {
-        copy_calls.push_back({staging_key, blob_key, /*conditional=*/false});
-        return DB::Cas::InMemoryBackend::resurrectStaged(staging_key, blob_key, fresh_header, staging_payload_offset);
+        /// The source is no longer an argument -- the caller opens the reader -- so `from` is recorded
+        /// as empty here and the "never the condemned key" invariant is asserted through `reads_of`
+        /// below, which counts what was actually READ. That is the stronger check: it observes the I/O
+        /// rather than a parameter the backend was told about.
+        copy_calls.push_back({String{}, blob_key, /*conditional=*/false});
+        return DB::Cas::InMemoryBackend::resurrect(payload, blob_key, fresh_header);
     }
+
+    /// Every key READ AS A STREAM, with a count. The resurrect opens its source with `getStream`, so
+    /// this counts exactly the reads that path performs -- and deliberately not the materializing
+    /// `get`, which the assertions themselves use to inspect bodies.
+    std::map<String, size_t> reads_of;
+
+    using DB::Cas::InMemoryBackend::getStream;
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & key, DB::Cas::Range range) override
+    {
+        ++reads_of[key];
+        return DB::Cas::InMemoryBackend::getStream(key, range);
+    }
+
 
     /// Every unconditional (resurrect) copy this backend saw — empty iff no live/condemned body was ever
     /// overwritten. `assertNeverOverwritesLiveBlob` reads this to enforce invariant (d).
@@ -568,9 +585,11 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     EXPECT_TRUE(backend->copy_calls[0].conditional);
     EXPECT_EQ(backend->copy_calls[0].to, blob_key);
     EXPECT_FALSE(backend->copy_calls[1].conditional);
-    EXPECT_EQ(backend->copy_calls[1].from, staging_key);
-    EXPECT_NE(backend->copy_calls[1].from, blob_key);   /// INV: resurrect source is NEVER the condemned blob key
     EXPECT_EQ(backend->copy_calls[1].to, blob_key);
+    /// INV: the resurrect reads the STAGING object and never the condemned blob key. Asserted on the
+    /// reads themselves rather than on a source argument, because the caller now opens the reader.
+    EXPECT_GT(backend->reads_of[staging_key], 0u) << "the resurrect must read the writer's own staging object";
+    EXPECT_EQ(backend->reads_of[blob_key], 0u) << "the condemned blob key must never be read";
     EXPECT_EQ(backend->unconditionalCopyCount(), 1u);
 
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
@@ -613,7 +632,7 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 /// against the object storage), so it reports S3 staging as usable independent of the backend mode. This
 /// lets `writeFile` take the S3-staging code path (stream to a staging object while hashing) WITHOUT
 /// needing a live/native conditional-copy backend for the promote: `PartWriteTxn::putBlob`'s
-/// `promoteStaged`/`resurrectStaged` seams (Native-mode only — see `CasObjectStorageBackend.cpp`) are
+/// `promoteStaged`/`resurrect` seams (Native-mode only — see `CasObjectStorageBackend.cpp`) are
 /// already covered directly against `Cas::PartWriteTxn`/`RecordingStagingBackend` above (Task 5) and against a
 /// live backend in Task 7's `with_rustfs` integration test; these two tests only ever exercise an S3
 /// pending blob that is either NEVER referenced (the B189 orphan shape — publishStaging skips its

@@ -133,7 +133,7 @@ PoolPtr openTestPool(BackendPtr backend)
 /// on the FIRST head() -- deterministically landing a fence trip BETWEEN `streamIfAbsent`'s conditional
 /// create (which returns Occupied over a present condemned blob WITHOUT a head -- see
 /// `conditionalCreateControlled`) and `uploadFromSource`'s condemned-displacement decision (whose first
-/// head is the `head(key)` right before the raw `resurrectStaged`/`putOverwrite` write) -- and (2) records
+/// head is the `head(key)` right before the raw `resurrect`/`putOverwrite` write) -- and (2) records
 /// those two raw displacement calls, so a test proves the [C2] fence check aborted BEFORE any durable
 /// displacement landed. Mirrors `TripOnHeadBackend` above and `RecordingStagingBackend` in
 /// gtest_cas_s3_staging.cpp (neither reusable across their anonymous namespaces).
@@ -155,11 +155,10 @@ public:
         return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
     }
 
-    Token resurrectStaged(const String & staging_key, const String & blob_key,
-                          const String & fresh_header, uint64_t staging_payload_offset) override
+    Token resurrect(DB::ReadBuffer & payload, const String & blob_key, const String & fresh_header) override
     {
         ++resurrect_staged_calls;
-        return InMemoryBackend::resurrectStaged(staging_key, blob_key, fresh_header, staging_payload_offset);
+        return InMemoryBackend::resurrect(payload, blob_key, fresh_header);
     }
 
     std::function<void()> trigger;
@@ -424,9 +423,9 @@ TEST(CASFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableC
 }
 
 /// (I2, backlog {#c2-resurrect-putoverwrite-fence-check}) The S3-native-staging sibling: the condemned
-/// displacement `resurrectStaged` branch (`BlobSource::server_side_copy_from` set) is the same RAW,
+/// displacement `resurrect` branch (`BlobSource::server_side_copy_from` set) is the same RAW,
 /// controller-uncoupled backend write. Same setup + fence trip -> the [C2] `checkFenceOrThrow` aborts with
-/// the typed transient refusal BEFORE `resurrectStaged`, so no unconditional server-side copy displaces
+/// the typed transient refusal BEFORE `resurrect`, so no unconditional re-upload displaces
 /// the condemned incarnation.
 TEST(CASFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall)
 {
@@ -465,7 +464,7 @@ TEST(CASFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurab
     });
 
     /// No unconditional server-side copy displaced the condemned incarnation.
-    EXPECT_EQ(backend->resurrect_staged_calls, 0) << "the fence check must abort before the raw resurrectStaged";
+    EXPECT_EQ(backend->resurrect_staged_calls, 0) << "the fence check must abort before the raw resurrect";
     const DB::Cas::HeadResult after = backend->head(blob_key);
     ASSERT_TRUE(after.exists);
     EXPECT_EQ(after.token, condemned_token) << "the condemned blob must be untouched (INV: never a stale displacement)";

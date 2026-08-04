@@ -178,7 +178,7 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
                 /// A successful commit deletes the S3 staging object
                 /// HERE — `committed` is only ever true when EVERY part's `publishStaging` ran to
                 /// completion (commit() sets it right before this call), which means every referenced
-                /// pending blob was already promoted (`PartWriteTxn::putBlob` → `promoteStaged`/`resurrectStaged`)
+                /// pending blob was already promoted (`PartWriteTxn::putBlob` → `promoteStaged`/`resurrect`)
                 /// or, for an orphaned pending blob (its entry removed by `unlinkFile`/`replaceFile`
                 /// before commit), was never going to be promoted at all — either way the staging object
                 /// is no longer needed as a resurrect source, so it is safe to reclaim now.

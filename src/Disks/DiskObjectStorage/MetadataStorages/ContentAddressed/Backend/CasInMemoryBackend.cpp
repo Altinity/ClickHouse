@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/copyData.h>
 #include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
@@ -306,30 +307,25 @@ PutResult InMemoryBackend::promoteStaged(const String & staging_key, const Strin
     return {PutOutcome::Done, t};
 }
 
-Token InMemoryBackend::resurrectStaged(const String & staging_key, const String & blob_key,
-                                       const String & fresh_header, uint64_t staging_payload_offset)
+Token InMemoryBackend::resurrect(ReadBuffer & payload, const String & blob_key,
+                                 const String & fresh_header)
 {
-    std::lock_guard lock(mutex_);
-    auto src = store_.find(staging_key);
-    if (src == store_.end())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "InMemoryBackend::resurrectStaged: staging object {} is absent", staging_key);
+    /// Drain the reader BEFORE taking the lock: the reader may be backed by another object in this
+    /// same store, and reading it under our own mutex would deadlock.
+    String body = fresh_header;
+    {
+        WriteBufferFromString out(body, AppendModeTag{});
+        copyData(payload, out);
+        out.finalize();
+    }
 
-    /// Re-upload only the writer's staging payload, skipping its envelope header, under a fresh header
-    /// instead of copying the staging object verbatim. The fresh header makes the resurrected body
-    /// different from the condemned incarnation for the same payload; on a content-addressed store
-    /// this also produces a different ETag, so a delayed exact-token delete for the old incarnation
-    /// cannot remove the resurrection (`INV-NO-RETURN`). The condemned `blob_key` is never read. The
-    /// payload is materialized from the staging bytes before the destination is written, and inserting
-    /// the distinct `blob_key` never invalidates the `staging_key` reference — `std::map` keeps
-    /// references to other elements valid across insert and assignment.
-    const String & staging_bytes = src->second.bytes;
-    const String payload = staging_payload_offset <= staging_bytes.size()
-        ? staging_bytes.substr(staging_payload_offset)
-        : String{};
+    /// The fresh header makes the resurrected body differ from the condemned incarnation for the same
+    /// payload, so a delayed exact-token delete for the old incarnation cannot remove the resurrection
+    /// (`INV-NO-RETURN`). The condemned `blob_key` is never read.
+    std::lock_guard lock(mutex_);
     const Token t = mintToken();
     Object obj;
-    obj.bytes = fresh_header + payload;
+    obj.bytes = std::move(body);
     obj.token = t;
     store_[blob_key] = std::move(obj);
     return t;

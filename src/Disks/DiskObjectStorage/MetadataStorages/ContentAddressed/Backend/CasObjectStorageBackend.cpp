@@ -1042,40 +1042,32 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};
 }
 
-Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const String & blob_key,
-                                            const String & fresh_header, uint64_t staging_payload_offset)
+Token ObjectStorageBackend::resurrect(ReadBuffer & payload, const String & blob_key,
+                                      const String & fresh_header)
 {
     if (mode != Mode::Native)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "ObjectStorageBackend::resurrectStaged is Native-mode only (EmulatedSingleProcess has no "
-            "server-side copy and is never selected for S3 staging)");
-
-    /// A condemned-resurrect overwrite is not a verbatim server-side copy: that would reproduce the
-    /// condemned incarnation's exact bytes and therefore its identical ETag. The queued exact-token
-    /// delete of the condemned incarnation could then delete the live resurrection. Instead re-upload
-    /// the writer's own staging payload (skipping the staging object's envelope header) under a
-    /// fresh-tagged `fresh_header`, so the resurrected body and token differ from the condemned one
-    /// (`INV-NO-RETURN`).
-    /// The source is always the writer's staging object, never the condemned `blob_key`; the caller
-    /// reaches this method only after observing `Condemned` metadata, so the overwrite targets no live blob.
-    auto in = object_storage->readObject(StoredObject(staging_key), getReadSettings(), /*read_hint=*/std::nullopt);
-    if (staging_payload_offset)
-        in->ignore(staging_payload_offset);
+            "ObjectStorageBackend::resurrect is Native-mode only");
 
     /// Unconditional overwrite of the condemned body (plain WriteSettings — no If-Match/If-None-Match).
     /// This is safe by three independent structural properties, not merely "no time to add a
     /// precondition": (1) the key is content-addressed, so every incarnation ever written under it is
-    /// byte-identical — an overwrite here rotates only the envelope/token, never the payload; (2) an
+    /// byte-identical in its PAYLOAD — an overwrite here rotates only the envelope/token; (2) an
     /// adopted dependency token VALUE is never a promote gate, only `has_value()` is consulted
     /// (tokenless-on-ref promote), so no consumer can observe or react to the specific bytes of the old
-    /// token; (3) the fresh-tagged `fresh_header` above guarantees the resurrected incarnation's token
-    /// differs from the condemned one, so every already-queued exact-token GC delete of the condemned
+    /// token; (3) the fresh-tagged `fresh_header` guarantees the resurrected incarnation's token differs
+    /// from the condemned one, so every already-queued exact-token GC delete of the condemned
     /// incarnation mismatches and misses (`INV-NO-RETURN`). An `If-Match` on the condemned token would
     /// only save a redundant re-upload on a lost race, never prevent data loss.
+    ///
+    /// Plain `WriteSettings` also means no forced single part: a conditional write on a
+    /// generation-token store is capped because GCS drops preconditions on multipart completion, and
+    /// this write carries none, so it may take the multipart path on every backend. The payload is
+    /// streamed from `payload` and never materialized — blob bodies have no size cap.
     auto out = object_storage->writeObject(
         StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, WriteSettings{});
     out->write(fresh_header.data(), fresh_header.size());
-    copyData(*in, *out);
+    copyData(payload, *out);
     out->finalize();
 
     /// The plain write does not reliably surface the destination ETag across dialects, so HEAD the
@@ -1083,7 +1075,7 @@ Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const St
     const auto hr = nativeHead(blob_key);
     if (!hr)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "ObjectStorageBackend::resurrectStaged: blob {} is absent immediately after the resurrect "
+            "ObjectStorageBackend::resurrect: blob {} is absent immediately after the resurrect "
             "re-upload — failing closed", blob_key);
     return hr->token;
 }

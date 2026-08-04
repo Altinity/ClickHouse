@@ -689,7 +689,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
     /// Condemned: displace the condemned incarnation with our fresh source.
     ///
     /// rev.7 [C2] (backlog {#c2-resurrect-putoverwrite-fence-check}): the two displacement calls below
-    /// (`resurrectStaged` / `putOverwrite`) are RAW backend writes with NO controller/fence coupling —
+    /// (`resurrect` / `putOverwrite`) are RAW backend writes with NO controller/fence coupling —
     /// unlike `streamIfAbsent`, which rides the request controller's fence gate. They were the only
     /// durable-effect writes left outside Task 4's fence-generation gate. Capture the mount fence
     /// generation now, at the displacement DECISION, and re-check it (and `mayMutate()`) immediately before
@@ -720,8 +720,14 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
         /// displacement decision, closing the same gap Task 4 closed on the plain-object surface.
         Token tok{};
         store->checkFenceOrThrow(displace_admitted_generation);
-        tok = store->backend().resurrectStaged(
-            *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
+        /// The staging object's own envelope header is skipped HERE, by whoever knows its shape: the
+        /// backend is handed a reader already positioned at the payload.
+        auto staged = store->backend().getStream(*source.server_side_copy_from);
+        if (!staged)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                "CAS resurrect: staging object {} is absent", *source.server_side_copy_from);
+        staged->stream->ignore(meta.blob_header_len);
+        tok = store->backend().resurrect(*staged->stream, key, fresh_header);
         const BlobDepRecord dep = makeDepAndEmit(tok);
         writeResurrectMetaClean(lm);
         return BlobUploadResult{ref, dep, BlobUploadOutcome::ResurrectedS3};
@@ -759,7 +765,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "uploadFromSource: source wrote {} bytes for overwrite, declared {}", written, source.size);
         }
-        /// rev.7 [C2]: same as `resurrectStaged` above -- a raw, uncoupled backend call; fence-checked against
+        /// rev.7 [C2]: same as `resurrect` above -- a raw, uncoupled backend call; fence-checked against
         /// the displacement-decision generation before the durable write.
         store->checkFenceOrThrow(displace_admitted_generation);
         overwrite_res = store->backend().putOverwrite(key, overwrite_body, hr.token);

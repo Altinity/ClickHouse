@@ -187,10 +187,9 @@ public:
 
     /// Count a staged resurrection as an unconditional overwrite of the destination blob. The
     /// wrapped backend remains responsible for its fresh-header and condemned-token guarantees.
-    Token resurrectStaged(const String & staging_key, const String & blob_key,
-                          const String & fresh_header, uint64_t staging_payload_offset) override
+    Token resurrect(ReadBuffer & payload, const String & blob_key, const String & fresh_header) override
     {
-        Token token = inner->resurrectStaged(staging_key, blob_key, fresh_header, staging_payload_offset);
+        Token token = inner->resurrect(payload, blob_key, fresh_header);
         /// An unconditional resurrect re-upload overwrites the (condemned) BLOB key.
         incrementCasEvent(classifyCasNs(blob_key), CasOp::Overwrite);
         return token;

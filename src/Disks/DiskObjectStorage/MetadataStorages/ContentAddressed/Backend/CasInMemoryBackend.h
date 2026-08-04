@@ -84,15 +84,14 @@ public:
     /// copies the complete staging object to `blob_key` only when the destination is absent and returns
     /// `PreconditionFailed` without changing it otherwise. The new token models the destination ETag.
     ///
-    /// `resurrectStaged` is the one sanctioned unconditional overwrite: it reads only the writer's
+    /// `resurrect` is the one sanctioned unconditional overwrite: it reads only the writer's
     /// staging object, skips its envelope header, prepends `fresh_header`, and writes the resulting
     /// body over `blob_key`. The fresh header makes the resurrected body and token different from the
     /// condemned incarnation, so a delayed exact-token delete for that old incarnation cannot remove
     /// the resurrection (`INV-NO-RETURN`). The caller must already have established that the
     /// destination is condemned.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
-    Token resurrectStaged(const String & staging_key, const String & blob_key,
-                          const String & fresh_header, uint64_t staging_payload_offset) override;
+    Token resurrect(ReadBuffer & payload, const String & blob_key, const String & fresh_header) override;
 
     // ---- Fault-injection controls ----
 

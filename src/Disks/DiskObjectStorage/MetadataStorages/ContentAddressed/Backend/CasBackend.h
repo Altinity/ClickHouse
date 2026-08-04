@@ -331,25 +331,31 @@ public:
             "Cas::Backend::promoteStaged (write-once server-side copy) is not implemented for this backend");
     }
 
-    /// UNCONDITIONAL re-upload of the writer's OWN staging PAYLOAD over `blob_key` under a FRESH-tagged
-    /// envelope header — the sanctioned condemned-object resurrection overwrite. The backend reads
-    /// the payload from `staging_key` skipping the first
-    /// `staging_payload_offset` bytes (the staging object's own envelope header), prepends `fresh_header`
-    /// (built by the caller with a freshly-minted `incarnation_tag`), and writes `[fresh_header][payload]`
-    /// to `blob_key`. The source is ALWAYS the writer's OWN staging object, NEVER a read/copy of the
-    /// condemned `blob_key`. The fresh header guarantees the resurrected body — and hence its
-    /// ETag/token — differs from the condemned incarnation, so a queued
-    /// exact-token delete of the condemned incarnation can never match the live resurrection
+    /// UNCONDITIONAL re-upload of the writer's OWN payload over `blob_key` under a FRESH-tagged
+    /// envelope header — the sanctioned condemned-object resurrection overwrite. Writes
+    /// `[fresh_header][payload]`, streaming `payload` from `reader`, and returns the fresh incarnation's
+    /// token. Blob bodies have no size cap, so the payload is never materialized.
+    ///
+    /// The reader is the caller's: it is ALWAYS the writer's own source (a staging object or a local
+    /// staged file), NEVER a read of the condemned `blob_key`, and the caller has already skipped any
+    /// envelope header on it. `fresh_header` must carry a freshly-minted `incarnation_tag`, which is what
+    /// makes the resurrected body — and hence its ETag/token — differ from the condemned incarnation, so
+    /// a queued exact-token delete of that incarnation can never match the live resurrection
     /// (`INV-NO-RETURN`).
-    /// The caller MUST have observed the current incarnation as `Condemned` (per-hash
-    /// meta point-read) before calling this, so it overwrites a condemned body, never a live blob (INV:
-    /// never overwrite a live blob). Returns the fresh incarnation token.
+    ///
+    /// UNCONDITIONAL is deliberate. An `If-Match` on the condemned token would save a redundant
+    /// re-upload when another writer resurrects the same blob first, and would prevent nothing: two
+    /// racing resurrections write payload-identical bodies, no consumer reads a dep token's VALUE, and
+    /// durable references name content hashes rather than incarnations.
+    ///
+    /// The caller MUST have observed the current incarnation as `Condemned` (per-hash meta point-read)
+    /// before calling this, so it overwrites a condemned body, never a live blob.
     /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
-    virtual Token resurrectStaged(const String & /*staging_key*/, const String & /*blob_key*/,
-                                  const String & /*fresh_header*/, uint64_t /*staging_payload_offset*/)
+    virtual Token resurrect(ReadBuffer & /*payload*/, const String & /*blob_key*/,
+                            const String & /*fresh_header*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Cas::Backend::resurrectStaged (server-side resurrect copy) is not implemented for this backend");
+            "Cas::Backend::resurrect is not implemented for this backend");
     }
 };
 
