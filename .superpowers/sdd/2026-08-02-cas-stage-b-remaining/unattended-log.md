@@ -853,3 +853,12 @@ Process note: the fix was FIRST written by mistake directly against the shared `
 (no build was run there, no commit made) before being caught, diffed out, reverted with
 `git checkout --`, and reapplied via `git apply` in the correct `lane-g-createns` worktree. `master`
 was confirmed clean afterward.
+
+### Watchdog 05:04 {#wd-0504}
+- Churn loop3 done 03:41 exit 0 → cumulative ~42 min full-scale churn, criterion met; t8-lead
+  dormant ~80 min post-finish AGAIN (its bounded polls die with the shell — the known
+  children-kill issue). PROCESS CHANGE: controller now arms its own watcher per soak run and wakes
+  the runner on marker; runner only launches/judges/commits.
+- rca-createns: RCA closed, fix parked on laneg/ci-fix-createns (68759dbd66e), post-soak
+  verification queued as task #5. master src verified clean.
+- Next: (a) row commit -> S44 smoke (controller-watched) -> S45 -> general pair.
