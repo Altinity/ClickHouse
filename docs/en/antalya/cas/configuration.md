@@ -84,6 +84,18 @@ carry a `cas_`/`ca_` prefix — the disk block already scopes them.
 | `gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
 | `staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in |
 
+### Choosing `blob_hash` {#choosing-blob-hash}
+
+`blob_hash` is fixed at pool creation, so pick it deliberately. `blob_hash_allow_new` is the
+escape hatch — it admits a second algorithm into an existing pool's `algos_used` rather than
+requiring a fresh pool.
+
+| Algorithm | Pick it for | Trade-off |
+|---|---|---|
+| `sha256` | Maximum safety | No known collision classes; slightly slower than the other two |
+| `xxh3-128` | Maximum speed | Fastest, 128-bit, no known collision classes |
+| `cityhash128` (default) | ClickHouse-ecosystem compatibility, and a possible future hash-reuse mode that avoids recomputation | Fast, but has a known class of collisions that occurs far more often than an ideal hash function would predict |
+
 ## Server-level settings {#server-settings}
 
 Source: `ServerSettings.cpp`. Unlike the disk-level list, these carry the `cas_` prefix because they
