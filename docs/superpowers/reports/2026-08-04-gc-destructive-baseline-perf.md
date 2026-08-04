@@ -48,44 +48,48 @@ performance model.
 Step 3 of the plan requires re-deriving every figure from the artifacts immediately before
 committing. Doing that surfaced three concrete mismatches between T8's published
 `{#step-3c-cost-inventory}` table and what is actually in the preserved specimen archive — not
-close-enough rounding, but numbers this archive cannot produce by any grouping this report tried:
+close-enough rounding, but numbers this archive cannot produce by any grouping this report tried.
+They resolve to **two distinct mechanisms, confirmed independently** (cross-checked against a
+second, independent re-derivation by the team lead) rather than one:
 
-1. **Per-phase invocation counts for `ch2`.** T8 states `pending_deletes` ran 108 times (ch1 63,
-   ch2 45). Direct counts against `predown_ch2/gc_log.tsv` (`awk -F'\t' '$27=="pending_deletes"'`,
-   cross-checked with a `clickhouse-local` `GROUP BY phase`) give **38**, not 45, and the same
-   ch2-only gap recurs for every phase in the table (`manifest_deletes` 38 not 45,
-   `ref_object_cleanup` 38 not 45, `namespace_cleanup` 76 not 102). `ch1`'s counts match T8
-   exactly in every case.
-2. **Rounds-to-fixpoint.** T8's criterion-3 evidence cites `ch2` rounds 105–108 explicitly
-   (condemned 168 → graduated 168 → redeleted 168 → two further zero rounds). `predown_ch2/gc_log.tsv`'s
-   highest `round` value is **101** (`event_time` 06:29:45, `awk -F'\t' 'NR>1{print $10}' | sort -n
-   | tail -1`) — rounds 105–108 are not present in the archive at all.
-3. **`pruned_through` high-water mark.** T8 reports "reached 1830 (ch1) / 3735 (ch2) by run end,"
-   explicitly flagged there as "a per-node high-water mark, not summable." The archive's actual
-   maximum `pruned_through` value on any `round_commit` row is **60** (ch1) / **98** (ch2)
-   (`awk -F'\t' '$27=="round_commit"{print $29}' | grep -o "'pruned_through':[0-9]*" | sort -t: -k2
-   -n | tail -1`). 1830 is suspiciously exactly what a `sumMap()` over ch1's 63 `round_commit` rows
-   produces instead of a `max()` — i.e. the number in T8 looks like the SUM T8's own sentence says
-   not to take.
+**Mechanism A — `ch2`'s live query ran later than the predown snapshot.** T8 states
+`pending_deletes` ran 108 times (ch1 63, ch2 45). Direct counts against `predown_ch2/gc_log.tsv`
+(`awk -F'\t' '$27=="pending_deletes"'`, cross-checked with a `clickhouse-local` `GROUP BY phase`)
+give **38**, not 45, and the same `ch2`-only gap recurs for every phase in the table
+(`manifest_deletes` 38 not 45, `ref_object_cleanup` 38 not 45, `namespace_cleanup` 76 not 102).
+T8's criterion-3 evidence separately cites `ch2` rounds 105–108 explicitly (condemned 168 →
+graduated 168 → redeleted 168 → two further zero rounds); `predown_ch2/gc_log.tsv`'s highest
+`round` value is **101** (`event_time` 06:29:45, `awk -F'\t' 'NR>1{print $10}' | sort -n |
+tail -1`) — rounds 105–108 are not present in the archive at all. Both point the same direction:
+T8's `ch2` figures reflect MORE `ch2` activity than the archived predown snapshot contains,
+consistent with T8's live query having run later, against the still-up cluster, than the moment
+`predown_ch2/gc_log.tsv` was captured (the specimen's own `README.md` states the predown dump is
+taken "the instant the run returned, before any teardown" — apparently earlier than whatever
+wall-clock point T8's live pass queried).
 
-All three point the same direction: T8's ch2 figures reflect MORE ch2 activity than the archived
-predown snapshot contains — consistent with T8's live query having run later, against the
-still-up cluster, than the moment `predown_ch2/gc_log.tsv` was captured (the specimen's own
-`README.md` states the predown dump is taken "the instant the run returned, before any
-teardown" — apparently earlier than whatever wall-clock point T8's live pass queried). Finding 3 is
-a different kind of error (a stated non-summable value that numerically matches a sum) and is
-independent of the timing question.
+**Mechanism B — `pruned_through` was reported as a SUM, on `ch1` too, contrary to its own stated
+caveat.** T8 reports "reached 1830 (ch1) / 3735 (ch2) by run end," explicitly flagged there as "a
+per-node high-water mark, not summable." The archive's actual maximum `pruned_through` value on
+any `round_commit` row is **60** (ch1, 63 rows) / **98** (ch2, 38 rows)
+(`awk -F'\t' '$27=="round_commit"{print $29}' | grep -o "'pruned_through':[0-9]*" | sort -t: -k2
+-n | tail -1`). A `sumMap()` over those same rows instead gives **exactly 1830 (ch1)** and 3021
+(ch2) — `ch1`'s figure in T8 is precisely the sum, not close to it, despite T8's own sentence
+saying not to take the sum. This is a genuinely different error than Mechanism A: it reproduces on
+`ch1`, where every invocation count otherwise matches T8 exactly — so **`ch1` does NOT match T8
+"exactly everywhere"**, and this report's earlier framing to that effect was itself wrong and is
+withdrawn here. `ch2`'s `pruned_through` (3735 in T8) is higher than even `ch2`'s own sum (3021),
+so `ch2` carries both mechanisms at once.
 
 **None of this changes T8's six-criteria PASS verdict** — criterion 1's family-level "every family
-did real work" claim holds on the archived range too (`ch2`'s own last-Success-round evidence at
-round 100, condemned 0 graduated 769 redeleted 769, precedes 2 further zero rounds inside the
-archive itself), and `ch1` — which carries **>99.7%** of every S3-op total in this report — matches
-T8 exactly everywhere it was checked. But the specific cited numbers (108/45, rounds 105–108, 1830/3735)
+did real work" claim holds on the archived range too (every family still shows nonzero destructive
+work on the corrected counts), and criterion 3's zero-backlog claim holds on the archive's own
+evidence (`ch2`'s last-Success-round evidence at round 100, condemned 0 graduated 769 redeleted
+769, precedes zero-work rounds inside the archive itself, corroborated independently by the fsck
+checkpoint trend in criterion 2). But the specific cited numbers (108/45, rounds 105–108, 1830/3735)
 are not reproducible from the artifact both this report and T8 were told is authoritative, and are
-therefore corrected here rather than repeated. **Per the dispatch, this is recorded in both
-documents and reported to the team lead before the ledger is marked Stage B COMPLETE** — see the
-closing message; `2026-08-03-stage-b-RESULTS.md` is not edited by this report, since the team lead
-asked to be told first.
+corrected — in both documents — rather than repeated. `2026-08-03-stage-b-RESULTS.md` has been
+corrected in its criterion-1 row, criterion-3 row, and the Step-3c inventory table + its
+introductory note, per the team lead's confirmation and explicit direction to proceed.
 
 Every number in the rest of this report is the archive's own, re-derived independently.
 
