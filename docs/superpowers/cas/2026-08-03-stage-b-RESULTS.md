@@ -151,10 +151,60 @@ this run: `fold_ref_intake.tables_clamped`=0 and `frontier_unprobed_budget`=0 on
 round (the frontier/probe budgets never bound); `ref_object_cleanup.namespaces_planned` (216 total)
 matches the full frontier namespace count with no truncated remainder; `namespace_cleanup`'s
 `janitor_pages` averaged ~1/round on both nodes, far under the named `gc_round_sweep_namespace_budget=20`
-throughput-watch value. Not independently checked here (no direct capped/declined field in this
-phase's own metrics as captured): `gc_round_sweep_recovery_op_budget`,
-`gc_round_prefix_wholesale_budget`, `gc_round_handoff_prefix_wholesale_budget`,
-`gc_round_outcome_entry_budget` — named as unverified rather than asserted clean.
+throughput-watch value. The other four caps, named unverified with the specific reason each is unverified rather than
+lumped together — "unverified" and "not exercised" are different claims, and only some of these
+are the latter:
+- `gc_round_sweep_recovery_op_budget` — **not exercised**: this run had zero injected checkpoint
+  corruption (that is the criterion-4 injection run's territory, not this clean specimen), so the
+  recovery-op sweep this budget bounds had nothing to do; its own phase metrics carry no
+  capped/declined counter to confirm the budget was even consulted at zero-work.
+- `gc_round_prefix_wholesale_budget` / `gc_round_handoff_prefix_wholesale_budget` — **no
+  capped/declined field observed** in either `handoff_reclaim`'s or `round_commit`'s captured
+  `phase_metrics` (`generations_reclaimed`/`objects_reclaimed`/`suppressed` on `handoff_reclaim`;
+  `generations_visited`/`pruned_through`/`generations_referenced` on `round_commit` — none of these
+  distinguish "did all available work" from "was capped short of it"). Would need either a dedicated
+  counter added or a controlled test analogous to Step-3e's baseline suites to verify either way.
+- `gc_round_outcome_entry_budget` — **no capped/declined field observed**: `pending_deletes`'
+  `outcome_logs_written`=62 (both nodes combined) is the closest available metric, but nothing in
+  the row distinguishes "wrote every outcome this round produced" from "wrote up to the cap and
+  dropped the rest" — same gap as above.
+
+## Step-3e — insert-path guard {#step-3e-insert-path-guard}
+
+The plan's Step-3e asks whether the dedup-log-bearing workload's namespace-file operation profile
+is unchanged versus the Task-4b baseline (Constraint 16) — "any increase on that path is a Stage-B
+FAIL, not a note." Initially attempted by sampling the live soak's own traffic, but no dedicated
+ProfileEvent isolates namespace-file operations (whole-file rewrite / append-emulation / remove /
+dedup-log rotation) from the CAS pool's general blob/manifest/ref S3 traffic — a live-sample number
+would carry too much noise to trust as a pass/fail gate.
+
+The plan's own Step-1 anticipated this: land a controlled baseline test FIRST, with exact recorded
+counts, so "unchanged" is checked against a fixed number rather than eyeballed. That baseline test
+exists in this tree, under a different filename than the plan's placeholder —
+`src/Disks/tests/gtest_cas_namespace_file_request_profile.cpp` (558 lines), suites
+`CASNamespaceFileRequestProfile` (5 tests, a `CountingBackend` pinning exact per-key request counts
+for all four named shapes) and `CASNamespaceFileDiskProfile` (3 tests, a `RecordingObjectStorage`
+pinning the "four zeros" — no catalog/ref/blob/manifest key touched — plus the once-per-table-open
+life-resolution cost and the no-catalog-write-on-removal invariant). Ran both suites against the
+current tree (`build/src/unit_tests_dbms --gtest_filter="CASNamespaceFileRequestProfile*:CASNamespaceFileDiskProfile*"`,
+`build/t8_step3e_ns_file_profile.log`): **`[  PASSED  ] 8 tests.` exit 0.** The pinned counts still
+hold:
+
+| Shape | Pinned request count |
+|---|---|
+| Create (absent key) | HEAD 1, PUT 1, GET 0, DELETE 0, LIST 0, conditional-PUT 0 |
+| Rewrite (existing key) | HEAD 1, PUT-overwrite 1 (token-conditioned), PUT 0, GET 0 |
+| Read | GET 1 (whole-body), HEAD 0, PUT 0 |
+| Append (read-modify-rewrite) | GET 1, HEAD 1, PUT-overwrite 1, PUT 0, DELETE 0, LIST 0 |
+| Remove | HEAD 1 (token), DELETE 1, GET 0, PUT 0, LIST 0 |
+| Dedup-log rotation (new segment + retire old) | LIST 1 (files prefix, one page), new-segment HEAD 1 + PUT 1, old-segment HEAD 1 + DELETE 1, GET 0, conditional-PUT 0 |
+| Steady-state file ops (all four shapes together) | zero keys touched containing the catalog / ref-log / blob / manifest key families (`CASNamespaceFileDiskProfile.SteadyStateFileOperationsTouchNoCatalogRefBlobOrManifestKey`) |
+| Life resolution | paid once per table open (first op touches the ref catalog key; the second op on the same open table does not) |
+| Removal on a never-opened table | catalog left byte-identical (token and bytes both unchanged) — a removal must not birth the namespace it is removing from |
+
+**Verdict: Step-3e PASS.** This is a stronger form of "profile unchanged" than a live-traffic
+sample — an executable, per-key-exact baseline re-run against the current tree, not an estimate —
+and it resolves the confidence gap the live-sampling attempt could not close.
 
 ## Criterion 4 — anomaly-arm injection evidence {#criterion-4-evidence}
 
