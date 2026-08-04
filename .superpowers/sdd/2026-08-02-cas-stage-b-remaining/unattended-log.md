@@ -870,3 +870,12 @@ was confirmed clean afterward.
   S44 rerun (with cluster reset) instead of a sample; woken t8-lead: S45 full FIRST, then resolve
   the sample from the predown archive or mark unresolved-residual honestly.
 - CI: cifix + createNamespace fixes parked; next CI tick :11.
+
+### CI check 06:11 — the createNamespace race killed ALL FOUR cas stateless lanes {#ci-0611}
+Second catch-point confirmed at scale: encode-time LOGICAL_ERROR "CAS ref catalog: entries are not
+canonically ordered / no duplicate namespace" (STID 2251-313e) -> Server died on amd_binary cas-s3,
+asan_ubsan cas-s3 1/2, tsan cas-s3 1/2 (+2/2 earlier), amd_binary cas-local; sibling test fails are
+post-abort cascade. Same race family as the parked fix 68759dbd66e. Task #5 upgraded: verification
+must prove BOTH catch-points closed (casAdmitEntry conflict-retry trace + admit-conflict regression
+interleaving). Non-CAS side: two integration lanes failed (db-disk old-analyzer 8/8, msan 9/10) —
+not yet triaged, likely unrelated; will classify when the unit/cas story is closed. PR still RUNNING.
