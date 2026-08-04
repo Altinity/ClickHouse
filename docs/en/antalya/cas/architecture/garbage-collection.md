@@ -65,26 +65,35 @@ The lease is therefore **work de-duplication, not mutual exclusion**.
 A round is one pass of 18 named phases ending in exactly one `gc/state` `CAS`
 (`Gc::runRegularRound`, `Gc/CasGc.cpp`).
 
+| # | Phase (`GcPhaseTimer` name) | What it does |
+|---|---|---|
+| 1 | `lease` | Acquire, renew or steal the lease inside `gc/state`. The only phase a not-a-leader round emits |
+| 2 | `pre_fold_ref_drain` | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; exact-CAS-delete the completed ones before anything else can act |
+| 3 | `heartbeat_floor` | One `LIST` of `gc/server-roots/`, one `GET` per mount slot, fence-out `PUT` for any mount whose write-token has held stable past the threshold |
+| 4 | `defer_decision` | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (nothing changed, no graduation due) or continue to a full fold |
+| 5 | `parent_seal_read` | Capture the parent fold seal's run references before the fold mutates the in-memory generation/attempt, to detect a ref that moved off an already-pruned generation |
+| 6 | `fold_ref_group` | Regroup the one `LIST` from phase 4 into per-table listings — no I/O, the keys are already in hand |
+| 7 | `fold_seal_read` | `GET` and decode the adopted fold seal that anchors this fold's coverage |
+| 8 | `fold_ref_intake` | `GET` every new ref-log record and every referenced manifest, extracting blob source edges |
+| 9 | `fold_reduce` | The three-cursor merge over prior edges, new deltas and the parent's condemned rows: spare, condemn, graduate or redelete each candidate |
+| 10 | `fold_seal_write` | Write the new fold seal once, write-once deterministic, adopting a byte-identical replay instead of rewriting it |
+| 11 | `pending_deletes` | The single content-delete site: exact-token `deleteExact` of every entry the *previous* round marked `delete_pending`, plus the forensic outcome-log writes |
+| 12 | `meta_pool_wait` | Drain the bounded pool of async `.meta` condemn-marker writes queued during the fold |
+| 13 | `round_commit` | Retention-prune old generations, then publish the single `gc/state` `CAS` that adopts the whole round |
+| 14 | `handoff_reclaim` | Post-`CAS`: reclaim any generation that a ref moved off during this very round, before the ordinary wholesale prune would reach it |
+| 15 | `manifest_deletes` | Delete manifest bodies whose owner-removal minus-one edge the `CAS` in phase 13 just adopted |
+| 16 | `namespace_cleanup` | One bounded page of the perpetual namespace janitor, reclaiming dead-life debris |
+| 17 | `ref_object_cleanup` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
+| 18 | `orphan_sweep` | One cursor-paced page of the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep); wrapped so it can never fail the round |
+
+Phases 5 through 18 run only when phase 4 decides to fold; a `DEFER` verdict returns immediately
+after one bounded namespace-janitor page, publishing no fold artifact and no `gc/state` `CAS` at
+all:
+
 ```mermaid
-flowchart TD
-    P1["1 lease -- acquire, renew or steal"] --> P2["2 pre_fold_ref_drain -- resolve adopted removal evidence"]
-    P2 --> P3["3 heartbeat_floor -- LIST mounts, fence the provably dead"]
-    P3 --> P4{"4 defer_decision -- LIST stream, build catalog-keyed plan"}
-    P4 -->|"nothing changed, no graduation due"| DEF["DEFER -- early return, no fold, no gc/state CAS"]
-    P4 --> P5["5 parent_seal_read"]
-    P5 --> P6["6 fold_ref_group"]
-    P6 --> P7["7 fold_seal_read -- adopted life rows"]
-    P7 --> P8["8 fold_ref_intake -- GET each new ref log, GET each manifest edge"]
-    P8 --> P9["9 fold_reduce -- merge: spare, graduate, condemn or redelete"]
-    P9 --> P10["10 fold_seal_write -- write-once deterministic seal"]
-    P10 --> P11["11 pending_deletes -- the single content-delete site, deleteExact"]
-    P11 --> P12["12 meta_pool_wait -- drain condemn-marker writes"]
-    P12 --> P13["13 round_commit -- prune, then the single gc/state CAS"]
-    P13 --> P14["14 handoff_reclaim, post-CAS"]
-    P14 --> P15["15 manifest_deletes -- bodies whose minus-one the CAS just adopted"]
-    P15 --> P16["16 namespace_cleanup -- one perpetual-janitor page"]
-    P16 --> P17["17 ref_object_cleanup -- prune covered logs and snapshots"]
-    P17 --> P18["18 orphan_sweep -- one cursor page, never fails the round"]
+flowchart LR
+    D4{"4 defer_decision"} -->|"nothing changed, no graduation due"| DEF["DEFER: janitor page only, return"]
+    D4 -->|"changed shards, or graduation due"| FOLD["phases 5 through 18: full fold and round commit"]
 ```
 
 Orderings that are load-bearing:
