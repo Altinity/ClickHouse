@@ -35,7 +35,7 @@ Plan: `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md` (`{#t8}`). Le
 | Soak (a) churn — 30m full | **PASS (loop shape)** | A single `--scale full` pass ran only ~14 min real churn, short of the plan's "≥30 min" — looped 3× back-to-back with distinct seeds (20260805, 20260806, 20260807), cumulative ~42 min continuous full-scale churn (1000 S34 iterations / 600 S35 cycles each pass). Judged at the LAST iteration's end state: `fsck dangling=0`, `dryrun ⊆ deletable: 0/0`, `event audit (no bad rows)=0`, `GC no Failed rounds=0`, `no unbounded leftovers=0`, `dropped content reclaimed to 0`, S34 9/9; S35 `no bad CA-log events=0`, `create/insert_errors=0`, final-table replica agreement equal, `no dangling after rapid same-name rotation=0`, 14/14. All 3 loop iterations independently PASS, `SCENARIO_EXIT=0` each (`churn_s34_s35.log`, `churn_s34_s35_loop2.log`, `churn_s34_s35_loop3.log`) | Maps onto the plan's (a) criterion — catalog entry count returns to baseline (`no unbounded leftovers`), zero alias reads (`event audit`/`no bad CA-log events`), fsck clean — now genuinely exercised at the written duration via the loop. The initial dev-scale ~1.5min run and the first `--scale full` ~14min single pass were both premature judgments, retracted before this row was finalized |
 | Soak (b) rebirth adversarial (S44) — 20m smoke | SURVIVED | 5/5 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/rebirth_s44_smoke2.log`); dev scale (6 cycles), same fixed-cycle-count pattern as (a) — actual wall time well under 20m | pre-qualification only, not a PASS criterion |
 | Soak (b) rebirth adversarial (S44) — 30m full | **PASS** | Two `--scale full` passes (seeds 20260805, 20260806), 40 cycles / 2000 rows-per-cycle each = 80 cycles total, 5/5 verdicts each, `SCENARIO_EXIT=0` each (`rebirth_s44.log`, `rebirth_s44_loop2.log`). Half (i), zero reads resolving to a newer incarnation: `no unexpected mutation errors across incarnation boundaries=0` (after the card fix), `recreate latency does not grow`, `CASRefNeedsRecovery=0`, `CASRefRecoveryStreamHole=0`, `fsck dangling=0` — all pass, both runs. Half (ii), debris trends to zero without blocking rebirth: a post-run drain-window observation (script + evidence below) against the standing cluster after the second full pass — `ca-fsck --detail`'s own authoritative counters (the tool the plan names for this criterion) read `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` | Maps onto the plan's (b) criterion, which — unlike (a) — carries NO duration text; judged by event/cycle coverage (80 full-scale cycles across 2 passes) plus an explicit post-run drain observation, not a synthetic 30-minute wall-clock. Cycle-bound card: `--duration` has no effect at any scale, disclosed honestly rather than padded |
-| Soak (c) decommission (S45) — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
+| Soak (c) decommission (S45) — 20m smoke | SURVIVED | 3/3 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/decommission_s45_smoke.log`); dev scale, fixed cycle count | pre-qualification only, not a PASS criterion |
 | Soak (c) decommission (S45) — 30m full | — | *(fill)* | S45 already validated live once (2026-08-03, seed 4) as a separate scenario-suite run — that pass does NOT satisfy this row |
 | Soak (d) general — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
 | Soak (d) general — 90m full (sequential-baseline destructive workload) | — | *(fill)* | — |
@@ -265,17 +265,29 @@ more times 20s apart, then runs a detailed `ca-fsck`.
   (17 rounds spanning the window) show `janitor_pages=17`, `janitor_keys=6114` visited,
   `janitor_deleted=0` throughout.
 
-Read together: fsck's own dead-life-specific counters (`janitor_pending_lives`, `lifeless_keys`) are
-zero, and the janitor visited thousands of keys across 17 rounds without deleting any — consistent
-with there being NO eligible dead-incarnation debris to reclaim in the first place, not with debris
-sitting stuck. The flat, nonzero `pool_shape()` `_files` count is therefore most likely counting
-something the raw filesystem classifier buckets into `_files` that is not the dead-incarnation debris
-class criterion (b) cares about (`classify_pool_path`'s heuristic is name-shape-based, not a
-catalog-liveness check) — but this was NOT verified further (e.g. by decoding the 40 objects'
-individual key shapes) within this task's time budget. Recorded as a genuine, unreconciled
-discrepancy between a naive filesystem count and the CA-authoritative fsck oracle, not papered over:
-the (b)-full PASS verdict rests on the fsck-authoritative reading (all relevant counters zero), per
-the plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question.
+**Follow-up sample (a fresh disposable S44 dev-scale run, 6 cycles, seed 20260899), taken directly
+before the (c) S45 leg started**, to test the hypothesis that the flat `_files` count is simply
+LIVE-incarnation files rather than dead debris: it is not. `docker exec` into the RustFS container
+and listing the pool directly shows 6 objects for 6 cycles, one per DISTINCT physical incarnation id
+(`cas/ns/state/<physid>/_files/format_version.txt`), and the scenario ends with the table dropped —
+there is no live incarnation of `s44_rebirth_nsfile` at all at sample time. These ARE
+dead-incarnation objects by directory identity. Re-running `ca-fsck --detail` against this fresh
+state still reported `lifeless_keys=0`, `janitor_pending_lives=0`, `dangling=0` — the same zero
+result as the original 40-object sample, reproduced independently.
+
+Net reading: the objects are dead, but the CA-authoritative correctness oracle does not flag them as
+a violation at either sampled checkpoint. Working (not fully traced) explanation from reading
+`CasNamespaceJanitor.cpp`: dead-incarnation physical reclaim looks like a two-stage process — the
+catalog's `Removing` entry must first graduate to fully-absent via the ordinary GC round
+(`deleteCompletedRemovingAtSnapshot`) before the namespace-janitor's
+`catalog_cut.life_index.resolve(*life_id)` gate stops skipping the physical object — and both
+observation windows here (60-100s, and near-zero for the fresh sample) may simply be short of
+that first stage completing. This is recorded as an OPEN observability gap (`pool_shape()`'s
+`_files` count cannot distinguish "orphaned and stuck" from "dead but mid the multi-stage reclaim,
+and not yet flagged as wrong"), not as resolved and not as proven-stuck debris — the (b)-full PASS
+verdict still rests on the fsck-authoritative reading (zero at every checkpoint sampled), per the
+plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question, but the
+mechanism question itself is carried to the post-B residual list rather than closed here.
 
 ## Residual gate row {#residual-gate-row}
 
@@ -324,6 +336,15 @@ finding).
   throughput watch item; the manifest-cleanup cap (`gc_round_manifest_cleanup_budget`) was REVERTED
   entirely (leaks under a one-shot pipeline — see `soak-t6b-report.md`), tracked as
   `[gc-mf-cleanup-durable-retry]` in `BACKLOG.md`.
+- S44 drain-observation mechanism gap (`{#s44-drain-observation}`): dead-incarnation
+  `_files/format_version.txt` objects, confirmed dead by directory identity, are never flagged by
+  `ca-fsck --detail`'s `lifeless_keys`/`janitor_pending_lives` at either sampled checkpoint, yet
+  `pool_shape()`'s raw `_files` prefix count never visibly decreased in the observed windows
+  (60-100s). Working explanation (not traced to a code-level proof): a two-stage reclaim where the
+  catalog `Removing`→absent graduation must complete before the namespace-janitor's physical-object
+  gate opens, and the observation windows were short of that. Not a Stage-B blocker (fsck, the
+  plan's designated tool, is clean at every checkpoint) but an open observability-mechanism
+  question worth a focused follow-up with catalog-state instrumentation, not black-box sampling.
 - `[gc-frontier-one-list]` (`BACKLOG.md:136`), deferred to a separate focused session after Stage B.
 - The four ex-known-red stateless tests, to be run green in the integration-lane battery stage
   under their current post-rename names: `05008_cas_gc_snapshot_prune`, `04290`/`04295`
