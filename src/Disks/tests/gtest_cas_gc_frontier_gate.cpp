@@ -25,6 +25,7 @@
 namespace DB::ErrorCodes
 {
     extern const int NETWORK_ERROR;
+    extern const int CORRUPTED_DATA;
 }
 
 /// THE DESTRUCTIVE-ROUND FRONTIER PROOF (spec 2026-07-27 "ref chain complete cut" §5).
@@ -473,6 +474,8 @@ struct GateVerdict
     uint64_t frontier_namespaces = 0;
     uint64_t frontier_proven = 0;
     uint64_t frontier_unprobed_budget = 0;
+    uint64_t catalog_entries = 0;
+    bool catalog_proved_empty = false;
 };
 
 GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy policy)
@@ -503,6 +506,10 @@ GateVerdict runRoundCapturingGate(const PoolPtr & store, Gc & gc, UniversePolicy
                 verdict.frontier_proven = *proven;
             if (const auto unprobed = value("frontier_unprobed_budget"))
                 verdict.frontier_unprobed_budget = *unprobed;
+            if (const auto entries = value("catalog_entries"))
+                verdict.catalog_entries = *entries;
+            if (const auto proved_empty = value("catalog_proved_empty"))
+                verdict.catalog_proved_empty = *proved_empty != 0;
         }
     });
     gc.runRegularRound({}, /*allow_steal*/true, policy);
@@ -927,15 +934,215 @@ TEST(CASGCFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
 }
 
 /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r11-empty-universe-vacuous}`):
-/// `Gc::fold` computes `frontier_complete = universe_authoritative && frontier_proven ==
-/// frontier_namespaces`. With an empty universe that equality is `0 == 0` -- vacuously TRUE unless
-/// guarded -- so this pool is built to make `frontier_namespaces` GENUINELY zero by every source that
-/// feeds it: no catalog entry (`injectRetire` touches only `gc/state`'s shard bookkeeping, never a
-/// namespace), no sealed cursor (no namespace has EVER folded, so the prior seal's coverage map --
-/// `parent_cursors` -- carries nothing), and no ref-log hint (none was ever written). A condemned blob
-/// with a real, present body and in-degree 0 is queued the way a real round would leave it
-/// (`injectRetire`), so if the guard is missing this round has every reason to delete it.
-TEST(CASGCFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqualsZero)
+/// `frontier_proven == frontier_namespaces` is `0 == 0` -- vacuously TRUE -- on an empty universe, which
+/// is not by itself a proof of anything: a fresh pool, a damaged catalog, and a genuinely emptied pool
+/// all produce the same zeros. The gate's non-vacuity term therefore has TWO ways to be satisfied:
+/// `frontier_namespaces > 0` (an ordinary nonempty pool, everything proven), or the round's own hot-scan
+/// catalog cut positively proving the universe empty (present, token-bearing, decoded, zero rows of
+/// every lifecycle state). The next two tests are that positive/negative pair.
+TEST(CASGCFrontierGate, ADecodedTokenBearingEmptyCatalogCompletesTheFrontierAndDrainsRetiredWork)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const DB::UInt128 blob(0xbead);
+
+    /// Built to make `frontier_namespaces` GENUINELY zero by every source that feeds it -- no catalog
+    /// entry (this pool never admitted a namespace), no sealed cursor, no ref-log hint -- while a
+    /// condemned blob with a real, present body and in-degree 0 sits queued exactly the way a real
+    /// round leaves one (`injectRetire`).
+    writeBlobBody(*backend, layout, blob);
+    const BlobRef blob_ref = legacyMetaTestRef(blob);
+    const Token blob_token = backend->head(layout.blobKey(blob_ref)).token;
+    injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
+    store->renewWatermarkOnce();
+
+    ASSERT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty())
+        << "the scenario needs a genuinely, provably empty catalog, or this test measures nothing";
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+
+    /// Round 1: `injectRetire`'s condemn_round (1) is already behind current_round (2), so this round
+    /// graduates -- publishes delete_pending against the observed token -- without deleting anything
+    /// yet (the physical delete is a LATER round's pre-CAS phase).
+    const GateVerdict graduate = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(graduate.saw_fold);
+    EXPECT_EQ(graduate.frontier_namespaces, 0u);
+    EXPECT_EQ(graduate.frontier_proven, 0u);
+    EXPECT_TRUE(graduate.catalog_proved_empty)
+        << "the catalog cut itself must be the proof, not the bare 0==0 equality";
+    EXPECT_TRUE(graduate.frontier_complete);
+    EXPECT_FALSE(graduate.suppress_destructive);
+    EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists)
+        << "graduation only PUBLISHES delete_pending; nothing is deleted yet";
+
+    /// Round 2: the pre-CAS phase executes the exact-token delete round 1's graduation queued.
+    const GateVerdict deleted = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(deleted.saw_fold);
+    EXPECT_TRUE(deleted.catalog_proved_empty);
+    EXPECT_TRUE(deleted.frontier_complete);
+    EXPECT_FALSE(deleted.suppress_destructive);
+    EXPECT_FALSE(backend->head(layout.blobKey(blob_ref)).exists)
+        << "a proved-empty universe is a COMPLETE frontier, not a suppressed one -- the condemned blob "
+           "must drain through the ordinary two-phase pipeline instead of leaking forever";
+}
+
+/// The negative half of the pair. A `Creating` row is a birth in progress (spec §3: no publication can
+/// exist under it, so `live_incarnation`/`walk_plan.lives()` exclude it -- see the R10 comment above the
+/// intake loop), not an empty universe -- but it produces the SAME `frontier_namespaces ==
+/// frontier_proven == 0` a genuinely empty catalog does. Only `catalog_cut_proved_empty` tells them
+/// apart, because it reads `entries` (every lifecycle state), not the frontier counters.
+TEST(CASGCFrontierGate, AZeroWalkableFrontierWithACreatingCatalogRowIsNotProvedEmpty)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const DB::UInt128 blob(0xbead);
+
+    writeBlobBody(*backend, layout, blob);
+    const BlobRef blob_ref = legacyMetaTestRef(blob);
+    const Token blob_token = backend->head(layout.blobKey(blob_ref)).token;
+    injectRetire(*backend, layout, /*round*/ 1, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = blob_ref, .token = blob_token, .size = 0}});
+    store->renewWatermarkOnce();
+
+    const RootNamespace stalled{"00/stalled@cas@"};
+    CatalogEntry entry;
+    entry.ns = stalled;
+    entry.state = NsState::Creating;
+    entry.incarnation = hexToU128("00000000000000000000000000000042");
+    entry.creator = CreatorFence{
+        .server_root_id = "test-stalled-creator", .writer_epoch = 1, .fence_generation = 1};
+    CasRefCatalog::casAdmitEntry(*backend, layout, /*gc_shards*/ 1, entry);
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    for (int i = 0; i < 6; ++i)
+    {
+        const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+        ASSERT_TRUE(v.saw_fold);
+        EXPECT_EQ(v.frontier_namespaces, 0u);
+        EXPECT_EQ(v.frontier_proven, 0u);
+        EXPECT_FALSE(v.catalog_proved_empty)
+            << "a Creating-only catalog is a birth in progress, not proof of an empty universe";
+        EXPECT_FALSE(v.frontier_complete);
+        EXPECT_TRUE(v.suppress_destructive);
+    }
+    expectEveryDeleteFamilyInert(*backend, "Creating-only catalog");
+    EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists);
+}
+
+/// The bootstrap-only absent-as-empty representation (`initializeEmptyForNewPool`) must never leak into
+/// the operational round: an absent mandatory catalog is corruption, never an empty authority set.
+TEST(CASGCFrontierGate, AnAbsentCatalogNeverReadsAsAnEmptyUniverse)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+
+    const Token catalog_token = backend->head(layout.refCatalogKey()).token;
+    ASSERT_EQ(backend->deleteExact(layout.refCatalogKey(), catalog_token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc(store, kGc);
+    backend->resetCounts();
+    bool saw_fold = false;
+    gc.setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "fold_reduce") saw_fold = true; });
+    try
+    {
+        gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::Authoritative);
+        FAIL() << "expected the missing mandatory catalog to throw before any fold gate verdict";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+    gc.setPhaseSink({});
+    EXPECT_FALSE(saw_fold) << "an absent catalog must abort before the round computes any gate verdict";
+    EXPECT_EQ(backend->deleteTotal(), 0u) << "no destructive work may run on an unauthorized round";
+}
+
+/// A malformed, truncated, wrong-typed, count-mismatched, or future-versioned catalog must not decode
+/// into a `Snapshot` at all -- these are the replacement guards for R11's original "damaged catalog"
+/// concern, now that the empty case has a positive proof to keep separate from a broken one.
+/// One table-driven test: each row installs a different broken body at the mandatory key and expects
+/// decode failure before any destructive work.
+///
+/// NOT covered here: a header version BELOW `RefCatalog`'s own birth generation. `checkCompatibility`
+/// today only rejects a version ABOVE `G_BUILD`; a version below a type's birth floor decodes as if it
+/// were legal, and `decodeRefCatalog` discards the parsed header entirely, so "decoded successfully"
+/// does not yet imply "legal version for this type". That gap is not load-bearing for THIS proof: the
+/// proof is token-present + a full structural decode (type, complete records, matching count trailer,
+/// no trailing bytes) + zero entries, and a well-formed-but-out-of-protocol empty catalog is already an
+/// accepted residual under the trusted-store model (the token proves byte identity, not history) --
+/// closing the version floor would only shrink that residual, not remove it. Tracked separately as
+/// `[cas-format-version-floor]` in `BACKLOG.md`; deliberately out of scope for this gate.
+TEST(CASGCFrontierGate, AMalformedCatalogNeverDecodesIntoAnEmptyProof)
+{
+    /// A one-entry catalog's canonical bytes, the base every mutation below starts from.
+    RefCatalog one_entry;
+    CatalogEntry entry;
+    entry.ns = RootNamespace{"00/malformed-base@cas@"};
+    entry.state = NsState::Live;
+    entry.incarnation = hexToU128("00000000000000000000000000000099");
+    one_entry.entries.push_back(entry);
+    const String base = encodeRefCatalog(one_entry);
+    const String empty_base = encodeRefCatalog(RefCatalog{});
+
+    const String type_needle = fmt::format("\"type\":\"{}\"", traitsFor(FormatId::RefCatalog).type);
+    ASSERT_NE(empty_base.find(type_needle), String::npos);
+    const String version_needle = fmt::format("\"v\":{}", currentCompatibilityVersion());
+    ASSERT_NE(empty_base.find(version_needle), String::npos);
+    ASSERT_NE(base.find("\"n\":1"), String::npos);
+
+    const auto replaceOnce = [](const String & haystack, const String & needle, const String & replacement) -> String
+    {
+        const auto pos = haystack.find(needle);
+        EXPECT_NE(pos, String::npos) << "expected to find '" << needle << "'";
+        String out = haystack;
+        out.replace(pos, needle.size(), replacement);
+        return out;
+    };
+
+    struct Case { const char * name; String bytes; };
+    const std::vector<Case> cases = {
+        {"wrong-type", replaceOnce(empty_base, type_needle, "\"type\":\"cas_ref_ckpt\"")},
+        /// The one version case the CURRENT (unmodified) gate actually enforces: a version ABOVE
+        /// `G_BUILD` is refused by `checkCompatibility` before decode proceeds.
+        {"future-version", replaceOnce(empty_base, version_needle, "\"v\":999999")},
+        {"trailer-count-mismatch", replaceOnce(base, "\"n\":1", "\"n\":2")},
+        /// The trailer line entirely gone: decode's post-entry loop expects another line and hits EOF.
+        {"missing-trailer", base.substr(0, base.rfind("{\"n\":1}\n"))},
+        /// The trailer present but its own line has no terminator: EOF strictly inside a line.
+        {"truncated-mid-line", base.substr(0, base.size() - 2)},
+    };
+
+    for (const Case & c : cases)
+    {
+        auto backend = std::make_shared<CountingBackend>();
+        auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+        const Layout & layout = store->layout();
+        const Token bootstrap_token = backend->head(layout.refCatalogKey()).token;
+        ASSERT_EQ(backend->casPut(layout.refCatalogKey(), c.bytes, bootstrap_token).outcome,
+            CasOutcome::Committed) << c.name;
+
+        Gc gc(store, kGc);
+        backend->resetCounts();
+        bool saw_fold = false;
+        gc.setPhaseSink([&](const GcPhaseRecord & rec) { if (rec.phase == "fold_reduce") saw_fold = true; });
+        EXPECT_THROW(
+            gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::Authoritative), DB::Exception)
+            << c.name;
+        gc.setPhaseSink({});
+        EXPECT_FALSE(saw_fold) << c.name << ": a broken catalog must abort before any fold gate verdict";
+        EXPECT_EQ(backend->deleteTotal(), 0u) << c.name << ": no destructive work may run on it";
+    }
+}
+
+/// `StageA_Suppressed` refuses outright regardless of what the catalog proves -- a proved-empty cut
+/// satisfies the frontier term but is not the only term the gate reads.
+TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -951,41 +1158,140 @@ TEST(CASGCFrontierGate, AGenuinelyEmptyUniverseRefusesTheFrontierDespiteZeroEqua
 
     Gc gc(store, kGc);
     backend->resetCounts();
-    drive(store, gc, /*rounds*/ 8, UniversePolicy::Authoritative);
-
-    /// Per-delete-family, not an aggregate: an aggregate zero can hide one family that ran while
-    /// another did not (the same lesson R11's own writeup draws from this campaign's
-    /// `entries_redeleted >= objects_deleted` vacuous-truth precedent).
-    EXPECT_EQ(backend->deleteTotal(), 0u)
-        << "an authoritative-but-EMPTY universe must refuse to be a complete frontier -- 0 == 0 is not "
-           "a proof. Deleted:" << deletedKeysMessage(*backend);
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/blobs/"), 0u) << "pre-CAS blob delete";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/manifests/"), 0u) << "manifest-body delete";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/gc/gen/"), 0u)
-        << "generation prune and hand-off reclaim";
-    EXPECT_EQ(backend->deleteCountForKeysContaining("/cas/ns/stream/"), 0u)
-        << "covered-log / superseded-snapshot cleanup";
+    for (int i = 0; i < 6; ++i)
+    {
+        const GateVerdict v = runRoundCapturingGate(store, gc, UniversePolicy::StageA_Suppressed);
+        ASSERT_TRUE(v.saw_fold);
+        EXPECT_TRUE(v.catalog_proved_empty)
+            << "the catalog cut is still genuinely empty -- the fact does not depend on policy";
+        EXPECT_FALSE(v.frontier_complete)
+            << "StageA_Suppressed refuses outright no matter what the catalog cut proves";
+        EXPECT_TRUE(v.suppress_destructive);
+    }
+    expectEveryDeleteFamilyInert(*backend, "StageA_Suppressed over a proved-empty catalog");
     EXPECT_TRUE(backend->head(layout.blobKey(blob_ref)).exists);
+}
 
-    /// The control: admitting ONE namespace with nothing durable in it (a catalog-only walk target,
-    /// proven by a single absent exact GET -- `AQuietKnownNamespaceCostsExactlyOneExactGet`'s own
-    /// shape) closes the universe non-vacuously (`frontier_namespaces = 1`, `frontier_proven = 1`), and
-    /// the SAME blob drains -- proving the zeros above were the guard, not an empty work queue.
-    ///
-    /// `casAdmitEntry` alone reaches `Live` with NO `_ckpt` (the acknowledged bridge divergence from
-    /// `completeCreation`'s production path, which always publishes `_ckpt.life_epoch` first); the walk
-    /// needs that `life_epoch` to seed its FIRST probe for a namespace with no log at all (the `expected`
-    /// initialization in `Gc::fold`, Stage B's `checkpoints.life_epochs` read). So this control writes a
-    /// `_ckpt` with `life_epoch` set directly, at the same sentinel key `casAdmitEntry` pinned the
-    /// namespace's incarnation to -- proving the namespace's own genesis, not guessing it.
-    const RootNamespace empty_ns{"00/empty@cas@"};
-    fixture::admitLive(*backend, layout, empty_ns);
-    backend->putIfAbsent(layout.refCkptKey(fixture::fixtureLife(empty_ns)),
-        encodeRefCkpt(RefCkpt{.life_epoch = std::optional<uint64_t>{1},
-                              .checkpoint_snapshot_id = std::nullopt, .last_epoch_seal = std::nullopt}));
-    drive(store, gc, /*rounds*/ 8, UniversePolicy::Authoritative);
-    EXPECT_FALSE(backend->head(layout.blobKey(blob_ref)).exists)
-        << "the work WAS real -- once the universe is provably closed (even trivially), it drains";
+/// THE BIRTH-AFTER-EMPTY-CUT BLOB RACE. The proved-empty exception's soundness rests on one hard fact:
+/// under this pool's protocol every live or live-precommit edge requires an exact `Live` catalog row
+/// (INV-3), so a catalog cut with zero rows proves no namespace ANYWHERE holds one -- AT THAT INSTANT.
+/// A namespace born strictly after the cut is invisible to the round that took it; safety for blob
+/// CONTENT then rests entirely on the condemned-marker/resurrection protocol (EDGE-BEFORE-OBSERVE:
+/// `ContentAddressedTransaction.cpp` persists the precommit edge before observing/uploading the pool
+/// blob), never on the frontier proof, which by construction cannot see a birth postdating its own cut.
+/// This test pins that: a real writer, through the production `createNamespace` lifecycle
+/// (`precommitAdd` on a namespace that has never existed), lands a precommit edge to an
+/// ALREADY-CONDEMNED blob strictly after round R's catalog cut but strictly before round R executes the
+/// pending delete that cut licensed.
+TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlobInstead)
+{
+    ensureBlobUploadPoolForTest();
+    ensureCondemnedUploadAdmissionForTest();
+
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
+    const Layout & layout = store->layout();
+    const RootNamespace doomed{"00/doomed@cas@"};
+
+    const String payload = "empty-cut-birth-race-payload";
+    const DB::UInt128 hash = u128Of(payload);
+    const BlobRef id = idOf(payload);
+    const String key = layout.blobKey(id);
+    String raw_body(store->poolMeta().blob_header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*backend, layout, hash, raw_body);
+
+    const ManifestRef mref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, doomed, mref, {blobEntryFor("data.bin", hash)});
+    publishCommittedTransition(*backend, layout, doomed, "ref_1", std::nullopt, mref);
+
+    Gc gc(store, kGc);
+    runRegularRoundReclaiming(gc);                                 /// folds the +1 edge
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, layout, doomed, "ref_1", mref);
+    runRegularRoundReclaiming(gc);                                 /// condemns: durable Condemned meta
+    store->renewWatermarkOnce();
+    const Token condemned_token = backend->head(key).token;
+    const auto condemned_meta = loadMetaForTest(*backend, layout, hash);
+    ASSERT_TRUE(condemned_meta.has_value());
+    ASSERT_EQ(condemned_meta->meta.state, MetaState::Condemned)
+        << "the delete round R is about to execute must be backed by durable Condemned evidence";
+    runRegularRoundReclaiming(gc);                                 /// graduates: publishes delete_pending
+    store->renewWatermarkOnce();
+
+    /// Remove `doomed` entirely -- the ONLY way the catalog can become genuinely, provably empty. A raw
+    /// `RemoveNamespace` op plus the Removing-state CAS mirrors
+    /// `CleanupEvidenceLeavesRemovedNamespaceCheckpointForJanitor`'s own recipe exactly.
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    const uint64_t remove_seq = appendRefLogSeed(*backend, layout, doomed, {remove_op});
+    publishRecoverableCkptForSemanticWrapper(*backend, layout, doomed, RefTxnId{1, remove_seq});
+    CasRefCatalog::casUpdate(*backend, layout, [&](const RefCatalog & current) -> RefCatalog
+    {
+        RefCatalog next = current;
+        const auto it = std::find_if(next.entries.begin(), next.entries.end(),
+            [&](const CatalogEntry & e) { return e.ns == doomed; });
+        EXPECT_NE(it, next.entries.end());
+        it->state = NsState::Removing;
+        it->removal_started_round = 1;
+        return next;
+    });
+
+    /// A SUPPRESSED round folds `doomed` through its removal terminal and records `cleanup_evidence` in
+    /// the seal, WITHOUT executing the delete_pending the graduate round above published -- suppressed
+    /// rounds carry pending deletes forward untouched. `StageA_Suppressed` here is the test's OWN
+    /// control over timing, not the scenario under test: it exists only to keep blob X's delete pending
+    /// until round R below, rather than letting it drain the ordinary way while `doomed` is still Live.
+    gc.runRegularRound({}, /*allow_steal*/true, UniversePolicy::StageA_Suppressed);
+    store->renewWatermarkOnce();
+    EXPECT_TRUE(backend->head(key).exists) << "the pending delete must still be carried, not yet run";
+
+    /// Round R: its pre-fold drain (`drainCompletedRemoving`) reads the round just above's
+    /// `cleanup_evidence` and drops `doomed`'s catalog row BEFORE this round's own hot-scan `GET` --
+    /// so round R's catalog cut is the first one that is genuinely, provably empty. The hook fires the
+    /// instant that cut is taken and races a real namespace birth into the window before round R's own
+    /// pre-CAS delete phase runs.
+    bool hook_fired = false;
+    Token fresh_token{};
+    gc.setPostHotScanCatalogReadHookForTest([&]()
+    {
+        hook_fired = true;
+        ASSERT_TRUE(CasRefCatalog::read(*backend, layout).catalog.entries.empty())
+            << "the race must land inside the window where the cut itself is already empty";
+
+        const RootNamespace newborn{"00/newborn@cas@"};
+        auto build = store->beginPartWrite(
+            PartWriteInfo{.intended_ref = newborn.string() + "/ref_1", .intended_namespace = newborn});
+        const ManifestId new_id = build->stageManifest({blobEntryFor("data.bin", hash)});
+        build->precommitAdd(newborn, "ref_1", new_id);            /// mints `newborn` via real createNamespace
+        const PutBlobResult uploaded = build->putBlob(id, BlobSource::fromString(payload));
+        EXPECT_EQ(uploaded.ref, id);
+        fresh_token = backend->head(key).token;
+        EXPECT_NE(fresh_token, condemned_token)
+            << "the writer must have observed Condemned and resurrected -- a fresh token, not an adopt "
+               "of the dying incarnation";
+    });
+
+    const GateVerdict verdict = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(hook_fired) << "the race hook never fired -- this test proves nothing about the race";
+    ASSERT_TRUE(verdict.saw_fold);
+    EXPECT_TRUE(verdict.catalog_proved_empty);
+    EXPECT_TRUE(verdict.frontier_complete);
+    EXPECT_FALSE(verdict.suppress_destructive);
+
+    EXPECT_TRUE(backend->head(key).exists)
+        << "the resurrected incarnation must survive round R's delete";
+    EXPECT_EQ(backend->head(key).token, fresh_token) << "and it is still the writer's incarnation";
+    EXPECT_EQ(backend->deleteExact(key, condemned_token).kind, DeleteOutcome::Kind::TokenMismatch)
+        << "the condemned token can never remove the fresh object (INV_NO_LOSS)";
+
+    /// A later round's own fresh catalog cut names `newborn`, folds its `+1`, and the blob's frontier is
+    /// intact going forward.
+    const GateVerdict later = runRoundCapturingGate(store, gc, UniversePolicy::Authoritative);
+    ASSERT_TRUE(later.saw_fold);
+    EXPECT_EQ(later.frontier_namespaces, 1u);
+    EXPECT_EQ(later.frontier_proven, 1u);
+    EXPECT_TRUE(backend->head(key).exists) << "the newly folded owner keeps the blob alive";
 }
 
 /// The generation prune's cursor must not move on a suppressed round either. It is a monotone

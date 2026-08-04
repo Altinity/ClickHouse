@@ -49,11 +49,17 @@ enum class UniversePolicy : uint8_t
     /// proofs decide the gate on their own.
     Authoritative = 1,
 
-    /// The gate opens only on a COMPLETE, CATALOG-PROVEN frontier: the universe is non-empty and every
-    /// namespace in it reached a proven frontier, no anomaly was recorded, and no hold rides forward.
-    /// Any one of those failing suppresses every destructive site POOL-WIDE — narrowing the suppression
-    /// to the offending namespace would be unsound, because blob in-degree is a pool-wide property and
-    /// no ownership partition of the blob space exists.
+    /// The gate opens only on a COMPLETE, CATALOG-PROVEN frontier: every namespace in the universe
+    /// reached a proven frontier, no anomaly was recorded, and no hold rides forward. A universe of size
+    /// zero is unproven by DEFAULT (`frontier_namespaces == 0` alone -- an empty-BY-COUNTER universe --
+    /// is never a proof; a fresh pool, a damaged catalog, and a legitimately empty pool all produce it
+    /// identically). It is proven only when the round's OWN hot-scan catalog cut positively demonstrates
+    /// it: present, token-bearing, decoded, and holding zero rows of every lifecycle state including
+    /// `Creating` (`FoldResult::catalog_cut_proved_empty`). Without that positive proof an emptied pool
+    /// would stop reclaiming permanently, because its universe can never again exceed zero. Any of these
+    /// failing suppresses every destructive site POOL-WIDE — narrowing the suppression to the offending
+    /// namespace would be unsound, because blob in-degree is a pool-wide property and no ownership
+    /// partition of the blob space exists.
     kDefault = Authoritative,
 };
 
@@ -471,6 +477,17 @@ public:
     /// blob in-degree). Production never calls this; trim is always enabled.
     void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
 
+    /// Fires once, synchronously, right after `listRefPrefix`'s hot-scan catalog `GET`
+    /// (`CasRefCatalog::read`) returns -- the exact instant the round's catalog cut is taken, before
+    /// the round does anything else with it. Lets a test land a real namespace birth (through the
+    /// production writer path) in the window between that cut and the round's later destructive work,
+    /// driving the interleaving deterministically instead of relying on real thread scheduling. Empty
+    /// (no-op) in production, mirroring `CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest`.
+    void setPostHotScanCatalogReadHookForTest(std::function<void()> hook)
+    {
+        post_hot_scan_catalog_read_hook_for_test = std::move(hook);
+    }
+
     /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
     /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
     /// writer's durable ownership history.
@@ -571,6 +588,15 @@ private:
         /// `UniversePolicy` for what the universe is and why the catalog is the only source that can
         /// bound it. False under `StageA_Suppressed` no matter what the per-namespace probes found.
         bool frontier_complete = false;
+
+        /// Whether the round's OWN hot-scan catalog cut (`catalog_cut`, the same `GET` the walk plan
+        /// already paid for -- never a second one) is itself the positive proof that the universe is
+        /// empty: a present, token-bearing, successfully decoded catalog with zero rows of ANY
+        /// lifecycle state, `Creating` included. `frontier_namespaces == 0` alone is NOT this proof --
+        /// it is also what a catalog holding only `Creating` rows produces, and a `Creating` row is a
+        /// birth in progress, not an empty universe. This is the second, POSITIVE way the frontier's
+        /// non-vacuity term can be satisfied, alongside `frontier_namespaces > 0`.
+        bool catalog_cut_proved_empty = false;
 
         /// The universe's size and how much of it this round proved, for the `fold_ref_intake` row: a
         /// round that suppressed everything owes the reader the two numbers that explain why.
@@ -882,6 +908,8 @@ private:
     /// against another node's clock; see `computeHeartbeatFloor`.
     std::function<uint64_t()> mono_ms_fn;
     bool trim_enabled = true;     /// TEST SEAM ONLY: production always trims; see setTrimEnabledForTest
+    /// TEST SEAM ONLY: see setPostHotScanCatalogReadHookForTest. Empty in production.
+    std::function<void()> post_hot_scan_catalog_read_hook_for_test;
     /// Leader-local, in-memory count of consecutive deferred
     /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever

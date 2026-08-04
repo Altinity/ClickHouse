@@ -1711,6 +1711,13 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// `cleanupRefObjects` and terminal-evidence attribution -- retains both the chosen incarnation and
     /// the lifecycle/absence distinction instead of re-reading or reducing the catalog independently.
     result.catalog_cut = catalog_snapshot;
+    /// THE POSITIVE EMPTY-UNIVERSE PROOF (see the destructive gate below). `token` is guaranteed by
+    /// `CasRefCatalog::read` on every operational path -- absence there is `CORRUPTED_DATA`, never an
+    /// empty snapshot -- but the check stays here so this fails closed if a bootstrap/test snapshot
+    /// ever reaches this line. `entries` (not `live_incarnation`, which drops `Creating`) is the right
+    /// source: a catalog holding only `Creating` rows must NOT read as an empty universe, and `entries`
+    /// is the one view that still carries those rows.
+    result.catalog_cut_proved_empty = catalog_snapshot.token.has_value() && catalog_snapshot.catalog.entries.empty();
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
@@ -2869,6 +2876,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// namespace is admitted with no listed objects and no sealed cursor yet).
     intake_timer->metric("frontier_namespaces", result.frontier_namespaces);
     intake_timer->metric("frontier_proven", result.frontier_proven);
+    /// `catalog_entries` is the hot-scan catalog cut's own row count (every lifecycle state, `Creating`
+    /// included), and `catalog_proved_empty` is the derived verdict the destructive gate's non-vacuity
+    /// term consults. Together they let an operator tell a proved-empty `0/0` (success) apart from a
+    /// `Creating`-only or otherwise unprovable `0/0` (still suppressed) without re-deriving either fact.
+    intake_timer->metric("catalog_entries", catalog_snapshot.catalog.entries.size());
+    intake_timer->metric("catalog_proved_empty", result.catalog_cut_proved_empty ? 1 : 0);
     intake_timer->metric("unhinted_quiet_walked", intake_unhinted_quiet);
     intake_timer->metric("frontier_unprobed_budget", intake_unprobed_budget);
     intake_timer->metric("catalog_only_walked", intake_catalog_only);
@@ -3024,15 +3037,25 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const bool universe_authoritative = policy == UniversePolicy::Authoritative;
     /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md
     /// {#r11-empty-universe-vacuous}`): `frontier_proven == frontier_namespaces` is `0 == 0` -- TRUE --
-    /// on an empty universe, which is not a proof of anything: a fresh pool, a damaged catalog, or a
-    /// read that legitimately returns nothing all produce zero entries. `frontier_namespaces > 0` is the
-    /// fail-closed floor that refuses to call that vacuous equality a complete frontier. It proves
-    /// nothing beyond that one refusal -- a nonzero count still needs every namespace PROVEN, which the
-    /// equality above still checks; this guard only closes the degenerate case the equality cannot tell
-    /// apart from a real proof.
+    /// on an empty universe, which is not a proof of anything BY ITSELF: a fresh pool, a damaged
+    /// catalog, or a read that legitimately returns nothing all produce zero entries. `frontier_namespaces
+    /// > 0` closes that degenerate case for the ordinary, nonempty pool -- a nonzero count still needs
+    /// every namespace PROVEN, which the equality above still checks.
+    ///
+    /// That floor alone is unsound for a pool whose LAST namespace was removed: the catalog then reads
+    /// genuinely empty forever, `frontier_namespaces` can never again exceed 0, and the equality's
+    /// vacuous truth can never be licensed -- an emptied pool would stop reclaiming permanently. The
+    /// floor's job was never "reject `frontier_namespaces == 0`", it was "reject the UNSUPPORTED case of
+    /// it". `catalog_cut_proved_empty` is the supported case: the round's own hot-scan catalog cut,
+    /// read once and reused (never a second `GET`), decoded successfully, token-bearing, and holding
+    /// zero rows of every lifecycle state including `Creating`. Under this pool's protocol every live or
+    /// live-precommit edge requires an exact `Live` catalog row (INV-3), so that cut is a positive proof
+    /// that no namespace anywhere holds one -- not merely an absence of proof. A catalog holding only
+    /// `Creating` rows produces the SAME `frontier_namespaces == 0` but is a birth in progress, not an
+    /// empty universe, and `catalog_cut_proved_empty` is false for it (see `entries.empty()` above).
     result.frontier_complete = universe_authoritative
-        && result.frontier_namespaces > 0
-        && result.frontier_proven == result.frontier_namespaces;
+        && result.frontier_proven == result.frontier_namespaces
+        && (result.frontier_namespaces > 0 || result.catalog_cut_proved_empty);
     const bool frontier_incomplete = !result.frontier_complete;
 
     result.suppress_destructive =
@@ -3047,14 +3070,24 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// the pool explains it -- so it is reported at Info with the same numbers rather than raising an
         /// alarm nobody can act on.
         ///
-        /// An AUTHORITATIVE-but-EMPTY universe (`frontier_namespaces == 0`) is a per-round cause and is
-        /// named explicitly here, because the bare equality `frontier_proven != frontier_namespaces`
-        /// reads `0 != 0` (false) and would otherwise miss it.
+        /// An AUTHORITATIVE-but-EMPTY universe that the catalog cut did NOT prove empty
+        /// (`frontier_namespaces == 0 && !catalog_cut_proved_empty` -- e.g. a `Creating`-only catalog)
+        /// is a per-round cause and is named explicitly here, because the bare equality
+        /// `frontier_proven != frontier_namespaces` reads `0 != 0` (false) and would otherwise miss it.
+        /// A catalog the cut DID prove empty is not a suppression cause at all: it satisfies
+        /// `frontier_complete`, so a round reaching this block with one is suppressed by an anomaly or
+        /// a hold, never by the frontier term.
         const bool per_round_cause = !report.anomalies.empty() || !carried_holds.empty()
             || result.frontier_proven != result.frontier_namespaces
-            || (universe_authoritative && result.frontier_namespaces == 0);
+            || (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty);
         const char * const universe_note =
             universe_authoritative ? "" : "; the caller supplied no universe";
+        /// Names the real reason a `Creating`-only (or otherwise unprovable) catalog is not an empty
+        /// universe, so the operator does not read a suppressed round with rows on file as "empty".
+        const String catalog_empty_note =
+            (universe_authoritative && result.frontier_namespaces == 0 && !result.catalog_cut_proved_empty)
+                ? fmt::format("; catalog holds {} row(s), none walkable/provable", catalog_snapshot.catalog.entries.size())
+                : String{};
         /// The per-cause breakdown of the unproven namespaces. Without it "N of M proven" names a
         /// deficit but not its cause, and the causes want opposite operator responses.
         const String deficit_note = result.frontier_deficit.total() == 0
@@ -3063,19 +3096,21 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (per_round_cause)
             LOG_WARNING(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}). Graduations and pending "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Graduations and pending "
                 "deletes are carried; nothing irreversible runs until a pass that clears all three.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
-                result.frontier_proven, result.frontier_namespaces, universe_note, deficit_note);
+                result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
+                deficit_note);
         else
             LOG_INFO(logger,
                 "CAS GC fold: destructive work SUPPRESSED this pass — {} anomaly(ies), {} held "
-                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}). Graduations and pending "
+                "namespace(s), frontier {} ({} of {} namespace(s) proven{}{}{}). Graduations and pending "
                 "deletes are carried; nothing irreversible runs until a pass that clears all three.",
                 report.anomalies.size(), carried_holds.size(),
                 result.frontier_complete ? "complete" : "INCOMPLETE",
-                result.frontier_proven, result.frontier_namespaces, universe_note, deficit_note);
+                result.frontier_proven, result.frontier_namespaces, universe_note, catalog_empty_note,
+                deficit_note);
     }
 
     std::vector<BlobSourceRetirement> orphan_source_retirements;
@@ -3778,6 +3813,16 @@ RoundInput Gc::listRefPrefix(const GcState & state)
     /// cannot force DEFER.
     RefScanSummary scan = enumerateRefPrefix();
     const CasRefCatalog::Snapshot catalog_cut = CasRefCatalog::read(store->backend(), store->layout());
+    /// TEST SEAM: see `setPostHotScanCatalogReadHookForTest`. Moved into a local before invoking (the
+    /// same reason `create_namespace_step1_pre_read_hook_for_test` is swapped rather than called
+    /// directly): a hook that reassigns the member from inside its own body would otherwise reassign
+    /// the very `std::function` executing it.
+    if (post_hot_scan_catalog_read_hook_for_test)
+    {
+        std::function<void()> hook_to_run;
+        std::swap(hook_to_run, post_hot_scan_catalog_read_hook_for_test);
+        hook_to_run();
+    }
     catalog_cut.life_index.throwIfAmbiguous("CAS GC hot scan");
     store->reconcileRefCatalogCut(catalog_cut);
 
