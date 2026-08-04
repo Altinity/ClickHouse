@@ -927,3 +927,12 @@ command = conservative lease re-read); sanitizer slack widens the gap. Product c
 inline on master (bounded retry through the documented refusal, commit above). Verification run
 deferred to the post-soak slot (praktika forbidden during soak). Codex dropns ruling received;
 dropns-fix draft writer running on lane-g. 90m specimen mid-run.
+
+### Watchdog 08:04 {#wd-0804}
+- 90m specimen at tick #38 (~45 min), pool 11.8 GB, healthy. Criterion-4 ANOMALY injected 03:39:42
+  (ckpt bytes backed up); the in-flight ch1 round is progressing (fold_ref_intake advanced to
+  03:45:48 — slow because the pool is at peak, not wedged); no Finish yet, so the anomaly verdict
+  is still pending. Leader is ch1 (my earlier ch2 correction was wrong: ch2's rows are NotALeader
+  no-ops). Hold arm gated on the clock (skip if past minute ~70; would become an owed item).
+- dropns-fix draft COMPLETE on lane-g (probe + 10 unit shapes + stateless 05023 + UNVERIFIED-DRAFT
+  report); waiting for the build slot. tsan heal-test fix committed on master (needs a verify run).
