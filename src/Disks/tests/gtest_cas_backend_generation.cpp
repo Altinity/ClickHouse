@@ -105,3 +105,64 @@ TEST(CASBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
     EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::ETag}));
     EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::Emulated}));
 }
+
+/// A conditional write on a generation-token store is forced single-part, because GCS honours no
+/// precondition on multipart completion — it completes the upload and DROPS the condition, turning a
+/// write that had to be refused into a silent overwrite. A single part is bounded, so a body above the
+/// cap cannot be conditionally written at all. The refusal must therefore be decided from the declared
+/// size, before any byte is offered, rather than surfacing as a storage error after the whole body has
+/// crossed the network.
+TEST(CASBackendGeneration, StreamOverwriteAboveSinglePutCapRefusesBeforeWriting)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
+        /*conditional_single_put_cap=*/1024);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    const auto created = b->putIfAbsent("p/gen/big", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+
+    try
+    {
+        b->putOverwriteStream("p/gen/big", created.token, /*declared_size=*/4096);
+        FAIL() << "a body above the single-PUT cap must be refused, not attempted";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::BAD_ARGUMENTS);
+        const String msg = e.message();
+        EXPECT_NE(msg.find("gcs_max_conditional_put_bytes"), String::npos)
+            << "the operator must be told which setting bounds this, message was: " << msg;
+    }
+
+    auto got = b->get("p/gen/big");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "original");
+}
+
+TEST(CASBackendGeneration, StreamOverwriteAtTheCapIsAllowed)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
+        /*conditional_single_put_cap=*/1024);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    const auto created = b->putIfAbsent("p/gen/atcap", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+    /// Exactly at the cap fits in one part: the bound is a maximum, not a strict inequality.
+    EXPECT_NE(b->putOverwriteStream("p/gen/atcap", created.token, /*declared_size=*/1024), nullptr);
+}
+
+/// The cap exists only because of the generation dialect's multipart gap. An ETag store honours the
+/// precondition on multipart completion, so its conditional writes have no size ceiling at all.
+TEST(CASBackendGeneration, EtagDialectHasNoStreamOverwriteSizeLimit)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
+        /*conditional_single_put_cap=*/1024);
+    b->setNativeTokenTypeForTest(TokenType::ETag);
+
+    const auto created = b->putIfAbsent("p/etag/big", "original");
+    ASSERT_EQ(created.outcome, PutOutcome::Done);
+    EXPECT_NE(b->putOverwriteStream("p/etag/big", created.token, /*declared_size=*/1ULL << 40), nullptr);
+}

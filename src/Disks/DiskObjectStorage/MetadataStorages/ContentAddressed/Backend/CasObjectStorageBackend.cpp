@@ -961,12 +961,28 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
 }
 
 WriteSinkPtr ObjectStorageBackend::putOverwriteStream(const String & key, const Token & expected,
-                                                      uint64_t /*declared_size*/, const ObjectMeta & meta)
+                                                      uint64_t declared_size, const ObjectMeta & meta)
 {
     /// A wrong-dialect expected token can never match, and letting it reach the wire would spend the
     /// whole body to learn that — the same up-front check `putOverwrite` makes.
     if (!mintingTypeMatches(expected.type))
         return std::make_unique<RefusingSink>(PutOutcome::PreconditionFailed);
+
+    /// A generation-token store honours NO precondition on multipart completion: it completes the
+    /// upload and drops the condition, which turns a write that had to be REFUSED into a silent
+    /// overwrite — for a token protocol, the worst outcome available. Conditional writes there are
+    /// therefore forced into a single part (`conditionalWriteSettings`), and a single part is bounded.
+    /// A body above that bound cannot be conditionally written at all, so refuse from the declared
+    /// size here rather than after the whole body has crossed the network to learn the same thing.
+    if (mode == Mode::Native && native_token_type == TokenType::Generation
+        && declared_size > conditional_single_put_cap)
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS conditional overwrite of {} bytes exceeds this backend's single-PUT budget of {} bytes "
+            "(gcs_max_conditional_put_bytes): a generation-token store cannot condition a multipart "
+            "completion, so a conditional write must fit in one part",
+            declared_size, conditional_single_put_cap);
+    }
 
     if (mode == Mode::Native)
     {
