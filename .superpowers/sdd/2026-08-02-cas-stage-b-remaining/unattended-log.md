@@ -1136,3 +1136,20 @@ the condition is met on the branch; FINDING #3 was found after the verdict and i
 
 **Standing rules:** two live worktrees only (master + lane-g); one heavy stage at a time; no pushes;
 execute in-turn rather than announcing; monitors do not wake me — poll.
+
+## Post-compact tick — 2026-08-04 22:50 {#post-compact-05023-green}
+
+**Done since last entry.** `05023_cas_dropns_leaked_namespace` **PASSED** via praktika (1 test
+passed, 4.33 s, stderr clean) — the drain now reaches `pending_condemned = 0` and no longer trips the
+harness's any-stderr-output rule. The log-noise change is committed as `4d40d453347`. Working tree
+under `src/` and `tests/` is clean apart from stateless debris.
+
+**Integration check.** `laneg/fix-verify` carries nine commits absent from `cas-gc-rebuild` by hash,
+but a content diff of the four fix-bearing files shows `ContentAddressedMetadataStorage.cpp`,
+`CasRefCatalog.cpp` and the 05023 script are byte-identical, and `gtest_cas_gc_frontier_gate.cpp`
+differs only because the main branch has the newer six-guard version. FINDING #1 and #2 are fully
+integrated; lane-g holds nothing unmerged that matters. Tasks #5/#6/#7 closed.
+
+**In flight.** Nothing — box idle, no builds, no soak, no praktika.
+
+**Next.** BACKLOG `[cas-tests-unchecked-optional-deref]` → criterion-4 HOLD-arm short soak → T9.
