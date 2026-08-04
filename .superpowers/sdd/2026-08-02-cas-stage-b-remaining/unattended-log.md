@@ -1055,3 +1055,18 @@ launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.m
 - COMMUNICATION FAILURE: the agent receives none of my messages and sends none; it is alive (running
   builds/tests). USER RULE recorded: exactly two live worktrees (master, lane-g) — the agent created a
   third (lane-g-emptyuniverse, now 37G of build tree); consolidation owed once its work is committed.
+
+### Watchdog 16:44 {#wd-1644}
+- USER CORRECTION + REVERT: `ReaderExecutorModeledCostMsPerRequestedMiB` is an UPSTREAM feature of
+  altinity/antalya-26.6 (PR #106968, in CHANGELOG), not ours; yesterday's obscure-names Task 6 commit
+  f43d7222b45 deleted it plus its test 04328_reader_executor_kpi_async_metric. Reverted as 9edc80179f2
+  and verified restored (metric published, delta bookkeeping members back, original test/reference
+  back, replacement test removed). RULE recorded: deleting existing functionality or tests in shared
+  files is never "cleanup" — it is a separate decision with an owner, and must not ride inside a
+  naming plan. I had misreported it as our own change; corrected.
+- FINDING #3 arc: gate+tests committed (ebf4fc54190, 65f5c7a0d0d); abort CLASSIFIED as test scaffold
+  (gdb backtrace: disengaged optional -> TestBody, no production frame; unchecked `get(...)->bytes`).
+  Janitor unlock ruled INTENDED (consult cleared it: own catalog cut, fence recheck, exact-token
+  deletes, opaque life ids). Open: exact-cadence assertions, the two rewritten pre-existing tests,
+  full-file re-run behind the abort, then consolidation into lane-g and removal of the third worktree.
+- New BACKLOG item ordered: `[cas-tests-unchecked-optional-deref]` (16 sites in one file, ~143 tree-wide).
