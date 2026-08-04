@@ -1,7 +1,0 @@
-docs/superpowers/cas/deferred-docs-fixes.md	records:23
-diff_25_8_26_3.md	records:3
-docs/superpowers/cas/draft-fixes-20260726.md	records:18
-.superpowers/sdd/2026-08-02-cas-stage-b-remaining/fixround-t6rev-report.md	records:7
-docs/superpowers/reports/2026-07-26-s42-stale-edge-repro/fsck_detail_live.txt	records:3
-docs/superpowers/reports/2026-07-26-list-incompleteness-proof/gc_anomaly_rows.txt	records:1
-utils/ca-soak/scenarios/gc_wedge_forensics_20260710.txt	records:2
