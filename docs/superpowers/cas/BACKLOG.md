@@ -15,14 +15,16 @@ specs/plans/worklogs/reports, the whole-branch review (`review1.md`), and the re
 notes, then verifying each candidate against the code at HEAD (branch `cas-gc-rebuild`). Issue IDs
 (B-numbers, T-numbers, S-numbers, D-numbers, review IDs, rev.6, …) are **preserved, never renumbered**.
 
-**Re-groomed 2026-08-04** against the 2026-08 docs-consolidation verdict set
-(`docs/superpowers/cas/consolidation-2026-08/verdicts/verdicts.jsonl` joined against
-`clusters/clusters.jsonl` by `issue_ids`, 4,633 verdicted clusters). Items whose every matching
-cluster verdicted terminal (`done`/`rejected`/`stale`/`doc-fact`) moved to
-[Closed by the 2026-08 consolidation](#closed-2026-08-consolidation). Items with any matching
-`open`/`unverifiable` cluster stayed live. Items with no cluster match were left untouched — the
-consolidation corpus does not claim full coverage of this file, and absence of a match is not
-evidence the item is resolved.
+**Re-groomed 2026-08-04, then aggressively pruned the same day** against the 2026-08 docs-consolidation
+verdict set (`docs/superpowers/cas/consolidation-2026-08/verdicts/verdicts.jsonl` joined against
+`clusters/clusters.jsonl` both by `issue_ids` and by `sources` citing this file's own anchors).
+Every item whose resolution was individually content-verified — not just verdict-matched — was
+either deleted outright (fully resolved; git history is the archive) or, where a long investigation's
+diagnosis was confirmed accurate but its recommended fix was still open, compressed to the live ask
+plus an evidence pointer, dropping the resolved narrative. Items with any still-open thread stayed
+live, and items with no cluster match were left untouched — the consolidation corpus does not claim
+full coverage of this file, and absence of a match is not evidence an item is resolved. This is a live
+document again, not an archive; git history holds everything trimmed.
 
 `ROADMAP.md` remains the DONE/history status roll-up; **this document is the live backlog.** For each
 item: `[<ID>] title — priority — one-line status/pointer`.
@@ -354,60 +356,15 @@ is a product question for the guard's author, not a test tweak to guess at.
 Why it survived its own landing commit: the narrow `Cas*:CA*` gate filter EXCLUDES `RefWriter*` (the
 2026-07-17 gate-filter gap). Use the comprehensive filter.
 
-## [GC-THROUGHPUT-COLLAPSE] dropped namespaces are never pruned once GC rounds stall — 63% of the CI pool was corpses {#gc-throughput-collapse}
+## [GC-THROUGHPUT-COLLAPSE] dropped namespaces are never pruned once GC rounds stall {#gc-throughput-collapse}
 
-Found 2026-07-24 by asking a question the first analysis had waved away ("isn't that LIST just the
-live refs of many parallel tests?"). It is not. Measured from the PR-2073 CA-s3 stateless run's
-server log:
-
-- of the 167 distinct ref-page boundaries the slow LIST walked, **128 distinct namespaces; 113 have an
-  explicit drop record and 97 were dropped BEFORE the query even started** (median 25 min earlier,
-  oldest 58 min). Weighted by page boundary, **63% of the listed volume sits in already-dropped
-  namespaces**; the only undropped ones are the server's own `system.*_log` tables;
-- 15,123 namespaces existed before the query, **9,538 explicitly dropped**;
-- the pool ran **32 GC rounds in 95 minutes and then none at all for the last ≥47 minutes**;
-- the rounds were losing: candidates 1006 -> 4841 -> 20046 while deletions stayed ~700/round, and the
-  round interval went 9 min -> 28 min -> never.
-
-MECHANISM — corrected twice, so here is only what is ESTABLISHED versus what is not.
-
-Established from the code: a round is all-or-nothing. `fold` (O(universe)) -> ONE `gc/state` CAS
-(`CasGc.cpp:636`) -> cleanup (`runNamespaceCleanupPasses` + `cleanupRefObjects`, `:725-727`). Cleanup
-sits after the commit point BY DESIGN — a `Removed` snapshot must be durable before the logs it covers
-may be deleted ("ORDER IS LOAD-BEARING", `:713-724`) — so any exit before the commit does ZERO
-cleanup, not partial cleanup. Rounds are serialized by the scheduler (`gc_round_mutex`,
-`gc_interval_sec=5` on this lane), so the next round only begins when the previous one RETURNS.
-
-NOT established, and previously asserted here in error: that a competing leader stole the lease and
-made the CAS lose. This lane runs a SINGLE server (`server_root_id=stateless-ca-s3`), so there is no
-second replica to compete; and stealing from a LIVE incumbent is refused by construction (manual
-rounds pass `allow_steal=false`; the loop's steal exists for DEAD-incumbent recovery). The lost-CAS
-path at `:638` is real code but there is no evidence it fired here — the discriminator is whether
-`gc/state moved during the round` appears in the log, which was never checked.
-
-Most parsimonious reading of the evidence: ONE round was still folding. With ~15k namespaces and
-20,046 candidates, a single round exceeding 47 minutes needs no contention to explain, and because
-rounds are serialized no further round could start. Cleanup did not run because the round never
-reached its commit point — a fold-COST problem (§2 `[Lever B]`, the O(pool) round), not a leadership
-problem. Either way the loop is the same: no cleanup -> dead namespaces persist -> universe grows ->
-fold slower.
-
-SEPARATE OPEN QUESTION worth checking, because it would make catch-up impossible on its own:
-deletions stayed flat near 700/round while candidates grew to 20,046. There IS a per-round budget in
-this area (`manifest_sweep_delete_budget_keys`, default 100, `CasGc.cpp:1463`) — determine whether the
-blob/manifest deletion path is likewise capped per round. A fixed per-round delete budget against a
-growing candidate set can never converge once it falls behind.
-
-NOT the same as `[codex-11]` (an EMPTY Live-but-ownerless ref-table revived through an
-allocate/register TOCTOU): here the namespaces were cleanly dropped, with populated ref-table logs
-left behind. This is a cleanup-THROUGHPUT failure and belongs with the GC scalability family
-(§2 `[Lever B]`, the O(pool) round cost, the quadratic-LIST scenario finding) — Lever B's change
-signal is exactly what would stop a round from re-walking an unchanged universe.
-
-Why it matters beyond CI: the same feedback loop applies to any long-lived pool with table churn.
-Evidence caveat from the analysis: 167 pages is a LOWER bound (the client only logs a URL when it
-retried), so the absolute volume is larger; the dead/live ratio is unaffected because boundaries
-sample uniformly by object count.
+Initial 2026-07-24 finding (63% of a CI pool's listed volume sat in already-dropped namespaces once
+GC rounds stalled under churn); superseded by the fuller 2026-07-25 RCA at
+[`{#gc-throughput-collapse-2026-07-25}`](#gc-throughput-collapse-2026-07-25), which identifies the
+same mechanism (rounds are all-or-nothing — no cleanup runs until the fold reaches its commit point,
+and a big-enough universe makes that point unreachable within the round interval) with the three
+separable defects tracked there. Not the same class as `[codex-11]` (an empty ownerless ref-table
+revived through a TOCTOU) — this is cleanup throughput, not a correctness defect.
 
 ## [04286 timeout] `system.remote_data_paths` walks EVERY disk — 600s timeout on the CA-s3 lane {#remote-data-paths-no-pushdown}
 
@@ -744,144 +701,58 @@ machinery entirely and just run the filter directly.
 - [x] RESOLVED as misdiagnosis + REAL FIX LANDED (f1f11 soak 2026-07-21): the "post-kill CA table load takes minutes" finding was an artifact — the table sits in a lazy_load_tables=1 DB (706095958ea) and materializes in ~18 ms on first touch; nothing touched it post-kill, while SYSTEM SYNC REPLICA misreported the unmaterialized StorageTableProxy as "is not replicated". Fixed in 2ba28ac4b6f (unwrapTableProxy across single-table SYSTEM verbs + stateless test 05017). OPEN EMPIRICAL TAIL: measure post-fault getNested cost under churn at the next soak's first chaos checkpoint — if genuinely minutes, that is the real availability item.
 - [ ] lazy_load_tables follow-ups (from T15 review, pre-existing): whole-db DROP REPLICA safety scan (InterpreterSystemQuery.cpp:~1687) and RESTART REPLICAS iteration skip unmaterialized proxies — a stale remote replica in ZK may stay uncleaned for lazy tables; STOP/START <action> on a single lazy table parks the ActionLock on the PROXY, invisible to the later-materialized nested storage.
 
-## Ref-ledger follow-ups from the two-model adversarial consult (Fable max-depth + gpt-5.6-sol high, 2026-07-21) {#ref-ledger-consult-followups-2026-07-21}
+## Ref-ledger follow-ups from the two-model adversarial consult (2026-07-21) {#ref-ledger-consult-followups-2026-07-21}
 
-Companion of the fail-closed restore (un-elided cross-owner check + snapshot validation + container
-hardening + `ApplyMode` privatization) that landed the same night. The three items below were
-consult-flagged, controller-verified, and deliberately DEFERRED with measurement/design gates —
-per-item severity and evidence in `docs/superpowers/reports/2026-07-21-reftablestate-experiments.md`
-and `tmp/consult-gpt56sol-answer.md`.
+Consult-flagged, controller-verified, deliberately deferred with measurement/design gates. Evidence:
+`docs/superpowers/reports/2026-07-21-reftablestate-experiments.md`, `tmp/consult-gpt56sol-answer.md`.
 
-- [ ] **HARD (design): post-durable-PUT allocation window in the ref-lane flush** (gpt-5.6-sol F2).
-  After the object store confirms the ref-log PUT `Committed`, the leader still performs allocating
-  work (`applyRefLogTxn` live install, `materializeCommitted` copying both COW containers) inside the
-  same critical section; a `std::bad_alloc` there is reported by the catch as "permanently
-  unreplayable history" and completes every waiter with an error for a transaction that IS durable —
-  a retry then legitimately observes "already exists"/"absent" splits. Pre-existing shape (predates
-  this round; E2's second container widened the window marginally). Fix direction (consult-endorsed):
-  construct + fully materialize the exact candidate state BEFORE the PUT; after durability, install
-  via a verified no-throw move under `state_mutex` (static_assert on noexcept), then update tail
-  counters. Touches the ledger flush ordering — needs its own spec + soak gate. UPDATE 2026-07-23:
-  the publish-confirm fetch-handoff review (round 3) independently rediscovered this window as the
-  one state breaking `confirmExactRef`. UPDATE 2026-07-24: **FOLDED (user direction) into the
-  unified publish-confirm spec** `2026-07-23-cas-fetch-handoff-publish-confirm-design.md`
-  §ledger-hardening — the poison marker (fail-closed half) is its item 1 / execution phase 3, the
-  full no-throw-install (this item) is its item 3 / execution phase 7 with the measurement gate
-  (wedge→flush bench + `BM_FlushInstall`) as the phase's first task. Tracked THERE now; this entry
-  kept as a pointer.
-- [ ] **DESIRABLE (measured, est. 2-3× recovery/GC-rebuild cut): recovery re-runs 3-4 codec passes per
-  snapshot row** (Fable F5). `recoverRefTableDetailed` decodes the snapshot, then `stateFromSnapshot`
-  re-encodes + re-decodes it (hand-built-snapshot defense), then per-row size helpers re-encode
-  fragments; the E3 report's "residual O(N)" replay constant is mostly this. Fix direction: a
-  validated-witness type produced by `decodeRefTableSnapshot` that `stateFromSnapshot` accepts
-  without the round-trip (hand-built callers keep the round-trip path); micro-bonus: seed
-  `snapshot_body_bytes` from `bytes.size() - snapshotFramingSize(...)`. Gate: benchmark
-  recovery-then-first-append before/after.
-- [ ] **VERIFY-then-maybe (measured): `precommits` is a plain `std::set`, deep-copied per state copy**
-  (both consults, independently). Every `RefTableState` scratch copy is O(P) string copies; P is
-  bounded only by the admission byte budget (up to ~64 MiB encoded), not by the 1,000-op txn cap;
-  every shipped "copy O(1) ~58 ns" number used a ONE-precommit fixture. BOTH consults: do NOT build
-  a third COW container without a number. First step: extend `BM_ScratchCopy`/`BM_Admits` with a
-  P-sweep (P=1/100/10,000) and check a precommit-heavy soak phase; only a real measured cliff
-  justifies a `RefCowPrecommitSet`.
+- **Post-durable-PUT allocation window in the ref-lane flush** — folded into the publish-confirm spec
+  (`2026-07-23-cas-fetch-handoff-publish-confirm-design.md` §ledger-hardening) and tracked there, not
+  here; this pointer stays only so the finding isn't rediscovered. Two round-2 nuances not to lose
+  when restructuring: the catch's "permanently unreplayable" framing over-claims (the covered region
+  can throw via `MemoryTracker` limits on a durable+applied transaction); wedge resolution followed
+  by flush is a path `BM_FlushInstall` does not model yet — measure it before changing anything.
+- **Recovery re-runs 3-4 codec passes per snapshot row** (measured, est. 2-3x recovery/GC-rebuild
+  cut) — `recoverRefTableDetailed` decodes, `stateFromSnapshot` re-encodes+re-decodes (hand-built
+  defense), then per-row size helpers re-encode again. Fix: a validated-witness type
+  `decodeRefTableSnapshot` produces that `stateFromSnapshot` accepts without the round-trip.
+- **`precommits` is a plain `std::set`, deep-copied per state scratch copy** — bounded only by the
+  ~64 MiB admission byte budget, not the 1,000-op cap; every shipped "O(1) ~58 ns copy" benchmark
+  used a one-precommit fixture. Do not build a third COW container without a number: extend
+  `BM_ScratchCopy`/`BM_Admits` with a P-sweep (1/100/10,000) first.
+- **GC per-table recovery gate before ref-log fold** (defense-in-depth; mandatory before any
+  multi-writer or rolling-upgrade-skew milestone) — refuted as a live defect today (single
+  lease-holder cannot mint the fabricated history this would catch), but still worth building before
+  that changes. Fix shape: per-table `recoverRefTable(ns)` before folding new logs, `CORRUPTED_DATA`
+  clamps the table (no cursor advance) rather than aborting the round.
 
-- [ ] **DESIRABLE (defense-in-depth; MANDATORY before any multi-writer or rolling-upgrade-skew
-  milestone): GC per-table recovery gate before ref-log fold** (round-2 consult disagreement,
-  resolved by two-model refutation 2026-07-21). The GC fold extracts manifest edges from decoded
-  logs without state-machine replay (`CasGc.cpp` ref intake; designed intake model, pinned by
-  `gtest_cas_gc_undercount_repro.cpp`); a codec-valid but semantically-fabricated removal of a LIVE
-  edge would fold a wrong `-1` and can premature-delete (source-edge identity carries no ref owner).
-  REFUTED as a live defect for the current branch: the single lease-holding writer structurally
-  cannot mint such history (validated-prefix argument), raw appenders are test-only, S3 tamper is
-  out of trust model — and the 2026-07-21 fail-closed fix NARROWED this surface (recovery now
-  rejects any history no valid state machine could produce) and is the prerequisite for the gate.
-  Fix shape (consult-endorsed): per-table `recoverRefTable(ns)` BEFORE folding that table's new
-  logs; on `CORRUPTED_DATA` clamp the table (no cursor advance, no delta merge, anomaly recorded —
-  same per-table clamp discipline as missing bodies), continue other tables. Abort-only ⇒ fold
-  determinism preserved. Cursor-aligned witness replay (the other proposed shape) is INFEASIBLE:
-  snapshots publish independently of the GC cursor and are routinely ahead of it. Cost: one
-  recovery per table per round (orphan sweep already pays exactly this; share the GETs).
-- [ ] AMEND the "post-durable-PUT allocation window" item above with two round-2 nuances: (a) the
-  catch's "provably unreachable / permanently unreplayable" framing is an over-claim — the covered
-  region includes `materializeCommitted`, which CAN throw in production via `MemoryTracker` limits,
-  yielding a wrong LOGICAL_ERROR diagnosis for a durable+applied transaction (narrow the framing to
-  the apply step when restructuring); (b) wedge resolution applies to the retained state without
-  materializing either COW container — bounded, but a post-wedge flush copies an unmaterialized
-  overlay, a path `BM_FlushInstall` does not model; measure wedge-resolution-followed-by-flush
-  before changing anything (naive post-durable materialize would add an allocation failure mode
-  between apply and unwedge).
+## Disk-error (ENOSPC / inode-exhaustion) audit follow-ups {#disk-error-audit-followups-2026-07-21}
 
-## Disk-error (ENOSPC / inode-exhaustion) audit follow-ups (8-agent sweep + controller verification, 2026-07-21) {#disk-error-audit-followups-2026-07-21}
+Staging/target/GC disk-error audit verdict held (staging ENOSPC fail-loud, Native S3 corruption-free,
+GC decision-durable-before-delete). Residual gaps, ordered by value:
 
-Findings of the staging/target/GC disk-error audit (staging `cas_scratch`, Native S3 target,
-`EmulatedSingleProcess` local target, GC round, read path). Overall verdict held: staging ENOSPC is
-fail-loud with no pool side effects; Native S3 stays corruption-free (atomic PUTs, fail-safe error
-classification in `finalizeConditionalWrite`, bounded `CasRequestControl` retries, fail-closed
-fencing); GC is decision-durable-before-delete with `suppress_destructive` on every corruption-
-tolerant fold branch. The items below are the residual gaps, ordered by value.
-
-- [ ] **HARD: size guard at dedup-admit** — `PartWriteTxn::observeAndAdmit` (4-arg overload,
-  `CasPartWriteTxn.cpp:276-288`) checks only `hr.size >= blob_header_len`; it never compares
-  `hr.size - header_len` against the caller's expected `source.size`, and `putBlob`'s dedup-hit
-  result is discarded by the transaction (`ContentAddressedTransaction.cpp:281`). A truncated
-  object sitting at a content-addressed key (possible on the emulated/local backend, see next item)
-  is admitted as a dedup hit and produces a durably unreadable part. One cheap comparison closes
-  the whole truncation-admit class on every backend (the HEAD-first path, the post-412 revive
-  observe, and the 3-arg gate path all funnel through this overload).
-- [ ] **HARD: temp-file + rename in the local blob write path** — moved to §14 {#local-backend}
-  (2026-07-23 grooming); paired with the size guard above as defense-in-depth.
-- [ ] **DESIRABLE: fsck physical-size check for blob bodies** — `runFsck` HEADs every blob but
-  never compares the physical size against `blob_header_len + entry.blob_size`, so a truncated
-  blob passes as `Reachable` (`CasFsck.cpp:371-414`). The listing already carries the sizes — the
-  check adds zero extra requests. Payload re-hash against the content address stays a separate,
-  opt-in deep mode (today NOTHING re-hashes on read by design — blob-body integrity is delegated
-  entirely to MergeTree `checksums.txt` / compressed-block checksums / `CHECK TABLE`).
-- [ ] **DESIRABLE: free-space guard + orphan sweeper for `scratch_path`** — the local staging write
-  path has no `IDisk::reserve`, no `statvfs` check, and MergeTree reservations cannot see the
-  scratch filesystem (the CA disk is object-backed, the scratch dir lives on the server data
-  path). Peak scratch usage = whole-part size × concurrent part writes (all pending blobs of a
-  part are held until `commit`). Also: orphaned `<rand>.tmp` files survive an unclean restart
-  forever — disk init only does `fs::create_directories`
-  (`MetadataStorageFactory.cpp:238`); the S3 staging prefix has `sweepOwnMountStaging`, the local
-  scratch dir has no sweeper at all. Minimum: document the sizing rule; better: a pre-write
-  free-space check plus a startup sweep of stale `*.tmp`.
-- [ ] **MINOR: wrap the GC post-CAS cleanup in try/catch** — the post-CAS owner-removed
-  manifest-body `deleteExact` loop (`CasGc.cpp:691`) and the hand-off `deletePrefixWholesale`
-  (`:677`) are not wrapped; a genuine backend error (5xx / storage-full) there escapes
-  `runRegularRound` AFTER the round's `gc/state` CAS committed. Data-safe (decision durable;
-  leaked bodies reclaimed by the orphan-manifest sweep) but it skips the rest of that round's
-  post-CAS cleanup and reddens the round. The orphan sweep itself is already wrapped
-  (`:728-735`) — extend the same containment to its two siblings.
-- [ ] **DESIRABLE: GC scheduler backoff + a distinct storage-full signal** — the pacing loop
-  retries a failing round at a fixed interval forever with no backoff, no failure counter, no
-  circuit breaker (`CasGcScheduler.cpp:255-261`); the only operator surface is
-  `last_success_age_seconds` in `system.content_addressed_mounts`. And no ProfileEvent
-  distinguishes "target storage full" (S3 507 / `XMinioStorageFull` / local ENOSPC) from generic
-  instability — both look like `CasConditionalWriteUnresolved` + rising staleness. Add
-  capped-exponential backoff on consecutive failed rounds, an alert-friendly health surface, and
-  a dedicated storage-full counter. Note the recovery asymmetry worth a runbook line: on a 100%
-  full target a round whose fold must write runs/seals dies BEFORE the pre-CAS delete phase, so
-  GC may need externally-freed headroom before it can reclaim anything.
-- [ ] **VERIFY: late-landing conditional PUT after fence loss** — a fenced mount never REPORTS
-  success (`CasRequestControl.cpp:330-334` post-write fence check), but the physical PUT may have
-  landed before the fence latched. Confirm the successor-side `writer_epoch` gating in
-  `CasRefProtocol`/`CasRefLedger` rejects such a late ref-log object. This is the same hazard
-  class as §1 "[Late Predecessor PUT]" and should be closed by rev.6 lease-boundary exclusivity —
-  this audit re-flagged it from the backend side; fold the confirmation into the rev.6 work rather
-  than tracking it separately.
-- [ ] **MINOR: destructor-`abandon` live-epoch precommit debris** — if `abandon` fails while a
-  failed transaction is being destroyed (e.g. the same backend outage that failed the commit), the
-  LIVE-epoch precommit binding persists and is reclaimed only on REMOUNT — neither GC nor the
-  (prior-epoch) stale-precommit sweep takes it (`ContentAddressedTransaction.cpp:117-123`, logged
-  loudly). Bounded, but under a persistently broken backend it accumulates; consider a
-  same-epoch periodic re-`abandon` retry or folding these into the mount-lease sweeper.
-- [ ] **DOC: runbook notes from the audit** — (a) `CHECK TABLE` is the ONLY detector of silent
-  same-length blob-body corruption (the CA layer never re-hashes payloads and never parses the
-  envelope header on reads — sole `decodeEnvelopeHeader` caller is `CasInspect.cpp:491`); (b) a
-  truncated blob surfaces as a premature-EOF read error via MergeTree size/checksum validation,
-  not as a CAS-layer exception (`ReadBufferFromFileView.cpp:78-102` signals early EOF, no
-  `physical size >= offset + length` check exists); (c) persistent target-full ends in a fenced
-  mount + bounded-failing INSERTs — reads stay unaffected.
+- **HARD: size guard at dedup-admit** — `PartWriteTxn::observeAndAdmit` never compares the observed
+  size against the caller's expected size, so a truncated object at a content-addressed key can be
+  admitted as a dedup hit, producing a durably unreadable part.
+- **HARD: temp-file + rename in the local blob write path** — moved to §14, paired with the guard above.
+- **DESIRABLE: fsck physical-size check for blob bodies** — `runFsck` HEADs every blob but never
+  compares physical size against the expected size, so a truncated blob passes as `Reachable`; the
+  listing already carries the sizes, so this is free.
+- **DESIRABLE: free-space guard + orphan sweeper for `scratch_path`** — no `statvfs` check before a
+  local staging write, and orphaned `*.tmp` files from an unclean restart are never swept (the S3
+  staging prefix has a sweeper; local scratch does not).
+- **MINOR: wrap the GC post-CAS cleanup in try/catch** — the post-CAS manifest-body delete loop and
+  hand-off prefix wholesale delete aren't wrapped, so a genuine backend error escapes the round after
+  its `gc/state` CAS already committed (data-safe, but reddens the round unnecessarily).
+- **DESIRABLE: GC scheduler backoff + a distinct storage-full signal** — the pacing loop retries a
+  failing round forever with no backoff and no ProfileEvent distinguishing target-storage-full from
+  generic instability.
+- **VERIFY: late-landing conditional PUT after fence loss** — same hazard class as the historical
+  Late-Predecessor-PUT item; confirm successor-side `writer_epoch` gating rejects it, fold into rev.6
+  lease work rather than tracking separately.
+- **MINOR: destructor-`abandon` live-epoch precommit debris** — if `abandon` fails during a failed
+  transaction's destruction, the live-epoch precommit binding persists until remount; bounded, but
+  worth a periodic re-`abandon` retry under a persistently broken backend.
 
 ## `lazy_load_tables` / `StorageTableProxy` — feature-level decision needed (consult audit 2026-07-21) {#lazy-load-tables-decision-2026-07-21}
 
@@ -1037,361 +908,64 @@ Path anatomy + hazard inventory (from code reading, 2026-07-24):
 - Expected effect calibration: even a perfect stage 2 does not reach 1.0× — ~12% of wall is the vetoed
   `HEAD`-before-`PUT` dedup cost; realistic target ~1.2×.
 
-## GC throughput collapse under a mass-DROP burst — RCA landed, three separable defects (2026-07-25) {#gc-throughput-collapse-2026-07-25}
+## GC throughput collapse under a mass-DROP burst — RCA landed, three separable defects {#gc-throughput-collapse-2026-07-25}
 
-Source: independent RCA by codex gpt-5.6 over the CA-s3 stateless lane log
-(`tmp/gc-collapse-rca/`, prompt was facts-only after two of my own hypotheses were wrong and retracted).
-Every load-bearing claim below was re-verified against the source by the controller.
+Root cause (CA-s3 stateless lane, mass table CREATE/DROP churn): rounds are serialized and drain all
+available work with no regular-round budget, so once DROP arrivals between round completions exceed
+one round's service rate, round time diverges (a queue-stability crossing, self-inflicted, not
+external — round wall time went 20s to 1716s over 6 rounds as candidates went 188 to 20,046). Three
+separable defects, all still open:
+- **The meta pool's "bounded" queue has zero depth**, so `scheduleOrThrowOnError`'s unbounded block
+  serializes the fold thread's own LIST/GET work behind condemn-marker PUT latency
+  (`CasGc.cpp:194,226`). A deeper queue buys overlap, not a lower floor — needs measurement before
+  tuning, since the endpoint can already be saturated.
+- **Completed namespaces keep permanent tombstones under the globally-enumerated ref prefix**, so fold
+  cost grows linearly in historically-unique namespace count forever. Needs a protocol split (spec
+  first, not a patch) separating completed-namespace tombstones from the enumerated prefix.
+- **`system.remote_data_paths` has no `disk_name` pushdown** — upstream code, tracked separately at
+  [`{#remote-data-paths-no-pushdown}`](#remote-data-paths-no-pushdown); amplified but did not cause
+  this collapse.
 
-**Observation.** On the CA-s3 lane (one server, CA is the default MergeTree disk, so every stateless
-test drops tables into one shared pool) GC round wall time went `~20s → 72 → 98 → 195 → 532 → 1716s`
-over rounds 27..32 while candidates went `188 → 20,046`. Round 33 was still in its pre-CAS path 39.5
-minutes in when the capture ended. NOT a deadlock, NOT lease theft, NOT a lost `gc/state` CAS
-(`grep -c "gc/state moved during the round"` = 0).
+**Gated on a measurement rig that does not exist yet**: the GC has no timing instrumentation at all
+(no per-phase wall time, no per-phase S3 request count) — every number above was reconstructed from
+log timestamps. Before choosing a production fix: (1) ship per-round per-phase introspection (wall
+time + request count by verb, surfaced via ProfileEvents/`system.cas_log`); (2) build a reproduction
+rig driven by namespace churn (not data volume — the ca-soak driver is the wrong instrument); (3)
+measure the queue-stability boundary and whether it's self-limiting. A naive fold budget is unsafe by
+construction (an omitted `+1` edge must suppress deletion, never permit it), so any bounded-round
+design needs durable progress state, hence a spec, not a patch.
 
-**Mechanism: a queue-stability crossing.** Rounds are serialized under `gc_round_mutex`, a round drains
-ALL available work (no regular-round budget on ref-log, manifest-edge, candidate or owner-delete
-counts), and dropped-namespace logs are protected from ref cleanup until a LATER completed round
-observes physical emptiness. So DROP arrivals between completions (measured `97, 270, 250, 525, 1297,
-4142`) feed the next round, and a longer round accumulates a bigger next batch. Once arrivals exceed
-one serialized round's service rate the loop diverges. Self-inflicted, not external.
+## fsck-vs-GC blob-retention leak — safety proven, root cause of the arrival still open {#fsck-gc-indegree-disagreement-2026-07-25}
 
-**Defect 1 (verified, cheap): the "bounded" meta pool has zero queue depth, so it back-pressures the
-fold thread.** `Gc::Gc` builds `meta_pool` with the 4-arg `ThreadPool` ctor
-(`CasGc.cpp:194`), which sets `queue_size = max_free_threads = max_threads = gc_meta_pool_size` (16)
-— see `ThreadPool.cpp:161`. `scheduleMetaJob` uses `scheduleOrThrowOnError` (`CasGc.cpp:226`), i.e.
-`wait_microseconds = nullopt`, i.e. `job_finished.wait(lock, pred)` — an UNBOUNDED block
-(`ThreadPool.cpp:342`). So this is not an async fan-out: from the 17th in-flight condemn-marker write
-onward the folding thread blocks on S3 latency in lockstep, and the fold's own LIST/GET work cannot
-overlap with the condemn PUTs. Under the lane's saturated endpoint (50% of LISTs hit `Poco Timeout`
-on attempt 1) 20k candidates at multi-second effective latency is tens of minutes — consistent with
-round 33.
-  - Bounding the round below is `meta_pool->wait()` before the single CAS (`CasGc.cpp:609`), so a
-    deeper queue does NOT change the `candidates / pool_size × RTT` floor; it only buys overlap.
-    Worth doing (a queue of, say, `4 × pool_size` keeps back-pressure and costs ~200 B per queued
-    closure) but it is an amplifier fix, not the cure. MEASURE first — the endpoint was already
-    saturated, so raising concurrency blindly can make it worse.
-  - Note for S43: `CannotAllocateThreadFaultInjector::injectFault()` sits inside this exact
-    `scheduleImpl`, and the CA fallback is "run the meta op inline" — correct, but it converts a
-    thread-allocation failure into a further round slowdown. That is the behaviour S43 should assert.
+Root-caused 2026-07-25: a live soak showed 56 blobs (104,755 bytes) that fsck's reachability walk
+finds unreferenced while GC's in-degree view assigns them in-degree 1 and never nominates them —
+flat across 1062+ rounds. Traced to an unmatched-minus-one: each blob has exactly one residual
+source edge whose owning manifest is gone, so the `-1` that should have cancelled the `+1` was a
+silent no-op (set-presence merge on an absent key). **Safety is proven** — this is a debris/retention
+class, not data loss (the edge-set model cannot over-delete; see the already-closed
+unmatched-removal-fold finding) — and the observability ask (count unmatched-remove no-ops) is
+already live as `CasGcUnmatchedRemoveDeltas`. Only `ca-gc-rebuild` (full traversal) clears existing
+debris; the incremental round cannot.
 
-**Defect 2 (verified, needs protocol work): completed namespaces keep permanent tombstones under the
-globally-enumerated ref prefix.** Ref cleanup never deletes the `_cleanup` marker or the newest
-constant-size `Removed` snapshot. Correct by design, but it makes the cost of every future fold grow
-LINEARLY in the number of historically-unique namespaces, forever, with no self-limit under a workload
-that keeps minting new ones (a CI lane; in production, every dropped table). The fix is to separate
-completed-namespace tombstones from the prefix the fold enumerates — real protocol state and
-migration, so: spec first, do NOT hack.
+**Still open: why the `-1` arrives with no matching `+1` to cancel.** Event-log forensics traced one
+occurrence to four `tmp-fetch_*` refs published and dropped inside a 43 ms window, with the `+1`
+folding ~3 minutes after the drop — leading, unverified hypothesis is a fold-order inversion (the
+removal record applied before the add record). Needs a targeted reproduction (concurrent fetch
+publish + immediate drop) in the fetch-handoff area, not more log archaeology. The ca-soak harness's
+`(M-F debris, B140)` mislabel for this population is tracked at
+[`{#fsck-large-pool-fixed}`](#fsck-large-pool-fixed).
 
-**Defect 3 (upstream, do not patch unilaterally): `system.remote_data_paths` has no `disk_name`
-pushdown** (`StorageSystemRemoteDataPaths.cpp:153`, the TODO is already there), so
-`04286_content_addressed_remote_data_paths` recursively LISTed the whole CA pool: 872 LISTs, 436
-timing out on attempt 1. The server spent 1181.9 s and then returned `ABORTED` because the client had
-already disconnected at the 600 s harness limit. This AMPLIFIED round 33 but did not start the
-collapse — round 32 already took 28.6 min before that query began. Falls under the
-upstream-consult-first rule.
+## LIST-as-journal data-loss class — RESOLVED by the v9 redesign {#list-as-journal-dataloss-2026-07-25}
 
-**The `deleted` plateau (~700-744 while candidates hit 20,046) is a DIFFERENT mechanism, not a budget.**
-`report.deleted` counts outcome-log entries of the delete pass (`CasGc.cpp:592`), and only
-prior-pass `delete_pending` entries enter `merge.redelete` (`CasBlobInDegree.cpp:412`). So the pipeline
-is condemn at round R → graduate at R+1 → delete at R+2, and each cohort lands two rounds later:
-188→151, 571→535, 794→723, 1006→769. Round 32's 20,046 fresh candidates COULD NOT have contributed to
-round 32's `deleted`. The 100-key `manifest_sweep_delete_budget_keys` applies only to the separate
-orphan-manifest sweep and never populates this field. Same DROP burst drives both symptoms; the
-plateau does not explain the long rounds.
-
-**Cheapest thing that actually breaks the loop, in evidence order:** stop making CA-S3 the default disk
-for the entire stateless lane (or throttle that lane's concurrency) — costs CA coverage breadth. The
-robust fix is resumable/bounded regular rounds with durable progress plus defect 2's prefix split; a
-NAIVE fold budget is unsafe, because an omitted `+1` edge must suppress deletion, not permit it.
-
-**Measurement we do not have and need before choosing a production fix:** per-round wall-time split
-across global ref LIST / ref-log+manifest GETs / candidate HEADs / meta-pool scheduling wait / blob+
-manifest deletes / namespace+ref cleanup. Without it any knob choice is a guess.
-
-## STUDY: GC bottleneck measurement rig + round introspection (opened 2026-07-25) {#gc-bottleneck-study-2026-07-25}
-
-**Gates** every fix proposed in [#gc-throughput-collapse-2026-07-25](#gc-throughput-collapse-2026-07-25).
-None of those may be implemented on the strength of the RCA alone: the RCA established the shape of the
-feedback loop from log timestamps, but it did NOT establish where the time inside a round goes. Picking
-a knob (meta-pool queue depth, `gc_meta_pool_size`, a round budget, a prefix split) without that split
-is guessing, and two of the knobs can plausibly make things worse — the endpoint was already saturated.
-
-### Why we cannot measure this today
-
-The GC has **no timing instrumentation at all**: `grep -i "Stopwatch|elapsed"` over
-`.../ContentAddressed/Gc/*.cpp` returns nothing. The one round-summary line
-(`CasGcScheduler.cpp:276`) reports `candidates / deleted / absent / replaced / spared /
-manifests_deleted` and **not even the round's own duration** — every wall-time number in the CI analysis
-was reconstructed by subtracting consecutive log timestamps, which is why "where did round 33 spend 39
-minutes" is unanswerable from the artifact. The existing `CasGc*` ProfileEvents
-(`CasGcEnumerationPages`, `CasGcMetaOps`, `CasGcRetired*`, `CasGcClampSuppressedPasses`, …) are all
-COUNTS of outcomes, never latencies and never per-phase request volume.
-
-### Deliverable 1 — introspection (ship this first; it is useful in production, not just for the study)
-
-Per-round, per-phase: wall time, S3 request count by verb (LIST/GET/HEAD/PUT/DELETE), bytes moved, page
-count. Phases at minimum: global ref-prefix LIST; ref-log GETs; manifest-edge GETs; candidate HEADs;
-meta-pool **scheduling wait** (distinct from meta-op execution — defect 1 predicts this is where the
-fold thread parks); the `gc/state` CAS; owner-manifest deletes; namespace cleanup; ref cleanup.
-Plus: retry/timeout counts per phase, so endpoint degradation is visible as itself rather than as
-"GC got slow". Surface via ProfileEvents + the round summary line + `system.content_addressed_log`
-(the B170 table already exists — see [[project_b170_cas_event_log]]). Decide deliberately whether the
-per-phase split is always-on or behind a setting; always-on is preferable if the cost is a few counters.
-
-### Deliverable 2 — a reproduction rig
-
-The ca-soak driver is the wrong instrument: it is steady-state on a small table set, and this failure
-mode is driven by **namespace churn**, not by data volume. The rig needs the CI lane's shape:
-one server, CA as the default MergeTree disk, one shared pool, `gc_interval_sec=5`, a local S3
-endpoint, and a generator that concurrently CREATEs and DROPs many short-lived tables. Target: drive
-the pool to the CI numbers (≈15k namespaces, ≈9.5k dropped, ≈20k candidates in one round) in far less
-than the 95 minutes the CI lane took, and make the arrival rate a knob so the queue-stability boundary
-can be crossed on purpose and observed from both sides. It must also be able to hold the endpoint
-UNsaturated, so endpoint slowness and GC cost can be separated — in the CI artifact they are confounded.
-
-### Deliverable 3 — the measurements
-
-1. Round wall-time split at a fixed pool size (answers "which phase dominates" — currently unknown).
-2. Scaling curves, measured separately: cost vs number of live namespaces; vs number of *historically
-   unique* namespaces (defect 2's permanent tombstones predict this one never flattens); vs candidate
-   count. These three are conflated in the CI data.
-3. The queue-stability boundary: DROP arrival rate at which round time stops converging, and how it
-   moves with `gc_meta_pool_size` and with meta-pool queue depth. Defect 1 predicts a deeper queue buys
-   overlap but does NOT move the `candidates / pool_size × RTT` floor, because `meta_pool->wait()`
-   precedes the CAS — that is a falsifiable prediction, so test it.
-4. Whether the collapse is self-limiting at some pool size or unbounded (open question from the RCA).
-
-### Then, and only then
-
-Choose a fix with numbers attached, and re-run the rig as the regression gate. Note that a naive fold
-budget is unsafe by construction: an omitted `+1` edge must suppress deletion, never permit it — so any
-bounded-round design has to carry durable progress state, which is why it needs a spec rather than a
-patch.
-
-## ROOT-CAUSED 2026-07-25, FIX OPEN: fsck vs GC disagree persistently about the same unreferenced blobs (soak v3) {#fsck-gc-indegree-disagreement-2026-07-25}
-
-**LIVE REPRODUCTION EXISTS** on the ca-soak stand as left after soak v3 — do not `down -v` it without
-capturing more. Artifacts: `tmp/f6-unreachable/{fsck_detail.txt,the_56_keys.txt,drain_watch.txt}`.
-
-MEASURED on the idle stand, zero workload:
-- `ca-fsck`: `reachable=406 dangling=0 unreachable=56 pending_gc=0 awaiting_gc=56 unaccounted=0`, FLAT
-  across 8 samples over 5.3 min and again 8 min later. 56 blobs, 104,755 bytes.
-- All 56 classify as `AwaitingGc` (`CasFsck.cpp:582`) with the note "edges still in the GC snapshot; the
-  drop has not folded yet (expected)".
-- GC holds the lease and folds once per 10 s (rounds 325..334+ observed). Every fold: `candidates=0`.
-  `previewDeletes`: `dryrun_count=0`.
-
-So fsck's reachability walk finds no live reference to these blobs, while GC's in-degree view assigns
-them in-degree > 0 and never nominates them, and dozens of folds do not change either verdict. Exactly
-one of the two components is wrong: fsck over-reports unreferenced, or GC under-collects (a retention
-leak). WHICH IS NOT ESTABLISHED — do not accept a mechanism that has not been checked against the live
-stand; two GC mechanisms proposed this week from log reading alone turned out wrong.
-
-Note the fsck note's word "expected" is load-bearing and currently unearned: the state is only expected
-if a later fold clears it, and folds did not.
-
-Related: the ca-soak harness labels this population `(M-F debris, B140)` in `checker.py:544`,
-`run.py:555` and the checkpoint lines. That label is wrong on its own terms — the product classifies
-them as `AwaitingGc`, not as the abandoned-build/displaced-tree class the harness cites, and
-`unaccounted=0` throughout. Fix the harness label together with whatever this turns out to be, not
-before: the label change must not be what makes the number stop looking suspicious.
-
-Sub-finding (cosmetic, fix with the round introspection in
-[#gc-bottleneck-study-2026-07-25](#gc-bottleneck-study-2026-07-25)): the DEFER path returns at
-`CasGc.cpp:368` before `report.round` is assigned, so every skip-unchanged round logs as
-`CA GC round 0: candidates=0 …` and is indistinguishable from a round that folded and found nothing.
-That cost real diagnosis time here.
-
-### ROOT CAUSE (systematic debugging, 2026-07-25): an UNMATCHED-MINUS-ONE permanently retains one blob per occurrence {#unmatched-minus-one-retention-leak}
-
-Resolves the investigation opened in
-[#fsck-gc-indegree-disagreement-2026-07-25](#fsck-gc-indegree-disagreement-2026-07-25). Every step below
-is a MEASUREMENT on the live post-soak stand or a line of source, not an inference.
-
-1. **56 present blobs have no live reference.** `ca-fsck`'s reachability walk (refs -> manifests ->
-   blobs) does not reach them. `dangling=0`, `unaccounted=0`.
-2. **Each has exactly ONE residual source edge** in the adopted in-degree run
-   (`soak_pool/gc/gen/343/attempt/1046/blob_target/0/0`, NDJSON): `{"b":"01<digest>","s":"<source_id>",
-   "m":"edge"}`. Verified 56/56, one row each, 56 DISTINCT source ids. So most of each blob's edges were
-   cancelled correctly and exactly one was not.
-3. **An edge identity is a (manifest, file-path) pair**: `source_id = CityHash128(namespace ‖
-   writer_epoch ‖ build_sequence ‖ manifest_ordinal ‖ path)` (`CasBlobInDegree.cpp:165`).
-4. **The manifests that contributed those edges are GONE.** None of the 56 digests appears in ANY of the
-   96 manifests still present in the pool. Methodology validated with a positive control: manifest bodies
-   carry `"blob":"ch128:<hex>"`, and a reachable blob's digest IS found by the same grep.
-5. **So GC computes in-degree = 1 and never nominates them**: `candidates_marked=0` on every one of 1062
-   rounds, `ca-gc-dryrun` = 0, and the count is flat at 56 across 8 fsck samples over 5.3 min and again
-   later — with zero workload on the CA pool (ca_stress has 0 active parts on BOTH nodes; the churning
-   `system.*_log` tables live on the `default` disk, not on CA).
-6. **This is NOT the missing-body path, and the designed protection never engaged.**
-   `foldManifestEdges` returns false without emitting deltas when the body is absent
-   (`CasGc.cpp:750-755`), and the caller is supposed to CLAMP the table (`CasGc.cpp:1123-1131`,
-   "a missing manifest body is a per-table CLAMP (barrier), never a round abort"). Measured:
-   `CasGcClampSuppressedPasses = 0` across 1062 rounds, against `CasRefManifestBodyFoldGets = 1,519,186`.
-   The barrier never fired, so bodies WERE present at fold time and the `-1` WAS emitted.
-7. **The `-1` therefore cancelled nothing.** The merge is a set-presence merge keyed by
-   `(blob_ref, source_id)` (`CasBlobInDegree.cpp:585-597`): a remove delta whose key is not present in
-   the prior is silently a no-op — `present` stays false, nothing is written, and **no counter records
-   it**. The unmatched `+1` is carried forward from the prior run forever.
-
-**CONSEQUENCE.** Every unmatched `-1` permanently retains one blob. The incremental GC can never reclaim
-it — not a latency, a leak. Only `ca-gc-rebuild` (disaster recovery, full traversal) clears it. Observed
-rate: 56 blobs / 104,755 bytes over one 4h soak. Unbounded in time.
-
-**This also explains the CI observation** that the ca-soak harness has been labelling `(M-F debris,
-B140)` for months. It is neither M-F debris nor B140.
-
-**NOT ESTABLISHED — the next question, stated precisely:** why the removal computed a different edge
-identity than the add. Two candidates: (a) the manifest body's entry paths differed between the
-add-fold and the remove-fold, so the `-1` was keyed on a different `path`; (b) the removal named a
-different `ManifestRef` (epoch/build/ordinal) than the add. Distinguishing them requires the MANIFEST
-ID on the edge events — `system.content_addressed_log` currently records only namespace + object_hash
-for `root_add`/`root_remove`, which is exactly why this could not be closed from the event log. Concrete
-introspection requirement for [#gc-bottleneck-study-2026-07-25](#gc-bottleneck-study-2026-07-25).
-
-**CHEAP AND SAFE NOW (does not fix the leak, makes it visible):** count remove deltas that matched no
-prior edge, as a ProfileEvent + a WARNING with the blob and source id. Pure observability, no protocol
-change, no behaviour change. A silent no-op on an unmatched cancel is the reason this survived months of
-soaks. Do this even before the mechanism is known.
-
-**DO NOT** "fix" it by making the fold drop edges whose manifest is absent: an omitted `+1` must suppress
-deletion, never permit it, and that change would delete live data on any transient body read failure.
-
-Artifacts: `tmp/f6-unreachable/` — `fsck_detail.txt`, `the_56_keys.txt`, `drain_watch.txt`,
-`run343.bin` (the decoded in-degree run), `manifest_bodies.txt` (all 96 present manifests).
-
-#### Event-log forensics (2026-07-25): all 56 leaks trace to FOUR `tmp-fetch_*` refs in a 43 ms window {#unmatched-minus-one-fetch-window}
-
-Follows [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak) and CORRECTS one of
-its conclusions.
-
-**Correction 1 — the event log DOES carry the edge identity.** I wrote that it records only namespace +
-object_hash. Wrong: `root_add`/`root_remove` rows carry `detail['manifest_ref_instance']`
-(`writer_epoch:build_sequence:manifest_ordinal`) and `detail['path']`, which together with `namespace`
-are exactly the inputs of `sourceEdgeId`. The edge balance IS reconstructable from the log.
-
-**Methodological trap worth remembering: you must UNION both nodes' logs.** Edge events are emitted by
-the folding leader, leadership moved between ch1 and ch2, and each server has its own
-`system.content_addressed_log`. Querying ch1 alone showed ~19 "uncancelled" edges for a single blob;
-after unioning ch2 it collapsed to exactly ONE — matching the in-degree run's ground truth exactly.
-
-**Correction 2 — the `-1` was not "emitted with a mismatched key"; no `root_remove` was ever recorded
-for these edges at all.** Per-path balance for manifest `1:42969:1` (ns `ca_soak_ch1`) is `adds=1
-removes=0` for ALL TWENTY of its paths, so the whole manifest's removal never folded — not a per-path
-key mismatch.
-
-**Where they come from.** All 56 blobs' uncancelled edges belong to just FOUR manifests, all in
-`ca_soak_ch1`, build_sequences 42969/42970/42971/42972, and every one of them is a FETCH TEMP ref:
-`tmp-fetch_20260725_2680{1,2}_…`, `tmp-fetch_20260725_2679{8,9}_…`. All four were published
-(`build_publish` → `promoted`) between 08:37:56.924 and .945 and dropped (`ref_drop`, "appended an
-owner_transition removal ref-log transaction") between .960 and .967 — a 43 ms window. Each published
-exactly once and dropped exactly once.
-
-**Rate: 4 out of 48,791 `tmp-fetch_*` refs in that namespace (~0.008%)** — a rare race, not a broken
-path, and clustered in one 43 ms window with four concurrent fetch publishes.
-
-**The ordering anomaly.** Their `+1` edges were folded at 08:40:51 — about three minutes AFTER the
-`ref_drop` that should have cancelled them.
-
-**LEADING HYPOTHESIS, NOT VERIFIED: an ordering inversion.** If the fold applied the removal record
-BEFORE the add record (journal position, not wall-clock), the removal would find no edge and be a
-SILENT no-op (the set-presence merge, `CasBlobInDegree.cpp:585-597`, writes nothing and counts nothing),
-and the subsequent add would then install an edge that nothing will ever cancel. That is precisely an
-[UNMATCHED-MINUS-ONE]. Verifying it needs the ref-log record order for those transactions, and those
-log objects have long been reclaimed on this stand — so it needs a TARGETED REPRODUCTION (concurrent
-fetch publish + immediate drop), not more archaeology here. Note this sits squarely in the fetch-handoff
-area the publish-confirm plan already covers.
-
-**Caveat on the numbers.** 19 chaos container restarts × a 2 s `flush_interval_milliseconds` means the
-event log can lose buffered rows. Log-derived uncancelled edges came to 80 against the run's ground
-truth of 56, so some rows ARE missing. The per-manifest conclusion is still safe: a manifest's `+1` and
-`-1` are emitted microseconds apart inside one fold, so losing the `-1` while keeping all twenty `+1`s
-is not a plausible loss pattern.
-
-## *** CRITICAL / RELEASE-BLOCKER: GC treats a paginated `LIST` as the journal, so a single incomplete page can silently DELETE LIVE DATA (2026-07-25) *** {#list-as-journal-dataloss-2026-07-25}
-
-Independent RCA by codex gpt-5.6-sol (xhigh) on the facts-only package in `tmp/leak-rca/`, dispatched
-after the retention leak in [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak).
-It REFUTED my ordering-inversion hypothesis and found a worse defect. Full output:
-`tmp/leak-rca/codex_rca.log`. The load-bearing step was re-verified by the controller (see below).
-
-**The defect.** GC discovers ref-log transactions by paginating `LIST(cas/refs/)`, groups the returned
-keys per namespace, and folds those above the namespace cursor (`CasGc.cpp:829`, `:1033`). The listing
-API gives a continuation cursor but NO snapshot token, high-water mark, or contiguity proof
-(`CasBackend.h:359`, `CasObjectStorageBackend.cpp:1083`), and transaction ids are not required to be
-contiguous — there is no gap check anywhere in the fold. The cursor then advances "per FULLY folded
-log", i.e. per record the round happened to SEE. A record omitted from one page is therefore skipped
-permanently: on later rounds it sorts at or below the cursor and is ignored, ref-log cleanup may delete
-it (`CasGc.cpp:1502` requires cursor coverage, not proof the record was applied), and the orphan sweep
-may then reclaim the manifest body (`CasOrphanManifestSweep.cpp:197`).
-
-CONTROLLER VERIFICATION of the two load-bearing claims: the comment at `CasGc.cpp:1035-1037` does say
-"the durable cursor advances per FULLY folded log", and `grep -niE "contiguous|gap|prev_txn"` over
-`CasGc.cpp` returns nothing that checks for a hole. Both hold.
-
-**BLAST RADIUS — this is a data-loss class, not a leak class.** The listing/cursor logic is
-operation-agnostic, so it can drop a `+1` exactly as easily as a `-1`:
-1. manifest `M1` owns blob token `B`; edge `E1` is known to GC.
-2. a new live manifest `M2` adopts the SAME deduplicated token `B`.
-3. `M2`'s `+1` is omitted from a listing page while GC advances past it.
-4. `M1` is removed and its `-1` folds normally.
-5. GC now sees zero edges for `B`, condemns it, graduates it, and deletes it by exact token —
-   while `M2` still references it.
-Exact-token deletion does NOT protect against this: `M2` references that exact token. Condemnation
-protects writes that occur AFTER condemnation; it cannot protect an already-committed owner whose `+1`
-was skipped. Dedup is what turns a silently-skipped `+1` into a deletion, which is why the observed
-symptom so far has only been retention.
-
-**What the observed 56 blobs are:** the benign polarity of the same defect. And per codex the rate is
-NOT 4-in-48,791 independent failures — the removals were batched (two refs share one `at_version`), so
-it is closer to ONE holey scan affecting four refs.
-
-**Origin of the holey page is NOT established** and is not recoverable from the captured state.
-Candidates: rustfs returning an incomplete/inconsistent page; S3 continuation behaviour under
-concurrent mutation; a bug in or below the iterator. Note ordinary concurrent append during a CORRECT
-paginated scan is NOT sufficient — a later same-namespace record was returned while an already-durable
-earlier one was not, which requires a real hole in the return set.
-
-**Fix plan (codex's, ordered).**
-0. **Containment:** disable destructive GC for the current pool format — blob graduation/deletion,
-   ref-log cleanup, orphan-manifest cleanup. Folding and diagnostics continue. A pool whose journal
-   coverage cannot be proven must not delete.
-1. **Replace LIST-as-journal with an authoritative per-namespace chain:** immutable `prev_txn_id` on
-   each transaction; an exact-addressed CAS-updated namespace head whose update IS the commit point;
-   an add-only exact-addressed namespace registry (itself chained — discovering namespaces by `LIST`
-   would recreate the defect). Format bump, no dual protocol (pre-release).
-2. **Make destructive GC conditional on a complete cut:** capture registry cut + per-namespace heads at
-   round start, traverse exact predecessor links back to the sealed cursor, require an exact meet; on
-   any unreadable/unvalidatable link, discard that namespace's fold and GLOBALLY suppress destructive
-   actions for the round (an unproven namespace may reference any blob). `LIST` becomes cleanup
-   inventory only, never evidence of completeness.
-3. **Ordering + diagnostics:** carry `(txn_id, op_ordinal)` into `BlobDelta` and validate by explicit
-   journal order; COUNT unmatched `-1`s, head-chain gaps, cursor/head lag, and cleanup attempts on
-   unproven records; preserve suspect logs on any anomaly instead of cleaning them.
-4. **Recovery:** format bump + fresh pools; for the affected pool keep destructive GC off or recreate
-   from authoritative replicas. NOTE `ca-gc-rebuild` is NOT a sufficient release fix — it also
-   discovers ref state through listing.
-
-**Reproduction (primary regression test):** subclass `CasInMemoryBackend`, seed `A` (owner-add),
-`R` (its owner-remove), `H` (later harmless record); have the first ref-prefix `LIST` return `A` and `H`
-but filter out `R`, while exact `GET(R)` still works. Assert today: cursor advances to `H`, a residual
-`+1` survives, restoring the listing does not cancel it. Add the MIRROR SAFETY TEST: omit a second live
-owner's `+1`, fold the first owner's `-1`, drive graduation, and assert the live blob is never deleted.
-
-**Codex's corrections to my evidence, accepted:** M5's event-log argument is supportive, not conclusive
-(add and remove may fold in different rounds, so a restart can keep one batch and lose the other) — the
-source-edge run plus the durable `ref_drop` plus the reclaimed removal logs is the stronger argument.
-M3 proves no OBSERVED transaction hit an absent body, not that every transaction was observed — which is
-exactly why the clamp never engaged. M4's silent no-op is real but probably not exercised here: the
-evidence supports "the remove never reached the reducer", not "it folded first". M8 is fold lag, not
-journal inversion.
-
-**Relationship to the publish-confirm plan:** Task 1 already pins `[UNMATCHED-MINUS-ONE]`, but only in
-the no-premature-deletion direction (see its own test comment). The retention direction is unpinned, and
-this entry shows the deletion direction is reachable by a DIFFERENT route than the counter-regression
-Task 1 guards. Tasks 13-14 (wire protocol, receiver flow) rewrite the very `tmp-fetch` lifecycle where
-this surfaced — sequence them AFTER containment, or attribution of future findings will be hopeless.
+The 2026-07-25 finding (GC discovering ref-log transactions via a paginated `LIST` with no
+contiguity proof, so an omitted page could silently authorize a live blob's deletion) is
+structurally closed by the v9 ref-table redesign: dense per-life ref ids, an in-band epoch seal,
+and a `_ckpt` recovery frontier make the defect class unrepresentable rather than merely detected.
+Recovery no longer reads listings at all (recovery-from-authority). Full incident facts, legal-lie
+classification, and the passport design for future LIST-trust optimizations are the settled record
+at [`2026-08-03-list-trust-verdict.md`](2026-08-03-list-trust-verdict.md) — do not re-litigate here.
+The one still-open, separately-tracked follow-up is the LIST-trust optimization plan at
+[`{#gc-frontier-one-list}`](#gc-frontier-one-list).
 
 ## The adopted fold seal referenced a PRUNED generation's run (observed 2026-07-25, same stand) {#adopted-seal-pruned-run-2026-07-25}
 
@@ -1403,493 +977,37 @@ nothing (no throw on 404 per [[feedback_ca_gc_never_throw_on_404]]). NOT ESTABLI
 prune raced the adopt, or the parent-seal capture missed the carry. Needs a targeted test, not
 log archaeology.
 
-## FIXED 2026-07-25 (`ca5a6b7bee8`): THIRD gtest gate-filter gap — parameterized `*/CasBackendContract` suites match neither `Cas*` nor `CA*` {#gate-filter-gap-3-backend-contract}
-
-Found by ENUMERATING the binary's suites instead of trusting the documented filter — which is the only
-method that works here, two previous gaps having been found the hard way (see
-[[reference_ca_gtest_gate_filter]] and {#gate-filter-gap} above).
-
-`InMemory/CasBackendContract` and `Local/CasBackendContract` are value-parameterized, so their full test
-names begin with the instantiation prefix (`InMemory/CasBackendContract.X/0`). A `Cas*` or `CA*` pattern
-anchors at the start of the FULL name, so both suites — the backend contract itself, i.e. exactly the
-layer every GC and ref-lane conclusion rests on — were excluded from every battery run.
-
-CORRECTED FILTER, verified by enumeration against `--gtest_list_tests` on 2026-07-25:
-
-```
-Ca*:CA*:ContentAddressed*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*:*CasBackendContract*
-```
-
-`Ca*` subsumes `Cas*` and also picks up `CaLifecycle`/`CaWiring` (gap 2). The trailing `*CasBackendContract*`
-is unanchored on purpose — that is the whole point. Runs 1335 tests over 227 suites; green as of
-`84cefb2c224`.
-
-Note `Cas*` also sweeps in `CascadeWriteBuffer`, which is unrelated to CAS and merely shares a prefix.
-Harmless (it passes), but do not read the suite count as "all CAS".
-
-LESSON, worth generalizing: a name-pattern gate silently under-tests and never reports what it skipped.
-Any gate defined by a glob should be re-derived from an enumeration periodically, not maintained by hand.
-
-### UPGRADE 2026-07-25: the deletion path is no longer an inference — it is MECHANISED in TLA+ {#list-as-journal-mechanised}
-
-`docs/superpowers/models/CaRelinkConfirmCore.tla`, config `_sab_holeylist` (Task 9 of the publish-confirm
-plan, landed `0d1e3f4cc7c`). Controller re-ran it independently: `_main` completes clean at 72,984 states,
-`_sab_holeylist` violates.
-
-The sabotage config changes NOTHING about the confirm protocol — every rule stays intact — and permits
-exactly **one** incomplete `LIST` page in the whole behaviour (`MaxHoles = 1`).
-`ConfirmedRelinkNeverDangles` breaks anyway. Essential trace: the receiver's `+1` is durable; an
-edge-neutral later transaction lands in the same namespace; confirm CORRECTLY answers yes; promote; the
-single holey fold observes the later transaction but omits the `+1` and advances the namespace cursor past
-it; the record is below the cursor forever, so complete later pages cannot recover it; condemn →
-`delete_pending` → delete over three rounds; a promoted, correctly-confirmed manifest now references a
-deleted blob.
-
-Two details that make this stronger, not weaker:
-- The one-hole budget was TIGHTENED during modelling. A first version let GC be arbitrarily lazy and TLC
-  found a cheap violation with no permanent skip at all; the adversary was constrained so the counterexample
-  is FORCED through the permanent skip. The finding survived being made harder to reach.
-- Three-phase graduation's sparing does not help. It can only spare what a fold shows it.
-
-CONSEQUENCE for how the model may be cited: `_main` passing is CONDITIONAL on a LIST-completeness
-assumption the shipped code does not establish. It means "the confirm protocol adds no new dangle path",
-NOT "a confirmed relink cannot dangle". It may not be cited as dangle-freedom until fix items 1-2 (the
-authoritative per-namespace chain and the complete-cut gate) land.
-
-### CORRECTION 2026-07-25: the "live reproduction" stand was destroyed by our own S42 smoke runs {#leak-repro-lost}
-
-The stand referenced by [#unmatched-minus-one-retention-leak](#unmatched-minus-one-retention-leak) as a
-live reproduction STOPPED being one at ~16:49 UTC, and the worklog kept asserting otherwise for another
-hour. Cause: the S42 card's smoke runs reset the cluster (two runs, `20260725T164254` and
-`20260725T164929`), which recreated the pool. Found only because the state was re-checked before teardown
-instead of trusting the note — post-teardown check read `reachable=6 unreachable=0`, i.e. a fresh pool.
-
-No evidence was lost: every artifact was captured between 12:50 and 15:00 and is in `tmp/f6-unreachable/`
-(detail fsck, the 56 keys, the decoded in-degree run, all 96 manifest bodies, the uncancelled-edge table,
-the per-path balance for the leaking manifest, both nodes' event-log slices). The mechanism is also
-mechanised in `CaRelinkConfirmCore.tla` `_sab_holeylist`, and the fix needs a targeted reproduction rather
-than this stand.
-
-LESSON, and the reason this is recorded rather than quietly dropped: a scenario card that resets the
-cluster is indistinguishable, from the outside, from one that does not. If a stand is being held as
-evidence, that has to be enforced (a lock file the cards honour, or a separate compose project), not
-merely written in a log — the same "a note is not a mechanism" failure as the harness whitelists found
-today.
-
-### DECISION 2026-07-25 (user), DETECTOR SHIPPED 2026-07-26: option C — catch it by the tail first, because the diagnosis is NOT confirmed {#list-as-journal-decision-c}
-
-Chosen over containment (disable destructive GC now) and over going straight to the journal chain.
-Reasoning recorded because the reasoning is the load-bearing part:
-
-- The pool is PRE-RELEASE with no production data at risk, so the present cost of the hole is possible
-  data loss in our OWN test pools — bad for attributing soak failures, not a loss of anything valuable.
-- Containment would disable GC exactly while we are building a soak gate to exercise GC, would break the
-  soak's disk budget (the last run reclaimed 124 GB at a single checkpoint), and would MASK the other GC
-  defects already in this backlog.
-- The chain + complete-cut fix is right but is protocol state plus a format bump, and it would cut across
-  Part B, which is mid-flight.
-
-**The user's qualification, which changes the design and not merely the wording: the LIST hypothesis is
-still UNCONFIRMED.** A holey page was never directly observed; it survives by elimination and is
-mechanised in TLA+, which proves the mechanism is SUFFICIENT, not that it is what happened.
-
-CONSEQUENCE — the detector must not be built for that hypothesis. A LIST-hole detector catches only a
-LIST hole; if the record is instead lost further down the pipeline (delta routing across gc shards, the
-reducer, the run flush) such a detector stays silent AND manufactures false confidence. So detect the
-EFFECT, mechanism-agnostically: *the fold cursor advanced past a transaction that was never applied.*
-
-Two cheap, complementary probes, neither assuming a cause:
-1. **The store lied** — after paginating the ref prefix and BEFORE advancing any cursor, re-derive the id
-   set independently and require agreement. A mismatch means the object store gave two different answers
-   about the same durable prefix; suppress destructive actions for the round and log loudly.
-2. **We dropped it** — count records intended-to-fold versus actually-applied per round and require
-   equality. This is the half a LIST-focused detector would miss entirely.
-
-Plus the mirror SAFETY test from the RCA, which is valuable independent of any of this: omit a second
-live owner's `+1`, fold the first owner's `-1`, drive graduation, and assert the live blob is never
-deleted. That pins "a missing `+1` suppresses deletion" BEFORE the protocol gets rewritten, not after.
-
-NOTE the detector is not free to design: id gaps are LEGITIMATE — Task 18 (landed today, `252ccbdf2d4`)
-deliberately leaves a safe gap when an append is refused before any attempt. So "a hole in the sequence"
-is not by itself an anomaly. An object that EXISTS in the store at or below the cursor and was never
-applied is unambiguous; a gap with no object is not.
-
-COMMITMENT attached to this choice, stated by the controller and accepted implicitly by choosing C: the
-real fix (the authoritative per-namespace chain and the complete-cut gate) lands BEFORE release. C makes
-the defect visible; it does not prevent it.
-
-## USER DECISIONS 2026-07-25 on the four open questions {#user-decisions-2026-07-25}
-
-### Q2 — the tool-vs-live-pool problem: the FRAMING was wrong, not just the answer {#q2-force-claim}
-
-Both my question and the design note
-(`specs/2026-07-25-cas-tool-read-without-ownership-design.md`) treated this as "may a tool read without
-claiming the mount". **It is not that.** The user: the problem is the differing SERVER UUID, not
-`mountWritable`. What is needed is the ability to say at mount time *"never mind that the server uuid
-differs — force a new one"* and mount as WRITE. A genuine read-only mount is a SEPARATE, not-yet-implemented
-task, not the answer to this one.
-
-So the design note is superseded as a recommendation. Its VERIFIED facts stand and stay useful — in
-particular that a claim against an owner-absent empty root SUCCEEDS and would lock the real server out
-(`CasServerRoot.cpp:142` then `:120-131`), and that the earlier CI carve-out never actually ran because its
-`sed` patches `config.xml` while the CA disk is declared in `config.d`.
-
-ONE FACTUAL CONCERN to settle before implementing, raised once and then dropped: the plan text describes
-the scrape as running against the data directory of a LIVE server. Force-claiming there does not merely
-bypass a nuisance check — it takes ownership from a running server, which is the failure the refusal
-exists to prevent. If the scrape actually runs post-mortem (server already stopped), force is exactly
-right and this concern is void. Worth one look at the CI step before coding, not a redesign.
-
-## Operator recovery: mounting a pool whose owner uuid differs (deferred 2026-07-25) {#operator-uuid-recovery}
-
-Split out of {#q2-force-claim} once the CI motivation for it evaporated. The CI scrape is fixed by a
-one-line change to which file its `sed` patches — the read-only path already exists in the product and CI
-already tried to use it — so nothing about the scrape needs a product change. See
-{#ci-scrape-readonly-sed-fix} below.
-
-WHAT REMAINS, and it is a real operator need, not a CI one: a server whose local uuid file was regenerated
-(wiped `/var/lib/clickhouse`, a pod recreated without a persistent volume) cannot mount its own pool. The
-refusal at `CasServerRoot.cpp:120-131` already names the three manual recoveries — restore the uuid file,
-configure a fresh `server_root_id`, or delete the owner object by hand after verifying no server uses the
-root. A supported command would automate the third.
-
-TWO READINGS, and the choice matters — settle it before implementing:
-- **Overwrite the owner uuid with a new one** (the literal reading of "force a new one"). Works, and
-  permanently locks the ORIGINAL server out of the pool. Also insufficient on its own: the uuid lives in
-  two durable objects, and a graceful shutdown leaves a mount object carrying the predecessor's uuid, so
-  `claimMount` then refuses it as `ForeignOwner`. The force has to cover both, in an order that keeps the
-  refuse-to-re-mint-epoch-1 guard armed.
-- **Adopt the pool's existing owner uuid and mount as it.** Reaches the same "mount as WRITE despite a
-  differing local uuid" outcome with no durable identity damage. `Pool::openForDecommission`
-  (`CasPool.cpp:720-776`) already does exactly this, so most of the work exists.
-
-The second reading looks strictly better for the stated need and the first should have to justify itself.
-Not decided; not started.
-
-NOTE this is NOT the read-only-mount task. The user was explicit that a genuine read-only mount is a
-separate, unimplemented piece of work, and it — not this — is the right answer to "an operator wants to
-look at a live pool from a second process".
-
-## CI scrape opens CA disks read-only — the remedy existed but never applied (fixed 2026-07-25) {#ci-scrape-readonly-sed-fix}
-
-`dump_system_tables` already carried the correct remedy: insert `<readonly>true</readonly>` next to the
-`content_addressed` marker so `clickhouse local` skips `mountWritable` and never claims ownership. It
-patched `/etc/clickhouse-server/config.xml`, where that marker does not exist — the CA storage policy is
-symlinked into `config.d/` by `tests/config/install.sh`. So `sed` matched nothing, silently, and the
-scrape kept dying on "owned by a different server" while looking like it had been handled.
-
-Fixed by patching `config.d/*.xml` as well, and by making a future no-op LOUD: if a CA disk is declared
-and the read-only marker is absent afterwards, the job now prints a warning naming the consequence. A
-silent no-op is how this survived in the first place, and it is the same shape as three other harness
-surfaces found the same day ({#gc-observation-vacuous-2026-07-25} and the entries it references).
-
-Verified by simulating the substitution against the two real config files before committing, rather than
-by reading the sed and believing it.
-
-## Part B codex review — DO NOT MERGE AS-IS: two blockers, two majors (2026-07-25) {#partb-review-findings}
-
-Full output `tmp/partb-review/codex_review.log`, package `tmp/partb-review/`. gpt-5.6-sol at xhigh over the
-combined 23-file diff, read as ONE protocol — which is exactly what none of the eight per-task agents did.
-The normal gate-0 → gate-1 → prepare → confirm → promote ordering is confirmed sound, and tasks 13-16 did
-NOT make `No` authoritative. Everything below is what composition exposed.
-
-### BLOCKER 1 — a completed recovery can expose a stale row and authorize `Yes`
-
-Recovery discovers snapshots and logs through paginated `backend.list` with no completeness proof, then
-publishes the result as `recovered = true` (`CasRefLedger.cpp:463`, `:736`). `confirmExactRef` treats a
-recovered, quiescent, clean, fenced runtime holding the exact row as sufficient for `Yes`
-(`CasRefLedger.cpp:334`). Atomic publication prevents a HALF-BUILT view; it does not prove the listing was
-COMPLETE.
-
-So if recovery's listing omits a later durable removal or repoint, it publishes a stale but
-apparently-healthy runtime and gate 1 answers `Yes` for a manifest that is gone. **That is a route around
-every ambiguity check** — the ambiguity was erased when incomplete recovery set `recovered = true`. If GC
-already folded the omitted removal and collected the blobs, the receiver commits a dangling manifest.
-
-This is DISTINCT from `_sab_holeylist`, where a CORRECT `Yes` still dangles because GC skips the receiver's
-own `+1`. Same root cause (LIST as journal), different path.
-
-Short-term safe behaviour: a LIST-recovered runtime must be ineligible for `Yes`. Real fix is the
-authoritative head/predecessor traversal already recorded in {#list-as-journal-dataloss-2026-07-25}.
-
-### BLOCKER 2 — an uncertain `precommitAdd` loses its cleanup owner and may delete its manifest body
-
-`PartWriteTxn::precommitAdd` records `precommit_target_ns` / `precommit_manifest` / `precommitted = true`
-only AFTER `appendRefOps` returns successfully (`CasPartWriteTxn.cpp:1013`). But an `Unresolved` append MAY
-HAVE LANDED — the code says so itself (`CasRefLedger.cpp:2152`). So on that path `prepareEntries`' catch
-calls `abandon` on an object that believes it never precommitted (`PartFolderAccess.cpp:450`): no removal
-is queued, no handle is returned, the error is converted to `MechanismFallbackAllowed`, and — worse —
-`abandon` best-effort DELETES the manifest body (`CasPartWriteTxn.cpp:1394`). When the wedge later resolves
-as committed, it installs a live precommit with no owning handle and possibly no body.
-
-This falsifies taxonomy row 2's "never staged". Needs an explicit uncertain-precommit state whose cleanup
-ownership survives the call; an arbitrary `NETWORK_ERROR` cannot be classified as safe byte fallback.
-
-### MAJOR 3 — a promote can commit and still be reported as fallback or failure
-
-`promote` maps every `NETWORK_ERROR` to `MechanismFallbackAllowed`
-(`ContentAddressedMetadataStorage.cpp:2057`), but the promotion PUT may have landed. There is also a purely
-local post-commit window: `promoteBuild` builds a `CommitOutcome` with copied strings BEFORE marking the
-handle terminal (`PartFolderAccess.cpp:325`), so an allocation failure there enters the failed-promote
-catch with the ref already committed. One logical fetch can then durably publish the relink ref, report
-fallback, remove it, and publish the byte-fetched ref — a sequential double publication rows 5 and 6 claim
-cannot happen. Promotion needs a terminal outcome distinguishing not-committed / committed / unresolved,
-and nothing after a durable commit may throw before the handle records `Committed`.
-
-### MAJOR 4 (latent) — move assignment can discard a terminal duty
-
-`PreparedPartWrite::operator=` overwrites the destination's build even when `abandonBuildBestEffort`
-returns false (`PartFolderAccess.cpp:380`), permanently dropping a cleanup owner. Not exercised today (the
-exchange path uses move construction), but the move-only ownership contract is false as written. Delete
-move assignment or preserve the original handle on failed cleanup.
-
-### Comments that overclaim, and one that is simply wrong
-
-- `CasRefLedger.h:57` states "`No` is a proof of the negative". It is not — the fence is evaluated LAST, so
-  a fence-lost mount answers `No`. This is the exact inversion the whole round has been guarding against,
-  sitting in the header that defines the contract.
-- `ContentAddressedMetadataStorage.cpp:2128` and `DataPartsExchange.cpp:1446` both claim every subsequent
-  GC fold sees the receiver's `+1`. The taxonomy caveat at `DataPartsExchange.cpp:1365` correctly
-  contradicts them.
-
-### Footprint objections (to weigh, not all accepted)
-
-`DataPartsExchange.h` exposes CAS-specific `allow_ca_relink` and service helpers beyond the opaque enum;
-receiver work spans `fetchSelectedPart` and `relinkPartToDisk`, sender work spans `processQuery` and two
-helpers. Both were knowingly accepted at the time and reported to the user. The reviewer also counts the
-`ProfileEvents.cpp` registration as outside the approved failpoint scope — that is a conflation: it came
-from Task 18, not the failpoint approval, and a ProfileEvent registration is not protocol coupling. Worth
-the user's judgement, not a silent dismissal.
-
-### Test gaps, and one pre-existing test that is green for the wrong reason
-
-`test_replicated_fetch_by_relink` (`test.py:255`) still proves relink ONLY through a flat blob count — the
-exact defect Task 16 found in the plan, left unfixed in the older test. A byte fetch dedups and passes it.
-
-Missing: recovery after one omitted LIST record then `confirmExactRef`; `LandedThenLost` during receiver
-`precommitAdd`, promotion and abort; allocation failure after durable promotion; move assignment with a
-failing abort; every gate-0 case (the gtest says integration owns them and no integration test does);
-source remount between offer and confirm; zero/multiple routing matches; confirm transport failure at HTTP
-level.
-
-### CORRECTION 2026-07-26 (user): "BLOCKER 1" is NOT a Part B defect — the confirm inherits the mount's trust, it does not create it {#partb-review-blocker1-downgraded}
-
-Downgraded from {#partb-review-findings}'s blocker 1 after the user challenged the framing. The challenge
-was right and the controller had accepted the reviewer's attribution without checking the boundary.
-
-VERIFIED: `confirmExactRef` reads the same `RefTableRuntime` and the same recovered `state` that
-`resolveRef` reads (`CasRefLedger.cpp:182` uses `getRefTableRuntime` + `ensureRefTableRecovered`;
-`confirmExactRef` at `:318` uses `find` on the same map purely to avoid CREATING a runtime). It is the same
-in-memory view that serves every ordinary read and that the write path makes its decisions on.
-
-So the confirm introduces no new trust assumption — it inherits the mount's. If that view can be stale in a
-way that matters, then the sender is ALSO serving reads from a manifest that is gone and deciding writes on
-a false picture. The blast radius is the mount, not the confirm, and the remedy is not in the confirm
-protocol.
-
-Blocker 1 is therefore the already-recorded {#list-as-journal-dataloss-2026-07-25} finding seen through one
-more lens, not a defect introduced by Part B. The reviewer stated a true fact and attributed it to the
-wrong component.
-
-WHAT SURVIVES, and it is smaller than the heading suggested: the confirm gives a stale LOCAL view a REMOTE
-consequence — without it a corrupt view harms its own mount, with it a peer can durably commit on the
-strength of it. That is amplification, not a new root cause, and it does not change the remedy.
-
-CONSEQUENCE the controller must own: the argument for moving the journal-chain fix AHEAD of the soak was
-built on "the same root now reaches a second path". That argument is weakened — same root, same path, plus
-propagation. The scheduling decision should rest on the original grounds, not on a blocker that turned out
-not to be one.
-
-The other three review findings (uncertain `precommitAdd`, promote-committed-reported-as-fallback, move
-assignment) are unaffected and are being fixed.
-
-### Part B review findings — RESOLVED, with two reviewer errors and one residual window (2026-07-26) {#partb-review-resolved}
-
-Fixed in `8e6fe6ef0af`. Gate 1373/1373 (five new tests, each seen red first), integration 11/11.
-
-Blocker 2, major 3 and major 4 are closed. Blocker 1 was downgraded, not fixed — see
-{#partb-review-blocker1-downgraded}; it is the known LIST-as-journal finding, not a Part B defect.
-
-**TWO PLACES THE REVIEWER WAS WRONG**, both caught by the implementer rather than by me — I had passed the
-first one straight through into the fix instructions:
-
-1. "Queue the exact removal (it is idempotent)" is FALSE. `RefTableState::applyOwnerTransition`'s
-   `RemovePrecommit` arm throws `CORRUPTED_DATA` on an absent binding
-   (`CasRefProtocol.cpp:216`). Following the review literally would have made every `abandon` of an
-   uncertain build fail forever, destructor retries included — turning a leak into a permanent wedge. The
-   removal is presence-checked under `Uncertain` only.
-2. Major 3's stated chain — "report fallback, remove it, publish the byte-fetched ref" — does not hold. An
-   allocation failure raises `MEMORY_LIMIT_EXCEEDED`, which is neither `ABORTED` nor `NETWORK_ERROR`, so it
-   propagates instead of becoming a fallback; and `abandon` appends a PRECOMMIT removal, which cannot undo
-   a committed ref. `isTerminal()` is also not discriminating, since abandoning an already-promoted build
-   succeeds. The defect was real; its mechanism was not as described.
-
-**RESIDUAL WINDOW, flagged not fixed:** `eraseView` still runs after the durable commit and can throw, and
-`ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after `promoteBuild` returns.
-Small, pre-existing, and unnamed by the review. Recorded here so it is not lost — closing it means
-extending the same no-throw-after-commit discipline one frame outward.
-
-**LESSON for how these reviews are consumed:** a strong review is evidence, not instruction. Two of its
-four remedies were wrong in ways that would have made things worse, and I forwarded one of them verbatim.
-Prescriptions from a reviewer deserve the same verification as claims from an implementer.
-
-
-## GC performance, FIRST MEASUREMENT (2026-07-26) {#gc-perf-first-measurement}
-
-No dedicated performance test has been run — this is the metric study the user scheduled for after the
-soak ({#q5-gc-introspection-now}), mined from the per-phase rows the 4 h run collected over 1,673 round
-attempts. It is the first quantitative answer to "where does GC slow down", a question that had no
-answer at all before this week because the GC carried no timers.
-
-### Where the time is
-
-| phase | rows | total | p50 | max |
-|---|---:|---:|---:|---:|
-| `fold_ref_intake` | 126 | **2998 s** | 21 ms | **1830 s** |
-| `fold_ref_list` | 128 | 1355 s | 98 ms | 491 s |
-| `defer_decision` | 253 | 1346 s | 98 ms | 431 s |
-| `orphan_sweep` | 123 | 975 s | **383 ms** | 526 s |
-| `ref_object_cleanup` | 123 | 785 s | 0 ms | 500 s |
-| `fold_reduce` | 125 | 760 s | 7 ms | 372 s |
-| `manifest_deletes` | 123 | 724 s | 0 ms | 556 s |
-| `lease` | 2255 | 104 s | 2 ms | 52 s |
-
-Two shapes, and they call for different responses. `fold_ref_intake` has a p50 of 21 ms and a max of
-**1830 s** — five orders of magnitude; the median round is free and the whole cost lives in the tail.
-`orphan_sweep` is the opposite: the worst MEDIAN at 383 ms, a steady toll on every round. `lease` runs on
-all 2,255 rounds and costs nothing — worth knowing so nobody optimises it.
-
-### The intake tail is LINEAR in the ref-log backlog
-
-| logs folded | duration | ms per log |
-|---:|---:|---:|
-| ~0 (120 rounds) | 21 ms | — |
-| 5,000 | 28.6 s | 5.72 |
-| 15,000 | 116.0 s | 7.73 |
-| 95,000 | 260.2 s | 2.74 |
-| 120,000 | 245.3 s | 2.04 |
-| 130,000 | 507.0 s | 3.90 |
-| 400,000 | 1829.6 s | 4.57 |
-
-**Weighted mean 3.9 ms per ref log ⇒ ~256 logs/s sustained fold throughput.** The per-log cost is flat
-across two orders of magnitude of backlog, which is what one object-store GET per log looks like — and the
-fsck measurement on the same store put ~70% of wall time in I/O wait, not CPU.
-
-### What this settles
-
-The CI throughput collapse ({#gc-throughput-collapse-2026-07-25}) was RCA'd as a queue-stability crossing
-and is now MEASURED: the fold's service rate is ~256 logs/s, so if ref logs arrive faster than that the
-backlog grows, the next round is longer, and more accumulates while it runs. The 400k-log round taking
-half an hour in a single phase is that loop at work. Nothing about it is mysterious any more; it is a rate
-mismatch with a number attached.
-
-### Caveats, stated because the numbers look cleaner than they are
-
-- The data comes from chaos runs. Node freezes and kills inflate tails; some part of the max column is a
-  frozen process, not work. Separating those needs a no-chaos run, which has not been done.
-- Sample sizes at the top of the backlog range are n=1 per bucket. The linearity rests on six points.
-- Per-log cost is presumed to be one GET each; that is inferred from the flatness and the I/O-bound
-  fsck measurement, NOT from counting requests. The per-phase rows carry `ProfileEvents`, so the request
-  count per phase is available and would settle it — that is the cheapest next step.
-
-### CORRECTION, same day: it is NOT one GET per log — it is 2.5-4.7, and the ratio GROWS {#gc-perf-gets-per-log}
-
-I wrote above that the flat per-log cost "is what one object-store GET per log looks like", and flagged
-that it was inferred from flatness rather than counted. Counted it — the `ProfileEvents` were already on
-every phase row — and the inference was wrong:
-
-| logs | secs | S3 GETs | GETs/log | ms/GET |
-|---:|---:|---:|---:|---:|
-| 5,672 | 28.6 | 14,706 | 2.59 | 1.94 |
-| 16,421 | 116.0 | 52,055 | 3.17 | 2.23 |
-| 96,167 | 260.2 | 328,157 | 3.41 | 0.79 |
-| 123,057 | 245.3 | 313,128 | 2.54 | 0.78 |
-| 132,618 | 507.0 | 611,216 | 4.61 | 0.83 |
-| 404,065 | 1829.6 | 1,912,078 | 4.73 | 0.96 |
-
-**Weighted: 4.29 GETs per log at ~0.94 ms per GET.** What is actually flat is the PER-REQUEST cost — a
-store round trip — while requests per log range 2.5 to 4.7 and trend UPWARD with backlog size.
-
-That changes where the lever is. The cost is not "one unavoidable read per log"; it is a request
-multiplier of four-ish that nobody has looked at. `foldManifestEdges` GETs a manifest BODY per manifest
-edge (`CasRefManifestBodyFoldGets` exists precisely to count that), so a log carrying several edges costs
-several GETs, and the same manifest body may be re-read across logs within one round with no cache in
-between. Reducing the multiplier is a different and probably cheaper intervention than anything aimed at
-the logs themselves.
-
-Also confirmed by the same rows: `S3ListObjects = 0` throughout `fold_ref_intake` — all the listing is in
-`fold_ref_list`, so the phase split is clean and the two costs are genuinely separable.
-
-Still not measured: whether the manifest-body re-reads are the multiplier. `CasRefManifestBodyFoldGets` is
-already recorded per phase, so this is again a query rather than an experiment.
-
-### ATTRIBUTED 2026-07-26: the multiplier is manifest edges, and every edge costs a HEAD *and* a GET {#gc-perf-multiplier-attributed}
-
-Task #9 answered by query, as predicted — no experiment needed. The counters were on the rows all along.
-
-**`S3GetObject` = `CasRefLogBodyGets` + `CasRefManifestBodyFoldGets`, exactly, on all six rows.**
-5672+9034=14706 · 16421+35634=52055 · 96167+231990=328157 · 123057+190071=313128 ·
-132618+478598=611216 · 404065+1508013=1912078. Nothing else in the phase reads from the store.
-
-So the composition is not mysterious. It is **one GET per ref-log body** — my original inference, correct
-for the log itself — **plus one GET per emitted manifest edge**. The "4.15 GETs per log" was never a per-log
-cost; it was `1 + edges_per_log`, and `edges_per_log` runs 1.54 → 3.73 and CLIMBS with backlog. That climb
-is the whole growth story.
-
-**And every edge costs a second round trip.** `CasManifestHead` = `CasManifestGet` =
-`CasRefManifestBodyFoldGets` = `CasRefEmittedEdges`, exactly, on every row. Each edge is a HEAD followed by
-a GET. Total round trips per phase = `logs + 2 × edges`:
-
-| logs | edges/log | round trips | ms/trip |
-|---:|---:|---:|---:|
-| 5,672 | 1.59 | 23,740 | 1.20 |
-| 96,167 | 2.41 | 560,147 | 0.46 |
-| 132,618 | 3.61 | 1,089,814 | 0.47 |
-| 404,065 | 3.73 | 3,420,091 | 0.53 |
-
-**~0.5 ms per round trip at scale**, flat across a 140x range of request counts. The intake phase is a
-straight function of its request count and nothing else — no hidden CPU term, no lock term.
-
-**The equality `manifest body GETs == emitted edges` is itself the finding.** It means there is NO caching
-of manifest bodies within a round, by construction: if the same manifest is named by ten edges, its body is
-fetched ten times. Whether that actually happens is the one thing still uncounted — it needs a DISTINCT
-manifest count against the edge count, which no counter currently carries. That is the next question, and
-it is the difference between "the work is irreducible" and "three quarters of it is repeat reads".
-
-**Do NOT read the HEAD-before-GET pair as a removable step.** It is a protocol step; the standing user veto
-on treating protocol steps as cheap wins applies (see [[feedback_head_before_put_protocol_untouchable]]).
-It is recorded here as a measured cost, not as a proposal.
-
-### Structure behind the multiplier, and a SHARPENED hypothesis for the distinct-manifest question {#gc-perf-intake-structure}
-
-More read-only decomposition of the same six rows. Structural facts, each an exact counter reading:
-
-- **`txns_opened == logs_intended`, exactly, every row.** One ref-log transaction per log object. No batching
-  and no fan-out at that level.
-- **`deltas_emitted / edges` ≈ 14-20**, stable across a 70x range of round sizes. Each manifest fetched
-  yields on the order of sixteen in-degree deltas — consistent with a part manifest naming ~16-20 files.
-  The delta volume is large in absolute terms (24.6M for the 404k-log round) but it is CPU-and-memory work,
-  not store traffic; the store traffic is entirely `logs + 2 × edges` as established above.
-- **`tables_scanned` is 2-8.** The ref-table dimension is negligible; nothing in this phase scales with it.
-
-**The hypothesis this sharpens, stated as a hypothesis.** `edges_per_log` runs 1.54-3.73. A transaction that
-publishes one ref and drops another names two manifests and therefore costs two fetches — and if the add and
-the drop concern the SAME manifest, that is two fetches of one body, a 50% waste on that transaction alone.
-There is a prior for exactly this shape in the writer path: [[project_part_removal_repoint_waste]] found
-repoints on `delete_tmp_*` refs accounting for ~22% of the writer PUT class.
-
-**This is NOT established.** No counter distinguishes "two manifests" from "one manifest twice", which is
-precisely why task #17 exists. What the structure adds is a specific thing to look for rather than a general
-suspicion, and a reason to expect the answer to be non-trivial rather than a tidy 1:1.
-
-It is also testable READ-ONLY before any counter is added: decode a sample of `_log/` objects on the stand
-and check whether the manifests named within a single transaction repeat. That would answer the cheap half
-of #17 without a product change.
-
-## fsck large-pool reporting: two residuals left after the 2026-07-26 fix {#fsck-large-pool-fixed}
+## Operator recovery: mounting a pool whose owner uuid differs — not decided, not started {#operator-uuid-recovery}
+
+A server whose local uuid file was regenerated (wiped data dir, a pod recreated without a persistent
+volume) cannot mount its own pool. `CasServerRoot.cpp:120-131`'s refusal already names three manual
+recoveries (restore the uuid file, configure a fresh `server_root_id`, or delete the owner object by
+hand after verifying no server uses the root); a supported command would automate the third. **Open
+design choice**: overwrite the owner uuid with a new one (works, but permanently locks the original
+server out, and must cover both the owner and mount objects to keep the epoch-1 re-mint guard armed),
+or adopt the pool's existing owner uuid and mount as it (`Pool::openForDecommission`,
+`CasPool.cpp:720-776`, already does exactly this — the reading that looks strictly better). Not the
+read-only-mount task, which is separate and unimplemented.
+
+## Part B pre-merge review — RESOLVED except one residual window {#partb-review-findings}
+
+The 2026-07-25 codex review of the publish-confirm protocol (23-file diff) found two blockers and
+two majors; fixed in `8e6fe6ef0af` (gate 1373/1373, five new tests each seen red first, integration
+11/11). Blocker 2 (uncertain `precommitAdd` losing its cleanup owner), major 3 (promote reported as
+fallback after a real commit), and major 4 (move assignment discarding a terminal duty) are closed.
+Blocker 1 ("a completed recovery can expose a stale row and authorize `Yes`") was downgraded, not
+fixed: the user correctly identified it inherits the mount's own trust rather than introducing a new
+one — it is the same [`{#list-as-journal-dataloss-2026-07-25}`](#list-as-journal-dataloss-2026-07-25)
+finding through the confirm lens, and that finding is itself now resolved by the v9 redesign. **One
+residual window remains, flagged not fixed:** `eraseView` still runs after the durable commit and can
+throw, and `ContentAddressedTransaction::publishStaging`'s `out_slot` is assigned only after
+`promoteBuild` returns — closing it means extending the no-throw-after-commit discipline one frame
+outward.
+
+## fsck large-pool reporting: three residuals left after the 2026-07-26 fix {#fsck-large-pool-fixed}
 
 Task #13 fixed `corrupted_runs` visibility/fatality, the inverted timeout budgets that made
-`--partial` unreachable, and the fabricated-clean-on-partial hazard (all landed, tested). Two
+`--partial` unreachable, and the fabricated-clean-on-partial hazard (all landed, tested). Three
 residuals remain open:
 - **The `M-F debris, B140` mislabel** (`checker.py`/`run.py`/`plot.py` docstrings) is still printed;
   the product classifies these as `AwaitingGc`, not the old B140 rationale. Docstring cleanup only.
@@ -1897,636 +1015,34 @@ residuals remain open:
   timeout path (`{#fsck-fabricated-clean-on-timeout}`). Not a live defect (every consumer is guarded
   by `not _detail_fsck_skipped`), but a landmine — fixing it needs auditing every downstream
   `f.get(...)`, deliberately not bolted onto the task #13 fix.
-
-## Probe A, task #12: the hypothesis space is now THREE, and the third one is new {#probe-a-direction-evidence}
-
-### CORRECTION FIRST: my own "zero probe A lines" reading was a masked permission error {#probe-a-permission-error}
-
-I grepped the soak's server logs from the host, got `0` everywhere, and wrote in the worklog that the
-current logs hold no probe A lines. The files are `-rw-r----- syslog:syslog`; my user is not in `syslog`.
-Every one of those greps was PERMISSION DENIED, and `2>/dev/null || echo 0` turned each denial into a
-confident zero. **That is the project's recurring failure shape, produced by my own shell.** Re-run inside
-the containers, the same logs hold 177,276 probe A lines on ch2's current log alone. Never let `|| echo 0`
-stand in for a command that can fail for reasons other than "no match".
-
-### Lost-lease: REFUTED {#probe-a-lease-refuted}
-
-Correlated all seven surviving firings against `gc_fence` / `gc_fence_out` / `mount_remount` /
-`mount_conflict`. **No lease-class event falls inside any firing window**, on either node, including the
-244,939 instance; a ±60 s halo finds nothing for it either. `gc_fence` fired 400 times on ch1 and 4,245 on
-ch2 during the run, so the logging is live and its silence here means something. My earlier claim that the
-giant instance was "very likely a lost-lease artifact" is withdrawn.
-
-(An intermediate query returned `NULL` rather than `0` from a correlated subquery. Reading that as "no
-events" would have reached the same conclusion by accident. Redone offline against the full event list.)
-
-### The direction split, which is the real evidence {#probe-a-direction-split}
-
-Probe A logs every hole with its id AND its direction. The two directions are not equally informative:
-
-| direction | ch1 | ch2 | what it excludes |
-|---|---:|---:|---|
-| missing from the FOLD's scan (walk 2) | 0 | 338,559 | nothing — concurrent deletion explains it |
-| missing from the PRE-FOLD scan (walk 1) | **30** | **28** | deletion cannot: walk 2 SAW the object |
-
-For the second direction the object demonstrably existed, and its id is below what walk 1 had already
-observed for that namespace, so walk 1 should have returned it.
-
-**Stale-epoch writer is also excluded.** Every one of the 58 ids carries epoch `0x4`, with near-consecutive
-sequences (`0x1f171`, `0x1f173`, `0x1f174` inside one namespace at one instant). A writer at an older epoch
-would be the only way to mint an id below `pre_max` after walk 1 — and these are not from an older epoch.
-
-### The third hypothesis, which the probe's own message does not consider {#probe-a-third-hypothesis}
-
-The log line asserts "an append cannot explain this". That reasoning holds only if appends become VISIBLE
-in sequence order. If a ref-log PUT can still be in flight while a later-sequenced PUT has already landed,
-then walk 1 legitimately sees `0x1f180` and legitimately misses `0x1f174` — no listing hole required, and
-walk 2 later sees both.
-
-This is not idle: `appendRefOps` uses a leader/batch model (`pending.push_back`, a leader carves and
-flushes a batch) and the queue mutex is released around the flush. Whether one leader's flush can issue
-several ref-log PUTs whose completions are observable out of order is the question, and it must be READ
-rather than assumed.
-
-**So #12 is not settled, but it is much better posed.** Either the object store returned an incomplete
-prefix — the release blocker {#list-as-journal-dataloss-2026-07-25}, observed rather than modelled — or
-the probe's justification has a hole and 58 of its firings are false positives that abort folding for
-nothing. Both outcomes matter, and they are distinguished by one question about the append path.
-
-**Next step, precisely:** determine whether a single leader's batch flush can have two ref-log PUTs in
-flight simultaneously for the same namespace. If it cannot, in-order visibility holds, the third hypothesis
-dies, and the 58 holes ARE the blocker observed in the wild.
-
-### #12 ANSWERED: all four alternatives are excluded — the store returned an incomplete prefix {#probe-a-answered}
-
-Continuing {#probe-a-direction-evidence}. The 58 "missing from the pre-fold scan" holes survive every
-alternative explanation, each excluded on evidence rather than plausibility:
-
-1. **Concurrent deletion** — excluded by direction. Walk 2 SAW the object; deletion cannot make something
-   reappear.
-2. **A stale-epoch writer minting an id below `pre_max`** — excluded by the ids. All 58 carry epoch `0x4`
-   with near-consecutive sequences, not an older epoch.
-3. **Two appends in flight at once, completing out of order** — excluded by the append path.
-   `leader_active` is per-`RefTable`, guarded by `ref_queue_mutex`, so one leader per namespace; the leader
-   PUTs via `putIfAbsentControlled`, which is synchronous and awaited; a carved chunk seals to exactly ONE
-   ref-log object. The PUT for W therefore completes before the PUT for X is issued. This is the
-   hypothesis the probe's own "an append cannot explain this" implicitly assumes away — it is true, but it
-   needed checking rather than asserting.
-4. **An `Unresolved` PUT landing late, after resolution declared the id a free gap** — excluded by design,
-   and the design says so explicitly: "`resolveByExactGet` never reports a plain absent verdict: an absent
-   or unreadable key returns `Unresolved`, since another attempt may still be legal." An absent key does
-   NOT free the id; the lane stays wedged, so no later append can get ahead of a still-flying one.
-   (`CasConditionalWriteUnresolved` fires 416 times on ch1 in a few hours, so this path is well travelled
-   — worth excluding rather than waving away.)
-
-**What remains is the probe's first-named explanation: the object store gave two different answers about
-the same durable prefix.** That is {#list-as-journal-dataloss-2026-07-25} — until now mechanised in TLA+
-and argued from first principles — **observed in a running system.**
-
-### Two things this does NOT establish {#probe-a-answered-limits}
-
-**It is RustFS, not AWS S3.** Everything here is against the test object store the soak and CI run on. It
-does not show that S3 behaves this way. That changes how alarming the observation is; it changes nothing
-about the design conclusion, because the GC must not depend on LIST completeness in the first place — which
-is precisely what the blocker says. A store that can do this exists and we run on it daily.
-
-**Exclusion 3 rests on reading the code, not on an experiment.** The reasoning is short and the invariants
-are documented in the source, but a reader who disagrees should attack that link first.
-
-### The reassuring half {#probe-a-detector-worked}
-
-Every one of the 7 firings ABORTED ref folding: no cursor advanced, no destructive action ran. The detector
-built earlier this round did exactly the job it was built for, on its first live outing, against the defect
-it was aimed at. The blocker's blast radius — a cursor advancing over records a round merely OBSERVED —
-did not occur because the probe stopped it.
-
-### Confirmation step worth doing cheaply {#probe-a-store-experiment}
-
-A standalone hammer against RustFS — write a known key set, LIST the prefix repeatedly under concurrent
-writes, diff each answer against the known set — would confirm the store-side behaviour directly, without a
-soak. That belongs with the rig (#10) and is much cheaper than one.
-
-### #18 in progress — and a GAP in my own experiment design, stated before the result {#probe-a-hammer-design-gap}
-
-The add-only hammer is running: 380k-key, 382-page listings under 6 concurrent writers, **zero holes across
-the first 21 rounds** (~5M keys listed cumulatively). That is already the page-count regime probe A's
-firings came from.
-
-**But the experiment is not yet a fair model of the CAS ref prefix, and the difference is the most likely
-discriminator.** My hammer only ADDS keys. The real ref prefix has objects being DELETED concurrently —
-GC removes folded logs — and deletion during a paginated walk is the classic source of listing anomalies:
-a continuation token can name a position whose key is gone by the time the next page is fetched, and how a
-store handles that is exactly where implementations differ.
-
-So a zero result from THIS run does not weigh against {#probe-a-answered}; it only rules out the add-only
-regime. The run that matters adds a DELETER thread removing keys from behind the listing cursor while it
-walks. That is the next configuration, and it should have been the first.
-
-Recording the gap before the verdict lands, so the verdict cannot be quietly reinterpreted to fit.
-
-### #18 RESULT: both direct regimes are CLEAN — which weakens {#probe-a-answered} {#probe-a-hammer-negative}
-
-Two valid runs against RustFS, using probe A's own witness rule:
-
-| regime | rounds | pages/listing | keys listed | deleted under each walk | HOLES |
-|---|---:|---:|---:|---:|---:|
-| add-only | 24 | up to 888 | 6.85M cumulative | — | **0** |
-| held population + deletion behind the cursor | 40 | 151-166 | ~6.2M cumulative | ~31,000 | **0** |
-
-(A third run is excluded as worthless: unthrottled deleters drained it to a single key by round 31, so most
-rounds listed 1-3 keys and could not have produced a hole. Recorded so nobody counts it as a third clean
-result.)
-
-**This is a real negative and it counts against my own conclusion.** {#probe-a-answered} reached "the store
-gave two different answers about the same durable prefix" by ELIMINATION. Two direct attempts in the two
-obvious regimes — the second of them a deliberate model of GC deleting from behind the listing cursor —
-found nothing at ~13M keys listed, more than nine times what probe A saw across its whole four-hour run.
-
-So one of these is true, and the next step is to find out which:
-
-1. **An eliminated hypothesis was eliminated wrongly.** The weakest link remains the in-flight-append
-   exclusion, which rests on reading the append path rather than on an experiment.
-2. **The hammer still differs from the CAS walk in a way that matters.** Three candidates, in my order of
-   suspicion:
-   - **RETRIES INSIDE A PAGINATED WALK.** CAS lists through the ClickHouse S3 client, with its own retry
-     and timeout budget; my hammer uses boto3 with 3 attempts against a healthy store. A page request that
-     errors and is retried mid-pagination is a completely untested path, and it is the one place a page
-     could be silently skipped.
-   - **CHAOS.** The soak froze and killed RustFS during runs. My hammer ran against a store nobody was
-     attacking. A pagination interrupted by a store restart may not honour its continuation token the same
-     way.
-   - **Key shape.** CAS keys are nested paths containing `@cas@`; mine are flat `k-NNNNNNNN`. Least likely,
-     but not excluded.
-
-**Cheapest next test, and it uses evidence already on disk:** correlate the probe A firing windows against
-RustFS faults and S3 request errors during the soak. If every firing sits inside a fault window, candidate
-2 is the answer and the store is innocent under normal operation — which changes the blocker's urgency
-without changing its validity, since a GC that trusts LIST completeness is still wrong.
-
-### The holes are NOT page-shaped — which rules out the model everyone would reach for {#probe-a-hole-shape}
-
-Decoded the ids and namespaces out of one firing (ch1, 06:06:09, 13 holes):
-
-```
-11 holes  span 0x1f171..0x1f17f  (15 id slots)  ns ca_soak_ch1/store/162/...
- 2 holes  span 0x1119c..0x1119d  ( 2 id slots)  ns ca_soak_ch2/store/243/...
-```
-
-Two TIGHT CONTIGUOUS CLUSTERS of adjacent keys, 13 in total, in two namespaces at the same instant. (The
-gaps inside the first span — `1f172`, `1f177`, … — are not evidence of interleaving: `appendRefOps`
-legitimately leaves id gaps, "the id is a safe gap", on its conclusive-rejection path.)
-
-**A dropped LIST page would be ~1000 keys.** This is thirteen. So "the store lost a page" — the natural
-reading of {#probe-a-answered}, and the one the probe's own message suggests — does not fit the data. Ref
-log keys are `<epoch hex>-<seq hex>.zst` zero-padded, so lexicographic order IS id order and these are
-physically ADJACENT keys in the listing. Walk 1 returned the keys after `0x1f17f` and skipped the short run
-before it.
-
-Two consequences:
-
-1. **It also rules out classic offset-pagination skew**, which the deletion regime would have exposed:
-   `del2` deleted ~31,000 keys from behind the cursor across each of 40 walks and produced ZERO holes. A
-   store that shifted its cursor on deletion would have failed that test loudly.
-2. **The mechanism drops SHORT ADJACENT RUNS, not pages.** That is a much narrower target than "the store
-   is inconsistent", and it is the shape any explanation now has to produce.
-
-I do not have a mechanism that predicts this shape yet. Stating that plainly rather than picking whichever
-of the surviving hypotheses is least disproved — the honest position after {#probe-a-hammer-negative} is
-that the cause is UNKNOWN, with the LIST-completeness reading weakened by two direct experiments and the
-elimination argument weakened by this shape.
-
-**Where it goes next:** the CAS walk lists through the ClickHouse S3 client under chaos, my hammer used
-boto3 against a healthy store. A retried page request is the one path that could plausibly return a
-slightly different window of keys. That is now the leading candidate and it is testable — inject page-level
-errors into the hammer's client and see whether short adjacent runs start disappearing.
-
-### THREE valid hammer runs, all negative — stop guessing and make the detector self-diagnosing {#probe-a-hammer-three-negatives}
-
-| run | pagination | rounds | pages | keys listed | deletes under each walk | HOLES |
-|---|---|---:|---:|---:|---:|---:|
-| add-only | continuation | 24 | ≤888 | 6.85M | — | 0 |
-| held population | continuation | 40 | 151-166 | 6.2M | ~31,000 | 0 |
-| held population | **start-after (what CAS does)** | 40 | 151-166 | 6.08M | ~15,500 | 0 |
-
-~19M keys listed. Nothing. Two more code-level hypotheses died on inspection in the same stretch:
-
-- **Page-limit mismatch between the two walks** — no: both use 1000 (walk 2 passes it explicitly, walk 1
-  takes the default). The stitch points still DRIFT between walks, because the key space mutates and the
-  count of keys before any given key differs — so a store that disagreed with itself at a stitch would
-  produce asymmetric holes. That remains a mechanism; it is just not a page-size bug.
-- **The two walks filtering keys differently** — no. Walk 1 selects with `parseRefObjectKey` inline; walk 2
-  collects raw keys and filters later via `groupRefKeys`. Both call the same parser. The only asymmetry is
-  STRICTNESS: walk 1 silently skips an unparseable key, walk 2 throws `CORRUPTED_DATA` and aborts the
-  round. That is worth tidying, but it produces an abort, never a hole.
-
-**The approach is wrong, not just the hypotheses.** Every attempt so far reconstructs the crime scene after
-the fact from ids in a log. The detector is already at the exact moment the disagreement exists and throws
-that moment away.
-
-**Change probe A to answer the question at firing time.** When a hole is found, immediately `HEAD` the hole
-key and record the verdict in the same log line:
-
-- **object EXISTS** → walk 1 missed a durable object. The listing was incomplete; store or client.
-- **object ABSENT** → walk 2 returned a key that is not there. A phantom, which points at the client or
-  iterator, not at LIST completeness — and would invalidate the whole reading of {#probe-a-answered}.
-
-One HEAD per hole, and holes are rare by construction (7 firings in four hours). It converts the next
-firing from a forensic puzzle into a decisive observation, and it is far cheaper than another 19M-key
-hammer run.
-
-## WHY the audit log could not trace this, which is itself the defect (user challenge, 2026-07-26) {#anomaly-detail-is-a-bare-count}
-
-Asked why `system.content_addressed_log` could not settle the probe A mechanism, given that this project's
-convention is to write the FULL CONTEXT of every critical decision into `detail`. Checked. The convention
-is not being followed at the one event that matters:
-
-```
-gc_fold_end   detail = {anomalies: '1', shards: '8'}
-gc_fold_begin detail = {}                                  -- empty, every row
-```
-
-`Gc::Report::recordAnomaly` takes `(namespace, shard, ManifestId, reason)`. **None of it reaches the audit
-log.** The row carries a COUNT. Probe A ABORTS ref folding — no cursor advance, no destructive action — and
-the queryable record of that decision is the number 1.
-
-Three consequences, all of which I hit this round without naming the cause:
-
-1. **The count cannot even identify WHICH anomaly fired.** A probe A disagreement and an undecodable
-   ref-log body both land as `anomalies: 1`. There is a `gc_fold_end` at 08:30:35 on ch1 that does not
-   appear among the probe A firings in the per-phase rows, and I cannot say what it was.
-2. **The real context exists only in the TEXT log**, which is rotated, compressed, syslog-owned and
-   unreadable from the host — which is how I produced a masked-permission "zero" earlier today
-   ({#probe-a-permission-error}).
-3. **So every investigation becomes forensics**: decode ids out of grep output instead of querying the
-   table built for exactly this.
-
-**Fix, and it subsumes the HEAD-at-firing-time step in {#probe-a-hammer-three-negatives}:** give the
-anomaly its own audit event carrying its context in `detail` — `reason`, `namespace`, the hole id, the
-DIRECTION (which enumeration missed it), the other enumeration's max id for that namespace, and the
-HEAD verdict on the hole key (exists / absent). Then the next firing is one `SELECT` away from a mechanism
-instead of an afternoon of log archaeology.
-
-That is the correct next step for {#probe-a-answered}, and it is a smaller change than the three hammer
-runs it would have replaced.
-
-### #20 DONE: the anomaly now records what it saw {#anomaly-detail-fixed}
-
-`gc_anomaly` event (namespace, hole id, direction, both enumerations' maxima, hole ordinal), two
-ProfileEvents (`CasGcProbeAHolePresent` / `CasGcProbeAHoleAbsent`), and the verdict in the log line.
-
-Three carriers on purpose, each covering another's blind spot: `EventEmitter` no-ops when no audit sink is
-installed, the text log is rotated and root-owned (which already produced one false "zero occurrences"
-today), and only the counters are readable by the soak harness, CI and `system.events`. Both counters are
-registered in `soak/signals.py`, so preflight fails rather than silently reading zero.
-
-Capped at 32 rows/round with the cap and true total in every row, plus an explicit line naming what was
-dropped. Test pins the DIRECTION of the verdict and was verified failing both ways — not taken, and
-inverted. Widened gate green (1379).
-
-**What this buys: the next probe A firing is one `SELECT` from a mechanism.** `present` means an
-enumeration omitted a durable object — {#list-as-journal-dataloss-2026-07-25} observed. `absent` means one
-returned a key that does not exist, which would invalidate that reading entirely and point at the client.
-Neither is recoverable after the fact, which is why three hammer runs and ~19M listed keys could not settle
-it.
-
-## *** CAUGHT LIVE 2026-07-26: a ref-prefix enumeration omitted two adjacent objects that DEMONSTRABLY EXISTED *** {#probe-a-caught-live}
-
-The instrumentation from {#anomaly-detail-fixed} paid off on its FIRST soak, inside the first four minutes.
-Three hammer runs and ~19M listed keys had failed to reproduce this; one `SELECT` now shows it.
-
-```
-namespace    ca_soak_ch1/store/3ba/3ba2c30d-...@cas@
-hole         epoch 1, seq 0x1430c   head_verdict = present
-hole         epoch 1, seq 0x1430d   head_verdict = present
-direction    missing from the pre-fold scan
-pre_max      epoch 1, seq 0x1430e          <-- walk 1 DID return this
-fold_max     epoch 1, seq 0x14a10
-```
-
-Counters agree: `CasGcRefScanDisagreements=2`, `CasGcProbeAHolePresent=2`, `CasGcProbeAHoleAbsent=0`.
-
-**Walk 1 returned `0x1430e` and skipped the two keys immediately below it.** Both objects were confirmed
-present by a HEAD taken at the moment of the disagreement. Same short-adjacent-run shape as the historical
-firings ({#probe-a-hole-shape}), now with a verdict attached instead of reconstructed.
-
-### What this settles, and what it does not {#probe-a-caught-live-limits}
-
-**Settled: the holes are not phantoms and not deletions.** `absent` would have meant walk 2 invented a key,
-which would have invalidated the whole reading; it did not happen. Deletion cannot explain a key that is
-present when checked.
-
-**NOT settled: incomplete listing vs non-serialized appends.** Two branches remain, and the HEAD verdict
-cannot separate them:
-
-1. The enumeration was incomplete — the LIST-as-journal blocker, observed.
-2. `0x1430c`/`0x1430d` were written AFTER `0x1430e`, so they genuinely did not exist when walk 1 ran. That
-   requires appends to a single namespace to complete out of order, which contradicts the reading of
-   `appendRefOps` in {#probe-a-answered} — one leader per `RefTable`, synchronous awaited PUT. That reading
-   is the weakest link in the argument and this is exactly where it would break.
-
-**The discriminator is one more field.** `HeadResult::attributes` carries object metadata; recording the
-hole object's LAST-MODIFIED time against the walk's start time decides it outright — modified before walk 1
-means the listing was incomplete, full stop; modified after means the append ordering assumption is wrong
-and the defect is in our writer, not the store. That is a small addition to the same event.
-
-Do NOT close {#list-as-journal-dataloss-2026-07-25} on this. It is much stronger evidence than anything
-before it, and it is still one field short of proof.
-
-### The lesson worth more than the finding {#probe-a-caught-live-lesson}
-
-Three hammer runs, ~19M keys listed, several code reads, an afternoon — all negative. One instrumentation
-change, one 20-minute soak, four minutes in — decisive. The detector was standing at the moment of the
-disagreement the whole time and throwing it away, and I went looking for the crime scene elsewhere instead
-of asking it what it saw. The user's question ("why can't you trace this through the CA log, we write the
-full context of every critical decision") is what redirected it.
-
-### The second branch closes too: append ordering verified at THREE levels {#probe-a-append-order-verified}
-
-{#probe-a-caught-live} left two branches. The second — that `0x1430c`/`0x1430d` were written AFTER
-`0x1430e`, so walk 1 legitimately missed them — required appends to one namespace to complete out of order.
-That rested on a single reading of `appendRefOps`, which I had repeatedly flagged as the argument's weakest
-link. Re-checked properly, it holds at three independent levels:
-
-1. **The baton.** `leader_active` lives in `RefTable`, guarded by `ref_queue_mutex`: one leader per
-   namespace, and a new tenure cannot begin until the previous released.
-2. **The flush loop is sequential.** `for (size_t item_index = 0; item_index < batch.size(); ++item_index)`,
-   committing chunk by chunk through `commitRefChunk`. Its own failure-isolation comment states the
-   ordering outright: "Earlier chunks that already committed keep their callers' success" — chunk N is
-   fully committed or failed before chunk N+1 is attempted.
-3. **The PUT is synchronous and awaited**, one object per carved chunk.
-
-Ids are minted in increasing order; within a tenure chunk order is id order, across tenures the baton
-orders them. **So the PUT for id N completes before the PUT for N+1 is issued.**
-
-Apply that to the captured firing: `0x1430c`, `0x1430d`, `0x1430e` are consecutive and ALL THREE were
-confirmed present. Therefore `c` and `d` were durable before `e`'s PUT even started. Walk 1 returned `e`,
-so walk 1 ran after `e` landed — hence after `c` and `d` landed — and did not return them.
-
-**The enumeration was incomplete.** {#list-as-journal-dataloss-2026-07-25} is no longer a model, an
-inference, or a survivor of elimination: it is observed, with the omitted objects proven to exist and the
-ordering that makes their absence impossible verified in three places.
-
-### The one thing still resting on reading rather than measurement {#probe-a-remaining-hardening}
-
-The ordering guarantee is established from SOURCE, not from an experiment. A reader who rejects it can
-still reject the conclusion. The clean way to close that is the object's LAST-MODIFIED time against the
-walk's start — and it is NOT currently reachable: `HeadResult::attributes` is `map<String,String>` of USER
-metadata, not S3's `LastModified`, and the writer's `ref_publish`/`ref_drop` audit events do not carry the
-ref txn id either (checked both). Surfacing either one is a real change, worth making, and it is hardening
-of a conclusion rather than a gate on it.
-
-### STILL OPEN after #13: the fsck budget, which #13 made honest rather than sufficient {#fsck-budget-still-open}
-
-The 2026-07-26 verdict soak skipped its GC-checkpoint entry gate again: `entry-gate fsck timed out
-(ca-fsck (detail=False) exceeded 180s)` on a pool of **5.5 GB**. No false "PERSISTENT dangling" this time —
-that regression is fixed and the timeout now degrades to a logged skip, which is correct behaviour.
-
-But correct behaviour here means **the gate does not run.** #13 removed the lie; it did not buy the check
-any time. A 5.5 GB pool is small, and 180 s is not close to enough — the earlier measurement of
-`reachable=0` after 160 s says the scan had not finished even its first phase.
-
-This is the same shape as everything else this round: an instrument that reports honestly that it saw
-nothing is better than one that lies, and still not a check. Options, none yet chosen:
-
-- scale the budget with pool size instead of a flat wall-clock number;
-- make the entry gate use `--partial` deliberately and treat the result as a lower bound (safe for the
-  gate's purpose only if a partial `dangling > 0` still fails, which it would);
-- make fsck itself cheaper — the intake measurements ({#gc-perf-multiplier-attributed}) suggest the same
-  per-request cost dominates here.
-
-Tracked so the skip does not become the accepted normal.
-
-### Verdict soak: GREEN, and three things it taught beyond the catch {#verdict-soak-outcome}
-
-`PHASE3 OK`, `SOAK_EXIT=0`. 88 signal reads, both new counters in preflight with per-node baselines, GC
-phases captured at 5/6 checkpoints over 179 round attempts.
-
-**1. The ProfileEvents counters were WIPED and the audit rows survived.** Final `system.events`:
-`disagreements=0 present=0 absent=0` on both nodes — chaos restarted the servers and process-local counters
-reset. `system.content_addressed_log` still holds the 2 `gc_anomaly` rows on ch1, with the ids, the
-direction and the `present` verdicts intact.
-
-**The finding this whole round turned on would have been ERASED by a restart if I had shipped only the
-counters.** The audit event is what made it durable, and that was the user's point when they asked why the
-CA log was not being used. Recording it because the reflex "add a ProfileEvent" is cheap and would have
-quietly lost the evidence.
-
-**2. Probe A is `reported-not-gated`** — `CasGcProbeAHolePresent peak=2, nonzero_in=28/88 reads`. A soak can
-go green with confirmed enumeration holes. Defensible today: the product already fails closed (folding
-aborted, no cursor advance, nothing deleted), so the run genuinely was safe. But now that the holes are
-CONFIRMED rather than suspected, whether a green run should be allowed to contain them is a decision
-someone should make deliberately rather than inherit.
-
-**3. `pending_deletes` hit 77.2 SECONDS in a single occurrence** — against `orphan_sweep=242.8ms`,
-`fold_reduce=223.1ms`, `fold_ref_list=60.7ms`. Three orders of magnitude above every other phase, on a
-20-minute run. The GC-performance work has been looking at `fold_ref_intake` because that is what dominated
-the 4-hour data; this says `pending_deletes` deserves its own look. Folded into the study
-({#gc-bottleneck-study-2026-07-25}), not chased now.
-
-### #11 and #19 are the SAME DEFECT seen from two ends {#leak-is-a-consequence-of-the-hole}
-
-Reading `CasBlobInDegree.cpp`'s merge against the recorded root cause makes the connection plain, and it
-reframes the leak fix.
-
-In-degree is a SET of source edges. The leak is a residual `+1` whose `-1` never folded
-({#unmatched-minus-one-retention-leak}: 56 blobs, exactly one residual edge each, contributing manifest
-gone). There are exactly two ways a `-1` fails to cancel its `+1`:
-
-1. **The `-1`'s ref log was OMITTED from an enumeration and the cursor advanced past it.** The log is never
-   folded again — sealing a cursor above a record is permanent — so the `+1` stands forever. This is
-   {#list-as-journal-dataloss-2026-07-25}, and as of {#probe-a-caught-live} it is CONFIRMED to happen.
-2. **The `-1` arrived BEFORE its `+1`.** `present` is false when the remove is applied, so the remove is
-   dropped as a per-key no-op; the `+1` then lands with nothing left to cancel it. This is the direction
-   `CasGcUnmatchedRemoveDeltas` counts — 22 occurrences in the 20-minute verdict soak.
-
-So the retention leak is not an independent bug to be fixed in the reducer. **It is a CONSEQUENCE**, and
-the reducer is behaving correctly in both cases: a set cannot cancel an element it never received, and
-dropping an unmatched remove is exactly right (the alternative — materialising a negative edge — is how a
-false deletion would be born).
-
-### What this changes about the fix {#leak-fix-reframed}
-
-**Do not "fix" the merge.** The obvious remedy was already known to be wrong (`RefTableState` throws
-`CORRUPTED_DATA` on an absent binding, turning a leak into a permanent wedge); this says something stronger
-— there is nothing to fix at that layer at all.
-
-Three separable pieces of real work instead:
-
-- **Source, path 1:** enumeration completeness. Probe A already ABORTS folding when it catches a hole, so
-  the cursor does not advance and path 1 is closed for holes it catches. Its two stated blind spots remain
-  open: a hole that reproduces IDENTICALLY in both enumerations, and a namespace dropped WHOLESALE from one
-  enumeration (no `ref_tables` entry, so the comparison loop never visits it).
-- **Source, path 2:** whatever lets a `-1` reach the reducer ahead of its `+1`. Unexamined. 22 occurrences
-  in 20 minutes is not rare, and it needs its own investigation — `CasGcUnmatchedRemoveDeltas` hands back
-  one example per round (`unmatched_remove_example`), which is where to start.
-- **The 56 already-leaked blobs:** a one-off reconciliation, since no incremental round can ever reclaim
-  them. Only a rebuild of the in-degree state can, which is what the fsck note already says.
-
-Task #11's framing ("fix the unmatched-minus-one retention leak") is therefore wrong as written and has
-been left in place only so the history reads honestly; the work is the three items above.
-
-## *** PROVEN BY MEASUREMENT: the enumeration was incomplete *** {#probe-a-proven-by-measurement}
-
-I wrote in {#probe-a-remaining-hardening} that the object's write time was "NOT currently reachable" and
-that the ordering guarantee therefore rested on reading source. **That was wrong.** `system.blob_storage_log`
-records every object write with a microsecond timestamp, and the user asked the obvious question I had not:
-what do the storage logs say?
-
-### The three keys of the captured firing {#proven-three-keys}
-
-```
-Upload  16:47:19.211480   .../_log/0000000000000001-000000000001430c.zst   200 B   <- hole
-Upload  16:47:19.212340   .../_log/0000000000000001-000000000001430d.zst   200 B   <- hole
-Upload  16:47:19.213680   .../_log/0000000000000001-000000000001430e.zst   195 B   <- the witness
-gc_anomaly fired at 16:47:38                                                       <- 19 SECONDS later
-```
-
-All three were written in strict id order, 2.2 ms apart. Walk 1 returned `0x1430e`, so walk 1 ran after
-`16:47:19.213680` — by which time `0x1430c` and `0x1430d` had been durable for 1.3-2.2 ms, and by the time
-the disagreement was reported, for nineteen seconds. Walk 1 did not return them.
-
-### The ordering guarantee is now measured too {#proven-ordering}
-
-Not "argued from `appendRefOps`". Across **65,263 ref-log uploads** in this namespace, partitioned by writer
-epoch: **zero out of order** (65,157 in epoch 1, 106 in epoch 2). Upload timestamps rise monotonically with
-id, exactly as the single-leader/awaited-PUT reading claimed.
-
-(A first pass reported one inversion. That was my query mixing two epochs — a remount restarts the
-sequence, so sorting by sequence alone puts a small post-remount id "before" a large pre-remount one.
-Corrected by partitioning; the artifact was mine, not the system's.)
-
-### So the conclusion no longer rests on any code reading {#proven-conclusion}
-
-**A ref-prefix enumeration failed to return two objects that had been durable for nineteen seconds, while
-returning a third written 2.2 ms after them.** {#list-as-journal-dataloss-2026-07-25} is proven.
-
-### The fail-closed path also worked end to end {#proven-failclosed}
-
-The same three keys were `Delete`d at `16:53:59` — six minutes later. Probe A aborted folding, the cursor
-did not advance, a later round enumerated completely and folded them, and GC then reclaimed them normally.
-**No leak resulted from this occurrence**, which is the behaviour the detector exists to produce.
-
-## GC round duration: the answer is SERIAL REQUEST LATENCY, measured (2026-07-26 night) {#gc-round-duration-answered}
-
-The user's three hypotheses for why a round takes tens of minutes — repeated work, unnecessary work,
-serial-where-parallel-is-possible — tested against the recorded data. **The third dominates and the other
-two are secondary**, with one of them refuted outright.
-
-### The decisive arithmetic {#duration-arithmetic}
-
-Requests per intake phase = `log GETs + edge GETs + edge HEADs`. Time divided by TOTAL requests (my earlier
-0.9 ms figure divided by GETs only and ignored the HEADs, which inflated it):
-
-| logs | secs | GETs | HEADs | requests | ms/request |
-|---:|---:|---:|---:|---:|---:|
-| 5,672 | 28.6 | 14,706 | 9,034 | 23,740 | 1.205 |
-| 16,421 | 116.0 | 52,055 | 35,634 | 87,689 | 1.323 |
-| 96,167 | 260.2 | 328,157 | 231,990 | 560,147 | **0.465** |
-| 123,057 | 245.3 | 313,128 | 190,071 | 503,199 | **0.487** |
-| 132,618 | 507.0 | 611,216 | 478,598 | 1,089,814 | **0.465** |
-| 404,065 | 1,829.6 | 1,912,078 | 1,508,013 | 3,420,091 | **0.535** |
-
-**The four large rounds agree within 1.15x at ~0.5 ms per request.** For the rounds that actually take
-minutes, phase time is 100% accounted for by serial round-trip latency: **there is no CPU term and no lock
-term to find.** The two small rounds sit at 1.2-1.3 ms and are not trusted — all this data comes from chaos
-runs, and at that size a single freeze dominates.
-
-The 30-minute round was **3.42 MILLION serial round trips**. Nothing is slow; there are simply that many,
-one after another.
-
-### Confirmed serial from source, and the code says so itself {#duration-serial}
-
-A plain `for (auto & [ns_str, listing] : ref_tables)` with a synchronous GET per log and per edge. No
-prefetch, no batching, no thread pool. GC's own comment: "one GET per new ref log plus one HEAD+GET per
-manifest edge, which on a busy pool is where the round's object-read budget goes." (`meta_pool` exists but
-is for async/advisory delete-side ops, not intake reads.)
-
-### Hypothesis 1, repeated work: REAL but secondary {#duration-repeated}
-
-- **Manifest bodies: 39.6% of edge fetches are re-reads** ({#gc-manifest-reuse-measured}). On the 404k
-  round that is ~597k redundant edges x 2 trips x 0.5 ms = **~600 s of the 1830 s**. Substantial, and a
-  round-scoped cache removes it without touching the protocol.
-- **Fold seal: REFUTED as a cost.** The product already counts it: 26 seal reads with 13 redundant across
-  all rounds on the stand — 50% redundant by COUNT, but 2 reads per round at 1-3.5 ms. It is noise. The
-  standing backlog suspicion that "the fold seal is read five times per round" does not survive contact
-  with the counter.
-
-### Hypothesis 2, unnecessary work: only the HEAD, and it is off-limits {#duration-unnecessary}
-
-Every edge costs a HEAD before its GET — **1.5 M of the 3.42 M trips on the big round, i.e. 44% of them,
-~800 s**. That is the single largest identifiable block. It is a protocol step under a standing user veto,
-so it is recorded as a measured cost and NOT proposed for removal. Everything else is irreducible: the log
-body must be read to know the transaction, and the manifest body must be read to know the blob list.
-
-### Hypothesis 3, serialism: THE ANSWER {#duration-serial-answer}
-
-At ~0.5 ms per trip and 3.42 M trips, parallel fetching alone gives:
-
-| concurrency | intake floor on the 404k round |
-|---|---|
-| 1 (today) | 1830 s |
-| 4 | ~460 s |
-| 8 | ~230 s |
-| 16 | ~115 s |
-
-Fetching is independent even though APPLICATION order is not: tables fold independently by design (a clamp
-on one does not stop others), and within a table the log bodies for ids above the cursor can be prefetched
-while the previous log is being applied. The ordering constraint is on the fold, not on the read.
-
-**Combining the two levers is multiplicative**: dropping the 39.6% redundant edge fetches first shrinks the
-request count, then parallelism divides what remains.
-
-### S42 at `--scale full` does NOT FIT on this machine — a finding, not just an incident {#s42-full-scale-too-big}
-
-Launched S42 at `--scale full` (8 writers, 4 readers, 1800 s leg-A workload). Watchdog caught it 12 minutes
-in on a disk trajectory, not a hang:
-
-```
-disk free  323G -> 223G in ~30 min, then 225G -> 218G in 20 SECONDS
-rate       ~21 GB/minute
-remaining  18 min of leg A still to run  =>  ~380 GB needed
-available  218 GB, and the alert floor is 60 GB
-load average 70.5, free memory 2 GB
-```
-
-Stopped deliberately before it broke the machine. Disk stabilised at 218 GB the moment it died, confirming
-S42 was the consumer.
-
-**Three things this is worth recording for:**
-
-1. **`--scale full` is not runnable on this host.** Any future attempt needs either a disk budget of ~400 GB
-   free or a smaller scale. The scenario has no pool-size cap parameter of its own (`--max-pool-gb` exists
-   on the soak driver, not on the scenario runner), so nothing stops it.
-2. **A memory-fault test run with 2 GB free RAM is compromised anyway.** S42 injects allocation failures via
-   `memory_tracker_fault_probability`; if the host is itself near exhaustion, real OOM kills become
-   indistinguishable from injected faults and the attribution the card is built for is destroyed. The run
-   needed headroom it did not have.
-3. **Load average 70** on a 2-replica scenario suggests the full-scale writer/reader counts are tuned for a
-   bigger machine than this one.
-
-**Next attempt must be at `--scale ci`,** with disk headroom checked BEFORE launch and memory headroom
-checked as a precondition of the fault injection being meaningful.
-
-### `pending_deletes` at 77 s has the SAME shape — and the obvious remedy is unavailable {#pending-deletes-shape}
-
-Phase 11/18 is a nested serial loop — per gc-shard, per retired entry — issuing one
-`backend.deleteExact(blobKey, token)` per object. One round trip each, awaited, no pool, no batching. At
-the measured ~0.5 ms per request, **77.2 s is roughly 150,000 deletes performed one after another.**
-
-So intake and pending_deletes are the same story: request-bound and serial.
-
-**The obvious remedy — S3 `DeleteObjects`, up to 1000 keys per call — is NOT available, and it is worth
-recording why so nobody re-proposes it.** `deleteExact` is SAFETY-critical and token-conditional: it must
-remove ONLY the incarnation whose token matches, and a wrong token must be a `TokenMismatch` with the
-object untouched (`CasBackend.h`: "conditional PUTs are protocol hygiene; casPut and deleteExact are
-SAFETY-critical", and backends that silently ignore the condition are rejected by `Cas::Probe`). Bulk
-delete carries no per-object precondition, so batching would trade exactness — the guarantee that GC never
-removes a replaced incarnation — for throughput. That is the wrong trade at any speedup.
-
-The backend exposes no bulk path at all, which is consistent with that.
-
-**Parallelism, however, IS available here**: N concurrent conditional deletes preserve exactness perfectly,
-because each carries its own token. The same lever as intake, and the same reason it works.
+- **The GC-checkpoint entry-gate fsck still does not finish** on a pool as small as 5.5 GB within
+  its 180 s budget — task #13 made the timeout degrade honestly (a logged skip, not a fake OK), but
+  the gate still does not run. Options not yet chosen: scale the budget with pool size, use
+  `--partial` deliberately as a lower bound, or make fsck itself cheaper.
+
+## Probe A / LIST-hole investigation — superseded, settled record moved {#probe-a-direction-evidence}
+
+The probe-A ref-prefix-enumeration-hole investigation (task #12/#18/#20, the "caught live"/"proven
+by measurement" firings, the audit-detail fix) is now fully captured by the settled reference doc
+[`2026-08-03-list-trust-verdict.md`](2026-08-03-list-trust-verdict.md), which cites these exact
+findings as its source material. Probe A itself was deleted from the code by the v9 redesign
+(recovery-from-authority no longer reads listings at all — see
+[`{#list-as-journal-dataloss-2026-07-25}`](#list-as-journal-dataloss-2026-07-25)). The one loose
+end this investigation surfaced — "path 2": a `-1` arriving before its `+1` produces an unmatched
+remove that the reducer correctly drops as a no-op — is the same edge-set mechanism the
+already-resolved unmatched-removal-fold finding covers (pinned by
+`CasBlobInDegree.*.UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges`).
+
+## GC round duration — measured, both fix levers already tracked {#gc-round-duration-answered}
+
+Root cause measured: GC round duration is 100% serial round-trip latency (~0.5 ms/request, no CPU or
+lock term), not repeated or unnecessary work — a 30-minute round is 3.42M serial round trips (intake:
+1 GET/log + 1 HEAD+GET/manifest edge; deletes: 1 conditional `deleteExact`/object, no bulk-delete path
+because it's token-conditional and safety-critical). Both fix levers this measurement identified are
+already separately tracked: parallel fetching/deleting (`{#gc-delete-concurrency-serial}` and the
+sibling intake lever) and dropping redundant manifest-body re-reads (folded into
+`{#gc-frontier-one-list}`). Operational finding from the same investigation: `--scale full` S42 needs
+~400 GB free disk and does not fit this host; use `--scale ci` with headroom checked first.
 
 ## S42 at `ci` scale: the OOM machinery HELD; the run failed on the environment {#s42-ci-verdict}
 
@@ -2793,79 +1309,32 @@ two fixes each added the missing suites to the list (a data fix that regenerates
 list is per-session). **Open fix**: fix the generator/pattern, then add a loud check — diff the
 generated list against `--gtest_list_tests` and fail on any unclaimed suite.
 
-## Refactoring candidates, derived from what actually broke today {#refactor-candidates-from-defects}
+## Refactoring candidates, derived from what actually broke {#refactor-candidates-from-defects}
 
-Compiled 2026-07-30 at the user's prompt, from the session's defect list rather than from taste. Each entry
-names the defects that came out of it, so the case is evidence and not preference. Ranked by
-value-per-risk, not by size.
+Ranked by value-per-risk, each backed by real defects it would have prevented.
 
-**1. Absence must be expressible in the type. THE ONE TO DO NOW.** `CasRefCatalog::resolveLifeOrSentinel`
-returns a `NamespaceLifeId` and, when the catalog does not name the namespace, returns the Stage-A sentinel.
-So a caller **cannot distinguish "here is the life" from "I do not know"** — it receives a plausible,
-well-formed, wrong key. That single property is the amplifier in all three vacuous-frontier findings
-(`{#r11-empty-universe-vacuous}`, `{#r11b-authority-vs-union}`, `{#r11c-incarnation-mismatch}`): each one is
-a proof fabricated out of a key space that is empty by construction.
-
-Change the signature to `std::optional<NamespaceLifeId>` and delete the fallback; where a caller genuinely
-wants the sentinel (raw test fixtures, where the sentinel IS the truth) it asks for it explicitly. **The
-compiler then performs the sweep** — all 24 call sites must state what they do when the answer is unknown,
-and R11c's class becomes a compile error instead of a silent proof. This is small, mechanical after the
-signature change, and it PREVENTS the class we have now found three times.
-
-**Mechanics, so whoever takes it does not re-derive them.** The signature change is one line; the work is the
-24 decisions behind it, and they fall into exactly three shapes:
-- **Raw test fixtures** — the sentinel IS the truth there, so they ask for it explicitly
-  (`stageATransition(ns)` at the call site). Mechanical.
-- **GC round paths** — must not fabricate: an unknown life means UNPROVEN plus an anomaly, never a probe at a
-  guessed key. This is where R11, R11b and R11c all lived, and the fold now has `FoldResult::live_incarnation`
-  to consult instead of re-resolving.
-- **Diagnostic and administrative paths** (fsck, decommission, probe A, the admin rebuild) — an unknown life is
-  a finding to REPORT, not a key to guess. fsck in particular must not emit a verdict computed at a guessed
-  key, which is exactly the shape of the `crossEpochFromSeal` defect found in the checkpoint review.
-
-**PLACED IN TASK 6 (2026-07-30), correcting the line that used to stand here.** I first wrote that this should
-be its own task, on the grounds that 24 deliberate decisions must not be swept. That was half right: the
-decisions must not be swept, but they are ALREADY Task 6's — deleting `stageATransition` forces every one of
-its sites to say what it does when no catalog life is known. Doing it separately would touch the same sites
-twice and create a merge surface against the task that has to touch them anyway. A mechanical sweep would
-still re-create the fallback under a new name, so the mechanism (an `optional` return) is what forces the
-decisions to be explicit. Attempted during Task 4-C and deliberately
-deferred: the same files were in flight, and racing an active implementer across 24 call sites would have cost
-more than the fix saves.
-
-**2. One life resolution per round, threaded — not re-derived.** Five mechanisms answer one question, across
-80 call sites: `resolveNamespaceLife` (10), `resolveLifeOrSentinel` (24), `discoverUniverse` (13),
-`stageATransition` (19), `fromCatalogEntry` (14). Defects from this tangle alone: C2 (writers at the sentinel
-while readers had moved to the real life), C3 (delete plan computed under one life, applied under another),
-NEW-3 (an optional parameter defaulting to self-resolution at the one site its doc said it would not), and I3
-(a full pool-wide catalog GET and decode per call, several in per-namespace loops, i.e. O(namespaces²) bytes
-per round). Task 4-C started the fix inside the fold with `FoldResult::live_incarnation`; the same treatment
-belongs in fsck and decommission, each resolving once per run.
-
-**3. The destructive gate collapses per-namespace facts into a pool-wide boolean.**
-`suppress_destructive = !anomalies.empty() || !holds.empty() || frontier_incomplete`. One namespace's anomaly
-stops reclamation for the whole pool, which is how a single un-cataloged namespace becomes a **permanent**
-pool-wide stall (`{#r11c-incarnation-mismatch}`'s neighbour, NEW-2). Task 7b's own text already requires the
-flip to carry the hold set per namespace — so the gate wants to be per-namespace and is currently scalar, and
-that mismatch has already produced one Critical and one stall hazard.
-
-**4. `Gc/CasGc.cpp` (4679 lines) and `Pool/CasRefLedger.cpp` (4249) are 18% of the subsystem between them.**
-Size here is not an aesthetic complaint: today's `chassert`-over-a-handled-branch sat four lines from the
-branch it killed, the double-unlock that masked a real error class lived in the same file, and both survived
-multiple reviews. **But NOT during open Criticals** — and when it happens, goldens first: this campaign's rule
-is that an extraction needs its equivalence fences written BEFORE the move, because a fence added afterwards
-tests the new shape rather than the preserved behaviour.
-
-**5. The fixture/production divergence should be one named seam, not a habit.** Raw test helpers write at the
-sentinel, admit catalog entries as `Live` with no `_ckpt`, and bypass birth — which produced the 164-test
-sweep, the test whose premise was inverted by a uniform pin, and two tests that pinned data loss as correct.
-One helper, one documented list of divergences, one place to look.
-
-**6. And the one that is not a code refactor: keep converting prose rules into executing checks.** Four rules
-failed today because they lived only in comments. The two that were converted — `FsckReport::clean` computed
-from `kFsckHardFindings` with a `static_assert` in three TUs, and the suite-list generator deriving from
-sources and failing on any unclaimed suite — both held immediately. Every remaining "whenever X, also do Y"
-comment in this subsystem is a candidate.
+1. **DONE, differently than proposed.** "Make catalog-life absence expressible in the type
+   (`resolveLifeOrSentinel` → `std::optional`)" was the top item here; the current API already does
+   this under a different name — `CasRefCatalog::lifeIfCataloged` returns
+   `std::optional<NamespaceLifeId>`.
+2. **One life resolution per round, threaded — not re-derived.** Five mechanisms still answer the
+   same question across ~80 call sites (`resolveNamespaceLife`, `discoverUniverse`,
+   `stageATransition`, `fromCatalogEntry`, plus the now-optional lookup). The fold has
+   `FoldResult::live_incarnation` to consult instead of re-resolving; fsck and decommission still
+   re-resolve per call.
+3. **The destructive gate collapses per-namespace facts into a pool-wide boolean.**
+   `suppress_destructive` is a single scalar OR over every namespace's anomalies/holds/frontier
+   state, so one un-cataloged namespace stalls reclamation for the whole pool. Wants to be
+   per-namespace.
+4. **`Gc/CasGc.cpp` and `Pool/CasRefLedger.cpp` are ~18% of the subsystem by line count** — not an
+   aesthetic complaint, real defects have hidden in both files' size. Extraction needs equivalence
+   fences written BEFORE the move, not after; not during open Criticals.
+5. **The fixture/production divergence should be one named seam, not a habit.** Raw test helpers
+   write at the sentinel and bypass birth in ways production code never does; one documented helper
+   instead of ad hoc divergence.
+6. **Keep converting prose rules into executing checks.** Two conversions already held immediately
+   (`FsckReport::clean` from a `static_assert`-guarded list; the gtest suite-list generator failing
+   loud on any unclaimed suite) — every remaining "whenever X, also do Y" code comment is a candidate.
 
 ## A GC-level backstop for never-born `_ckpt` debris — and Task 3's closure of it was unsound {#ckpt-neverborn-gc-backstop}
 
