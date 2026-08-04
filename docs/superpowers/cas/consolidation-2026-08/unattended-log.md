@@ -118,3 +118,157 @@ Watchdog: session cron fe033cd7, every 20 min (:13/:33/:53). Ledger of record:
 ## 2026-08-04 04:03 (watchdog)
 - All 28 forks done (D6 landed 03:58: 1 MATERIAL — naming-unification Risks). audit-m2 at 444, D6's 6 records not yet folded; nudge sent to finalize.
 - Next: final wave report -> commit audit-m2 -> gate-m-report.md -> T5 clustering (input: 5550 batch + 94 audit-m + ~450 audit-m2).
+
+## 2026-08-04 04:12
+- Gate M PASSED + committed (fe4a3512f91). gate-m-report.md = user checkpoint packet (post-hoc review).
+- T5 clustering launched (6094 records -> topic clusters via codex chunks + cross-chunk merge). T4 formal review running in parallel.
+
+## 2026-08-04 04:23 (watchdog)
+- T5 clustering running: 16 input chunks prepared (04:07), 3 chunk cluster outputs done, 3 codex processes alive.
+- T4 closed with clean formal review. No stalls, no wake-ups.
+- Next: chunk clustering -> cross-chunk merge -> gate_cluster -> commit -> T6 verification.
+
+## 2026-08-04 04:43 (watchdog)
+- T5: 13/16 chunk cluster outputs done (newest 04:42), 2 codex lanes alive on the tail. On pace.
+- Next: last 3 chunks -> cross-chunk merge -> gate_cluster -> commit -> T6.
+
+## 2026-08-04 05:03 (watchdog)
+- T5: stuck at 13/16 since 04:42 with only 1 codex alive — possible dead lanes on the last 3 chunks. Status+relaunch nudge SENT to t5-clustering.
+- Foreign t8 soak commits in tree — normal.
+
+## 2026-08-04 05:23 (watchdog)
+- T5 recovered: 16/16 chunk outputs done; 3 codex alive = cross-chunk merge pass running. Final clusters.jsonl pending.
+- No wake-ups needed. Next: merge apply -> gate_cluster -> commit -> T6.
+
+## 2026-08-04 05:43 (watchdog)
+- T5 merge phase active: all-chunk-clusters.jsonl assembled, merge-in/ working dir fresh, 3 codex alive (cross-chunk merge directives). Progressing, no stall.
+- Next: apply merges -> gate_cluster -> commit -> T6.
+
+## 2026-08-04 06:03 (watchdog)
+- T5 merge still running: merge-in/ touched 05:58, 1 codex on the tail. Slowish but alive; no stall (<20 min since last activity).
+- Next: apply merges -> gate_cluster -> commit -> T6.
+
+## 2026-08-04 06:10
+- T5 DONE+committed (56a2e1a): 4633 clusters (3863 singletons, 718 x2-5, 52 x>5). codex soft-fail root cause: add `-s workspace-write`. Review running.
+- Next: review verdict -> T6 verification fan-out (the big one).
+
+## 2026-08-04 06:23 (watchdog)
+- T5 committed; t1-review reviewing (partition + over-merge sampling) — in progress, not stalled.
+- No codex lanes (expected between phases). Next: T5 verdict -> T6 verification fan-out.
+
+## 2026-08-04 06:43 (watchdog)
+- T5 fix committed (70dc55b: identifier gate + 7 verbatim repairs); scoped re-review in flight at t1-review. Not stalled.
+- Next: re-review verdict -> T5 complete -> T6 verification fan-out.
+
+## 2026-08-04 07:03 (watchdog)
+- T5 re-review verdict pending 35 min — wake-up SENT to t1-review (3 quick checks).
+- All else quiet. Next: T5 complete -> T6.
+
+## 2026-08-04 07:23 (watchdog)
+- T6: mechanical verdicts 163 done; Tier A evidence: 1 pilot batch done, 0 codex currently running (likely pilot validation gap between pilot and fan-out).
+- Borderline — will wake t6-verify if no new evidence batches by next sweep.
+
+## 2026-08-04 07:43 (watchdog)
+- T6 Tier A STALLED: pilot batch-001 done 07:17, no codex, no new batches for 26 min. Wake-up SENT to t6-verify (launch full fan-out or report pilot problem).
+
+## 2026-08-04 07:50
+- T6 resumed: mechanical 163 verdicts (17 unverifiable + 146 ephemeral); 4470 clusters -> 149 Tier-A batches; full fan-out launched (3 lanes x -P3 = 9 codex, resumable .done markers).
+- Tier B tooling ready, waits for evidence. gate_c.py written.
+
+## 2026-08-04 08:03 (watchdog)
+- T6 Tier A healthy: 18/149 evidence batches done (newest 08:02), 9 codex alive. Pace ~1.4 batch/min across lanes -> ETA ~1.5-2h for Tier A.
+- No wake-ups. Next: Tier B verdict fan-out as evidence accumulates.
+
+## 2026-08-04 08:23 (watchdog)
+- T6 Tier A: 32/149 done (+14 in 20 min), 9 codex alive. Tier B not yet dispatched (accumulating evidence). Healthy.
+
+## 2026-08-04 08:43 (watchdog)
+- T6 Tier A: 52/149 (+20), 12 codex alive. Tier B still 0 — sent pipelining suggestion (start verdicts over completed evidence now, no barrier).
+
+## 2026-08-04 09:03 (watchdog)
+- T6: Tier A 71/149 (9 codex), Tier B 8 batches / 320 verdicts done, pipelined. Healthy.
+- HEAD-verified naming carry-forward recorded for page tasks: metadata_type="cas", system.cas_log/cas_gc_log/cas_mounts, unprefixed settings.
+
+## 2026-08-04 09:23 (watchdog)
+- Tier A 90/149 healthy. Tier B FROZEN at 8 batches for 20 min with ~80 evidence batches ready — wake-up SENT (keep 3-5 verdict agents in flight; wave-commit reminder).
+
+## 2026-08-04 09:43 (watchdog)
+- T6: Tier A 109/149, merged verdicts 483, tierB wave cycling. Codex: 9.
+- Healthy; next milestones: Tier A finish, ~1000-verdict wave commit, Gate C.
+
+## 2026-08-04 10:00
+- User flagged: 541 clusters have empty Tier A evidence (no backticked identifiers) -> false unverifiable. Added Tier B-deep sub-phase: self-searching verdict agents (subsystem-scoped Grep/Read, phrase/log-fragment search), supersede semantics, after main pass.
+
+## 2026-08-04 10:03 (watchdog)
+- T6: Tier A 130/149 (9 codex), verdicts 883 merged + 400 pending merge (~1283/4633 total). Waves cycling; wave commit still pending (t6 merges then commits).
+- Tier B-deep sub-phase queued (541 empty-evidence clusters, user-driven). Healthy, no wake-ups.
+
+## 2026-08-04 10:23 (watchdog)
+- Tier A 145/149 (6 codex, finishing). Tier B wave loop idle ~20 min (400 pending merge, merged frozen at 883) — wake-up SENT (merge + wave commit + next wave + B-deep prep).
+
+## 2026-08-04 10:35
+- T6 wave 1 committed (6cbeec21537): verdicts.jsonl = 1283. Tier A 148/149. Wave 2 (15 agents, 600 clusters) in flight.
+- t6 self-fixed the polling gap: autonomous auto_merge_loop.sh (3-min merge+regen) + Monitor. Tier B-deep filter scripted (find_deep_candidates.py), runs when main pass drains.
+
+## 2026-08-04 10:43 (watchdog)
+- Tier A COMPLETE 149/149. Verdicts merged: 1883/4633 (auto-merge loop alive x2, pending 0 — wave 3 dispatch expected from t6).
+- No codex (Tier A over). Healthy.
+
+## 2026-08-04 11:03 (watchdog)
+- T6 STALLED: merged frozen 1883, wave 3 never dispatched (~70 batches remain). Wake-up SENT (dispatch waves of 15 + start B-deep on already-final unverifiables).
+
+## 2026-08-04 11:23 (watchdog)
+- T6: merged 2683/4633 (auto-merge consuming waves cleanly), batches 044-063 landed. ~13 batches remain in main pass + Tier B-deep after.
+- Wave-2 commit pending (past 1000-mark since wave 1) — expect t6 to commit soon; not stalled otherwise.
+
+## 2026-08-04 11:43 (watchdog)
+- T6: 3593/4633 merged (wave-2 commit 6e2f2a82a39 landed); batches through 086 in. ~26 batches left in main pass, then B-deep (~856 unverifiable candidates pre-filter).
+- Histogram: done 1180 / unverifiable 856 / stale 555 / doc-fact 517 / open 338 / ephemeral 146 / rejected 1. Healthy.
+
+## 2026-08-04 12:00
+- Parallel lanes opened per user: T8 style-gate (implementer), T14 AGENTS.md (controller-drafted, committed 56323fe, fact-check review running). T9 starts when T8 lands. T6 unaffected.
+
+## 2026-08-04 12:03 (watchdog)
+- T6 stalled between waves again (3593 frozen, ~27 batches undispatched) — wake-up SENT.
+- T8: both tool files on disk, agent still working (no report yet). T14: fix committed (cf0bbf5), false-Critical rebutted, awaiting re-review verdict.
+
+## 2026-08-04 12:25
+- T8 style gate COMPLETE (clean review, all probes green). T14 AGENTS.md complete earlier.
+- Active: T6 main-pass tail (~280 clusters) + B-deep next; T9 architecture g1 pages (implementer writing).
+
+## 2026-08-04 12:23 (watchdog)
+- T6: 4353/4633; last main-pass batches (106-113) in flight; tierB-deep candidate/excluded files already prepared — t6 alive.
+- T9: all 4 pages authored (index 97 / storage-layout 152 / blob-protocol 233 / mounts-leases 232 lines, gates 0); provenance sweep + late-verdict join + single commit pending at t9.
+- No wake-ups. Next: T6 deep waves + gate_c; T9 commit -> review.
+
+## 2026-08-04 12:50
+- T9 pages committed (5af272b, 0ee9a7b) and under review. T6: main-pass tail + B-deep prep continuing.
+
+## 2026-08-04 12:43 (watchdog)
+- T6 STALLED at 4353 for 30 min (tail batches 106-113 never ran) + deep-candidates list suspiciously small (151, pre-extension scope). Wake-up SENT: re-dispatch tail, regenerate candidates with extended rule post-merge.
+- T9 under review at t1-review. No other issues.
+
+## 2026-08-04 13:10
+- T9 COMPLETE: 4 architecture pages live under docs/en/antalya/cas/architecture/ (review: 0 false facts). T10 (5 protocol pages) authoring.
+- T6: main pass 113/113 batches produced; awaiting merge + final wave commit + extended deep-candidate regen.
+
+## 2026-08-04 13:03 (watchdog)
+- T6 MAIN PASS COMPLETE: 4633/4633 verdicts merged. Wave-3 commit + extended deep-candidate regen + deep waves pending — push sent to t6.
+- T10 (5 protocol pages) committed, under review. T9 complete.
+
+## 2026-08-04 13:35
+- T6 finalization in full swing: gate_c path-check bug fixed (200+ false fails -> 129 -> 45 mechanically repaired + 86 under remediation agents); extended deep regen done: 868 deep-worthy / 318 excluded (210 rationale-only, 83 bare-metric, 25 external). 16/35 deep batches launched (concurrency-capped).
+- T10 items 1-3 committed (ea43485, 4d8b38f); item 4 (namespaces.md new page) pending at t10.
+
+## 2026-08-04 13:23 (watchdog)
+- T6 deep: 16/35 batches done (recovery rate holding ~75-90%). Remaining 19 dispatching as slots free.
+- T11: 7 pages in authoring forks (none on disk yet — expected, ~15 min in). No stalls.
+- User approved backend.md (T11) + decommission section (T12).
+
+## 2026-08-04 14:00
+- T11 COMPLETE (review clean): all 11+7=... 17 public pages now live under docs/en/antalya/cas/. T12 runbooks authoring (live MOVE PARTITION validation).
+- T6: deep waves continuing (16+/35 at last count).
+
+## 2026-08-04 14:15
+- T11 line fully closed (7 commits; user fixes: zero-copy motivation, design-history language, arch-index consistency).
+- Active: T12 runbooks (research done, pages authoring); T6 deep tail (wake-up sent for batches 17-35).

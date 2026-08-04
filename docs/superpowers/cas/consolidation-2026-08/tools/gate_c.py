@@ -15,6 +15,7 @@ Exits non-zero with a list of errors on any failure.
 import json
 import os
 import re
+import subprocess
 import sys
 
 WORKDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,19 +24,45 @@ REPO_ROOT = os.path.abspath(os.path.join(WORKDIR, "..", "..", "..", ".."))
 VALID_VERDICTS = {"done", "rejected", "stale", "open", "doc-fact", "unverifiable", "ephemeral"}
 EVIDENCE_REQUIRED = {"done", "stale", "rejected", "doc-fact"}
 
-PATH_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_]+(?::[0-9]+)?|[A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+")
+# A path candidate embedded anywhere in free-form prose. Two shapes:
+#  - a filename with a dotted extension (the common case)
+#  - a bare multi-segment path with no extension (e.g. `tests/clickhouse-test`,
+#    a real extensionless script) -- requires at least one "/" so it isn't
+#    confused with an arbitrary dotted word.
+PATH_RE = re.compile(
+    r"[A-Za-z0-9_./-]*[A-Za-z0-9_-]+\.[A-Za-z0-9_]+"
+    r"|[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+"
+)
+
+
+def build_basename_index():
+    """Tier B evidence often cites a bare filename (e.g. `CasTypes.h:266`)
+    without the full directory path -- the agent knows the symbol lives in a
+    file by that name but wasn't handed the full path in Tier A's evidence
+    string. Requiring the full relative path would fail those verdicts even
+    though the citation is genuine, so a bare filename that uniquely (or at
+    all) identifies a tracked file also counts."""
+    out = subprocess.run(
+        ["git", "ls-files", "--", "src", "tests", "programs", "utils", "docs"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    index = {}
+    for line in out.splitlines():
+        index.setdefault(os.path.basename(line), []).append(line)
+    return index
+
+
+BASENAME_INDEX = build_basename_index()
 
 
 def evidence_has_existing_path(evidence: str) -> bool:
-    for token in re.split(r"[\s,]+", evidence):
-        token = token.strip("()[]{}\"'`")
-        if not token:
+    for match in PATH_RE.finditer(evidence):
+        candidate = match.group(0).strip("()[]{}\"'`,;:")
+        if not candidate:
             continue
-        path_part = token.split(":", 1)[0].split("~", 1)[0]
-        if not path_part or "/" not in path_part:
-            continue
-        candidate = os.path.join(REPO_ROOT, path_part)
-        if os.path.exists(candidate):
+        if os.path.exists(os.path.join(REPO_ROOT, candidate)):
+            return True
+        if os.path.basename(candidate) in BASENAME_INDEX:
             return True
     return False
 

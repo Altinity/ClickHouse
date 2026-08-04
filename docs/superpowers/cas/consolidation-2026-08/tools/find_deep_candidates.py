@@ -76,11 +76,10 @@ def main():
     for cid, v in verdict_of.items():
         if v["verdict"] != "unverifiable":
             continue
-        ev = evidence_of.get(cid)
-        if ev is None:
-            continue
-        if ev.get("found_at") or ev.get("not_found"):
-            continue
+        # Extended scope: every unverifiable cluster is a candidate, not just
+        # the empty-Tier-A-evidence subset. Clusters with partial/tangential
+        # Tier A evidence benefit from the deep agent's own follow-up search
+        # just as much -- it gets the existing evidence AND searches further.
         candidates.append(cid)
 
     deep_worthy = []
@@ -109,7 +108,7 @@ def main():
         for cid, reason in stays_unverifiable:
             f.write(f"{cid}\t{reason}\n")
 
-    print(f"unverifiable-with-empty-evidence candidates: {len(candidates)}")
+    print(f"unverifiable candidates (extended scope): {len(candidates)}")
     print(f"  deep-worthy (write to tierB-deep-candidates.txt): {len(deep_worthy)}")
     print(f"  stays-unverifiable (mechanical exclusion, tierB-deep-excluded.tsv): {len(stays_unverifiable)}")
     from collections import Counter

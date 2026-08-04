@@ -1,0 +1,1 @@
+{"columns":[{"kind":"Default","name":"event_date","num_defaults":0,"num_rows":2},{"kind":"Default","name":"event_id","num_defaults":0,"num_rows":2},{"kind":"Default","name":"payload","num_defaults":0,"num_rows":2}],"propagate_types_serialization_versions_to_nested_types":true,"types_serialization_versions":{"string":1},"version":1}

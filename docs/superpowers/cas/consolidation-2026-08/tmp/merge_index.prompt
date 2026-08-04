@@ -1,0 +1,28 @@
+You are deduplicating a topic-cluster list from a ClickHouse CAS documentation
+consolidation. All clusters below share the same `target` page: index.
+Every entry is already a merged cluster from one chunk of the pipeline; the same
+underlying claim can appear as a separate cluster in more than one chunk because
+chunking happened before clustering.
+
+Input file (JSON Lines, one cluster summary per line: cluster_id, topic,
+canonical_claim):
+
+/home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/cas/consolidation-2026-08/clusters/merge-in/index.jsonl
+
+Find clusters in this list that make the SAME point (not just a related point —
+the same specific claim, possibly phrased differently or with a subset/superset
+of the same identifiers) and should be merged into one. Do not merge clusters
+that are merely on the same subtopic but assert different facts.
+
+Write output to /home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/cas/consolidation-2026-08/clusters/merge-in/index.merge.jsonl as JSON Lines, one merge group per line, ONLY for
+groups of 2 or more cluster_ids that should merge:
+
+{"merge": ["chunk_003-014", "chunk_007-002", "chunk_011-091"]}
+
+Do not emit a line for clusters that have no duplicate — omit them entirely, they
+stay as-is. Do not invent cluster_ids not present in the input. A cluster_id must
+appear in at most one merge group.
+
+After the JSONL, write /home/mfilimonov/workspace/ClickHouse/master/docs/superpowers/cas/consolidation-2026-08/clusters/merge-in/index.merge.jsonl.manifest with exactly one line:
+
+input_clusters:<N> merge_groups:<M>

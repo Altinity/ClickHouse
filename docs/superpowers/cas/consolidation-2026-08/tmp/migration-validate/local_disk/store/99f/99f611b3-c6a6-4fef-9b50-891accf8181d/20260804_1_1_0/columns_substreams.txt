@@ -1,0 +1,9 @@
+columns substreams version: 1
+3 columns:
+1 substreams for column `event_date`:
+	event_date
+1 substreams for column `event_id`:
+	event_id
+2 substreams for column `payload`:
+	payload.size
+	payload
