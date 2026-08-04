@@ -70,7 +70,7 @@ A round is one pass of 18 named phases ending in exactly one `gc/state` `CAS`
 | 1 | `lease` | Acquire, renew or steal the lease inside `gc/state`. The only phase a not-a-leader round emits |
 | 2 | `pre_fold_ref_drain` | Resolve catalog `Removing` rows whose cleanup evidence the adopted parent already sealed; exact-CAS-delete the completed ones before anything else can act |
 | 3 | `heartbeat_floor` | One `LIST` of `gc/server-roots/`, one `GET` per mount slot, fence-out `PUT` for any mount whose write-token has held stable past the threshold |
-| 4 | `defer_decision` | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (nothing changed, no graduation due) or continue to a full fold |
+| 4 | `defer_decision` | One full `LIST` of `cas/ns/stream/`, build the catalog-keyed ref walk plan; decide `DEFER` (nothing changed, no graduation due) or continue to a full fold. A `DEFER` verdict still runs one namespace-janitor page — the same work phase 16 does on a folding round — with its deletes suppressed |
 | 5 | `parent_seal_read` | Capture the parent fold seal's run references before the fold mutates the in-memory generation/attempt, to detect a ref that moved off an already-pruned generation |
 | 6 | `fold_ref_group` | Regroup the one `LIST` from phase 4 into per-table listings — no I/O, the keys are already in hand |
 | 7 | `fold_seal_read` | `GET` and decode the adopted fold seal that anchors this fold's coverage |
@@ -86,13 +86,14 @@ A round is one pass of 18 named phases ending in exactly one `gc/state` `CAS`
 | 17 | `ref_object_cleanup` | Prune ref logs and snapshots once both fold coverage and a live snapshot make them safe to delete |
 | 18 | `orphan_sweep` | One cursor-paced page of the [orphan-manifest sweep](/antalya/cas/architecture/manifests-and-refs#orphan-sweep); wrapped so it can never fail the round |
 
-Phases 5 through 18 run only when phase 4 decides to fold; a `DEFER` verdict returns immediately
-after one bounded namespace-janitor page, publishing no fold artifact and no `gc/state` `CAS` at
-all:
+Phases 5 through 18 run only when phase 4 decides to fold. A `DEFER` verdict is not a bare no-op:
+it still runs one bounded namespace-janitor page with `suppress_destructive = true` — cursor
+progress and diagnostics only, no deletes — and then returns, publishing no fold artifact and no
+`gc/state` `CAS` at all:
 
 ```mermaid
 flowchart LR
-    D4{"4 defer_decision"} -->|"nothing changed, no graduation due"| DEF["DEFER: janitor page only, return"]
+    D4{"4 defer_decision"} -->|"nothing changed, no graduation due"| DEF["DEFER: one suppressed<br/>namespace-janitor page, then return"]
     D4 -->|"changed shards, or graduation due"| FOLD["phases 5 through 18: full fold and round commit"]
 ```
 

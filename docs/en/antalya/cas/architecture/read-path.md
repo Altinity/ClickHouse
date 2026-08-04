@@ -39,13 +39,27 @@ decoding the whole body is cheaper than any partial-read machinery would be.
 | Manifest decode cache | `(ManifestId, Token)` | `manifest_decode_cache_bytes` | 128 MiB | A mandatory `HEAD` on **every** access, cache hit or miss |
 | Part-folder view cache (`Cas::CachedPartFolderAccess`, `Parts/PartFolderAccess.h`) | Part ref key | `part_folder_cache_bytes`, `part_folder_cache_max_entries`, `part_folder_cache_max_entry_bytes` | 64 MiB / 10 000 entries / 16 MiB | Its `ForceFresh` policy re-proves the manifest body via that same mandatory `HEAD`, paced by `part_folder_validate` (`always` \| `never` \| `age <seconds>`) |
 
-**The `HEAD` is mandatory even on a cache hit.** It proves the live ref still names an existing
-object — the no-dangle invariant — and it supplies the token; only then is the decode cache
-consulted. On a miss, the `GET` is followed by two identity checks: the body's self-declared `ref`
-must match the key, and its namespace must match, each `CORRUPTED_DATA` on failure. Only a fully
-validated decode enters the cache. Setting either cache's byte budget to `0` disables retention
-while leaving the `HEAD`-and-validate sequence intact — a cache is purely an optimization, never a
-trust boundary.
+**The `HEAD` is mandatory even on a cache hit** — the page's most counter-intuitive fact, because it
+means a cache hit still costs one object-store round trip:
+
+```mermaid
+flowchart TD
+    A["readManifestShared(ManifestId)"] --> B["HEAD the manifest key"]
+    B -->|"absent"| C["throw FILE_DOESNT_EXIST -- INV-NO-DANGLE,<br/>a live ref must never name a missing object"]
+    B -->|"present, token t"| D{"cache lookup (ManifestId, t)"}
+    D -->|hit| E["return the cached decode -- no GET"]
+    D -->|miss| F["GET the body"]
+    F --> G{"body's own ref and namespace<br/>match the key?"}
+    G -->|no| H["throw CORRUPTED_DATA"]
+    G -->|yes| I["decode, insert into cache keyed by (ManifestId, t), return"]
+```
+
+The `HEAD` is what proves the live ref still names an existing object — the no-dangle invariant —
+and it supplies the token that keys the cache; only then is the decode cache consulted. On a miss,
+the `GET` is followed by the two identity checks in the diagram, each `CORRUPTED_DATA` on failure.
+Only a fully validated decode enters the cache. Setting either cache's byte budget to `0` disables
+retention while leaving the `HEAD`-and-validate sequence intact — a cache is purely an
+optimization, never a trust boundary.
 
 The part-folder view cache is invalidated on every promote and repoint, and is single-flight on a
 cold build: concurrent readers of the same not-yet-cached view coalesce into one build rather than
