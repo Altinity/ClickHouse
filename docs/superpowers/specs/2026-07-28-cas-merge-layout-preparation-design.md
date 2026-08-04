@@ -148,7 +148,10 @@ in this spec, so it starts immediately. Source of the inventory:
 **A1 — standalone fixes** (small, each with its own test, easy to justify):
 `ReadBufferFromFileView` position corruption (B115), `ReadBufferFromS3` retry-cancel (B117),
 `ThreadStatus` lifetime (B90), `LocalObjectStorage` TOCTOU, `MergeTreeDeduplicationLog` null-writer,
-`copyS3File` `message_format_string`, `Expect: 100-continue`.
+`copyS3File` `message_format_string`, `Expect: 100-continue`, and the `clickhouse-disks`
+non-interactive `--query` exit code (`upstream.md` G-item; unlike the rest of A1 it already rides in
+the CAS pull request, so carving it out is a removal from that PR rather than a fresh extraction, and
+it must take the integration-test fix it forces with it).
 
 **A2 — object-storage conditional-write API**: `S3Exception::isPreconditionFailed`, token/conditional
 surface on `IObjectStorage`, conditional PUT/COPY in `S3ObjectStorage` and `copyS3File`, the GCS

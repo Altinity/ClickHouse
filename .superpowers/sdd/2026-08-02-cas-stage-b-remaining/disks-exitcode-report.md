@@ -80,12 +80,23 @@ to simulate the corruption the test then recovers from. Validated with `ast.pars
 Not verified: the test has not been *run*. Confirming the fix makes the three sanitizer lanes green
 needs an integration run, which this session was directed not to perform.
 
-## Upstream note
+## Where the carve-out obligation is recorded
 
-`docs/superpowers/cas/BACKLOG.md`, section `[disks-exit-code-upstream]` (anchor
-`{#disks-exit-code-upstream}`). BACKLOG.md rather than `upstream.md`: BACKLOG.md is the live pending
-list with a stable anchor scheme and a frontmatter'd doc identity, while `upstream.md` is an unstructured
-scratch dump of design notes with no entry format to join.
+Per the ruling, the change **rides in this pull request** — the feature is pre-release and the CI
+gating it enables is needed here — and must **later** be carved out into its own upstream PR carrying
+its rationale plus the test fix it forces. It must not be silently bundled into a CAS-feature PR when
+the series is produced.
+
+- `docs/superpowers/cas/upstream.md` — the carve inventory, and the home of the record. The §G list
+  gained `clickhouse-disks non-interactive exit code`, and a `G-item` section under it states the site,
+  why the change is right, that it changes behavior for every user of the tool, the two reviewer-facing
+  details, the latent test defect with its mechanism, the blast-radius conclusion, and the carve-out
+  obligation itself.
+- `docs/superpowers/specs/2026-07-28-cas-merge-layout-preparation-design.md` — added to the Workstream
+  A1 "standalone fixes" enumeration, noting that unlike the rest of A1 it already rides in the CAS PR,
+  so carving it is a removal from that PR rather than a fresh extraction.
+- `docs/superpowers/cas/BACKLOG.md` `{#disks-exit-code-upstream}` — a short pointer only. The detail
+  deliberately does not live here.
 
 A stale `fsck`/`cas-fsck` name in the `DisksApp` exit-code comment was batched into
 `docs/superpowers/cas/deferred-docs-fixes.md` as D50 rather than opened as a code round.
@@ -94,3 +105,5 @@ A stale `fsck`/`cas-fsck` name in the `DisksApp` exit-code comment was batched i
 
 - `11b5c32a5f2` — ca: tests -- read metadata_path before the detach that hides it
 - `0a17684b9d2` — docs: BACKLOG/upstream -- the clickhouse-disks exit-code change is upstream-affecting
+- `09f86623e9d` — docs: report -- clickhouse-disks exit-code blast radius
+- (this commit) — docs: carve inventory -- record the exit-code change as a carve-out obligation
