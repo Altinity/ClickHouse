@@ -908,3 +908,13 @@ being reverted; (b) provisional again. New lead: dropTableFinally's storage drop
 part-shaped paths and never removeRecursive the table ROOT (the dropNamespace trigger). Added to
 the tree: the TWO-REPLICA dimension (was system.tables checked on both nodes? does the card's DROP
 fan out to both?). Empirical confirm queued for the smoke->90m gap. General (d) smoke running.
+
+### Watchdog 06:44 {#wd-0644}
+- FINDING #2 ROOT-CAUSED (proof via system.text_log): existsDirectory(TableDir)="has >=1 part ref"
+  ignores namespace files -> dropAllData already-removed skip -> dropNamespace never fires ->
+  1 leaked live catalog entry per create/drop cycle, every MergeTree on CAS. Codex consult
+  running (dropns dossier; answer pending). Fix cycle = task #6, after consult + user review.
+- General (d) smoke: in drain-probe stage (~50 min in), healthy. 90m leg next, consult verdict
+  expected during it. t8-lead holding correctly.
+- (b) row PROVISIONAL pending nothing now (its mystery became FINDING #2's evidence); will be
+  re-judged with the finding's disposition at verdict time.
