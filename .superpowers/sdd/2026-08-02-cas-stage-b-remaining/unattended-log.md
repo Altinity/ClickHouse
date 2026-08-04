@@ -766,3 +766,13 @@ product, not (d) flake (3-for-3 deterministic on the failing commit rules that o
   iteration: C = cross-generation listing, both shards present, non-empty; B unchanged. One run,
   then hard stop (revert to the three independently-correct fixes + return-item).
 - CI PR 2073: next tick :11 will re-check; local cifix sanity was 2/2 green.
+
+### CI check 03:11 {#ci-0311}
+New stateless FAILs beyond the known unit pair, all in NON-CAS lanes, all flake-shaped:
+02205_HTTP_user_agent (urllib connection error, historically flaky net test);
+04033_tpc_ds_q14 + q75 (both at exactly 900.03s = harness timeout, amd_debug parallel — heavy
+TPC-DS on debug under load); 03634_autopr_input_bytes_estimation (same debug-parallel lane).
+None touch CAS surfaces (no cas disk in those lanes; queries don't reach CAS code). Classified
+LIKELY-FLAKY/pre-existing; no local fix prepared. Escalation rule: if any repeats on the next CI
+round, do the artifact-level RCA then. cas-lane stateless jobs still PENDING. Unit-pair fix
+already in branch (aacc233dc13) awaiting next push.
