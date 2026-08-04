@@ -10,8 +10,7 @@ doc_type: 'reference'
 # CAS architecture — storage layout {#storage-layout}
 
 Every key in a pool is built by one class, `Cas::Layout` (`Formats/CasLayout.h`), which owns
-exactly the pool prefix. Every persisted object is text — there is no binary format and no
-protobuf dependency (`Formats/README.md`).
+exactly the pool prefix. Every persisted object is text (`Formats/README.md`).
 
 ## Key table {#key-table}
 
@@ -146,7 +145,6 @@ inline inside the manifest's raw payload zone, not a separate key.
 ## Notes {#notes}
 
 - `cas/ns/state/<life_id>/_ckpt` carries **no** `.zst` suffix: `cas_ref_ckpt`'s compression policy
-  is `never`, unlike its `_log`/`_snap` siblings in the same `cas/ns/` tree.
-- The `cas/refs/` prefix that appears in older design notes does not exist at `HEAD`; the live
-  namespace-stream tree is `cas/ns/stream/` (immutable `_log`/`_snap` objects) and
+  is `never`, while its `_log`/`_snap` siblings in the same `cas/ns/` tree compress `always`.
+- The namespace-stream tree is `cas/ns/stream/` (immutable `_log`/`_snap` objects) and
   `cas/ns/state/` (mutable `_ckpt`, verbatim `_files/`).
