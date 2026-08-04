@@ -3363,3 +3363,47 @@ human-readable confirmation did not.
 `Information` level, bounded by a time window and/or row cap (an unbounded dump risks turning the predown
 step itself into the next `cas_log.tsv`-sized artifact). Not attempted here — recorded as a tooling gap
 so the next investigation that needs this evidence doesn't rediscover the gap the hard way.
+
+## `[damaged-object-diagnose-and-repair]` fsck must diagnose AND repair a damaged rebuildable object; the runbook must say how {#damaged-object-repair}
+
+**Found by the T8 criterion-4 injection** (Stage-B soak; evidence pack
+`.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-injection-evidence/`): a single namespace
+checkpoint (`cas/ns/state/<life>/_ckpt`) was overwritten with garbage under a live writer. The GC fold
+behaved exactly as designed — it detected the damage, classified the namespace as an anomaly/hold and
+suppressed every irreversible family, round after round — but nothing in the product ever repaired the
+object, and the live ref lane went to `CASRefNeedsRecovery` and stayed there for the remaining ~20
+minutes of the run, including after the exact original bytes were restored. Byte-level damage to a
+durable object is outside the trusted-store fault model this design assumes, so this is not a
+correctness defect; it is an OPERABILITY hole: the system fails closed forever and hands the operator
+no lever.
+
+**What is missing, in priority order.**
+
+1. **`ca-fsck` should diagnose the class precisely.** Today a damaged object surfaces as a suppressed
+   GC round plus a counter; fsck's report has no row that says "namespace N's checkpoint is present but
+   undecodable" (as distinct from absent, which is a legal cold-recovery state). Add the distinction:
+   *present-and-undecodable* vs *absent* vs *decodable-but-inconsistent*, per affected object kind
+   (`_ckpt`, fold seal, `gc/state`, catalog), naming the exact key.
+2. **`ca-fsck --repair` (or an explicit sibling verb) should REBUILD what is rebuildable.** The
+   checkpoint is a derived accelerator over the durable ref-log, so a damaged one is reconstructible by
+   the same recovery walk the writer already implements (`recoverRefTableDetailed` / the recovery-epoch
+   seal). The repair verb should: re-derive the object from its authoritative source, publish it by the
+   ordinary CAS write path (no new object kinds, no protocol change), and refuse — loudly — for any
+   object whose content is NOT derivable (a blob body, a committed ref-log record: those are the real
+   data, and their loss is a restore-from-backup situation, not a repair).
+3. **The lane must be able to leave `NeedsRecovery` once the source is sound again.** Our single
+   observation says it did not, even after byte-identical restore. Whether that is a wedge, a
+   remount-only exit, or an artifact of the injected shape is UNVERIFIED — determine it, and if the only
+   exit is a remount, say so in the runbook and consider making recovery retry on its own.
+4. **Runbook section: "a CAS object is damaged".** Operator-facing, in the numbered doc set, covering:
+   how the condition ANNOUNCES itself (suppressed rounds naming the namespace, the fsck row from item 1,
+   the `CASRefNeedsRecovery` counter); why there is no urgency (GC has already frozen everything
+   irreversible — the pool is safe, it is just not reclaiming); the asymmetry an operator must know
+   (an ABSENT checkpoint is a legal state that triggers cold recovery, a CORRUPT one is not — so the
+   fallback of last resort is to DELETE the damaged derived object, never to hand-edit it); the repair
+   sequence once item 2 exists; what NOT to do (`DROP POOL MEMBER` is for dead members, not damaged
+   data; never hand-delete blob bodies or ref-log records; never "restore" bytes from an unofficial
+   copy); and when the answer really is backup/restore because the damaged object is authoritative.
+
+**Note on scope.** Items 1, 2 and 4 are operability work and need no protocol change. Item 3 may reveal
+a real recovery-path defect; treat its outcome as its own item if so.
