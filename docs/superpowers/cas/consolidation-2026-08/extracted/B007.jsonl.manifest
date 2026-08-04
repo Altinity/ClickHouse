@@ -1,10 +1,10 @@
 docs/superpowers/specs/2026-07-06-cas-mount-lease-fence-recovery-design.md	records:16
 docs/superpowers/specs/2026-07-06-cas-night-findings-fix-plan-design.md	records:16
 docs/superpowers/worklogs/2026-07-06-p31-mount-lease-root-cause.md	records:7
-docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md	records:24
-docs/superpowers/plans/2026-07-07-cas-dangling-precommit-manifest-orphan-fix.md	records:7
+docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md	records:23
+docs/superpowers/plans/2026-07-07-cas-dangling-precommit-manifest-orphan-fix.md	records:6
 docs/superpowers/specs/2026-07-07-cas-dangling-precommit-manifest-orphan-fix-design.md	records:8
-docs/superpowers/plans/2026-07-07-cas-resurrect-reupload-orphan-fix.md	records:4
+docs/superpowers/plans/2026-07-07-cas-resurrect-reupload-orphan-fix.md	records:3
 docs/superpowers/specs/2026-07-07-cas-resurrect-reupload-orphan-fix-design.md	records:6
 docs/superpowers/plans/2026-07-08-cas-file-cache-disk-support.md	records:3
 docs/superpowers/specs/2026-07-08-cas-file-cache-disk-support-design.md	records:6

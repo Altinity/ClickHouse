@@ -1,12 +1,12 @@
-docs/superpowers/worklogs/2026-07-17-unattended-r5-r6-round.md	records:11
+docs/superpowers/worklogs/2026-07-17-unattended-r5-r6-round.md	records:10
 docs/superpowers/worklogs/2026-07-17-unattended-round2.md	records:3
 docs/superpowers/worklogs/2026-07-17-unattended-round2-part1.md	records:6
 docs/superpowers/worklogs/2026-07-17-unattended-stabilization-resume.md	records:3
 docs/superpowers/reports/2026-07-18-asan-battery-exclusion-list-correction.md	records:4
 docs/superpowers/reports/2026-07-18-asan-battery-rca.md	records:4
-docs/superpowers/reports/2026-07-18-logical-error-asan-abort-triage.md	records:10
+docs/superpowers/reports/2026-07-18-logical-error-asan-abort-triage.md	records:7
 docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md	records:4
 docs/superpowers/reports/2026-07-18-s23-idle-rss-rca.md	records:2
-docs/superpowers/reports/2026-07-18-s23-jemalloc-profile.md	records:6
+docs/superpowers/reports/2026-07-18-s23-jemalloc-profile.md	records:5
 docs/superpowers/reports/2026-07-18-s23-tracked-growth-rca.md	records:4
 docs/superpowers/reports/2026-07-18-s31-dryrun-shards-rca.md	records:2

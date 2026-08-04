@@ -1,0 +1,11 @@
+docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
+docs/superpowers/plans/2026-07-07-cas-dangling-precommit-manifest-orphan-fix.md
+docs/superpowers/plans/2026-07-07-cas-resurrect-reupload-orphan-fix.md
+docs/superpowers/plans/2026-07-12-cas-stabilization-cleanup.md
+docs/superpowers/worklogs/2026-07-17-unattended-r5-r6-round.md
+docs/superpowers/reports/2026-07-18-logical-error-asan-abort-triage.md
+docs/superpowers/reports/2026-07-18-s23-jemalloc-profile.md
+docs/superpowers/specs/2026-07-21-reftablestate-closed-class-experiments-design.md
+docs/superpowers/reports/2026-07-21-reftablestate-experiments.md
+docs/superpowers/cas/01-architecture.md
+docs/superpowers/cas/upstream-patch-inventory.md
