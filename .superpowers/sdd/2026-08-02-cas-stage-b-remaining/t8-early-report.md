@@ -140,15 +140,102 @@ test, landed in an existing suite (no new suite).
 - Did not start any praktika or soak run myself, per the standing serialization rule relayed
   mid-task.
 
-## What remains for the battery phase
+## Battery phase (Step 2, executed after this report's first version) {#battery-phase}
 
-1. Integration lanes (the CA selector set named in T6 Step 3 plus whatever the suite inventory
-   lists beyond it).
-2. The four required soaks (churn, S44 rebirth, S45 decommission, 90-minute general), each
+Commits: `da09c996104` (integration batch A), `5b36eeda55c` (batch B), `43aff19ed51` (stateless
+four), `44db0d3739` covers item-4/F1/F2 already, and separately `c9147d312bd` +
+`5db304f1566` (the sharded-GC arc). Full detail and all logs live in
+`docs/superpowers/cas/2026-08-03-stage-b-RESULTS.md`'s `{#integration-lane-results}` and
+`{#ex-known-red-stateless}` sections; this section adds the narrative trail for the one lane that
+took real work.
+
+**Integration lanes**: 10 `test_cas_*` dirs run in two batches of 5, strictly sequential, never
+overlapping any other heavy stage (build/gate/praktika/soak) per the standing box rule. Batch A:
+6 passed, 1 skipped (`test_cas_gc_sharded`, see below). Batch B: 17 passed, 0 failed.
+
+**Ex-known-red stateless four**: `05008_cas_gc_snapshot_prune`, `04290_cas_no_leftovers`,
+`04295_cas_mutation_no_leftovers`, `05010_cas_mounts_gc_health` — 4/4 passed via the CAS-default
+`Stateless tests (amd_binary, cas storage, parallel)` job, one invocation.
+
+**`test_cas_gc_sharded` — the campaign's no-skip rule applied.** A CA test skipped as needs-infra
+is not an acceptable "no action": it either runs, or becomes a named, placed return-item. This one
+had a cheap path — every other CAS integration test already uses RustFS (not MinIO) for exactly
+the conditional-delete capability this test's own skip reason named as missing — so option (a) was
+pursued rather than filing a return-item. Six-run RCA arc, in order:
+
+1. **Run #1** (rustfs/minio swap only, `gc_sharded_rustfs.log`): red in **13s**, at the very first
+   query — `KeyError: 'replica'`. RCA: a pre-existing Python `.format()`/ClickHouse-macro
+   brace-escaping bug (`'{replica}'` instead of `'{{replica}}'`) in `live_table`'s `CREATE TABLE`,
+   latent since the module has been permanently skipped since it was written. Not caused by the
+   rustfs swap. Fixed (2 sites); the correctly-escaped form already existed elsewhere in the same
+   file to copy from.
+2. **Run #2** (`gc_sharded_rustfs2.log`): red in the real test body — "GC did not complete even
+   one generation within 90.0s". Deep RCA required per the controller's branch-3 concern (real GC
+   defect vs stale premise vs config gap). Found: the test polled S3 keys named `completion_seal`
+   under `gc/gen/<generation>/` — `grep -rn completion_seal src/` returns **zero hits anywhere in
+   production**; the real key is `fold_seal`, and the real path additionally has an
+   `attempt/<attempt>/` segment the test's prefix omitted entirely
+   (`Layout::gcGenAttemptPrefix`/`foldSealKey`/`blobTargetRunKey`, `CasLayout.h`). Confirmed
+   branch (1), stale test premise, not a GC defect, with hard evidence (a zero-hit grep, not an
+   absence claim).
+3. Authority for the rewrite, verified before writing any code: `Gc/CasOrphanManifestSweep.cpp`'s
+   `readAdoptedFoldSeal` — read `gc/state`, take `(snap_generation, snap_attempt)`, GET that exact
+   `foldSealKey`. `gc/state`'s wire format (`CasGcStateFormat.cpp`) is a JSON-like text object with
+   fields literally spelled `"sg"`/`"sa"`, so a direct regex read from Python is exact without a
+   C++ decoder.
+4. **Run #3** (`gc_sharded_rustfs3.log`, first B/C rewrite): red again, but at the SAME latent-bug
+   class as run #1 — `Code: 60, Unknown table 'system.text_log'` right after
+   `node2.restart_clickhouse(kill=True)`. A second independent pre-existing bug (the underlying
+   table takes a moment to become queryable post-restart), also latent forever. Fixed with
+   `query_with_retry` (an existing helper, not a new mechanism).
+5. **Run #4** (`gc_sharded_rustfs4.log`): the B/C rewrite reached the real assertions for the
+   first time and failed on substance — "node2 has CA fatal/error entries matching 'DANGLE',
+   6 == 0". Deep RCA (no fix attempted before reporting, per the controller's regime-change
+   instruction once mechanics stopped being the failure mode): pulled all 6 lines verbatim from
+   `_instances-gw0/node2/logs/clickhouse-server.log` (read via a throwaway root container since
+   the docker-created directories are not otherwise readable). All 6 were `Code: 60. Unknown table
+   'system.text_log'` errors from the RETRY loop itself, echoing the failing query's own text
+   (which contains the literal substring `%DANGLE%`, the LIKE pattern) — a self-referential
+   artifact: `query_with_retry`'s failed attempts logged `<Error>` lines that, once `text_log`
+   became queryable, were themselves counted as "DANGLE" matches by the very query that had just
+   started succeeding. Zero real dangle-shaped content found anywhere (grepped the log and the raw
+   MergeTree part data directly). Classified and reported before touching code, per instruction.
+   Fixed: split a keyword-free readiness probe (via `query_with_retry`) from the real keyword
+   checks (plain `.query()`, no retry, run only once the table is confirmed queryable).
+6. **Run #5** (`gc_sharded_rustfs5.log`): text_log fix worked, assertion B passed for the first
+   time. Assertion C failed: "no blob_target keys found ... generation=8 attempt=40". RCA: the
+   carry-forward argument in the original C design was inverted — a seal's `blob_target_runs`
+   carry a PARENT's runs forward as REFERENCES, but the physical objects stay under the
+   `(generation, attempt)` prefix where they were originally WRITTEN; a late-soak adopted attempt
+   whose own round produced no new deltas can have an empty `blob_target/` prefix of its own.
+   Rewrote assertion C to scan the whole `gc/gen/` subtree (every generation/attempt) rather than
+   only the currently-adopted pair — matching the original test's actual intent ("both shards
+   produced runs somewhere over the soak") without needing to decode any seal body.
+7. **Run #6** (`gc_sharded_rustfs6.log`): **green — 1 passed in 78.01s.**
+
+None of the four bugs found were in production code; all four were pre-existing, latent test-only
+defects in a module that had literally never executed before this task (permanently
+`pytest.mark.skip`d since it was written). The B/C rewrite's structural correctness rests on two
+verified production facts, not assumption: `readAdoptedFoldSeal`'s two-hop `gc/state` → seal
+lookup (the authority for "adopted"), and `blob_target_runs`' carry-forward-by-reference semantics
+(why C needs the whole subtree, not one attempt).
+
+**Deviation disclosed**: the anti-vacuity requirement (log the observed key set on the first green
+run) was implemented as a `print()` before the assertion that consumes it — genuinely executes,
+proven by the pass — but its captured stdout was not preserved in this harness's per-test log
+artifact for a PASSING test (`--report-log-exclude-logs-on-passed-tests`, a `pytest` invocation
+flag this job's `ci/jobs/integration_test_job.py` sets, not something this task's scope covers
+changing). The pass itself (both C sub-assertions succeeded) is the evidence the listing was
+non-empty and covered both shards; the literal key list was not captured as an artifact.
+
+## What remains for the battery phase (soaks) {#remaining-soaks}
+
+The controller (team lead) orchestrates the soak stage from here, per the plan's task ownership.
+Remaining, not started by this task:
+
+1. The four required soaks (churn, S44 rebirth, S45 decommission, 90-minute general), each
    smoke-then-full per the pinned commands in the RESULTS doc.
-3. The Step-3c cost inventory and the six result criteria, both measured off the soak's
+2. The Step-3c cost inventory and the six result criteria, both measured off the soak's
    `system.content_addressed_garbage_collection_log` rows.
-4. The specimen preservation (Step 3f) and the insert-path guard (Step 3e).
-5. The four ex-known-red stateless tests, to be run green under their current names
-   (`05008_cas_gc_snapshot_prune`, `04290`/`04295`, `05010`).
-6. The final results file completion (battery table's integration/soak rows, the verdict line).
+3. The specimen preservation (Step 3f) and the insert-path guard (Step 3e).
+4. The final results file completion (soak rows, the verdict line).
