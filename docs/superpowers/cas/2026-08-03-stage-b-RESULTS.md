@@ -302,12 +302,38 @@ leads the queue. So `DROP TABLE ... SYNC` is fully synchronous end-to-end: by th
 cycle's DROP statement returns, the standard `DatabaseCatalog::dropTableFinally` cleanup — which
 calls `table.table->drop()`, expected to route through the CA transaction's
 `removeDirectory`/`removeRecursive` chain into `dropNamespace` — has already run. **The finding is
-open again, with priority.** The (b)-full row's PASS verdict has reverted to PROVISIONAL. Current
-lead, not yet confirmed: `dropTableFinally`'s storage-level cleanup may only walk PART-shaped paths
-(routing to `dropRefIfPresent`) and never issue the final `removeRecursive` on the table's own ROOT
-directory (the call that actually matches `Cas::parseTableUuid` and fires `dropNamespace`) — still
-tracing, and a direct empirical check (drop one table, read the catalog immediately after the SYNC
-statement returns) is queued for the gap between this soak stage's smoke and its full leg.
+open again, with priority.** The (b)-full row's PASS verdict has reverted to PROVISIONAL.
+
+**ROOT CAUSE CONFIRMED**, no rerun needed — `system.text_log` (which retains longer than the
+rotated file logs, which had already aged past the discrimination run's window) still held the
+exact lines. For all 6 dead incarnations from the earlier catalog dump, at the exact time of that
+run: `"dropAllData: path store/<uuid>/ is already removed from disk ca"` — `MergeTreeData.cpp`'s
+`dropAllData()`, the `if (!disk->existsDirectory(relative_data_path)) { LOG_INFO(...); continue; }`
+gate. That `continue` skips BOTH the `format_version.txt` removal AND the `removeRecursive` call
+that would reach `Cas::parseTableUuid` → `dropNamespace`.
+
+Traced why `existsDirectory` answers false: `ContentAddressedMetadataStorage::existsDirectory`,
+`DirShape::TableDir` case (`ContentAddressedMetadataStorage.cpp:1544-1546`):
+```cpp
+case DirShape::TableDir:
+    /// A table directory exists iff it has at least one committed part.
+    return store()->hasAnyRefWithPrefix(liveNamespace(*dr.uuid), "");
+```
+This answers "does the table directory exist" by checking ONLY for committed PART refs — never
+for table-level verbatim namespace files. `dropAllData()` removes every part first; by the time it
+reaches this check, there are none left, so `existsDirectory` correctly reports "no parts" but
+`dropAllData` reads that as "directory already gone" — even though `format_version.txt` is still
+physically present under the same table root. The whole remaining cleanup, including the one call
+that would admit namespace removal, is skipped. This reproduces on every single create/drop cycle
+of a table whose only CA-disk footprint (after part removal) is a namespace file rather than a
+part — unbounded over time, not a timing artifact.
+
+This is a confirmed production defect, not a card artifact: `DROP TABLE ... SYNC` (what the card
+uses throughout) is fully synchronous end-to-end by design (traced separately: the client blocks in
+`waitTableFinallyDropped`, `ignore_delay` adds no delay term, the cleanup task is scheduled
+immediately) — the namespace is still never transitioned. **No fix attempted.** This is
+protocol-adjacent (the CA disk's `existsDirectory` contract vs. `MergeTreeData`'s generic drop
+cleanup expectations) and goes through a codex consult before any change, per standing orders.
 
 ## S45 post-run drain-window observation {#s45-drain-observation}
 
@@ -380,13 +406,26 @@ finding).
   throughput watch item; the manifest-cleanup cap (`gc_round_manifest_cleanup_budget`) was REVERTED
   entirely (leaks under a one-shot pipeline — see `soak-t6b-report.md`), tracked as
   `[gc-mf-cleanup-durable-retry]` in `BACKLOG.md`.
-- S44 drain-observation, OPEN with priority (`{#s44-drain-observation}`): the flat, nonzero
-  `_files` count in the S44 drain window is NOT explained by
-  `database_atomic_delay_before_drop_table_sec` — that explanation was drafted, then RETRACTED
-  once the trace showed `DROP TABLE ... SYNC` (what the card uses throughout) bypasses that delay
-  entirely and is fully synchronous by design. The dead-incarnation catalog entries staying `live`
-  after a SYNC drop returns is unexplained and under active investigation; the (b)-full row's PASS
-  is PROVISIONAL pending it.
+- S44 drain-observation, CONFIRMED PRODUCT FINDING, pending codex consult before any fix
+  (`{#s44-drain-observation}`): root cause traced to an exact site.
+  `ContentAddressedMetadataStorage::existsDirectory`'s `DirShape::TableDir` case
+  (`ContentAddressedMetadataStorage.cpp:1544-1546`) answers "does this table directory exist" by
+  checking ONLY for committed PART refs (`store()->hasAnyRefWithPrefix(liveNamespace(*dr.uuid),
+  "")`), never for table-level verbatim namespace files (`format_version.txt`, mutation entries).
+  `MergeTreeData::dropAllData()` removes parts first, THEN checks `existsDirectory` before doing
+  its own remaining cleanup (`format_version.txt` removal, then the `removeRecursive` call that
+  triggers `dropNamespace`) — once parts are gone, the CA `existsDirectory` check answers false
+  even though `format_version.txt` is still physically present, so `dropAllData` logs "path ... is
+  already removed from disk ca" and skips its own cleanup entirely, INCLUDING the call that would
+  transition the namespace to `Removing`. Confirmed directly via `system.text_log` (which retained
+  the window after the file logs had rotated past it): the exact log line, with the exact
+  incarnation UUID from the earlier catalog dump, for all 6 dead incarnations in the discrimination
+  run. Not a card artifact, not a timing window issue — `DROP TABLE ... SYNC` is fully synchronous
+  by design (traced end-to-end: client blocks in `waitTableFinallyDropped`, `ignore_delay` adds no
+  delay term, the cleanup task is scheduled immediately) and the namespace is STILL never
+  transitioned, on every single create/drop cycle, unbounded over time. The (b)-full row's PASS
+  stays PROVISIONAL. No fix attempted — protocol-adjacent (CA disk's existence-check contract vs
+  MergeTree's generic drop cleanup), going through a codex consult before any change.
 - `[gc-frontier-one-list]` (`BACKLOG.md:136`), deferred to a separate focused session after Stage B.
 - The four ex-known-red stateless tests, to be run green in the integration-lane battery stage
   under their current post-rename names: `05008_cas_gc_snapshot_prune`, `04290`/`04295`
