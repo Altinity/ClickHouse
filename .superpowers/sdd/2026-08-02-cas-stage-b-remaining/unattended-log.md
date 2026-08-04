@@ -1153,3 +1153,24 @@ integrated; lane-g holds nothing unmerged that matters. Tasks #5/#6/#7 closed.
 **In flight.** Nothing — box idle, no builds, no soak, no praktika.
 
 **Next.** BACKLOG `[cas-tests-unchecked-optional-deref]` → criterion-4 HOLD-arm short soak → T9.
+
+## Tick — 2026-08-04 13:08 {#tick-gate-both-lanes}
+
+**Done since last tick.** BACKLOG `[cas-tests-unchecked-optional-deref]` filed (`55a6903535b`), with
+figures re-measured at write time — the pre-compact "16 sites / ~143 tree-wide" did not survive
+checking; the honest count is 13 candidates in 9 files (a naive scan says 52, mostly false positives),
+plus the non-`void`-helper caveat that makes a blind `EXPECT_TRUE`→`ASSERT_TRUE` sweep uncompilable.
+
+**Gate, first run: RED in BOTH lanes, same single test** —
+`CASGCRefWalkPlan.UnmatchedAdoptedParentLifeIsObservedWithoutEnteringThePlan`. A test DID assert the
+removed log text (`gtest_cas_ref_catalog.cpp:1676-1678`); the earlier "nothing asserts it" check
+stopped at the counter assertions above it. Rewritten to assert the silence
+(`EXPECT_EQ(log_capture.captured(), "")`). ASan reported ZERO sanitizer findings across 1998 tests.
+
+**Coverage finding.** The gate filter is now derived from the binary's own suite list; it matches the
+old `Cas*:CA*` exactly (276 of 621 suites). But the ASan binary has **294** — the extra 18 are
+`*DeathTest` suites behind `#if defined(DEBUG_OR_SANITIZER_BUILD)`. A release-only gate never
+compiles, let alone runs, those abort-path tests.
+
+**In flight.** `tmp/run_ca_gate_both.sh` rerun, started 13:03: release build+gate, then ASan
+build+gate, sequential. **Next:** commit the test fix once both are green → criterion-4 HOLD arm → T9.
