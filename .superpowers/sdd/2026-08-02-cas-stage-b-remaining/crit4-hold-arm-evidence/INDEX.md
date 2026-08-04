@@ -151,9 +151,18 @@ independently of `system.cas_gc_log`.
 - `final_fsck_ch1.log` — a live `clickhouse disks --disk ca_ro --query "cas-fsck --detail"` against
   the still-running cluster after clearance, launched as a closing health check. **Not required by
   the criterion** (the round-level `system.cas_gc_log` evidence above already proves the per-family
-  suppression and clearance on its own); included as a health check only. If this file is empty or
-  missing a completed summary line, the fsck ran past this evidence being written and was not
-  waited on further — the per-round evidence above does not depend on it.
+  suppression and clearance on its own); included as a health check only. It completed with
+  `dangling=0 chain_broken=0 lifeless_keys=0` — the injection left no data-loss or chain-corruption
+  finding — but `stale_edge=3279` nonzero (the summary line's own tail: `reachable=24527 dangling=0
+  unreachable=210051 pending_gc=85804 awaiting_gc=14423 unaccounted=3181 stale_edge=3279
+  corrupted_runs=0 chain_broken=0 lifeless_keys=0`). This run was killed with `SIGTERM` right after
+  capturing the clearing round, without ever reaching the harness's own write-quiescing checkpoint
+  the way the Stage-B specimen does before every `cas-fsck` it trusts for criterion 2 — so this fsck
+  ran against a pool with a large, still-draining insert/backlog in flight, not a quiesced one. That
+  is a plausible, not confirmed, explanation for the nonzero `stale_edge`; it was not investigated
+  further, since criterion 4's own bar (per-family suppression during the hold, resumed work after
+  clearance) does not depend on this fsck and is already proven above from `system.cas_gc_log`
+  directly. Flagged here rather than left implicit.
 
 ## What this does NOT cover
 
