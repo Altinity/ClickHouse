@@ -227,6 +227,23 @@ six-result-criteria table above; not repeated a third time here to avoid drift. 
 PASS/FAIL bar (survived: no crash, no wedge, no hung fixpoint) is decided by whoever runs it,
 immediately before running it — not pinned in advance.
 
+**Executed on master worktree** (per user directive), 2026-08-04. Smoke-survival bars, each
+recorded here BEFORE that smoke was launched, per the E4 note above:
+
+- **(a) churn smoke**: `scenarios.run`'s own S34/S35 verdicts all report a non-FAIL status, no
+  unhandled Python exception/traceback in the log, no container crash/restart-loop, process exits
+  within a reasonable margin of the 20-minute duration (not hung indefinitely past it).
+- **(b) S44 smoke**: the card's own verdicts (the always-zero CA counters, drop/recreate latency
+  trend) all report non-FAIL, no unhandled exception, no container crash, exits near the 20-minute
+  mark.
+- **(c) S45 smoke**: `ca-drop-member`'s own exit code 0, the card's verdicts non-FAIL, no
+  container crash, exits near the 20-minute mark (allowing for the lease-wait poll bound the card
+  already accounts for).
+- **(d) general smoke**: `soak.run`'s own hard asserts (both replicas equal the model, fsck
+  `dangling==0` and `stale_edge==0`, GC dry-run ⊆ fsck `unreachable`) all pass at every checkpoint
+  the 20-minute window reaches, no unhandled exception, no container crash, process exits near the
+  20-minute mark.
+
 ## Residual gate row {#residual-gate-row}
 
 Every accumulated item from the ledger, walked and recorded (item / source / disposition /
