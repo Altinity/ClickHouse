@@ -1195,3 +1195,24 @@ remaining match was my own shell, then reran clean.
 `HoldReason` that simulates a fault INSIDE the trusted-store model (a store that loses an object),
 rather than byte-rot under a live writer, which the RESULTS doc already ruled outside the model and
 which is what cost the seed-`20260805` run. **Next after it:** T9.
+
+## Tick — 2026-08-04 13:55 {#tick-hold-arm-satisfied}
+
+**Criterion-4 HOLD ARM: SATISFIED.** `GapBelowWitness` injected by deleting ONE ref-log object
+(`...656a`) in namespace `865d3a88...`, witnesses `...656b/656c` untouched; three consecutive rounds
+held, all `outcome=Success`, every delete family explicitly zero-work + `suppressed:1`
+(`manifest_deletes`, `handoff_reclaim`, `ref_object_cleanup`, `orphan_sweep`, plus zero generation
+pruning); `frontier_unprobed_budget=0` rules out a budget skip. After a byte-identical restore, round
+`ae46f97f...` cleared it with `absent_probes=0` — folding THROUGH the position, not observing another
+absent — and resumed real work (33,428 manifest deletes). Safety counters 0 on both nodes throughout.
+Evidence: `crit4-hold-arm-evidence/`; commits `01b07d13f26`, `30c8372f799`, `38b18cf4305`.
+
+**One correction I made to the delegated work, twice.** (1) Before firing: the agent planned `rm -rf`
+on a DIRECTORY, which would have removed the witness too and produced `WitnessDisappeared`
+("corruption, never clearance") — an unclearable hold and a wasted run. Corrected to a single key.
+(2) After: all three held rounds carry `anomalies=1`, so a reader can object that the anomaly term
+alone explains the suppression. It cannot — that anomaly IS the hold being recorded (one injected
+fault lit all three gate terms), and `CasGc.cpp` says so at the gate. The arm therefore cannot isolate
+term 2 and now says so in both INDEX.md and RESULTS.md (`185b96dce7f`).
+
+**Lane free** — cluster torn down, object restored. **Next: T9**, the last item before Stage B closes.
