@@ -331,26 +331,6 @@ continuing the ID series, not renumbering anything above.
 - **[gc-enabled-false-silent] `gc_enabled=false` accumulates garbage silently** — HARD (user settings-policy direction) — Disabling the background GC scheduler produces no ongoing signal that reclamation has stopped. Add a periodic warning log line plus a metric while `gc_enabled=false` and the pool has reclaimable debris, so an operator who disabled GC for a legitimate reason (or by mistake) finds out before the pool grows unbounded.
 - **[dedup-presence-only-window-recheck] re-verify the deduplication presence-only-admit corruption window** — VERIFY (user-flagged from memory, re-derive from the disk-error audit) — The 2026-07-21 disk-error audit (`#disk-error-audit-followups-2026-07-21`) identified a presence-only dedup admit as a corruption-window class; re-verify against HEAD whether this window is still open post the format/staging changes since that audit, and either close it out or fold it back into an active item with current evidence.
 
-## Recently closed (2026-07-13 grooming — do NOT re-open) {#recently-closed}
-
-Verified DONE at HEAD; recorded so they are not re-triaged:
-
-- **[refactor: DiskObjectStorageTransaction part-path virtualization]** — DONE-by-deletion (all-tree
-  part-files Task 6, `430216ad1ef`): the item's target — the CA eager-dispatch rename hook (B182,
-  `isContentAddressedMutablePartFileRename`) — is deleted outright rather than abstracted behind a
-  virtual; its only trigger (`txn_version.txt.tmp` → `txn_version.txt` MVCC rename) no longer exists
-  on a CA disk since Task 5's `supportsAtomicFileWrites` short-circuit writes `txn_version.txt`
-  directly (see `DiskObjectStorageTransaction.cpp::moveFile`). Also closes the mutable-set removal
-  more broadly: `uuid.txt`/`txn_version.txt`/`metadata_version.txt` are now ordinary manifest entries
-  (Task 6), and a committed-file unlink stages a removal mark resolved via repoint (Task 8) — the
-  `mutable_files`/`mutable_removed`/`isMutablePerPartFile` fields/predicate themselves are legacy,
-  pending Task 9's schema-deletion sweep. (review1 #13.)
-- **B200 pool-member decommission** — DONE 2026-07-15 (spec `2026-07-13-cas-pool-member-decommission-design.md`, plan `2026-07-13-cas-pool-member-decommission.md`): `Store::openForDecommission` admin claim gate `03b3b95de44`; `decommissionPoolMember` core `e0e83e8521d` + precommit-count fix `1b5a7f5faf3`; drain sweeps `eb8f78adef2`+`5780b6ec646` + manifest-debris tolerate-and-continue fix `3d641996a1a`; slot retirement `6c86deebd1a`; SQL surface `70599d30cf4`+`0def36c2f7e`+`51ff6879864` (ON CLUSTER round-trip fix); disks facade `ca-drop-member` `e375fafa5e0`. Integration test = Task 7 (landing separately). Follow-up scenario card → §10.
-
-- **Whole stabilization iteration** (`docs/superpowers/plans/2026-07-12-cas-stabilization-cleanup.md`) — every task committed (A1 `~Store()` teardown abort, A2 RunFile OOB, A3 flushRefBatch wedge, A4 EDGE-BEFORE-OBSERVE throw, A5 Ordinary-detached namespace, A6 skip_access_check, A7 stable-Gc manual round, A8 fold-seal enum range-check, A9 dropRefBestEffort logging, A10 suppress_destructive once; B1 path memoization, B2 explain-journal opt-in, B3 per-disk GC health, B4 late-predecessor counter [→ to be removed by rev.6]; C1 token policy, C2 forEachListedKey + delete classifier, C3 blobKey in CasLayout.cpp, C4 unified dir dispatch, C5 whole-part-txn encapsulation; D1–D5 dead-code/vestigial removal; E1 GC-REBUILD access right split, E2 config naming, E3 typed mounts columns; F1 delete `poc/cas_mergetree`; R412 one 412 policy, RExpect scoped 100-continue).
-- **Umbrella review `review1.md`** — findings 1, 3–12 + minors fixed by the stabilization iteration; finding 2 (relink "RBAC") retracted as not-a-bug and documented (interserver channel == ordinary `ReplicatedMergeTree` trust boundary); only findings 13 (god-class/virtualization refactors) and 14 (coverage gaps) + `DiskSelector` isolation carried forward (§9, §10).
-- **B31** capability gate — `supportZeroCopyReplication()==false` for CA with a B31 comment; unsupported ops rejected by independent gates (ALTER PARTITION throws, BACKUP restore routes through a whole-part transaction). **B192** event-name review — 51 event types all neutral snake_case, no flagged terms. **B10 minors** `~Build`/`retireBuildSeq` (no I/O on the dtor path), `inDegreeInGeneration` (test/preview-only), redundant `sweepNamespace` watermark GET, signed-in-degree accumulation (unsigned edge-set model) — all fixed. `RunFileReader::seek` FIRST-block-≥-target contract bug fixed (`035edbcf7e1`). Vestigial manifest-backpressure surface removed (`e743da297bb`). B207 fsck phantom-dangling, B3/B186 `FreezeViaHardLinks` red, deposed-leader `clearSparedMeta` — all RESOLVED (2026-07-11).
-
 ## Obsolete / superseded (removed or to be removed) {#obsolete}
 
 - **[B1] `manifest_hash` on the Keeper `/parts` znode — REJECTED (2026-07-14), do NOT re-open as a Keeper field.** Layering decision: replication code stays disk-agnostic — a CA-specific field in the Keeper part header (`ReplicatedMergeTreePartHeader`, `commitPart`/`getCommitPartOps`) would couple `ReplicatedMergeTree` to one disk implementation, grow the upstream-contact surface of the fork, and add states (plus znode-format/mixed-version evolution) to already-complex replication machinery. It is also unnecessary: fetch-by-relink learns the manifest id **in-band** (interserver handshake, `DataPartsExchange`); real data divergence is already caught by the stock tolerant `checkPartChecksumsAndCommit` → `checkEqual`; and manifest-level divergence between replicas is a benign, bounded, self-cleaning dedup-MISS (`01-architecture.md §benign-cross-replica-divergence`). If divergence *observability* is ever wanted, it is a pool-side concern — fsck/`ca-inspect` can group live refs by (table, part name) across server namespaces and flag differing manifest ids — never a Keeper field.
@@ -511,10 +491,6 @@ Mechanism is no longer "open": build/dl_probe.py reproduces it deterministically
 ### UPDATE-3 2026-07-17: mechanism RE-TRACED against source + CORRECTED (commit f7d337bab5b) — durability ordering is INVERTED on CA
 A line-by-line code re-trace (prompted by a user challenge to a contradiction in the report) CORRECTS the write-path claim. Earlier notes said `renameParts()`/`stageManifest` at ReplicatedMergeTreeSink.cpp:976 is the durable CAS commit that runs BEFORE the Keeper multi (:985), so a failed CAS write throws before any znode — FALSE. Verified ordering in `commitPart`: (1) `renameParts()` (:976) on CA = **pure overlay re-key, NO publish, blobs B188-deferred** (`ContentAddressedTransaction.cpp:368-369,1177`; blobs "do NOT upload here" :589); (2) **Keeper multi (:985) commits block_id+part-znode durably** (Keeper is a separate container, UP under rustfs-pause → clean ZOK); (3) `transaction.commit()` (:990) → `MergeTreeData::Transaction::commit` (MergeTreeData.cpp:8797-8799 `commitTransaction`) → `ContentAddressedTransaction::commit`→`publishStaging`→**`uploadPendingBlobs`+`promoteBuild` = the ONLY durable point (:358/:361)**, hangs 90s on paused rustfs → THROW → txn destructor `rollback()` (MergeTreeData.cpp:8689) = "Undoing transaction … Removing parts" (local part removed). So on CA the durability order is **INVERTED**: Keeper metadata at :985 commits BEFORE part data at :990 — a genuine **split-commit window :985→:990**. On a plain disk this is safe (data already durable on the committer's LOCAL disk before/at rename, part re-fetchable); on CA `renameParts` makes nothing durable, so the RMT protocol's "renamed part = durable data" assumption is false. The surviving block_id (independent `replicated_deduplication_window` lifetime) makes the byte-identical retry a false dedup no-op (`getActiveContainingPart`→null → `exists_locally=false` → "already exists on other replicas as part …; ignoring it", ReplicatedMergeTreeSink.cpp:511-517 → INSERT_WAS_DEDUPLICATED → ack, 0 rows). R3 governs SILENCE only (its NETWORK_ERROR "retry-later" induces the retry); the split-commit window is generic-CA. FIX = HARD product/arch decision (do NOT land blind): (a) verify-on-dedup on CA — honor a block_id dedup only when the referenced part's data is verified recoverable; and/or (b) gate the Keeper block_id/part-znode commit on CA-data durability (publish data before/atomically with the multi — touches RMT commit ordering); and/or (c) invalidate the block_id znode when its part is rolled-back/LOST. Pre-R3 repro still only needed to classify introduced-vs-amplified (with R3 = silent loss; pre-R3 the same split-commit likely surfaces as a hard client error = not silently lost). Full section: report "CORRECTION (2026-07-17, code re-trace)".
 
-## [B199] FIXED 2026-07-17: `RefWriterRecoverySeal.SealPutConflictThrowPropagatesAndDoesNotWedgeRecovery` deterministic RED — test fixture invalidated by formats-v3 zstd framing
-RESOLVED — RCA `docs/superpowers/reports/2026-07-17-b199-recovery-seal-zstd-rca.md`. NOT a product bug: the fixture faked the "foreign different object" as `own bytes + trailing garbage`, which the pre-v3 text decoder tolerated (the flagged F3-1a decode laxity) but the v3 zstd frame check correctly rejects (`Src size is incorrect` = fail-closed on a genuinely undecodable seal — the frame check CLOSED F3-1a). Fix (test-only): fixture gains `corrupt_foreign_bytes` (a caller-provided VALID foreign object); the test lands a real 3-row foreign seal and asserts adoption via `listRefs()==3` (provably the foreign content, not a local 2-row recompute). Battery after fix: 907/907, zero reds. Historical entry below.
-Deterministic (5/5 + clean-dir rerun) on the current branch. Signature: the test's seal PUT conflict resolves as expected (CORRUPTED_DATA from `resolveByExactGet`, "observed a DIFFERENT object"), but then the recovery `listRefs` -> `ensureRefTableRecovered` dies with `CAS cas_ref_snap: zstd decompression failed: Src size is incorrect` (gtest_cas_ref_writer.cpp:2944; CasRefLedger.cpp:383/:163). NOT caused by the renameParts durability fix: byte-identical failure present in `build/fix2_cas_battery.log` (2026-07-17 03:58, R3-era binary, BEFORE T1/T2 existed) — that nightly battery RED went unnoticed (process lesson: battery log analysis must assert FAILED==0, not skim). Suspect area: rev.6 seal / snapshot-streaming codec interplay (seal-conflict path leaves a `_snap` object the recovery reader can't decompress — truncated/misframed write on the conflict path?). Needs its own systematic-debugging pass; not a T2 gate (pre-existing), but IS a real recovery-path red — triage soon, before the next release gate.
-
 ## [B208] CA startup mount-probe is fail-closed against a TRANSIENT S3 outage — server aborts and stays down (found by S40, 2026-07-17)
 A server started while the object store is unreachable dies during metadata load: the CA-pool mount startup capability probe (S3 write `_probe/<uuid>/token`) times out (`WriteBufferFromS3 ... Timeout`) -> `Application::main` treats it as fatal (`Caught exception while loading metadata: Code 499 S3_ERROR`) -> exit 243, no retry, stays down until an operator restarts it. Seen twice: S40 run `20260717T090957_S40_seed1` (ch2 `docker start` inside the rustfs pause window — by design of the scenario), and the earlier dl_probe repro (same Exited 243 after `docker restart -t 1` during the pause). Product question: a bounded startup retry / degraded-start (mount later, serve non-CA tables meanwhile) instead of aborting — weigh against fail-closed principles (a server that starts without its pool must not fake readiness). NOT a gate for the durability fix (S40's contract only requires acked data to survive on the live replica — it does). Related: the self-remount recovery work covers RUNNING servers losing the pool; this is the STARTUP window. NOTE (T3 review): S40's fixed fault schedule hits this abort DETERMINISTICALLY (ch2 restarts inside the pause) and the card carries no verdict on ch2 rejoining — when B208 is fixed, add an informational recovery verdict to S40 so a regression here produces signal.
 
@@ -529,38 +505,6 @@ S39's ci param row bakes in a short-fault window that violates the card's own ti
 
 ## GREEN-DEBT: ca-soak GC-checkpoint timeout formula assumes normal-speed GC throughput -- blows the budget under TSan (found 2026-07-18)
 `soak/checker.py:fixpoint_timeout_s` computes a backlog-scaled real-time bound as `5 * (initial_unreachable/reclaim_per_round_guess=50) * gc_interval_s`, i.e. it assumes the SERVER's own background-GC round throughput is roughly 50 reclaims/round (a normal-speed baseline). Running the standard 20-min phase-3 chaos soak against a TSan-instrumented server hits `CHECKPOINT FAILURE: GC unreachable count never stabilized within {bound}s` at the `gc_checkpoint` stage -- the unreachable-count history was clearly trending down (peak 26170 -> 12251) when the budget expired, i.e. GC was actively converging, just slower than the formula assumes; `dangling=0` and fsck stayed settled throughout. This is a harness-timing artifact, NOT a correctness bug -- TSan's severe per-memory-access instrumentation overhead drops the server's actual reclaim throughput well below the formula's baseline, so a backlog that comfortably fits the budget under a normal or ASan-instrumented binary blows through it under TSan. Same root-cause class as `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` above (TSan overhead vs a real-time budget calibrated for normal speed; that gtest is now FIXED by freezing its clock, but this soak-harness formula is a different codepath and still needs its own fix). Fix on resume: add a sanitizer-aware multiplier to `fixpoint_timeout_s` (or an explicit CLI override) so a full TSan chaos-soak can run through the chaos window; low priority since the workload/mutation/ttl_pressure stages and the full gtest battery already validate TSan correctness with zero races found.
-
-## RESOLVED 2026-07-18: the CAS gtest battery no longer needs a known-abort exclusion list at all
-Historically, running the CAS gtest battery under ASan/TSan required a peel-and-continue script
-(`build/asan_battery.sh` etc.) that accumulated a 41-entry list of tests known to abort the whole
-process (a `LOGICAL_ERROR` throw calls `abort()` under `DEBUG_OR_SANITIZER_BUILD`, per
-`Exception.cpp`'s `handle_error_code`), excluding each by name. On the user's explicit directive
-("почини раз и навсегда, без всяких странных списков исключений" — fix it once and for all, no more
-exclusion lists), audited every test in that class and closed all of them:
-- 3 genuine stack-use-after-scope bugs (not the LOGICAL_ERROR class at all — a red herring the
-  exclusion list had been silently papering over) plus 2 latent ones of the same kind: an event-sink
-  capture vector declared after the Pool. Fixed by reordering declarations (`99879af4aca`).
-- 3 test-only fault injections that misused LOGICAL_ERROR to simulate an ordinary external/observer
-  failure (a sink callback throwing, a construction failure, an "unrecognized exception" example) —
-  swapped to `UNKNOWN_EXCEPTION` (`4efc898b951`, plus the CI-fix commit `def79031982`'s B122 case using
-  `CORRUPTED_DATA`).
-- 2 production sites that genuinely misused LOGICAL_ERROR for expected external/data failures
-  (OpenSSL/allocation faults in `CasBlobHashingWriteBuffer.cpp`, a decode-reachable data-integrity
-  check in `CasRefSnapshotFormat.cpp`) — swapped to `OPENSSL_ERROR`/`CANNOT_ALLOCATE_MEMORY` and
-  `CORRUPTED_DATA` respectively (`0e069357957`).
-- 6 tests exercising genuine production invariants that correctly throw LOGICAL_ERROR — split each
-  into the existing release-build assertion (`#ifndef DEBUG_OR_SANITIZER_BUILD`) plus a new
-  death test (`EXPECT_DEATH`, `#if DEBUG_OR_SANITIZER_BUILD`) that proves the abort positively instead,
-  matching the pre-existing `CasBlobDigestDeathTest` precedent (`99879af4aca`, `0d5f0be10c5`).
-- A second gtest-filter coverage gap (`CaWiring*`/`CaTransaction*`/etc., ~89-90 tests, matching neither
-  `Cas*` nor `CA*`) that had hidden 3 of the above bugs from every battery run this session — see
-  `reference_ca_gtest_gate_filter` memory / `def79031982`.
-
-**Result**: `unit_tests_dbms --gtest_filter='<the corrected filter>'` (no `:-exclusions` at all) now
-passes 1034/1034 under ASan, 1034/1034 under TSan, and 1030/1030 under a plain (non-sanitizer) build
-(the count differs only because 4 `#ifdef DEBUG_OR_SANITIZER_BUILD`-gated death tests exist solely in
-sanitizer builds). Any CAS gtest battery gate going forward can drop the peel-and-continue exclusion
-machinery entirely and just run the filter directly.
 
 - [ ] CLEANUP (from F4a review 2026-07-21): delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
 
@@ -825,18 +769,6 @@ publish + immediate drop) in the fetch-handoff area, not more log archaeology. T
 `(M-F debris, B140)` mislabel for this population is tracked at
 [`{#fsck-large-pool-fixed}`](#fsck-large-pool-fixed).
 
-## LIST-as-journal data-loss class — RESOLVED by the v9 redesign {#list-as-journal-dataloss-2026-07-25}
-
-The 2026-07-25 finding (GC discovering ref-log transactions via a paginated `LIST` with no
-contiguity proof, so an omitted page could silently authorize a live blob's deletion) is
-structurally closed by the v9 ref-table redesign: dense per-life ref ids, an in-band epoch seal,
-and a `_ckpt` recovery frontier make the defect class unrepresentable rather than merely detected.
-Recovery no longer reads listings at all (recovery-from-authority). Full incident facts, legal-lie
-classification, and the passport design for future LIST-trust optimizations are the settled record
-at [`2026-08-03-list-trust-verdict.md`](2026-08-03-list-trust-verdict.md) — do not re-litigate here.
-The one still-open, separately-tracked follow-up is the LIST-trust optimization plan at
-[`{#gc-frontier-one-list}`](#gc-frontier-one-list).
-
 ## The adopted fold seal referenced a PRUNED generation's run (observed 2026-07-25, same stand) {#adopted-seal-pruned-run-2026-07-25}
 
 Once observed: an adopted fold seal's `blob_target_runs` named a generation's run object that
@@ -890,67 +822,7 @@ residuals remain open:
   the gate still does not run. Options not yet chosen: scale the budget with pool size, use
   `--partial` deliberately as a lower bound, or make fsck itself cheaper.
 
-## Probe A / LIST-hole investigation — superseded, settled record moved {#probe-a-direction-evidence}
-
-The probe-A ref-prefix-enumeration-hole investigation (task #12/#18/#20, the "caught live"/"proven
-by measurement" firings, the audit-detail fix) is now fully captured by the settled reference doc
-[`2026-08-03-list-trust-verdict.md`](2026-08-03-list-trust-verdict.md), which cites these exact
-findings as its source material. Probe A itself was deleted from the code by the v9 redesign
-(recovery-from-authority no longer reads listings at all — see
-[`{#list-as-journal-dataloss-2026-07-25}`](#list-as-journal-dataloss-2026-07-25)). The one loose
-end this investigation surfaced — "path 2": a `-1` arriving before its `+1` produces an unmatched
-remove that the reducer correctly drops as a no-op — is the same edge-set mechanism the
-already-resolved unmatched-removal-fold finding covers (pinned by
-`CasBlobInDegree.*.UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges`).
-
-## S42 at `ci` scale: the OOM machinery HELD; the run failed on the environment {#s42-ci-verdict}
-
-Status line: `S42 DONE: status=FAIL (26/28 verdicts pass)`. Both failures are ENVIRONMENTAL, and the
-distinction is the whole result.
-
-### The safety signals — all clean {#s42-safety}
-
-```
-QueryMemoryLimitExceeded     2184   <- the injected faults DID fire; the run is NOT vacuous
-CasRefApplyPoisoned             0   <- THE critical invariant: no writer's view is untrustworthy
-CasRefAppendWedged              2
-CasRefAppendUnwedged            2   <- both wedges RESOLVED; fail-closed worked end to end
-CasRefAppendDefiniteFailure     0
-CasGcUnmatchedRemoveDeltas      0   <- no retention-leak signal
-acked blocks               11,960
-```
-
-**On the question actually asked — do we break under memory exhaustion? — the answer is no.** 2,184
-allocation faults landed, no cache was poisoned, both wedged ref lanes recovered, and every acked block
-survived.
-
-### The two failed verdicts, and why they are the environment {#s42-env}
-
-**1. "statements failed only with the injected allocation error" — 23,561 other failures.** Every sampled
-one is `Code: 210 ... CAS write could not be committed (stageManifest: part-manifest PUT is UNCERTAIN
-(retry budget exhausted))`. That is a request-timeout cascade, not a memory error.
-
-**2. "GC no Failed rounds" — 2.** Both are `Code: 499 ... Timeout ... (S3_ERROR)` on objects of **268 bytes**
-and **4,606 bytes**. A 268-byte GET timing out is a store that is not answering, not a product that cannot
-allocate.
-
-### Why the environment was compromised, and why that was predictable {#s42-env-cause}
-
-This run started while the host was still recovering from the `--scale full` attempt
-({#s42-full-scale-too-big}): load average was 22–48 at launch, and RustFS shares the machine with two
-ClickHouse servers and the workload. Under that, small-object requests time out and the retry budget
-empties.
-
-**The card's gate did exactly its job.** It is built to fail when non-injected errors appear, precisely so
-attribution is never muddied — and here it caught a polluted experiment rather than a defect. That is the
-gate working, not the gate being wrong.
-
-### Verdict, stated the way it should be recorded {#s42-verdict-wording}
-
-- **On memory-exhaustion safety: PASS on every signal**, with the anti-vacuity gate satisfied (2,184 faults).
-- **On the card's own strict criterion: FAIL**, because the environment injected 23,561 failures of its own.
-- **Therefore the run is INCONCLUSIVE as a certification** and must be repeated on a quiet host before S42
-  can be called green. It is NOT evidence of a defect.
+- **[S42-ci-verdict] S42 memory-exhaustion card needs a clean re-run to certify** — {#s42-ci-verdict} — TEST — `ci`-scale S42 passed every safety signal (2,184 injected allocation faults fired, `CasRefApplyPoisoned=0`, both wedged ref lanes recovered, `CasGcUnmatchedRemoveDeltas=0`, 11,960 acked blocks survived) but failed 2/28 of its own strict verdicts on request-timeout cascades traced to a compromised host (still recovering from a prior `--scale full` attempt, load average 22-48). Not evidence of a defect, but not a certification either — re-run on a quiet host before calling S42 green.
 
 
 ## The fsck exit set and SQL row still have no test that can fail for them {#fsck-untestable-render-surfaces}
