@@ -58,6 +58,26 @@ Backup/restore round-trip, in order:
    (`restore_output.log`). Restored 2026-08-04T11:34:41Z. The restored `xl.meta` is byte-for-byte
    the original (770 bytes, same content) — this is a restore, not a new write.
 
+## What this experiment can and cannot isolate — read before the numbers
+
+Every held round below carries `anomalies=1` at `Finish`. Since the gate is
+`suppress_destructive = anomalies || carried_holds || !frontier_complete`, a reader is right to ask
+whether the suppression is explained by the anomaly alone, leaving the hold arm proving nothing the
+anomaly arm had not already proved. The answer, stated here rather than left to be discovered:
+
+- **That `anomalies=1` IS the hold being recorded, not a second fault.** The injection introduced
+  exactly one fault — one deleted object. `CasGc.cpp`, at the gate computation, says so in its own
+  words: *"Term 2 is STRUCTURAL. Today every hold also records an anomaly, so term 1 happens to imply
+  it -- but that is a property of the current code, not the invariant, and a gate that relies on a
+  coincidence opens the day the coincidence stops holding."* The third term was lit by the same hold
+  as well (`frontier INCOMPLETE ... unproven: held=1`). One injected fault lit all three terms.
+- **So this experiment cannot isolate term 2 as the sole cause, and does not claim to.** Isolating it
+  would require a hold that records no anomaly, which the current code does not produce.
+- **What it does establish is the criterion's own wording**: with a hold present, every delete family
+  is inert for those rounds, per family, and the round still completes. It additionally establishes
+  the CLEARING behaviour, which the anomaly arm never showed — that injection never cleared
+  (`CASRefNeedsRecovery` stayed nonzero for the rest of its run).
+
 ## Rounds observed — held, then cleared
 
 All four round attempts' full `Start`/`Phase`/`Finish` rows (29-column, untruncated) are in

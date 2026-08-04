@@ -274,6 +274,18 @@ ref intake: namespace ... HELD at 0000000000000001-000000000000656a -- ref intak
 id absent below a same-epoch witness -- contiguity says this cannot happen, so a durable record is
 missing."` / `"CAS GC fold: destructive work SUPPRESSED this pass ..."`.
 
+**What this arm does NOT isolate, stated before the result is read.** All three held rounds also
+carry `anomalies=1`, and the gate is `suppress_destructive = anomalies || carried_holds ||
+!frontier_complete` — so a reader could object that the anomaly term alone explains the suppression.
+That `anomalies=1` is the hold BEING RECORDED, not a second fault: the injection introduced exactly
+one fault, and `CasGc.cpp` says at the gate itself that "today every hold also records an anomaly, so
+term 1 happens to imply it -- but that is a property of the current code, not the invariant". The
+third term was lit by the same hold too (`unproven: held=1`). One injected fault lit all three terms,
+so this arm cannot isolate term 2 as the sole cause and does not claim to; isolating it would need a
+hold that records no anomaly, which the current code does not produce. What it does establish is the
+criterion's own wording — every delete family inert for those rounds, per family, round still
+completes — plus the clearing behaviour below, which the anomaly arm never showed.
+
 After the byte-identical restore, the next round (`ae46f97f...`) cleared the hold by genuinely
 re-reading the restored position (`fold_ref_intake`: `tables_held=0, absent_probes=0,
 frontier_proven=2` — folding through `offending_position` per `CasFoldSealFormat.h:58-60`, not by
