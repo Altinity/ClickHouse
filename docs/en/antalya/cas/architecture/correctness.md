@@ -25,7 +25,7 @@ reader-facing summary.
 | Model (`docs/superpowers/models/`) | Invariant it proves | Counterexample it caught |
 |---|---|---|
 | `CaIncarnationCore.tla` | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN` — the safety spine for the whole GC core | `sab_unconddelete`: replacing the exact-token delete with an unconditional one lets a stale delete kill the live incarnation a resurrect just wrote |
-| `CaBuildRootPrecommit.tla` | `INV_NO_DANGLE_COMMITTED` — a committed manifest never references an absent blob | Reproduces the B140 production dangle exactly: `WriteBlob → AdoptBlob → BuildDie → GcDelete → Commit` with no presence re-check publishes a manifest over a deleted blob |
+| `CaBuildRootPrecommit.tla` | `INV_NO_DANGLE_COMMITTED` — a committed manifest never references an absent blob | Reproduces the dangling-manifest hazard exactly: `WriteBlob → AdoptBlob → BuildDie → GcDelete → Commit` with no presence re-check publishes a manifest over a deleted blob |
 | `CaGcLeaseCore.tla` | `NoFalseSteal` — no leader steals leadership from a live, mid-round incumbent | Without the advisory heartbeat, a frozen `seq` during a round looks identical to a dead leader, and a second leader steals from the alive one |
 | `CaCasMountCore.tla` | Reclaim exclusivity for an expired mount | `sab_wallclockreclaim`: trusting the foreign mount body's wall-clock timestamp (instead of observing a stable token on the reclaimer's own monotonic clock) breaks exclusivity |
 | `CaB140DangleMerge.tla` | `INV_NO_LOSS` across a GC lease handoff | Trim-before-durable: a fold cursor trimmed from in-memory state (not the durable snapshot) skips a live edge across a lease handoff, and the referenced blob is deleted while still live |
@@ -44,8 +44,8 @@ the design leans on both rather than either alone. `TLA+` proves a protocol's co
 line of `C++` exists — the two-coordinate namespace-incarnation proof and the build-root necessity
 proof were both design decisions made this way. The soak, running two `ReplicatedMergeTree`
 replicas against one shared pool under a seeded workload and a seeded fault injector, finds what an
-idealized model necessarily abstracts away: the B140 dangle and the resurrect-reupload orphan were
-both first observed live, in `system.cas_log`, before either got a focused model. Each
+idealized model necessarily abstracts away: the dangling-manifest hazard and the resurrect-reupload orphan were
+both first observed live in `system.cas_log` during soak runs, before either got a focused model. Each
 quiesced soak checkpoint cross-checks `SQL` results against a model oracle and runs
 `clickhouse-disks ca-fsck` plus `ca-gc-dryrun`, asserting `dangling=0`.
 

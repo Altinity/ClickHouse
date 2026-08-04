@@ -34,7 +34,7 @@ the sequence of pivots that produced the architecture described elsewhere in thi
 | 2026-06-01 | Starting point: "content-addressed storage for `MergeTree`" thesis and a working proof of concept |
 | 2026-06-07 – 10 | The generation-in-the-key core is abandoned; the incarnation-token design replaces it |
 | 2026-06-11 | The incarnation model passes exhaustive model checking with zero violations |
-| 2026-06-18 | The B140 dangle leads to replacing per-blob protection hints with structural build-root reachability |
+| 2026-06-18 | A dangling manifest reference — a committed manifest naming an already-deleted blob — leads to replacing per-blob protection hints with structural build-root reachability |
 | 2026-06-24 – 26 | Formats begin converging on a single self-describing envelope (completed in July as the all-text, JSON-based codec set) |
 | 2026-06-26 | Root-local full-tree manifests collapse a forest of small `GC` objects into one hot/cold split |
 | 2026-07-01 | The namespace registry is deleted; discovery moves to the two-coordinate incarnation-and-round scheme |
