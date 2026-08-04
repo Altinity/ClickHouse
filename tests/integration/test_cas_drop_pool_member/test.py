@@ -172,9 +172,25 @@ def test_drop_dead_pool_member_heals_the_pool():
     #     (`224aacd8eb9`), never the decommission command's, so a row this same call just legitimately
     #     transitioned still counts as "owned" and the retirement fence correctly refuses the slot.
     #     This is a success with GC completion pending, not a failure.
-    report_tsv = node1.query(
-        "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
-    ).rstrip("\n")
+    #     The mounts-table poll above and the decommission command judge liveness by DIFFERENT
+    #     predicates on purpose: the table renders TTL arithmetic over the last observed mount row,
+    #     while the command re-reads the mountpoint object and refuses while the lease could still
+    #     be live under its conservative safety margin. The destructive side being stricter is the
+    #     fail-close direction, so the table saying "not live" does not guarantee the command is
+    #     ready yet -- under sanitizer slowdowns the gap is wide enough to hit. Retry the command
+    #     itself through the documented "wait for its lease to lapse" refusal, bounded.
+    report_tsv = None
+    for _ in range(90):
+        try:
+            report_tsv = node1.query(
+                "SYSTEM CAS DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+            ).rstrip("\n")
+            break
+        except Exception as e:
+            if "alive or contended" not in str(e):
+                raise
+            time.sleep(1.0)
+    assert report_tsv is not None, "decommission kept refusing: lease never lapsed within the bound"
     fields = report_tsv.split("\t")
     assert len(fields) == 10, report_tsv
     assert fields[0] == SRID2, report_tsv
