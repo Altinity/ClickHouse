@@ -102,7 +102,7 @@ tolerated anomaly — `CaGcAckFloorCore`/T6a review, `096b3611988`).
 | 1 | Healthy rounds really perform destructive work | per-family delete counts per round in `system.cas_gc_log` (schema successor of the plan's named table) | every family with work nonzero on healthy rounds; no family silently inert | **PASS, with one explained exception.** Both nodes summed over the 90m specimen window: `pending_deletes` deleted 281,956 entries; `manifest_deletes` deleted 522,503; `ref_object_cleanup` issued 140,096 `DiskS3DeleteObjects`; `round_commit`'s generation pruning advanced `pruned_through` from the run's start to 1830 (ch1) / 3735 (ch2). `orphan_sweep` and `namespace_cleanup`'s janitor arm both deleted **zero** across the whole run (14,586 candidates listed, all `skipped`, zero in any of the four tracked `retained_*` reasons) — traced to source (`CasGc.cpp` `reportSweepRetention`, its own comment): `skipped` "also counts malformed keys, ineligible prefixes, protected owners and budget-deferred candidates", i.e. a clean run with no injected staleness/aborts legitimately produces zero orphaned manifest/namespace-file debris to reclaim. Not silently inert — traced to a documented, source-confirmed reason, not asserted |
 | 2 | `ca-fsck --detail` finds no dangling / stale-edge | fsck at soak end AND a mid-soak checkpoint | zero dangling, zero stale-edge, both runs | **PASS.** Mid-soak (`GC checkpoint (stage §8 checkpoint+GC)` at t+1890s-ish) through 5 further `recovery checkpoint` samples to the harness's own `final converge checkpoint`: all 7 checkpoints read `dangling=0 stale_edge=0 unreachable=0`. A fresh live `ca-fsck --detail` run against the still-standing cluster (both `ca-soak-ch1-1` and `ca-soak-ch2-1`, `--detail` full object listing) after the soak returned: `dangling=0 unreachable=0 stale_edge=0 chain_broken=0 lifeless_keys=0 janitor_pending=0`, both nodes, identical (shared pool) |
 | 3 | Backlog reaches zero STABLY | `pending_condemned` + cleanup backlog sampled per round to fixpoint | reaches zero and STAYS zero across ≥3 further rounds | **PASS.** ch2's Finish-row tail: round 105 condemned 168 → round 106 graduated 168 (0 remaining condemned) → round 107 redeleted 168 (0/0/0 remaining) → rounds 107 (7 further Deferred) and 108 (2 Deferred + 1 Success) all show `condemned=graduated=redeleted=objects_deleted=0` — 10 further round attempts at zero after the drain, well past the ≥3-round bar. Corroborated by the fsck checkpoint trend (criterion 2): `unreachable` (fold backlog / `AwaitingGc`) reads 0 at every one of the 7 checkpoints sampled across the run |
-| 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family; round still completes; ZERO "no usable checkpoint" anomalies on healthy post-flip rounds (T6a carry) | **ANOMALY ARM: SATISFIED** (`{#criterion-4-evidence}`, evidence durably extracted to `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-injection-evidence/`). HOLD ARM: deferred to a separate short dedicated run per the controller's ruling (not injected into the specimen) — recorded as owed, not failed. **T6a carry SATISFIED on the clean specimen itself**: `sum(anomalies)=0` on both nodes across the entire 90m run, zero `system.text_log` hits for "no usable checkpoint" |
+| 4 | Holds/anomalies still suppress every irreversible path | inject one hold and one anomaly during the soak | all delete families inert for those rounds, per family; round still completes; ZERO "no usable checkpoint" anomalies on healthy post-flip rounds (T6a carry) | **BOTH ARMS SATISFIED.** ANOMALY ARM: `{#criterion-4-evidence}`, evidence durably extracted to `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-injection-evidence/`. HOLD ARM: run separately, short and dedicated, per the controller's ruling (kept out of the 90m specimen) — `HoldReason::GapBelowWitness` injected by deleting one durable `_log` object at the filesystem level (a witness above it, same epoch, left untouched); three consecutive rounds held with every destructive family (`manifest_deletes`, `handoff_reclaim`, `ref_object_cleanup`, `orphan_sweep`, generation pruning) explicitly `suppressed`/zero-work and each round still `outcome=Success`; after a byte-identical restore the next round's `fold_ref_intake` read the position back (`absent_probes=0`, folding through the position, not observing another absent) and resumed real destructive work in the same round (`manifest_deletes` deleted 33,428). `CASRefNeedsRecovery`/`CASGCUnappliedFoldedTransactions`/`CASRefRecoveryStreamHole` stayed 0 throughout, both nodes — evidence at `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-hold-arm-evidence/`. **T6a carry SATISFIED on the clean specimen itself**: `sum(anomalies)=0` on both nodes across the entire 90m run, zero `system.text_log` hits for "no usable checkpoint" |
 | 5 | No second full stream LIST after probe-A removal | LIST counts per round attributed by prefix and phase | exactly ONE full `cas/ns/stream/` enumeration per round, EVERY round; the bounded `cas/ns/` janitor page reported separately | **PASS.** `CASRefGlobalListPages` (the stream-enumeration-specific counter) is nonzero on the `defer_decision` phase ONLY, across every other phase checked (`fold_reduce`, `heartbeat_floor`, `namespace_cleanup`, `round_commit`) — and `defer_decision` runs at most once per `round_id` by the phase pipeline's own construction, so this is exactly one full enumeration per round. `CASGCEnumerationPages` (a broader, multi-site shared counter) also appears nonzero on `fold_reduce`/`round_commit`, but traced to source (`ProfileEvents.cpp:882`, increment sites in `CasOrphanManifestSweep.cpp:36/619` and `CasGc.cpp:85/3516`) these are legitimately separate scans — the orphan-manifest sweep's own enumeration and the generation-pruning wholesale-delete's page count — not a second `cas/ns/stream/` scan. `namespace_cleanup`'s `CASGCList` (69/round on ch1, matching its `janitor_pages`) is the bounded `cas/ns/` janitor page, reported and counted separately as required |
 | 6 | Phase timings + S3 op counts give the baseline | the Step-3c inventory (below) | recorded as the explicit `MultiDelete`/concurrency baseline, un-timed spans named | **RECORDED**, see `{#step-3c-cost-inventory}` — sequential-baseline only, no `MultiDelete`, no delete-side concurrency, matching the plan's explicit non-goal ("faster is not a goal; this is the honest cost baseline") |
 
@@ -249,8 +249,50 @@ active lane), so this does not fail Stage B. The unresolved recovery-clearing qu
 as a named post-B residual (below). The Stage-B specimen is the CLEAN rerun, seed `20260807`, no
 injections.
 
-**Hold arm**: NOT executed against the specimen run, per the controller's ruling (a separate, short,
-dedicated run after the specimen, to keep the specimen pristine) — recorded as owed, not failed.
+**Hold arm**: run separately from the specimen, per the controller's ruling (a short, dedicated
+soak — `utils/ca-soak`, phase 3, 20m, seed `20260901` — kept out of the 90m specimen to protect
+it). `HoldReason::GapBelowWitness` (`CasFoldSealFormat.h:45`), chosen over the checkpoint-corruption
+shape used above because that shape is byte-rot of a durable object under a live writer — already
+ruled outside CAS's trusted-store fault model by this same document's anomaly-arm finding above.
+`GapBelowWitness` instead simulates a store losing or lying about an object it still claims to hold
+(the LIST-lie/race fault the design defends against): namespace
+`865d3a88b5332a8e47c8b1463b483da3` (`ca_soak.ca_stress` on ch1), epoch 1, ref-log object
+`0000000000000001-000000000000656a` deleted at the filesystem level (RustFS stores each S3 object
+as its own directory; removing one directory removes exactly that key), leaving durable witnesses
+`...656b`/`...656c` above it, same epoch, untouched. Backup/restore verified byte-identical via a
+scratch round-trip on the container filesystem before and after the real delete.
+
+Three consecutive GC round attempts held on the namespace (`52c5216d...`, `972ac3c2...`,
+`6c696cd5...`), all `outcome=Success`. Each round's `fold_ref_intake` showed
+`tables_held=1, frontier_unprobed_budget=0` (ruling out a budget skip) and `fold_reduce` showed
+`suppress_destructive=1, frontier_complete=0`; every destructive family carried an explicit
+zero-work `suppressed` tag: `manifest_deletes {attempted:0, deleted:0, suppressed:1}`,
+`handoff_reclaim {suppressed:1}`, `ref_object_cleanup {suppressed:1}`, `orphan_sweep {deleted:0,
+suppressed:1}`, and generation pruning inside `round_commit` ran zero work
+(`generations_visited:0, pruned_through:0`). Server log, verbatim, once per held round: `"CAS GC
+ref intake: namespace ... HELD at 0000000000000001-000000000000656a -- ref intake: expected next
+id absent below a same-epoch witness -- contiguity says this cannot happen, so a durable record is
+missing."` / `"CAS GC fold: destructive work SUPPRESSED this pass ..."`.
+
+After the byte-identical restore, the next round (`ae46f97f...`) cleared the hold by genuinely
+re-reading the restored position (`fold_ref_intake`: `tables_held=0, absent_probes=0,
+frontier_proven=2` — folding through `offending_position` per `CasFoldSealFormat.h:58-60`, not by
+observing a different absent) and resumed real destructive work in the same round:
+`manifest_deletes {attempted:33428, deleted:33428, suppressed:0}`, `ref_object_cleanup
+{suppressed:0}`, `orphan_sweep {suppressed:0}`, `handoff_reclaim {suppressed:0}`, generation
+pruning resumed (`generations_visited:3, pruned_through:3`). `CASRefNeedsRecovery`,
+`CASGCUnappliedFoldedTransactions`, and `CASRefRecoveryStreamHole` stayed 0 on both nodes
+throughout — unlike the anomaly arm's checkpoint-corruption injection above, this fault left no
+counter stuck nonzero. A closing `cas-fsck --detail` (not required by the criterion, run as a
+health check) found `dangling=0 chain_broken=0 lifeless_keys=0`; it also found `stale_edge=3279`
+nonzero, plausibly but not confirmedly explained by this run being terminated right after capturing
+evidence, before ever reaching the harness's own write-quiescing checkpoint the specimen reaches
+before every fsck it trusts for criterion 2 above — not investigated further, since criterion 4's
+own bar does not depend on this fsck.
+
+**Verdict: hold arm SATISFIED.** All delete families inert across all three held rounds, every
+round still completed, and the hold cleared only by folding through the offending position — evidence
+durably extracted to `.superpowers/sdd/2026-08-02-cas-stage-b-remaining/crit4-hold-arm-evidence/`.
 
 ## Executable-prose sweep (Step E2) {#e2-executable-prose-sweep}
 
@@ -553,8 +595,6 @@ finding).
   checkpoint damage once the bytes are good again is a legitimate robustness question for a
   dedicated follow-up. Artifact:
   `utils/ca-soak/logs_archive/2026-08-03-stage-b-specimen/failed_injected_run/`.
-- Hold-arm injection (criterion 4, second half): not executed against the Stage-B specimen by
-  design (kept the specimen pristine); owed as a separate, short, dedicated run.
 - T6b named residuals: C3 byte-axis (retained-BYTE axis reduced 1000→100, not bounded);
   `recoverRefTableDetailedFromAuthority` internal cost is one coarse unit, not bounded by design
   (fsck/rebuild need the complete table); capped spared entries lose their audit outcome record
@@ -635,8 +675,6 @@ creation race and an unbounded namespace leak on every table drop whose last par
 must be visible.
 
 **Carried forward, named, not blocking this PASS:**
-- The hold-arm injection (criterion 4, second half) — not executed against any specimen by design;
-  owed as a separate, short, dedicated run.
 - The four unverifiable T6b budget caps (`{#t6b-budget-watch}`): one confirmed not exercised this
   run (`gc_round_sweep_recovery_op_budget`), three genuinely unmeasurable from the metrics captured
   (`gc_round_prefix_wholesale_budget`, `gc_round_handoff_prefix_wholesale_budget`,
