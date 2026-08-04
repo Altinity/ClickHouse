@@ -219,19 +219,12 @@ The measured `GET` formula is exact: total `GET`s equal ref-log body `GET`s plus
 `CAS`. A deferred round is cheaper still: one `LIST`, three seal `GET`s, the lease `GET`/`PUT` and
 the heartbeat floor — no `gc/state` `CAS` at all.
 
-Per-round budgets bound the destructive work of any single pass, all disk-level settings:
+The round's work is internally self-regulated: anything a pass cannot finish is carried and retried
+by the next round's cursors, never dropped. The internal pacing knobs are deliberately not part of
+the user-facing configuration surface.
 
 | Setting | Default | Bounds |
 |---|---|---|
-| `gc_round_graduation_budget` | 5000 | condemned to delete_pending, per round |
-| `gc_round_redelete_budget` | 5000 | exact-token deletes of prior delete_pending rows |
-| `gc_round_sweep_namespace_budget` | 20 | distinct namespaces the orphan sweep may build a protection view for |
-| `gc_round_sweep_recovery_op_budget` | 5000 | committed-tail ref-log GET/decode ops the sweep's recovery walk may spend |
-| `gc_round_ref_cleanup_budget` | 5000 | covered log/snapshot deletes |
-| `gc_round_prefix_wholesale_budget` | 20000 | generation-prefix wholesale-delete object cap |
-| `gc_round_handoff_prefix_wholesale_budget` | 5000 | post-CAS hand-off reclaim object cap, reserved separately so a prune-heavy round cannot starve it |
-| `gc_round_outcome_entry_budget` | 5000 | forensic outcome-log entries across redelete/spared |
-| `manifest_sweep_list_budget_keys` / `manifest_sweep_delete_budget_keys` | 1000 / 100 | orphan-sweep LIST/DELETE pacing |
 | `gc_meta_pool_size` | 16 | bounded pool for condemn-marker writes |
 
 ## Observability {#observability}
