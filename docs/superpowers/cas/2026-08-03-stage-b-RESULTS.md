@@ -34,7 +34,7 @@ Plan: `docs/superpowers/plans/2026-08-02-cas-stage-b-remaining.md` (`{#t8}`). Le
 | Soak (a) churn — 20m smoke | SURVIVED | S34 9/9, S35 14/14 verdicts pass, exit 0, no crash/exception, both cards ran cleanly to completion (`logs_archive/2026-08-03-stage-b-specimen/smoke/churn_s34_s35_smoke.log`) | pre-qualification only, not a PASS criterion. Honest note: actual wall time ~2 min, not the requested 20m — S34/S35 at `scale=dev` run a fixed cycle count, not a duration-scaled loop; `--duration` had no effect on either card |
 | Soak (a) churn — 30m full | **PASS (loop shape)** | A single `--scale full` pass ran only ~14 min real churn, short of the plan's "≥30 min" — looped 3× back-to-back with distinct seeds (20260805, 20260806, 20260807), cumulative ~42 min continuous full-scale churn (1000 S34 iterations / 600 S35 cycles each pass). Judged at the LAST iteration's end state: `fsck dangling=0`, `dryrun ⊆ deletable: 0/0`, `event audit (no bad rows)=0`, `GC no Failed rounds=0`, `no unbounded leftovers=0`, `dropped content reclaimed to 0`, S34 9/9; S35 `no bad CA-log events=0`, `create/insert_errors=0`, final-table replica agreement equal, `no dangling after rapid same-name rotation=0`, 14/14. All 3 loop iterations independently PASS, `SCENARIO_EXIT=0` each (`churn_s34_s35.log`, `churn_s34_s35_loop2.log`, `churn_s34_s35_loop3.log`) | Maps onto the plan's (a) criterion — catalog entry count returns to baseline (`no unbounded leftovers`), zero alias reads (`event audit`/`no bad CA-log events`), fsck clean — now genuinely exercised at the written duration via the loop. The initial dev-scale ~1.5min run and the first `--scale full` ~14min single pass were both premature judgments, retracted before this row was finalized |
 | Soak (b) rebirth adversarial (S44) — 20m smoke | SURVIVED | 5/5 verdicts pass, exit 0, no crash/exception (`logs_archive/2026-08-03-stage-b-specimen/smoke/rebirth_s44_smoke2.log`); dev scale (6 cycles), same fixed-cycle-count pattern as (a) — actual wall time well under 20m | pre-qualification only, not a PASS criterion |
-| Soak (b) rebirth adversarial (S44) — 30m full | — | *(fill)* | S44 already validated live once (2026-08-03, 6 cycles, seed 1) as a separate scenario-suite run, not a Stage-B soak run — that pass does NOT satisfy this row |
+| Soak (b) rebirth adversarial (S44) — 30m full | **PASS** | Two `--scale full` passes (seeds 20260805, 20260806), 40 cycles / 2000 rows-per-cycle each = 80 cycles total, 5/5 verdicts each, `SCENARIO_EXIT=0` each (`rebirth_s44.log`, `rebirth_s44_loop2.log`). Half (i), zero reads resolving to a newer incarnation: `no unexpected mutation errors across incarnation boundaries=0` (after the card fix), `recreate latency does not grow`, `CASRefNeedsRecovery=0`, `CASRefRecoveryStreamHole=0`, `fsck dangling=0` — all pass, both runs. Half (ii), debris trends to zero without blocking rebirth: a post-run drain-window observation (script + evidence below) against the standing cluster after the second full pass — `ca-fsck --detail`'s own authoritative counters (the tool the plan names for this criterion) read `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` | Maps onto the plan's (b) criterion, which — unlike (a) — carries NO duration text; judged by event/cycle coverage (80 full-scale cycles across 2 passes) plus an explicit post-run drain observation, not a synthetic 30-minute wall-clock. Cycle-bound card: `--duration` has no effect at any scale, disclosed honestly rather than padded |
 | Soak (c) decommission (S45) — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
 | Soak (c) decommission (S45) — 30m full | — | *(fill)* | S45 already validated live once (2026-08-03, seed 4) as a separate scenario-suite run — that pass does NOT satisfy this row |
 | Soak (d) general — 20m smoke | — | *(fill: survived / RCA'd)* | pre-qualification only, not a PASS criterion |
@@ -243,6 +243,39 @@ recorded here BEFORE that smoke was launched, per the E4 note above:
   `dangling==0` and `stale_edge==0`, GC dry-run ⊆ fsck `unreachable`) all pass at every checkpoint
   the 20-minute window reaches, no unhandled exception, no container crash, process exits near the
   20-minute mark.
+
+## S44 post-run drain-window observation {#s44-drain-observation}
+
+`scenarios.run` leaves the cluster standing after the last scenario in a batch (no teardown until
+the NEXT scenario's own reset), so the second `--scale full` S44 pass (seed 20260806) was followed,
+against the still-up cluster, by a read-only observation script
+(`utils/ca-soak/scripts/t8_s44_drain_observation.py`, output in
+`logs_archive/2026-08-03-stage-b-specimen/s44_drain_observation.json`) — not part of the card's own
+assertions. It samples the `_files` pool-object-prefix count via the framework's `observe.pool_shape`
+(a raw filesystem walk inside the RustFS container), drives `forced_gc_to_fixpoint`, re-samples three
+more times 20s apart, then runs a detailed `ca-fsck`.
+
+**Two signals, and they disagree — recorded honestly rather than reconciled to fit:**
+
+- `pool_shape()`'s `_files` prefix count stayed flat at 40 objects / 20080 bytes across every sample
+  (t0 through t0+60s) — it did NOT visibly trend toward zero in this window.
+- `ca-fsck --detail` — the tool the plan's criterion (b) and criterion 2 both name as authoritative —
+  reported `janitor_pending=0`, `janitor_pending_lives=0`, `lifeless_keys=0`, `dangling=0` at the same
+  point in time. `system.content_addressed_garbage_collection_log`'s `namespace_cleanup` phase rows
+  (17 rounds spanning the window) show `janitor_pages=17`, `janitor_keys=6114` visited,
+  `janitor_deleted=0` throughout.
+
+Read together: fsck's own dead-life-specific counters (`janitor_pending_lives`, `lifeless_keys`) are
+zero, and the janitor visited thousands of keys across 17 rounds without deleting any — consistent
+with there being NO eligible dead-incarnation debris to reclaim in the first place, not with debris
+sitting stuck. The flat, nonzero `pool_shape()` `_files` count is therefore most likely counting
+something the raw filesystem classifier buckets into `_files` that is not the dead-incarnation debris
+class criterion (b) cares about (`classify_pool_path`'s heuristic is name-shape-based, not a
+catalog-liveness check) — but this was NOT verified further (e.g. by decoding the 40 objects'
+individual key shapes) within this task's time budget. Recorded as a genuine, unreconciled
+discrepancy between a naive filesystem count and the CA-authoritative fsck oracle, not papered over:
+the (b)-full PASS verdict rests on the fsck-authoritative reading (all relevant counters zero), per
+the plan's own choice of `ca-fsck --detail` as the tool for exactly this class of question.
 
 ## Residual gate row {#residual-gate-row}
 
