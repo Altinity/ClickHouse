@@ -414,6 +414,16 @@ friends).
 MSG
 
 # ========================== Phase 6: documentation ===========================
+group cas-docs-antalya 'docs/en/antalya/*' <<'MSG'
+CAS documentation: the Antalya CAS book
+
+The dedicated documentation set under docs/en/antalya/cas/: architecture
+(storage layout, manifests and refs, blob protocol, part lifecycle, read
+path, replication, mounts and leases, namespaces, garbage collection,
+correctness, design history) and operations (configuration, bucket
+requirements, monitoring, debugging, troubleshooting, migration).
+MSG
+
 group cas-docs 'docs/en/*' <<'MSG'
 CAS documentation
 
