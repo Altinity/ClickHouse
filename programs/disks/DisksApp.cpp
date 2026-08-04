@@ -560,7 +560,6 @@ int DisksApp::main(const std::vector<String> & /*args*/)
     DB::Cas::initializeBlobUploadPool(16);
     /// The condemned-local resurrection branch reaches the byte-weighted admission unconditionally too;
     /// `0` derives the cap from the same pool size (16 * 64 MiB), mirroring the server default.
-    DB::Cas::initializeCondemnedUploadAdmission(0, 16);
 
     registerCommands();
 
@@ -674,7 +673,6 @@ int mainEntryClickHouseDisks(int argc, char ** argv)
     SCOPE_EXIT_SAFE({
         DB::StaticThreadPool::shutdownAll();
         DB::Cas::shutdownBlobUploadPool();
-        DB::Cas::shutdownCondemnedUploadAdmission();
         GlobalThreadPool::shutdown();
     });
 

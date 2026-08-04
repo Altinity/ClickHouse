@@ -1499,7 +1499,6 @@ try
         LOG_INFO(log, "Waiting for background threads");
         DB::StaticThreadPool::shutdownAll();
         DB::Cas::shutdownBlobUploadPool();
-        DB::Cas::shutdownCondemnedUploadAdmission();
         GlobalThreadPool::instance().shutdown();
         LOG_INFO(log, "Background threads finished in {} ms", watch.elapsedMilliseconds());
     });
@@ -1722,9 +1721,6 @@ try
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
 
     DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::cas_blob_upload_pool_size]);
-    DB::Cas::initializeCondemnedUploadAdmission(
-        server_settings[ServerSetting::cas_condemned_upload_memory_bytes],
-        server_settings[ServerSetting::cas_blob_upload_pool_size]);
 
     std::string path_str = getCanonicalPath(String(server_settings[ServerSetting::path]), original_working_directory);
     fs::path path = path_str;

@@ -427,9 +427,6 @@ void LocalServer::initialize(Poco::Util::Application & self)
     /// pool unconditionally once a `cas` disk commits a part, so every entry point
     /// that can run a CA INSERT must initialize it, not only `clickhouse-server`.
     DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::cas_blob_upload_pool_size]);
-    DB::Cas::initializeCondemnedUploadAdmission(
-        server_settings[ServerSetting::cas_condemned_upload_memory_bytes],
-        server_settings[ServerSetting::cas_blob_upload_pool_size]);
 }
 
 
@@ -910,7 +907,6 @@ void LocalServer::cleanup()
         /// is torn down. Idempotent and noexcept, so safe even if never initialized (e.g. no
         /// `cas` disk was ever used).
         DB::Cas::shutdownBlobUploadPool();
-        DB::Cas::shutdownCondemnedUploadAdmission();
 
         if (global_context)
         {

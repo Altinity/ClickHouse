@@ -1230,7 +1230,6 @@ TEST(CASGCFrontierGate, AProvedEmptyCatalogUnderStageASuppressedStaysSuppressed)
 TEST(CASGCFrontierGate, ANamespaceBornAfterTheEmptyCutResurrectsTheCondemnedBlobInstead)
 {
     ensureBlobUploadPoolForTest();
-    ensureCondemnedUploadAdmissionForTest();
 
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
@@ -2379,7 +2378,6 @@ TEST(CASGCFrontierGate, ALateEdgeSparesADeletePendingBlobAtTheDeleteSite)
 TEST(CASGCFrontierGate, AResurrectedIncarnationSurvivesTheDelayedStaleTokenDelete)
 {
     ensureBlobUploadPoolForTest();
-    ensureCondemnedUploadAdmissionForTest();
 
     auto backend = std::make_shared<CountingBackend>();
     auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds=*/0);
