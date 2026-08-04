@@ -503,21 +503,6 @@ continuing the ID series, not renumbering anything above.
 - **[gc-enabled-false-silent] `gc_enabled=false` accumulates garbage silently** — HARD (user settings-policy direction) — Disabling the background GC scheduler produces no ongoing signal that reclamation has stopped. Add a periodic warning log line plus a metric while `gc_enabled=false` and the pool has reclaimable debris, so an operator who disabled GC for a legitimate reason (or by mistake) finds out before the pool grows unbounded.
 - **[dedup-presence-only-window-recheck] re-verify the deduplication presence-only-admit corruption window** — VERIFY (user-flagged from memory, re-derive from the disk-error audit) — The 2026-07-21 disk-error audit (`#disk-error-audit-followups-2026-07-21`) identified a presence-only dedup admit as a corruption-window class; re-verify against HEAD whether this window is still open post the format/staging changes since that audit, and either close it out or fold it back into an active item with current evidence.
 
-## Closed by the 2026-08 consolidation {#closed-2026-08-consolidation}
-
-Verified against the docs-consolidation verdict set (`docs/superpowers/cas/consolidation-2026-08/verdicts/verdicts.jsonl` joined against `clusters/clusters.jsonl` by `issue_ids`) on **2026-08-04**. Each item below had every matching cluster verdicted `done`/`rejected`/`stale`/`doc-fact` — no open work remains under the ID. Moved out of the live sections; do NOT re-open without a fresh claim.
-
-- **[AD-3] day-2 runbook** — doc-fact — `Layout::checkNamespace` rejects `..` path segments and the surrounding runbook material is confirmed present at HEAD (`CasLayout.cpp:319`, `gtest_cas_layout.cpp:127`).
-- **[B10] `manifest_size` always 0 in `Resolved`** — stale/doc-fact — the field still hardcodes zero (`CasRefLedger.cpp:343~resolveRef`), but the claimed live consumer is gone: the part-folder cache weight is `PartFolderView::estimatedBytes` (`PartFolderAccess.cpp:136`), not `bytes + manifest_size` — the under-count this item worried about does not exist under the current weight formula.
-- **[B125] integration tests on RustFS (not MinIO)** — done/doc-fact — soak/integration compose already pins RustFS (`utils/ca-soak/docker-compose.yml:13`, `docker-compose-multidisk.yml:11`), and real access-control tests exist in the release-readiness area (`05011_cas_gc_rebuild_access.sh`, `05019_cas_fsck_access.sh`).
-- **[B5] reconcile shared-pool integration tests to the per-`server_root_id` tree** — done/doc-fact — `ProbeOutcome` (`CasBackend.h:140-146`) and the sharded-fold mechanism (`gc_shards > 1`, `gtest_cas_gc_shard_plan.cpp:278`, `CaGcRootLocalPartManifestCore.tla:521`) confirm the per-server-root tree is what integration coverage now exercises.
-- **[B85] read-path 404 auto-repair** — done — `CasManifestReader::readManifest` confirms INV-NO-DANGLE fires on the missing-body path; a read-path 404 is a hard error by design, settling the "still wanted?" question raised by this item as no.
-- **[C2] defense-in-depth: fence-generation check on `resurrectStaged`/`putOverwrite`** — done — already self-marked DONE in place at {#c2-resurrect-putoverwrite-fence-check} (2026-07-23, commit-verified, tests named); independently re-confirmed by this pass (`CasPlainObjects.cpp:34~casPutObject` fence-generation admission/recheck, `ContentAddressedMetadataStorage.h` Local/Emulated backend coverage). Full detail kept in place, not duplicated here.
-- **[S16] strict resurrect-count check may fail deterministically** — doc-fact — `forced_gc_to_fixpoint` (`utils/ca-soak/scenarios/framework/gc.py:144`) and the event-name plumbing (`CasEvent.cpp:19`) confirm this is scenario-cycle tuning, not a product bug, as the item already suspected.
-- **[SEC-1] trust-domain documentation** — doc-fact — CityHash128/XXH3 are confirmed non-cryptographic defaults (`CasBlobDigest.h:40~BlobHashAlgo`, `gtest_cas_blob_hasher.cpp:77`) with sha256 available as the trust-domain-scoped building block this item names.
-- **[UNMATCHED-MINUS-ONE] unmatched removal-fold `-1` — verified harmless; pin the property** — done — the "REMAINING WORK" this item asked for (a cheap gtest pinning that an unmatched `-1` spares sibling edges) is landed: `CasBlobInDegree.h:63-64~sourceEdgeId`, `gtest_cas_blob_indegree.cpp:831~UnmatchedRemovalIsAPerKeyNoOpAndSparesSiblingEdges`.
-- **[codex-6] wire the fetch-handoff retention pin** — done — the publish-then-confirm design this item specced is landed: `CasPartWriteTxn.cpp:937~precommitAdd`, `DataPartsExchange.cpp` `Fetcher::relinkPartToDisk`/`Service::answerContentAddressedConfirm`, `CasRefLedger.cpp:400-401~confirmExactRef` — receiver publishes its `+1` binding then confirms with the sender before promote, exactly as designed.
-
 ## Recently closed (2026-07-13 grooming — do NOT re-open) {#recently-closed}
 
 Verified DONE at HEAD; recorded so they are not re-triaged:
@@ -706,11 +691,6 @@ Deterministic (5/5 + clean-dir rerun) on the current branch. Signature: the test
 ## [B208] CA startup mount-probe is fail-closed against a TRANSIENT S3 outage — server aborts and stays down (found by S40, 2026-07-17)
 A server started while the object store is unreachable dies during metadata load: the CA-pool mount startup capability probe (S3 write `_probe/<uuid>/token`) times out (`WriteBufferFromS3 ... Timeout`) -> `Application::main` treats it as fatal (`Caught exception while loading metadata: Code 499 S3_ERROR`) -> exit 243, no retry, stays down until an operator restarts it. Seen twice: S40 run `20260717T090957_S40_seed1` (ch2 `docker start` inside the rustfs pause window — by design of the scenario), and the earlier dl_probe repro (same Exited 243 after `docker restart -t 1` during the pause). Product question: a bounded startup retry / degraded-start (mount later, serve non-CA tables meanwhile) instead of aborting — weigh against fail-closed principles (a server that starts without its pool must not fake readiness). NOT a gate for the durability fix (S40's contract only requires acked data to survive on the live replica — it does). Related: the self-remount recovery work covers RUNNING servers losing the pool; this is the STARTUP window. NOTE (T3 review): S40's fixed fault schedule hits this abort DETERMINISTICALLY (ch2 restarts inside the pause) and the card carries no verdict on ch2 rejoining — when B208 is fixed, add an informational recovery verdict to S40 so a regression here produces signal.
 
-## CLOSED 2026-07-17: S37 chaos-leg oracle bug — self-grounding oracle landed (`a1e27178ba6`), first VALID mid-policy-MOVE-kill verdict is GREEN
-Resolved by the GREEN-DEBT #22 fix: the card now reads `rows_before_chaos_insert` and expects `rows_before + ttl_rows` (self-grounding) instead of the fixed param, plus bounded `PART_IS_TEMPORARILY_LOCKED` retry on the MOVE leg. Validated: dev rerun PASS 23/23 pre-hardening (build/test_s37_greendebt_run2.log) AND post-hardening committed-card run PASS 23/23 (RUN_HISTORY 20260717T173612_S37_seed1) — the first genuine atomicity verdicts, NO product defect. Historical entry below.
-## (historical) VERIFY: S37 chaos-leg oracle bug (rows==100 vs true 200) — the mid-policy-MOVE-kill atomicity property has NEVER actually been verified (sharpened 2026-07-17)
-The "restart mid-policy-MOVE is atomic" verdict has failed byte-identically on every run since the R2 landing (26590e4aa55f -> today), and today's post-DL-fix run shows `mover_error=None, checksum_stable=True, rows=200` — exactly 100 (TTL leg) + 100 (chaos leg insert into the SAME un-truncated `s37_ttl`), with the data checksum unchanged across the kill. This confirms the 2026-07-16 "minor/unconfirmed" note: the card's expectation compares against the fixed `ttl_rows` param (100) instead of the true expected 200 — a scenario-oracle bug that has been MASKING the real property. ACTION: fix the card (truncate before the chaos leg, or expect 200), re-run S37; only then do we learn whether a genuine mid-MOVE-kill atomicity defect exists. Until then S37=22/23 is a harness artifact, not a product verdict — but also NOT evidence of safety.
-
 ## GREEN-DEBT: S39 ci-scale config bug — `short_fault_s=15 >= _MOUNT_RENEW_PERIOD_S=10` invariant violation at ci scale (found DL-fix T4, 2026-07-17)
 S39's ci param row bakes in a short-fault window that violates the card's own timing assumption (the "short" leg must complete its fault inside a renewal period for the no-fence assertion to be sound); dev scale is correct and is what all prior green runs used (ci scale had NEVER run per RUN_HISTORY — this red was latent since the card's creation e93c28a17694a1). Fix the ci row in `s39_lease_fault_tolerance.py` param_table (size ci off the same 30s TTL anchor as dev, keeping short < renew period) and run S39 at ci scale to green. Per the no-known-reds rule this is a tracked return-item, not a "known".
 
@@ -719,10 +699,6 @@ S39's ci param row bakes in a short-fault window that violates the card's own ti
 
 ## GREEN-DEBT: local build-dir config drift — ALL localize_rust_c_* rules in build/build.ninja lost their reference-library args (found 2026-07-17 at image build)
 `ninja -C build clickhouse` now fails at `localize_rust_c_chdig` ("Error: no reference libraries given"); inspection shows EVERY localize rule (chdig, polyglot, wasmtime, delta_kernel_ffi) in the generated build.ninja carries only 4 args (lib/ar/objcopy/nm) and zero refs — while corrosion-cmake's generator only creates these targets when `_localize_ref_libs` is non-empty (contrib/corrosion-cmake/CMakeLists.txt:319-415). So some past reconfigure generated with a state where the genexprs produced nothing — latent until today because the rust targets were never dirty in recent incremental builds (T2's build passed because its cargo steps rebuilt but chdig localize did not re-run... first execution today failed). Impact: any future `ninja` touching rust contribs fails in build/. Fix on resume: full cmake re-configure of build/ (then check one localize rule has refs) — and understand WHICH configure produced the argless state (guard against recurrence). The 2026-07-17 nightly image was built from the T2 binary (10:35, all DL-fix gates ran on it) — unaffected.
-
-## FIXED 2026-07-18: `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` real-clock/TSan speed artifact
-This boundary test (constructs a manifest just under the 256 MiB `kExpectedManifestEncodedCap` and stages it) failed deterministically under TSan (3/3 reruns, ~24-26s each) with `stageManifest: part-manifest PUT ... UNCERTAIN (retry budget exhausted)` — no `ThreadSanitizer` warning anywhere, ruling out a genuine race. Root cause: `openPool()` in `gtest_cas_part_write.cpp` did not inject a fake `boot_ms_fn` (unlike other deadline-sensitive tests in this suite), so `CasMountRuntime::refAppendFenceOk` gated every controlled attempt against the REAL wall clock (mount_lease_ttl_ms=30000, safety margin 7000ms -> fence trips ~23s after pool-open). The pre-retry-loop encode+seal of a ~256 MiB manifest body, ordinarily ~4.3-4.9s (passed reliably under plain builds and under ASan), ran long enough under TSan's per-memory-access instrumentation to approach/exceed that ~23s real-clock threshold. Verified NOT a regression at the time (none of the 2026-07-18 fix-wave + final-review commits touched `CasMountRuntime.cpp`'s fence logic or the manifest-encode path).
-**FIX** (`47ea8f3c1d9`): the test now opens its Pool with a frozen `boot_ms_fn` (`[] { return uint64_t{0}; }`) instead of the shared `openPool()` helper, decoupling both the mount-lease fence and the CAS request controller's own deadline math (both consult the same injected clock seam) from real execution speed. Verified 3/3 green under TSan (~22-23s each, real CPU time, no longer racing a lease deadline) and unchanged under ASan/plain.
 
 ## GREEN-DEBT: ca-soak GC-checkpoint timeout formula assumes normal-speed GC throughput -- blows the budget under TSan (found 2026-07-18)
 `soak/checker.py:fixpoint_timeout_s` computes a backlog-scaled real-time bound as `5 * (initial_unreachable/reclaim_per_round_guess=50) * gc_interval_s`, i.e. it assumes the SERVER's own background-GC round throughput is roughly 50 reclaims/round (a normal-speed baseline). Running the standard 20-min phase-3 chaos soak against a TSan-instrumented server hits `CHECKPOINT FAILURE: GC unreachable count never stabilized within {bound}s` at the `gc_checkpoint` stage -- the unreachable-count history was clearly trending down (peak 26170 -> 12251) when the budget expired, i.e. GC was actively converging, just slower than the formula assumes; `dangling=0` and fsck stayed settled throughout. This is a harness-timing artifact, NOT a correctness bug -- TSan's severe per-memory-access instrumentation overhead drops the server's actual reclaim throughput well below the formula's baseline, so a backlog that comfortably fits the budget under a normal or ASan-instrumented binary blows through it under TSan. Same root-cause class as `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` above (TSan overhead vs a real-time budget calibrated for normal speed; that gtest is now FIXED by freezing its clock, but this soak-harness formula is a different codepath and still needs its own fix). Fix on resume: add a sanitizer-aware multiplier to `fixpoint_timeout_s` (or an explicit CLI override) so a full TSan chaos-soak can run through the chaos window; low priority since the workload/mutation/ttl_pressure stages and the full gtest battery already validate TSan correctness with zero races found.
@@ -945,22 +921,6 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
   forward on `StorageProxy` also changes `StorageTableFunctionProxy` semantics (a table-function proxy now
   answers the mutation-possibility check from its nested storage rather than the `IStorage` default) — sound,
   but call it out explicitly (codex F5).
-
-## [C2] defense-in-depth: fence-generation check on resurrectStaged + putOverwrite {#c2-resurrect-putoverwrite-fence-check}
-**DONE (2026-07-23, whole-increment-review fix commit — I2).** Both condemned-displacement branches of `PartWriteTxn::uploadFromSource` now capture the mount fence generation at the displacement DECISION (`displace_admitted_generation = store->fenceGeneration()`) and re-check it via `store->checkFenceOrThrow` immediately before the raw `resurrectStaged` / `putOverwrite` call — the last two durable writes left outside Task 4's fence-generation gate are now covered. Scope held EXACTLY to these two calls; the debris deletes (`cleanupStagedManifestDebrisBestEffort`'s `deleteExact`, `cleanupPendingTempFiles`) were left untouched (proven structurally incarnation-safe). Tests: `CasFenceGeneration.CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableCall` + `.CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall` (RED-demo verified: without the check the displacement lands and the flow throws `NETWORK_ERROR`, not 668). Entry kept for history.
-
-(2026-07-23, from rev.7 Task 4b review) The condemned-displacement branches of `PartWriteTxn::uploadFromSource` call `resurrectStaged`/`putOverwrite` raw — zero fence coupling. SAFETY already holds (the subsequent ref publish is fence-coupled → post-trip displaced blob = unreferenced debris; never-revive invariant intact — writer re-uploads its OWN bytes under a fresh incarnation_tag; putOverwrite is If-Match). Residual = one wasted post-trip write + a GC-liveness nuisance (fresh token dodges a queued exact-token condemned delete → one extra round). Adding `checkFenceOrThrow` there closes [C2] uniformly. SCOPE EXACTLY these two calls; do NOT chase the debris deletes (`cleanupStagedManifestDebrisBestEffort`'s `deleteExact`, `cleanupPendingTempFiles`) — both proven structurally incarnation-safe (build-scoped manifest keys / per-txn random staging keys).
-
-
-## Operator assertion for natural Vanished(erased) + GC-quiescent wiring (land TOGETHER) {#erased-capability-operator-assertion}
-
-> **OBSOLETE (2026-07-23): FORGET-only v1 decision** — the natural `Vanished(erased)` proof stack is excised entirely (spec rev.8 §9); no capability assertion is needed. Kept for history; the v2 door is the git history of the reviewed implementation.
-
-Superseded 2026-07-23 (T17): the FORGET-only decision (the `OBSOLETE` note above) resolved the
-formerly-pending question — the natural-`Vanished(erased)` proof stack (`gc_quiescent_fn`,
-`setStrongPrefixListCapable`, the outstanding-request counter, the prefix-emptiness probe) was **excised**,
-neither wired nor shipped dormant (spec rev.8 §9 excision list; plan excision task, commit `434f3214cec`).
-Nothing remains to wire. Full technical detail is in the git history of the reviewed implementation (the v2 door).
 
 ## CAS disk lifecycle rev.8 round (FORGET-only) — closure + residuals (2026-07-23) {#disk-lifecycle-rev8-closure}
 
@@ -1996,70 +1956,6 @@ suspicion, and a reason to expect the answer to be non-trivial rather than a tid
 It is also testable READ-ONLY before any counter is added: decode a sample of `_log/` objects on the stand
 and check whether the manifests named within a single transaction repeat. That would answer the cheap half
 of #17 without a product change.
-
-## ANSWERED 2026-07-26 — task #17: 39.6% of intake manifest fetches are re-reads, and the mechanism is exact {#gc-manifest-reuse-measured}
-
-Answered the cheap way, as {#gc-perf-intake-structure} proposed: decoded the ref-log objects on the stand
-with `ca-inspect` and counted. **No product change was needed to get the answer**, so the counter proposed
-in task #17 is not required for the decision (it may still be wanted for continuous tracking — separate
-question).
-
-Population: **all 959 ref-log transactions** currently in the soak pool, 8 namespaces, 6 epochs. Not a
-sample.
-
-### The rule that decides the cost {#reuse-rule}
-
-`manifestEdgesOfTxn` (Pool/CasRefProtocol.cpp) emits at most one edge per `OwnerTransition`, by shape:
-
-| shape | edge | manifest fetched |
-|---|---|---|
-| `AddPrecommit` | `+1` on the new manifest | yes |
-| `RemovePrecommit` / `RemoveCommitted` | `-1` on the old manifest | yes |
-| `Promote` (Precommit -> Committed, same manifest) | **none** — "the manifest keeps an owner the whole time, so there is no net edge" | **no** |
-
-The `Promote` exemption matters and I initially got it wrong: my first pass charged two fetches to every
-promote (it names the same manifest in both bindings) and produced 66.6% redundancy. Reading the emission
-rule instead of assuming it removed 6,112 phantom fetches and brought the number to 39.6%. **The measured
-number below is the one derived from the actual rule.**
-
-### What was measured {#reuse-numbers}
-
-```
-transactions                      959
-shapes            AddPrecommit 2991 · RemoveCommitted 4574 · Promote (no edge) 3056
-EDGES emitted (== manifest GETs)  7565      = 7.89 per txn
-distinct manifests among edges    4573
-  redundancy                      39.6%
-  repeat histogram                {1: 1582, 2: 2990, 3: 1}
-intra-transaction redundancy      0.0%      <- every edge WITHIN a txn names a distinct manifest
-manifests with both +1 and -1     2991      <- fetched once to add, once to remove
-```
-
-**The waste is entirely cross-transaction and the mechanism is exact.** 7565 − 4573 = 2992 redundant
-fetches; 2991 manifests carry both an add and a remove edge in this window. A part's manifest body is read
-once when its ref is published and again when its ref is dropped — the same bytes, for the same blob list,
-because there is no cache between them (proven independently by `CasManifestGet == CasRefEmittedEdges`
-exactly, in {#gc-perf-multiplier-attributed}).
-
-### What this does and does not license {#reuse-conclusions}
-
-A **round-scoped manifest-body cache** is a real lever: it would eliminate ~40% of the dominant phase's
-store traffic on this workload, and each avoided edge saves TWO round trips (HEAD + GET), not one. An
-op-scoped or transaction-scoped cache would save **nothing** — intra-transaction redundancy is exactly zero.
-
-Three honest caveats:
-
-1. **This is the residual pool (959 logs), not the measured rounds (5k-404k logs).** Direction of the bias
-   is arguable but not measured: a larger fold window should capture MORE add/remove pairs in one round,
-   pushing redundancy up, not down. That is a prediction. It should be checked against a large round before
-   any cache is sized.
-2. `edges/txn` here is 7.89 against 1.54-3.73 observed in the soak rounds — a different transaction mix
-   (this pool holds bulk-drop transactions of up to 297 ops). The REDUNDANCY FRACTION is the transferable
-   quantity, not the per-txn rate.
-3. A cache needs a memory bound; manifests are not small, and the fold already holds per-round buffers.
-
-Task #10 (the rig) was blocked on this and is unblocked: the service rate to design against is the measured
-256 logs/s, with a known ~40% headroom available from caching rather than from protocol change.
 
 ## FIXED 2026-07-26 — task #13: fsck could not report on a large pool, in four separate ways {#fsck-large-pool-fixed}
 
