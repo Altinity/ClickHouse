@@ -887,3 +887,15 @@ not yet triaged, likely unrelated; will classify when the unit/cas story is clos
   queued right after the soak slot frees, must cover the encode-time catch-point.
 - Remaining: discrimination verdict -> general pair (20m smoke + 90m specimen) -> 3c/3d/3e ->
   STAGE B verdict. Then #5.
+
+### 05:5x — FINDING #2 (Stage-B-relevant): DROP TABLE leaves CA namespaces LIVE {#finding-drop-live}
+S44 discrimination verdict: the dead incarnations' catalog entries are still state=live after
+DROP TABLE SYNC completed at the SQL layer (system.tables empty); GC-to-fixpoint changes nothing
+(rounds go Success->Deferred forever — correct behavior given all-live). Reproduced at 2 scales
+(40-cycle and 6-cycle). NOT a GC/janitor defect — the live->Removing transition is never admitted
+on DROP for this shape. Open discriminator: S34/S35 churn + 04290/04295 no-leftovers all PASS —
+their drops reclaim; what ingredient does S44 add (replicated? SYNC? concurrent held readers at
+drop)? RCA directed (trace wiring -> discriminate -> one disposable repro), NO fix without
+controller+codex (protocol-adjacent: removal admission under held lifetimes). General pair launches
+at the 60-min RCA checkpoint regardless. (b) row stays provisional; evidence:
+s44_discrimination.json in the specimen dir.
