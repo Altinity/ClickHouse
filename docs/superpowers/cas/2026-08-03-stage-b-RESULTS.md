@@ -59,7 +59,7 @@ batches of 5, strictly sequential (never overlapped with anything else on the bo
 | `test_cas_drop_pool_member` | PASS | 2/2 (`test_drop_dead_pool_member_heals_the_pool`, `test_drop_pool_member_rejected_on_readonly_disk`) |
 | `test_cas_file_cache` | PASS | 2/2 (`test_cache_over_ca_startup_and_roundtrip`, `test_cache_hits_on_repeated_reads`) |
 | `test_cas_gc_s3` | PASS | 1/1 (`test_gc_reclaims_dropped_blobs`) |
-| `test_cas_gc_sharded` | SKIPPED (pre-existing, infra) | `test_sharded_gc_soak` skips itself: "CA capability probe requires DeleteObject If-Match (ETag-conditional delete, MinIO >= RELEASE.2025-09). The integration-test MinIO image (RELEASE.2024-09-13T20-26-02Z) does not support it; the probe fails fail-closed and the server refuses to start." A pre-existing, self-documented infra gap in the local MinIO image version, not a CAS regression — the test's own skip reason names the fix (update the image) |
+| `test_cas_gc_sharded` | PASS (fixed, no longer skipped) | Initial run: `test_sharded_gc_soak` self-skipped on a MinIO-image capability gap (DeleteObject If-Match, MinIO >= RELEASE.2025-09 needed). Per the campaign's no-skip rule, switched the fixture to RustFS (every other CAS integration test already does; MinIO OSS lacks the needed conditional-delete support) and ran it for real — the FIRST time this module has ever executed. That surfaced three more independent, pre-existing, latent test-only bugs (a Python format/ClickHouse-macro brace-escaping bug; a post-restart `system.text_log` query race; the completion/shard-coverage assertions polling S3 keys that never matched production's actual layout — `completion_seal` never existed, the real name is `fold_seal`, and the path shape was missing an `attempt/<attempt>/` segment). Rewrote the two structural assertions against `gc/state`'s own adopted-(generation,attempt) authority (the same lookup production's `readAdoptedFoldSeal` uses) and a whole-`gc/gen/`-subtree shard scan. Six-run RCA arc, full detail in `c9147d312bd`'s commit message and the battery report. Final: **1 passed in 78.01s** (`build/t8_integration/gc_sharded_rustfs6.log`). The observed-blob_target-key-set log line (added per the anti-vacuity requirement) executes before the assertion that consumes it, but its stdout was not preserved in the harness's per-test artifact for a PASSING run (`--report-log-exclude-logs-on-passed-tests`) — the pass itself is the evidence the listing was non-empty and covered both shards, just not a captured verbatim key list |
 | `test_cas_insert_fault_recovery` | PASS | 1/1 (`test_post_multi_termination_uses_ordinary_lost_part_recovery`) |
 | `test_cas_lazy_load_recovery` | PASS | 1/1 (`test_lazy_cas_table_self_heals_after_s3_recovery`) |
 | `test_cas_ref_snaplog` | PASS | 1/1 (`test_ref_snaplog_lifecycle_reclaims_and_fsck_clean`) |
@@ -69,9 +69,11 @@ batches of 5, strictly sequential (never overlapped with anything else on the bo
 
 Batch A: `build/t8_integration/batchA.log`, `PRAKTIKA_EXIT=0`, 6 passed / 1 skipped in 53.90s.
 Batch B: `build/t8_integration/batchB.log`, `PRAKTIKA_EXIT=0`, 17 passed / 0 failed in 77.05s.
+`test_cas_gc_sharded` (was the batch-A skip, fixed separately per the no-skip rule):
+`build/t8_integration/gc_sharded_rustfs6.log`, `PRAKTIKA_EXIT=0`, 1 passed in 78.01s.
 
-**Integration battery total: 23 passed, 1 skipped (pre-existing infra gap), 0 failed, across all
-10 `test_cas_*` dirs.**
+**Integration battery total, final: 24 passed, 0 skipped, 0 failed, across all 10 `test_cas_*`
+dirs.**
 
 ## Ex-known-red stateless tests {#ex-known-red-stateless}
 
