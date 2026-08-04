@@ -1389,7 +1389,7 @@ TEST(CASRefWriterAppendLane, FenceMovementAtCheckpointPublicationRequiresRecover
         life, RefTxnId{candidate.writer_epoch, candidate.ref_sequence + 1})));
 }
 
-/// Phase 3 (spec 2026-07-17-cas-reftable-cow-map-design.md §Materialization): each of these N
+/// Phase 3 (reftable-cow-map materialization): each of these N
 /// publishes is its own isolated (unbatched) flush touching exactly one NEW ref -- if
 /// `flushRefBatch` did not materialize `rt->state.committed` after installing each flush's
 /// transaction, the overlay would grow by ~1 entry per flush and this would read back ~N,

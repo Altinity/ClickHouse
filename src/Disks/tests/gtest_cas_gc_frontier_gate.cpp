@@ -933,7 +933,6 @@ TEST(CASGCFrontierGate, AnExhaustedProbeBudgetSuppressesEveryDeleteFamily)
     EXPECT_TRUE(backend->head(blobKeyOf(layout, blob)).exists);
 }
 
-/// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md {#r11-empty-universe-vacuous}`):
 /// `frontier_proven == frontier_namespaces` is `0 == 0` -- vacuously TRUE -- on an empty universe, which
 /// is not by itself a proof of anything: a fresh pool, a damaged catalog, and a genuinely emptied pool
 /// all produce the same zeros. The gate's non-vacuity term therefore has TWO ways to be satisfied:

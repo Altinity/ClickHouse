@@ -15,9 +15,8 @@ namespace DB::Cas
 /// default for a backend without sharper evidence).
 SentinelProbeResult probeSentinel(Backend & backend, const String & key);
 
-/// Verdict of the zero-write startup bootstrap residual check (spec §2 "Startup [C4], ordered vs the
-/// capability probe [D2]", docs/superpowers/specs/
-/// 2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md). Before a writable `Pool::open` runs
+/// Verdict of the zero-write startup bootstrap residual check ("Startup ordered vs the capability
+/// probe"). Before a writable `Pool::open` runs
 /// the MUTATING `_probe/` capability battery, it must decide whether it is safe to bootstrap a missing
 /// `_pool_meta`. `pool_prefix` is EXCLUSIVELY CAS-owned: a fresh pool identity may be minted ONLY over a
 /// genuinely empty prefix — never over residual data an incomplete erase left behind (that would strand

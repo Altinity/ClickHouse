@@ -204,8 +204,7 @@ TEST(CASOperationGate, ContentReadOnVanishedThrowsTypedPerReasonMessage)
 /// point: a lease blip is unavailability, an identity loss is damage, and consumers outside CAS act on
 /// the difference. `ReplicatedMergeTreePartCheckThread` declares a part broken and detaches it for any
 /// refusal its `isRetryableException` hatch does not recognise, so coding a blip 668 made healthy parts
-/// look corrupt (BACKLOG {#lease-blip-part-check-collapse};
-/// `docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md`).
+/// look corrupt (BACKLOG {#lease-blip-part-check-collapse}).
 TEST(CASOperationGate, EveryClassThrowsRetryableTransientOnTransientNotLive)
 {
     auto storage = openGateStorage();

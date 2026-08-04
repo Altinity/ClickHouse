@@ -384,9 +384,8 @@ private:
 
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
-    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`
-    /// (A3 mint-tightening, spec 2026-07-23-cas-fetch-handoff-publish-confirm-design.md): an unowned
-    /// id may enter ownership only from the transaction that freshly staged it. Kept separate from
+    /// Every `ManifestId` this transaction has minted via `stageManifest`, checked by `precommitAdd`:
+    /// an unowned id may enter ownership only from the transaction that freshly staged it. Kept separate from
     /// `staged_manifests` above -- that vector's role (best-effort abandon cleanup) is unrelated and
     /// could change independently; this set exists purely as the ABA barrier's identity check, so it
     /// stays correct even if the cleanup vector's contents or lifetime ever change.

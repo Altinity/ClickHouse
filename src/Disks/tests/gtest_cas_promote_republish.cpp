@@ -9,7 +9,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
-/// RED/characterization tests for design doc 2026-07-08-cas-promote-over-committed-leak-fix-design.md:
+/// RED/characterization tests for the promote-over-committed leak fix:
 ///   BUG 1a (PROMOTE-OVER-COMMITTED-LEAK): `PartWriteTxn::promote` silently overwrites `refs[final_ref_name]`
 ///   when it already names a DIFFERENT committed manifest, orphaning the old manifest (leak). The fix
 ///   (Task 2) makes this throw `ABORTED` instead.
@@ -220,7 +220,7 @@ TEST(CASPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
     EXPECT_EQ(storage->getFileSize(dst_path + "/data.bin"), 9u);
 }
 
-/// REMOVED (all-tree-part-files Task 9, spec 2026-07-14-cas-all-tree-part-files-design.md §3):
+/// REMOVED (all-tree-part-files Task 9):
 /// `RepublishReDriveResyncsDriftedMutableFiles` proved that `republishRef`'s idempotent-skip path
 /// re-synced dst's `mutable_files` from src's CURRENT resolve when src's mutable payload drifted
 /// between the crashed attempt and the re-drive. That side channel is gone -- `metadata_version.txt`
@@ -276,7 +276,7 @@ TEST(CASPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 /// judges the manifest build-dead while an un-removed precommit still names it (GC no longer reclaims
 /// abandoned precommits — the writer removes them itself).
 ///
-/// A3 mint-tightening (spec 2026-07-23-cas-fetch-handoff-publish-confirm-design.md §A3) INVERTS this
+/// A3 mint-tightening INVERTS this
 /// test's original tail assertion. Before A3, this test's black-box PROOF that `abandon()` had really
 /// removed the exact precommit binding was that a FRESH `precommitAdd` for the SAME (ref_name,
 /// manifest_ref) succeeded -- a still-live binding would instead throw CORRUPTED_DATA ("add precommit

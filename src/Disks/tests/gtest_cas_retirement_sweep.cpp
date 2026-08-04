@@ -37,8 +37,8 @@
 ///      loses to it. The wait is deleted outright, setting and all -- the feature never shipped, so
 ///      there is no config to protect and no parsed-but-inert period to serve.
 ///
-/// The companion prose (premise / verdict / replacement / evidence, one row per retired item) is
-/// `docs/superpowers/cas/2026-07-28-stage-a-retirement-verdicts.md`.
+/// The retirement rationale (premise / verdict / replacement / evidence, one row per retired item)
+/// is captured in `docs/en/antalya/cas/architecture/design-history.md`.
 
 namespace DB::ErrorCodes
 {

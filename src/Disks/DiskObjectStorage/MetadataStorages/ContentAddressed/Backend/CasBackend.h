@@ -129,8 +129,7 @@ struct ListPage
     String next_cursor;       /// Last returned key; empty => no more pages.
 };
 
-/// Typed erasure evidence for one key or one prefix — see
-/// docs/superpowers/specs/2026-07-22-cas-disk-lease-loss-throw-and-stop-verbs-design.md §2. `head`/
+/// Typed erasure evidence for one key or one prefix. `head`/
 /// `get` deliberately flatten every kind of miss (a clean absence, a missing bucket/container, a
 /// permission failure, a transport fault) into one "not found" result, which is exactly right for
 /// their callers (a plain read) but wrong for lifecycle recovery, which must never treat a

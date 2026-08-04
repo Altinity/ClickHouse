@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 
-/// CAS pluggable-blob-hash Phase 2 (design 2026-07-11-cas-pluggable-blob-hash-design.md §12),
-/// Task 1: `BlobDigest` (the pool-scoped variable-length content digest, ADDITIVE-ONLY -- no
+/// CAS pluggable-blob-hash Phase 2, Task 1: `BlobDigest` (the pool-scoped variable-length content digest, ADDITIVE-ONLY -- no
 /// existing `UInt128 blob_hash` field is migrated in this task) + the ONE `PoolMeta`-scoped
 /// `DigestCodec` all digest<->hex/bytes conversion must route through.
 ///

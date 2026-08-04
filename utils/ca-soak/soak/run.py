@@ -93,8 +93,8 @@ TABLE = "ca_stress"
 # Dedicated Atomic database, created EAGERLY (lazy_load_tables OFF) by the single shared
 # `setup_cluster_and_table` helper. lazy_load_tables was deliberately turned off (2026-07-22): the
 # StorageTableProxy wrapper is under a quarantine decision after several unforwarded-virtual product
-# bugs (see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and the CAS backlog's
-# lazy_load_tables item). The table name stays bare; the workload connection's default database is DB.
+# bugs (see the CAS backlog's lazy_load_tables item). The table name stays bare; the workload
+# connection's default database is DB.
 DB = "ca_soak"
 FSCK_CONTAINER = "ca-soak-ch1-1"
 
@@ -1410,8 +1410,7 @@ def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
 
     lazy_load_tables is DELIBERATELY OFF (2026-07-22): the StorageTableProxy wrapper is under a
     quarantine decision after several unforwarded-virtual product bugs (SYSTEM verbs, mutations, TTL
-    metadata, rename -- see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and the
-    CAS backlog's lazy_load_tables item). Cost of turning it off: a transient S3 error during CAS table
+    metadata, rename -- see the CAS backlog's lazy_load_tables item). Cost of turning it off: a transient S3 error during CAS table
     load once again strands the table in a permanently-FAILED AsyncLoader job until restart (the property
     lazy_load_tables=1 was added for) -- outage-at-load scenarios lose that coverage until the feature
     decision lands."""

@@ -25,8 +25,7 @@ ManifestRef mref(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 }
 
 /// ===================================================================================
-/// Keyed ops: contains/insert/erase across base+overlay (spec:
-/// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md "E2 owned-manifest index").
+/// Keyed ops: contains/insert/erase across base+overlay (the "E2 owned-manifest index" work).
 /// ===================================================================================
 
 TEST(CASRefCowManifestSet, EmptySetHasNoMembers)

@@ -3041,8 +3041,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// `Live`/`Removing` set, so the per-namespace proofs decide on their own; `StageA_Suppressed`
     /// refuses outright, which is the posture a test asserting inertness selects. See `UniversePolicy`.
     const bool universe_authoritative = policy == UniversePolicy::Authoritative;
-    /// R11 (`docs/superpowers/cas/2026-07-28-ref-rework-adjacent-findings.md
-    /// {#r11-empty-universe-vacuous}`): `frontier_proven == frontier_namespaces` is `0 == 0` -- TRUE --
+    /// `frontier_proven == frontier_namespaces` is `0 == 0` -- TRUE --
     /// on an empty universe, which is not a proof of anything BY ITSELF: a fresh pool, a damaged
     /// catalog, or a read that legitimately returns nothing all produce zero entries. `frontier_namespaces
     /// > 0` closes that degenerate case for the ordinary, nonempty pool -- a nonzero count still needs

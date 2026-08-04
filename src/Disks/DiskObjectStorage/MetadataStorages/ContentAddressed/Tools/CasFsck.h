@@ -65,8 +65,7 @@ enum class FsckClass : uint8_t
                    /// nonzero 32-hex life id) whose life is simply absent from a catalog cut taken AFTER
                    /// the physical listing. This is the protocol-produced interval between a fenced GC
                    /// exact-deleting a `Removing` catalog row and the perpetual `NamespaceJanitor`
-                   /// reaching this key on a later bounded page -- inert debris, not damage (see
-                   /// `docs/superpowers/specs/2026-07-27-cas-ref-chain-complete-cut-design.md`). Reported
+                   /// reaching this key on a later bounded page -- inert debris, not damage. Reported
                    /// as a soft finding: NOT in `kFsckHardFindings`, does not fail the report.
 };
 
@@ -237,7 +236,7 @@ inline constexpr std::array kFsckHardFindings{
 /// for those, this assert plus the list below it is the whole of the mechanism, so bumping the number
 /// without visiting them defeats it. Bump it only after all three are done.
 ///
-/// AND IT REACHES NO PROSE. The rule is also restated in `docs/superpowers/cas/08-testing-and-soak.md`
+/// AND IT REACHES NO PROSE. The rule is also restated in `docs/superpowers/cas/AGENTS.md`
 /// and in the soak harness's comments and messages; those restatements have gone stale before -- more
 /// than once, about the exit set -- and nothing here can break a build over them. (No count is given,
 /// for the same reason the paragraph above gives none: nobody keeping a tally of restatements can

@@ -17,8 +17,8 @@ counterexample is treated as seriously as a real violation — it means the mode
 covering the case it claimed to cover. This is why every safety rule below ships with the
 counterexample that appears when you remove it.
 
-The full model index lives at `docs/superpowers/cas/06-tla-models.md`; this page is the
-reader-facing summary.
+The full model index (source `.tla` files and proof-run records) lives at
+`docs/superpowers/models/`; this page is the reader-facing summary.
 
 ## Model → invariant → counterexample {#model-invariant-counterexample}
 

@@ -732,7 +732,7 @@ TEST(CASPartFolderAccess, BaselineRequestCountsWithoutRetention)
 
 /// ==== Phase 4 (retention) semantics battery: spec §Testing acceptance criteria ====
 
-/// REMOVED (all-tree-part-files Task 9, spec 2026-07-14-cas-all-tree-part-files-design.md §3):
+/// REMOVED (all-tree-part-files Task 9):
 /// `MutableRefreshWithoutManifestRead` and `WriteThroughEraseThenRebuild` proved the cache facade's
 /// `LastDecision::MutableRefresh` fast path -- a cheap re-check that could serve a retained view whose
 /// manifest was unchanged but whose separate mutable payload had drifted, without a manifest re-read.

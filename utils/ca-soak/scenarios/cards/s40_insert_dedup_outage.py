@@ -1,7 +1,6 @@
 """S40: acked-then-lost INSERT under an S3 outage + replica kill (dedup phantom regression gate).
 
-Reproduces the 2026-07-17 CRITICAL data loss (report
-docs/superpowers/reports/2026-07-17-dataloss-traced-root-cause.md): continuous byte-identical-retry
+Reproduces the 2026-07-17 CRITICAL data loss: continuous byte-identical-retry
 sync inserts while RustFS is paused past the CAS write budget (90s) and the second replica is
 killed mid-outage. Before the renameParts durability fix, an insert whose Keeper multi committed
 the block_id but whose disk commit then failed left a PHANTOM dedup znode; the client retry

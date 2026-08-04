@@ -1584,7 +1584,7 @@ TEST(CASPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
     EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, id);
 }
 
-/// all-tree-part-files Task 2 (spec 2026-07-14-cas-all-tree-part-files-design.md §4, TLA+ `WRepoint`):
+/// all-tree-part-files Task 2 (TLA+ `WRepoint`):
 /// `promote`'s existing unique-ref guard (BUG 1a) refuses to overwrite a committed ref naming a
 /// DIFFERENT manifest -- correct for an ACCIDENTAL double-publish, but there is no way to perform an
 /// INTENDED repoint (a standalone write/remove on an already-committed part) without it. `allow_repoint`

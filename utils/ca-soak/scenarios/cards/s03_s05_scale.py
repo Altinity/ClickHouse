@@ -214,7 +214,7 @@ class S03(Scenario):
             "CASRefLogBodyGets"))
 
         # --- ops-budget: an IDLE round (no touch) does near-zero generation-run I/O -----------
-        # Phase 4 Lever A (GC round skip-unchanged; docs/superpowers/cas/ROADMAP.md): a round that
+        # Phase 4 Lever A (GC round skip-unchanged; docs/en/antalya/cas/roadmap.md): a round that
         # makes no destructive decision DEFERs and re-adopts the sealed in-degree generation instead
         # of rebuilding it from a full snapshot read. Pre-fix, BACKLOG "S3-BUDGET — idle GC has a high
         # fixed per-round cost on a large static pool" measured ~1362 `CASGCGet` PER ROUND on a static

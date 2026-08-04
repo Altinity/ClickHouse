@@ -286,8 +286,7 @@ std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
 /// (leaving the part queued for a later check) exactly when `checkDataPart::isRetryableException`
 /// recognises the error, and otherwise declares the part broken -- detach and re-fetch.
 /// `INVALID_STATE` is absent from that classifier, so a lease blip used to read as part corruption
-/// (BACKLOG `{#lease-blip-part-check-collapse}`; audit
-/// `docs/superpowers/reports/2026-07-29-ca-transient-classifier-audit.md`). Re-coding the CA transients
+/// (BACKLOG `{#lease-blip-part-check-collapse}`). Re-coding the CA transients
 /// was chosen over widening the upstream classifier because `INVALID_STATE` is broad: widening it would
 /// also reclassify 18 unrelated TERMINAL sites, CA and non-CA alike.
 ///

@@ -1,6 +1,7 @@
 """Unit tests for the CAS signal reader (`soak.signals`).
 
-The theme these tests defend is one clause of `docs/superpowers/cas/INTENT.md`: a signal that can
+The theme these tests defend is one clause of `docs/superpowers/cas/AGENTS.md`'s fail-closed
+invariant: a signal that can
 degrade to "nothing observed" rather than to an error is a defect. So the assertions are mostly about
 what must RAISE — an unknown counter, a server-side rejection — versus the two things that may
 legitimately return a sentinel: a node that is down, and a system log that was never materialized.

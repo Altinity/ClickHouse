@@ -377,7 +377,7 @@ TEST(CASTransactionInlining, EagerFileInlinedDataBinBlobbed)
     EXPECT_EQ(storage->getFileSize("a99/a99a99a9-9999-4999-8999-999999999999/all_1_1_0/checksums.txt"), 13u);
 }
 
-/// all-tree-part-files Task 4 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): a standalone
+/// all-tree-part-files Task 4: a standalone
 /// write of ONE file onto an ALREADY-COMMITTED part must carry every other file of that part forward
 /// (a repoint, Task 3), never replace the manifest with just the touched file.
 TEST(CASTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
@@ -463,7 +463,7 @@ TEST(CASTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
-/// all-tree-part-files Task 6 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): the mutable-
+/// all-tree-part-files Task 6: the mutable-
 /// per-part-file branch is deleted from `writeFile` -- uuid.txt/metadata_version.txt/txn_version.txt
 /// now flow down the ordinary content path, landing in the manifest like any other file.
 TEST(CASTransactionAllTree, BuildTimeSidecarsLandInManifest)
@@ -537,7 +537,7 @@ TEST(CASTransactionAllTree, CommittedTxnVersionStoreRepoints)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
-/// all-tree-part-files Task 8 (B123 evolution, spec 2026-07-14-cas-all-tree-part-files-design.md §6):
+/// all-tree-part-files Task 8 (B123 evolution):
 /// a lone surgical unlink of ONE committed content file (not followed by a whole-part removal in the
 /// same transaction — the ATTACH `removeVersionMetadata` shape) must actually delete the file via a
 /// repoint-remove, closing the pre-Task-8 fail-open (unlinkFile of a committed content file used to be

@@ -12,7 +12,7 @@
 >   residual-settling loops keep the summary counter. `HARNESS-DRAIN-VERDICT-CONVERGENCE` — same.
 > - **STILL OPEN**: `NEEDS-INFRA-S12/S22/S27`; the three `SCENARIO (proposed)` ack-floor cards
 >   (SIGSTOP floor hold, kill-mid-burst fence-out, request-budget guard — now release-gate items,
->   see `docs/superpowers/cas/ROADMAP.md §release-gates-2026-07-03`); `S07` manifest-cap needs
+>   see `docs/en/antalya/cas/roadmap.md`); `S07` manifest-cap needs
 >   ci/full scale; B206 settle-gate tuning; B207 fsck phantom-dangling race (RESTORED to the
 >   roadmap as a release gate).
 > - `PRODUCT BUG (S13 mount self-recovery)` — RESOLVED by self-remount (2026-07-02, marked inline).
@@ -808,7 +808,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   round — the S05/S08 scaling this entry measured) is still O(universe) per fold, because a single
   FOLD still rebuilds the whole in-degree generation. That is Lever B (incremental point-updatable
   in-degree, so even a non-idle round is O(delta) not O(universe)) — still open, tracked in
-  `docs/superpowers/cas/ROADMAP.md` under "GC round is O(universe) not O(delta)".
+  `docs/en/antalya/cas/roadmap.md` under "GC round is O(universe) not O(delta)".
   - **UPDATE (S08, 100000 tiny parts):** the same O(pool-object-count) scaling reached **398 s
     (6.6 min) for a SINGLE GC fold round** at ~100k parts (one round deleted 24392 manifests). Data
     points: 87 ms @ 400 parts (S03) -> 93 s @ 10k tables (S05) -> 398 s @ 100k parts (S08). The
@@ -1243,7 +1243,7 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   token)`, matching `CaIncarnationCore`'s `GRetire`. Adds `blob_retire_replaced` CA-log event +
   `CASGCRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
   TLA+-gated by `CaGcResurrectReuploadOrphan` (`_bug.cfg` violates `NoLeakForever`, `_fix.cfg` holds; see
-  `docs/superpowers/cas/06-tla-models.md` §Area 12). Commits `5156d37454b`(TLA+)..`6da55fce2a0`(tests), fix
+  `docs/superpowers/models/` (`CaGcResurrectReuploadOrphan`)). Commits `5156d37454b`(TLA+)..`6da55fce2a0`(tests), fix
   `308360e595d`. Verified: unit `CasGcLeak.*` (RED→GREEN + idempotency + writer-side retire-view), and S30 —
   the blob residual moved from stuck `unaccounted` to a draining pipeline (the remaining S30 `_manifests`
   orphan was a DISTINCT bug, `DANGLING-PRECOMMIT`, since also fixed). Follow-up: touch-gating dimension in
@@ -1274,8 +1274,8 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   GC-side reclaim being parked by the token-diff `Skip`: `reclaimAbandonedPrecommit` only runs on a
   fold-visit, and a content-static shard holding the abandoned precommit is Skip-parked, so reclaim never
   re-runs once the watermark proves the precommit dead. Fix (TLA+-gated by
-  `SkipParksDeadPrecommit`/`LiveDeadPrecommitReclaimed`, see `docs/superpowers/cas/06-tla-models.md`
-  §Area 7): `Gc::computeDiscoverDecisions` force-Reads a token-stable shard whose sealed minimal live
+  `SkipParksDeadPrecommit`/`LiveDeadPrecommitReclaimed`, see `docs/superpowers/models/`):
+  `Gc::computeDiscoverDecisions` force-Reads a token-stable shard whose sealed minimal live
   precommit `isPrecommitDead` vs the mount watermark, so `reclaimAbandonedPrecommit` runs, emits the
   owner-removal, the fold folds the `-1`, and R6 deletes the manifest. Commits: TLA+ `3a836c24364` +
   sibling-cfg `5fe74bd373e`; RED test `910646891e0`; `isPrecommitDead` `180a6f2cc0e`; `ShardCoverage`
@@ -1360,8 +1360,8 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   the destination: if dst is already committed with the same path-sorted `entries`, skip
   stage/precommit/promote and `dropRef(src)` (finish the interrupted rename); a different-content dst throws
   `ABORTED`. So a RENAME/DETACH-ATTACH crash re-drive no longer leaks and never reaches promote's guard.
-  TLA+ gate: `AtMostOneCommittedManifestPerRef` holds in `stage2` (`docs/superpowers/cas/06-tla-models.md`
-  §Area 7). Commits: TLA+ `7e604ff1a2a`; RED tests `fa6b7689459`; promote guard `0c8c564f498` (+ test-fix
+  TLA+ gate: `AtMostOneCommittedManifestPerRef` holds in `stage2` (`docs/superpowers/models/`).
+  Commits: TLA+ `7e604ff1a2a`; RED tests `fa6b7689459`; promote guard `0c8c564f498` (+ test-fix
   `dee120cdde8`); republishRef idempotency `93e7cda1085`. Unit: `CasPromoteRepublish.*` (promote fail-close,
   same-manifest idempotent, absent-ref, re-drive idempotent, different-content conflict).
 

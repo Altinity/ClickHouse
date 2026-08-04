@@ -24,7 +24,7 @@ RefCommittedRow row(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 }
 
 /// ===================================================================================
-/// Keyed ops (spec 2026-07-17-cas-reftable-cow-map-design.md §Mechanism)
+/// Keyed ops
 /// ===================================================================================
 
 TEST(CASRefCowMap, EmptyMapHasNoEntries)

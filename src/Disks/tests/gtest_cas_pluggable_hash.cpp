@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
-/// P1-T2 (CAS pluggable-blob-hash Phase 1, design 2026-07-11-cas-pluggable-blob-hash-design.md §4/§8):
+/// P1-T2 (CAS pluggable-blob-hash Phase 1):
 /// `PoolMeta` records the pool-wide `blob_hash_algo` and `PoolMeta::createOrValidate` fail-closes on a
 /// disk config that disagrees with an existing pool's recorded algo -- the pool-wide durability
 /// invariant (never silently re-hash an existing pool).
 ///
-/// Phase 3 T4 (design 2026-07-11-cas-mixed-algo-pools-design.md §5) RELAXES that single fail-closed
+/// Phase 3 T4 RELAXES that single fail-closed
 /// value into `PoolMeta::algos_used` (sorted, append-only): a config algo already a MEMBER is
 /// accepted with no write (steady state); a non-member is admitted via a CAS-union ONLY when the
 /// disk opts in (`blob_hash_allow_new`), and refused (`BAD_ARGUMENTS`, same as before) otherwise --
@@ -535,7 +535,7 @@ TEST(CASPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 }
 
 /// ============================================================================================
-/// CAS mixed-algo pools Phase 3 T5 (design 2026-07-11-cas-mixed-algo-pools-design.md §5/§7):
+/// CAS mixed-algo pools Phase 3 T5:
 /// path-derived `BlobRef` in the sweep/fsck (`Layout::parseBlobKey`) and per-entry admission
 /// validation at `foldManifestEdges` with refresh-on-miss.
 /// ============================================================================================
@@ -746,7 +746,7 @@ TEST(CASPluggableHash, ReaderGenerationIsRaisedToGBuild)
 }
 
 /// ============================================================================================
-/// CAS mixed-algo pools Phase 3 T6 (design 2026-07-11-cas-mixed-algo-pools-design.md §9.3/§9.5):
+/// CAS mixed-algo pools Phase 3 T6:
 /// cross-cutting cruxes over a pool that genuinely mixes algos end-to-end (reclaim + distinctness).
 /// The no-bare-digest grep gates (design Step 3) are run separately, not as gtest bodies.
 /// ============================================================================================

@@ -6,7 +6,7 @@
 
 /// Task 3 (all-tree-part-files plan, 2026-07-15): `CachedPartFolderAccess::repointRef` -- the audited
 /// primitive a standalone write/remove on an already-COMMITTED part must go through once the mutable
-/// per-part file set is empty (spec 2026-07-14-cas-all-tree-part-files-design.md §4). It republishes
+/// per-part file set is empty. It republishes
 /// the whole manifest with the new entry set, riding `PartWriteTxn::promote`'s `allow_repoint` mode (Task 2).
 
 namespace ProfileEvents

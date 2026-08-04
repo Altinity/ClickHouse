@@ -22,12 +22,11 @@
 ///     N=100: 48.8 us    N=1,000: 476 us    N=10,000: 5,018 us    N=100,000: 55,976 us
 ///     Google Benchmark complexity fit: O(N log N), RMS 2%.
 ///   After incremental admits() (2026-07-20) -- O(1) via incremental body-byte counters on
-///   RefTableState (see docs/superpowers/specs/2026-07-20-cas-ref-admits-incremental-budget-design.md):
+///   RefTableState:
 ///     N=100: 1842 ns    N=1,000: 1875 ns    N=10,000: 1864 ns    N=100,000: 1919 ns
 ///     Google Benchmark complexity fit: O(1), RMS 1-2%.
 ///
-/// BM_EncodeRefLogTxn history (this binary; acceptance gate for the CasJsonWriter migration,
-/// docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md):
+/// BM_EncodeRefLogTxn history (this binary; acceptance gate for the CasJsonWriter migration):
 ///   Before CasJsonWriter, field-by-field WriteBuffer calls (baseline): 753 ns.
 ///   After CasJsonWriter bulk-append migration (2026-07-20): 333 ns -- this is the shipped code.
 ///   BM_MemcpyTxnBytes floor (same bytes, plain String appends of 16-byte fragments): 30.7 ns.
@@ -42,8 +41,7 @@
 /// Phase B baselines, 2026-07-21, pre-encapsulation (this binary; `--benchmark_repetitions=3
 /// --benchmark_report_aggregates_only=true`; medians reported). Recorded ahead of the
 /// `RefTableState` encapsulation refactor so later phases can re-run this exact suite unchanged and
-/// diff against these numbers. Full comparison table:
-/// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md.
+/// diff against these numbers.
 ///   BM_Admits (promote op; stays O(1) via the incremental budget counters, untouched by this round):
 ///     N=100: 963 ns    N=1,000: 979 ns    N=10,000: 988 ns    N=100,000: 1,029 ns
 ///     Complexity fit: O(1), RMS 2%.
@@ -72,7 +70,7 @@
 ///     Complexity fit: O(N log N), RMS 2%.
 ///
 /// Final, 2026-07-21, shipped tree (post E1+E2+E3; E4 tried and REVERTED -- full per-phase tables in
-/// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md, `bench_t5_e3.log`):
+/// `bench_t5_e3.log`):
 ///   BM_AdmitsAddPrecommit: ~692-714 ns FLAT across N=100..100,000 -- O(1), RMS 1%
 ///     (the owned-manifest index replaced the linear scan; ~571x at N=100k).
 ///   BM_ReplayHistory: 1,725.58 ns/row (was 48,859) -- in-place `TrustedReplay` apply, -96.5%.
@@ -214,8 +212,7 @@ BENCHMARK(BM_EncodeRefLogTxn);
 /// The "near-memcpy" floor for BM_EncodeRefLogTxn: the SAME encoded bytes assembled from
 /// precomputed 16-byte fragments by plain String appends -- approximating the writer's append
 /// granularity with zero formatting/escaping work. Originally an acceptance gate for the
-/// CasJsonWriter migration (docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md);
-/// measurement showed the <=3x-of-floor target is physically unreachable for a validating,
+/// CasJsonWriter migration; measurement showed the <=3x-of-floor target is physically unreachable for a validating,
 /// JSON-escaping encoder (BM_EncodeRefLogTxn lands at ~10.8x this floor even after the 2.26x
 /// CasJsonWriter speedup -- see the BACKLOG resolution for the profiled breakdown). Kept as a
 /// documented reference floor, not a pass/fail gate.

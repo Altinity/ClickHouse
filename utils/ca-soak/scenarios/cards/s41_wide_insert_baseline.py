@@ -4,8 +4,7 @@ Establishes the CAS-on-S3 WRITE-PATH performance baseline for a wide insert and 
 bottleneck diagnosis. The workload is one big INSERT into a WIDE MergeTree table with 30 mixed-type
 columns partitioned into many partitions, so a single insert commits ~one part per partition — many
 parts x 30 columns => thousands of blobs through the serial commit path. This is the exact shape the
-write-path stage-1 design (docs/superpowers/specs/2026-07-22-cas-writepath-stage1-internal-design.md)
-targets, and this card is the measurement that gates it.
+write-path stage-1 design targets, and this card is the measurement that gates it.
 
 Two legs on the SAME node, identical DDL + identical deterministic INSERT:
 

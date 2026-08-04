@@ -1085,7 +1085,7 @@ TEST(CASWiringOps, FilesOnlyTableRootRemovalIsImmediatelyAbsentWithoutGc)
     EXPECT_FALSE(storage->existsFile("a77/a77a77a7-7777-4777-8777-777777777777/format_version.txt"));
 }
 
-/// REMOVED (all-tree-part-files Task 6, spec 2026-07-14-cas-all-tree-part-files-design.md §4):
+/// REMOVED (all-tree-part-files Task 6):
 /// `MutableTmpMoveOnCommittedPart` exercised `VersionMetadataOnDisk`'s OLD atomic-write dance —
 /// autocommit `txn_version.txt.tmp`, then a standalone one-shot `moveFile(.tmp -> txn_version.txt)`
 /// — via `ContentAddressedTransaction::moveFile` directly. That dance no longer exists in production:

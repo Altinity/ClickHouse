@@ -4,9 +4,8 @@ The suite faults nodes (kill/restart) and the object store (`s3faultproxy`), but
 ALLOCATOR. This card makes allocation failure a first-class fault source, and it exists for ONE
 window: a ref-log transaction whose PUT has already succeeded, where the in-memory apply then
 throws. That window leaves the writer cache MISSING a durable transaction — a data-loss class,
-because a snapshot published from a poisoned cache can hide the transaction permanently (design
-`docs/superpowers/specs/2026-07-23-cas-fetch-handoff-publish-confirm-design.md`
-§[Problem 2](#problem-ledger)). §A1 made the three install regions allocation-free, and §A2's lane
+because a snapshot published from a poisoned cache can hide the transaction permanently.
+§A1 made the three install regions allocation-free, and §A2's lane
 state machine (`RefLaneState`, `ProfileEvents::CASRefNeedsRecovery`) is what must catch anything
 that still slips through.
 

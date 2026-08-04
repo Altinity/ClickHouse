@@ -345,8 +345,8 @@ TEST(CASGCRetire, DeleteRemovesBodyAndMeta)
 /// in-degree recovers before graduation is SPARED (unchanged ledger behavior) but GC must NEVER flip its
 /// meta `Condemned -> Clean` on the spare. A deposed leader that cleared-then-lost the round would leave a
 /// stray-`Clean` over a still-condemned body; a writer reading `Clean` would reuse the exact condemned
-/// token, which a stale exact-token redelete then deletes (INV_NO_LOSS live-blob loss —
-/// `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`). The spare leaves the meta `Condemned`;
+/// token, which a stale exact-token redelete then deletes (INV_NO_LOSS live-blob loss).
+/// The spare leaves the meta `Condemned`;
 /// ONLY a writer that displaces the body with a fresh incarnation token publishes `Clean`.
 TEST(CASGCRetire, SpareLeavesMetaCondemned)
 {
