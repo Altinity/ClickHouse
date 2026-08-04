@@ -776,3 +776,10 @@ None touch CAS surfaces (no cas disk in those lanes; queries don't reach CAS cod
 LIKELY-FLAKY/pre-existing; no local fix prepared. Escalation rule: if any repeats on the next CI
 round, do the artifact-level RCA then. cas-lane stateless jobs still PENDING. Unit-pair fix
 already in branch (aacc233dc13) awaiting next push.
+
+### Watchdog 02:44 {#wd-0244}
+- Sharded test run #6: PASSED (78s). Full arc green: rustfs fixture + 4 latent test bugs peeled
+  (brace-format, dead key-layout premise, text_log post-restart race, self-referential DANGLE
+  artifact) + adopted-seal authority (B) + cross-generation both-shards check (C). The gc_shards=1
+  blindspot now has real integration coverage. t8-lead woken to commit the arc + battery close-out.
+- Next: soak stage (staged smoke->full, one at a time), 3c/3d inventory, specimen, verdict.
