@@ -44,6 +44,26 @@ bucket. There is no external coordinator, and no `Keeper` usage inside the pool 
 stays exactly where `ReplicatedMergeTree` already used it, for replication log and part-set
 consensus, and its load does not grow with pool size.
 
+## Deployment guidance {#deployment-guidance}
+
+`GC` throughput is proportional to how much changes in the pool: a pool holding a very large
+number of parts from many servers, or data that churns very quickly, means longer `GC` rounds.
+Two consequences for planning:
+
+- **The preferred deployment is a second tier for cold data**: hot, fast-churning parts stay on
+  the local (or plain S3) tier, and `CAS` holds the large, slow-moving cold tail — where
+  deduplication pays the most and `GC` traffic is minimal.
+- **At large scale, shard the pool by key prefix.** With tens of servers, or thousands of tables
+  and millions of parts, split the deployment into several independent pools by giving each shard
+  its own prefix — the shards can share one bucket:
+
+  ```xml
+  <endpoint>https://bucket.s3.amazonaws.com/cas/{shard}</endpoint>
+  ```
+
+  Each prefix is a fully independent pool (its own refs, leases, and `GC`), so rounds stay short
+  regardless of the total fleet size.
+
 ## Status {#status}
 
 `CAS` is **experimental**. It ships in Altinity Antalya builds. Experimental means the on-disk
