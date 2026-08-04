@@ -508,3 +508,41 @@ one operation, not two.
 The general lesson for this backlog item: any proposal that defeats a queued delete by editing a
 record OTHER than the object's own incarnation is defeating a check that does not read that record. If
 it did read it, the protocol would rest on a document any writer could forge.
+
+### The most promising alternative: make the local arm UNCONDITIONAL, like the S3-staging arm already is {#displacement-unconditional-write}
+
+Established while examining the two above, and it looks stronger than either. Ask what the `If-Match`
+on the resurrect write actually buys, and the answer is narrower than it appears:
+
+- It does NOT protect anyone's durable references. `ManifestEntry` carries a `BlobRef` -- the content
+  hash -- and the word `token` does not occur in the part-manifest format at all. Incarnation tokens
+  live in `BlobDepRecord` inside one transaction and in the audit event; nothing durable names an
+  incarnation, and the bodies of two racing resurrections are equivalent by construction (same content
+  hash; they differ only in the `incarnation_tag` inside the envelope header).
+- It does NOT provide INV-NO-RETURN. That comes from minting a FRESH `incarnation_tag`, which changes
+  the bytes and therefore the ETag, so GC's queued exact-token delete of the condemned incarnation
+  misses. The condition is not what saves the resurrection; the fresh tag is.
+- What it does buy is (a) ECONOMY -- a loser adopts the winner's incarnation instead of re-uploading a
+  body that already exists, which on a multi-gigabyte blob is the difference between one HEAD and
+  gigabytes of traffic per loser -- and (b) the ability to tell "someone displaced it first" apart from
+  "GC deleted it in the window", which the refusal path currently disambiguates with a second HEAD.
+
+**The precedent is already in the tree, in the sibling arm of the same branch.** `resurrectStaged` --
+the S3-native staging path -- "UNCONDITIONALLY writes `[fresh_header][payload]` to `blob_key`"
+(`CasObjectStorageBackend.h`). So the design already accepts an unconditional resurrect write when the
+bytes come from staging. If that is sound there, the question is what makes the local-source arm
+different, and the answer may be: nothing but history.
+
+**Why this could be the best of the three: it also solves GCS.** The single-part cap exists only for
+CONDITIONAL writes (`conditionalWriteSettings` sets `s3_force_single_part_upload` for
+generation-token stores because GCS drops preconditions on multipart completion). An UNCONDITIONAL
+write has no such restriction and may take the multipart path on GCS like anywhere else. An
+unconditional streaming resurrect would therefore be size-independent on EVERY backend, and the GCS
+ceiling -- and the guard, and the settings-table caveat -- would stop being needed for this path.
+
+What must be settled before adopting it: whether losing the adopt-on-conflict economy is acceptable
+(measure how often two writers race the same condemned blob -- the fan-out makes it plausible), and
+whether anything downstream depends on the post-`Done` claim that the stored incarnation is OURS
+rather than merely equivalent. The audit event records our token; if a racing writer overwrote us a
+moment later, that event describes an incarnation that no longer exists -- harmless for correctness as
+far as this analysis goes, but it should be stated rather than discovered.
