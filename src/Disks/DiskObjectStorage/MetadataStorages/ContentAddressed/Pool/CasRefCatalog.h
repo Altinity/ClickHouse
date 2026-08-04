@@ -247,8 +247,8 @@ public:
     /// + `completeCreation` are for, so this reports `Superseded` (never `LOGICAL_ERROR`) and sends the
     /// caller back through its own resume loop: sibling openers of the same namespace that all observed
     /// "no entry" before any of them landed step 1 race in here exactly this way. A namespace already
-    /// `Live`/`Removing` IS a caller bug (recreating an existing name is Task 5's -- removal's --
-    /// business, not creation's) and still throws `LOGICAL_ERROR` naming the observed state.
+    /// `Live`/`Removing` IS a caller bug (recreating an existing name is removal's business, not
+    /// creation's) and still throws `LOGICAL_ERROR` naming the observed state.
     static NamespaceCreationOutcome createNamespace(
         Backend & backend, const Layout & layout, uint64_t gc_shards,
         const RootNamespace & ns, const CreatorFence & creator,

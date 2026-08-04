@@ -174,8 +174,10 @@ std::vector<CatalogEntry>::const_iterator findEntry(const RefCatalog & catalog, 
 /// Thrown from `createNamespaceStep1`'s own `mutate` (below) when a FRESH read -- the first one, or
 /// any `Conflict` retry's re-read -- already carries an entry for the namespace being admitted. Never
 /// thrown by the public `casAdmitEntry`: that function keeps its documented "already-present is a
-/// caller bug, let `encodeRefCatalog` abort" contract for its many single-namespace-per-catalog
-/// callers (production and test). `createNamespace` alone needs the other answer, because ITS
+/// caller bug, let `encodeRefCatalog` abort" contract for its many single-namespace-per-catalog test
+/// callers -- it has no production caller at all; `createNamespaceStep1` below duplicates its
+/// admission shape rather than calling it, precisely so this recheck can be added without weakening
+/// `casAdmitEntry` itself. `createNamespace` alone needs the other answer, because ITS
 /// "already present" can be a sibling opener's OWN in-flight step 1 landing between createNamespace's
 /// pre-check read and this loop's read -- a race the design already names and resumes through
 /// `Superseded`, not a caller bug.
@@ -198,8 +200,17 @@ std::function<void()> create_namespace_step1_pre_read_hook_for_test;
 RefCatalog createNamespaceStep1(
     Backend & backend, const Layout & layout, uint64_t gc_shards, const CatalogEntry & entry)
 {
+    /// Moved into a local before invoking, not called on the global directly: a hook that reassigns
+    /// `create_namespace_step1_pre_read_hook_for_test` from inside its own body (a test driving a
+    /// one-shot interleaving) would otherwise reassign the very `std::function` object whose `operator()`
+    /// is executing it -- undefined behavior, not merely untidy. The local copy is a distinct object the
+    /// hook body cannot reach.
     if (create_namespace_step1_pre_read_hook_for_test)
-        create_namespace_step1_pre_read_hook_for_test();
+    {
+        std::function<void()> hook_to_run;
+        std::swap(hook_to_run, create_namespace_step1_pre_read_hook_for_test);
+        hook_to_run();
+    }
 
     const auto mutate = [&entry](const RefCatalog & cur) -> RefCatalog
     {

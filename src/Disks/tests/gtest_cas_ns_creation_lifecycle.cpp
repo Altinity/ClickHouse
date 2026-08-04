@@ -268,12 +268,12 @@ TEST(CASNsCreationLifecycle, CreateNamespaceRacingASiblingsFullCreateBetweenPreC
 
     /// Fires exactly once, inside the LOSER's `createNamespace` call, after its pre-check read already
     /// observed no entry -- synchronously runs the winner's own full `createNamespace` to completion
-    /// (all the way to `Live`) before the loser's step 1 performs its own first read. Cleared before
-    /// this closure returns so the winner's own nested call, and every later call in the test, run
-    /// hook-free.
+    /// (all the way to `Live`) before the loser's step 1 performs its own first read. The production
+    /// call site swaps the hook into a local before invoking it, so the global is already empty by the
+    /// time this body runs: the winner's own nested call, and every later call in the test, run
+    /// hook-free without this body needing to clear it itself.
     CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest([&]
     {
-        CasRefCatalog::setCreateNamespaceStep1PreReadHookForTest(nullptr);
         const auto winner_outcome = CasRefCatalog::createNamespace(
             backend, layout, 1, ns, winner, /*admitted_generation=*/1, ALWAYS_ADMITTED, generousDeadline());
         ASSERT_EQ(winner_outcome, CasRefCatalog::NamespaceCreationOutcome::Live);
