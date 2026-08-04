@@ -758,3 +758,11 @@ product, not (d) flake (3-for-3 deterministic on the failing commit rules that o
   change: potential product signal; t8-lead directed to full RCA (verbatim lines, transient-vs-
   persistent discriminator, fsck evidence) before any fix. Rewrite cap lifted — test is detecting.
 - Soak stage remains queued behind this RCA.
+
+### Watchdog 02:24 {#wd-0224}
+- Sharded run #5: DANGLE artifact fix worked; assertion B (adopted seal) PASSED; C failed its own
+  anti-vacuity guard — adopted attempt's blob_target/ prefix legitimately EMPTY (carried runs are
+  seal-body REFERENCES; physical keys stay under the attempt that wrote them). Directed FINAL
+  iteration: C = cross-generation listing, both shards present, non-empty; B unchanged. One run,
+  then hard stop (revert to the three independently-correct fixes + return-item).
+- CI PR 2073: next tick :11 will re-check; local cifix sanity was 2/2 green.
