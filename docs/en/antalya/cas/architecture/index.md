@@ -12,8 +12,8 @@ doc_type: 'reference'
 `CAS` ("content-addressed storage") is a `MetadataStorage` back-end for object-storage disks
 (`metadata_type = cas`) that stores every `MergeTree` part file once, addressed by the hash of
 its content. Many servers share one object-storage pool with no byte duplication, no zero-copy
-replication bookkeeping in Keeper, and no per-blob reference counting that grows with data
-volume instead of cluster size.
+bookkeeping in `Keeper`, no per-replica local-disk reference state that grows with data volume,
+and no mutable per-blob refcount.
 
 It is still experimental — that is deliberate, not a caveat to apologize for. Pre-release means
 the format can still change cheaply, with zero compatibility scaffolding, and the design can
