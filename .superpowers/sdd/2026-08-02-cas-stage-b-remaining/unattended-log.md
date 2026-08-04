@@ -1174,3 +1174,24 @@ compiles, let alone runs, those abort-path tests.
 
 **In flight.** `tmp/run_ca_gate_both.sh` rerun, started 13:03: release build+gate, then ASan
 build+gate, sequential. **Next:** commit the test fix once both are green → criterion-4 HOLD arm → T9.
+
+## Tick — 2026-08-04 13:20 {#tick-gates-green-hold-arm-started}
+
+**Gates GREEN in both lanes** on the corrected tree: release **1993/1993** (276 suites), ASan
+**1998/1998** (294 suites), zero sanitizer findings. Test fix committed `6b7651d156d`.
+
+**The test fix changed shape on review.** My first attempt asserted the captured log was empty, which
+pins the ABSENCE of a message: it protects nothing and would fail on any future logging added to that
+path for an unrelated reason. Replaced by dropping the capture from the test entirely — the counter
+assertion (`CASGCUnmatchedAdoptedParentLives` +1, `droppedParentRows() == 1`, and the unmatched life
+in neither the plan nor the parent/successor fold states) already states what the test is for.
+`ScopedCasGcLogCapture` stays — another test in the same file uses it.
+
+**Also fixed a process error of mine:** `pkill` by script name failed and the command aborted before
+the restart, so the ASan lane ran ~6 minutes against a stale binary. Killed by PID, verified the only
+remaining match was my own shell, then reran clean.
+
+**In flight.** Criterion-4 HOLD arm, delegated: injection shape chosen is `GapBelowWitness` — the one
+`HoldReason` that simulates a fault INSIDE the trusted-store model (a store that loses an object),
+rather than byte-rot under a live writer, which the RESULTS doc already ruled outside the model and
+which is what cost the seed-`20260805` run. **Next after it:** T9.
