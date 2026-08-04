@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <IO/ReadBufferFromString.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 
@@ -104,4 +105,28 @@ TEST(CASBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
     /// tokenMatches is exact identity (value AND type) — a same-value/different-type token never matches.
     EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::ETag}));
     EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::Emulated}));
+}
+
+/// The single-PUT cap binds CONDITIONAL writes, because that is where GCS drops the precondition. A
+/// resurrect carries no precondition, so it must not be capped -- this is the regression test for a
+/// ceiling that used to apply here and no longer does. A future consistency-minded refactor that
+/// routes the resurrect through conditionalWriteSettings would silently reintroduce it; this fails
+/// then.
+TEST(CASBackendGeneration, ResurrectIsNotBoundByTheSinglePutCap)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native,
+        /*conditional_single_put_cap=*/16);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    ASSERT_EQ(b->putIfAbsent("p/gen/res", "original").outcome, PutOutcome::Done);
+
+    const String payload(1024, 'x');   /// far above the 16-byte cap
+    DB::ReadBufferFromOwnString in{payload};
+    const Token tok = b->resurrect(in, "p/gen/res", String("HDR"));
+    EXPECT_FALSE(tok.empty());
+
+    auto got = b->get("p/gen/res");
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, "HDR" + payload);
 }

@@ -56,6 +56,12 @@ auto-detected from the endpoint host. It also rejects one shape outright: a **co
 ignores preconditions on that call — a measured, documented gap, not a hypothetical one. `CAS`'s
 conditional writes therefore always take the single-`PUT` path on a generation-dialect backend.
 
+This bounds CONDITIONAL writes only. The write-once create carries `If-None-Match`, so on a
+generation-dialect backend it is single-part and limited by `gcs_max_conditional_put_bytes`. The
+condemned-blob resurrect carries no precondition — its identity comes from a freshly minted
+incarnation tag rather than from a compare-and-swap — so it takes the ordinary multipart path and has
+no size limit on any backend.
+
 Every request carrying a rewritten header also has its AWS auth headers stripped and every
 remaining `x-amz-*` header renamed to `x-goog-*`, since GCS rejects a mixed header set.
 

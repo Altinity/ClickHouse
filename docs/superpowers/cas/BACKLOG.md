@@ -418,6 +418,13 @@ continuing the ID series, not renumbering anything above.
 
 ## `[gcs-conditional-overwrite-rethink]` GCS conditional overwrite needs re-thinking from the premise, not a bigger cap {#gcs-conditional-overwrite-rethink}
 
+**SCOPE NARROWED (2026-08-04): the resurrect path no longer has this problem.** The condemned-blob
+resurrect is now an UNCONDITIONAL streaming write (`Backend::resurrect`), takes multipart on every
+backend, and is size-unlimited on GCS too. What remains capped is the CONDITIONAL write-once
+CREATE (`If-None-Match`), still forced single-part under `gcs_max_conditional_put_bytes` -- so this
+item is now only about creating a blob larger than the cap on GCS, and everything below about the
+overwrite/resurrect shape is historical context.
+
 GCS honours no preconditions on multipart completion — Google's own XML API documentation says
 "Preconditions are not supported in the requests", and it was measured independently on 2026-07-03
 (`0a3bc2f1fc6`). A lost precondition there does not fail the write, it **silently overwrites**, which
@@ -447,102 +454,3 @@ deleted; whether GCS should instead be documented as supporting CAS only below a
 and whether the upstream change is worth it for one backend. The answer may legitimately be "cap it,
 document it, and refuse bigger blobs" — that is a design decision, and it has not been made.
 
-## `[condemned-displacement-delete-then-reupload]` Model the delete-then-re-upload alternative in TLA+ before dismissing it {#condemned-displacement-delete-then-reupload}
-
-The condemned-blob displacement currently REPLACES the dying incarnation with a conditional write
-against its exact token. The alternative — `deleteExact(key, condemned_token)` followed by an ordinary
-write-once `putIfAbsentStream` — is attractive: it needs no conditional-overwrite streaming form at
-all, and the "object absent → re-stream" path it lands in already exists and is exercised
-(`CasPartWriteTxn.cpp`, the `!hr.exists` arm, which handles a concurrent GC delete).
-
-It was set aside on three arguments, and those arguments are exactly what a model should either
-confirm or destroy:
-
-1. **The absence window is the whole upload.** Between the delete and the completed re-upload the key
-   does not exist, and for a multi-gigabyte blob that is minutes, not milliseconds. The conditional
-   overwrite has no such window: the key is populated at every instant.
-2. **Readers address blobs by CONTENT, not by incarnation.** `ManifestEntry` carries a `BlobRef`, not a
-   token, so a reader that resolves a live reference during the window gets a 404 on a blob it has
-   every right to read. Live references to a condemned blob are possible by construction: condemnation
-   is decided from a snapshot, and a reference can be admitted after it — our own dedup is that case.
-3. **It converts a recoverable failure into data loss.** Today a failed displacement (lost lease,
-   crash, refused precondition) changes nothing and can be retried. With delete-first, a crash between
-   the two steps destroys the body permanently, and every part that had deduplicated onto it loses
-   data.
-
-Argument 1 is arithmetic and argument 3 is a crash-ordering claim — both are precisely what TLA+
-settles. **Argument 2 is the one worth modelling first**, because it is a reachability question, not
-an intuition: is there an interleaving in which a reader holds a live reference to a condemned blob
-whose body is absent? If the model says no such state is reachable, the delete-then-re-upload shape
-becomes strictly simpler than what we are building and the seam addition should be reconsidered.
-
-The GC analogy does NOT transfer, and the model should encode why: GC deletes only what it has proven
-unreachable and creates nothing in its place, so it never occupies a state where a key must exist but
-does not.
-
-Existing models to extend rather than start from scratch: the resurrect/condemn specs under
-`docs/superpowers/models/` that already carry INV-NO-RETURN and the condemn-marker ordering.
-
-### A second alternative, examined and rejected: re-point the meta instead of the body {#displacement-repoint-meta}
-
-Also worth carrying into any brainstorming here, because it is the shape people reach for first and
-the reason it fails is instructive. The idea: leave the condemned body alone and instead rewrite its
-per-hash meta object — back to `Clean`, or pointing at a token that does not exist — so the queued
-delete finds nothing to match.
-
-It cannot work as stated, and the reason is structural rather than incidental. The blob delete site
-(`CasGc.cpp`, the `redelete_now` loop) issues `deleteExact(blobKey(entry.ref), entry.token)` with the
-token carried in GC's OWN durable retired pipeline, decided at condemnation. The meta is not consulted
-there at all. Rewriting it therefore cancels nothing: GC still arrives with the token it saved, the
-body still goes, and the meta is left asserting health for an object that no longer exists — precisely
-the dangling state the exact-token protocol exists to prevent.
-
-The design says so in its own words nearby: a stale `deleteExact(t1)` is safe because by the time it
-runs "the object is absent OR a writer already changed its incarnation token". Changing the incarnation
-token is the ONLY sanctioned way to defeat a queued delete. And a token is an ETag, i.e. a function of
-the bytes — a server-side copy of an object onto itself reproduces the same body and the same ETag, so
-there is no way to mint a new token without writing content. That is why `buildHeader` mints a fresh
-`incarnation_tag`: changing the header bytes is what changes the ETag. Token change and body write are
-one operation, not two.
-
-The general lesson for this backlog item: any proposal that defeats a queued delete by editing a
-record OTHER than the object's own incarnation is defeating a check that does not read that record. If
-it did read it, the protocol would rest on a document any writer could forge.
-
-### The most promising alternative: make the local arm UNCONDITIONAL, like the S3-staging arm already is {#displacement-unconditional-write}
-
-Established while examining the two above, and it looks stronger than either. Ask what the `If-Match`
-on the resurrect write actually buys, and the answer is narrower than it appears:
-
-- It does NOT protect anyone's durable references. `ManifestEntry` carries a `BlobRef` -- the content
-  hash -- and the word `token` does not occur in the part-manifest format at all. Incarnation tokens
-  live in `BlobDepRecord` inside one transaction and in the audit event; nothing durable names an
-  incarnation, and the bodies of two racing resurrections are equivalent by construction (same content
-  hash; they differ only in the `incarnation_tag` inside the envelope header).
-- It does NOT provide INV-NO-RETURN. That comes from minting a FRESH `incarnation_tag`, which changes
-  the bytes and therefore the ETag, so GC's queued exact-token delete of the condemned incarnation
-  misses. The condition is not what saves the resurrection; the fresh tag is.
-- What it does buy is (a) ECONOMY -- a loser adopts the winner's incarnation instead of re-uploading a
-  body that already exists, which on a multi-gigabyte blob is the difference between one HEAD and
-  gigabytes of traffic per loser -- and (b) the ability to tell "someone displaced it first" apart from
-  "GC deleted it in the window", which the refusal path currently disambiguates with a second HEAD.
-
-**The precedent is already in the tree, in the sibling arm of the same branch.** `resurrectStaged` --
-the S3-native staging path -- "UNCONDITIONALLY writes `[fresh_header][payload]` to `blob_key`"
-(`CasObjectStorageBackend.h`). So the design already accepts an unconditional resurrect write when the
-bytes come from staging. If that is sound there, the question is what makes the local-source arm
-different, and the answer may be: nothing but history.
-
-**Why this could be the best of the three: it also solves GCS.** The single-part cap exists only for
-CONDITIONAL writes (`conditionalWriteSettings` sets `s3_force_single_part_upload` for
-generation-token stores because GCS drops preconditions on multipart completion). An UNCONDITIONAL
-write has no such restriction and may take the multipart path on GCS like anywhere else. An
-unconditional streaming resurrect would therefore be size-independent on EVERY backend, and the GCS
-ceiling -- and the guard, and the settings-table caveat -- would stop being needed for this path.
-
-What must be settled before adopting it: whether losing the adopt-on-conflict economy is acceptable
-(measure how often two writers race the same condemned blob -- the fan-out makes it plausible), and
-whether anything downstream depends on the post-`Done` claim that the stored incarnation is OURS
-rather than merely equivalent. The audit event records our token; if a racing writer overwrote us a
-moment later, that event describes an incarnation that no longer exists -- harmless for correctness as
-far as this analysis goes, but it should be stated rather than discovered.
