@@ -531,10 +531,6 @@ disk-level and server-level settings surface.
 - `deduplication_head_first_min_bytes` — `1` MiB by default. Minimum blob size at which a `HEAD` is sent
   before the body, so that an upload of already-present content can be skipped. `0` disables it.
 - `gc_snapshot_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
-- `manifest_sweep_list_budget_keys` — `1000` by default. Per-round key-listing budget for the manifest
-  sweep.
-- `manifest_sweep_delete_budget_keys` — `100` by default. Per-round delete budget for the manifest
-  sweep.
 - `gcs_max_conditional_put_bytes` — `1` GiB by default. On generation-token backends (Google Cloud
   Storage), the body of a conditional write is RAM-buffered up to this size; a larger conditional
   write throws `NOT_IMPLEMENTED`. Irrelevant on `ETag`-based backends such as AWS S3.
