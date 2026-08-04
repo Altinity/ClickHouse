@@ -862,3 +862,11 @@ was confirmed clean afterward.
 - rca-createns: RCA closed, fix parked on laneg/ci-fix-createns (68759dbd66e), post-soak
   verification queued as task #5. master src verified clean.
 - Next: (a) row commit -> S44 smoke (controller-watched) -> S45 -> general pair.
+
+### Watchdog 04:44 {#wd-0444}
+- Soak progress: (a) churn PASS (3x loop, 42min); (b) S44 PASS committed (2x80 cycles + drain
+  window; fsck-authoritative, pool_shape 40-object note disclosed); S45 smoke PASS.
+- Open: the 40-key live-vs-dead sample verdict is unclear — the "verify_sample" log shows a fresh
+  S44 rerun (with cluster reset) instead of a sample; woken t8-lead: S45 full FIRST, then resolve
+  the sample from the predown archive or mark unresolved-residual honestly.
+- CI: cifix + createNamespace fixes parked; next CI tick :11.
