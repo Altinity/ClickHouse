@@ -1,5 +1,0 @@
-columns format version: 1
-3 columns:
-`event_date` Date
-`event_id` UInt64
-`payload` String
