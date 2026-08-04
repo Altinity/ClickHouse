@@ -1042,3 +1042,16 @@ USER SANCTION given for the candidate direction: under `universe_authoritative` 
 authoritative catalog read is positive proof of no live edge (unlike a LIST-shaped nothing), so a
 proven-empty universe may complete the frontier while an inconclusive one still refuses. Codex consult
 launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.md) before any code.
+
+### Watchdog 15:24 {#wd-1524}
+- FINDING #3 fix in progress: codex consult ANSWERED (endorse with narrowing — the proof must be the
+  token-bearing decoded catalog snapshot with zero entries ACROSS ALL states, not frontier_namespaces==0;
+  a Creating-only catalog must keep failing closed). Decoder version-floor hardening DESCOPED by
+  controller (not load-bearing, shared-format blast radius) -> BACKLOG item.
+- emptyuniverse-fix agent: writing gate + six replacement tests (one guard test replaced by positive
+  proved-empty drain, Creating-only, absent, malformed, StageA_Suppressed, birth-after-empty-cut race).
+  Diff scale audited and justified (351/41 tests, 61/16+33/5 production). Work UNCOMMITTED; 4 tests red
+  in its current run (expected failing-first or a real gate hole — unresolved).
+- COMMUNICATION FAILURE: the agent receives none of my messages and sends none; it is alive (running
+  builds/tests). USER RULE recorded: exactly two live worktrees (master, lane-g) — the agent created a
+  third (lane-g-emptyuniverse, now 37G of build tree); consolidation owed once its work is committed.
