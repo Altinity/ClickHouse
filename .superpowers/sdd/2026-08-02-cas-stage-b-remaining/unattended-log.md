@@ -1070,3 +1070,16 @@ launched (tmp/codex_emptyuniverse_consult.md -> tmp/codex_emptyuniverse_answer.m
   deletes, opaque life ids). Open: exact-cadence assertions, the two rewritten pre-existing tests,
   full-file re-run behind the abort, then consolidation into lane-g and removal of the third worktree.
 - New BACKLOG item ordered: `[cas-tests-unchecked-optional-deref]` (16 sites in one file, ~143 tree-wide).
+
+### Watchdog 17:24 {#wd-1724}
+- FINDING #3 INTEGRATED: three commits cherry-picked to cas-gc-rebuild (27a41a0cf05, 5440c0278c4,
+  6be51656992); third worktree removed (back to master+lane-g, 45G reclaimed). Build green.
+- First full CA gate on the integrated tree: 2024/2027 — three pre-existing tests failed, ALL of the
+  same class (they pinned the pre-fix standstill): the two CASGCRoundDefer "inert debris" tests
+  asserted deleteTotal()==0 (the dead-life janitor now legitimately reclaims by exact token) and
+  CASTruncateReclaim.DropNamespaceLeavesSharedBlobDebrisForPerpetualSweep required unreachable>0
+  after dropping the last namespace (it is now 0 — the pool drains). Rewritten to assert the
+  substance (body never read; janitor is the deleter; sweep finishes) — 18/18 green, committed
+  0508e724dcb. Full CA gate rerunning.
+- NEXT: full gate verdict -> rerun 05023 (must reach pending_condemned=0) -> [cas-tests-unchecked-
+  optional-deref] BACKLOG entry -> hold-arm short soak -> T9.
