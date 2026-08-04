@@ -76,27 +76,29 @@ The bare, uncached form — a storage policy pointing directly at the `CAS` disk
 
 ## Disk-level settings {#disk-settings}
 
-Source: `ContentAddressedSettings.cpp` (`LIST_OF_CONTENT_ADDRESSED_SETTINGS`). None of these keys
-carry a `cas_`/`ca_` prefix — the disk block already scopes them.
+None of these keys carry a `cas_`/`ca_` prefix — the disk block already scopes them.
+
+`CAS` is experimental: any setting below may change semantics, change its default, or disappear
+entirely before release. Treat this table as a snapshot of the current build, not a stable contract.
 
 | Setting | Default | Description |
 |---|---|---|
-| `server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint` |
+| `server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount |
 | `scratch_path` | server data path | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
-| `gc_enabled` | `true` | Run the background GC scheduler on this disk |
+| `gc_enabled` | `true` | Run the background GC scheduler on this disk. `false` is a debugging aid, not an operating mode: garbage then accumulates indefinitely and silently — watch `system.cas_gc_log` for round activity if you ever toggle it |
 | `gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
-| `blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`); fixed at pool creation |
-| `blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool's `algos_used` |
-| `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later) |
+| `blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
+| `blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
+| `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Safer than the name suggests: only the preflight probe is skipped — the conditional-write correctness check still runs unconditionally on every writable mount |
 | `deduplication_cache_bytes` | 64 MiB | Byte budget of the blob presence cache (`0` disables) |
 | `deduplication_head_first_min_bytes` | 1 MiB | Minimum blob size to try a `HEAD` before uploading the body |
 | `gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
-| `gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1); creation-time only |
+| `gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `gcs_max_conditional_put_bytes` | 1 GiB | GCS single-`PUT` budget for conditional writes (generation-token stores only) |
 | `part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
 | `part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
 | `part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
-| `part_folder_validate` | `always` | `ForceFresh` body re-proof policy (`always` \| `never` \| `age <seconds>`) |
+| `part_folder_validate` | `always` | Cache body re-proof policy (`always` \| `never` \| `age <seconds>`). **Leave at `always`**: the other modes trade the fail-closed body-existence check for an optimization — this is a trust decision about unverified data, not a performance knob |
 | `manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
 | `gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
 | `staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in |

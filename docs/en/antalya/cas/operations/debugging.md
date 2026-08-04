@@ -134,7 +134,8 @@ SYSTEM CAS GC RUN cas;
 
 One row per disk it ran on: `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`,
 `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`,
-`entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`. Omitting
+`entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, `anomalies`,
+`pending_candidates`, `pending_condemned`, `pending_retired`. Omitting
 the disk name runs one round on every content-addressed disk on the node. A manual run executes
 regardless of `SYSTEM CAS GC STOP` — `STOP` pauses only the background scheduler.
 
