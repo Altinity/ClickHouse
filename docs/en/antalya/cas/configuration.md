@@ -123,7 +123,6 @@ are process-wide, not scoped to one disk block.
 | Setting | Default | Description |
 |---|---|---|
 | `cas_blob_upload_pool_size` | `16` | Size of the dedicated server-wide thread pool used to upload blobs in parallel when committing a `CAS` part. Zero is rejected: the pool must have at least one thread |
-| `cas_condemned_upload_memory_bytes` | `0` | Aggregate memory budget for the one `CAS` upload branch that materializes a whole blob body in memory (resurrecting a condemned incarnation with a local source). `0` derives the budget from `cas_blob_upload_pool_size` times a 64 MiB per-task budget; a single resurrection exceeding the whole budget is still admitted alone rather than waiting forever |
 
 ## `SYSTEM CAS` commands {#system-commands}
 
