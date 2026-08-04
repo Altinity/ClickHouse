@@ -918,3 +918,12 @@ fan out to both?). Empirical confirm queued for the smoke->90m gap. General (d) 
   expected during it. t8-lead holding correctly.
 - (b) row PROVISIONAL pending nothing now (its mystery became FINDING #2's evidence); will be
   re-judged with the finding's disposition at verdict time.
+
+### CI check 07:11 {#ci-0711}
+New: Integration (amd_tsan 4/6) — 2/1198: test_replicated_database (non-CAS, watch) +
+test_cas_drop_pool_member heal test: decommission REFUSED fail-close ("lease held") after the
+mounts-table poll said not-live — two liveness predicates diverge by design (table = TTL arithmetic,
+command = conservative lease re-read); sanitizer slack widens the gap. Product correct; test fixed
+inline on master (bounded retry through the documented refusal, commit above). Verification run
+deferred to the post-soak slot (praktika forbidden during soak). Codex dropns ruling received;
+dropns-fix draft writer running on lane-g. 90m specimen mid-run.
