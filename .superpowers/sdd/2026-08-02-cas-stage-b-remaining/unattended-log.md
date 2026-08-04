@@ -1012,3 +1012,14 @@ dropAllData namespace leak (8042f221be7, codex-ruled design). Specimen preserved
 figure was confirmed re-derivable. Carried named: hold-arm injection owed, 4 unverifiable T6b caps,
 checkpoint-corruption recovery residual, 05023 deferral. NEXT: codex verdict on fix-verify ->
 integrate both fixes -> 05023 via praktika -> hold-arm short run -> T9.
+
+### Watchdog 13:04 {#wd-1304}
+- T8 COMPLETE (verdict committed 801712397cd); specimen archived, cluster torn down, box free.
+- fix-verify: codex verdict APPROVE-WITH-FIXES landed 08:45 (extracted to tmp/codex_fixverify_answer.md).
+  Open with the agent: revert of the StorageJoin/StorageSet CAS-conditioned TRUNCATE throw (USER
+  RULING — wrong layer, upstream-scope creep; the Join/Set truncate question must be answered by a
+  self-heal determination + BACKLOG item instead), internal-label comment leakage flagged by codex,
+  and the per-finding disposition. Woken; no commits since 00f5e4475e4.
+- Nine `codex exec -m gpt-5.6-luna` processes on the box are NOT ours — batch-NNN wrappers from the
+  neighbouring docs-consolidation session; left alone deliberately.
+- NEXT: fix-verify triage -> integrate both fixes -> 05023 via praktika -> hold-arm short run -> T9.
