@@ -783,3 +783,11 @@ already in branch (aacc233dc13) awaiting next push.
   artifact) + adopted-seal authority (B) + cross-generation both-shards check (C). The gc_shards=1
   blindspot now has real integration coverage. t8-lead woken to commit the arc + battery close-out.
 - Next: soak stage (staged smoke->full, one at a time), 3c/3d inventory, specimen, verdict.
+
+### Watchdog 03:24 {#wd-0324}
+- Churn full leg #2 (--scale full): SCENARIO_EXIT=0 in ~14 min of real spec-scale churn — honest
+  progress but still < the written >=30 min; directed the sanctioned loop shape (extra seeds
+  back-to-back, judge at end). Scale-knob lesson recorded: E4 pinned commands lacked --scale,
+  default dev silently shrank runs (caught by smoke staging).
+- t8-lead post-finish dormancy recurred (3rd time) — poll-then-ACT reminder issued.
+- CI PR 2073: no change since 03:11 tick. Next: churn loop -> S44 pair -> S45 pair -> general pair.
