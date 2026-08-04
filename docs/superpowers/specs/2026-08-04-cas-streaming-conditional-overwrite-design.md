@@ -1,6 +1,12 @@
 # CAS streaming conditional overwrite — design
 
-**Status:** approved, not implemented.
+**Status: SUPERSEDED** by `2026-08-04-cas-unconditional-resurrect-design.md`, which drops the
+condition entirely. Kept because its analysis of the seam and of the GCS multipart gap remains
+correct and is cited by the successor; what it got wrong was assuming the resurrect write needed
+to be conditional at all. `resurrectStaged` -- the sibling arm of the same branch -- already wrote
+unconditionally, and its own comment said why: an `If-Match` there saves a redundant re-upload on
+a lost race and never prevents data loss.
+
 **Supersedes:** the condemned-upload memory admission (`initializeCondemnedUploadAdmission`), which
 this design deletes outright.
 
