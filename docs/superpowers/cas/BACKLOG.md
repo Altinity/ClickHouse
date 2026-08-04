@@ -482,3 +482,29 @@ does not.
 
 Existing models to extend rather than start from scratch: the resurrect/condemn specs under
 `docs/superpowers/models/` that already carry INV-NO-RETURN and the condemn-marker ordering.
+
+### A second alternative, examined and rejected: re-point the meta instead of the body {#displacement-repoint-meta}
+
+Also worth carrying into any brainstorming here, because it is the shape people reach for first and
+the reason it fails is instructive. The idea: leave the condemned body alone and instead rewrite its
+per-hash meta object — back to `Clean`, or pointing at a token that does not exist — so the queued
+delete finds nothing to match.
+
+It cannot work as stated, and the reason is structural rather than incidental. The blob delete site
+(`CasGc.cpp`, the `redelete_now` loop) issues `deleteExact(blobKey(entry.ref), entry.token)` with the
+token carried in GC's OWN durable retired pipeline, decided at condemnation. The meta is not consulted
+there at all. Rewriting it therefore cancels nothing: GC still arrives with the token it saved, the
+body still goes, and the meta is left asserting health for an object that no longer exists — precisely
+the dangling state the exact-token protocol exists to prevent.
+
+The design says so in its own words nearby: a stale `deleteExact(t1)` is safe because by the time it
+runs "the object is absent OR a writer already changed its incarnation token". Changing the incarnation
+token is the ONLY sanctioned way to defeat a queued delete. And a token is an ETag, i.e. a function of
+the bytes — a server-side copy of an object onto itself reproduces the same body and the same ETag, so
+there is no way to mint a new token without writing content. That is why `buildHeader` mints a fresh
+`incarnation_tag`: changing the header bytes is what changes the ETag. Token change and body write are
+one operation, not two.
+
+The general lesson for this backlog item: any proposal that defeats a queued delete by editing a
+record OTHER than the object's own incarnation is defeating a check that does not read that record. If
+it did read it, the protocol would rest on a document any writer could forge.
