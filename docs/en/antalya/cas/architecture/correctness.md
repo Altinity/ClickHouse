@@ -69,6 +69,16 @@ record for the world where that rule is missing, and the corpus is itself period
 for faithfulness to the code — a model whose guarantee the code no longer needs is deleted rather
 than kept as false comfort.
 
+## Test coverage {#test-coverage}
+
+The implementation was built test-first (TDD), and the coverage is correspondingly dense:
+
+| Layer | Volume |
+|---|---|
+| Unit tests (`gtest`, `CAS*` suites) | ~1,900 test cases across ~130 files, covering formats, the write and read paths, the ref machinery, `GC`, recovery, and the backend contract |
+| Integration tests | 10 dedicated `test_cas_*` suites (shared pools, `GC` on S3, sharded `GC`, relink replication, fault-injected `INSERT` recovery, member decommission, and more) |
+| Stateless tests | over 200 `CAS`-specific tests, in addition to the whole standard suite running on a `CAS`-default server (below) |
+
 ## The whole test suite, on CAS by default {#stateless-suite-on-cas}
 
 Beyond the model corpus and the soak harness, the standard ClickHouse **stateless test suite runs
