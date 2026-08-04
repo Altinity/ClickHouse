@@ -84,7 +84,12 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 
 
 std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & iter);
+<<<<<<< HEAD
 Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id);
+=======
+Poco::Dynamic::Var getAvroType(DataTypePtr type);
+Poco::Dynamic::Var getAvroLogicalType(DataTypePtr type);
+>>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
 
 /// Spec: https://iceberg.apache.org/spec/?h=metadata.json#table-metadata-fields
 std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(

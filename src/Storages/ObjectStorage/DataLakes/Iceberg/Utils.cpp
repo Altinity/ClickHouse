@@ -9,7 +9,11 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
+<<<<<<< HEAD
 #include <DataTypes/DataTypeDateTime64.h>
+=======
+#include <DataTypes/DataTypesDecimal.h>
+>>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -598,6 +602,10 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             return {"timestamp", true};
         case TypeIndex::Time:
             return {"time", true};
+        case TypeIndex::Time64:
+            if (getDecimalScale(*type) <= 6)
+                return {"time", true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
         case TypeIndex::String:
             return {"string", true};
         case TypeIndex::UUID:
@@ -688,11 +696,11 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         case TypeIndex::Int32:
         case TypeIndex::Date:
         case TypeIndex::Date32:
-        case TypeIndex::Time:
             return "int";
         case TypeIndex::UInt64:
         case TypeIndex::Int64:
         case TypeIndex::DateTime:
+<<<<<<< HEAD
             return "long";
         case TypeIndex::DateTime64:
         {
@@ -704,6 +712,18 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
             timestamp_type->set("logicalType", "timestamp-micros");
             timestamp_type->set("adjust-to-utc", assert_cast<const DataTypeDateTime64 &>(*type).hasExplicitTimeZone());
             return timestamp_type;
+=======
+        case TypeIndex::DateTime64:
+        case TypeIndex::Time:
+            return "long";
+        case TypeIndex::Time64:
+        {
+            auto scale = getDecimalScale(*type);
+            if (scale <= 6)
+                return "long";
+            else
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+>>>>>>> ce7967042ba (Merge pull request #2129 from Altinity/feature/antalya-26.6/pr-1761)
         }
         case TypeIndex::Float32:
             return "float";
@@ -745,6 +765,27 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type, Int32 field_id)
         default:
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
     }
+}
+
+Poco::Dynamic::Var getAvroLogicalType(DataTypePtr type)
+{
+    if (type->isNullable())
+    {
+        auto type_nullable = std::static_pointer_cast<const DataTypeNullable>(type);
+        return getAvroLogicalType(type_nullable->getNestedType());
+    }
+
+    const WhichDataType which(type);
+    if (which.isTime())
+        return "time-micros";
+    if (which.isTime64())
+    {
+        auto scale = getDecimalScale(*type);
+        if (scale <= 6)
+            return "time-micros";
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported time precision for avro {}({})", type->getName(), scale);
+    }
+    return Poco::Dynamic::Var();
 }
 
 static Poco::JSON::Object::Ptr getPartitionField(
