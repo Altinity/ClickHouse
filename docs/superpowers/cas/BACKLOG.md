@@ -1395,32 +1395,13 @@ this surfaced — sequence them AFTER containment, or attribution of future find
 
 ## The adopted fold seal referenced a PRUNED generation's run (observed 2026-07-25, same stand) {#adopted-seal-pruned-run-2026-07-25}
 
-Noticed while verifying an unrelated change; recording the measurement before it is lost.
-
-MEASURED on the post-soak stand, one consistent read:
-- `gc/state` = `{"round":342,"gc_shards":1,"snap_generation":342,"snap_pruned_through":339,"snap_attempt":1043,...}`
-- the ADOPTED seal `soak_pool/gc/gen/342/attempt/1043/fold_seal` carried
-  `"blob_target_runs":[{"key":"soak_pool/gc/gen/339/attempt/1016/blob_target/0/0","generation":339}]`
-  (reference-parent carry — a current shard's run legitimately living under an older generation's key)
-- that run object **did not exist**: `ca-inspect` reported "key … does not exist", and an `s3` listing of
-  `soak_pool/gc/gen/**` returned only the seals for 341/342/343 plus gen 343's own run.
-
-That is exactly what `CasGc.cpp:629-645` says must never happen. `pruneSupersededGenerations` is passed a
-`referenced_generations` set built from the new seal's runs AND the parent seal's runs, with the comment
-"Retention must never reclaim these" and "a losing leader must not destroy what the winning leader's
-already-adopted seal still points at (triage #5)". Here the adopted seal's referenced generation was
-reclaimed anyway.
-
-CONSEQUENCE while it lasts: `zeroInDegree` iterates the adopted seal's runs, so an absent run yields ZERO
-candidates — GC keeps completing rounds and reclaims nothing, silently (per
-[[feedback_ca_gc_never_throw_on_404]] GC must not throw on a 404 during fold, so nothing surfaces). This is
-NOT the explanation for the 56 retained blobs — a later observation had gen 343 adopted WITH its run present
-and `candidates_marked` still 0 — but it is an independent defect and a second reason a round can quietly
-collect nothing.
-
-NOT ESTABLISHED: whether the prune raced the adopt, whether `snap_pruned_through=339` is inclusive of 339,
-or whether the parent-seal capture missed the carry. Needs the same treatment as the other GC findings: a
-targeted test, not log archaeology. Note the stand is still up.
+Once observed: an adopted fold seal's `blob_target_runs` named a generation's run object that
+`pruneSupersededGenerations` had already reclaimed, despite `CasGc.cpp:629-645`'s explicit
+"retention must never reclaim these" guard over the parent seal's referenced generations. While it
+lasts, `zeroInDegree` sees zero candidates from the absent run and the round silently reclaims
+nothing (no throw on 404 per [[feedback_ca_gc_never_throw_on_404]]). NOT ESTABLISHED: whether the
+prune raced the adopt, or the parent-seal capture missed the carry. Needs a targeted test, not
+log archaeology.
 
 ## FIXED 2026-07-25 (`ca5a6b7bee8`): THIRD gtest gate-filter gap — parameterized `*/CasBackendContract` suites match neither `Cas*` nor `CA*` {#gate-filter-gap-3-backend-contract}
 
@@ -1558,35 +1539,6 @@ the scrape as running against the data directory of a LIVE server. Force-claimin
 bypass a nuisance check — it takes ownership from a running server, which is the failure the refusal
 exists to prevent. If the scrape actually runs post-mortem (server already stopped), force is exactly
 right and this concern is void. Worth one look at the CI step before coding, not a redesign.
-
-### Q3 — `ca-fsck` stays NON-fatal on `stale_edge` for now {#q3-stale-edge-nonfatal}
-
-As implemented. No change. (The controller's suggestion to bind the flip to the leak fix was not adopted;
-leave it simply non-fatal.)
-
-### Q4 — what "green" means for S42 {#q4-s42-green}
-
-Green is **a consistent state on disk and in memory**, NOT "we proved a fault landed in the post-durable
-install window". This overrides the card's current soundness guard, which returns `inconclusive` whenever
-the targeted poison/failpoint signal is zero — a signal that is zero by construction today, since the
-install-region seam is gtest-only.
-
-Consequence for the card: the verdict rests on the consistency assertions (post-restart view identical to
-pre-restart, journal-rebuilt view containing every acked block, replicas agreeing, fsck clean). The
-targeted counters stay REPORTED, not gating. Keep an anti-vacuity guard on the GENERIC fault count so a run
-in which no allocation fault occurred at all still cannot read as green — that part of the discipline
-survives; it is only the window-specific targeting that is dropped.
-
-### DONE 2026-07-26 — Q5 option (c): introspection now, study later {#q5-gc-introspection-now}
-
-Do the introspection NOW. Shape specified by the user: **each GC phase emits its own ROW in
-`system.content_addressed_garbage_collection_log`**, carrying all the metrics that matter for that phase —
-not extra columns on the single per-round row.
-
-Then, AFTER Part B and its soak: study the collected metrics, look for anomalies, and only then decide what
-further investigation is warranted. The reproduction rig from
-{#gc-bottleneck-study-2026-07-25} is therefore NOT built yet — real metrics from real runs come first and
-may well retarget it.
 
 ## Operator recovery: mounting a pool whose owner uuid differs (deferred 2026-07-25) {#operator-uuid-recovery}
 
@@ -1781,29 +1733,6 @@ extending the same no-throw-after-commit discipline one frame outward.
 four remedies were wrong in ways that would have made things worse, and I forwarded one of them verbatim.
 Prescriptions from a reviewer deserve the same verification as claims from an implementer.
 
-## RESOLVED — `ca-fsck` never printed `corrupted_runs` (found 2026-07-26, closed 2026-07-30) {#fsck-corrupted-runs-invisible}
-
-Found while wiring the soak's signal capture. `FsckReport::clean()` requires `corrupted_runs == 0`, but
-`programs/disks/CommandFsck.cpp` does not print the field on the summary line — it prints `stale_edge` and
-its neighbours and omits this one. So a corrupt source-edge run is invisible to every consumer of the
-applet: the summary says nothing, and the only observable form is a `corrupted-run` DETAIL row, which only
-a `--detail` scan produces.
-
-The harness counted those detail rows and warned, which was a workaround for a one-line product fix.
-
-**RESOLVED.** `corrupted_runs` is on the summary line, is one of the five findings whose nonzero value makes
-`CommandFsck::executeImpl` exit nonzero, and is a row of `kFsckHardFindings` — from which `FsckReport::clean`
-is now computed, with a `static_assert` that trips in three translation units when the list grows. Closed by
-the Task 1c fix rounds. Kept rather than deleted because this entry is the origin of the recurrence the fence
-exists to end, and later text cites it. Note the ORIGINAL text above still describes the defect in the
-present tense; it is history, not state.
-Same family as everything else this week: the information exists, the reporting path drops it, and the
-result reads as absence rather than as an error.
-
-Also worth noting alongside: `ca-fsck` exits 0 on `stale_edge > 0` — only `dangling` and
-`snapshot_oracle_mismatches` throw — so the soak checkpoint's existing `exit_code != 0` gate never covered
-that class either. The new checkpoint assert is the only gate, deliberately (see
-{#q3-stale-edge-nonfatal}: the user chose non-fatal for the applet).
 
 ## GC performance, FIRST MEASUREMENT (2026-07-26) {#gc-perf-first-measurement}
 
@@ -1957,68 +1886,17 @@ It is also testable READ-ONLY before any counter is added: decode a sample of `_
 and check whether the manifests named within a single transaction repeat. That would answer the cheap half
 of #17 without a product change.
 
-## FIXED 2026-07-26 — task #13: fsck could not report on a large pool, in four separate ways {#fsck-large-pool-fixed}
+## fsck large-pool reporting: two residuals left after the 2026-07-26 fix {#fsck-large-pool-fixed}
 
-Opened as "the `corrupted_runs` one-liner plus the 180 s budget". Measuring first turned it into four
-defects, two of which were worse than the ones on the card.
-
-### 1. `corrupted_runs` was invisible AND non-fatal {#fsck-corrupted-runs-fixed}
-
-Counted since the seal check landed, a term of `FsckReport::clean`, rendered in `--detail` rows — and
-absent from the summary line, which is the only thing the harness parses, CI greps, or an operator reads.
-It also did not make `ca-fsck` exit nonzero, unlike the other two `clean()` terms. So a GC source-edge run
-failing its whole-file seal checksum was invisible twice over, and no run has ever reported one.
-
-Both fixed. The summary line moved out of `CommandFsck::executeImpl` into `Cas::formatFsckSummary`, which
-exists so the line is reachable from a unit test at all — `CasFsckSummary.EveryHardFindingAppearsOnThe
-SummaryLine` is written against `clean()`'s own terms, so the NEXT hard finding added without rendering
-fails there instead of hiding for months. Verified failing before the fix, not just passing after.
-
-### 2. The two timeout budgets were INVERTED, which made `--partial` unreachable {#fsck-partial-inversion}
-
-The harness bounded the SUBPROCESS at 180 s while `ca-fsck`'s own scan deadline defaulted to 600 s. The
-process was therefore always killed before its internal deadline could fire — and that internal deadline
-is the only path that prints accumulated `partial=1` counts. `--partial` existed in the product the entire
-time and could not be reached from the caller.
-
-Measured cost in the 4-hour Part B soak: **4 of 39 checkpoints lost their whole post-GC fsck gate**
-(`dangling`, `stale_edge`, dryrun-subset — all skipped), plus 4 entry-gate skips. The gate drops out
-exactly when the pool is big, which is when it is worth having.
-
-Fixed by placing the scan deadline strictly inside the subprocess budget (`PARTIAL_MARGIN_S = 20`) and
-passing `--partial` from the timeout-prone call sites.
-
-### 3. The fix would have introduced a fabricated consistency proof {#fsck-partial-gate-hazard}
-
-Caught by writing the regression test before believing the fix. With `partial=True` a timed-out scan now
-RETURNS `dangling=0, exit_code=0` instead of raising — and `wait_for_pool_consistent` counts exactly that
-as a clean read. Turning on partial would have converted an honest timeout into a fabricated coherent cut:
-the precise failure the partial work exists to remove. `clean` now also requires `not partial`, and
-`stale_edge_verdict` returns `unchecked` on any partial result. A positive finding is still checked BEFORE
-the partial gate — being partial weakens proofs of ABSENCE, never evidence of PRESENCE.
-
-### 4. The `M-F debris, B140` label was still printed 40 times per run {#fsck-mf-debris-label-removed}
-
-The attribution is wrong — the product classifies these as `AwaitingGc`, the ack-floor pipeline mid-flight
-— and believing that label is what hid the retention leak. Three output sites, not the two a first
-`grep | head -3` showed; the third was found only by re-grepping the whole file. Explanatory docstrings in
-`checker.py`, `run.py` and `plot.py` still carry the B140 rationale and are NOT fixed here.
-
-### Residual, recorded rather than half-fixed {#fsck-fabricated-clean-on-timeout}
-
-On the remaining `FsckTimeout` path the harness still substitutes `{"dangling": 0, "unreachable": 0, ...}`
-— fabricated zeros. Every consumer past that point is guarded by `not _detail_fsck_skipped`, so no assert
-reads them today; it is a landmine, not a live defect, and it is now commented as one at the site. Removing
-it means auditing every downstream `f.get(...)`, which is a change with real regression surface and does
-not belong bolted onto this one.
-
-### Also fixed: the harness suite had 4 pre-existing RED tests {#soak-suite-stale-reds}
-
-Found while running the suite for this task, unrelated to it, all stale tests rather than product defects —
-each the tail of a deliberate 2026-07-22 change nobody updated the test for: `lazy_load_tables` asserted as
-emitted after it was turned off; a `FakeNode` answering only `ping` after the readiness gate started
-proving table load with a real read; an error-message assertion pinned to the pre-2026-07-22 wording. A red
-suite is worse than no suite — nobody can tell signal from noise in it. Now 275 pass, 0 fail.
+Task #13 fixed `corrupted_runs` visibility/fatality, the inverted timeout budgets that made
+`--partial` unreachable, and the fabricated-clean-on-partial hazard (all landed, tested). Two
+residuals remain open:
+- **The `M-F debris, B140` mislabel** (`checker.py`/`run.py`/`plot.py` docstrings) is still printed;
+  the product classifies these as `AwaitingGc`, not the old B140 rationale. Docstring cleanup only.
+- **`FsckTimeout` still substitutes fabricated `{"dangling": 0, ...}` zeros** on the remaining
+  timeout path (`{#fsck-fabricated-clean-on-timeout}`). Not a live defect (every consumer is guarded
+  by `not _detail_fsck_skipped`), but a landmine — fixing it needs auditing every downstream
+  `f.get(...)`, deliberately not bolted onto the task #13 fix.
 
 ## Probe A, task #12: the hypothesis space is now THREE, and the third one is new {#probe-a-direction-evidence}
 
@@ -2699,73 +2577,6 @@ gate working, not the gate being wrong.
 - **Therefore the run is INCONCLUSIVE as a certification** and must be repeated on a quiet host before S42
   can be called green. It is NOT evidence of a defect.
 
-### What the product did under a store that stopped answering {#s42-behaviour}
-
-Worth recording separately, because it is the interesting half: faced with mass request timeouts, the write
-path returned `UNCERTAIN (retry budget exhausted)` to the client and **wedged the affected ref lanes rather
-than guessing**. Both lanes later unwedged. No data was lost and nothing was silently dropped. That is the
-fail-closed design behaving correctly under a fault class the card was not even aiming at.
-
-## Environment: two non-CAS reds that block an UNFILTERED `unit_tests_dbms` run (2026-07-29) {#unfiltered-unit-test-env-reds}
-
-USER RULINGS (2026-07-29 evening): (1) `contrib/silk` fiber assert — OUT OF SCOPE, ignore
-(no upstream action from this effort; keep the ASan exclusion filter). (2) root-owned
-`./logs` — DELETED by the user; unfiltered runs from the repo root are unblocked.
-CLOSED as attention items. Related audit note: `CANNOT_PARSE_INPUT_ASSERTION_FAILED` (28,170
-in `system.errors`, zero log lines) is EXPLAINED by the user — noise from `toDateTime(...)`
-inside `INSERT ... VALUES` (the fast VALUES parser fails on expressions and falls back to SQL
-evaluation, counting the error each time); not a defect, removed from the audit addendum's
-open questions.
-
-Neither is ours and neither affects the CA gate, which is filtered. Both were hit while running the
-convergence's ASan gate and are recorded so the next person does not re-diagnose them.
-
-**1. `contrib/silk` fiber-scheduler assertion.** `SilkFiberSocketTest/1` (the `SecurePolicy`
-instantiation) aborts the whole binary with
-`contrib/silk/src/fibers/fiber.cpp:1010 assertion failed: !scheduler`. Proven CAS-independent: it
-reproduces with
-
-```
-<build>/src/unit_tests_dbms --gtest_filter='SilkFiberSocketTest*'
-```
-
-i.e. with no CAS code executing at all, and `contrib/silk` was last touched by a submodule bump long
-before this branch. Handling: exclude it from unfiltered runs
-(`--gtest_filter='-SilkFiberSocketTest/1.*'`), which is how the convergence's whole-binary ASan pass
-was obtained. Upstream-contrib issue; not on the CAS backlog to FIX, only to route around.
-
-**2. Root-owned `./logs` in the repository root.** `CoordinationTest/0.TestSummingRaft1` refuses to
-start (`Path ./logs already exists, remove it to run test`) and then terminates the binary when its
-own `remove_all` throws `Directory not empty`. The directory is root-owned, dated 2026-07-03, from a
-docker run, and untracked — **it needs the user's `sudo` to remove; do not attempt it from an agent
-session.** Until then, run unfiltered unit tests from a scratch working directory rather than the
-repository root. Filtered CA gates are unaffected (they never reach that test).
-
-**Log-reading trap in the same runs.** An unfiltered `unit_tests_dbms` log contains embedded NUL
-bytes AND can lose the head of its own redirected stdout (gtest's opening banner and thousands of
-early `[ OK ]` lines simply absent from a completed log). Two consequences: always `grep -a`, and
-never gate a waiter on `until grep -q "^MARKER=" "$log"` — plain `grep -q` returns 1 on such a file
-where `grep -aq` returns 0, so the waiter hangs forever. Write completion markers to a separate small
-text file, and count "did suite X run" DURING the run rather than from the finished file. The
-trailing gtest SUMMARY block always survives, so pass/fail totals stay trustworthy.
-
-## Numbered CAS doc set documents pre-Stage-A ref and namespace-file shapes {#numbered-docs-stale-ref-shapes}
-
-Found by the Task 1c review, explicitly as a NON-finding of that task — it was already stale before
-Task 1 and Task 1c neither worsened it nor was asked to fix it. Recorded so it is not re-discovered
-as a finding a third time.
-
-`docs/superpowers/cas/01-architecture.md`, `codecs.md`, `11-walkthrough.md`, `03-writer-protocol.md`
-and `09-read-protocol.md` still document namespace files at `roots/<ns>/_files/<name>` — the
-namespace-only shape that Task 1c deleted in favour of `roots/<ns>/<incarnation>/_files/<name>` — and
-still show the pre-Stage-A ref shape `cas/refs/<ns>/<shard>`. `Layout::rootsPrefix`'s own doc comment
-still says "root-shard manifest", vocabulary that predates the ref rework.
-
-Do not fix these piecemeal per task: the key shapes are still moving through Stage B, so a sweep now
-buys one round of accuracy and then rots again. The sweep belongs at the end of Stage B, where the
-final shapes are settled — and it is the same discipline as the plan's `{#restatement-impact}`
-do-not-cite list, for the same reason: a stale `refCkptKey` reference survived four tasks before
-anyone swept it.
 
 ## The fsck exit set and SQL row still have no test that can fail for them {#fsck-untestable-render-surfaces}
 
@@ -2807,41 +2618,20 @@ re-derive either from scratch.
 
 ## A loose mountpoint object under `_files/` is classified as a corrupt namespace file {#loose-mountpoint-object-as-corrupt-namespace-file}
 
-Behaviour half of the Task 1c review's MINOR-1 (the wording half is
-`deferred-docs-fixes.md` `{#d1-parse-namespace-file-key-contract}`). Filed separately because a
-finding reported as a wording problem turned out to name a real consequence, and batching it with
-comment fixes would have buried it.
+`Layout::mountpointObjectKey` does not enforce the `_files` reservation its own doc comment
+claims, so a loose object at `roots/<srid>/_files/x` satisfies `parseNamespaceFileKey`'s necessary
+condition and gets treated as ours — `ca-decommission` refuses fail-close and `ca-fsck` posts a
+hard `lifeless_keys` finding against a key that is not damage. Direction is safe (refuse/report,
+never delete) so not urgent, but a hard finding against an undamaged key trains an operator to
+disbelieve hard findings. **Open decision**: enforce the reservation in `mountpointObjectKey`
+(makes the existing doc comment true) or narrow the classifier.
 
-`Layout::mountpointObjectKey` does not enforce the `_files` reservation — its doc asserts that those
-segments "never appear in a real ClickHouse loose-file path" and checks nothing. So a loose object at
-`roots/<srid>/_files/x` satisfies `parseNamespaceFileKey`'s necessary condition and is treated as one
-of ours. Consequence: `ca-decommission` refuses fail-close and `ca-fsck` posts a hard `lifeless_keys`
-finding against a key that is not damage.
+## Stateless drain tests still owe their assertion restoration (Task 7b) {#stateless-pending-double-count}
 
-**The direction is safe** (refuse and report, never delete), which is why this is not urgent. What
-makes it worth fixing is that a hard finding against a non-damaged key trains an operator to
-disbelieve hard findings. Decide between enforcing the reservation in `mountpointObjectKey` and
-narrowing the classifier; the first is the one that makes the existing doc true.
-
-## RESOLVED — the stateless drain tests' `PENDING` gauge double-counted {#stateless-pending-double-count}
-
-Found by the review of `76ee70da4a7`, ruled out of scope there because the formula is carried over
-unchanged from before that commit — filed so it is not re-discovered as a new defect.
-
-`04290_content_addressed_no_leftovers.sh` and `04295_content_addressed_mutation_no_leftovers.sh`
-compute `PENDING = pending_candidates + pending_condemned + pending_retired`. But `pending_condemned`
-is documented in `Gc/CasGc.h` as "their total (candidates + retired), the overall pipeline gauge" — so
-the sum is exactly **twice** the true outstanding count.
-
-**Harmless as a signal, misleading as a number.** Both tests use it only as `> 0` / `= 0`, and doubling
-preserves both, so no assertion is wrong. What is wrong is every figure it prints: the failure message
-`GC did not drain the retire pipeline within the bounded loop (pending=64)` reports 64 where the
-pipeline held 32. Those two numbers (64 and 152) were quoted in this session's `05008` diagnosis; the
-conclusion did not depend on their magnitude, but a future diagnosis might.
-
-**RESOLVED 2026-07-30**: both tests now read `pending_condemned` alone (`8e9b06c2a81`). Done ahead of Task 7b
-because it was free — neither file was touched by any in-flight work, and both tests are registered known-red,
-so the change could not mask or alter a verdict. Task 7b still owes their assertion restoration.
+`04290_content_addressed_no_leftovers.sh`/`04295_content_addressed_mutation_no_leftovers.sh`'s
+`PENDING` double-counting (`pending_condemned` already totals candidates+retired) is fixed — both
+tests now read `pending_condemned` alone (`8e9b06c2a81`, 2026-07-30). Task 7b still owes restoring
+their assertions (both are currently registered known-red).
 
 ## The `!attempt_armed` arm's non-deletion is unpinned, by a judgement I endorsed {#attempt-armed-arm-unpinned}
 
@@ -2995,32 +2785,13 @@ machine load rather than with the tree.
 
 ## The gate suite list silently omits suites — THIRD recurrence, because both prior fixes fixed the data {#gate-suite-list-omits-third-recurrence}
 
-Found 2026-07-30 by Task 4-C's implementer, and found the right way: by asking *why did my gate not catch
-this* rather than only fixing the test that failed.
-
-`tmp/cas_suites.txt`'s generation matches `Cas*:CA*`, which **cannot** match `CaWiring` or `CaLifecycle`
-(`Ca` + lowercase matches neither `Cas` nor `CA`) and cannot match `RefWriterAppendLane`,
-`RefWriterNamespaceBirth`, `RefWriterChunkedFlush` or `RefTableCacheEviction` at all. **Twenty suites, 17
-of them CAS-relevant, were run by no gate pass in an entire session** — and one of the newly-included ones
-immediately produced a hard abort plus further failures.
-
-**Every gate figure reported during that session was therefore partial**: 1601, 1628, 1639, 1658, 1660 and
-1661 were all computed over an incomplete set, including the deltas checked as "exact match to the new test
-count". The arithmetic was self-consistent and still measured the wrong population.
-
-**This is the third recurrence, and the reason it recurs is the shape of the previous two fixes.** Both
-earlier rounds closed it by ADDING the missing suites to the list — a data fix. The list is regenerated per
-session, so each fix regenerated away. The second of those recurrences hid three real bugs.
-
-**So the fix is not a longer list.** Fix the generator or the pattern, and then add the check that makes
-omission loud: **diff the generated list against the binary's own `--gtest_list_tests` output and fail when
-any suite is unclaimed** — a suite must either be in the CAS set or be excluded by name with a stated
-reason. A list that silently omits is indistinguishable from a list that covers, which is precisely why the
-same gap has now cost three rounds and why "we added them" is not a closure.
-
-**The generalisable rule: a filter is a claim about coverage, and a claim about coverage needs a
-two-sided check.** One side is what the filter selects; the other is what exists. Nothing in this
-repository compared the two until a hidden abort forced someone to look.
+Found 2026-07-30: `tmp/cas_suites.txt`'s generation matches `Cas*:CA*`, which cannot match
+`CaWiring`/`CaLifecycle` (lowercase `Ca` matches neither `Cas` nor `CA`) or several `RefWriter*`
+suites — 20 suites, 17 CAS-relevant, ran by no gate pass in an entire session, so every gate figure
+that session was computed over an incomplete population. THIRD recurrence of this shape; the prior
+two fixes each added the missing suites to the list (a data fix that regenerates away, since the
+list is per-session). **Open fix**: fix the generator/pattern, then add a loud check — diff the
+generated list against `--gtest_list_tests` and fail on any unclaimed suite.
 
 ## Refactoring candidates, derived from what actually broke today {#refactor-candidates-from-defects}
 
