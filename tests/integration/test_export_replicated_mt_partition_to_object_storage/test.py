@@ -1895,3 +1895,61 @@ def test_export_partition_dest_column_not_in_source_key_rejected(cluster):
     )
     assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
     assert "country" in error, f"expected the error to name column 'country', got: {error!r}"
+
+
+def test_export_partition_column_timezone_rendered_in_destination_zone(cluster):
+    """A hive partition value lives as text in the object path and is read back in the destination
+    column's time zone, so the export has to spell it the way the destination would. Spelling it in the
+    source's zone names a different instant and the row reads back shifted by the offset between the
+    two zones. INSERT SELECT into an identical table is the reference behavior."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_mt_{uid}"
+    s3_export = f"tz_export_s3_{uid}"
+    s3_insert = f"tz_insert_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, ts DateTime('UTC'))"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toDate(ts) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+    for table in (s3_export, s3_insert):
+        node.query(
+            f"CREATE TABLE {table} (id UInt64, ts DateTime('Asia/Tokyo'))"
+            f" ENGINE = S3(s3_conn, filename='{table}', format=Parquet, partition_strategy='hive')"
+            f" PARTITION BY ts"
+        )
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_export}")
+    wait_for_export_status(node, mt_table, s3_export, pid, "COMPLETED", timeout=90)
+
+    node.query(f"INSERT INTO {s3_insert} SELECT * FROM {mt_table}")
+
+    source_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {mt_table}").strip()
+    exported_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_export}").strip()
+    inserted_instant = node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_insert}").strip()
+    assert exported_instant == source_instant, (
+        f"the exported row moved in time: source {source_instant}, destination {exported_instant}"
+    )
+    assert inserted_instant == source_instant, (
+        f"INSERT SELECT must not move it either: source {source_instant},"
+        f" destination {inserted_instant}"
+    )
+
+    # 2024-03-05 15:00:00 UTC is 2024-03-06 00:00:00 in Tokyo.
+    exported_directory = node.query(
+        f"SELECT DISTINCT extract(_path, 'ts=[^/]*') FROM {s3_export}"
+    ).strip()
+    inserted_directory = node.query(
+        f"SELECT DISTINCT extract(_path, 'ts=[^/]*') FROM {s3_insert}"
+    ).strip()
+    assert exported_directory == "ts=2024-03-06 00:00:00", (
+        f"unexpected hive directory: {exported_directory!r}"
+    )
+    assert inserted_directory == exported_directory, (
+        f"export and INSERT SELECT disagree on the partition directory:"
+        f" {exported_directory!r} vs {inserted_directory!r}"
+    )

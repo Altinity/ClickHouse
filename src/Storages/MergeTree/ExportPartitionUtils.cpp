@@ -684,6 +684,15 @@ namespace
     }
 #endif
 
+    /// Two types are interchangeable for partitioning only if their canonical names match. IDataType::equals
+    /// is too weak here: it deliberately treats DateTime and DateTime64 with different time zones as equal,
+    /// since they are interchangeable for INSERT, but a time zone changes what a temporal transform returns,
+    /// so the same expression over the two types can produce different partitions.
+    bool isSameTypeForPartitioning(const DataTypePtr & lhs, const DataTypePtr & rhs)
+    {
+        return lhs->getName() == rhs->getName();
+    }
+
     /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
     void verifyColumnMapsToSinglePartition(
         const PartitionTerm & term,
@@ -723,9 +732,9 @@ namespace
 
         /// The written value is transform(cast(source)), and the endpoints only bound the interior rows if
         /// the cast preserves order. Preserving every value is not enough: Int -> String loses nothing, yet
-        /// "10" sorts before "2", so an interior row can fall outside the endpoints. Without a cast the
+        /// "10" sorts before "2", so an interior row can fall outside the endpoints. With identical types the
         /// order holds trivially; otherwise CAST must prove it over the partition's actual range.
-        const bool is_cast_needed = !source_type->equals(*destination_type);
+        const bool is_cast_needed = !isSameTypeForPartitioning(source_type, destination_type);
         if (is_cast_needed)
         {
             const auto cast_function
@@ -805,7 +814,8 @@ namespace
 
         const auto it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
         return it != minmax_column_names.end() && destination_sample.has(term.column)
-            && minmax_column_types[it - minmax_column_names.begin()]->equals(*destination_sample.getByName(term.column).type);
+            && isSameTypeForPartitioning(
+                minmax_column_types[it - minmax_column_names.begin()], destination_sample.getByName(term.column).type);
     }
 
     /// Asserts every destination partition term maps the whole source partition to a single destination

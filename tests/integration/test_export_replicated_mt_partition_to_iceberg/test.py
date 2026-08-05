@@ -2155,6 +2155,41 @@ def test_export_partition_timezone_mismatch_rejected(cluster):
     )
 
 
+def test_export_partition_column_timezone_mismatch_rejected(cluster):
+    """The same mismatch as above, but with the timezone carried by the column type instead of the
+    partition expression. Both sides read `toRelativeDayNum(event_time)`, so the terms are identical and
+    only the types differ - and DateTime types with different timezones compare equal, so the structural
+    match must not be decided by type equality alone. The part stays within one Tokyo day while spanning
+    two UTC days, so it maps to two destination partitions and must be rejected.
+
+    `iceberg_partition_timezone` is deliberately left unset: setting it stamps a timezone onto the
+    destination term, which alone makes the terms differ and hides what this test covers."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_coltz_{uid}"
+    iceberg_table = f"iceberg_coltz_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_time DateTime('Asia/Tokyo')",
+             "toRelativeDayNum(event_time)", replica_name="replica1")
+    # Both literals are 2024-03-05 in Tokyo (the column's timezone) but 2024-03-04 and 2024-03-05 in UTC.
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 01:00:00'), (2, '2024-03-05 18:00:00')"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime('UTC')",
+                    partition_by="toRelativeDayNum(event_time)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a partition-column timezone mismatch, got: {error!r}"
+    )
+
+
 def test_export_partition_commit_uses_exported_parts_not_new_inserts(cluster):
     """The deferred commit derives the Iceberg partition value only from the exact exported parts
     recorded in the manifest, never from parts inserted/merged into the source partition after
