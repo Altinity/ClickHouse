@@ -642,6 +642,48 @@ namespace
         return terms;
     }
 
+#if USE_AVRO
+    std::vector<PartitionTerm> parseIcebergPartitionTerms(
+        const Poco::JSON::Object::Ptr & partition_spec_json,
+        const std::unordered_map<Int32, String> & source_id_to_column_name,
+        const String & partition_timezone)
+    {
+        auto source_id_to_name = [&](Int32 id) -> String
+        {
+            auto it = source_id_to_column_name.find(id);
+            return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
+        };
+
+        const auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
+        const size_t spec_size = spec_fields ? spec_fields->size() : 0;
+
+        std::vector<PartitionTerm> terms;
+        terms.reserve(spec_size);
+        for (UInt32 i = 0; i < spec_size; ++i)
+        {
+            const auto field = spec_fields->getObject(i);
+            const auto dest_transform = field->getValue<String>(Iceberg::f_transform);
+            const String column = source_id_to_name(field->getValue<Int32>(Iceberg::f_source_id));
+            const auto transform_and_argument = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
+
+            if (!transform_and_argument)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination field on column '{}' uses transform "
+                    "'{}', which has no ClickHouse equivalent.", column, dest_transform);
+
+            /// A bare source column parses to an empty function name, which is what Iceberg calls identity.
+            terms.push_back({
+                column,
+                transform_and_argument->transform_name == "identity" ? "" : transform_and_argument->transform_name,
+                transform_and_argument->argument
+                    ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt,
+                transform_and_argument->time_zone});
+        }
+
+        return terms;
+    }
+#endif
+
     /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
     void verifyColumnMapsToSinglePartition(
         const String & column,
@@ -859,44 +901,14 @@ namespace
                 source_id_to_column_name[f->getValue<Int32>(Iceberg::f_id)] = f->getValue<String>(Iceberg::f_name);
             }
         }
-        auto source_id_to_name = [&](Int32 id) -> String
-        {
-            auto it = source_id_to_column_name.find(id);
-            return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
-        };
 
-        const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
-        const size_t actual_size = actual_fields ? actual_fields->size() : 0;
         const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
 
         /// Rebuild the destination spec as ClickHouse partition terms, mirroring ChunkPartitioner and the commit
-        /// path, so the same compatibility rule applies as for a plain object storage destination. An empty spec
-        /// yields no terms: an unpartitioned table has a single partition that every source part maps to.
-        std::vector<PartitionTerm> destination_terms;
-        destination_terms.reserve(actual_size);
-        for (UInt32 i = 0; i < actual_size; ++i)
-        {
-            const auto af = actual_fields->getObject(i);
-            const auto dest_transform = af->getValue<String>(Iceberg::f_transform);
-            const String column = source_id_to_name(af->getValue<Int32>(Iceberg::f_source_id));
-            const auto transform_and_argument = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
-
-            if (!transform_and_argument)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition to Iceberg table: destination field on column '{}' uses transform "
-                    "'{}', which has no ClickHouse equivalent.", column, dest_transform);
-
-            /// A bare source column parses to an empty function name, which is what Iceberg calls identity.
-            destination_terms.push_back({
-                column,
-                transform_and_argument->transform_name == "identity" ? "" : transform_and_argument->transform_name,
-                transform_and_argument->argument
-                    ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt,
-                transform_and_argument->time_zone});
-        }
-
+        /// path, so the same compatibility rule applies as for a plain object storage destination.
         verifyPartitionTermsCompatibility(
-            destination_terms, source_metadata, destination_metadata, parts, partition_id, context);
+            parseIcebergPartitionTerms(partition_spec_json, source_id_to_column_name, partition_timezone),
+            source_metadata, destination_metadata, parts, partition_id, context);
     }
 #endif
 
