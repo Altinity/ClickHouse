@@ -190,6 +190,16 @@ void buildSortingDAG(QueryPlan::Node & node, std::optional<ActionsDAG> & dag, Fi
                 appendFixedColumnsFromFilterExpression(*filter_expression, fixed_columns);
 
         }
+        if (const auto row_level_filter = reading->getRowLevelFilter())
+        {
+            /// Should ignore limit if there is filtering.
+            limit = 0;
+
+            appendExpression(dag, row_level_filter->actions);
+            if (const auto * filter_expression = dag->tryFindInOutputs(row_level_filter->column_name))
+                appendFixedColumnsFromFilterExpression(*filter_expression, fixed_columns);
+
+        }
         return;
     }
 

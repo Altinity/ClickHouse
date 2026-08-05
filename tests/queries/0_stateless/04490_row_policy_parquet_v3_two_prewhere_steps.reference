@@ -1,0 +1,20 @@
+-- policy is active (6 of 10 rows have flag = 1)
+6
+-- row policy + WHERE moved to prewhere
+1	a	1
+4	a	1
+10	a	1
+-- row policy + explicit PREWHERE
+1	a	1
+4	a	1
+10	a	1
+-- row policy alone (single step)
+1	a	1
+2	b	1
+4	a	1
+6	c	1
+8	b	1
+10	a	1
+-- expression policy + WHERE (policy routed to WHERE)
+1	a	1
+4	a	1

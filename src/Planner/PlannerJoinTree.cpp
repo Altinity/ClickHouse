@@ -986,7 +986,16 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                 {
                     table_expression_data.setRowLevelFilterActions(row_policy_filter_info->actions.clone());
                     /// TODO: Never put row-level security filter in WHERE clause for storages that do not support PREWHERE to avoid merging of filters.
-                    if (storage->supportsPrewhere())
+                    /// Upstream checks only supportsPrewhere() here, having dropped the supportedPrewhereColumns()
+                    /// check that the pre-#87303 add_filter lambda applied to every filter. Keep that check for the
+                    /// row policy: File/URL/ObjectStorage restrict prewhere to physical columns, and a row policy's
+                    /// filter column is an expression name, so those storages sent the policy to WHERE before. The
+                    /// Parquet v3 reader cannot run two filtering steps (Reader::applyPrewhere asserts
+                    /// filter.size() == rows_pass, but forms a later step's column from its unfiltered subchunk), and
+                    /// antalya enables that reader by default, so routing the policy into prewhere there aborts.
+                    auto supported_prewhere_columns = storage->supportedPrewhereColumns();
+                    if (storage->supportsPrewhere()
+                        && (!supported_prewhere_columns || supported_prewhere_columns->contains(row_policy_filter_info->column_name)))
                         row_level_filter = std::make_shared<FilterDAGInfo>(std::move(*row_policy_filter_info));
                     else
                         where_filters.emplace_back(std::move(*row_policy_filter_info), "Row-level security filter");

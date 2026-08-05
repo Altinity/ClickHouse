@@ -2087,6 +2087,24 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
 
 void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_group)
 {
+    /// Materialize the input columns of every step before running any step. formOutputColumn takes
+    /// the decoded subchunk, which still has rows_total rows because the decoders only saw the
+    /// filter as it stood before any step ran. A column first formed by a later step would
+    /// therefore disagree with the columns an earlier step already filtered down to rows_pass, and
+    /// the filtering below only shrinks what is already in row_subgroup.output - pending subchunks
+    /// are never touched. Forming them all up front keeps every step's block at rows_pass.
+    ///
+    /// rows_pass, not rows_total, is the row count every block here has: the decoded subchunks hold
+    /// rows_pass rows (see decodePrimitiveColumn), and each step shrinks them further.
+    for (const PrewhereStep & step : prewhere_steps)
+        for (size_t output_idx : step.input_column_idxs)
+        {
+            const auto & output_info = output_columns.at(output_idx);
+            auto & col = row_subgroup.output.at(output_info.idx_in_output_block.value());
+            if (!col)
+                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_pass);
+        }
+
     for (size_t step_idx = 0; step_idx < prewhere_steps.size(); ++step_idx)
     {
         const PrewhereStep & step = prewhere_steps.at(step_idx);
@@ -2096,11 +2114,12 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
         {
             const auto & output_info = output_columns.at(output_idx);
             auto & col = row_subgroup.output.at(output_info.idx_in_output_block.value());
+            /// Unreachable: the loop above materialized every step's inputs.
             if (!col)
-                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_total);
+                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_pass);
             block.insert({col, output_info.type, output_info.name});
         }
-        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_total);
+        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_pass);
 
         step.actions.execute(block);
 
