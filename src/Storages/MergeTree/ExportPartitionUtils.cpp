@@ -686,10 +686,7 @@ namespace
 
     /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
     void verifyColumnMapsToSinglePartition(
-        const String & column,
-        const String & function_name,
-        std::optional<Int64> argument,
-        const std::optional<String> & time_zone,
+        const PartitionTerm & term,
         const Names & minmax_column_names,
         const DataTypes & minmax_column_types,
         const Block & destination_sample,
@@ -697,11 +694,11 @@ namespace
         const String & partition_id,
         const ContextPtr & context)
     {
-        const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+        const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
         if (slot_it == minmax_column_names.end())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: the destination partition expression uses column '{}', which is "
-                "not part of the source MergeTree partition key.", column);
+                "not part of the source MergeTree partition key.", term.column);
         const size_t slot = static_cast<size_t>(slot_it - minmax_column_names.begin());
         const auto & source_type = minmax_column_types[slot];
 
@@ -710,19 +707,19 @@ namespace
         if (source_type->isNullable())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: column '{}' is Nullable, so a NULL forms a separate destination "
-                "partition; partition the source by the matching destination partition expression.", column);
+                "partition; partition the source by the matching destination partition expression.", term.column);
 
         if (!minmax.initialized || slot >= minmax.hyperrectangle.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: no min/max statistics available for column '{}' in partition "
-                "'{}'; cannot validate partitioning.", column, partition_id);
+                "'{}'; cannot validate partitioning.", term.column, partition_id);
         const auto & min_value = minmax.hyperrectangle[slot].left;
         const auto & max_value = minmax.hyperrectangle[slot].right;
 
-        if (!destination_sample.has(column))
+        if (!destination_sample.has(term.column))
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition: destination column '{}' not found.", column);
-        const auto destination_type = destination_sample.getByName(column).type;
+                "Cannot export partition: destination column '{}' not found.", term.column);
+        const auto destination_type = destination_sample.getByName(term.column).type;
 
         /// The written value is transform(cast(source)), and the endpoints only bound the interior rows if
         /// the cast preserves order. Preserving every value is not enough: Int -> String loses nothing, yet
@@ -732,19 +729,19 @@ namespace
         if (is_cast_needed)
         {
             const auto cast_function
-                = createInternalCast({source_type, column}, destination_type, CastType::nonAccurate, {}, context);
+                = createInternalCast({source_type, term.column}, destination_type, CastType::nonAccurate, {}, context);
             if (!cast_function->hasInformationAboutMonotonicity()
                 || !cast_function->getMonotonicityForRange(*source_type, min_value, max_value).is_monotonic)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition '{}': values of column '{}' cross a non-monotonic cast boundary to "
                     "the destination type {}, so it spans multiple destination partitions.",
-                    partition_id, column, destination_type->getName());
+                    partition_id, term.column, destination_type->getName());
         }
 
         auto values_column = source_type->createColumn();
         values_column->insert(min_value);
         values_column->insert(max_value);
-        const auto cast_column = castColumn({std::move(values_column), source_type, column}, destination_type);
+        const auto cast_column = castColumn({std::move(values_column), source_type, term.column}, destination_type);
 
         Field cast_min;
         Field cast_max;
@@ -755,19 +752,19 @@ namespace
         /// destination transform applied to [cast(min), cast(max)] must be monotonic (so the endpoints
         /// bound every interior row; a hash such as bucket is not) and map both endpoints to one value.
         bool spans_multiple_partitions;
-        if (function_name.empty() || function_name == "identity")
+        if (term.function.empty() || term.function == "identity")
         {
             spans_multiple_partitions = cast_min != cast_max;
         }
         else
         {
-            auto resolver = FunctionFactory::instance().get(function_name, context);
+            auto resolver = FunctionFactory::instance().get(term.function, context);
             ColumnsWithTypeAndName arguments;
-            if (argument)
-                arguments.push_back({DataTypeUInt64().createColumnConst(2, *argument), std::make_shared<DataTypeUInt64>(), "width"});
-            arguments.push_back({cast_column, destination_type, column});
-            if (time_zone)
-                arguments.push_back({DataTypeString().createColumnConst(2, *time_zone), std::make_shared<DataTypeString>(), "timezone"});
+            if (term.argument)
+                arguments.push_back({DataTypeUInt64().createColumnConst(2, *term.argument), std::make_shared<DataTypeUInt64>(), "width"});
+            arguments.push_back({cast_column, destination_type, term.column});
+            if (term.time_zone)
+                arguments.push_back({DataTypeString().createColumnConst(2, *term.time_zone), std::make_shared<DataTypeString>(), "timezone"});
 
             const auto function = resolver->build(arguments);
             if (!function->hasInformationAboutMonotonicity()
@@ -790,7 +787,7 @@ namespace
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition '{}': the source partition might span multiple destination partitions "
                 "for column '{}'. A source MergeTree partition must map to a single destination partition.",
-                partition_id, column);
+                partition_id, term.column);
     }
 
     bool sourceHasMatchingPartitionTerm(
@@ -840,8 +837,7 @@ namespace
             if (sourceHasMatchingPartitionTerm(term, source_terms, minmax_column_names, minmax_column_types, destination_sample))
                 continue;
 
-            verifyColumnMapsToSinglePartition(term.column, term.function, term.argument, term.time_zone,
-                minmax_column_names, minmax_column_types, destination_sample, minmax, partition_id, context);
+            verifyColumnMapsToSinglePartition(term, minmax_column_names, minmax_column_types, destination_sample, minmax, partition_id, context);
         }
     }
 }
