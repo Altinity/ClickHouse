@@ -46,13 +46,13 @@ def same_credentials_cluster():
 
 def test_same_credentials(same_credentials_cluster):
     node1.query("insert into test_table values ('2017-06-16', 111, 0)")
-    time.sleep(1)
+    node2.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
     assert node1.query("SELECT id FROM test_table order by id") == "111\n"
     assert node2.query("SELECT id FROM test_table order by id") == "111\n"
 
     node2.query("insert into test_table values ('2017-06-17', 222, 1)")
-    time.sleep(1)
+    node1.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
     assert node1.query("SELECT id FROM test_table order by id") == "111\n222\n"
     assert node2.query("SELECT id FROM test_table order by id") == "111\n222\n"
@@ -85,13 +85,13 @@ def no_credentials_cluster():
 
 def test_no_credentials(no_credentials_cluster):
     node3.query("insert into test_table values ('2017-06-18', 111, 0)")
-    time.sleep(1)
+    node4.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
     assert node3.query("SELECT id FROM test_table order by id") == "111\n"
     assert node4.query("SELECT id FROM test_table order by id") == "111\n"
 
     node4.query("insert into test_table values ('2017-06-19', 222, 1)")
-    time.sleep(1)
+    node3.query("SYSTEM SYNC REPLICA test_table", timeout=60)
 
     assert node3.query("SELECT id FROM test_table order by id") == "111\n222\n"
     assert node4.query("SELECT id FROM test_table order by id") == "111\n222\n"
