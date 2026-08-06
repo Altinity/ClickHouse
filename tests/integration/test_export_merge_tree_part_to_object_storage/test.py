@@ -1110,3 +1110,84 @@ def test_export_part_subcolumn_partition_key_tuple_fewer_fields_in_source_is_rej
     )
 
 
+def test_export_part_nullable_datetime_partition_key_timezone_mismatch_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"nullable_tz_mt_table_{postfix}"
+    s3_table = f"nullable_tz_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts Nullable(DateTime('UTC')))
+        ENGINE = MergeTree()
+        PARTITION BY ts
+        ORDER BY id
+        SETTINGS allow_nullable_key = 1, enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts Nullable(DateTime('Asia/Tokyo')))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY ts
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"getDateTimeTimeZoneName() only recognizes bare DateTime/DateTime64, so wrapping "
+        f"the partition key in Nullable(...) hides the timezone from it entirely; "
+        f"canBeSafelyCast() provides no fallback here either, since "
+        f"DataTypeDateTime::equals() treats any two DateTime types as equal regardless "
+        f"of timezone by design, so this needs its own dedicated rejection - even "
+        f"without export_merge_tree_part_allow_lossy_cast being set; got: {error!r}"
+    )
+
+
+def test_export_part_lowcardinality_datetime_partition_key_timezone_mismatch_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"lc_tz_mt_table_{postfix}"
+    s3_table = f"lc_tz_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts LowCardinality(DateTime('UTC')))
+        ENGINE = MergeTree()
+        PARTITION BY ts
+        ORDER BY id
+        SETTINGS allow_suspicious_low_cardinality_types = 1, enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts LowCardinality(DateTime('Asia/Tokyo')))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY ts
+        SETTINGS allow_suspicious_low_cardinality_types = 1
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"Same gap as the Nullable case, but for LowCardinality(DateTime(...)); "
+        f"got: {error!r}"
+    )
+
+

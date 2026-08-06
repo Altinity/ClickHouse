@@ -15,6 +15,8 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/Utils.h>
 #include <Functions/FunctionHelpers.h>
 #include <Interpreters/ActionsDAG.h>
@@ -643,9 +645,10 @@ namespace ExportPartitionUtils
     {
         std::optional<String> getDateTimeTimeZoneName(const DataTypePtr & type)
         {
-            if (const auto * datetime_type = checkAndGetDataType<DataTypeDateTime>(type.get()))
+            const auto unwrapped_type = removeNullable(removeLowCardinality(type));
+            if (const auto * datetime_type = checkAndGetDataType<DataTypeDateTime>(unwrapped_type.get()))
                 return datetime_type->getTimeZone().getTimeZone();
-            if (const auto * datetime64_type = checkAndGetDataType<DataTypeDateTime64>(type.get()))
+            if (const auto * datetime64_type = checkAndGetDataType<DataTypeDateTime64>(unwrapped_type.get()))
                 return datetime64_type->getTimeZone().getTimeZone();
             return {};
         }

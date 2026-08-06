@@ -6787,7 +6787,7 @@ void MergeTreeData::exportPartToTable(
         source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
     if (!dest_storage->isDataLake())
-        ExportPartitionUtils::verifyMergeTreePartitionCompatibility(source_metadata_ptr, destination_metadata_ptr);
+        ExportPartitionUtils::assertPartitionKeyASTAreEqual(source_metadata_ptr, destination_metadata_ptr);
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
