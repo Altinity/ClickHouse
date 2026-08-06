@@ -18,14 +18,14 @@ CREATE ROW POLICY 04098_p3 ON t_row_policy_or USING id = 5 AS permissive TO ALL;
 
 SET enable_analyzer = 0;
 SELECT 'old analyzer';
-SELECT trim(BOTH ' ' FROM explain) FROM (EXPLAIN actions = 1 SELECT id FROM t_row_policy_or SETTINGS optimize_move_to_prewhere = 0)
-WHERE explain LIKE '%Filter column: in(%';
+SELECT explain FROM (EXPLAIN actions = 1 SELECT id FROM t_row_policy_or)
+WHERE explain LIKE '%Row level filter column:%';
 
 SET enable_analyzer = 1;
 SELECT 'new analyzer';
-SELECT trim(BOTH ' ' FROM replaceRegexpOne(explain, '__set_UInt64_\\d+_\\d+', '__set_UInt64_'))
-FROM (EXPLAIN actions = 1 SELECT id FROM t_row_policy_or SETTINGS optimize_move_to_prewhere = 0)
-WHERE explain LIKE '%Filter column: in(%';
+SELECT replaceRegexpOne(explain, '__set_UInt64_\\d+_\\d+', '__set_UInt64_')
+FROM (EXPLAIN actions = 1 SELECT id FROM t_row_policy_or)
+WHERE explain LIKE '%Row level filter column:%';
 
 SELECT 'result';
 SELECT id FROM t_row_policy_or ORDER BY id;
