@@ -185,6 +185,7 @@ public:
 
     void drop(ContextPtr context) override;
 
+<<<<<<< HEAD
     static DataLakeMetadataPtr createWithDeserialization(
         const ObjectStoragePtr & object_storage,
         const StorageObjectStorageConfigurationWeakPtr & configuration,
@@ -197,6 +198,10 @@ public:
     {
         return persistent_components;
     }
+=======
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
+>>>>>>> 31cd3f9714e (Merge pull request #2141 from Altinity/feature/antalya-26.6/auto-grp-pr-1662)
 
 private:
     static Iceberg::PersistentTableComponents initializePersistentTableComponents(
@@ -222,6 +227,9 @@ private:
     /// scoped to the queried path reaches beyond this table there.
     void checkTableRootIsQueriedPath(std::string_view operation) const;
 
+    std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
     const DB::Iceberg::PersistentTableComponents persistent_components;
@@ -229,8 +237,6 @@ private:
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
     ObjectIterator prepared_iterator;
-
-    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 
     void backgroundMetadataPrefetcherThread();
 };
