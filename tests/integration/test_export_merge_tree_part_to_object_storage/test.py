@@ -1272,8 +1272,48 @@ def test_export_part_timezone_sensitive_expression_partition_key_is_rejected(clu
         f"Unlike toUnixTimestamp(ts), toDate(ts) genuinely depends on ts's declared "
         f"timezone (day boundaries differ between UTC and Asia/Tokyo), so it must "
         f"remain protected by the timezone guard - the allowlist in "
-        f"collectTimezoneSensitiveColumns() must not be so broad that it lets this "
-        f"through too; got: {error!r}"
+        f"collectColumnsRequiringTimezoneCheck() must not be so broad that it lets "
+        f"this through too; got: {error!r}"
+    )
+
+
+def test_export_part_timezone_sensitive_function_nested_in_invariant_function_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_nested_mt_table_{postfix}"
+    s3_table = f"tz_nested_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toUnixTimestamp(toDate(ts))
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toUnixTimestamp(toDate(ts))
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"toDate(ts) inside toUnixTimestamp(toDate(ts)) already produces a "
+        f"timezone-dependent value before toUnixTimestamp ever runs, so wrapping it "
+        f"in an outer invariant function must not exempt ts from the check - only "
+        f"ts's *immediate* parent function determines that; got: {error!r}"
     )
 
 

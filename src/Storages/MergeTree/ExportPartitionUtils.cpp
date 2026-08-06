@@ -655,11 +655,9 @@ namespace ExportPartitionUtils
             return {};
         }
 
-        /// toUnixTimestamp-family functions return the same value regardless of the argument's
-        /// declared timezone, so a column used only inside them doesn't need the check below.
         void collectColumnsRequiringTimezoneCheck(
             const ASTPtr & node,
-            bool inside_timezone_invariant_function,
+            const ASTFunction * immediate_parent_function,
             std::unordered_set<String> & columns_requiring_timezone_check)
         {
             if (!node)
@@ -667,29 +665,30 @@ namespace ExportPartitionUtils
 
             if (const auto * identifier = node->as<ASTIdentifier>())
             {
-                if (!inside_timezone_invariant_function)
+                static const std::unordered_set<String> timezone_invariant_functions = {
+                    "toUnixTimestamp",
+                    "toUnixTimestamp64Second",
+                    "toUnixTimestamp64Milli",
+                    "toUnixTimestamp64Micro",
+                    "toUnixTimestamp64Nano",
+                };
+                const bool wrapped_by_invariant_function
+                    = immediate_parent_function && timezone_invariant_functions.contains(immediate_parent_function->name);
+                if (!wrapped_by_invariant_function)
                     columns_requiring_timezone_check.insert(identifier->name());
                 return;
             }
 
             if (const auto * function = node->as<ASTFunction>())
             {
-                static const std::unordered_set<String> timezone_invariant_functions = {
-                    "toUnixTimestamp",
-                    "toUnixTimestamp64Milli",
-                    "toUnixTimestamp64Micro",
-                    "toUnixTimestamp64Nano",
-                };
-                const bool wraps_in_invariant_function
-                    = inside_timezone_invariant_function || timezone_invariant_functions.contains(function->name);
                 if (function->arguments)
                     for (const auto & argument : function->arguments->children)
-                        collectColumnsRequiringTimezoneCheck(argument, wraps_in_invariant_function, columns_requiring_timezone_check);
+                        collectColumnsRequiringTimezoneCheck(argument, function, columns_requiring_timezone_check);
                 return;
             }
 
             for (const auto & child : node->children)
-                collectColumnsRequiringTimezoneCheck(child, inside_timezone_invariant_function, columns_requiring_timezone_check);
+                collectColumnsRequiringTimezoneCheck(child, nullptr, columns_requiring_timezone_check);
         }
 
         void verifyPartitionKeyColumn(
@@ -797,7 +796,7 @@ namespace ExportPartitionUtils
         }
 
         std::unordered_set<String> columns_requiring_timezone_check;
-        collectColumnsRequiringTimezoneCheck(source_metadata->getPartitionKeyAST(), false, columns_requiring_timezone_check);
+        collectColumnsRequiringTimezoneCheck(source_metadata->getPartitionKeyAST(), nullptr, columns_requiring_timezone_check);
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
