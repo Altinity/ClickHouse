@@ -45,11 +45,12 @@ TO TABLE [destination_database.]destination_table
 
 ## Requirements
 
-`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/engines/table-engines/mergetree-family/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements, in particular:
+`EXPORT PARTITION` exports each part via the same mechanism as [`EXPORT PART`](/docs/en/antalya/part_export.md#requirements), so the source and destination tables must satisfy the same compatibility requirements, in particular:
 
 1. **Identical schemas** - same columns, types, and order
 2. **Matching partition keys** - partition expressions must be identical
-3. **Partition key columns at the same position** - columns are matched by position, so every column that is part of the source table's partition key must also sit at the same position in the destination table's schema, even if both tables' `PARTITION BY` expressions are textually identical. See [`EXPORT PART` requirements](/docs/en/engines/table-engines/mergetree-family/part_export.md#requirements) for a worked example and the exact error message.
+3. **Partition key columns at the same position** - columns are matched by position, so every column that is part of the source table's partition key must also sit at the same position in the destination table's schema, even if both tables' `PARTITION BY` expressions are textually identical. See [`EXPORT PART` requirements](/docs/en/antalya/part_export.md#requirements) for a worked example and the exact error message.
+4. **Matching timezones for `DateTime`/`DateTime64` partition key columns** - a mismatched declared timezone between source and destination is rejected unless the partition key column is wrapped in a known timezone-independent function such as `toUnixTimestamp`. See [`EXPORT PART` requirements](/docs/en/antalya/part_export.md#requirements) for the full list and its known limitations.
 
 ## Settings
 
@@ -259,5 +260,4 @@ WHERE source_table = 'rmt_table' AND destination_table = 's3_table';
 
 ## Related Features
 
-- [ALTER TABLE EXPORT PART](/docs/en/engines/table-engines/mergetree-family/part_export.md) - Export individual parts (non-replicated)
-
+- [ALTER TABLE EXPORT PART](/docs/en/antalya/part_export.md) - Export individual parts (non-replicated)

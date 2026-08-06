@@ -55,6 +55,10 @@ Source and destination tables must be 100% compatible:
 
   This explicit check only applies to partition key columns. A mismatch in the position of a non-partition-key column is **not** rejected by name - it is only caught if the source and destination types are not castable. If two non-partition-key columns happen to have swapped positions but compatible types, the export succeeds and silently writes values into the wrong destination column, so keep the full column order identical (per point 1) rather than relying on this check alone.
 
+4. **Matching timezones for `DateTime`/`DateTime64` partition key columns** - if a partition key column has type `DateTime`/`DateTime64` and its declared timezone differs between the source and destination tables, the export is rejected with `BAD_ARGUMENTS`, because the partition value the source computed at insert time may not match what the destination would compute for the same physical instant. This check is skipped only when the partition key wraps the column in a function that is known to return a timezone-independent result, such as `toUnixTimestamp`, `toUnixTimestamp64Second`, `toUnixTimestamp64Milli`, `toUnixTimestamp64Micro`, or `toUnixTimestamp64Nano`, optionally passed through value-preserving wrappers like `assumeNotNull`, `materialize`, or `identity` (e.g. `PARTITION BY toUnixTimestamp(assumeNotNull(ts))`).
+
+   This is a fixed allowlist, not a general proof of timezone-independence, so some genuinely timezone-independent expressions are currently rejected too. For example, `PARTITION BY toUInt32(ts)` is also timezone-independent because converting `DateTime` to a numeric type uses the stored Unix timestamp and does not perform a calendar-time computation. However, `toUInt32` is not on the allowlist, so the export is rejected even though it would be safe.
+
 In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
 
 ## Settings

@@ -1451,3 +1451,64 @@ def test_export_part_timezone_sensitive_function_behind_value_preserving_wrapper
     )
 
 
+# `timezone_invariant_functions` in `collectColumnsRequiringTimezoneCheck` is a
+# fixed allowlist, not a proof of timezone-independence. This test documents the
+# conservative rejection of safe expressions that the allowlist does not recognize.
+@pytest.mark.parametrize(
+    "function_name, source_type, destination_type, value",
+    [
+        pytest.param(
+            "toUInt32",
+            "DateTime('UTC')",
+            "DateTime('Asia/Tokyo')",
+            "2024-03-05 15:00:00",
+            id="toUInt32-DateTime",
+        ),
+        pytest.param(
+            "toInt64",
+            "DateTime64(3, 'UTC')",
+            "DateTime64(3, 'Asia/Tokyo')",
+            "2024-03-05 15:00:00.000",
+            id="toInt64-DateTime64",
+        ),
+    ],
+)
+def test_export_part_unrecognized_timezone_invariant_function_is_rejected(
+    cluster, function_name, source_type, destination_type, value
+):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_unrecognized_mt_table_{postfix}"
+    s3_table = f"tz_unrecognized_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts {source_type})
+        ENGINE = MergeTree()
+        PARTITION BY {function_name}(ts)
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts {destination_type})
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY {function_name}(ts)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '{value}')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"`{function_name}(ts)` uses the stored epoch value and does not perform a "
+        f"calendar-time conversion, but `{function_name}` is not on the allowlist. "
+        f"The export must be conservatively rejected; got: {error!r}"
+    )
