@@ -89,7 +89,7 @@ namespace ExportPartitionUtils
         const std::string & exception_message,
         const LoggerPtr & log);
 
-    void verifyMergeTreePartitionCompatibility(
+    void assertPartitionKeyASTAreEqual(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata);
 

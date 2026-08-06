@@ -8416,7 +8416,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
 
     if (!dest_storage->isDataLake())
-        ExportPartitionUtils::verifyMergeTreePartitionCompatibility(src_snapshot, destination_snapshot);
+        ExportPartitionUtils::assertPartitionKeyASTAreEqual(src_snapshot, destination_snapshot);
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 

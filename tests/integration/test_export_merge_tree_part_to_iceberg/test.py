@@ -896,3 +896,47 @@ def test_export_part_runtime_cast_failure_propagates_async(cluster):
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_tuple_subcolumn_partition_key_iceberg_rejected(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_tuple_subcol_{sfx}"
+    iceberg = f"iceberg_tuple_subcol_{sfx}"
+    iceberg_partitioned = f"iceberg_tuple_subcol_part_{sfx}"
+
+    create_error = node.query_and_get_error(
+        f"CREATE TABLE {iceberg_partitioned} (t Tuple(b Int32, a Int32), val String) "
+        f"ENGINE = IcebergS3('http://minio1:9001/root/data/{iceberg_partitioned}/', 'minio', 'ClickHouse_Minio_P@ssw0rd') "
+        f"PARTITION BY t.a"
+    )
+    assert "Unknown field to partition" in create_error, (
+        f"Expected Iceberg to reject the tuple subcolumn partition key at CREATE time, "
+        f"got: {create_error!r}"
+    )
+
+    make_mt(node, mt, "t Tuple(a Int32, b Int32), val String", "t.a")
+    make_iceberg_s3(node, iceberg, "t Tuple(b Int32, a Int32), val String", "val")
+
+    node.query(f"INSERT INTO {mt} VALUES ((1, 99), 'x')")
+
+    part = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    export_error = node.query_and_get_error(
+        f"ALTER TABLE {mt} EXPORT PART '{part}' TO TABLE {iceberg} "
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
+        f"allow_experimental_insert_into_iceberg = 1"
+    )
+    assert "Unknown field to partition" in export_error, (
+        f"Expected export validation to reject the tuple subcolumn partition key of {mt}, "
+        f"got: {export_error!r}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")

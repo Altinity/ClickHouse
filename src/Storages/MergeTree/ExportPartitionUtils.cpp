@@ -20,6 +20,7 @@
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Storages/ColumnsDescription.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -648,9 +649,55 @@ namespace ExportPartitionUtils
                 return datetime64_type->getTimeZone().getTimeZone();
             return {};
         }
+
+        void verifyPartitionKeyColumn(
+            const ColumnWithTypeAndName & source_column,
+            const ColumnWithTypeAndName & destination_column,
+            size_t position,
+            const std::vector<String> & required_columns,
+            const ColumnsDescription & source_columns_description,
+            const ColumnsDescription & destination_columns_description,
+            const StorageID & destination_storage_id)
+        {
+            if (source_column.name != destination_column.name)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
+                    "table, but the destination's column at that position is named '{}'. EXPORT "
+                    "PART/PARTITION matches columns by position, so partition key columns must be "
+                    "declared at the same position in both tables.",
+                    destination_storage_id.getFullTableName(),
+                    source_column.name,
+                    position,
+                    destination_column.name);
+
+            for (const auto & column_name : required_columns)
+            {
+                const auto source_resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
+                const auto destination_resolved
+                    = destination_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
+                if (!source_resolved || !destination_resolved)
+                    continue;
+
+                const auto source_time_zone = getDateTimeTimeZoneName(source_resolved->type);
+                const auto destination_time_zone = getDateTimeTimeZoneName(destination_resolved->type);
+                if (source_time_zone && destination_time_zone && *source_time_zone != *destination_time_zone)
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot export to {}: partition key column '{}' is {} in the source table "
+                        "but {} in the destination. The destination's hive-style partition path is "
+                        "rendered from the source value without converting the timezone, so this "
+                        "would silently shift the exported value by the timezone offset. Use the "
+                        "same timezone in both tables' partition key column.",
+                        destination_storage_id.getFullTableName(),
+                        column_name,
+                        source_resolved->type->getName(),
+                        destination_resolved->type->getName());
+            }
+        }
     }
 
-    void verifyMergeTreePartitionCompatibility(
+    void assertPartitionKeyASTAreEqual(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata)
     {
@@ -687,10 +734,21 @@ namespace ExportPartitionUtils
             ActionsDAG::MatchColumnsMode::Position,
             context);
 
+        const auto & source_columns_description = source_metadata->getColumns();
+        const auto & destination_columns_description = destination_metadata->getColumns();
         auto partition_key_columns = source_metadata->getColumnsRequiredForPartitionKey();
-        const std::unordered_set<String> partition_key_column_set(
-            std::make_move_iterator(partition_key_columns.begin()),
-            std::make_move_iterator(partition_key_columns.end()));
+
+        /// Owning top-level column name -> required PARTITION BY names it owns. Two cases:
+        /// - Flat key `PARTITION BY a` -> {"a": ["a"]}: "a" is not a subcolumn, it owns itself.
+        /// - Composite key `PARTITION BY t.ts` -> {"t": ["t.ts"]}: "t.ts" is a subcolumn of "t".
+        /// - Multiple subcolumns of one owner, `PARTITION BY (t.a, t.b)` -> {"t": ["t.a", "t.b"]}.
+        std::unordered_map<String, std::vector<String>> owner_to_partition_key_columns;
+        for (const auto & column_name : partition_key_columns)
+        {
+            auto resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
+            const auto & owner_column_name = resolved ? resolved->getNameInStorage() : column_name;
+            owner_to_partition_key_columns[owner_column_name].push_back(column_name);
+        }
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
@@ -700,33 +758,16 @@ namespace ExportPartitionUtils
             const auto & source_column = source_columns[i];
             const auto & destination_column = destination_columns[i];
 
-            if (partition_key_column_set.contains(source_column.name) && source_column.name != destination_column.name)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
-                    "table, but the destination's column at that position is named '{}'. EXPORT "
-                    "PART/PARTITION matches columns by position, so partition key columns must be "
-                    "declared at the same position in both tables.",
-                    destination_storage_id.getFullTableName(),
-                    source_column.name,
+            if (const auto owned_it = owner_to_partition_key_columns.find(source_column.name);
+                owned_it != owner_to_partition_key_columns.end())
+                verifyPartitionKeyColumn(
+                    source_column,
+                    destination_column,
                     i,
-                    destination_column.name);
-
-            if (partition_key_column_set.contains(source_column.name))
-            {
-                const auto source_time_zone = getDateTimeTimeZoneName(source_column.type);
-                const auto destination_time_zone = getDateTimeTimeZoneName(destination_column.type);
-                if (source_time_zone && destination_time_zone && *source_time_zone != *destination_time_zone)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Cannot export to {}: partition key column '{}' is {} in the source table "
-                        "but {} in the destination. The destination's hive-style partition path is "
-                        "rendered from the source value without converting the timezone, so this "
-                        "would silently shift the exported value by the timezone offset. Use the "
-                        "same timezone in both tables' partition key column.",
-                        destination_storage_id.getFullTableName(),
-                        destination_column.name,
-                        source_column.type->getName(),
-                        destination_column.type->getName());
-            }
+                    owned_it->second,
+                    source_columns_description,
+                    destination_columns_description,
+                    destination_storage_id);
 
             /// Lossy casts may silently change values, so reject them unless the user opts in.
             if (allow_lossy_cast)
