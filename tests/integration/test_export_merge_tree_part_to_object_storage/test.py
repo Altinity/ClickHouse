@@ -1317,3 +1317,137 @@ def test_export_part_timezone_sensitive_function_nested_in_invariant_function_is
     )
 
 
+def test_export_part_unix_timestamp64_second_partition_key_is_allowed(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_u64s_mt_table_{postfix}"
+    s3_table = f"tz_u64s_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime64(3, 'UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toUnixTimestamp64Second(ts)
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime64(3, 'Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toUnixTimestamp64Second(ts)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00.000')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+
+    time.sleep(3)
+    result = node.query(
+        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
+        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
+        f"'id Int32, ts DateTime64(3, \\'Asia/Tokyo\\')') "
+        f"WHERE _file NOT LIKE 'commit%'"
+    ).strip()
+    assert result == "1", (
+        f"toUnixTimestamp64Second(ts) is documented as being relative to UTC, not the "
+        f"declared timezone of ts (see toUnixTimestamp64Second.cpp's own "
+        f"documentation), so a mismatched timezone between source and destination "
+        f"must not block this export; got count={result!r}"
+    )
+
+
+def test_export_part_value_preserving_function_wrapped_in_invariant_function_is_allowed(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_passthrough_mt_table_{postfix}"
+    s3_table = f"tz_passthrough_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toUnixTimestamp(assumeNotNull(ts))
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toUnixTimestamp(assumeNotNull(ts))
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+
+    time.sleep(3)
+    result = node.query(
+        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
+        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
+        f"'id Int32, ts DateTime(\\'Asia/Tokyo\\')') "
+        f"WHERE _file NOT LIKE 'commit%'"
+    ).strip()
+    assert result == "1", (
+        f"assumeNotNull(ts) is identity on the underlying value, so it must not break "
+        f"the chain between ts and the enclosing toUnixTimestamp - the check must look "
+        f"past value-preserving wrapper functions, not just the immediate parent; "
+        f"got count={result!r}"
+    )
+
+
+def test_export_part_timezone_sensitive_function_behind_value_preserving_wrapper_is_rejected(
+    cluster,
+):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_nested_passthrough_mt_table_{postfix}"
+    s3_table = f"tz_nested_passthrough_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toUnixTimestamp(assumeNotNull(toDate(ts)))
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toUnixTimestamp(assumeNotNull(toDate(ts)))
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"toDate(ts) is still timezone-sensitive even when reached through the "
+        f"value-preserving assumeNotNull() and wrapped by the invariant "
+        f"toUnixTimestamp() two levels up - skipping past passthrough functions must "
+        f"not also skip past genuinely timezone-sensitive ones; got: {error!r}"
+    )
+
+

@@ -657,7 +657,7 @@ namespace ExportPartitionUtils
 
         void collectColumnsRequiringTimezoneCheck(
             const ASTPtr & node,
-            const ASTFunction * immediate_parent_function,
+            const ASTFunction * effective_parent_function,
             std::unordered_set<String> & columns_requiring_timezone_check)
         {
             if (!node)
@@ -673,7 +673,7 @@ namespace ExportPartitionUtils
                     "toUnixTimestamp64Nano",
                 };
                 const bool wrapped_by_invariant_function
-                    = immediate_parent_function && timezone_invariant_functions.contains(immediate_parent_function->name);
+                    = effective_parent_function && timezone_invariant_functions.contains(effective_parent_function->name);
                 if (!wrapped_by_invariant_function)
                     columns_requiring_timezone_check.insert(identifier->name());
                 return;
@@ -681,9 +681,16 @@ namespace ExportPartitionUtils
 
             if (const auto * function = node->as<ASTFunction>())
             {
+                static const std::unordered_set<String> value_preserving_functions = {
+                    "identity",
+                    "assumeNotNull",
+                    "materialize",
+                };
+                const ASTFunction * next_parent_function
+                    = value_preserving_functions.contains(function->name) ? effective_parent_function : function;
                 if (function->arguments)
                     for (const auto & argument : function->arguments->children)
-                        collectColumnsRequiringTimezoneCheck(argument, function, columns_requiring_timezone_check);
+                        collectColumnsRequiringTimezoneCheck(argument, next_parent_function, columns_requiring_timezone_check);
                 return;
             }
 
