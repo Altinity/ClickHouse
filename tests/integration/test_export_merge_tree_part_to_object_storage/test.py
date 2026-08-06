@@ -1191,3 +1191,89 @@ def test_export_part_lowcardinality_datetime_partition_key_timezone_mismatch_is_
     )
 
 
+def test_export_part_timezone_invariant_expression_partition_key_is_allowed(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_invariant_mt_table_{postfix}"
+    s3_table = f"tz_invariant_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toUnixTimestamp(ts)
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toUnixTimestamp(ts)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
+
+    time.sleep(3)
+    result = node.query(
+        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
+        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
+        f"'id Int32, ts DateTime(\\'Asia/Tokyo\\')') "
+        f"WHERE _file NOT LIKE 'commit%'"
+    ).strip()
+    assert result == "1", (
+        f"Expected the export to succeed and produce 1 row: toUnixTimestamp(ts) does "
+        f"not depend on ts's declared timezone, so a mismatched timezone between "
+        f"source and destination must not block it; got count={result!r}"
+    )
+
+
+def test_export_part_timezone_sensitive_expression_partition_key_is_rejected(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"tz_sensitive_mt_table_{postfix}"
+    s3_table = f"tz_sensitive_s3_table_{postfix}"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
+        ENGINE = MergeTree()
+        PARTITION BY toDate(ts)
+        ORDER BY id
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+    """)
+
+    node.query(f"""
+        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
+        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
+        PARTITION BY toDate(ts)
+    """)
+
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
+
+    part_name = node.query(
+        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
+        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
+    ).strip()
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
+        f"Unlike toUnixTimestamp(ts), toDate(ts) genuinely depends on ts's declared "
+        f"timezone (day boundaries differ between UTC and Asia/Tokyo), so it must "
+        f"remain protected by the timezone guard - the allowlist in "
+        f"collectTimezoneSensitiveColumns() must not be so broad that it lets this "
+        f"through too; got: {error!r}"
+    )
+
+

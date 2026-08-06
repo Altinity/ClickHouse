@@ -22,6 +22,8 @@
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Storages/ColumnsDescription.h>
 
 #if USE_AVRO
@@ -653,11 +655,49 @@ namespace ExportPartitionUtils
             return {};
         }
 
+        /// toUnixTimestamp-family functions return the same value regardless of the argument's
+        /// declared timezone, so a column used only inside them doesn't need the check below.
+        void collectColumnsRequiringTimezoneCheck(
+            const ASTPtr & node,
+            bool inside_timezone_invariant_function,
+            std::unordered_set<String> & columns_requiring_timezone_check)
+        {
+            if (!node)
+                return;
+
+            if (const auto * identifier = node->as<ASTIdentifier>())
+            {
+                if (!inside_timezone_invariant_function)
+                    columns_requiring_timezone_check.insert(identifier->name());
+                return;
+            }
+
+            if (const auto * function = node->as<ASTFunction>())
+            {
+                static const std::unordered_set<String> timezone_invariant_functions = {
+                    "toUnixTimestamp",
+                    "toUnixTimestamp64Milli",
+                    "toUnixTimestamp64Micro",
+                    "toUnixTimestamp64Nano",
+                };
+                const bool wraps_in_invariant_function
+                    = inside_timezone_invariant_function || timezone_invariant_functions.contains(function->name);
+                if (function->arguments)
+                    for (const auto & argument : function->arguments->children)
+                        collectColumnsRequiringTimezoneCheck(argument, wraps_in_invariant_function, columns_requiring_timezone_check);
+                return;
+            }
+
+            for (const auto & child : node->children)
+                collectColumnsRequiringTimezoneCheck(child, inside_timezone_invariant_function, columns_requiring_timezone_check);
+        }
+
         void verifyPartitionKeyColumn(
             const ColumnWithTypeAndName & source_column,
             const ColumnWithTypeAndName & destination_column,
             size_t position,
             const std::vector<String> & required_columns,
+            const std::unordered_set<String> & columns_requiring_timezone_check,
             const ColumnsDescription & source_columns_description,
             const ColumnsDescription & destination_columns_description,
             const StorageID & destination_storage_id)
@@ -676,6 +716,9 @@ namespace ExportPartitionUtils
 
             for (const auto & column_name : required_columns)
             {
+                if (!columns_requiring_timezone_check.contains(column_name))
+                    continue;
+
                 const auto source_resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
                 const auto destination_resolved
                     = destination_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
@@ -753,6 +796,9 @@ namespace ExportPartitionUtils
             owner_to_partition_key_columns[owner_column_name].push_back(column_name);
         }
 
+        std::unordered_set<String> columns_requiring_timezone_check;
+        collectColumnsRequiringTimezoneCheck(source_metadata->getPartitionKeyAST(), false, columns_requiring_timezone_check);
+
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
         const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
@@ -768,6 +814,7 @@ namespace ExportPartitionUtils
                     destination_column,
                     i,
                     owned_it->second,
+                    columns_requiring_timezone_check,
                     source_columns_description,
                     destination_columns_description,
                     destination_storage_id);
