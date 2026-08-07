@@ -57,6 +57,8 @@ Source and destination tables must support positional schema conversion:
 
   For `PARTITION BY t.a`, this rule applies to the top-level owning column `t`. Exporting from `t Tuple(a Int32, b Int32)` to `t Tuple(b Int32, a Int32)` is rejected, even though `a` is accessed by name. Requiring a stable layout for every partition-key owner also protects positional expressions such as `tupleElement(t, 1)` from changing their meaning after conversion.
 
+  The element-name check only applies when both the source and destination `Tuple` declare explicit names; an unnamed `Tuple` (e.g. `Tuple(Int32, Int32)`) is compared to the destination by element position and type only. For example, exporting from `t Tuple(Int32, Int32)` to `t Tuple(x Int32, y Int32)` is allowed as long as element types match positionally.
+
   The same rule applies when the named tuple is nested inside a container. For example, `arr Array(Tuple(a Int32, b Int32))` and `arr Array(Tuple(b Int32, a Int32))` are incompatible when `arr` provides an input to the partition key. Likewise, tuple layouts in both the key and value types of `Map` are checked recursively.
 
   In this case, the export throws a `BAD_ARGUMENTS` exception whose message includes `partition key column 't' has a different Tuple element layout in the source (Tuple(a Int32, b Int32)) and destination (Tuple(b Int32, a Int32)). Tuple element names must be declared in the same order in both tables`.
