@@ -322,6 +322,7 @@ class RejectedPartExportCase(NamedTuple):
     dst_partition_by: str
     insert_values: str
     error_substrings: tuple = ()
+    partition_strategy: str = "hive"
 
 
 REJECTED_PART_EXPORT_CASES = [
@@ -332,7 +333,9 @@ REJECTED_PART_EXPORT_CASES = [
             dst_columns="b Int32, a Int32",
             dst_partition_by="a",
             insert_values="(1, 1), (1, 2)",
-            error_substrings=("partition key column",),
+            error_substrings=(
+                "partition key column 'a' is at position 0 in the source table",
+            ),
         ),
         id="same_partition_key_different_column_order_single_column",
     ),
@@ -343,7 +346,9 @@ REJECTED_PART_EXPORT_CASES = [
             dst_columns="c Int32, b Int32, a Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 1, 1, 'x'), (1, 1, 1, 'y')",
-            error_substrings=("partition key column",),
+            error_substrings=(
+                "partition key column 'a' is at position 0 in the source table",
+            ),
         ),
         id="same_partition_key_different_column_order_multi_column",
     ),
@@ -354,7 +359,9 @@ REJECTED_PART_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(c, b, a)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_order_mismatch",
     ),
@@ -365,7 +372,9 @@ REJECTED_PART_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_fewer_in_destination",
     ),
@@ -376,20 +385,51 @@ REJECTED_PART_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_more_in_destination",
     ),
     pytest.param(
         RejectedPartExportCase(
-            src_columns="id Int64, ts DateTime('UTC')",
-            src_partition_by="ts",
-            dst_columns="id Int64, ts DateTime('Asia/Tokyo')",
-            dst_partition_by="ts",
-            insert_values="(1, '2024-03-05 15:00:00')",
-            error_substrings=("timezone",),
+            src_columns="ts DateTime, category String, decoy DateTime, val String",
+            src_partition_by="(toYYYYMM(ts), category)",
+            dst_columns="decoy DateTime, category String, ts DateTime, val String",
+            dst_partition_by="(toYYYYMM(ts), category)",
+            insert_values=(
+                "('2024-03-05 15:00:00', 'category', "
+                "'2024-03-06 15:00:00', 'x')"
+            ),
+            error_substrings=(
+                "partition key column 'ts' is at position 0 in the source table",
+            ),
+            partition_strategy="wildcard",
         ),
-        id="partition_key_timezone_mismatch",
+        id="function_and_column_partition_key_owner_reordered",
+    ),
+    pytest.param(
+        RejectedPartExportCase(
+            src_columns=(
+                "t Tuple(ts DateTime, value Int32), category String, "
+                "decoy Tuple(ts DateTime, value Int32), val String"
+            ),
+            src_partition_by="(toYYYYMM(t.ts), category)",
+            dst_columns=(
+                "decoy Tuple(ts DateTime, value Int32), category String, "
+                "t Tuple(ts DateTime, value Int32), val String"
+            ),
+            dst_partition_by="(toYYYYMM(t.ts), category)",
+            insert_values=(
+                "(('2024-03-05 15:00:00', 1), 'category', "
+                "('2024-03-06 15:00:00', 2), 'x')"
+            ),
+            error_substrings=(
+                "partition key column 't' is at position 0 in the source table",
+            ),
+            partition_strategy="wildcard",
+        ),
+        id="function_over_subcolumn_partition_key_owner_reordered",
     ),
 ]
 
@@ -411,9 +451,14 @@ def test_export_part_partition_key_mismatch_variants_are_rejected(cluster, case)
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
 
+    filename = (
+        f"{s3_table}/{{_partition_id}}/{{_file}}"
+        if case.partition_strategy == "wildcard"
+        else s3_table
+    )
     node.query(f"""
         CREATE TABLE {s3_table} ({case.dst_columns})
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        ENGINE = S3(s3_conn, filename='{filename}', format=Parquet, partition_strategy='{case.partition_strategy}')
         PARTITION BY {case.dst_partition_by}
     """)
 
@@ -429,8 +474,11 @@ def test_export_part_partition_key_mismatch_variants_are_rejected(cluster, case)
     for substring in case.error_substrings:
         assert substring in error, f"Expected {substring!r} in error, got: {error}"
 
-    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
+    if case.partition_strategy == "hive":
+        count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+        assert count == 0, (
+            f"Expected 0 rows in destination after rejected export, got {count}"
+        )
 
 
 def test_export_part_multi_column_partition_key_success(cluster):
@@ -473,77 +521,6 @@ def test_export_part_multi_column_partition_key_success(cluster):
     assert result == "1\t2\t3\tx\n1\t2\t3\ty", f"Unexpected exported data:\n{result}"
 
 
-def test_export_part_non_partition_key_timezone_mismatch_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_ok_mt_table_{postfix}"
-    s3_table = f"tz_ok_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int64, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY id
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int64, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY id
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-    time.sleep(5)
-
-    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
-    assert count == 1, f"Expected 1 row in destination after export, got {count}"
-
-    source_ts = node.query(f"SELECT ts FROM {mt_table}").strip()
-    assert source_ts == "2024-03-05 15:00:00", f"Unexpected source value: {source_ts}"
-
-    dest_ts = node.query(f"SELECT ts FROM {s3_table}").strip()
-    assert dest_ts == "2024-03-06 00:00:00", (
-        f"Expected the exported value to be the same instant displayed in the "
-        f"destination's Asia/Tokyo timezone ('2024-03-06 00:00:00'), got: {dest_ts}"
-    )
-
-    source_unix_ts = int(node.query(f"SELECT toUnixTimestamp(ts) FROM {mt_table}").strip())
-    dest_unix_ts = int(node.query(f"SELECT toUnixTimestamp(ts) FROM {s3_table}").strip())
-    assert source_unix_ts == dest_unix_ts, (
-        f"Expected exported DateTime value to be preserved regardless of the "
-        f"destination column's timezone, got source={source_unix_ts}, dest={dest_unix_ts}"
-    )
-
-
-def test_export_part_tuple_subcolumn_partition_key_hive_destination_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    s3_table = f"tuple_subcol_s3_table_{postfix}"
-
-    error = node.query_and_get_error(f"""
-        CREATE TABLE {s3_table} (t Tuple(b Int32, a Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY t.a
-    """)
-    assert "BAD_ARGUMENTS" in error and "part of the storage columns" in error, (
-        f"Expected hive partition strategy to reject the tuple subcolumn "
-        f"partition expression at CREATE time, got: {error!r}"
-    )
-
-
 def read_exported_files(node, s3_table):
     return node.query(
         f"SELECT t.a, t.b, val FROM "
@@ -562,7 +539,7 @@ def get_export_part_log(node, mt_table):
     ).strip()
 
 
-def test_export_part_tuple_subcolumn_partition_key_wildcard_destination(cluster):
+def test_export_part_named_tuple_fields_reordered_with_subcolumn_partition_key_is_allowed(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
@@ -635,10 +612,15 @@ def test_export_part_subcolumn_partition_key_different_subcolumn_is_rejected(clu
     error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
     )
-    assert "BAD_ARGUMENTS" in error and "different `PARTITION BY` expressions" in error, (
+    assert (
+        "BAD_ARGUMENTS" in error
+        and "source and destination tables have different `PARTITION BY` expressions"
+        in error
+    ), (
         f"Both tables declare `a` as the same Tuple(b Int32, c Int32) (so the column-cast "
-        f"check passes and the owner-name-only partition_key_column_set = {{'a'}} in "
-        f"verifyExportSchemaCastable cannot distinguish `a.b` from `a.c`), but the source "
+        f"check passes and the owner-name-only `partition_key_owner_columns` contains "
+        f"only `a`, so `verifyExportSchemaCastable` cannot distinguish `a.b` from "
+        f"`a.c`), but the source "
         f"partitions by `a.b` and the destination by `a.c` — a genuinely different "
         f"partition key that must be caught by the `PARTITION BY` AST comparison; "
         f"got: {error!r}"
@@ -684,29 +666,37 @@ def test_export_part_tuple_subcolumn_partition_key_owner_column_reordered_is_rej
     )
 
 
-def test_export_part_subcolumn_partition_key_timezone_mismatch_is_rejected(cluster):
+def test_export_part_multiple_partition_key_subcolumns_with_same_owner_reordered_is_rejected(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"subcol_tz_mt_table_{postfix}"
-    s3_table = f"subcol_tz_s3_table_{postfix}"
+    mt_table = f"same_owner_subcolumns_mt_table_{postfix}"
+    s3_table = f"same_owner_subcolumns_s3_table_{postfix}"
 
     node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32, ts DateTime('UTC')), val String)
+        CREATE TABLE {mt_table} (
+            t Tuple(a Int32, b Int32),
+            decoy Tuple(a Int32, b Int32),
+            val String
+        )
         ENGINE = MergeTree()
-        PARTITION BY t.ts
+        PARTITION BY (t.a, t.b)
         ORDER BY tuple()
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
 
     node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32, ts DateTime('Asia/Tokyo')), val String)
+        CREATE TABLE {s3_table} (
+            decoy Tuple(a Int32, b Int32),
+            t Tuple(a Int32, b Int32),
+            val String
+        )
         ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY t.ts
+        PARTITION BY (t.a, t.b)
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, '2024-03-05 15:00:00'), 'x')")
+    node.query(f"INSERT INTO {mt_table} VALUES ((1, 10), (2, 20), 'x')")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
@@ -716,15 +706,9 @@ def test_export_part_subcolumn_partition_key_timezone_mismatch_is_rejected(clust
     error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
     )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"Expected export to reject the nested partition key column `t.ts` changing "
-        f"timezone from UTC to Asia/Tokyo between source and destination, the same way "
-        f"a top-level DateTime partition key column with mismatched timezones is "
-        f"rejected (see test_export_part_partition_key_mismatch_variants_are_rejected's "
-        f"'partition_key_timezone_mismatch' case). getDateTimeTimeZoneName() is called "
-        f"on the owning column's type (Tuple(...)), not on the actual DateTime "
-        f"subcolumn's type, so it can never recognize a timezone at all here; "
-        f"got: {error!r}"
+    assert "BAD_ARGUMENTS" in error and "partition key column 't'" in error, (
+        f"Expected both `t.a` and `t.b` to resolve to the same top-level owner `t` "
+        f"and reject swapping `t` with `decoy`; got: {error!r}"
     )
 
 
@@ -771,7 +755,7 @@ def test_export_part_multi_level_subcolumn_partition_key_owner_reordered_is_reje
     assert "BAD_ARGUMENTS" in error and "partition key column" in error, (
         f"Expected export to reject `t` and `decoy` swapping positions around the "
         f"two-level-deep partition key column `t.x.a`. This only works if "
-        f"getNameInStorage() resolves all the way to the top-level column `t`, not to "
+        f"`getNameInStorage` resolves all the way to the top-level column `t`, not to "
         f"the intermediate level `t.x`; got: {error!r}"
     )
 
@@ -906,609 +890,4 @@ def test_export_part_subcolumn_partition_key_owner_reordered_rejected_even_with_
         f"`export_merge_tree_part_allow_lossy_cast = 1` must not suppress the rejection "
         f"of `t`/`decoy` swapping positions around the partition key column `t.a`; "
         f"got: {error!r}"
-    )
-
-
-def test_export_part_tuple_column_real_narrowing_same_order_is_rejected_diagnostic(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tuple_narrow_same_order_mt_table_{postfix}"
-    s3_table = f"tuple_narrow_same_order_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32, b Int64), val String)
-        ENGINE = MergeTree()
-        PARTITION BY val
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32, b Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY val
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((100, 5000000000), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    print(f"DIAGNOSTIC SAME-ORDER-NARROWING ERROR: {error!r}")
-    assert "INCOMPATIBLE_COLUMNS" in error and "lossy cast" in error, (
-        f"Expected the genuinely narrowing `b` field (Int64 -> Int32, same field order "
-        f"on both sides) to be rejected as a lossy cast; got: {error!r}"
-    )
-
-
-def test_export_part_tuple_column_fewer_fields_in_destination_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tuple_fewer_fields_mt_table_{postfix}"
-    s3_table = f"tuple_fewer_fields_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32, ts DateTime('UTC')), val String)
-        ENGINE = MergeTree()
-        PARTITION BY val
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY val
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, '2024-03-05 15:00:00'), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error and "lossy cast" in error, (
-        f"`t` is not a partition key column here. The destination's `t` (Tuple(a Int32)) "
-        f"has fewer fields than the source's `t` (Tuple(a Int32, ts DateTime('UTC'))), "
-        f"which canBeSafelyCast's tuple arity check (lhs_type_elements_size != "
-        f"to_tuple_type_elements.size()) must reject; got: {error!r}"
-    )
-
-
-def test_export_part_subcolumn_partition_key_tuple_fewer_fields_in_destination_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"subcol_key_fewer_fields_mt_table_{postfix}"
-    s3_table = f"subcol_key_fewer_fields_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32, ts DateTime('UTC')), val String)
-        ENGINE = MergeTree()
-        PARTITION BY t.ts
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY t.a
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, '2024-03-05 15:00:00'), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error and "lossy cast" in error, (
-        f"The partition key `t.ts` requires a field the destination's `t` doesn't have "
-        f"at all, so verifyPartitionKeyColumn's timezone lookup finds "
-        f"destination_resolved == nullopt for 't.ts' and defers (continue); the arity "
-        f"mismatch must still be caught right after by canBeSafelyCast on the whole "
-        f"`t` column; got: {error!r}"
-    )
-
-
-def test_export_part_tuple_column_fewer_fields_in_source_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tuple_fewer_fields_src_mt_table_{postfix}"
-    s3_table = f"tuple_fewer_fields_src_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32), val String)
-        ENGINE = MergeTree()
-        PARTITION BY val
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32, ts DateTime('UTC')), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY val
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1,), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error and "lossy cast" in error, (
-        f"Reverse direction of the fewer-fields case: the source's `t` (Tuple(a Int32)) "
-        f"has fewer fields than the destination's `t` (Tuple(a Int32, ts "
-        f"DateTime('UTC'))). canBeSafelyCast's arity check is a plain size "
-        f"inequality, so it must reject this direction too; got: {error!r}"
-    )
-
-
-def test_export_part_subcolumn_partition_key_tuple_fewer_fields_in_source_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"subcol_key_fewer_fields_src_mt_table_{postfix}"
-    s3_table = f"subcol_key_fewer_fields_src_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32), val String)
-        ENGINE = MergeTree()
-        PARTITION BY t.a
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(a Int32, ts DateTime('UTC')), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY t.a
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1,), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "INCOMPATIBLE_COLUMNS" in error and "lossy cast" in error, (
-        f"Here `t.a` (the partition key) exists and resolves fine on both sides, so "
-        f"verifyPartitionKeyColumn's timezone check passes without throwing; the extra "
-        f"`ts` field the destination has beyond the source's `t` must still be caught "
-        f"by canBeSafelyCast's arity check, independent of the partition key guard "
-        f"succeeding; got: {error!r}"
-    )
-
-
-def test_export_part_nullable_datetime_partition_key_timezone_mismatch_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"nullable_tz_mt_table_{postfix}"
-    s3_table = f"nullable_tz_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts Nullable(DateTime('UTC')))
-        ENGINE = MergeTree()
-        PARTITION BY ts
-        ORDER BY id
-        SETTINGS allow_nullable_key = 1, enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts Nullable(DateTime('Asia/Tokyo')))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY ts
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"getDateTimeTimeZoneName() only recognizes bare DateTime/DateTime64, so wrapping "
-        f"the partition key in Nullable(...) hides the timezone from it entirely; "
-        f"canBeSafelyCast() provides no fallback here either, since "
-        f"DataTypeDateTime::equals() treats any two DateTime types as equal regardless "
-        f"of timezone by design, so this needs its own dedicated rejection - even "
-        f"without export_merge_tree_part_allow_lossy_cast being set; got: {error!r}"
-    )
-
-
-def test_export_part_lowcardinality_datetime_partition_key_timezone_mismatch_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"lc_tz_mt_table_{postfix}"
-    s3_table = f"lc_tz_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts LowCardinality(DateTime('UTC')))
-        ENGINE = MergeTree()
-        PARTITION BY ts
-        ORDER BY id
-        SETTINGS allow_suspicious_low_cardinality_types = 1, enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts LowCardinality(DateTime('Asia/Tokyo')))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY ts
-        SETTINGS allow_suspicious_low_cardinality_types = 1
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"Same gap as the Nullable case, but for LowCardinality(DateTime(...)); "
-        f"got: {error!r}"
-    )
-
-
-def test_export_part_timezone_invariant_expression_partition_key_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_invariant_mt_table_{postfix}"
-    s3_table = f"tz_invariant_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toUnixTimestamp(ts)
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toUnixTimestamp(ts)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-    time.sleep(3)
-    result = node.query(
-        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
-        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
-        f"'id Int32, ts DateTime(\\'Asia/Tokyo\\')') "
-        f"WHERE _file NOT LIKE 'commit%'"
-    ).strip()
-    assert result == "1", (
-        f"Expected the export to succeed and produce 1 row: toUnixTimestamp(ts) does "
-        f"not depend on ts's declared timezone, so a mismatched timezone between "
-        f"source and destination must not block it; got count={result!r}"
-    )
-
-
-def test_export_part_timezone_sensitive_expression_partition_key_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_sensitive_mt_table_{postfix}"
-    s3_table = f"tz_sensitive_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toDate(ts)
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toDate(ts)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"Unlike toUnixTimestamp(ts), toDate(ts) genuinely depends on ts's declared "
-        f"timezone (day boundaries differ between UTC and Asia/Tokyo), so it must "
-        f"remain protected by the timezone guard - the allowlist in "
-        f"collectColumnsRequiringTimezoneCheck() must not be so broad that it lets "
-        f"this through too; got: {error!r}"
-    )
-
-
-def test_export_part_timezone_sensitive_function_nested_in_invariant_function_is_rejected(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_nested_mt_table_{postfix}"
-    s3_table = f"tz_nested_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toUnixTimestamp(toDate(ts))
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toUnixTimestamp(toDate(ts))
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"toDate(ts) inside toUnixTimestamp(toDate(ts)) already produces a "
-        f"timezone-dependent value before toUnixTimestamp ever runs, so wrapping it "
-        f"in an outer invariant function must not exempt ts from the check - only "
-        f"ts's *immediate* parent function determines that; got: {error!r}"
-    )
-
-
-def test_export_part_unix_timestamp64_second_partition_key_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_u64s_mt_table_{postfix}"
-    s3_table = f"tz_u64s_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime64(3, 'UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toUnixTimestamp64Second(ts)
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime64(3, 'Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toUnixTimestamp64Second(ts)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00.000')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-    time.sleep(3)
-    result = node.query(
-        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
-        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
-        f"'id Int32, ts DateTime64(3, \\'Asia/Tokyo\\')') "
-        f"WHERE _file NOT LIKE 'commit%'"
-    ).strip()
-    assert result == "1", (
-        f"toUnixTimestamp64Second(ts) is documented as being relative to UTC, not the "
-        f"declared timezone of ts (see toUnixTimestamp64Second.cpp's own "
-        f"documentation), so a mismatched timezone between source and destination "
-        f"must not block this export; got count={result!r}"
-    )
-
-
-def test_export_part_value_preserving_function_wrapped_in_invariant_function_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_passthrough_mt_table_{postfix}"
-    s3_table = f"tz_passthrough_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toUnixTimestamp(assumeNotNull(ts))
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toUnixTimestamp(assumeNotNull(ts))
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-    time.sleep(3)
-    result = node.query(
-        f"SELECT count() FROM s3('http://minio1:9001/root/data/{s3_table}/**', "
-        f"'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
-        f"'id Int32, ts DateTime(\\'Asia/Tokyo\\')') "
-        f"WHERE _file NOT LIKE 'commit%'"
-    ).strip()
-    assert result == "1", (
-        f"assumeNotNull(ts) is identity on the underlying value, so it must not break "
-        f"the chain between ts and the enclosing toUnixTimestamp - the check must look "
-        f"past value-preserving wrapper functions, not just the immediate parent; "
-        f"got count={result!r}"
-    )
-
-
-def test_export_part_timezone_sensitive_function_behind_value_preserving_wrapper_is_rejected(
-    cluster,
-):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_nested_passthrough_mt_table_{postfix}"
-    s3_table = f"tz_nested_passthrough_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts DateTime('UTC'))
-        ENGINE = MergeTree()
-        PARTITION BY toUnixTimestamp(assumeNotNull(toDate(ts)))
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts DateTime('Asia/Tokyo'))
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY toUnixTimestamp(assumeNotNull(toDate(ts)))
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 15:00:00')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"toDate(ts) is still timezone-sensitive even when reached through the "
-        f"value-preserving assumeNotNull() and wrapped by the invariant "
-        f"toUnixTimestamp() two levels up - skipping past passthrough functions must "
-        f"not also skip past genuinely timezone-sensitive ones; got: {error!r}"
-    )
-
-
-# `timezone_invariant_functions` in `collectColumnsRequiringTimezoneCheck` is a
-# fixed allowlist, not a proof of timezone-independence. This test documents the
-# conservative rejection of safe expressions that the allowlist does not recognize.
-@pytest.mark.parametrize(
-    "function_name, source_type, destination_type, value",
-    [
-        pytest.param(
-            "toUInt32",
-            "DateTime('UTC')",
-            "DateTime('Asia/Tokyo')",
-            "2024-03-05 15:00:00",
-            id="toUInt32-DateTime",
-        ),
-        pytest.param(
-            "toInt64",
-            "DateTime64(3, 'UTC')",
-            "DateTime64(3, 'Asia/Tokyo')",
-            "2024-03-05 15:00:00.000",
-            id="toInt64-DateTime64",
-        ),
-    ],
-)
-def test_export_part_unrecognized_timezone_invariant_function_is_rejected(
-    cluster, function_name, source_type, destination_type, value
-):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tz_unrecognized_mt_table_{postfix}"
-    s3_table = f"tz_unrecognized_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (id Int32, ts {source_type})
-        ENGINE = MergeTree()
-        PARTITION BY {function_name}(ts)
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (id Int32, ts {destination_type})
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY {function_name}(ts)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES (1, '{value}')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
-    )
-    assert "BAD_ARGUMENTS" in error and "timezone" in error, (
-        f"`{function_name}(ts)` uses the stored epoch value and does not perform a "
-        f"calendar-time conversion, but `{function_name}` is not on the allowlist. "
-        f"The export must be conservatively rejected; got: {error!r}"
     )

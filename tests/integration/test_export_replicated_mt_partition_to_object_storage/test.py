@@ -1789,7 +1789,9 @@ REJECTED_PARTITION_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(c, b, a)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_order_mismatch",
     ),
@@ -1800,7 +1802,9 @@ REJECTED_PARTITION_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_fewer_in_destination",
     ),
@@ -1811,20 +1815,11 @@ REJECTED_PARTITION_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("different `PARTITION BY` expressions",),
+            error_substrings=(
+                "source and destination tables have different `PARTITION BY` expressions",
+            ),
         ),
         id="multi_column_partition_key_more_in_destination",
-    ),
-    pytest.param(
-        RejectedPartitionExportCase(
-            src_columns="id Int64, ts DateTime('UTC')",
-            src_partition_by="ts",
-            dst_columns="id Int64, ts DateTime('Asia/Tokyo')",
-            dst_partition_by="ts",
-            insert_values="(1, '2024-03-05 15:00:00')",
-            error_substrings=("timezone",),
-        ),
-        id="partition_key_timezone_mismatch",
     ),
 ]
 

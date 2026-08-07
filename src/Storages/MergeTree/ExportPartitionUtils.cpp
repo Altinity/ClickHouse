@@ -13,17 +13,10 @@
 #include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
-#include <DataTypes/DataTypeDateTime.h>
-#include <DataTypes/DataTypeDateTime64.h>
-#include <DataTypes/DataTypeLowCardinality.h>
-#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/Utils.h>
-#include <Functions/FunctionHelpers.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
-#include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Storages/ColumnsDescription.h>
 
 #if USE_AVRO
@@ -643,112 +636,6 @@ namespace ExportPartitionUtils
     }
 #endif
 
-    namespace
-    {
-        std::optional<String> getDateTimeTimeZoneName(const DataTypePtr & type)
-        {
-            const auto unwrapped_type = removeNullable(removeLowCardinality(type));
-            if (const auto * datetime_type = checkAndGetDataType<DataTypeDateTime>(unwrapped_type.get()))
-                return datetime_type->getTimeZone().getTimeZone();
-            if (const auto * datetime64_type = checkAndGetDataType<DataTypeDateTime64>(unwrapped_type.get()))
-                return datetime64_type->getTimeZone().getTimeZone();
-            return {};
-        }
-
-        void collectColumnsRequiringTimezoneCheck(
-            const ASTPtr & node,
-            const ASTFunction * effective_parent_function,
-            std::unordered_set<String> & columns_requiring_timezone_check)
-        {
-            if (!node)
-                return;
-
-            if (const auto * identifier = node->as<ASTIdentifier>())
-            {
-                static const std::unordered_set<String> timezone_invariant_functions = {
-                    "toUnixTimestamp",
-                    "toUnixTimestamp64Second",
-                    "toUnixTimestamp64Milli",
-                    "toUnixTimestamp64Micro",
-                    "toUnixTimestamp64Nano",
-                };
-                const bool wrapped_by_invariant_function
-                    = effective_parent_function && timezone_invariant_functions.contains(effective_parent_function->name);
-                if (!wrapped_by_invariant_function)
-                    columns_requiring_timezone_check.insert(identifier->name());
-                return;
-            }
-
-            if (const auto * function = node->as<ASTFunction>())
-            {
-                static const std::unordered_set<String> value_preserving_functions = {
-                    "identity",
-                    "assumeNotNull",
-                    "materialize",
-                };
-                const ASTFunction * next_parent_function
-                    = value_preserving_functions.contains(function->name) ? effective_parent_function : function;
-                if (function->arguments)
-                    for (const auto & argument : function->arguments->children)
-                        collectColumnsRequiringTimezoneCheck(argument, next_parent_function, columns_requiring_timezone_check);
-                return;
-            }
-
-            for (const auto & child : node->children)
-                collectColumnsRequiringTimezoneCheck(child, nullptr, columns_requiring_timezone_check);
-        }
-
-        void verifyPartitionKeyColumn(
-            const ColumnWithTypeAndName & source_column,
-            const ColumnWithTypeAndName & destination_column,
-            size_t position,
-            const std::vector<String> & required_columns,
-            const std::unordered_set<String> & columns_requiring_timezone_check,
-            const ColumnsDescription & source_columns_description,
-            const ColumnsDescription & destination_columns_description,
-            const StorageID & destination_storage_id)
-        {
-            if (source_column.name != destination_column.name)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
-                    "table, but the destination's column at that position is named '{}'. EXPORT "
-                    "PART/PARTITION matches columns by position, so partition key columns must be "
-                    "declared at the same position in both tables.",
-                    destination_storage_id.getFullTableName(),
-                    source_column.name,
-                    position,
-                    destination_column.name);
-
-            for (const auto & column_name : required_columns)
-            {
-                if (!columns_requiring_timezone_check.contains(column_name))
-                    continue;
-
-                const auto source_resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
-                const auto destination_resolved
-                    = destination_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
-                if (!source_resolved || !destination_resolved)
-                    continue;
-
-                const auto source_time_zone = getDateTimeTimeZoneName(source_resolved->type);
-                const auto destination_time_zone = getDateTimeTimeZoneName(destination_resolved->type);
-                if (source_time_zone && destination_time_zone && *source_time_zone != *destination_time_zone)
-                    throw Exception(
-                        ErrorCodes::BAD_ARGUMENTS,
-                        "Cannot export to {}: partition key column '{}' is {} in the source table "
-                        "but {} in the destination. The destination's hive-style partition path is "
-                        "rendered from the source value without converting the timezone, so this "
-                        "would silently shift the exported value by the timezone offset. Use the "
-                        "same timezone in both tables' partition key column.",
-                        destination_storage_id.getFullTableName(),
-                        column_name,
-                        source_resolved->type->getName(),
-                        destination_resolved->type->getName());
-            }
-        }
-    }
-
     void assertPartitionKeyASTAreEqual(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata)
@@ -787,23 +674,16 @@ namespace ExportPartitionUtils
             context);
 
         const auto & source_columns_description = source_metadata->getColumns();
-        const auto & destination_columns_description = destination_metadata->getColumns();
-        auto partition_key_columns = source_metadata->getColumnsRequiredForPartitionKey();
-
-        /// Owning top-level column name -> required PARTITION BY names it owns. Two cases:
-        /// - Flat key `PARTITION BY a` -> {"a": ["a"]}: "a" is not a subcolumn, it owns itself.
-        /// - Composite key `PARTITION BY t.ts` -> {"t": ["t.ts"]}: "t.ts" is a subcolumn of "t".
-        /// - Multiple subcolumns of one owner, `PARTITION BY (t.a, t.b)` -> {"t": ["t.a", "t.b"]}.
-        std::unordered_map<String, std::vector<String>> owner_to_partition_key_columns;
-        for (const auto & column_name : partition_key_columns)
+        /// Collect the top-level columns that own columns or subcolumns required by `PARTITION BY`.
+        /// For example, both `PARTITION BY t.a` and `PARTITION BY (t.a, t.b)` add `t`.
+        std::unordered_set<String> partition_key_owner_columns;
+        for (const auto & column_or_subcolumn_name : source_metadata->getColumnsRequiredForPartitionKey())
         {
-            auto resolved = source_columns_description.tryGetColumnOrSubcolumn(GetColumnsOptions::All, column_name);
-            const auto & owner_column_name = resolved ? resolved->getNameInStorage() : column_name;
-            owner_to_partition_key_columns[owner_column_name].push_back(column_name);
+            auto resolved = source_columns_description.tryGetColumnOrSubcolumn(
+                GetColumnsOptions::All, column_or_subcolumn_name);
+            const auto & column_name = resolved ? resolved->getNameInStorage() : column_or_subcolumn_name;
+            partition_key_owner_columns.insert(column_name);
         }
-
-        std::unordered_set<String> columns_requiring_timezone_check;
-        collectColumnsRequiringTimezoneCheck(source_metadata->getPartitionKeyAST(), nullptr, columns_requiring_timezone_check);
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
@@ -813,17 +693,19 @@ namespace ExportPartitionUtils
             const auto & source_column = source_columns[i];
             const auto & destination_column = destination_columns[i];
 
-            if (const auto owned_it = owner_to_partition_key_columns.find(source_column.name);
-                owned_it != owner_to_partition_key_columns.end())
-                verifyPartitionKeyColumn(
-                    source_column,
-                    destination_column,
+            if (partition_key_owner_columns.contains(source_column.name) && source_column.name != destination_column.name)
+            {
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
+                    "table, but the destination's column at that position is named '{}'. EXPORT "
+                    "PART/PARTITION matches columns by position, so partition key columns must be "
+                    "declared at the same position in both tables.",
+                    destination_storage_id.getFullTableName(),
+                    source_column.name,
                     i,
-                    owned_it->second,
-                    columns_requiring_timezone_check,
-                    source_columns_description,
-                    destination_columns_description,
-                    destination_storage_id);
+                    destination_column.name);
+            }
 
             /// Lossy casts may silently change values, so reject them unless the user opts in.
             if (allow_lossy_cast)
