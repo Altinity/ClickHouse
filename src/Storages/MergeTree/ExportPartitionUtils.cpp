@@ -13,7 +13,9 @@
 #include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/Utils.h>
@@ -649,17 +651,43 @@ namespace ExportPartitionUtils
 
             const auto * source_tuple = checkAndGetDataType<DataTypeTuple>(source_type_unwrapped.get());
             const auto * destination_tuple = checkAndGetDataType<DataTypeTuple>(destination_type_unwrapped.get());
-            if (!source_tuple || !destination_tuple)
-                return source_tuple == destination_tuple;
-
-            if (source_tuple->getElementNames() != destination_tuple->getElementNames())
-                return false;
-
-            const auto & source_elements = source_tuple->getElements();
-            const auto & destination_elements = destination_tuple->getElements();
-            for (size_t i = 0; i < source_elements.size(); ++i)
-                if (!haveSameTupleElementLayout(source_elements[i], destination_elements[i]))
+            if (source_tuple || destination_tuple)
+            {
+                if (!source_tuple || !destination_tuple)
                     return false;
+
+                if (source_tuple->getElementNames() != destination_tuple->getElementNames())
+                    return false;
+
+                const auto & source_elements = source_tuple->getElements();
+                const auto & destination_elements = destination_tuple->getElements();
+                for (size_t i = 0; i < source_elements.size(); ++i)
+                    if (!haveSameTupleElementLayout(source_elements[i], destination_elements[i]))
+                        return false;
+
+                return true;
+            }
+
+            const auto * source_array = checkAndGetDataType<DataTypeArray>(source_type_unwrapped.get());
+            const auto * destination_array = checkAndGetDataType<DataTypeArray>(destination_type_unwrapped.get());
+            if (source_array || destination_array)
+            {
+                if (!source_array || !destination_array)
+                    return false;
+
+                return haveSameTupleElementLayout(source_array->getNestedType(), destination_array->getNestedType());
+            }
+
+            const auto * source_map = checkAndGetDataType<DataTypeMap>(source_type_unwrapped.get());
+            const auto * destination_map = checkAndGetDataType<DataTypeMap>(destination_type_unwrapped.get());
+            if (source_map || destination_map)
+            {
+                if (!source_map || !destination_map)
+                    return false;
+
+                return haveSameTupleElementLayout(source_map->getKeyType(), destination_map->getKeyType())
+                    && haveSameTupleElementLayout(source_map->getValueType(), destination_map->getValueType());
+            }
 
             return true;
         }

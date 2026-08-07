@@ -522,14 +522,49 @@ def test_export_part_multi_column_partition_key_success(cluster):
 
 
 @pytest.mark.parametrize(
-    "partition_by",
+    "owner_name, source_type, destination_type, partition_by, insert_value",
     [
-        pytest.param("t.a", id="named_subcolumn"),
-        pytest.param("tupleElement(t, 1)", id="positional_tuple_element"),
+        pytest.param(
+            "t",
+            "Tuple(a Int32, b Int32)",
+            "Tuple(b Int32, a Int32)",
+            "t.a",
+            "(1, 99)",
+            id="named_subcolumn",
+        ),
+        pytest.param(
+            "t",
+            "Tuple(a Int32, b Int32)",
+            "Tuple(b Int32, a Int32)",
+            "tupleElement(t, 1)",
+            "(1, 99)",
+            id="positional_tuple_element",
+        ),
+        pytest.param(
+            "arr",
+            "Array(Tuple(a Int32, b Int32))",
+            "Array(Tuple(b Int32, a Int32))",
+            "tupleElement(arr[1], 'a')",
+            "[(1, 99)]",
+            id="tuple_nested_in_array",
+        ),
+        pytest.param(
+            "m",
+            "Map(String, Tuple(a Int32, b Int32))",
+            "Map(String, Tuple(b Int32, a Int32))",
+            "tupleElement(m['key'], 'a')",
+            "map('key', (1, 99))",
+            id="tuple_nested_in_map_value",
+        ),
     ],
 )
-def test_export_part_named_tuple_fields_reordered_for_partition_key_is_rejected(
-    cluster, partition_by
+def test_export_part_tuple_fields_reordered_for_partition_key_is_rejected(
+    cluster,
+    owner_name,
+    source_type,
+    destination_type,
+    partition_by,
+    insert_value,
 ):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
@@ -539,7 +574,7 @@ def test_export_part_named_tuple_fields_reordered_for_partition_key_is_rejected(
     s3_table = f"reordered_tuple_s3_table_{postfix}"
 
     node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(a Int32, b Int32), val String)
+        CREATE TABLE {mt_table} ({owner_name} {source_type}, val String)
         ENGINE = MergeTree()
         PARTITION BY {partition_by}
         ORDER BY tuple()
@@ -547,12 +582,12 @@ def test_export_part_named_tuple_fields_reordered_for_partition_key_is_rejected(
     """)
 
     node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(b Int32, a Int32), val String)
+        CREATE TABLE {s3_table} ({owner_name} {destination_type}, val String)
         ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
         PARTITION BY {partition_by}
     """)
 
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, 99), 'x')")
+    node.query(f"INSERT INTO {mt_table} VALUES ({insert_value}, 'x')")
 
     part_name = node.query(
         f"SELECT name FROM system.parts WHERE database = currentDatabase() "
