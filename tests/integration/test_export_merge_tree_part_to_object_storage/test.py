@@ -521,36 +521,27 @@ def test_export_part_multi_column_partition_key_success(cluster):
     assert result == "1\t2\t3\tx\n1\t2\t3\ty", f"Unexpected exported data:\n{result}"
 
 
-def read_exported_files(node, s3_table):
-    return node.query(
-        f"SELECT t.a, t.b, val FROM "
-        f"s3('http://minio1:9001/root/data/{s3_table}/**', 'minio', 'ClickHouse_Minio_P@ssw0rd', 'Parquet', "
-        f"'t Tuple(b Int32, a Int32), val String') "
-        f"WHERE _file NOT LIKE 'commit%'"
-    ).strip()
-
-
-def get_export_part_log(node, mt_table):
-    node.query("SYSTEM FLUSH LOGS")
-    return node.query(
-        f"SELECT part_name, error, exception FROM system.part_log "
-        f"WHERE event_type = 'ExportPart' AND database = currentDatabase() "
-        f"AND table = '{mt_table}' ORDER BY event_time"
-    ).strip()
-
-
-def test_export_part_named_tuple_fields_reordered_with_subcolumn_partition_key_is_allowed(cluster):
+@pytest.mark.parametrize(
+    "partition_by",
+    [
+        pytest.param("t.a", id="named_subcolumn"),
+        pytest.param("tupleElement(t, 1)", id="positional_tuple_element"),
+    ],
+)
+def test_export_part_named_tuple_fields_reordered_for_partition_key_is_rejected(
+    cluster, partition_by
+):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"tuple_subcol_wc_mt_table_{postfix}"
-    s3_table = f"tuple_subcol_wc_s3_table_{postfix}"
+    mt_table = f"reordered_tuple_mt_table_{postfix}"
+    s3_table = f"reordered_tuple_s3_table_{postfix}"
 
     node.query(f"""
         CREATE TABLE {mt_table} (t Tuple(a Int32, b Int32), val String)
         ENGINE = MergeTree()
-        PARTITION BY t.a
+        PARTITION BY {partition_by}
         ORDER BY tuple()
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
     """)
@@ -558,7 +549,7 @@ def test_export_part_named_tuple_fields_reordered_with_subcolumn_partition_key_i
     node.query(f"""
         CREATE TABLE {s3_table} (t Tuple(b Int32, a Int32), val String)
         ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY t.a
+        PARTITION BY {partition_by}
     """)
 
     node.query(f"INSERT INTO {mt_table} VALUES ((1, 99), 'x')")
@@ -568,15 +559,12 @@ def test_export_part_named_tuple_fields_reordered_with_subcolumn_partition_key_i
         f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
     ).strip()
 
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-    time.sleep(5)
-
-    part_log = get_export_part_log(node, mt_table)
-    result = read_exported_files(node, s3_table)
-    assert result == "1\t99\tx", (
-        f"Tuple element values were remapped: source t = (a=1, b=99), "
-        f"exported files read back (t.a, t.b) as: {result!r}; part_log: {part_log!r}"
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error and "different Tuple element layout" in error, (
+        f"Expected export to reject reordered named `Tuple` fields used by "
+        f"`PARTITION BY {partition_by}`, got: {error!r}"
     )
 
 

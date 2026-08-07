@@ -13,7 +13,11 @@
 #include <unordered_set>
 #include <Core/Block.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/Utils.h>
+#include <Functions/FunctionHelpers.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -636,6 +640,61 @@ namespace ExportPartitionUtils
     }
 #endif
 
+    namespace
+    {
+        bool haveSameTupleElementLayout(const DataTypePtr & source_type, const DataTypePtr & destination_type)
+        {
+            const auto source_type_unwrapped = removeNullable(removeLowCardinality(source_type));
+            const auto destination_type_unwrapped = removeNullable(removeLowCardinality(destination_type));
+
+            const auto * source_tuple = checkAndGetDataType<DataTypeTuple>(source_type_unwrapped.get());
+            const auto * destination_tuple = checkAndGetDataType<DataTypeTuple>(destination_type_unwrapped.get());
+            if (!source_tuple || !destination_tuple)
+                return source_tuple == destination_tuple;
+
+            if (source_tuple->getElementNames() != destination_tuple->getElementNames())
+                return false;
+
+            const auto & source_elements = source_tuple->getElements();
+            const auto & destination_elements = destination_tuple->getElements();
+            for (size_t i = 0; i < source_elements.size(); ++i)
+                if (!haveSameTupleElementLayout(source_elements[i], destination_elements[i]))
+                    return false;
+
+            return true;
+        }
+
+        void verifyPartitionKeyColumn(
+            const ColumnWithTypeAndName & source_column,
+            const ColumnWithTypeAndName & destination_column,
+            size_t position,
+            const StorageID & destination_storage_id)
+        {
+            if (source_column.name != destination_column.name)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
+                    "table, but the destination's column at that position is named '{}'. EXPORT "
+                    "PART/PARTITION matches columns by position, so partition key columns must be "
+                    "declared at the same position in both tables.",
+                    destination_storage_id.getFullTableName(),
+                    source_column.name,
+                    position,
+                    destination_column.name);
+
+            if (!haveSameTupleElementLayout(source_column.type, destination_column.type))
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export to {}: partition key column '{}' has a different Tuple element "
+                    "layout in the source ({}) and destination ({}). Tuple element names must be "
+                    "declared in the same order in both tables.",
+                    destination_storage_id.getFullTableName(),
+                    source_column.name,
+                    source_column.type->getName(),
+                    destination_column.type->getName());
+        }
+    }
+
     void assertPartitionKeyASTAreEqual(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata)
@@ -693,19 +752,8 @@ namespace ExportPartitionUtils
             const auto & source_column = source_columns[i];
             const auto & destination_column = destination_columns[i];
 
-            if (partition_key_owner_columns.contains(source_column.name) && source_column.name != destination_column.name)
-            {
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export to {}: partition key column '{}' is at position {} in the source "
-                    "table, but the destination's column at that position is named '{}'. EXPORT "
-                    "PART/PARTITION matches columns by position, so partition key columns must be "
-                    "declared at the same position in both tables.",
-                    destination_storage_id.getFullTableName(),
-                    source_column.name,
-                    i,
-                    destination_column.name);
-            }
+            if (partition_key_owner_columns.contains(source_column.name))
+                verifyPartitionKeyColumn(source_column, destination_column, i, destination_storage_id);
 
             /// Lossy casts may silently change values, so reject them unless the user opts in.
             if (allow_lossy_cast)
