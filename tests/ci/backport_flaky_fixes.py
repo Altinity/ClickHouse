@@ -181,19 +181,29 @@ def update_pr(repo: str, number: int, title: str, body: str, labels: list, dry_r
 
     labels = existing_labels(repo, labels)
 
-    cmd = [
-        "gh", "pr", "edit", str(number),
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-    ]
-    for label in labels:
-        cmd += ["--add-label", label]
-
-    result = subprocess.run(cmd, text=True, capture_output=False)
+    # Use REST instead of `gh pr edit`: the latter queries GraphQL projectCards
+    # (Projects classic), which fails under GITHUB_TOKEN even with PullRequests:write.
+    payload = json.dumps({"title": title, "body": body})
+    result = subprocess.run(
+        ["gh", "api", "-X", "PATCH", f"repos/{repo}/pulls/{number}", "--input", "-"],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
     if result.returncode != 0:
-        print("gh pr edit failed", file=sys.stderr)
+        print(f"gh api PATCH pulls/{number} failed:\n{result.stderr or result.stdout}", file=sys.stderr)
         sys.exit(1)
+
+    if labels:
+        label_payload = json.dumps({"labels": labels})
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "--input", "-"],
+            input=label_payload,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(f"Warning: could not add labels to PR #{number}:\n{result.stderr or result.stdout}", file=sys.stderr)
 
 
 def create_pr(repo: str, branch: str, base: str, title: str, body: str, labels: list, dry_run: bool) -> None:
