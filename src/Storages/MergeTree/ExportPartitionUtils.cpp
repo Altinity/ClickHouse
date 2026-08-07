@@ -656,7 +656,12 @@ namespace ExportPartitionUtils
                 if (!source_tuple || !destination_tuple)
                     return false;
 
-                if (source_tuple->getElementNames() != destination_tuple->getElementNames())
+                if (source_tuple->hasExplicitNames() && destination_tuple->hasExplicitNames())
+                {
+                    if (source_tuple->getElementNames() != destination_tuple->getElementNames())
+                        return false;
+                }
+                else if (source_tuple->getElements().size() != destination_tuple->getElements().size())
                     return false;
 
                 const auto & source_elements = source_tuple->getElements();
