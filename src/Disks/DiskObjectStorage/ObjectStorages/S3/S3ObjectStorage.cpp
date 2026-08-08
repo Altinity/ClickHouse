@@ -19,6 +19,7 @@
 #include <IO/S3/getObjectInfo.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/Requests.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
 #include <Interpreters/Context.h>
@@ -954,11 +955,44 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(
 
 ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags) const
 {
+    /// When the caller only needs identity (size / etag / part offsets, not tags or user metadata) we
+    /// take a fast path: consult the process-wide identity cache to skip the metadata request entirely
+    /// on repeat opens, and on a miss fetch via GetObjectAttributes (one request for size + etag +
+    /// multipart part sizes, with a HEAD fallback) instead of a plain HEAD. This is what removes the
+    /// per-file HEAD on lake scans. The tags path is unchanged. See ObjectStorageIdentityCache.
+    const bool identity_only = !with_tags;
+    const String identity_key = uri.bucket + "/" + path;
+
+    if (identity_only)
+    {
+        if (auto cached = ObjectStorageIdentityCache::instance().tryGet(identity_key))
+        {
+            ObjectMetadata result;
+            result.size_bytes = cached->size;
+            result.is_size_known = cached->is_size_known;
+            result.etag = cached->etag;
+            result.part_offsets = cached->part_offsets;
+            /// The cache does not store Last-Modified. Leaving it at the epoch with
+            /// `is_last_modified_known == true` would make schema and count caches treat the object
+            /// as older than every cached entry.
+            result.is_last_modified_known = false;
+            return result;
+        }
+    }
+
     auto settings_ptr = s3_settings.get();
+
+    auto fetch = [&](const S3::Client & c) -> S3::ObjectInfo
+    {
+        if (identity_only)
+            return S3::getObjectIdentity(c, uri.bucket, path, /*version_id=*/ {});
+        return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+    };
+
     S3::ObjectInfo object_info;
     try
     {
-        object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+        object_info = fetch(*client.get());
     }
     catch (DB::Exception & e)
     {
@@ -969,7 +1003,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             if (new_client)
             {
                 client.set(std::move(new_client));
-                object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+                object_info = fetch(*client.get());
                 updated = true;
             }
         }
@@ -987,6 +1021,25 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     result.etag = object_info.etag;
     result.tags = std::move(object_info.tags);
     result.attributes = object_info.metadata;
+    if (identity_only)
+        result.is_last_modified_known = object_info.last_modification_time != 0;
+
+    /// GetObjectAttributes returns per-part sizes; convert to cumulative start offsets.
+    if (!object_info.part_sizes.empty())
+    {
+        result.part_offsets.reserve(object_info.part_sizes.size());
+        uint64_t offset = 0;
+        for (size_t part_size : object_info.part_sizes)
+        {
+            result.part_offsets.push_back(offset);
+            offset += part_size;
+        }
+    }
+
+    if (identity_only)
+        ObjectStorageIdentityCache::instance().set(
+            identity_key,
+            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
 
     return result;
 }

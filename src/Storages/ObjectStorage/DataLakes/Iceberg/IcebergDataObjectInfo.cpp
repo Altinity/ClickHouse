@@ -100,6 +100,10 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
     , resolved_storage(std::move(resolved_storage_))
 {
     chassert(resolved_key_.empty() == (resolved_storage == nullptr));
+    /// Object identity (size / etag / multipart part offsets) is intentionally not pre-populated from
+    /// the manifest. S3ObjectStorage::getObjectMetadata loads it once and keeps it in
+    /// ObjectStorageIdentityCache, so Iceberg data files get the real ETag used by the filesystem,
+    /// page, and Parquet metadata caches. Pre-populating metadata here would skip that path.
 }
 
 IcebergDataObjectInfo::IcebergDataObjectInfo(const RelativePathWithMetadata & path_)
