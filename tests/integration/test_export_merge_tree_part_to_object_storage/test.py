@@ -9,6 +9,12 @@ from helpers.cluster import ClickHouseCluster
 from helpers.network import PartitionManager
 
 
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("ignore_extra_source_columns_by_position", id="by-position"),
+    pytest.param("ignore_extra_source_columns_by_name", id="by-name"),
+]
+
+
 def skip_if_remote_database_disk_enabled(cluster):
     """Skip test if any instance in the cluster has remote database disk enabled.
 
@@ -979,7 +985,52 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
     node.query(f"DROP TABLE {s3_table}")
 
 
-def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(cluster):
+@pytest.mark.parametrize(
+    "mismatch_mode,expected_error",
+    [
+        pytest.param("ignore_extra_source_columns_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("ignore_extra_source_columns_by_name", "THERE_IS_NO_COLUMN", id="by-name"),
+    ],
+)
+def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
+    cluster, mismatch_mode, expected_error
+):
+    node = cluster.instances["node1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"count_fewer_still_mt_table_{postfix}"
+    s3_table = f"count_fewer_still_s3_table_{postfix}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16) "
+        f"ENGINE = MergeTree() PARTITION BY year ORDER BY tuple() "
+        f"SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020)")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, extra String) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_schema_mismatch_mode = '{mismatch_mode}'"
+    )
+    assert expected_error in error, (
+        f"Expected {expected_error} for source<dest column count with {mismatch_mode}, got: {error}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {s3_table}").strip())
+    assert count == 0, f"Expected 0 rows in destination table after rejected export, got {count}"
+
+    node.query(f"DROP TABLE {mt_table}")
+    node.query(f"DROP TABLE {s3_table}")
+
+
+@pytest.mark.parametrize("mismatch_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(cluster, mismatch_mode):
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -999,7 +1050,7 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'"
+        f"SETTINGS export_merge_tree_part_schema_mismatch_mode = '{mismatch_mode}'"
     )
     wait_for_export_part(node=node, table=mt_table, part="2020_1_1_0")
 

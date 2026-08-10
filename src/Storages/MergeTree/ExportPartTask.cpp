@@ -113,15 +113,6 @@ namespace
         }
     }
 
-    /// Mirrors `InterpreterInsertQuery::addInsertToSelectPipeline`: positional match,
-    /// destination header = `getSampleBlockNonMaterialized()`, all type bridging is done
-    /// by the CAST inside `makeConvertingActions`. No pre-validation, no per-column
-    /// lossy/non-lossy classification — restrictions are exactly what INSERT SELECT enforces.
-    ///
-    /// Exception: when `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`
-    /// and the source has more columns than the destination, the extra trailing source
-    /// columns (by position) are dropped by a preliminary projection step before the
-    /// positional convert, so `makeConvertingActions` always sees equal-sized inputs.
     void addExportConvertingActions(
         QueryPlan & plan_for_part,
         const IStorage & destination_storage,
@@ -131,9 +122,10 @@ namespace
             = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
+        const auto schema_mismatch_mode =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
         const bool ignore_extra_source_columns_by_position =
-            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode]
-                == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
 
@@ -169,7 +161,9 @@ namespace
         auto dag = ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            ActionsDAG::MatchColumnsMode::Position,
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+                ? ActionsDAG::MatchColumnsMode::Name
+                : ActionsDAG::MatchColumnsMode::Position,
             local_context);
 
         auto expression_step = std::make_unique<ExpressionStep>(
@@ -353,8 +347,6 @@ bool ExportPartTask::executeStep()
         /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
         materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
-        /// Align the pipeline header with the destination's non-materialized sample block,
-        /// using the same `makeConvertingActions(Position)` call INSERT SELECT performs.
         addExportConvertingActions(plan_for_part, *destination_storage, local_context);
 
         QueryPlanOptimizationSettings optimization_settings(local_context);

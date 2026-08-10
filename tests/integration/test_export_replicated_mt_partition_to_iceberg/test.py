@@ -26,6 +26,12 @@ from helpers.iceberg_export_stats import (
 from helpers.network import PartitionManager
 
 
+EXTRA_SOURCE_COLUMN_MODES = [
+    pytest.param("ignore_extra_source_columns_by_position", id="by-position"),
+    pytest.param("ignore_extra_source_columns_by_name", id="by-name"),
+]
+
+
 @pytest.fixture(scope="module")
 def cluster():
     try:
@@ -1578,12 +1584,14 @@ def test_export_partition_column_count_mismatch_source_fewer_is_rejected(cluster
     )
 
 
-def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(cluster):
+@pytest.mark.parametrize("mismatch_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(cluster, mismatch_mode):
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).
-    With `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`,
+    With `export_merge_tree_part_schema_mismatch_mode` set to either
+    `ignore_extra_source_columns_by_position` or `ignore_extra_source_columns_by_name`,
     the export must succeed: the trailing `extra` source column is dropped
-    (matched positionally) and only `id`/`year` land in the destination.
+    and only `id`/`year` land in the destination.
     """
     node = cluster.instances["replica1"]
 
@@ -1624,7 +1632,7 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+            "export_merge_tree_part_schema_mismatch_mode": mismatch_mode,
         },
     )
     wait_for_export_status(node=node, source_table=mt_table, dest_table=iceberg_table,
@@ -1637,12 +1645,21 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
 
 
-def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(cluster):
+@pytest.mark.parametrize(
+    "mismatch_mode,expected_error",
+    [
+        pytest.param("ignore_extra_source_columns_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("ignore_extra_source_columns_by_name", "THERE_IS_NO_COLUMN", id="by-name"),
+    ],
+)
+def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
+    cluster, mismatch_mode, expected_error
+):
     """
-    `ignore_extra_source_columns_by_position` only relaxes the source-has-more-columns
-    direction. Source has 2 columns (id, year), destination has 3 (id, year, extra):
-    the destination cannot be filled from the source, so this must still be
-    rejected synchronously even with the relaxed setting.
+    Neither `ignore_extra_source_columns_by_position` nor `ignore_extra_source_columns_by_name`
+    relaxes the source-has-fewer-columns direction. Source has 2 columns (id, year),
+    destination has 3 (id, year, extra): the destination cannot be filled from the
+    source, so this must still be rejected synchronously even with the relaxed setting.
     """
     node = cluster.instances["replica1"]
 
@@ -1661,12 +1678,11 @@ def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+            "export_merge_tree_part_schema_mismatch_mode": mismatch_mode,
         },
     )
-    assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
-        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for source<dest column count "
-        f"even with ignore_extra_source_columns_by_position, got: {error!r}"
+    assert expected_error in error, (
+        f"Expected {expected_error} for source<dest column count with {mismatch_mode}, got: {error!r}"
     )
 
     rows_in_system_view = node.query(
@@ -1793,7 +1809,10 @@ def test_export_partition_key_arity_mismatch_is_rejected(cluster):
     assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
 
 
-def test_export_partition_ignore_extra_setting_prefix_contains_different_type_rejected_without_lossy_cast(cluster):
+@pytest.mark.parametrize("mismatch_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_ignore_extra_setting_prefix_contains_different_type_rejected_without_lossy_cast(
+    cluster, mismatch_mode
+):
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1810,7 +1829,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_type_re
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+            "export_merge_tree_part_schema_mismatch_mode": mismatch_mode,
         },
     )
     assert "INCOMPATIBLE_COLUMNS" in error, (
@@ -1822,7 +1841,10 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_type_re
     assert count == 0, f"Expected 0 rows in Iceberg table after rejected export, got {count}"
 
 
-def test_export_partition_ignore_extra_setting_prefix_contains_different_type_succeeds_with_lossy_cast(cluster):
+@pytest.mark.parametrize("mismatch_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_ignore_extra_setting_prefix_contains_different_type_succeeds_with_lossy_cast(
+    cluster, mismatch_mode
+):
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1839,7 +1861,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_type_su
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+            "export_merge_tree_part_schema_mismatch_mode": mismatch_mode,
             "export_merge_tree_part_allow_lossy_cast": 1,
         },
     )
@@ -1881,7 +1903,8 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_name(cl
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected data:\n{result}"
 
 
-def test_export_partition_ignore_extra_setting_is_noop_when_column_counts_match(cluster):
+@pytest.mark.parametrize("mismatch_mode", EXTRA_SOURCE_COLUMN_MODES)
+def test_export_partition_ignore_extra_setting_is_noop_when_column_counts_match(cluster, mismatch_mode):
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1898,7 +1921,7 @@ def test_export_partition_ignore_extra_setting_is_noop_when_column_counts_match(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_mismatch_mode": "ignore_extra_source_columns_by_position",
+            "export_merge_tree_part_schema_mismatch_mode": mismatch_mode,
         },
     )
     wait_for_export_status(node=node, source_table=mt_table, dest_table=iceberg_table,

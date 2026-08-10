@@ -578,6 +578,7 @@ enum class MergeTreePartExportSchemaMismatchMode : uint8_t
 {
     strict,
     ignore_extra_source_columns_by_position,
+    ignore_extra_source_columns_by_name,
 };
 
 DECLARE_SETTING_ENUM(MergeTreePartExportSchemaMismatchMode)

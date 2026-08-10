@@ -4,6 +4,8 @@
 #include <vector>
 #include <string>
 #include <Core/Field.h>
+#include <Core/ColumnsWithTypeAndName.h>
+#include <Core/SettingsEnums.h>
 #include <Common/Logger.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
@@ -87,15 +89,23 @@ namespace ExportPartitionUtils
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata);
 
+    void verifyExportColumnCastsAreSafe(
+        const ColumnsWithTypeAndName & source_columns,
+        const ColumnsWithTypeAndName & destination_columns,
+        MergeTreePartExportSchemaMismatchMode schema_mismatch_mode,
+        const StorageID & destination_storage_id);
+
     /// Validates that source columns can be exported into the destination with the
-    /// same positional CAST matching as `INSERT INTO dest SELECT * FROM src`. Lossy
-    /// casts are rejected unless `export_merge_tree_part_allow_lossy_cast` is set.
+    /// configured positional or name-based CAST matching. Lossy casts are rejected
+    /// unless `export_merge_tree_part_allow_lossy_cast` is set.
     ///
     /// By default the source and destination must have the same number of columns.
     /// If `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`, a
     /// source with more columns than the destination is allowed: the extra trailing
     /// source columns (by position) are excluded from the comparison here, matching
     /// what `ExportPartTask::addExportConvertingActions` drops from the actual data.
+    /// If the mode is `ignore_extra_source_columns_by_name`, destination columns are
+    /// matched to source columns by their exact names and may appear in a different order.
     ///
     /// Throws BAD_ARGUMENTS on any violation.
     void verifyExportSchemaCastable(

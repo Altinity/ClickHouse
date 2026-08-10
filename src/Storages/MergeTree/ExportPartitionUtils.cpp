@@ -68,6 +68,7 @@ namespace ErrorCodes
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
     extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
+    extern const int THERE_IS_NO_COLUMN;
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
@@ -125,6 +126,7 @@ namespace ExportPartitionUtils
             ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
             ErrorCodes::ILLEGAL_COLUMN,
             ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+            ErrorCodes::THERE_IS_NO_COLUMN,
             ErrorCodes::INCOMPATIBLE_COLUMNS,
             ErrorCodes::NO_SUCH_COLUMN_IN_TABLE,
             ErrorCodes::NOT_IMPLEMENTED,
@@ -914,6 +916,24 @@ namespace
         return true;
     }
 
+    void verifyExportColumnCastIsSafe(
+        const ColumnWithTypeAndName & source_column,
+        const ColumnWithTypeAndName & destination_column,
+        const StorageID & destination_storage_id)
+    {
+        if (canBeSafelyCast(source_column.type, destination_column.type))
+            return;
+
+        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
+            "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
+            "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
+            "to allow lossy casts during export.",
+            destination_storage_id.getFullTableName(),
+            destination_column.name,
+            source_column.type->getName(),
+            destination_column.type->getName());
+    }
+
     void verifyPartitionKeyColumn(
         const ColumnWithTypeAndName & source_column,
         const ColumnWithTypeAndName & destination_column,
@@ -944,6 +964,46 @@ namespace
                 destination_column.type->getName());
     }
 
+    void verifyExportColumnCastsAreSafe(
+        const ColumnsWithTypeAndName & source_columns,
+        const ColumnsWithTypeAndName & destination_columns,
+        MergeTreePartExportSchemaMismatchMode schema_mismatch_mode,
+        const StorageID & destination_storage_id)
+    {
+        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name)
+        {
+            std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
+            source_columns_by_name.reserve(source_columns.size());
+            for (const auto & source_column : source_columns)
+                source_columns_by_name.emplace(source_column.name, &source_column);
+
+            for (const auto & destination_column : destination_columns)
+            {
+                const auto source_it = source_columns_by_name.find(destination_column.name);
+                if (source_it == source_columns_by_name.end())
+                    throw Exception(
+                        ErrorCodes::THERE_IS_NO_COLUMN,
+                        "Cannot find column `{}` in source stream",
+                        destination_column.name);
+
+                verifyExportColumnCastIsSafe(*source_it->second, destination_column, destination_storage_id);
+            }
+            return;
+        }
+
+        if (source_columns.size() < destination_columns.size()
+            || (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::strict
+                && source_columns.size() != destination_columns.size()))
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {})",
+                source_columns.size(),
+                destination_columns.size());
+
+        for (size_t i = 0; i < destination_columns.size(); ++i)
+            verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
+    }
+
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
@@ -966,9 +1026,10 @@ namespace
         /// the trimming `ExportPartTask::addExportConvertingActions` applies to the real data.
         /// The reverse (destination has more columns than source) is always rejected below by
         /// `makeConvertingActions`, in both modes.
+        const auto schema_mismatch_mode =
+            context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
         const bool ignore_extra_source_columns_by_position =
-            context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode]
-                == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
         if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
         {
@@ -984,7 +1045,9 @@ namespace
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            ActionsDAG::MatchColumnsMode::Position,
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+                ? ActionsDAG::MatchColumnsMode::Name
+                : ActionsDAG::MatchColumnsMode::Position,
             context);
 
         const auto & source_columns_description = source_metadata->getColumns();
@@ -1001,29 +1064,47 @@ namespace
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
-        for (size_t i = 0; i < num_columns; ++i)
+        /// Partition-key columns must keep a stable identity across the conversion, regardless of
+        /// `allow_lossy_cast`, so that `PARTITION BY` keeps selecting the same values after export.
+        /// `ignore_extra_source_columns_by_name` matches columns by name (see `makeConvertingActions`
+        /// above), so look the source column up by name instead of assuming the same position.
+        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name)
         {
-            const auto & source_column = source_columns[i];
-            const auto & destination_column = destination_columns[i];
+            std::unordered_map<String, size_t> source_positions_by_name;
+            source_positions_by_name.reserve(source_columns.size());
+            for (size_t i = 0; i < source_columns.size(); ++i)
+                source_positions_by_name.emplace(source_columns[i].name, i);
 
-            if (partition_key_owner_columns.contains(source_column.name))
-                verifyPartitionKeyColumn(source_column, destination_column, i, destination_storage_id);
+            for (const auto & destination_column : destination_columns)
+            {
+                if (!partition_key_owner_columns.contains(destination_column.name))
+                    continue;
 
-            /// Lossy casts may silently change values, so reject them unless the user opts in.
-            if (allow_lossy_cast)
-                continue;
+                const auto source_it = source_positions_by_name.find(destination_column.name);
+                if (source_it == source_positions_by_name.end())
+                    continue; /// Reported as THERE_IS_NO_COLUMN by verifyExportColumnCastsAreSafe below.
 
-            if (!canBeSafelyCast(source_column.type, destination_column.type))
-                throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
-                    "Cannot export to {}: column '{}' requires a lossy cast from {} to {}, "
-                    "which may change values. Set `export_merge_tree_part_allow_lossy_cast = 1` "
-                    "to allow lossy casts during export.",
-                    destination_storage_id.getFullTableName(),
-                    destination_column.name,
-                    source_column.type->getName(),
-                    destination_column.type->getName());
+                verifyPartitionKeyColumn(
+                    source_columns[source_it->second], destination_column, source_it->second, destination_storage_id);
+            }
         }
+        else
+        {
+            const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
+            for (size_t i = 0; i < num_columns; ++i)
+                if (partition_key_owner_columns.contains(source_columns[i].name))
+                    verifyPartitionKeyColumn(source_columns[i], destination_columns[i], i, destination_storage_id);
+        }
+
+        /// Lossy casts may silently change values, so reject them unless the user opts in.
+        if (allow_lossy_cast)
+            return;
+
+        verifyExportColumnCastsAreSafe(
+            source_columns,
+            destination_columns,
+            schema_mismatch_mode,
+            destination_storage_id);
     }
 }
 
