@@ -360,7 +360,7 @@ REJECTED_PART_EXPORT_CASES = [
             dst_partition_by="(c, b, a)",
             insert_values="(1, 2, 3, 'x')",
             error_substrings=(
-                "source and destination tables have different `PARTITION BY` expressions",
+                "Tables have different partition key",
             ),
         ),
         id="multi_column_partition_key_order_mismatch",
@@ -373,7 +373,7 @@ REJECTED_PART_EXPORT_CASES = [
             dst_partition_by="(a, b)",
             insert_values="(1, 2, 3, 'x')",
             error_substrings=(
-                "source and destination tables have different `PARTITION BY` expressions",
+                "Tables have different partition key",
             ),
         ),
         id="multi_column_partition_key_fewer_in_destination",
@@ -386,7 +386,7 @@ REJECTED_PART_EXPORT_CASES = [
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
             error_substrings=(
-                "source and destination tables have different `PARTITION BY` expressions",
+                "Tables have different partition key",
             ),
         ),
         id="multi_column_partition_key_more_in_destination",
@@ -669,7 +669,7 @@ def test_export_part_subcolumn_partition_key_different_subcolumn_is_rejected(clu
     )
     assert (
         "BAD_ARGUMENTS" in error
-        and "source and destination tables have different `PARTITION BY` expressions"
+        and "Tables have different partition key"
         in error
     ), (
         f"Both tables declare `a` as the same Tuple(b Int32, c Int32) (so the column-cast "

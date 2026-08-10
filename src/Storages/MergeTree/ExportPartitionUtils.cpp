@@ -738,8 +738,7 @@ namespace ExportPartitionUtils
         };
 
         if (query_to_string(source_metadata->getPartitionKeyAST()) != query_to_string(destination_metadata->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition: source and destination tables have different `PARTITION BY` expressions");
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
     }
 
     void verifyExportSchemaCastable(
