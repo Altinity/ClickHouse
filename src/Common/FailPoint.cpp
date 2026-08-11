@@ -43,6 +43,7 @@ static struct InitFiu
     REGULAR(cluster_discovery_faults) \
     REGULAR(cluster_discovery_unregister_fail) \
     REGULAR(stripe_log_sink_write_fallpoint) \
+    REGULAR(hybrid_watermarks_read_fail) \
     ONCE(smt_commit_merge_mutate_zk_fail_after_op) \
     ONCE(smt_commit_merge_mutate_zk_fail_before_op) \
     ONCE(smt_commit_write_zk_fail_after_op) \

@@ -161,6 +161,13 @@ public:
         return stop_flag;
     }
 
+    void wakeup()
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        any_need_update = true;
+        cv.notify_one();
+    }
+
 private:
     std::condition_variable cv;
     mutable std::mutex mu;
@@ -827,7 +834,9 @@ bool ClusterDiscovery::upsertCluster(ClusterInfo & cluster_info)
         return true;
     };
 
-    if (!cluster_info.current_node_is_observer && !contains(node_uuids, current_node_name))
+    if (!cluster_info.current_node_is_observer
+        && context->isSwarmModeEnabled()
+        && !contains(node_uuids, current_node_name))
     {
         LOG_ERROR(log, "Can't find current node in cluster '{}', will register again", cluster_info.name);
         registerInZk(zk, cluster_info);
@@ -905,6 +914,12 @@ void ClusterDiscovery::registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & inf
                 node_path,
                 Coordination::errorMessage(code));
         LOG_DEBUG(log, "Current node {} is observer of cluster {}", current_node_name, info.name);
+        return;
+    }
+
+    if (!context->isSwarmModeEnabled())
+    {
+        LOG_DEBUG(log, "STOP SWARM MODE called, skip self-registering current node {} in cluster {}", current_node_name, info.name);
         return;
     }
 
@@ -994,6 +1009,18 @@ bool ClusterDiscovery::retryPendingUnregisters()
     return pending_zk_unregisters.empty();
 }
 
+void ClusterDiscovery::unregisterFromZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info)
+{
+    if (info.current_node_is_observer)
+        return;
+
+    String node_path = getShardsListPath(info.zk_root) / current_node_name;
+    LOG_DEBUG(log, "Removing current node {} from cluster {}", current_node_name, info.name);
+
+    zk->remove(node_path);
+    LOG_DEBUG(log, "Current node {} removed from cluster {}", current_node_name, info.name);
+}
+
 void ClusterDiscovery::initialUpdate()
 {
     LOG_DEBUG(log, "Initializing");
@@ -1044,6 +1071,18 @@ void ClusterDiscovery::initialUpdate()
 
     LOG_DEBUG(log, "Initialized");
     is_initialized = true;
+}
+
+void ClusterDiscovery::registerAll()
+{
+    register_change_flag = RegisterChangeFlag::RCF_REGISTER_ALL;
+    clusters_to_update->wakeup();
+}
+
+void ClusterDiscovery::unregisterAll()
+{
+    register_change_flag = RegisterChangeFlag::RCF_UNREGISTER_ALL;
+    clusters_to_update->wakeup();
 }
 
 void ClusterDiscovery::findDynamicClusters(
@@ -1330,6 +1369,27 @@ bool ClusterDiscovery::runMainThread(std::function<void()> up_to_date_callback)
         if (all_up_to_date)
         {
             up_to_date_callback();
+        }
+
+        RegisterChangeFlag flag = register_change_flag.exchange(RegisterChangeFlag::RCF_NONE);
+
+        if (flag == RegisterChangeFlag::RCF_REGISTER_ALL)
+        {
+            LOG_DEBUG(log, "Register in all dynamic clusters");
+            for (auto & [_, info] : clusters_info)
+            {
+                auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
+                registerInZk(zk, info);
+            }
+        }
+        else if (flag == RegisterChangeFlag::RCF_UNREGISTER_ALL)
+        {
+            LOG_DEBUG(log, "Unregister in all dynamic clusters");
+            for (auto & [_, info] : clusters_info)
+            {
+                auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
+                unregisterFromZk(zk, info);
+            }
         }
     }
     LOG_DEBUG(log, "Worker thread stopped");

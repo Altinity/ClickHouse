@@ -54,6 +54,9 @@ public:
 
     ~ClusterDiscovery();
 
+    void registerAll();
+    void unregisterAll();
+
 private:
     struct NodeInfo
     {
@@ -218,6 +221,7 @@ private:
     void initialUpdate();
 
     void registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info);
+    void unregisterFromZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info);
 
     struct PendingZkUnregister
     {
@@ -302,6 +306,15 @@ private:
     std::vector<PendingZkUnregister> pending_zk_unregisters;
 
     MultiVersion<Macros>::Version macros;
+
+    enum RegisterChangeFlag
+    {
+        RCF_NONE,
+        RCF_REGISTER_ALL,
+        RCF_UNREGISTER_ALL,
+    };
+
+    std::atomic<RegisterChangeFlag> register_change_flag = RegisterChangeFlag::RCF_NONE;
 };
 
 }
