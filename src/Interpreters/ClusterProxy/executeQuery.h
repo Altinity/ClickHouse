@@ -9,8 +9,12 @@
 
 #include <memory>
 #include <optional>
+<<<<<<< HEAD
 #include <string_view>
 #include <vector>
+=======
+#include <span>
+>>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 
 namespace DB
 {
@@ -148,7 +152,8 @@ void executeQuery(
     const std::string & sharding_key_column_name,
     const DistributedSettings & distributed_settings,
     AdditionalShardFilterGenerator shard_filter_generator,
-    bool is_remote_function);
+    bool is_remote_function,
+    std::span<const SelectQueryInfo> additional_query_infos = {});
 
 std::optional<QueryPipeline> executeInsertSelectWithParallelReplicas(
     const ASTInsertQuery & query_ast,

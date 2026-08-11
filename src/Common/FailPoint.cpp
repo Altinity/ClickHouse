@@ -47,8 +47,12 @@ static struct InitFiu
     ONCE(connection_stale_on_establish) \
     REGULAR(cluster_discovery_faults) \
     REGULAR(stripe_log_sink_write_fallpoint) \
+<<<<<<< HEAD
     REGULAR(file_checker_update_and_save_fail_reading_sizes) \
     REGULAR(file_checker_update_and_save_fail_persisting) \
+=======
+    REGULAR(hybrid_watermarks_read_fail) \
+>>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
     ONCE(smt_commit_merge_mutate_zk_fail_after_op) \
     ONCE(smt_commit_merge_mutate_zk_fail_before_op) \
     ONCE(smt_commit_write_zk_fail_after_op) \

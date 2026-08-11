@@ -54,8 +54,14 @@ public:
     void updateTreeHashImpl(SipHash & hash_state, bool ignore_alias) const override;
 
     void restoreTable();  // TODO(ilezhankin): get rid of this
+<<<<<<< HEAD
     /// Returns |nullptr| if identifier is not table, or if it is parameterized (see `isParam`).
     boost::intrusive_ptr<ASTTableIdentifier> createTable() const;
+=======
+    void resetSemanticTable();  // Reset semantic to empty string (see ResetSemanticTableVisitor)
+
+    boost::intrusive_ptr<ASTTableIdentifier> createTable() const;  // returns |nullptr| if identifier is not table.
+>>>>>>> 8eebeab9cc5 (Merge pull request #2144 from Altinity/feature/antalya-26.6/auto-grp-pr-1694)
 
     String full_name;
     std::vector<String> name_parts;
