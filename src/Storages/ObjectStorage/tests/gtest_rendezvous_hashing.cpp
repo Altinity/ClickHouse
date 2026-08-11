@@ -126,7 +126,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 0, 10));
         ASSERT_TRUE(checkHead(paths, {6}));
@@ -135,7 +135,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 1, 10));
         ASSERT_TRUE(checkHead(paths, {0, 2, 4}));
@@ -144,7 +144,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 2, 10));
         ASSERT_TRUE(checkHead(paths, {1, 5, 7, 8}));
@@ -153,7 +153,7 @@ TEST(RendezvousHashing, SingleNode)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 3, 10));
         ASSERT_TRUE(checkHead(paths, {3, 9}));
@@ -164,7 +164,7 @@ TEST(RendezvousHashing, MultipleNodes)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica0", "replica1", "replica2", "replica3"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
 
     {
         std::vector<std::string> paths;
@@ -196,7 +196,7 @@ TEST(RendezvousHashing, SingleNodeReducedCluster)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica2", "replica1"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 0, 10));
         ASSERT_TRUE(checkHead(paths, {1, 5, 6, 7, 8, 9}));
@@ -205,7 +205,7 @@ TEST(RendezvousHashing, SingleNodeReducedCluster)
     {
         auto iterator = makeIterator();
         std::vector<std::string> replicas = {"replica2", "replica1"};
-        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+        StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
         std::vector<std::string> paths;
         ASSERT_TRUE(extractNForReplica(distributor, paths, 1, 10));
         ASSERT_TRUE(checkHead(paths, {0, 2, 3, 4}));
@@ -216,7 +216,7 @@ TEST(RendezvousHashing, MultipleNodesReducedCluster)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica2", "replica1"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
 
     {
         std::vector<std::string> paths;
@@ -235,7 +235,7 @@ TEST(RendezvousHashing, MultipleNodesReducedClusterOneByOne)
 {
     auto iterator = makeIterator();
     std::vector<std::string> replicas = {"replica2", "replica1"};
-    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false);
+    StorageObjectStorageStableTaskDistributor distributor(iterator, std::move(replicas), false, 0, false);
 
     std::vector<std::string> paths0;
     std::vector<std::string> paths1;

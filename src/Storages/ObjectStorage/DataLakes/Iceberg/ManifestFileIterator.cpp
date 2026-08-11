@@ -10,6 +10,7 @@
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergFieldParseHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFileIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
@@ -47,6 +48,7 @@ namespace DB::Iceberg
 
 using namespace DB;
 
+<<<<<<< HEAD
 namespace
 {
     /// Iceberg store decimal values as unscaled value with two's-complement big-endian binary
@@ -137,6 +139,8 @@ namespace
 
 }
 
+=======
+>>>>>>> f7a9d3433b2 (Merge pull request #2145 from Altinity/feature/antalya-26.6/auto-grp-pr-1687)
 const std::vector<ProcessedManifestFileEntryPtr> &
 ManifestFileIterator::ManifestFileEntriesHandle::getFilesWithoutDeleted(FileContentType content_type) const
 {
