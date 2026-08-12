@@ -1489,6 +1489,56 @@ void ClusterDiscovery::shutdown()
         main_thread.join();
 }
 
+void ClusterDiscovery::disableAndShutdown()
+{
+    LOG_DEBUG(log, "Disabling cluster discovery");
+
+    /// Stop the worker before touching clusters_info so upsert cannot re-register.
+    shutdown();
+
+    /// Config-reloader thread has no ZooKeeper component; unregister requires one.
+    auto component_guard = Coordination::setCurrentComponent("ClusterDiscovery::disableAndShutdown");
+
+    for (const auto & [name, info] : clusters_info)
+    {
+        if (info.current_node_is_observer)
+            continue;
+        if (!unregisterFromZk(info.zk_name, info.zk_root, name))
+        {
+            LOG_WARNING(
+                log,
+                "Failed to unregister current node from cluster '{}' while disabling discovery",
+                name);
+        }
+    }
+
+    for (const auto & pending : pending_zk_unregisters)
+    {
+        if (!unregisterFromZk(pending.zk_name, pending.zk_root, pending.cluster_name))
+        {
+            LOG_WARNING(
+                log,
+                "Failed to complete pending unregister for cluster '{}' while disabling discovery",
+                pending.cluster_name);
+        }
+    }
+    pending_zk_unregisters.clear();
+
+    clusters_info.clear();
+    multicluster_discovery_paths.clear();
+    get_nodes_callbacks.clear();
+    register_change_flag.store(RegisterChangeFlag::RCF_NONE);
+
+    {
+        std::lock_guard lock(pending_config_mutex);
+        pending_config_update.reset();
+    }
+    {
+        std::lock_guard lock(mutex);
+        cluster_impls.clear();
+    }
+}
+
 ClusterDiscovery::~ClusterDiscovery()
 {
     try

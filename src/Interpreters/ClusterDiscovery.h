@@ -52,6 +52,10 @@ public:
     ClusterPtr getCluster(const String & cluster_name) const;
     std::unordered_map<String, ClusterPtr> getClusters() const;
 
+    /// Stop the worker, remove participant ephemerals, and drop published clusters.
+    /// Used when allow_experimental_cluster_discovery is turned off on reload.
+    void disableAndShutdown();
+
     ~ClusterDiscovery();
 
     void registerAll();

@@ -6096,6 +6096,7 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
 {
     ClusterDiscovery * discovery_to_update = nullptr;
     ClusterDiscovery * discovery_just_created_ptr = nullptr;
+    std::unique_ptr<ClusterDiscovery> discovery_to_disable;
     bool clusters_changed = false;
     {
         std::lock_guard lock(shared->clusters_mutex);
@@ -6109,6 +6110,8 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
         ///
         /// Still start a discovery object created after server start when only the allow-flag
         /// flipped (remote_servers subtree unchanged) — otherwise the worker never runs.
+        /// The reverse transition (allow 1 -> 0) must tear discovery down even when remote_servers
+        /// is unchanged; otherwise the worker stays registered until restart.
         const bool remote_servers_unchanged
             = shared->clusters && shared->clusters_config
             && isSameConfiguration(*config, *shared->clusters_config, config_name);
@@ -6130,6 +6133,10 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
                 shared->cluster_discovery = std::make_unique<ClusterDiscovery>(*config, getGlobalContext(), getMacros());
                 discovery_just_created = true;
             }
+        }
+        else if (shared->cluster_discovery)
+        {
+            discovery_to_disable = std::move(shared->cluster_discovery);
         }
 
         if (!remote_servers_unchanged)
@@ -6155,6 +6162,10 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
             discovery_just_created_ptr = shared->cluster_discovery.get();
     }
 
+    /// Tear down outside clusters_mutex: joins the worker and may touch ZooKeeper.
+    if (discovery_to_disable)
+        discovery_to_disable->disableAndShutdown();
+
     /// Apply discovery updates outside clusters_mutex: may start the worker and touch ZooKeeper.
     if (discovery_to_update)
         discovery_to_update->updateFromConfig(*config, config_name);
@@ -6164,8 +6175,8 @@ void Context::setClustersConfig(const ConfigurationPtr & config, bool enable_dis
         discovery_just_created_ptr->start();
 
     /// Avoid DDL host-id refresh / log noise when remote_servers (and discovery) did not change.
-    /// Still notify when discovery was just created (e.g. allow-flag-only reload).
-    if (clusters_changed || discovery_to_update || discovery_just_created_ptr)
+    /// Still notify when discovery was just created or disabled (e.g. allow-flag-only reload).
+    if (clusters_changed || discovery_to_update || discovery_just_created_ptr || discovery_to_disable)
     {
         SharedLockGuard lock(shared->mutex);
         if (shared->ddl_worker)
