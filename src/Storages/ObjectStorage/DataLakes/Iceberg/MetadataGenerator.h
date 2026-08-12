@@ -37,7 +37,8 @@ public:
         Int64 added_delete_files,
         Int64 num_deleted_rows,
         std::optional<Int64> user_defined_snapshot_id = std::nullopt,
-        std::optional<Int64> user_defined_timestamp = std::nullopt);
+        std::optional<Int64> user_defined_timestamp = std::nullopt,
+        bool is_truncate = false);
 
     /// Create a manifest-only rewrite snapshot (`replace` operation) carrying `total-*` counters forward so `OPTIMIZE ... MANIFEST` is idempotent.
     NextMetadataResult generateManifestOnlySnapshot(
