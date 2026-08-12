@@ -52,7 +52,13 @@ private:
     bool tryInitVirtualHostedStyle(bool is_using_aws_private_link_interface, bool use_strict_pattern);
 };
 
+<<<<<<< HEAD
 std::string expandRegionToAmazonPath(const std::string & region);
+=======
+/// Resolve the S3 endpoint URL for a given AWS region using the SDK's
+/// Smithy endpoint rules (handles all partitions: standard, China, GovCloud, etc.).
+std::string resolveS3Endpoint(const std::string & region);
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
 }
 

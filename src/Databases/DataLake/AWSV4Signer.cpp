@@ -12,8 +12,13 @@
 #include <aws/core/http/standard/StandardHttpRequest.h>
 #include <aws/core/http/URI.h>
 #include <aws/core/utils/memory/AWSMemory.h>
+<<<<<<< HEAD
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 
+=======
+
+#include <sstream>
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 #include <utility>
 
 namespace DB
@@ -32,6 +37,7 @@ namespace
 
 Aws::Http::HttpMethod mapPocoMethodToAws(const String & method)
 {
+<<<<<<< HEAD
     using Poco::Net::HTTPRequest;
 
     static const std::pair<String, Aws::Http::HttpMethod> supported_methods[] = {
@@ -41,6 +47,18 @@ Aws::Http::HttpMethod mapPocoMethodToAws(const String & method)
         {HTTPRequest::HTTP_DELETE, Aws::Http::HttpMethod::HTTP_DELETE},
         {HTTPRequest::HTTP_HEAD, Aws::Http::HttpMethod::HTTP_HEAD},
         {HTTPRequest::HTTP_PATCH, Aws::Http::HttpMethod::HTTP_PATCH},
+=======
+    using Aws::Http::HttpMethod;
+    using Poco::Net::HTTPRequest;
+
+    static const std::pair<String, HttpMethod> supported_methods[] = {
+        {HTTPRequest::HTTP_GET, HttpMethod::HTTP_GET},
+        {HTTPRequest::HTTP_POST, HttpMethod::HTTP_POST},
+        {HTTPRequest::HTTP_PUT, HttpMethod::HTTP_PUT},
+        {HTTPRequest::HTTP_DELETE, HttpMethod::HTTP_DELETE},
+        {HTTPRequest::HTTP_HEAD, HttpMethod::HTTP_HEAD},
+        {HTTPRequest::HTTP_PATCH, HttpMethod::HTTP_PATCH},
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
     };
 
     for (const auto & [poco_method, aws_method] : supported_methods)
@@ -74,7 +92,11 @@ void signRequestWithAWSV4(
 
     if (!payload.empty())
     {
+<<<<<<< HEAD
         auto body_stream = Aws::MakeShared<Aws::StringStream>("AWSV4Signer");
+=======
+        auto body_stream = Aws::MakeShared<std::stringstream>("AWSV4Signer");
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
         body_stream->write(payload.data(), static_cast<std::streamsize>(payload.size()));
         body_stream->seekg(0);
         request.AddContentBody(body_stream);

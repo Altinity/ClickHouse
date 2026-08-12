@@ -8,6 +8,8 @@
 #include <Common/re2.h>
 #include <IO/Archives/ArchiveUtils.h>
 
+#include <aws/s3/S3EndpointProvider.h>
+
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
 
@@ -264,7 +266,11 @@ void URI::validateKey(const String & key, const Poco::URI & uri)
     }
 }
 
+<<<<<<< HEAD
 std::string expandRegionToAmazonPath(const std::string & region)
+=======
+std::string resolveS3Endpoint(const std::string & region)
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 {
     Aws::S3::Endpoint::S3EndpointProvider provider;
     provider.AccessBuiltInParameters().SetStringParameter("Region", Aws::String(region));

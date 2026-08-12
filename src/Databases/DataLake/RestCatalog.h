@@ -205,11 +205,22 @@ protected:
         const std::string & table_name,
         TableMetadata & result) const;
 
+<<<<<<< HEAD
     /// Load catalog config (special http handler) utilizing information from catalog_state and auth_headers.
     Config loadConfig(const CatalogState & catalog_state, const std::optional<DB::HTTPHeaderEntries> & auth_headers = std::nullopt);
     virtual DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const;
+=======
+    Config loadConfig();
+    virtual DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const;
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
     void validateAuthHeaders(const DB::HTTPHeaderEntry & header) const;
+
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
     virtual void sendRequest(
@@ -325,7 +336,16 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
+<<<<<<< HEAD
     DB::HTTPHeaderEntries getAuthHeaders(const CatalogState & catalog_state, bool update_token) const override;
+=======
+    DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const override;
+>>>>>>> 55471e34c35 (Merge pull request #2184 from Altinity/feature/antalya-26.6/auto-grp-pr-1808)
 
     const std::string & getGoogleADCClientId() const { return google_adc_client_id; }
     const std::string & getGoogleADCClientSecret() const { return google_adc_client_secret; }
