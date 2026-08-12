@@ -344,7 +344,18 @@ void ClusterDiscovery::removeStaticCluster(const String & name)
 
     /// Drop local tracking even if Keeper remove fails: config already removed the cluster.
     /// Keep enough identity to retry ephemeral cleanup so peers stop seeing this node.
-    if (!unregisterFromZk(it->second.zk_name, it->second.zk_root, name))
+    /// Aliases that share zk_name/zk_root share one ephemeral; do not remove it while another
+    /// participant alias still needs the registration.
+    if (pathHasActiveParticipant(it->second.zk_name, it->second.zk_root, &name))
+    {
+        LOG_DEBUG(
+            log,
+            "Skip unregister for removed cluster '{}': another participant still owns path {}:{}",
+            name,
+            it->second.zk_name,
+            it->second.zk_root);
+    }
+    else if (!unregisterFromZk(it->second.zk_name, it->second.zk_root, name))
     {
         pending_zk_unregisters.push_back(PendingZkUnregister{
             .zk_name = it->second.zk_name,
@@ -907,6 +918,18 @@ void ClusterDiscovery::registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & inf
     {
         /// Drop leftover ephemeral registration when transitioning from participant to observer
         /// (or if a stale node remained). ZNONODE means already absent.
+        /// Shared-path aliases: another participant may still own this ephemeral.
+        if (pathHasActiveParticipant(info.zk_name, info.zk_root))
+        {
+            LOG_DEBUG(
+                log,
+                "Current node {} is observer of cluster {} (shared path {}:{} still owned by another participant)",
+                current_node_name,
+                info.name,
+                info.zk_name,
+                info.zk_root);
+            return;
+        }
         fiu_do_on(FailPoints::cluster_discovery_retry_signal_fail,
         {
             throw Exception(
@@ -985,6 +1008,21 @@ bool ClusterDiscovery::unregisterFromZk(const String & zk_name, const String & z
     }
 }
 
+bool ClusterDiscovery::pathHasActiveParticipant(
+    const String & zk_name,
+    const String & zk_root,
+    const String * exclude_cluster_name) const
+{
+    for (const auto & [name, info] : clusters_info)
+    {
+        if (exclude_cluster_name && name == *exclude_cluster_name)
+            continue;
+        if (!info.current_node_is_observer && info.zk_name == zk_name && info.zk_root == zk_root)
+            return true;
+    }
+    return false;
+}
+
 bool ClusterDiscovery::retryPendingUnregisters()
 {
     if (pending_zk_unregisters.empty())
@@ -996,16 +1034,7 @@ bool ClusterDiscovery::retryPendingUnregisters()
     for (const auto & pending : pending_zk_unregisters)
     {
         /// Re-add put a participant back on this path; drop stale cleanup instead of deleting the live ephemeral.
-        bool path_has_participant = false;
-        for (const auto & [_, info] : clusters_info)
-        {
-            if (!info.current_node_is_observer && info.zk_name == pending.zk_name && info.zk_root == pending.zk_root)
-            {
-                path_has_participant = true;
-                break;
-            }
-        }
-        if (path_has_participant)
+        if (pathHasActiveParticipant(pending.zk_name, pending.zk_root))
             continue;
 
         if (!unregisterFromZk(pending.zk_name, pending.zk_root, pending.cluster_name))

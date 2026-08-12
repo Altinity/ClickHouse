@@ -977,3 +977,84 @@ def test_keeper_exception_after_wait_restores_retry_signal(start_cluster):
         time.sleep(1)
     else:
         raise AssertionError(f"Cluster views did not converge after retry-signal recovery: {rows}")
+
+
+def _shared_path_aliases_config(include_alias_a, alias_a_observer=False):
+    alias_a = ""
+    if include_alias_a:
+        observer = "\n                <observer/>" if alias_a_observer else ""
+        alias_a = f"""
+        <alias_a>
+            <discovery>
+                <path>/clickhouse/discovery/test_shared_path_aliases</path>{observer}
+            </discovery>
+        </alias_a>"""
+    return f"""
+<clickhouse>
+    <allow_experimental_cluster_discovery>1</allow_experimental_cluster_discovery>
+    <remote_servers>{alias_a}
+        <alias_b>
+            <discovery>
+                <path>/clickhouse/discovery/test_shared_path_aliases</path>
+            </discovery>
+        </alias_b>
+    </remote_servers>
+</clickhouse>
+"""
+
+
+def _alias_b_host_count(node):
+    return int(
+        node.query(
+            "SELECT count() FROM system.clusters WHERE cluster = 'alias_b'",
+            password="passwordAbc",
+        )
+    )
+
+
+def test_reload_remove_shared_path_alias_keeps_peer_membership(start_cluster):
+    """Removing one participant alias must not delete the shared ephemeral while another remains."""
+    # node0: two aliases on one Keeper path; node1: only the retained alias.
+    reload_config_on_node(nodes["node0"], _shared_path_aliases_config(include_alias_a=True))
+    reload_config_on_node(nodes["node1"], _shared_path_aliases_config(include_alias_a=False))
+
+    for retry in range(15):
+        if _alias_b_host_count(nodes["node1"]) == len(nodes):
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("alias_b not ready with both nodes before shared-path alias remove")
+
+    reload_config_on_node(nodes["node0"], _shared_path_aliases_config(include_alias_a=False))
+
+    # Membership must never transiently drop: the shared ephemeral must stay.
+    for _ in range(20):
+        hosts = _alias_b_host_count(nodes["node1"])
+        if hosts != len(nodes):
+            raise AssertionError(
+                f"Peer lost membership after removing shared-path alias_a; alias_b hosts={hosts}"
+            )
+        time.sleep(0.2)
+
+    # Convert-to-observer on a restored alias_a must also keep the shared registration.
+    reload_config_on_node(nodes["node0"], _shared_path_aliases_config(include_alias_a=True))
+    for retry in range(15):
+        if _alias_b_host_count(nodes["node1"]) == len(nodes):
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError("alias_b not ready before shared-path alias observer convert")
+
+    reload_config_on_node(
+        nodes["node0"],
+        _shared_path_aliases_config(include_alias_a=True, alias_a_observer=True),
+    )
+
+    for _ in range(20):
+        hosts = _alias_b_host_count(nodes["node1"])
+        if hosts != len(nodes):
+            raise AssertionError(
+                f"Peer lost membership after converting shared-path alias_a to observer; "
+                f"alias_b hosts={hosts}"
+            )
+        time.sleep(0.2)

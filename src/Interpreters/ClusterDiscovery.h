@@ -236,6 +236,12 @@ private:
 
     /// Returns false if Keeper remove failed; caller should queue a retry.
     bool unregisterFromZk(const String & zk_name, const String & zk_root, const String & cluster_name);
+    /// True if a non-observer entry still owns this Keeper registration path.
+    /// When removing `exclude_cluster_name`, pass it so the cluster being dropped is ignored.
+    bool pathHasActiveParticipant(
+        const String & zk_name,
+        const String & zk_root,
+        const String * exclude_cluster_name = nullptr) const;
     /// Retries failed unregisters. Returns true when the queue is empty.
     /// Drops pending entries whose path already has an active participant again.
     bool retryPendingUnregisters();
