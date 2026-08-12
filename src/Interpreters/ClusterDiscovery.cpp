@@ -119,6 +119,21 @@ public:
         cv.notify_one();
     }
 
+    /// Set an existing key only. Late Keeper watch callbacks must use this so a removed
+    /// cluster name cannot be reinserted after Flags::remove.
+    void setIfPresent(const T & key, bool value = true)
+    {
+        std::unique_lock<std::mutex> lk(mu);
+        if (stop_flag)
+            return;
+        auto it = flags.find(key);
+        if (it == flags.end())
+            return;
+        it->second = value;
+        any_need_update |= value;
+        cv.notify_one();
+    }
+
     /// Just notify the condition variable.
     void set()
     {
@@ -330,7 +345,7 @@ void ClusterDiscovery::addStaticCluster(ParsedStaticDiscovery && parsed)
     get_nodes_callbacks[name] = std::make_shared<Coordination::WatchCallback>(
         [cluster_name = name, my_clusters_to_update = clusters_to_update](auto)
         {
-            my_clusters_to_update->set(cluster_name);
+            my_clusters_to_update->setIfPresent(cluster_name);
         });
 
     clusters_to_update->set(name);
@@ -698,7 +713,7 @@ Strings ClusterDiscovery::getNodeNames(zkutil::ZooKeeperPtr & zk,
                 {
                     if (my_discovery_paths_need_update)
                         my_discovery_paths_need_update->store(true);
-                    my_clusters_to_update->set(cluster_name);
+                    my_clusters_to_update->setIfPresent(cluster_name);
                 });
             auto res = get_nodes_callbacks.insert(std::make_pair(cluster_name, watch_dynamic_callback));
             callback = res.first;
@@ -1384,6 +1399,8 @@ bool ClusterDiscovery::runMainThread(std::function<void()> up_to_date_callback)
                 if (cluster_info_it == clusters_info.end())
                 {
                     LOG_ERROR(log, "Unknown cluster '{}'", cluster_name);
+                    /// Drop keys resurrected by late Keeper callbacks after removal.
+                    clusters_to_update->remove(cluster_name);
                     continue;
                 }
 
@@ -1419,6 +1436,7 @@ bool ClusterDiscovery::runMainThread(std::function<void()> up_to_date_callback)
                 if (cluster_info_it == clusters_info.end())
                 {
                     LOG_ERROR(log, "Unknown dynamic cluster '{}'", cluster_name);
+                    clusters_to_update->remove(cluster_name);
                     continue;
                 }
                 auto & cluster_info = cluster_info_it->second;
