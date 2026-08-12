@@ -176,7 +176,11 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     Int64 num_deleted_rows,
     std::optional<Int64> user_defined_snapshot_id,
     std::optional<Int64> user_defined_timestamp,
+<<<<<<< HEAD
     SnapshotOperation operation)
+=======
+    bool is_truncate)
+>>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
 {
     int format_version = metadata_object->getValue<Int32>(Iceberg::f_format_version);
 
@@ -220,6 +224,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
 
     auto parent_snapshot = getParentSnapshot(parent_snapshot_id);
     Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
+<<<<<<< HEAD
     /// A merge-on-read DELETE writes position-delete files (num_deleted_rows != 0): per the Iceberg
     /// spec that snapshot is an `overwrite`, not an `append`. Compaction passes `Replace` explicitly.
     const char * operation_name = Iceberg::f_append;
@@ -233,12 +238,25 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     summary->set(Iceberg::f_added_files_size, std::to_string(added_files_size));
     summary->set(Iceberg::f_changed_partition_count, std::to_string(num_partitions));
     if (num_deleted_rows != 0)
+=======
+    if (is_truncate)
+    {
+        summary->set(Iceberg::f_operation, Iceberg::f_overwrite);
+        Int32 prev_total_records = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(Iceberg::f_total_records) ? std::stoi(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(Iceberg::f_total_records)) : 0;
+        Int32 prev_total_data_files = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(Iceberg::f_total_data_files) ? std::stoi(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(Iceberg::f_total_data_files)) : 0;
+
+        summary->set(Iceberg::f_deleted_records, std::to_string(prev_total_records));
+        summary->set(Iceberg::f_deleted_data_files, std::to_string(prev_total_data_files));
+    }
+    else if (num_deleted_rows == 0)
+>>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
     {
         summary->set(Iceberg::f_added_delete_files, std::to_string(added_delete_files));
         summary->set(Iceberg::f_added_position_delete_files, std::to_string(added_delete_files));
         summary->set(Iceberg::f_added_position_deletes, std::to_string(num_deleted_rows));
     }
 
+<<<<<<< HEAD
     setSnapshotTotals(
         summary,
         parent_snapshot,
@@ -248,6 +266,25 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
         /*added_delete_files=*/added_delete_files,
         /*added_position_deletes=*/num_deleted_rows,
         /*added_equality_deletes=*/0);
+=======
+    auto sum_with_parent_snapshot = [&](const char * field_name, Int64 snapshot_value)
+    {
+        if (is_truncate)
+        {
+            summary->set(field_name, std::to_string(0));
+            return;
+        }
+        Int64 prev_value = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(field_name) ? parse<Int64>(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(field_name)) : 0;
+        summary->set(field_name, std::to_string(prev_value + snapshot_value));
+    };
+
+    sum_with_parent_snapshot(Iceberg::f_total_records, added_records);
+    sum_with_parent_snapshot(Iceberg::f_total_files_size, added_files_size);
+    sum_with_parent_snapshot(Iceberg::f_total_data_files, added_files);
+    sum_with_parent_snapshot(Iceberg::f_total_delete_files, added_delete_files);
+    sum_with_parent_snapshot(Iceberg::f_total_position_deletes, num_deleted_rows);
+    sum_with_parent_snapshot(Iceberg::f_total_equality_deletes, 0);
+>>>>>>> 911f0dcb139 (Merge pull request #2125 from Altinity/feature/antalya-26.6/pr-1655)
     new_snapshot->set(Iceberg::f_summary, summary);
 
     new_snapshot->set(Iceberg::f_schema_id, metadata_object->getValue<Int32>(Iceberg::f_current_schema_id));
