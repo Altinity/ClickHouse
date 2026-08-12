@@ -57,6 +57,7 @@ namespace FailPoints
 {
     extern const char cluster_discovery_faults[];
     extern const char cluster_discovery_unregister_fail[];
+    extern const char cluster_discovery_retry_signal_fail[];
 }
 
 namespace
@@ -906,6 +907,12 @@ void ClusterDiscovery::registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & inf
     {
         /// Drop leftover ephemeral registration when transitioning from participant to observer
         /// (or if a stale node remained). ZNONODE means already absent.
+        fiu_do_on(FailPoints::cluster_discovery_retry_signal_fail,
+        {
+            throw Exception(
+                ErrorCodes::KEEPER_EXCEPTION,
+                "Failpoint cluster_discovery_retry_signal_fail is triggered in observer tryRemove");
+        });
         auto code = zk->tryRemove(node_path);
         if (code != Coordination::Error::ZOK && code != Coordination::Error::ZNONODE)
             throw Exception(
@@ -1095,6 +1102,9 @@ void ClusterDiscovery::findDynamicClusters(
 
     for (auto & [full_path, path] : multicluster_discovery_paths)
     {
+        /// Cleared before Keeper I/O so a throw must restore the bit; otherwise the worker
+        /// may sleep forever with no children watch reinstalled.
+        bool cleared_need_update = false;
         if (unchanged_roots)
         {
             if (!path.need_update->exchange(false))
@@ -1107,56 +1117,74 @@ void ClusterDiscovery::findDynamicClusters(
                     continue;
                 }
             }
+            else
+                cleared_need_update = true;
         }
 
-        auto zk = context->getDefaultOrAuxiliaryZooKeeper(path.zk_name);
-        zk->createAncestors(path.zk_path);
-        zk->createIfNotExists(path.zk_path, "");
-
-        auto clusters = zk->getChildrenWatch(
-            path.zk_path,
-            nullptr,
-            Coordination::WatchCallbackPtrOrEventPtr{path.watch_callback, ProfileEvents::ZooKeeperWatchTriggeredClusterDiscovery});
-
-        for (const auto & cluster : clusters)
+        try
         {
-            auto p = clusters_info.find(cluster);
-            if (p != clusters_info.end() && !p->second.isDynamic())
+            fiu_do_on(FailPoints::cluster_discovery_retry_signal_fail,
             {
-                /// Not a warning - node can register itsefs in one cluster and discover other clusters
-                LOG_TRACE(log, "Found dynamic duplicate of cluster '{}' in config and Keeper, skipped", cluster);
-                continue;
+                throw Exception(
+                    ErrorCodes::KEEPER_EXCEPTION,
+                    "Failpoint cluster_discovery_retry_signal_fail is triggered in findDynamicClusters");
+            });
+
+            auto zk = context->getDefaultOrAuxiliaryZooKeeper(path.zk_name);
+            zk->createAncestors(path.zk_path);
+            zk->createIfNotExists(path.zk_path, "");
+
+            auto clusters = zk->getChildrenWatch(
+                path.zk_path,
+                nullptr,
+                Coordination::WatchCallbackPtrOrEventPtr{path.watch_callback, ProfileEvents::ZooKeeperWatchTriggeredClusterDiscovery});
+
+            for (const auto & cluster : clusters)
+            {
+                auto p = clusters_info.find(cluster);
+                if (p != clusters_info.end() && !p->second.isDynamic())
+                {
+                    /// Not a warning - node can register itsefs in one cluster and discover other clusters
+                    LOG_TRACE(log, "Found dynamic duplicate of cluster '{}' in config and Keeper, skipped", cluster);
+                    continue;
+                }
+
+                if (info.contains(cluster))
+                {
+                    /// Possible with several root paths, it's a configuration error
+                    LOG_WARNING(log, "Found dynamic duplicate of cluster '{}' in Keeper, skipped record by path {}:{}",
+                        cluster, path.zk_name, path.zk_path);
+                    continue;
+                }
+
+                info.emplace(
+                    cluster,
+                    ClusterInfo(
+                        /* name_= */ cluster,
+                        /* zk_name_= */ path.zk_name,
+                        /* zk_root_= */ path.zk_path + "/" + cluster,
+                        /* host_name= */ "",
+                        /* username= */ path.username,
+                        /* password= */ path.password,
+                        /* cluster_secret= */ path.cluster_secret,
+                        /* port= */ context->getTCPPort(),
+                        /* secure= */ path.is_secure_connection,
+                        /* shard_id= */ 0,
+                        /* observer_mode= */ true,
+                        /* invisible= */ false,
+                        /* multicluster_full_path_= */ full_path
+                    )
+                );
             }
 
-            if (info.contains(cluster))
-            {
-                /// Possible with several root paths, it's a configuration error
-                LOG_WARNING(log, "Found dynamic duplicate of cluster '{}' in Keeper, skipped record by path {}:{}",
-                    cluster, path.zk_name, path.zk_path);
-                continue;
-            }
-
-            info.emplace(
-                cluster,
-                ClusterInfo(
-                    /* name_= */ cluster,
-                    /* zk_name_= */ path.zk_name,
-                    /* zk_root_= */ path.zk_path + "/" + cluster,
-                    /* host_name= */ "",
-                    /* username= */ path.username,
-                    /* password= */ path.password,
-                    /* cluster_secret= */ path.cluster_secret,
-                    /* port= */ context->getTCPPort(),
-                    /* secure= */ path.is_secure_connection,
-                    /* shard_id= */ 0,
-                    /* observer_mode= */ true,
-                    /* invisible= */ false,
-                    /* multicluster_full_path_= */ full_path
-                )
-            );
+            path.watch.restart();
         }
-
-        path.watch.restart();
+        catch (...)
+        {
+            if (cleared_need_update)
+                path.need_update->store(true);
+            throw;
+        }
     }
 }
 
@@ -1213,6 +1241,9 @@ void ClusterDiscovery::startImpl()
                 tryLogCurrentException(log, "Caught exception in cluster discovery runMainThread");
                 if (clusters_to_update->isStopped())
                     break;
+                /// Flags::wait may have already cleared the only wake bit before the throw.
+                /// Re-arm so backoff retry does not sleep until an unrelated event.
+                clusters_to_update->wakeup();
             }
             if (finish || clusters_to_update->isStopped())
                 break;
@@ -1261,135 +1292,169 @@ bool ClusterDiscovery::runMainThread(std::function<void()> up_to_date_callback)
         if (finished)
             break;
 
-        consumePendingConfigUpdate();
+        /// Snapshot of work acknowledged by wait(). Must be restored if this iteration throws
+        /// before watches / register commands are reinstalled; otherwise the worker blocks forever.
+        RegisterChangeFlag consumed_register_flag = RegisterChangeFlag::RCF_NONE;
 
-        if (!retryPendingUnregisters())
+        try
         {
-            /// Keep waking the loop with a short interruptible backoff so ephemeral cleanup
-            /// retries without failing / rolling back the already-applied config update.
-            using namespace std::chrono_literals;
-            for (auto remaining = std::chrono::milliseconds(1000);
-                 remaining.count() > 0 && !clusters_to_update->isStopped();)
+            fiu_do_on(FailPoints::cluster_discovery_retry_signal_fail,
             {
-                constexpr auto slice = std::chrono::milliseconds(50);
-                auto step = remaining < slice ? remaining : slice;
-                std::this_thread::sleep_for(step);
-                remaining -= step;
-            }
-            if (!clusters_to_update->isStopped())
-                clusters_to_update->set();
-        }
+                throw Exception(
+                    ErrorCodes::KEEPER_EXCEPTION,
+                    "Failpoint cluster_discovery_retry_signal_fail is triggered after Flags::wait");
+            });
 
-        std::unordered_map<String, ClusterInfo> new_dynamic_clusters_info;
-        std::unordered_set<String> unchanged_roots;
-        findDynamicClusters(new_dynamic_clusters_info, &unchanged_roots);
+            consumePendingConfigUpdate();
 
-        std::unordered_set<String> clusters_to_insert;
-        std::unordered_set<String> clusters_to_remove;
-
-        /// Remove clusters that are not found in new_dynamic_clusters_info
-        for (const auto & [cluster_name, info] : clusters_info)
-        {
-            if (!info.isDynamic())
-                continue;
-            if (!new_dynamic_clusters_info.erase(cluster_name)
-                && !unchanged_roots.contains(info.multicluster_full_path))
-                clusters_to_remove.insert(cluster_name);
-        }
-        /// new_dynamic_clusters_info now contains only new clusters
-        for (const auto & [cluster_name, _] : new_dynamic_clusters_info)
-            clusters_to_insert.insert(cluster_name);
-
-        for (const auto & cluster_name : clusters_to_remove)
-            removeDynamicCluster(cluster_name);
-
-        clusters_info.merge(new_dynamic_clusters_info);
-
-        for (const auto & [cluster_name, need_update] : clusters)
-        {
-            auto cluster_info_it = clusters_info.find(cluster_name);
-            if (cluster_info_it == clusters_info.end())
+            if (!retryPendingUnregisters())
             {
-                LOG_ERROR(log, "Unknown cluster '{}'", cluster_name);
-                continue;
+                /// Keep waking the loop with a short interruptible backoff so ephemeral cleanup
+                /// retries without failing / rolling back the already-applied config update.
+                using namespace std::chrono_literals;
+                for (auto remaining = std::chrono::milliseconds(1000);
+                     remaining.count() > 0 && !clusters_to_update->isStopped();)
+                {
+                    constexpr auto slice = std::chrono::milliseconds(50);
+                    auto step = remaining < slice ? remaining : slice;
+                    std::this_thread::sleep_for(step);
+                    remaining -= step;
+                }
+                if (!clusters_to_update->isStopped())
+                    clusters_to_update->set();
             }
 
-            auto & cluster_info = cluster_info_it->second;
-            if (!need_update)
+            std::unordered_map<String, ClusterInfo> new_dynamic_clusters_info;
+            std::unordered_set<String> unchanged_roots;
+            findDynamicClusters(new_dynamic_clusters_info, &unchanged_roots);
+
+            std::unordered_set<String> clusters_to_insert;
+            std::unordered_set<String> clusters_to_remove;
+
+            /// Remove clusters that are not found in new_dynamic_clusters_info
+            for (const auto & [cluster_name, info] : clusters_info)
             {
-                /// force updating periodically
-                bool force_update = cluster_info.watch.elapsedSeconds() > std::chrono::seconds(force_update_interval).count();
-                if (!force_update)
+                if (!info.isDynamic())
                     continue;
+                if (!new_dynamic_clusters_info.erase(cluster_name)
+                    && !unchanged_roots.contains(info.multicluster_full_path))
+                    clusters_to_remove.insert(cluster_name);
+            }
+            /// new_dynamic_clusters_info now contains only new clusters
+            for (const auto & [cluster_name, _] : new_dynamic_clusters_info)
+                clusters_to_insert.insert(cluster_name);
+
+            for (const auto & cluster_name : clusters_to_remove)
+                removeDynamicCluster(cluster_name);
+
+            clusters_info.merge(new_dynamic_clusters_info);
+
+            for (const auto & [cluster_name, need_update] : clusters)
+            {
+                auto cluster_info_it = clusters_info.find(cluster_name);
+                if (cluster_info_it == clusters_info.end())
+                {
+                    LOG_ERROR(log, "Unknown cluster '{}'", cluster_name);
+                    continue;
+                }
+
+                auto & cluster_info = cluster_info_it->second;
+                if (!need_update)
+                {
+                    /// force updating periodically
+                    bool force_update = cluster_info.watch.elapsedSeconds() > std::chrono::seconds(force_update_interval).count();
+                    if (!force_update)
+                        continue;
+                }
+
+                String name = cluster_name;
+                if (upsertCluster(cluster_info))
+                {
+                    cluster_info_it = clusters_info.find(name);
+                    if (cluster_info_it != clusters_info.end())
+                        cluster_info_it->second.watch.restart();
+                    LOG_DEBUG(log, "Cluster '{}' updated successfully", name);
+                }
+                else
+                {
+                    all_up_to_date = false;
+                    /// no need to trigger convar, will retry after timeout in `wait`
+                    clusters_to_update->set(name);
+                    LOG_WARNING(log, "Cluster '{}' wasn't updated, will retry", name);
+                }
             }
 
-            String name = cluster_name;
-            if (upsertCluster(cluster_info))
+            for (const auto & cluster_name : clusters_to_insert)
             {
-                cluster_info_it = clusters_info.find(name);
-                if (cluster_info_it != clusters_info.end())
-                    cluster_info_it->second.watch.restart();
-                LOG_DEBUG(log, "Cluster '{}' updated successfully", name);
+                auto cluster_info_it = clusters_info.find(cluster_name);
+                if (cluster_info_it == clusters_info.end())
+                {
+                    LOG_ERROR(log, "Unknown dynamic cluster '{}'", cluster_name);
+                    continue;
+                }
+                auto & cluster_info = cluster_info_it->second;
+                String name = cluster_name;
+                if (upsertCluster(cluster_info))
+                {
+                    cluster_info_it = clusters_info.find(name);
+                    if (cluster_info_it != clusters_info.end())
+                        cluster_info_it->second.watch.restart();
+                    LOG_DEBUG(log, "Dynamic cluster '{}' inserted successfully", name);
+                }
+                else
+                {
+                    all_up_to_date = false;
+                    /// no need to trigger convar, will retry after timeout in `wait`
+                    clusters_to_update->set(name);
+                    LOG_WARNING(log, "Dynamic cluster '{}' wasn't inserted, will retry", name);
+                }
             }
-            else
+
+            if (all_up_to_date)
             {
-                all_up_to_date = false;
-                /// no need to trigger convar, will retry after timeout in `wait`
-                clusters_to_update->set(name);
-                LOG_WARNING(log, "Cluster '{}' wasn't updated, will retry", name);
+                up_to_date_callback();
             }
+
+            consumed_register_flag = register_change_flag.exchange(RegisterChangeFlag::RCF_NONE);
+
+            if (consumed_register_flag == RegisterChangeFlag::RCF_REGISTER_ALL)
+            {
+                LOG_DEBUG(log, "Register in all dynamic clusters");
+                for (auto & [_, info] : clusters_info)
+                {
+                    auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
+                    registerInZk(zk, info);
+                }
+            }
+            else if (consumed_register_flag == RegisterChangeFlag::RCF_UNREGISTER_ALL)
+            {
+                LOG_DEBUG(log, "Unregister in all dynamic clusters");
+                for (auto & [_, info] : clusters_info)
+                {
+                    auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
+                    unregisterFromZk(zk, info);
+                }
+            }
+
+            consumed_register_flag = RegisterChangeFlag::RCF_NONE;
         }
-
-        for (const auto & cluster_name : clusters_to_insert)
+        catch (...)
         {
-            auto cluster_info_it = clusters_info.find(cluster_name);
-            if (cluster_info_it == clusters_info.end())
+            for (const auto & [cluster_name, need_update] : clusters)
             {
-                LOG_ERROR(log, "Unknown dynamic cluster '{}'", cluster_name);
-                continue;
+                if (need_update)
+                    clusters_to_update->set(cluster_name);
             }
-            auto & cluster_info = cluster_info_it->second;
-            String name = cluster_name;
-            if (upsertCluster(cluster_info))
-            {
-                cluster_info_it = clusters_info.find(name);
-                if (cluster_info_it != clusters_info.end())
-                    cluster_info_it->second.watch.restart();
-                LOG_DEBUG(log, "Dynamic cluster '{}' inserted successfully", name);
-            }
-            else
-            {
-                all_up_to_date = false;
-                /// no need to trigger convar, will retry after timeout in `wait`
-                clusters_to_update->set(name);
-                LOG_WARNING(log, "Dynamic cluster '{}' wasn't inserted, will retry", name);
-            }
-        }
 
-        if (all_up_to_date)
-        {
-            up_to_date_callback();
-        }
-
-        RegisterChangeFlag flag = register_change_flag.exchange(RegisterChangeFlag::RCF_NONE);
-
-        if (flag == RegisterChangeFlag::RCF_REGISTER_ALL)
-        {
-            LOG_DEBUG(log, "Register in all dynamic clusters");
-            for (auto & [_, info] : clusters_info)
+            if (consumed_register_flag != RegisterChangeFlag::RCF_NONE)
             {
-                auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
-                registerInZk(zk, info);
+                /// Do not overwrite a newer registerAll/unregisterAll posted while we failed.
+                RegisterChangeFlag expected = RegisterChangeFlag::RCF_NONE;
+                register_change_flag.compare_exchange_strong(expected, consumed_register_flag);
             }
-        }
-        else if (flag == RegisterChangeFlag::RCF_UNREGISTER_ALL)
-        {
-            LOG_DEBUG(log, "Unregister in all dynamic clusters");
-            for (auto & [_, info] : clusters_info)
-            {
-                auto zk = context->getDefaultOrAuxiliaryZooKeeper(info.zk_name);
-                unregisterFromZk(zk, info);
-            }
+
+            clusters_to_update->wakeup();
+            throw;
         }
     }
     LOG_DEBUG(log, "Worker thread stopped");

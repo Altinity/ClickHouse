@@ -930,3 +930,50 @@ def test_reload_my_hostname_and_shard_updates_local_and_peer(start_cluster):
         raise AssertionError(
             f"Hostname/shard reload did not propagate to local and peer system.clusters: {rows}"
         )
+
+
+def test_keeper_exception_after_wait_restores_retry_signal(start_cluster):
+    """A one-shot Keeper throw after Flags::wait must not leave peer updates stuck forever."""
+    reload_config_on_node(nodes["node0"], _registration_config("reg-host-node0", 1))
+    reload_config_on_node(nodes["node1"], _registration_config("reg-host-node1", 1))
+
+    expected_initial = "reg-host-node0\t1\nreg-host-node1\t1"
+    for retry in range(15):
+        rows = {_registration_rows(node) for node in nodes.values()}
+        if rows == {expected_initial}:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError(f"Initial registration view not ready: {rows}")
+
+    node0 = nodes["node0"]
+    node0.query(
+        "SYSTEM ENABLE FAILPOINT cluster_discovery_retry_signal_fail",
+        password="passwordAbc",
+    )
+
+    # Peer-only registration change: node0 is woken by the Keeper children watch, not by a
+    # local config reload. Without restoring flags/wake after the failpoint throw, node0 would
+    # wait until an unrelated event (or never) to see the new payload.
+    reload_config_on_node(nodes["node1"], _registration_config("reg-host-node1-renamed", 2))
+
+    expected_updated = "reg-host-node0\t1\nreg-host-node1-renamed\t2"
+    for retry in range(20):
+        rows = _registration_rows(node0)
+        if rows == expected_updated:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError(
+            f"node0 did not recover peer registration update after one-shot Keeper failpoint; "
+            f"got {rows!r}"
+        )
+
+    # Peer that did not hit the failpoint must also converge.
+    for retry in range(15):
+        rows = {_registration_rows(node) for node in nodes.values()}
+        if rows == {expected_updated}:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError(f"Cluster views did not converge after retry-signal recovery: {rows}")
