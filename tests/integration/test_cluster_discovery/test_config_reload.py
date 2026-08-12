@@ -260,6 +260,116 @@ def reload_config_on_node(node, config_body):
     node.query("SYSTEM RELOAD CONFIG", password="passwordAbc")
 
 
+def test_reload_static_discovery_ownership_transitions(start_cluster):
+    """Static ↔ discovery must not leave a stale Clusters::impl entry that shadows discovery."""
+    cluster_name = "test_ownership_cluster"
+    config_static = f"""
+<clickhouse>
+    <allow_experimental_cluster_discovery>1</allow_experimental_cluster_discovery>
+    <remote_servers>
+        <{cluster_name}>
+            <shard>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </{cluster_name}>
+    </remote_servers>
+</clickhouse>
+"""
+    config_discovery = f"""
+<clickhouse>
+    <allow_experimental_cluster_discovery>1</allow_experimental_cluster_discovery>
+    <remote_servers>
+        <{cluster_name}>
+            <discovery>
+                <path>/clickhouse/discovery/{cluster_name}</path>
+            </discovery>
+        </{cluster_name}>
+    </remote_servers>
+</clickhouse>
+"""
+
+    def host_names():
+        return [
+            node.query(
+                f"SELECT groupArray(host_name) FROM system.clusters WHERE cluster = '{cluster_name}'",
+                password="passwordAbc",
+            ).strip()
+            for node in nodes.values()
+        ]
+
+    def wait_hosts_contain(needle, msg, retries=10):
+        for _ in range(retries):
+            hosts = host_names()
+            if all(needle in h for h in hosts):
+                return
+            time.sleep(1)
+        raise AssertionError(f"{msg}: {hosts}")
+
+    def wait_cluster_absent(msg, retries=10):
+        for _ in range(retries):
+            counts = [
+                int(
+                    node.query(
+                        f"SELECT count() FROM system.clusters WHERE cluster = '{cluster_name}'",
+                        password="passwordAbc",
+                    )
+                )
+                for node in nodes.values()
+            ]
+            if all(c == 0 for c in counts):
+                return
+            time.sleep(1)
+        raise AssertionError(f"{msg}: {counts}")
+
+    # Static only — placeholder host must be visible.
+    reload_config_on_all(config_static)
+    wait_hosts_contain("127.0.0.1", "Static ownership not applied")
+
+    # Static → discovery: discovery must win (not keep 127.0.0.1 from impl).
+    reload_config_on_all(config_discovery)
+    check_on_cluster(
+        list(nodes.values()),
+        len(nodes),
+        cluster_name=cluster_name,
+        what="count()",
+        msg="Discovery ownership not applied after static→discovery",
+        query_params={"password": "passwordAbc"},
+        retries=6,
+    )
+    for hosts in host_names():
+        if "127.0.0.1" in hosts:
+            raise AssertionError(
+                f"Stale static Cluster still shadows discovery after reload: {hosts}"
+            )
+
+    # Discovery → static.
+    reload_config_on_all(config_static)
+    wait_hosts_contain("127.0.0.1", "Static ownership not restored after discovery→static")
+
+    # Static → removed.
+    reload_config_on_all(CONFIG_NO_DISCOVERY)
+    wait_cluster_absent("Cluster still present after removal")
+
+    # static → discovery → removed (skip return to static).
+    reload_config_on_all(config_static)
+    wait_hosts_contain("127.0.0.1", "Static ownership not applied before second discovery cycle")
+    reload_config_on_all(config_discovery)
+    check_on_cluster(
+        list(nodes.values()),
+        len(nodes),
+        cluster_name=cluster_name,
+        what="count()",
+        msg="Discovery ownership not applied on second cycle",
+        query_params={"password": "passwordAbc"},
+        retries=6,
+    )
+    reload_config_on_all(CONFIG_NO_DISCOVERY)
+    wait_cluster_absent("Cluster still present after discovery→removed")
+
+
 def test_reload_discovery_credentials(start_cluster):
     reload_config_on_all(CONFIG_WITH_PWD)
 
