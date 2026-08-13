@@ -84,6 +84,7 @@ static struct InitFiu
     REGULAR(dummy_failpoint) \
     REGULAR(prefetched_reader_pool_failpoint) \
     REGULAR(object_storage_file_prefetch_failpoint) \
+    PAUSEABLE(object_storage_reader_pool_pause) \
     REGULAR(taskstats_counters_reset_throw) \
     REGULAR(shared_set_sleep_during_update) \
     REGULAR(smt_outdated_parts_exception_response) \

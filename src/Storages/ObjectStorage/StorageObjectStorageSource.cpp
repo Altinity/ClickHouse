@@ -93,6 +93,7 @@ namespace DB
 namespace FailPoints
 {
     extern const char object_storage_file_prefetch_failpoint[];
+    extern const char object_storage_reader_pool_pause[];
 }
 
 namespace Setting
@@ -165,7 +166,16 @@ StorageObjectStorageSource::StorageObjectStorageSource(
     , parser_shared_resources(std::move(parser_shared_resources_))
     , format_filter_info(std::move(format_filter_info_))
     , read_from_format_info(info)
-    , create_reader_pool(context_->getPrefetchThreadpool())
+    , own_reader_pool(
+          std::make_shared<ThreadPool>(
+              CurrentMetrics::StorageObjectStorageThreads,
+              CurrentMetrics::StorageObjectStorageThreadsActive,
+              CurrentMetrics::StorageObjectStorageThreadsScheduled,
+              1 /* max_threads */))
+    , create_reader_pool(
+          context_->getSettingsRef()[Setting::object_storage_max_files_to_prefetch] <= 1
+          ? *own_reader_pool
+          : context_->getPrefetchThreadpool())
     , file_iterator(file_iterator_)
     , schema_cache(StorageObjectStorage::getSchemaCache(context_, configuration->getTypeName()))
     , create_reader_scheduler(threadPoolCallbackRunnerUnsafe<ReaderHolder>(create_reader_pool, ThreadName::READER_POOL))
@@ -176,9 +186,10 @@ StorageObjectStorageSource::StorageObjectStorageSource(
 StorageObjectStorageSource::~StorageObjectStorageSource()
 {
     LOG_DEBUG(log, "Source finished: files_read={}", total_files_read);
-    /// The scheduled work captures `this`, and create_reader_pool is shared with the rest of the
-    /// server, so waiting for the whole pool is both wrong (it would wait for unrelated queries)
-    /// and insufficient to express what we need. Wait for exactly this source's own futures.
+    /// The scheduled work captures `this`. When create_reader_pool is the shared server-wide pool
+    /// (max_files_to_prefetch > 1), waiting for the whole pool would also be wrong (it would wait
+    /// for unrelated queries) and insufficient to express what we need. Wait for exactly this
+    /// source's own futures instead, which also covers the dedicated-pool case below.
     for (auto & reader_future : reader_futures)
     {
         if (reader_future.valid())
@@ -1361,6 +1372,9 @@ std::future<StorageObjectStorageSource::ReaderHolder> StorageObjectStorageSource
 {
     return create_reader_scheduler([=, this]
     {
+        /// Lets a test observe, via `system.metrics`, which pool (own_reader_pool or the shared
+        /// context_->getPrefetchThreadpool()) this task actually runs on while it is held here.
+        FailPointInjection::pauseFailPoint(FailPoints::object_storage_reader_pool_pause);
         auto reader_holder = createReader();
         if (prime && reader_holder)
         {

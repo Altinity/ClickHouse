@@ -89,11 +89,17 @@ protected:
     FormatFilterInfoPtr format_filter_info;
 
     ReadFromFormatInfo read_from_format_info;
-    /// Server-wide pool for remote object storage prefetches (sized by the `prefetch_threadpool_pool_size`
-    /// server setting), the same one `MergeTreePrefetchedReadPool` submits to. It is shared on
-    /// purpose: a private pool per source sized from `object_storage_max_files_to_prefetch` would
-    /// make the thread count `streams * max_files_to_prefetch`, unbounded by anything global.
-    /// Because the pool outlives this source, outstanding futures must be waited for in the
+    /// Dedicated single-thread pool, used by create_reader_pool below at the default
+    /// `object_storage_max_files_to_prefetch` of 1 - the same private per-source pool `master` (i.e.
+    /// before this setting existed) uses unconditionally - so prefetches cannot contend with
+    /// unrelated queries on the server-wide pool. Constructing it is cheap (threads are spawned
+    /// lazily on schedule), so it's unconditional even though it goes unused above 1, where a pool
+    /// sized from the setting would make the thread count `streams * max_files_to_prefetch`,
+    /// unbounded by anything global - create_reader_pool falls back to the shared
+    /// `context_->getPrefetchThreadpool()` (the same one `MergeTreePrefetchedReadPool` submits to)
+    /// instead.
+    std::shared_ptr<ThreadPool> own_reader_pool;
+    /// Because the shared pool outlives this source, outstanding futures must be waited for in the
     /// destructor - the scheduled work captures `this`.
     ThreadPool & create_reader_pool;
 
