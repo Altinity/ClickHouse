@@ -267,17 +267,7 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
             ConstraintsDescription{},
             partition_by,
             context,
-<<<<<<< HEAD
             /* is_table_function */true);
-=======
-            /* comment */ String{},
-            /* format_settings */ std::nullopt, /// No format_settings
-            /* mode */ LoadingStrictnessLevel::CREATE,
-            /* catalog */ nullptr,
-            /* if_not_exists */ false,
-            /* is_datalake_query*/ false,
-            /* is_table_function */ true);
->>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
 
         storage->startup();
         return storage;
