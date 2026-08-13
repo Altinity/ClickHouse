@@ -36,12 +36,12 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = f"release"
+    REGRESSION_HASH = "release"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
     needs: [config_workflow, docker_server_image]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
+    if: ${{  !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +54,7 @@ class AltinityWorkflowTemplates:
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
-      if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
+      if: ${{  !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
       with:
@@ -122,7 +122,6 @@ class AltinityWorkflowTemplates:
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
-          workflow_config: ${{ needs.config_workflow.outputs.data }}
           final: true
 """,
         "SourceUpload": r"""

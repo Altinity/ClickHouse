@@ -185,7 +185,7 @@ jobs:
           fi
 
   build_amd_debug:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
@@ -281,7 +281,7 @@ jobs:
           fi
 
   build_amd_asan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
@@ -329,7 +329,7 @@ jobs:
           fi
 
   build_amd_tsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
@@ -377,7 +377,7 @@ jobs:
           fi
 
   build_amd_msan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
@@ -425,7 +425,7 @@ jobs:
           fi
 
   build_amd_ubsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
@@ -473,7 +473,7 @@ jobs:
           fi
 
   build_amd_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
@@ -569,7 +569,7 @@ jobs:
           fi
 
   build_arm_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
@@ -809,7 +809,7 @@ jobs:
           fi
 
   stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBvbGQgYW5hbHl6ZXIsIHMzIHN0b3JhZ2UsIERhdGFiYXNlUmVwbGljYXRlZCwgcGFyYWxsZWwp') }}
     name: "Stateless tests (amd_binary, old analyzer, s3 storage, DatabaseReplicated, parallel)"
@@ -905,7 +905,7 @@ jobs:
           fi
 
   stateless_tests_amd_binary_parallelreplicas_s3_storage_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBQYXJhbGxlbFJlcGxpY2FzLCBzMyBzdG9yYWdlLCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (amd_binary, ParallelReplicas, s3 storage, parallel)"
@@ -1001,7 +1001,7 @@ jobs:
           fi
 
   stateless_tests_arm_binary_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_binary]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (arm_binary, parallel)"
@@ -1150,7 +1150,7 @@ jobs:
 
   GrypeScanServer:
     needs: [config_workflow, docker_server_image]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
+    if: ${{  !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     strategy:
       fail-fast: false
       matrix:
@@ -1163,7 +1163,7 @@ jobs:
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
-      if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
+      if: ${{  !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
       with:
@@ -1229,7 +1229,6 @@ jobs:
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
-          workflow_config: ${{ needs.config_workflow.outputs.data }}
           final: true
 
   SourceUpload:

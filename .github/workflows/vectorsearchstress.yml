@@ -74,7 +74,7 @@ jobs:
           fi
 
   vector_search_stress:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow]
     name: "Vector Search Stress"
     outputs:
