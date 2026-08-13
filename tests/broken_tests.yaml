@@ -83,6 +83,10 @@
   reason: KNOWN - Unstable upstream
 - name: 03644_object_storage_correlated_subqueries
   reason: KNOWN - Unstable in upstream 25.8.
+- name: 04299_constraint_subst_correlated_subquery_root
+  reason: 'KNOWN: Issue #2051'
+  check_types:
+  - ParallelReplicas
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
