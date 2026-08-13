@@ -2075,7 +2075,6 @@ static ColumnWithTypeAndName readNonNullableColumnFromArrowColumn(
             {
                 array_type = std::make_shared<DataTypeArray>(nested_column.type);
             }
-<<<<<<< HEAD
             /// Validate that the last offset matches the nested column size before constructing
             /// ColumnArray.  ColumnArray's constructor skips data->size() == last_offset when
             /// data->empty() (the && !data->empty() short-circuit), so a crafted Arrow file
@@ -2089,8 +2088,6 @@ static ColumnWithTypeAndName readNonNullableColumnFromArrowColumn(
                         "Arrow List column '{}': last offset {} does not match nested column size {}",
                         column_name, off.back(), array_data_column->size());
             }
-=======
->>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
             auto array_column = ColumnArray::create(array_data_column, offsets_column);
             return {std::move(array_column), array_type, column_name};
         }
@@ -2402,10 +2399,7 @@ static ColumnWithTypeAndName readColumnFromArrowColumn(
         arrow_column->type()->id() != arrow::Type::LARGE_LIST &&
         arrow_column->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
         arrow_column->type()->id() != arrow::Type::MAP &&
-<<<<<<< HEAD
         (arrow_column->type()->id() != arrow::Type::STRUCT || allow_nullable_struct) &&
-=======
->>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
         arrow_column->type()->id() != arrow::Type::DICTIONARY)
     {
         DataTypePtr nested_type_hint;
