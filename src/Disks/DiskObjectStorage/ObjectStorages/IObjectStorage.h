@@ -363,6 +363,16 @@ public:
         return getObjectMetadata(object.getPath(), with_tags);
     }
 
+    /// Same as above, but lets the caller ask for the object's multipart part layout (part_offsets).
+    /// Only S3 populates it, and only on request: it costs a heavier GetObjectAttributes call instead
+    /// of a plain HEAD (both return size + etag; only GetObjectAttributes returns the per-part sizes).
+    /// The default ignores the flag and issues the plain metadata request, so non-S3 storages and
+    /// callers that do not need part-aligned reads pay nothing extra.
+    virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool /*fetch_part_offsets*/) const
+    {
+        return getObjectMetadata(path, with_tags);
+    }
+
     /// Same as getObjectMetadata(), but ignores if object does not exist.
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const = 0;
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const RelativePathWithMetadata & object, bool with_tags) const

@@ -1973,7 +1973,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 
     if (!object_info.metadata)
     {
-        object_info.metadata = object_storage->getObjectMetadata(object_info, /*with_tags=*/ false);
+        object_info.metadata = object_storage->getObjectMetadata(
+            object_info.getPath(), /*with_tags=*/ false,
+            /*fetch_part_offsets=*/ effective_read_settings.object_storage_identity_cache_fetch_part_offsets);
     }
     else if (!object_info.metadata->is_fetched && validate_etag_on_read)
     {

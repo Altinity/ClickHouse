@@ -7348,6 +7348,9 @@ Use userspace page cache when reading from local disks. Used for testing, unlike
     DECLARE(Bool, use_page_cache_for_object_storage, false, R"(
 Use userspace page cache when reading from object storage table functions (s3, azure, hdfs) and table engines (S3, Azure, HDFS).
 )", 0) \
+    DECLARE(Bool, object_storage_identity_cache_fetch_part_offsets, false, R"(
+Fetch the S3 multipart part layout (part offsets) when reading object metadata, using a `GetObjectAttributes` request instead of a plain `HEAD`. The part offsets enable part-aligned reads, but `GetObjectAttributes` is heavier than a `HEAD` and is issued per file, so on a cold, cache-empty scan it adds latency without benefit unless part-aligned reads are used. When disabled (the default), a `HEAD` is used, which still returns the object size and etag needed for cache keys.
+)", 0) \
     DECLARE(Bool, read_from_page_cache_if_exists_otherwise_bypass_cache, false, R"(
 Use userspace page cache in passive mode, similar to read_from_filesystem_cache_if_exists_otherwise_bypass_cache.
 )", 0) \
