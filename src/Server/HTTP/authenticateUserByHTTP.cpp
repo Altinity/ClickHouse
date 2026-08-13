@@ -1,3 +1,4 @@
+#include <Access/AccessControl.h>
 #include <Access/Authentication.h>
 #include <Access/Credentials.h>
 #include <Access/ExternalAuthenticators.h>
@@ -18,7 +19,6 @@
 #if USE_SSL
 #    include <Common/Crypto/X509Certificate.h>
 #endif
-
 
 namespace DB
 {
@@ -129,6 +129,7 @@ bool authenticateUserByHTTP(
     /// (both methods are insecure).
     bool has_credentials_in_query_params = params.has("user") || params.has("password");
 
+<<<<<<< HEAD
     /// Whether the request carries an `Authorization` header that should be treated as
     /// credentials. The sentinel value `never` (which `play.html` sets on the requests it can
     /// add headers to) disables it.
@@ -152,6 +153,9 @@ bool authenticateUserByHTTP(
     /// its own configured credentials, an `Authorization` header is still rejected as a mix of
     /// authentication methods, regardless of the query parameters (see below).
     bool has_http_credentials = has_authorization_header && !has_credentials_in_query_params;
+=======
+    String bearer_token;
+>>>>>>> a894ddeb080 (Merge pull request #2140 from Altinity/feature/antalya-26.6/auto-grp-pr-1658)
 
     std::string spnego_challenge;
 #if USE_SSL
@@ -270,6 +274,12 @@ bool authenticateUserByHTTP(
             if (spnego_challenge.empty())
                 throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: SPNEGO challenge is empty");
         }
+        else if (Poco::icompare(scheme, "Bearer") == 0)
+        {
+            bearer_token = auth_info;
+            if (bearer_token.empty())
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: Bearer token is empty");
+        }
         else
         {
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: '{}' HTTP Authorization scheme is not supported", scheme);
@@ -346,6 +356,28 @@ bool authenticateUserByHTTP(
         }
     }
 #endif
+    else if (!bearer_token.empty())
+    {
+        const auto & access_control = global_context->getAccessControl();
+        if (!access_control.isTokenAuthEnabled())
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
+
+        const auto token_credentials = TokenCredentials(bearer_token);
+        const auto & external_authenticators = access_control.getExternalAuthenticators();
+
+        /// Pre-user-lookup token validation. Pass `prime_cache_on_success=false`
+        /// so this unconstrained call (no processor pin, no JWT claims) does not
+        /// populate the token cache. The cache is reserved for entries produced
+        /// by the per-user authentication path (`Authentication::areCredentialsValid`),
+        /// which applies the user's pinned processor and per-user claims.
+        /// Without this, a user whose `<jwt>` block omits `<processor>` would
+        /// satisfy a later cache lookup with empty `processor_name` -- silently
+        /// inheriting whichever processor happened to win this auto-discovery race.
+        if (!external_authenticators.checkTokenCredentials(token_credentials, /*processor_name=*/"", /*jwt_claims=*/"", /*prime_cache_on_success=*/false))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: Token could not be verified.");
+
+        current_credentials = std::make_unique<TokenCredentials>(token_credentials);
+    }
     else // I.e., now using user name and password strings ("Basic").
     {
         if (!current_credentials)
