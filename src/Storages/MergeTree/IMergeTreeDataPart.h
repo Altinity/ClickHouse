@@ -177,7 +177,7 @@ public:
     virtual void removeMarksFromCache(MarkCache * mark_cache) const = 0;
 
     /// Removes data related to data part from mark and primary index caches.
-    void clearCaches();
+    void clearCaches() const;
 
     /// Returns true if data related to data part may be stored in mark and primary index caches.
     bool mayStoreDataInCaches() const;

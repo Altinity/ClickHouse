@@ -55,6 +55,7 @@ public:
 
     ObjectStorageQueueMetadata(
         ObjectStorageType storage_type_,
+        const std::string & zookeeper_name_,
         const fs::path & zookeeper_path_,
         const ObjectStorageQueueTableMetadata & table_metadata_,
         size_t cleanup_interval_min_ms_,
@@ -79,6 +80,7 @@ public:
     /// what is in keeper (for example, processing_threads_num is adjustable,
     /// because its default depends on the CPU cores on the server);
     static ObjectStorageQueueTableMetadata syncWithKeeper(
+        const String & zookeeper_name,
         const fs::path & zookeeper_path,
         const ObjectStorageQueueSettings & settings,
         const ColumnsDescription & columns,
@@ -147,6 +149,11 @@ public:
     ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr
     tryAcquireBucket(const Bucket & bucket, const Processor & processor);
 
+    const String & getZooKeeperName() const { return zookeeper_name; }
+    zkutil::ZooKeeperPtr getZooKeeper() const { return getZooKeeper(log, zookeeper_name); }
+    // Keep log parameter to match upstream signature; may be unused in this build.
+    static zkutil::ZooKeeperPtr getZooKeeper(LoggerPtr log, const String & zookeeper_name);
+
     /// Set local ref count for metadata.
     void setMetadataRefCount(std::atomic<size_t> & ref_count_) { chassert(!metadata_ref_count); metadata_ref_count = &ref_count_; }
 
@@ -173,6 +180,7 @@ private:
     ObjectStorageQueueTableMetadata table_metadata;
     const ObjectStorageType storage_type;
     const ObjectStorageQueueMode mode;
+    const std::string zookeeper_name;
     const fs::path zookeeper_path;
     const size_t keeper_multiread_batch_size;
 
