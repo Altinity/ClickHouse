@@ -369,7 +369,7 @@ def main() -> None:
         sys.exit(0)
 
     all_applied = prior_applied + applied
-    pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
+    pr_title = f"{base_branch.title()} - Automated backport of flaky-fix commits from upstream ({date_tag})"
     pr_body = build_pr_body(upstream_repo, all_applied, conflicted)
     pr_labels = labels_for_branch(base_branch)
 
