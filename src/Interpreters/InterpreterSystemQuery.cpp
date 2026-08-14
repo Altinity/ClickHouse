@@ -59,6 +59,7 @@
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <Storages/Freeze.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/ObjectStorage/Azure/Configuration.h>
@@ -602,7 +603,12 @@ BlockIO InterpreterSystemQuery::execute()
 #else
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for AWS S3");
 #endif
-
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
+            ObjectStorageListObjectsCache::instance().clear();
+            break;
+        }
         case Type::CLEAR_FILESYSTEM_CACHE:
         {
             getContext()->checkAccess(AccessType::SYSTEM_DROP_FILESYSTEM_CACHE);
@@ -2879,9 +2885,13 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_DROP_FORMAT_SCHEMA_CACHE);
             break;
         case Type::CLEAR_S3_CLIENT_CACHE:
+<<<<<<< HEAD
             required_access.emplace_back(AccessType::SYSTEM_DROP_S3_CLIENT_CACHE);
             break;
         case Type::CLEAR_DISTRIBUTED_CACHE:
+=======
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_DISTRIBUTED_CACHE);
             break;

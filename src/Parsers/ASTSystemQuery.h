@@ -58,6 +58,7 @@ public:
         CLEAR_FORMAT_SCHEMA_CACHE,
         CLEAR_AVRO_SCHEMA_CACHE,
         CLEAR_S3_CLIENT_CACHE,
+        DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE,
         STOP_LISTEN,
         START_LISTEN,
         RESTART_REPLICAS,
@@ -291,9 +292,16 @@ protected:
 
 }
 
+<<<<<<< HEAD
 /// ASTSystemQuery::Type has more than 128 values, which is outside the default magic_enum range
 /// [-128, 127]. ParserSystemQuery matches SYSTEM keywords via magic_enum::enum_values, so any
 /// out-of-range value silently drops from the keyword list and stops parsing.
+=======
+/// The number of SYSTEM query types exceeds the default magic_enum range [-128, 127].
+/// Without extending the range magic_enum silently ignores the types with values above 127,
+/// so such queries cannot be parsed (ParserSystemQuery iterates over magic_enum::enum_values)
+/// and cannot be formatted (ASTSystemQuery::typeToString indexes a magic_enum-sized array).
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 template <> struct magic_enum::customize::enum_range<DB::ASTSystemQuery::Type>
 {
     static constexpr int min = 0;

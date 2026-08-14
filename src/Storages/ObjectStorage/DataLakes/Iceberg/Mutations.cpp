@@ -793,6 +793,7 @@ void alter(
     while (i < MAX_TRANSACTION_RETRIES)
     {
         auto log = getLogger("IcebergMutations");
+<<<<<<< HEAD
         auto [last_version, metadata_path, compression_method] = getLatestMetadataFileAndVersionWithCatalog(
             object_storage,
             catalog,
@@ -804,6 +805,62 @@ void alter(
             log.get(),
             persistent_table_components.table_uuid,
             persistent_table_components.metadata_compression_method);
+=======
+
+        int last_version = 0;
+        String metadata_path;
+        CompressionMethod compression_method = CompressionMethod::None;
+        if (!catalog)
+        {
+            auto last_version_info = getLatestOrExplicitMetadataFileAndVersion(
+                object_storage,
+                persistent_table_components.table_path,
+                data_lake_settings,
+                persistent_table_components.metadata_cache,
+                context,
+                log.get(),
+                persistent_table_components.table_uuid,
+                persistent_table_components.metadata_compression_method,
+                /* force_fetch_latest_metadata */ true,
+                /* ignore_explicit_metadata_file_path */ true);
+            last_version = last_version_info.version;
+            metadata_path = last_version_info.path;
+            compression_method = last_version_info.compression_method;
+        }
+        else
+        {
+            DataLake::TableMetadata table_metadata;
+            table_metadata.withDataLakeSpecificProperties().withLocation();
+            const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+            catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+            auto specific_properties = table_metadata.getDataLakeSpecificProperties();
+            if (!specific_properties.has_value() || specific_properties->iceberg_metadata_file_location.empty())
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Catalog did not return a metadata file location for table '{}.{}'",
+                    namespace_name, table_name);
+
+            DataLakeStorageSettings effective_settings = data_lake_settings;
+            effective_settings[DataLakeStorageSetting::iceberg_metadata_file_path]
+                = table_metadata.getMetadataLocation(specific_properties->iceberg_metadata_file_location);
+
+            auto last_version_info = getLatestOrExplicitMetadataFileAndVersion(
+                object_storage,
+                persistent_table_components.table_path,
+                effective_settings,
+                persistent_table_components.metadata_cache,
+                context,
+                log.get(),
+                persistent_table_components.table_uuid,
+                persistent_table_components.metadata_compression_method,
+                /* force_fetch_latest_metadata */ true,
+                /* ignore_explicit_metadata_file_path */ false);
+            last_version = last_version_info.version;
+            metadata_path = last_version_info.path;
+            compression_method = last_version_info.compression_method;
+        }
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
         FileNamesGenerator filename_generator(persistent_table_components.path_resolver.getTableLocation(), false, CompressionMethod::None, write_format);
         filename_generator.setVersion(last_version + 1);

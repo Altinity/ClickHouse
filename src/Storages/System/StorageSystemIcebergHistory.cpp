@@ -19,6 +19,12 @@
 #include <Processors/Port.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromSystemNumbersStep.h>
+<<<<<<< HEAD
+=======
+#include <Storages/SelectQueryInfo.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Access/ContextAccess.h>
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
@@ -91,10 +97,14 @@ void StorageSystemIcebergHistory::fillData(
 
     const auto access = context_copy->getAccess();
 
+<<<<<<< HEAD
     if (!access->isGranted(AccessType::SHOW_TABLES))
         return;
 
     auto add_history_record = [&](const String & database_name, const String & table_name, StorageObjectStorage * object_storage)
+=======
+    auto add_history_record = [&](const DatabaseTablesIteratorPtr & it, StorageObjectStorageCluster * object_storage)
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     {
         if (!access->isGranted(AccessType::SHOW_TABLES, database_name, table_name))
             return;
@@ -180,6 +190,7 @@ void StorageSystemIcebergHistory::fillData(
     };
     VirtualColumnUtils::filterBlockWithPredicate(predicate, filtered_block, context_copy);
 
+<<<<<<< HEAD
     const ColumnString & databases_to_read = assert_cast<const ColumnString &>(*filtered_block.getByName("database").column);
     const ColumnString & tables_to_read = assert_cast<const ColumnString &>(*filtered_block.getByName("table").column);
 
@@ -205,6 +216,13 @@ void StorageSystemIcebergHistory::fillData(
         if (auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(storage.get()))
         {
             add_history_record(database_name, table_name, object_storage_table);
+=======
+                if (auto * object_storage_table = dynamic_cast<StorageObjectStorageCluster *>(storage.get()))
+                {
+                    add_history_record(iterator, object_storage_table);
+                }
+            }
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         }
     }
 #endif

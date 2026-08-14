@@ -27,12 +27,18 @@ struct IcebergMetadataLogElement
     void appendToBlock(MutableColumns & columns) const;
 };
 
+<<<<<<< HEAD
 /// Returns the value of the query-level setting `iceberg_metadata_log_level`.
 IcebergMetadataLogLevel getIcebergMetadataLogLevel(const ContextPtr & local_context);
 
 void insertRowToLogTableImpl(
+=======
+/// Here `get_row` function is used instead `row` string to calculate string only when required.
+/// Inside `insertRowToLogTable` code can exit immediately after `iceberg_metadata_log_level` setting check.
+void insertRowToLogTable(
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     const ContextPtr & local_context,
-    String row,
+    std::function<String()> get_row,
     IcebergMetadataLogLevel row_log_level,
     const String & table_path,
     const Iceberg::IcebergPathFromMetadata & file_path,

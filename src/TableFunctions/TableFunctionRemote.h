@@ -27,6 +27,10 @@ public:
 
     bool needStructureConversion() const override { return false; }
 
+    void setRemoteTableFunction(ASTPtr remote_table_function_ptr_) { remote_table_function_ptr = remote_table_function_ptr_; }
+
+    void setActualTableStructure(ColumnsDescription remote_table_columns_) { remote_table_columns = remote_table_columns_; }
+
 private:
 
     StoragePtr executeImpl(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns, bool is_insert_query) const override;
@@ -43,10 +47,14 @@ private:
     StorageID remote_table_id = StorageID::createEmpty();
     ASTPtr remote_table_function_ptr;
     ASTPtr sharding_key = nullptr;
+<<<<<<< HEAD
 
     /// Changes from a SETTINGS clause among the arguments, applied to the `DistributedSettings`
     /// of the created `StorageDistributed`, e.g. SETTINGS skip_unavailable_shards = 1.
     SettingsChanges settings_changes;
+=======
+    ColumnsDescription remote_table_columns;
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 };
 
 }

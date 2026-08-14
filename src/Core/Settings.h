@@ -63,6 +63,7 @@ class WriteBuffer;
     M(CLASS_NAME, DistributedCachePoolBehaviourOnLimit) /* Cloud only */ \
     M(CLASS_NAME, DistributedDDLOutputMode) \
     M(CLASS_NAME, DistributedProductMode) \
+    M(CLASS_NAME, ObjectStorageClusterJoinMode) \
     M(CLASS_NAME, Double) \
     M(CLASS_NAME, EscapingRule) \
     M(CLASS_NAME, ExplainQueryPlanDefault) \
@@ -89,6 +90,7 @@ class WriteBuffer;
     M(CLASS_NAME, LogsLevel) \
     M(CLASS_NAME, Map) \
     M(CLASS_NAME, MaxThreads) \
+    M(CLASS_NAME, MergeTreePartExportFileAlreadyExistsPolicy) \
     M(CLASS_NAME, Milliseconds) \
     M(CLASS_NAME, MsgPackUUIDRepresentation) \
     M(CLASS_NAME, MySQLDataTypesSupport) \
@@ -126,8 +128,12 @@ class WriteBuffer;
     M(CLASS_NAME, DeduplicateInsertSelectMode) \
     M(CLASS_NAME, DeduplicateInsertMode) \
     M(CLASS_NAME, FileLikeEngineDefaultPartitionStrategy) \
+<<<<<<< HEAD
     M(CLASS_NAME, UniqueKeyProbeImplementation) \
     M(CLASS_NAME, SkipUnavailableShardsMode)
+=======
+    M(CLASS_NAME, ExportPartitionAllOnError) \
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 
 COMMON_SETTINGS_SUPPORTED_TYPES(Settings, DECLARE_SETTING_TRAIT)

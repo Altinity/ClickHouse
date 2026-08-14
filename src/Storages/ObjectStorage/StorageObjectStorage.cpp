@@ -1,4 +1,5 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
@@ -35,17 +36,28 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/TableSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadataDeltaKernel.h>
 #include <Interpreters/StorageID.h>
+<<<<<<< HEAD
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
+=======
+#include <Common/parseGlobs.h>
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/DataLake/Common.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+<<<<<<< HEAD
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeString.h>
+=======
+#include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Poco/JSON/Parser.h>
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 
 namespace DB
@@ -67,12 +79,16 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int INCORRECT_DATA;
     extern const int BAD_ARGUMENTS;
+<<<<<<< HEAD
     extern const int ACCESS_DENIED;
 }
 
 namespace FailPoints
 {
     extern const char datalake_simulate_missing_table_state[];
+=======
+    extern const int FILE_ALREADY_EXISTS;
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 String StorageObjectStorage::getPathSample(ContextPtr context)
@@ -141,13 +157,15 @@ StorageObjectStorage::StorageObjectStorage(
     std::optional<FormatSettings> format_settings_,
     LoadingStrictnessLevel mode,
     std::shared_ptr<DataLake::ICatalog> catalog_,
-    bool if_not_exists_,
+    bool /*if_not_exists_*/,
     bool is_datalake_query,
     bool distributed_processing_,
     ASTPtr partition_by_,
-    ASTPtr order_by_,
+    ASTPtr /*order_by_*/,
     bool is_table_function_,
-    bool lazy_init)
+    bool lazy_init,
+    bool updated_configuration,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -160,9 +178,9 @@ StorageObjectStorage::StorageObjectStorage(
     , background_operations_assignee(*this, table_id_, BackgroundJobsAssignee::Type::DataProcessing, Context::getGlobalContextInstance())
 {
     configuration->initPartitionStrategy(partition_by_, columns_in_table_or_function_definition, context);
-    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->format == "auto");
+    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool need_resolve_sample_path = context->getSettingsRef()[Setting::use_hive_partitioning]
-        && !configuration->partition_strategy
+        && !configuration->getPartitionStrategy()
         && !configuration->isDataLakeConfiguration();
     const bool catalog_manages_created_location
         = catalog_ && catalog_->managesTableLocation() && mode == LoadingStrictnessLevel::CREATE;
@@ -182,17 +200,9 @@ StorageObjectStorage::StorageObjectStorage(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta lake CDF is allowed only for deltaLake table function");
     }
 
-    if (!is_table_function && !columns_in_table_or_function_definition.empty() && !is_datalake_query && mode == LoadingStrictnessLevel::CREATE)
-    {
-        LOG_DEBUG(log, "Creating new storage with specified columns");
-        configuration->create(
-            object_storage, context, columns_in_table_or_function_definition, partition_by_, order_by_, if_not_exists_, catalog, storage_id);
-    }
-
-    bool updated_configuration = false;
     try
     {
-        if (!do_lazy_init)
+        if (!do_lazy_init && !updated_configuration)
         {
             if (is_table_function)
                 configuration->lazyInitializeIfNeeded(object_storage, context);
@@ -219,7 +229,7 @@ StorageObjectStorage::StorageObjectStorage(
         tryLogCurrentException(log, /*start of message = */ "", LogsLevel::warning);
     }
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
 
@@ -228,7 +238,7 @@ StorageObjectStorage::StorageObjectStorage(
         if (configuration->isDataLakeConfiguration())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The _schema_hash placeholder is not supported for DataLake engines");
 
-        if (configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+        if (configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The _schema_hash placeholder is not supported with hive partition strategy");
 
         if (columns.empty())
@@ -243,7 +253,7 @@ StorageObjectStorage::StorageObjectStorage(
     configuration->check(context);
 
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context);
+        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -251,8 +261,14 @@ StorageObjectStorage::StorageObjectStorage(
     /// of the table, so that CREATE, ATTACH and server startup do not depend on the endpoint.
     hive_partitioning_sample_path_deferred = !is_table_function && need_resolve_sample_path && !need_resolve_columns_or_format;
 
+<<<<<<< HEAD
     if (updated_configuration && sample_path.empty() && need_resolve_sample_path
         && !hive_partitioning_sample_path_deferred && !configuration->partition_strategy)
+=======
+    /// FIXME: We need to call getPathSample() lazily on select
+    /// in case it failed to be initialized in constructor.
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->getPartitionStrategy())
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     {
         try
         {
@@ -284,7 +300,7 @@ StorageObjectStorage::StorageObjectStorage(
             sample_path);
     }
 
-    bool format_supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->format, context, format_settings);
+    bool format_supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->getFormat(), context, format_settings);
 
     /// TODO: Known problems with datalake prewhere:
     ///  * If the iceberg table went through schema evolution, columns read from file may need to
@@ -340,8 +356,10 @@ StorageObjectStorage::StorageObjectStorage(
 
     metadata.setConstraints(constraints_);
     metadata.setComment(comment);
-    if (configuration->partition_strategy)
-        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+    if (configuration->getPartitionStrategy())
+    {
+        metadata.partition_key = configuration->getPartitionStrategy()->getPartitionKeyDescription();
+    }
 
     metadata.setVirtuals(createVirtualColumns(metadata.columns, sample_path, context));
 
@@ -355,8 +373,13 @@ VirtualColumnsDescription StorageObjectStorage::createVirtualColumns(
         columns,
         context,
         format_settings,
+<<<<<<< HEAD
         configuration->partition_strategy_type,
         sample_path);
+=======
+        configuration->getPartitionStrategyType(),
+        sample_path));
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
     if (configuration->getType() == ObjectStorageType::Web && !columns.has("_headers"))
     {
@@ -379,17 +402,17 @@ String StorageObjectStorage::getName() const
 
 bool StorageObjectStorage::prefersLargeBlocks() const
 {
-    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->format);
+    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->getFormat());
 }
 
 bool StorageObjectStorage::parallelizeOutputAfterReading(ContextPtr context) const
 {
-    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->format, context);
+    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->getFormat(), context);
 }
 
 bool StorageObjectStorage::supportsSubsetOfColumns(const ContextPtr & context) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context, format_settings);
 }
 
 bool StorageObjectStorage::supportsPrewhere() const
@@ -551,7 +574,7 @@ void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr quer
         new_metadata.columns,
         query_context,
         format_settings,
-        configuration->partition_strategy_type)));
+        configuration->getPartitionStrategyType())));
 }
 
 
@@ -659,8 +682,7 @@ void StorageObjectStorage::read(
         configuration->update(object_storage, local_context);
     }
 
-
-    if (configuration->partition_strategy && configuration->partition_strategy_type != PartitionStrategyFactory::StrategyType::HIVE)
+    if (configuration->getPartitionStrategy() && configuration->getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::HIVE)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Reading from a partitioned {} storage is not implemented yet",
@@ -792,9 +814,10 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     /// Not a data lake, just raw object storage
 
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
-        return std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        return std::make_shared<PartitionedSink>(configuration->getPartitionStrategy(), sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -810,8 +833,8 @@ SinkToStoragePtr StorageObjectStorage::write(
         format_settings,
         sample_block,
         local_context,
-        configuration->format,
-        configuration->compression_method);
+        configuration->getFormat(),
+        configuration->getCompressionMethod());
 }
 
 bool StorageObjectStorage::optimize(
@@ -825,6 +848,132 @@ bool StorageObjectStorage::optimize(
     [[maybe_unused]] ContextPtr context)
 {
     return configuration->optimize(object_storage, metadata_snapshot, context, format_settings);
+}
+
+bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
+{
+    if (isDataLake())
+    {
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+        return configuration->getExternalMetadata()->supportsImport(local_context);
+    }
+
+    if (!configuration->getPartitionStrategy())
+        return false;
+
+    if (configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::WILDCARD)
+        return configuration->getRawPath().hasExportFilenameWildcard();
+
+    return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
+}
+
+SinkToStoragePtr StorageObjectStorage::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    const std::function<void(const std::string &)> & new_file_path_callback,
+    bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
+    const std::optional<std::string> & iceberg_metadata_json_string,
+    const std::optional<FormatSettings> & format_settings_,
+    ContextPtr local_context)
+{
+    if (isDataLake())
+    {
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+        auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+        return configuration->getExternalMetadata()->import(
+            catalog,
+            new_file_path_callback,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
+            *iceberg_metadata_json_string,
+            format_settings_ ? format_settings_ : format_settings,
+            local_context);
+    }
+
+    std::string partition_key;
+
+    if (configuration->getPartitionStrategy())
+    {
+        const auto column_with_partition_key = configuration->getPartitionStrategy()->computePartitionKey(block_with_partition_values);
+
+        if (!column_with_partition_key->empty())
+        {
+            partition_key = column_with_partition_key->getDataAt(0);
+        }
+    }
+
+    const auto base_path = configuration->getPathForWrite(partition_key, file_name).path;
+
+    auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+
+    return std::make_shared<MultiFileStorageObjectStorageSink>(
+        base_path,
+        /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
+        object_storage,
+        configuration,
+        max_bytes_per_file,
+        max_rows_per_file,
+        overwrite_if_exists,
+        new_file_path_callback,
+        format_settings_ ? format_settings_ : format_settings,
+        std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
+        local_context);
+}
+
+void StorageObjectStorage::commitExportPartitionTransaction(
+    const String & transaction_id,
+    const String & partition_id,
+    const Strings & exported_paths,
+    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+    ContextPtr local_context)
+{
+    if (isDataLake())
+    {
+        /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) only to
+        /// extract the schema-id and partition-spec-id that were current when the export began.
+        /// partition_columns and partition_types are derived inside commitExportPartitionTransaction
+        /// from the same JSON; the representative source partition columns are carried here so the
+        /// partition tuple can be recomputed through the destination transform.
+        Poco::JSON::Parser iceberg_parser;
+        Poco::JSON::Object::Ptr iceberg_metadata =
+            iceberg_parser.parse(iceberg_commit_export_partition_arguments.metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+        const auto original_schema_id = iceberg_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+        const auto partition_spec_id   = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        configuration->lazyInitializeIfNeeded(object_storage, local_context);
+        auto metadata_snapshot = getInMemoryMetadataPtr(local_context, false);
+        configuration->getExternalMetadata()->commitExportPartitionTransaction(
+            catalog,
+            storage_id,
+            transaction_id,
+            original_schema_id,
+            partition_spec_id,
+            iceberg_commit_export_partition_arguments.partition_source_block,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock()),
+            exported_paths,
+            configuration,
+            local_context);
+        return;
+    }
+
+    const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
+
+    /// if file already exists, nothing to be done
+    if (object_storage->exists(StoredObject(commit_object)))
+    {
+        LOG_DEBUG(getLogger("StorageObjectStorage"), "Commit file already exists, nothing to be done: {}", commit_object);
+        return;
+    }
+
+    auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
+    for (const auto & p : exported_paths)
+    {
+        out->write(p.data(), p.size());
+        out->write("\n", 1);
+    }
+    out->finalize();
 }
 
 void StorageObjectStorage::truncate(
@@ -918,7 +1067,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 {
     ObjectInfos read_keys;
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
-    auto schema = readSchemaFromFormat(configuration->format, format_settings, *iterator, context);
+    auto schema = readSchemaFromFormat(configuration->getFormat(), format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
     return schema;
 }
@@ -939,7 +1088,7 @@ std::string StorageObjectStorage::resolveFormatFromData(
 
 std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAndFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const StorageObjectStorageConfigurationPtr & configuration,
+    StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -948,7 +1097,7 @@ std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAn
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
     auto [columns, format] = detectFormatAndReadSchema(format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
-    configuration->format = format;
+    configuration->setFormat(format);
     return std::pair(columns, format);
 }
 
@@ -973,6 +1122,7 @@ bool hasPartitionStrategyArgument(const ASTs & args)
 
 void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
+<<<<<<< HEAD
     configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
 
     if (configuration->partition_strategy_was_inferred
@@ -1002,6 +1152,9 @@ void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const
             make_intrusive<ASTLiteral>("none")};
         args.push_back(makeASTOperator("equals", std::move(partition_strategy_args)));
     }
+=======
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, const std::string & storage_engine_name)

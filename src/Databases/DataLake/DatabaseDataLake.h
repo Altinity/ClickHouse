@@ -126,6 +126,7 @@ private:
     /// front. Guarded by `catalog_mutex` because lazy initialization can race concurrent readers.
     void initialize() const TSA_REQUIRES(catalog_mutex);
 
+<<<<<<< HEAD
     /// `initialize`, but when loading from existing metadata a catalog that resolves the now-restricted server
     /// identity is left unavailable (its reason recorded) instead of propagating, so server startup is not
     /// aborted; a user-initiated create/attach stays fail-closed and the `ACCESS_DENIED` propagates.
@@ -136,6 +137,9 @@ private:
     void resetCatalog(String reason) const TSA_REQUIRES(catalog_mutex);
 
     std::shared_ptr<StorageObjectStorageConfiguration> getConfiguration(
+=======
+    StorageObjectStorageConfigurationPtr getConfiguration(
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         DatabaseDataLakeStorageType type,
         DataLakeStorageSettingsPtr storage_settings) const;
 

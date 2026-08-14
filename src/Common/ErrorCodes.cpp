@@ -658,10 +658,14 @@
     M(776, RESOURCE_LIMIT_EXCEEDED) \
     M(777, MEMORY_RESERVATION_KILLED) \
     M(778, MEMORY_RESERVATION_FAILED) \
+<<<<<<< HEAD
     M(779, UNSUPPORTED_MEDIA_TYPE) \
     M(780, SW_SERVER_NO_WORKERS_AVAILABLE) \
     M(781, AI_PROVIDER_RESPONSE_TRUNCATED) \
     M(782, AI_PROVIDER_RESPONSE_INCOMPLETE) \
+=======
+    M(779, CATALOG_NAMESPACE_DISABLED) \
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 \
     M(900, DISTRIBUTED_CACHE_ERROR) \
     M(901, CANNOT_USE_DISTRIBUTED_CACHE) \
@@ -680,6 +684,7 @@
     M(1006, INVALID_CURSOR_LOOKUP) \
     M(1007, ILLEGAL_STREAM) \
     M(1008, TEMPORARY_DATA_NOT_IN_CACHE) \
+<<<<<<< HEAD
     M(1009, S3_OBJECT_CHANGED_DURING_READ) \
     M(1010, UNIQUE_KEY_DENSE_INDEX_UNREADABLE) \
     M(1011, HANDLER_ALREADY_EXISTS) \
@@ -687,6 +692,11 @@
     M(1013, AMBIGUOUS_HANDLER) \
     M(1014, TRANSACTION_ROLLBACK_PARTIAL_FAILURE) \
     M(1015, FILE_CHANGED_DURING_READ) \
+=======
+    M(1009, PENDING_MUTATIONS_NOT_ALLOWED) \
+    M(1010, EXPORT_PARTITION_ALREADY_EXPORTED) \
+    M(1011, PARTITION_EXPORT_FAILED) \
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -703,6 +713,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
+<<<<<<< HEAD
     constexpr ErrorCode END = 1015;
 
 #if !defined(CLICKHOUSE_PARSER_MINIMAL_BUILD)
@@ -711,6 +722,9 @@ namespace ErrorCodes
       * around 150 KB of data for the whole table, which the server wants for `system.errors` but a
       * standalone build of the parser has nothing to do with: the names above are all it needs.
       */
+=======
+    constexpr ErrorCode END = 1011;
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     ErrorPairHolder values[END + 1]{};
 #endif
 

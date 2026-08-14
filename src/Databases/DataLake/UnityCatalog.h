@@ -22,6 +22,7 @@ public:
         const std::string & catalog_,
         const std::string & base_url_,
         const std::string & catalog_credential_,
+        const std::string & namespaces_,
         DB::ContextPtr context_);
 
     ~UnityCatalog() override = default;
@@ -37,11 +38,13 @@ public:
     void getTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     bool tryGetTableMetadata(
         const std::string & schema_name,
         const std::string & table_name,
+        DB::ContextPtr context_,
         TableMetadata & result) const override;
 
     std::optional<StorageType> getStorageType() const override { return std::nullopt; }
@@ -60,6 +63,15 @@ private:
     std::pair<Poco::Dynamic::Var, std::string> getJSONRequest(const std::string & route, const Poco::URI::QueryParameters & params = {}) const;
     std::pair<Poco::Dynamic::Var, std::string> postJSONRequest(const std::string & route, std::function<void(std::ostream &)> out_stream_callaback) const;
 
+<<<<<<< HEAD
+=======
+    Poco::Net::HTTPBasicCredentials credentials{};
+
+    std::unordered_set<std::string> allowed_namespaces;
+
+    bool isNamespaceAllowed(const std::string & namespace_) const;
+
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     DataLake::ICatalog::Namespaces getSchemas(const std::string & base_prefix, size_t limit = 0) const;
 
     CatalogTables getTablesForSchema(const std::string & schema, size_t limit = 0) const;

@@ -194,7 +194,7 @@ template <typename Definition, typename Configuration, bool is_data_lake>
 ColumnsDescription TableFunctionObjectStorage<
     Definition, Configuration, is_data_lake>::getActualTableStructure(ContextPtr context, bool is_insert_query) const
 {
-    if (configuration->structure == "auto")
+    if (configuration->getStructure() == "auto")
     {
         auto storage = getObjectStorage(context, !is_insert_query);
         configuration->lazyInitializeIfNeeded(object_storage, context);
@@ -203,7 +203,6 @@ ColumnsDescription TableFunctionObjectStorage<
         ColumnsDescription columns;
         resolveSchemaAndFormat(
             columns,
-            configuration->format,
             std::move(storage),
             configuration,
             /* format_settings */std::nullopt,
@@ -220,7 +219,7 @@ ColumnsDescription TableFunctionObjectStorage<
 
         return columns;
     }
-    return parseColumnsListFromString(configuration->structure, context);
+    return parseColumnsListFromString(configuration->getStructure(), context);
 }
 
 template <typename Definition, typename Configuration, bool is_data_lake>
@@ -234,8 +233,8 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
     chassert(configuration);
     ColumnsDescription columns;
 
-    if (configuration->structure != "auto")
-        columns = parseColumnsListFromString(configuration->structure, context);
+    if (configuration->getStructure() != "auto")
+        columns = parseColumnsListFromString(configuration->getStructure(), context);
     else if (!structure_hint.empty())
         columns = structure_hint;
     else if (!cached_columns.empty())
@@ -248,11 +247,13 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
     /// Only use parallel replicas if the Cluster variant of this table function exists
     /// (e.g. `s3Cluster` for `s3`). Table functions without a Cluster variant (e.g. `paimonLocal`)
     /// cannot distribute work via task iterators, so distributing would just read all data on every replica.
+    /// `getName`, not `Definition::name`: with `TableFunctionObjectStorageClusterFallback`
+    /// the definition is the *Cluster one, while the invoked function is `s3`.
     const auto can_use_parallel_replicas = !parallel_replicas_cluster_name.empty()
         && query_settings[Setting::parallel_replicas_for_cluster_engines]
         && context->canUseTaskBasedParallelReplicas()
         && !context->isDistributed()
-        && TableFunctionFactory::instance().isTableFunctionName(String(name) + "Cluster");
+        && TableFunctionFactory::instance().isTableFunctionName(getName() + "Cluster");
 
     const auto is_secondary_query = context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
@@ -266,8 +267,15 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
             columns,
             ConstraintsDescription{},
             partition_by,
+            /* order_by */ nullptr,
             context,
-            /* is_table_function */true);
+            /* comment */ String{},
+            /* format_settings */ std::nullopt, /// No format_settings
+            /* mode */ LoadingStrictnessLevel::CREATE,
+            configuration->getCatalog(context, StorageID(getDatabaseName(), table_name)),
+            /* if_not_exists */ false,
+            /* is_datalake_query*/ false,
+            /* is_table_function */ true);
 
         storage->startup();
         return storage;
@@ -315,6 +323,7 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
 {
     UNUSED(factory);
 #if USE_AWS_S3
+<<<<<<< HEAD
     factory.registerFunction<TableFunctionObjectStorage<S3Definition, StorageS3Configuration>>(
         {.description = R"DOCS_MD(
 import { ExperimentalBadge } from "/snippets/components/ExperimentalBadge/ExperimentalBadge.jsx";
@@ -980,10 +989,18 @@ As a result, the data is written into three files in different buckets: `my_buck
 - [S3 table function](/reference/functions/table-functions/s3)
 - [S3 engine](/reference/engines/table-engines/integrations/s3)
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction},
+=======
+    factory.registerFunction<TableFunctionObjectStorage<GCSDefinition, StorageS3Configuration, false>>(
+        {
+            .description=R"(The table function can be used to read the data stored on GCS.)",
+            .examples{{GCSDefinition::name, "SELECT * FROM gcs(url, access_key_id, secret_access_key)", ""}},
+            .category = FunctionDocumentation::Category::TableFunction
+        },
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
         {.allow_readonly = false}
     );
 
-    factory.registerFunction<TableFunctionObjectStorage<COSNDefinition, StorageS3Configuration>>(
+    factory.registerFunction<TableFunctionObjectStorage<COSNDefinition, StorageS3Configuration, false>>(
         {
             .description=R"(The table function can be used to read the data stored on COSN.)",
             .examples{{COSNDefinition::name, "SELECT * FROM cosn(url, access_key_id, secret_access_key)", ""}},
@@ -992,7 +1009,7 @@ As a result, the data is written into three files in different buckets: `my_buck
         {.allow_readonly = false}
     );
 
-    factory.registerFunction<TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration>>(
+    factory.registerFunction<TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration, false>>(
         {
             .description=R"(The table function can be used to read the data stored on OSS.)",
             .examples{{OSSDefinition::name, "SELECT * FROM oss(url, access_key_id, secret_access_key)", ""}},
@@ -1001,6 +1018,7 @@ As a result, the data is written into three files in different buckets: `my_buck
         {.allow_readonly = false}
     );
 #endif
+<<<<<<< HEAD
 
 #if USE_AZURE_BLOB_STORAGE
     factory.registerFunction<TableFunctionObjectStorage<AzureDefinition, StorageAzureConfiguration>>(
@@ -1406,24 +1424,30 @@ SELECT * FROM HDFS('hdfs://hdfs1:9000/data/path/date=*/country=*/code=*/*.parque
         {.allow_readonly = false}
     );
 #endif
+=======
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 }
 
 #if USE_AZURE_BLOB_STORAGE
-template class TableFunctionObjectStorage<AzureDefinition, StorageAzureConfiguration>;
-template class TableFunctionObjectStorage<AzureClusterDefinition, StorageAzureConfiguration>;
+template class TableFunctionObjectStorage<AzureDefinition, StorageAzureConfiguration, false>;
+template class TableFunctionObjectStorage<AzureClusterDefinition, StorageAzureConfiguration, false>;
 #endif
 
 #if USE_AWS_S3
-template class TableFunctionObjectStorage<S3Definition, StorageS3Configuration>;
-template class TableFunctionObjectStorage<S3ClusterDefinition, StorageS3Configuration>;
-template class TableFunctionObjectStorage<GCSDefinition, StorageS3Configuration>;
-template class TableFunctionObjectStorage<COSNDefinition, StorageS3Configuration>;
-template class TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration>;
+template class TableFunctionObjectStorage<S3Definition, StorageS3Configuration, false>;
+template class TableFunctionObjectStorage<S3ClusterDefinition, StorageS3Configuration, false>;
+template class TableFunctionObjectStorage<GCSDefinition, StorageS3Configuration, false>;
+template class TableFunctionObjectStorage<COSNDefinition, StorageS3Configuration, false>;
+template class TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration, false>;
 #endif
 
 #if USE_HDFS
-template class TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfiguration>;
-template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConfiguration>;
+template class TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfiguration, false>;
+template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConfiguration, false>;
+#endif
+
+#if USE_AVRO
+template class TableFunctionObjectStorage<IcebergClusterDefinition, StorageIcebergConfiguration, true>;
 #endif
 
 #if USE_AVRO
@@ -1469,6 +1493,7 @@ template class TableFunctionObjectStorage<DeltaLakeAzureClusterDefinition, Stora
 template class TableFunctionObjectStorage<HudiClusterDefinition, StorageS3HudiConfiguration, true>;
 #endif
 
+<<<<<<< HEAD
 #if USE_AVRO
 void registerTableFunctionIceberg(TableFunctionFactory & factory);
 void registerTableFunctionIceberg(TableFunctionFactory & factory)
@@ -2219,6 +2244,8 @@ The command returns a table with `metric_name` and `metric_value` columns showin
 }
 #endif
 
+=======
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 
 #if USE_AVRO
 void registerTableFunctionPaimon(TableFunctionFactory & factory);
@@ -2370,6 +2397,7 @@ Data types supported in Paimon partition keys:
 void registerTableFunctionDeltaLake(TableFunctionFactory & factory);
 void registerTableFunctionDeltaLake(TableFunctionFactory & factory)
 {
+<<<<<<< HEAD
 #if USE_AWS_S3
     factory.registerFunction<TableFunctionDeltaLake>(
          {.description = R"DOCS_MD(
@@ -2492,6 +2520,8 @@ Query id: 65032944-bed6-4d45-86b3-a71205a2b659
             .category = FunctionDocumentation::Category::TableFunction},
          {.allow_readonly = false});
 #endif
+=======
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     // Register the new local Delta Lake table function
     factory.registerFunction<TableFunctionDeltaLakeLocal>(
          {.description = R"(The table function can be used to read the DeltaLake table stored locally.)",
@@ -2501,6 +2531,7 @@ Query id: 65032944-bed6-4d45-86b3-a71205a2b659
 }
 #endif
 
+<<<<<<< HEAD
 #if USE_AWS_S3
 void registerTableFunctionHudi(TableFunctionFactory & factory);
 void registerTableFunctionHudi(TableFunctionFactory & factory)
@@ -2547,22 +2578,17 @@ A table with the specified structure for reading data in the specified Hudi tabl
 }
 #endif
 
+=======
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 void registerDataLakeTableFunctions(TableFunctionFactory & factory)
 {
     UNUSED(factory);
-#if USE_AVRO
-    registerTableFunctionIceberg(factory);
-#endif
-
-#if USE_AVRO
-    registerTableFunctionPaimon(factory);
-#endif
 
 #if USE_PARQUET && USE_DELTA_KERNEL_RS
     registerTableFunctionDeltaLake(factory);
 #endif
-#if USE_AWS_S3
-    registerTableFunctionHudi(factory);
+#if USE_AVRO
+    registerTableFunctionPaimon(factory);
 #endif
 }
 }

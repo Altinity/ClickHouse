@@ -342,6 +342,7 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
     const bool is_attach = mode > LoadingStrictnessLevel::CREATE;
     validateSettings(*queue_settings_, is_attach);
 
+<<<<<<< HEAD
     /// The object storage S3 client is built once here and reused by background threads, so the effective
     /// per-session credential restriction must be captured now from the CREATE query (its
     /// `s3_allow_server_credentials_in_user_queries` value arrives as `allow_server_credentials_in_user_queries_`).
@@ -371,11 +372,15 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
 
     object_storage = configuration->createObjectStorage(object_storage_context, /* is_readonly */true, std::nullopt);
     FormatFactory::instance().checkFormatName(configuration->format);
+=======
+    object_storage = configuration->createObjectStorage(context_, /* is_readonly */true, std::nullopt);
+    FormatFactory::instance().checkFormatName(configuration->getFormat());
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
     configuration->check(context_);
 
     ColumnsDescription columns{columns_};
     std::string sample_path;
-    resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context_);
+    resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context_);
     configuration->check(context_);
 
     bool is_path_with_hive_partitioning = false;
@@ -432,7 +437,7 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
         zk_path,
         *queue_settings_,
         storage_metadata.getColumns(),
-        configuration_->format,
+        configuration_->getFormat(),
         context_,
         is_attach,
         log);
@@ -613,7 +618,7 @@ void StorageObjectStorageQueue::renameInMemory(const StorageID & new_table_id)
 
 bool StorageObjectStorageQueue::supportsSubsetOfColumns(const ContextPtr & context_) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context_, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context_, format_settings);
 }
 
 class ReadFromObjectStorageQueue : public SourceStepWithFilter

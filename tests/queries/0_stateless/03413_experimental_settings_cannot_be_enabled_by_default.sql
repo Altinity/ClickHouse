@@ -8,7 +8,11 @@ SELECT name, value FROM system.settings WHERE tier = 'Experimental' AND type = '
   'throw_on_unsupported_query_inside_transaction',
   'ai_function_throw_on_error',
   'ai_function_throw_on_quota_exceeded',
+<<<<<<< HEAD
   'time_series_prefer_recent_samples_table',
+=======
+  'allow_experimental_export_merge_tree_part',
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 -- turned ON for Altinity Antalya builds specifically
   'allow_experimental_iceberg_read_optimization'
 );

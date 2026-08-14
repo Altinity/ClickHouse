@@ -810,6 +810,7 @@ std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryP
 namespace
 {
 
+<<<<<<< HEAD
 class RewriteInToGlobalInVisitor : public InDepthQueryTreeVisitorWithContext<RewriteInToGlobalInVisitor>
 {
 public:
@@ -855,6 +856,166 @@ public:
 
         return true;
     }
+=======
+class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasColumnsVisitor>
+{
+    QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node) const
+    {
+        const auto * column_node = node->as<ColumnNode>();
+        if (!column_node || !column_node->hasExpression())
+            return nullptr;
+
+        const auto & column_source = column_node->getColumnSourceOrNull();
+        if (!column_source || column_source->getNodeType() == QueryTreeNodeType::JOIN
+                           || column_source->getNodeType() == QueryTreeNodeType::CROSS_JOIN
+                           || column_source->getNodeType() == QueryTreeNodeType::ARRAY_JOIN)
+            return nullptr;
+
+        auto column_expression = column_node->getExpression();
+        const auto & column_name = column_node->getColumnName();
+
+        if (!context->getSettingsRef()[Setting::enable_alias_marker])
+        {
+            column_expression->setAlias(column_name);
+            return column_expression;
+        }
+
+        String alias_id;
+        const auto & source_alias = column_source->getAlias();
+        if (!source_alias.empty())
+            alias_id = source_alias + "." + column_name;
+        else
+            alias_id = column_name;
+
+        if (auto * function_node = column_expression->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker")
+        {
+            auto & arguments = function_node->getArguments().getNodes();
+            if (arguments.size() == 2)
+                arguments[1] = std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>());
+
+            column_expression->setAlias(column_name);
+            return column_expression;
+        }
+
+        QueryTreeNodes arguments;
+        arguments.reserve(2);
+        arguments.emplace_back(std::move(column_expression));
+        arguments.emplace_back(std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>()));
+
+        auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
+        alias_marker_node->getArguments().getNodes() = std::move(arguments);
+        alias_marker_node->setAlias(column_name);
+        resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
+
+        return alias_marker_node;
+    }
+
+public:
+    explicit ReplaseAliasColumnsVisitor(ContextPtr context_) : context(std::move(context_)) {}
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        if (auto column_expression = getColumnNodeAliasExpression(node))
+            node = column_expression;
+    }
+
+private:
+    ContextPtr context;
+};
+
+using ColumnNameToColumnNodeMap = std::unordered_map<std::string, ColumnNodePtr>;
+
+ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNodePtr & table_expression_node, const ContextPtr & context)
+{
+    const TableNode * table_node = table_expression_node->as<TableNode>();
+    const TableFunctionNode * table_function_node = table_expression_node->as<TableFunctionNode>();
+    if (!table_node && !table_function_node)
+        return {};
+
+    // Rebuild per-column nodes (including ALIAS expressions) for the replacement table expression.
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals(VirtualsKind::All, VirtualsMaterializationPlace::All);
+    if (storage_snapshot->storage.supportsSubcolumns())
+        get_column_options.withSubcolumns();
+
+    auto column_names_and_types = storage_snapshot->getColumns(get_column_options);
+    const auto & columns_description = storage_snapshot->metadata->getColumns();
+
+    ColumnNameToColumnNodeMap column_name_to_node;
+    column_name_to_node.reserve(column_names_and_types.size());
+
+    for (const auto & column_name_and_type : column_names_and_types)
+    {
+        const auto & column_default = columns_description.getDefault(column_name_and_type.name);
+        if (column_default && column_default->kind == ColumnDefaultKind::Alias)
+        {
+            auto alias_expression = buildQueryTree(column_default->expression, context);
+            QueryAnalysisPass(table_expression_node).run(alias_expression, context);
+            if (!alias_expression->getResultType()->equals(*column_name_and_type.type))
+                alias_expression = buildCastFunction(alias_expression, column_name_and_type.type, context, true);
+
+            auto column_node = std::make_shared<ColumnNode>(column_name_and_type, std::move(alias_expression), table_expression_node);
+            column_name_to_node.emplace(column_name_and_type.name, std::move(column_node));
+        }
+        else
+        {
+            auto column_node = std::make_shared<ColumnNode>(column_name_and_type, table_expression_node);
+            column_name_to_node.emplace(column_name_and_type.name, std::move(column_node));
+        }
+    }
+
+    return column_name_to_node;
+}
+
+class ReplaceColumnNodesForTableExpressionVisitor : public InDepthQueryTreeVisitor<ReplaceColumnNodesForTableExpressionVisitor>
+{
+public:
+    ReplaceColumnNodesForTableExpressionVisitor(
+        const QueryTreeNodePtr & from_,
+        const QueryTreeNodePtr & to_,
+        const ColumnNameToColumnNodeMap & column_name_to_node_)
+        : from(from_), to(to_), column_name_to_node(column_name_to_node_)
+    {}
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * column_node = node->as<ColumnNode>();
+        if (!column_node)
+            return;
+
+        auto column_source = column_node->getColumnSourceOrNull();
+        if (!column_source)
+            return;
+
+        if (column_source.get() != from.get())
+            return;
+
+        auto it = column_name_to_node.find(column_node->getColumnName());
+        if (it != column_name_to_node.end())
+        {
+            auto replacement = it->second->clone();
+            replacement->setAlias(column_node->getAlias());
+            node = std::move(replacement);
+        }
+        else
+        {
+            // Preserve the column name but rebind its source to the replacement table expression.
+            column_node->setColumnSource(to);
+        }
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
+    {
+        auto child_node_type = child_node->getNodeType();
+        return !(child_node_type == QueryTreeNodeType::QUERY || child_node_type == QueryTreeNodeType::UNION);
+    }
+
+private:
+    QueryTreeNodePtr from;
+    QueryTreeNodePtr to;
+    const ColumnNameToColumnNodeMap & column_name_to_node;
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 };
 
 bool rewriteJoinToGlobalJoinIfNeeded(QueryTreeNodePtr join_tree)
@@ -912,6 +1073,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
         auto table_function_node = std::make_shared<TableFunctionNode>(remote_table_function_node.getFunctionName());
         table_function_node->getArgumentsNode() = remote_table_function_node.getArgumentsNode();
+        table_function_node->setSettingsChanges(remote_table_function_node.getSettingsChanges());
 
         if (table_expression_modifiers)
             table_function_node->setTableExpressionModifiers(*table_expression_modifiers);
@@ -967,10 +1129,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     {
         auto & query_node = query_tree_to_modify->as<QueryNode&>();
         if (query_node.hasWhere())
-        {
-            RewriteInToGlobalInVisitor visitor(query_context);
-            visitor.visit(query_node.getWhere());
-        }
+            rewriteInToGlobalIn(query_node.getWhere(), query_context);
 
         rewriteJoinToGlobalJoinIfNeeded(query_node.getJoinTreeNode());
     }
@@ -1546,7 +1705,8 @@ std::optional<QueryPipeline> StorageDistributed::distributedWrite(const ASTInser
     }
     if (auto src_storage_cluster = std::dynamic_pointer_cast<IStorageCluster>(src_storage))
     {
-        return distributedWriteFromClusterStorage(*src_storage_cluster, query, local_context);
+        if (!src_storage_cluster->getClusterName(local_context).empty())
+            return distributedWriteFromClusterStorage(*src_storage_cluster, query, local_context);
     }
 
     return {};

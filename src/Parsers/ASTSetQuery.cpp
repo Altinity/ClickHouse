@@ -132,10 +132,15 @@ void ASTSetQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & format, 
                 return true;
             }
 
+<<<<<<< HEAD
             /// Intrinsically secret regardless of engine: DataLakeStorageSettings is shared by the
             /// DataLakeCatalog database engine and the Iceberg*/Paimon*/DeltaLake* table engines.
             /// Matches the ungated check in hasSecretParts().
             if (DataLake::SETTINGS_TO_HIDE.contains(change.name))
+=======
+            if (DataLake::DATABASE_ENGINE_NAME == state.create_engine_name
+                    || DataLake::DATABASE_ALIAS_NAME == state.create_engine_name)
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
             {
                 ostr << " = " << DataLake::SETTINGS_TO_HIDE.at(change.name)(change.value);
                 return true;

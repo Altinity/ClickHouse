@@ -75,6 +75,7 @@ TEST_CONFIGS = [
         True,
         "pins azurite to fixed host port 10000 (Spark emulator mode); concurrent --dist=each workers collide on bind",
     ),
+<<<<<<< HEAD
     TC(
         "test_storage_delta/test.py",
         False,
@@ -93,6 +94,9 @@ TEST_CONFIGS = [
         "starts a Spark JVM + multi-node ClickHouse cluster per module fixture",
         dist_each_sequential=True,
     ),
+=======
+    TC("test_export_replicated_mt_partition_to_object_storage/", True, "ZooKeeper can't handle too many parallel requests"),
+>>>>>>> 5f5903e8e3b (Merge pull request #2146 from Altinity/feature/antalya-26.6/auto-grp-pr-1718)
 ]
 
 
