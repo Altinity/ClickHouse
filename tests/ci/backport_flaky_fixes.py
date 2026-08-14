@@ -7,6 +7,7 @@ previous run if it already exists for this base branch.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -172,28 +173,58 @@ def pr_backport_commits(repo: str, number: int):
     return out
 
 
+def write_step_summary(text: str) -> None:
+    """Append a line to GITHUB_STEP_SUMMARY when running in Actions."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def pr_url(repo: str, number: int) -> str:
+    return f"https://github.com/{repo}/pull/{number}"
+
+
 def update_pr(repo: str, number: int, title: str, body: str, labels: list, dry_run: bool) -> None:
+    url = pr_url(repo, number)
     if dry_run:
         print(f"DRY RUN: would update PR #{number} in {repo}:", file=sys.stderr)
         print(f"  title:  {title}", file=sys.stderr)
         print(f"  labels: {', '.join(labels)}", file=sys.stderr)
+        print(f"  url:    {url}", file=sys.stderr)
         return
 
     labels = existing_labels(repo, labels)
 
-    cmd = [
-        "gh", "pr", "edit", str(number),
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-    ]
-    for label in labels:
-        cmd += ["--add-label", label]
-
-    result = subprocess.run(cmd, text=True, capture_output=False)
+    # Use REST instead of `gh pr edit`: the latter queries GraphQL projectCards
+    # (Projects classic), which fails under GITHUB_TOKEN even with PullRequests:write.
+    payload = json.dumps({"title": title, "body": body})
+    result = subprocess.run(
+        ["gh", "api", "-X", "PATCH", f"repos/{repo}/pulls/{number}", "--input", "-"],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
     if result.returncode != 0:
-        print("gh pr edit failed", file=sys.stderr)
+        print(f"gh api PATCH pulls/{number} failed:\n{result.stderr or result.stdout}", file=sys.stderr)
         sys.exit(1)
+
+    if labels:
+        label_payload = json.dumps({"labels": labels})
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{number}/labels", "--input", "-"],
+            input=label_payload,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            print(f"Warning: could not add labels to PR #{number}:\n{result.stderr or result.stdout}", file=sys.stderr)
+
+    print(f"Updated PR: {url}", file=sys.stderr)
+    write_step_summary(f"- Updated [{title}]({url})")
 
 
 def create_pr(repo: str, branch: str, base: str, title: str, body: str, labels: list, dry_run: bool) -> None:
@@ -218,10 +249,19 @@ def create_pr(repo: str, branch: str, base: str, title: str, body: str, labels: 
     for label in labels:
         cmd += ["--label", label]
 
-    result = subprocess.run(cmd, text=True, capture_output=False)
+    result = subprocess.run(cmd, text=True, capture_output=True)
     if result.returncode != 0:
-        print("gh pr create failed", file=sys.stderr)
+        print(f"gh pr create failed:\n{result.stderr or result.stdout}", file=sys.stderr)
         sys.exit(1)
+
+    url = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+    if url:
+        print(url)
+        print(f"Opened PR: {url}", file=sys.stderr)
+        write_step_summary(f"- Opened [{title}]({url})")
+    else:
+        print("Opened PR (no URL in gh output)", file=sys.stderr)
+        write_step_summary(f"- Opened PR: {title}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -285,7 +325,10 @@ def main() -> None:
         prior_applied = [(sha, subject, None) for sha, subject in prior_commits]
         missing = [c for c in missing if c["sha"] not in prior_shas]
         if not missing:
+            url = pr_url(args.repo, reuse_number)
             print(f"PR #{reuse_number} already contains all missing commits. Nothing to do.", file=sys.stderr)
+            print(f"Existing PR: {url}", file=sys.stderr)
+            write_step_summary(f"- No new commits for `{base_branch}`; existing PR: [#{reuse_number}]({url})")
             return
 
     prefetch_upstream_objects([c["sha"] for c in missing])
@@ -326,7 +369,7 @@ def main() -> None:
         sys.exit(0)
 
     all_applied = prior_applied + applied
-    pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
+    pr_title = f"{base_branch.title()} - Automated backport of flaky-fix commits from upstream ({date_tag})"
     pr_body = build_pr_body(upstream_repo, all_applied, conflicted)
     pr_labels = labels_for_branch(base_branch)
 
