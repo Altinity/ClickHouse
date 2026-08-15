@@ -41,11 +41,16 @@ struct URI
         const std::string & uri_,
         bool allow_archive_path_syntax = false,
         bool keep_presigned_query_parameters = true,
-        S3UriStyle uri_style = S3UriStyle::AUTO);
+        S3UriStyle uri_style = S3UriStyle::AUTO,
+        bool enable_url_encoding = true);
     void addRegionToURI(const std::string & region);
 
     static void validateBucket(const std::string & bucket, const Poco::URI & uri);
     static void validateKey(const std::string & key, const Poco::URI & uri);
+
+    /// Returns true if 'region' string is an AWS S3 region
+    /// https://docs.aws.amazon.com/general/latest/gr/s3.html
+    static bool isAWSRegion(std::string_view region);
 
 private:
     bool tryInitPathStyle();
