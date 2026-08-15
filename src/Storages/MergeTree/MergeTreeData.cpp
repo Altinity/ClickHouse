@@ -6726,11 +6726,6 @@ void MergeTreeData::exportPartToTable(
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto source_metadata_ptr = getInMemoryMetadataPtr();
     auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
 
@@ -6791,13 +6786,8 @@ void MergeTreeData::exportPartToTable(
     ExportPartitionUtils::verifyExportSchemaCastable(
         source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
-    /// Iceberg partition compatibility is checked above; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
     if (!dest_storage->isDataLake())
-    {
-        if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
+        ExportPartitionUtils::assertPartitionKeyASTAreEqual(source_metadata_ptr, destination_metadata_ptr);
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
