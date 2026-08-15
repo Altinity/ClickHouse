@@ -14,6 +14,11 @@
 -- that column is not an input to the row-policy step and is only formed by the second step.
 
 SET input_format_parquet_use_native_reader_v3 = 1;
+-- Pin the analyzer: the routing assertions below check the supportedPrewhereColumns() guard,
+-- which lives in PlannerJoinTree and so only applies to the new analyzer. The old analyzer
+-- (InterpreterSelectQuery) routes every row policy to row_level_filter whenever the storage
+-- supports prewhere, so the expression-policy assertion would differ under enable_analyzer = 0.
+SET enable_analyzer = 1;
 
 DROP ROW POLICY IF EXISTS p_flag ON t_parquet_rls;
 DROP ROW POLICY IF EXISTS p_expr ON t_parquet_rls;
@@ -39,6 +44,17 @@ SELECT * FROM t_parquet_rls WHERE value = 'a' ORDER BY id;
 SELECT '-- row policy + explicit PREWHERE';
 SELECT * FROM t_parquet_rls PREWHERE value = 'a' ORDER BY id;
 
+-- Pin the routing the two-step case depends on: without this the queries above keep returning
+-- the right rows even if the policy stopped reaching the reader, and the coverage would be lost
+-- silently. Note LIKE is case-sensitive, so '%Filter column:%' does not match the reader's
+-- 'Row level filter column:'.
+SELECT '-- routing: bare-column policy reaches the reader as a row-level filter';
+SELECT
+    countIf(explain LIKE '%Row level filter column:%') = 1 AS row_policy_in_reader,
+    countIf(explain LIKE '%Filter column:%')           = 0 AS row_policy_not_external,
+    countIf(explain LIKE '%Prewhere filter column:%')  = 1 AS prewhere_in_reader
+FROM (EXPLAIN actions = 1 SELECT * FROM t_parquet_rls PREWHERE value = 'a');
+
 SELECT '-- row policy alone (single step)';
 SELECT * FROM t_parquet_rls ORDER BY id;
 
@@ -51,6 +67,13 @@ CREATE ROW POLICY p_expr ON t_parquet_rls FOR SELECT USING id <= 4 TO ALL;
 
 SELECT '-- expression policy + WHERE (policy routed to WHERE)';
 SELECT * FROM t_parquet_rls WHERE value = 'a' ORDER BY id;
+
+SELECT '-- routing: expression policy is diverted to WHERE, only prewhere reaches the reader';
+SELECT
+    countIf(explain LIKE '%Row level filter column:%') = 0 AS row_policy_not_in_reader,
+    countIf(explain LIKE '%Filter column:%')           = 1 AS row_policy_is_external_filter,
+    countIf(explain LIKE '%Prewhere filter column:%')  = 1 AS prewhere_in_reader
+FROM (EXPLAIN actions = 1 SELECT * FROM t_parquet_rls PREWHERE value = 'a');
 
 DROP ROW POLICY p_expr ON t_parquet_rls;
 DROP TABLE t_parquet_rls;
