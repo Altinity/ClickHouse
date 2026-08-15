@@ -1,3 +1,10 @@
+-- Disable parallel replicas for the whole test. Besides keeping the EXPLAIN plans
+-- deterministic (see the comment above the first EXPLAIN), the data queries below need it
+-- too: projection reading is skipped on remote replicas unless parallel_replicas_local_plan
+-- is set, which clickhouse-test randomizes, and force_optimize_projection = 1 then throws
+-- PROJECTION_NOT_USED.
+SET enable_parallel_replicas = 0;
+
 DROP TABLE IF EXISTS test_rls_projection;
 DROP ROW POLICY IF EXISTS rls_policy ON test_rls_projection;
 

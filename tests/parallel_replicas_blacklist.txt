@@ -528,8 +528,3 @@
 00443_optimize_final_vertical_merge
 01660_join_or_any
 01801_s3_cluster
-
-    PROJECTION_NOT_USED with force_optimize_projection: projectionsCommon.cpp only
-    reports projection support for the initiator when parallel_replicas_local_plan is
-    set, which clickhouse-test randomizes here (upstream forces it back to 1)
-03800_projection_row_policy_filter_column
