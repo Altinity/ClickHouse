@@ -361,6 +361,7 @@ static bool writeMetadataFiles(
     const DataFileWriteResultWithStats & delete_files,
     const DataFileWriteResultWithStats & data_files,
     ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
     ContextPtr context,
     FileNamesGenerator & filename_generator,
     const Iceberg::IcebergPathResolver & path_resolver,
@@ -508,6 +509,7 @@ static bool writeMetadataFiles(
                 DBMS_DEFAULT_BUFFER_SIZE,
                 context->getWriteSettings());
 
+<<<<<<< HEAD
             chassert(!per_entry_content_types.empty());
             generateManifestList(
                 path_resolver,
@@ -522,6 +524,28 @@ static bool writeMetadataFiles(
                 /* use_previous_snapshots */ true,
                 per_entry_content_types);
             buffer_manifest_list->finalize();
+=======
+            try
+            {
+                generateManifestList(
+                    path_resolver,
+                    metadata,
+                    object_storage,
+                    secondary_storages,
+                    context,
+                    manifest_entries,
+                    new_snapshot,
+                    manifest_entry_sizes,
+                    *buffer_manifest_list,
+                    content_type);
+                buffer_manifest_list->finalize();
+            }
+            catch (...)
+            {
+                cleanup();
+                throw;
+            }
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
         }
 
         std::string json_representation = stringifyJSON(metadata, 4);
@@ -650,6 +674,7 @@ void mutate(
     StorageMetadataPtr storage_metadata,
     StorageID storage_id,
     ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
     const DataLakeStorageSettings & data_lake_settings,
     const PersistentTableComponents & persistent_table_components,
     const String & write_format,
@@ -750,10 +775,39 @@ void mutate(
 
         if (mutation_files)
         {
+<<<<<<< HEAD
             if (!writeMetadataFiles(
                     mutation_files->delete_file,
                     mutation_files->data_file,
+=======
+            auto result_delete_files_metadata = writeMetadataFiles(
+                mutation_files->delete_file,
+                object_storage,
+                secondary_storages,
+                context,
+                filename_generator,
+                persistent_table_components.path_resolver,
+                data_lake_settings,
+                write_format,
+                catalog,
+                storage_id,
+                metadata,
+                partititon_spec,
+                static_cast<Int32>(partition_spec_id),
+                chunk_partitioner,
+                Iceberg::FileContentType::POSITION_DELETE,
+                std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
+                !mutation_files->data_file);
+            if (!result_delete_files_metadata)
+                continue;
+
+            if (mutation_files->data_file)
+            {
+                auto result_data_files_metadata = writeMetadataFiles(
+                    *mutation_files->data_file,
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
                     object_storage,
+                    secondary_storages,
                     context,
                     filename_generator,
                     persistent_table_components.path_resolver,

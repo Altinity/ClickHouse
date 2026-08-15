@@ -47,6 +47,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 
@@ -198,9 +199,42 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
             current_manifest_file_iterator = nullptr;
         }
 
+<<<<<<< HEAD
         /// Make sure a prefetch of the next matching manifest is in flight.
         schedulePrefetchIfPossible();
         if (!prefetched_manifest.has_value())
+=======
+        /// Find the next manifest file with matching content type.
+        while (manifest_file_index < data_snapshot->manifest_list_entries.size())
+        {
+            const auto & manifest_list_entry = data_snapshot->manifest_list_entries[manifest_file_index++];
+            if (manifest_list_entry.content_type != manifest_file_content_type)
+                continue;
+
+            auto manifest_file_cacheable_part = Iceberg::getManifestFile(
+                object_storage,
+                persistent_components,
+                local_context,
+                log,
+                manifest_list_entry.manifest_file_path,
+                manifest_list_entry.manifest_file_byte_size,
+                *secondary_storages);
+
+            current_manifest_file_iterator = Iceberg::ManifestFileIterator::create(
+                manifest_file_cacheable_part.deserializer,
+                manifest_list_entry.manifest_file_path,
+                persistent_components.path_resolver,
+                *persistent_components.schema_processor,
+                manifest_list_entry.added_sequence_number,
+                manifest_list_entry.added_snapshot_id,
+                local_context,
+                filter_dag,
+                table_snapshot->schema_id);
+            break;
+        }
+
+        if (!current_manifest_file_iterator)
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
             return std::nullopt;
 
         /// Take ownership of the in-flight prefetch: move it out of the member and reset the
@@ -272,7 +306,8 @@ SingleThreadIcebergKeysIterator::SingleThreadIcebergKeysIterator(
     const ActionsDAG * filter_dag_,
     Iceberg::TableStateSnapshotPtr table_snapshot_,
     Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-    PersistentTableComponents persistent_components_)
+    PersistentTableComponents persistent_components_,
+    std::shared_ptr<SecondaryStorages> secondary_storages_)
     : object_storage(object_storage_)
     , filter_dag(makeManifestFilterDag(filter_dag_, local_context_))
     , local_context(local_context_)
@@ -280,6 +315,7 @@ SingleThreadIcebergKeysIterator::SingleThreadIcebergKeysIterator(
     , data_snapshot(data_snapshot_)
     , persistent_components(persistent_components_)
     , log(getLogger("IcebergIterator"))
+    , secondary_storages(secondary_storages_)
     , manifest_file_content_type(manifest_file_content_type_)
     , prefetch_runner(threadPoolCallbackRunnerUnsafe<Iceberg::ManifestFileCacheableInfo>(
           getIOThreadPool().get(), DB::ThreadName::ICEBERG_ITERATOR))
@@ -295,7 +331,8 @@ IcebergIterator::IcebergIterator(
     IDataLakeMetadata::FileProgressCallback callback_,
     Iceberg::TableStateSnapshotPtr table_snapshot_,
     Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-    PersistentTableComponents persistent_components_)
+    PersistentTableComponents persistent_components_,
+    std::shared_ptr<SecondaryStorages> secondary_storages_)
     : logger(getLogger("IcebergIterator"))
     , object_storage(std::move(object_storage_))
     , local_context(local_context_)
@@ -307,12 +344,31 @@ IcebergIterator::IcebergIterator(
           object_storage,
           local_context_,
           Iceberg::ManifestFileContentType::DATA,
+<<<<<<< HEAD
           filter_dag_,
+=======
+          filter_dag.get(),
           table_snapshot_,
           data_snapshot_,
-          persistent_components_)
+          persistent_components_,
+          secondary_storages_)
+    , deletes_iterator(
+          object_storage,
+          local_context_,
+          Iceberg::ManifestFileContentType::DELETE,
+          filter_dag.get(),
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
+          table_snapshot_,
+          data_snapshot_,
+          persistent_components_,
+          secondary_storages_)
     , blocking_queue(100)
     , callback(std::move(callback_))
+<<<<<<< HEAD
+=======
+    , secondary_storages(secondary_storages_)
+    , table_schema_id(table_snapshot_->schema_id)
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 {
     /// Decoding any manifest reads settings from the context, so a missing one is fatal either way.
     if (!local_context)
@@ -469,12 +525,26 @@ ObjectInfoPtr IcebergIterator::next(size_t)
     Iceberg::ProcessedManifestFileEntryPtr manifest_file_entry;
     if (blocking_queue.pop(manifest_file_entry))
     {
+<<<<<<< HEAD
         IcebergDataObjectInfoPtr object_info
             = std::make_shared<IcebergDataObjectInfo>(
                 manifest_file_entry,
                 persistent_components.path_resolver.resolve(manifest_file_entry->parsed_entry->file_path_key),
                 table_state_snapshot->schema_id,
                 Iceberg::getIdentityPartitionColumnValues(*manifest_file_entry, *persistent_components.schema_processor));
+=======
+        const auto & raw_metadata_path = manifest_file_entry->parsed_entry->file_path_key.serialize();
+        auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
+            persistent_components.table_location, raw_metadata_path,
+            object_storage, *secondary_storages, local_context,
+            persistent_components.path_resolver);
+
+        IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(
+            manifest_file_entry, raw_metadata_path, table_state_snapshot->schema_id, storage_to_use, resolved_key);
+
+        object_info->info.requires_external_storage = (storage_to_use != object_storage);
+
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
         for (const auto & position_delete :
              defineDeletesSpan(manifest_file_entry, position_deletes_files, /* is_equality_delete */ false, logger))
         {
@@ -510,7 +580,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                     lower.has_value() ? lower->serialize() : "[no lower bound]",
                     upper.has_value() ? upper->serialize() : "[no upper bound]");
                 object_info->addPositionDeleteObject(
-                    position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
+                    position_delete, position_delete->parsed_entry->file_path_key.serialize());
             }
         }
 
@@ -527,7 +597,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
              defineDeletesSpan(manifest_file_entry, equality_deletes_files, /* is_equality_delete */ true, logger))
         {
             object_info->addEqualityDeleteObject(
-                equality_delete, persistent_components.path_resolver.resolve(equality_delete->parsed_entry->file_path_key));
+                equality_delete, equality_delete->parsed_entry->file_path_key.serialize());
         }
 
         if (!object_info->info.equality_deletes_objects.empty())
@@ -539,6 +609,52 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 object_info->info.data_object_file_path_key);
         }
 
+<<<<<<< HEAD
+=======
+        if (!object_info->info.requires_external_storage)
+        {
+            /// Flag the file if it resolves to a different storage/key (e.g. a same-bucket file outside the table prefix)
+            auto needs_absolute_path_protocol = [&](const String & file_path)
+            {
+                auto [del_storage, del_key] = resolveObjectStorageForPath(
+                    persistent_components.table_location, file_path, object_storage, *secondary_storages, local_context,
+                    persistent_components.path_resolver);
+                if (del_storage != object_storage)
+                    return true;
+                try
+                {
+                    auto [stripped_storage, stripped_key] = resolveObjectStorageForPath(
+                        persistent_components.table_location, SchemeAuthorityKey(file_path).key, object_storage,
+                        *secondary_storages, local_context, persistent_components.path_resolver);
+                    return stripped_storage != object_storage || stripped_key != del_key;
+                }
+                catch (const Exception &)
+                {
+                    /// The stripped key is unresolvable, so old workers cannot read it either.
+                    return true;
+                }
+            };
+            auto any_needs_protocol = [&](const auto & delete_objects)
+            {
+                for (const auto & del : delete_objects)
+                    if (needs_absolute_path_protocol(del.file_path))
+                        return true;
+                return false;
+            };
+
+            object_info->info.requires_external_storage =
+                any_needs_protocol(object_info->info.position_deletes_objects)
+                || any_needs_protocol(object_info->info.equality_deletes_objects);
+        }
+
+        object_info->relative_path_with_metadata.setFileMetaInfo(std::make_shared<DataFileMetaInfo>(
+                                    *persistent_components.schema_processor,
+                                    table_schema_id, /// current schema id to use current column names
+                                    manifest_file_entry->resolved_schema_id, /// file's schema id to interpret value_bounds bytes
+                                    manifest_file_entry->parsed_entry->columns_infos,
+                                    manifest_file_entry->parsed_entry->value_bounds));
+
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
 
         if (callback)

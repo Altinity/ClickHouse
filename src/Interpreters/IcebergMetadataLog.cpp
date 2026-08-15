@@ -107,13 +107,22 @@ void insertRowToLogTableImpl(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg metadata log table is not configured");
     }
 
+<<<<<<< HEAD
     iceberg_metadata_log->add([&](DB::IcebergMetadataLogElement & element)
     {
         element = DB::IcebergMetadataLogElement{
+=======
+    String normalized_table_path = table_path;
+    while (normalized_table_path.size() > 1 && normalized_table_path.back() == '/')
+        normalized_table_path.pop_back();
+
+    iceberg_metadata_log->add(
+        DB::IcebergMetadataLogElement{
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
             .current_time = spec.tv_sec,
             .query_id = local_context->getCurrentQueryId(),
             .content_type = row_log_level,
-            .table_path = table_path,
+            .table_path = normalized_table_path,
             .file_path = file_path.serialize(),
             .metadata_content = row,
             .row_in_file = row_in_file,

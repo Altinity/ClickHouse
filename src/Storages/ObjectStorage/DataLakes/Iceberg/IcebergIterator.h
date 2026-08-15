@@ -28,6 +28,11 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+<<<<<<< HEAD
+=======
+#include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
+#include <Storages/ObjectStorage/Utils.h>
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
 namespace DB
 {
@@ -45,7 +50,8 @@ public:
         const ActionsDAG * filter_dag_,
         TableStateSnapshotPtr table_snapshot_,
         IcebergDataSnapshotPtr data_snapshot_,
-        PersistentTableComponents persistent_components);
+        PersistentTableComponents persistent_components,
+        std::shared_ptr<SecondaryStorages> secondary_storages_);
 
     ~SingleThreadIcebergKeysIterator();
 
@@ -61,6 +67,8 @@ private:
     Iceberg::IcebergDataSnapshotPtr data_snapshot;
     PersistentTableComponents persistent_components;
     LoggerPtr log;
+
+    std::shared_ptr<SecondaryStorages> secondary_storages;
 
     size_t manifest_file_index = 0;
     Iceberg::ManifestIteratorPtr current_manifest_file_iterator;
@@ -88,7 +96,12 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::TableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
+<<<<<<< HEAD
         Iceberg::PersistentTableComponents persistent_components);
+=======
+        Iceberg::PersistentTableComponents persistent_components_,
+        std::shared_ptr<SecondaryStorages> secondary_storages_);
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 
     ObjectInfoPtr next(size_t) override;
 
@@ -119,6 +132,11 @@ private:
     std::exception_ptr deletes_exception TSA_GUARDED_BY(deletes_mutex);
     std::exception_ptr exception;
     std::mutex exception_mutex;
+<<<<<<< HEAD
+=======
+    std::shared_ptr<SecondaryStorages> secondary_storages;  // Sometimes data or manifests can be located on another storage
+    Int32 table_schema_id;
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 };
 }
 

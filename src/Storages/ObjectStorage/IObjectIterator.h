@@ -55,12 +55,21 @@ struct ObjectInfo
 
     FileBucketInfoPtr file_bucket_info;
 
+<<<<<<< HEAD
     /// Lazy materialization: if set, read only these rows of the file.
     /// Sorted absolute row indexes within the file, see FormatFilterInfo::rows_to_read.
     std::shared_ptr<const PaddedPODArray<UInt64>> rows_to_read;
 
     String getIdentifier(bool include_file_bucket_info = true) const;
     String getIdentifierForPath(const String & path, bool include_file_bucket_info = true) const;
+=======
+    /// Polymorphic copy: preserves the dynamic type (e.g. `IcebergDataObjectInfo` with its
+    /// resolved storage and metadata path) where a plain copy construction would slice it.
+    virtual std::shared_ptr<ObjectInfo> clone() const { return std::make_shared<ObjectInfo>(*this); }
+
+    String getIdentifier() const;
+    String getIdentifierForPath(const String & path) const;
+>>>>>>> 2d42c9523e2 (Merge pull request #2154 from Altinity/feature/antalya-26.6/ClickHouse-ClickHouse-pr-90740)
 };
 
 using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
