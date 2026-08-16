@@ -13,6 +13,7 @@
 #include <Parsers/ASTExpressionList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
@@ -59,15 +60,32 @@ BlockIO InterpreterOptimizeQuery::execute()
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "OPTIMIZE MANIFEST is incompatible with FINAL, PARTITION, DEDUPLICATE, CLEANUP, and DRY RUN options");
 
 #if USE_AVRO
-        auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(table.get());
-        if (!object_storage_table)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
+        IDataLakeMetadata * external_metadata = nullptr;
+        std::shared_ptr<DataLake::ICatalog> catalog;
 
-        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_table->getExternalMetadata(getContext()));
+        auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(table.get());
+        auto * object_storage_cluster_table = dynamic_cast<StorageObjectStorageCluster *>(table.get());
+
+        if (object_storage_table)
+        {
+            external_metadata = object_storage_table->getExternalMetadata(getContext());
+            catalog = object_storage_table->getCatalog();
+        }
+        else if (object_storage_cluster_table)
+        {
+            external_metadata = object_storage_cluster_table->getExternalMetadata(getContext());
+            catalog = object_storage_cluster_table->getCatalog();
+        }
+        else
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
+        }
+
+        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(external_metadata);
         if (!iceberg_metadata)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
 
-        iceberg_metadata->optimizeManifestFiles(metadata_snapshot, getContext(), object_storage_table->getCatalog(), table_id);
+        iceberg_metadata->optimizeManifestFiles(metadata_snapshot, getContext(), catalog, table_id);
         return {};
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "OPTIMIZE MANIFEST is only supported for Iceberg tables");
