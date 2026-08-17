@@ -341,7 +341,7 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
     if (!client_id.empty())
     {
         auto current = access_token.get();
-        if (!current || update_token || access_token->isExpired())
+        if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveAccessToken()));
             current = access_token.get();
