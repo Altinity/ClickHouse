@@ -1064,10 +1064,6 @@ namespace
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        /// Partition-key columns must keep a stable identity across the conversion, regardless of
-        /// `allow_lossy_cast`, so that `PARTITION BY` keeps selecting the same values after export.
-        /// `ignore_extra_source_columns_by_name` matches columns by name (see `makeConvertingActions`
-        /// above), so look the source column up by name instead of assuming the same position.
         if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name)
         {
             std::unordered_map<String, size_t> source_positions_by_name;
@@ -1082,7 +1078,7 @@ namespace
 
                 const auto source_it = source_positions_by_name.find(destination_column.name);
                 if (source_it == source_positions_by_name.end())
-                    continue; /// Reported as THERE_IS_NO_COLUMN by verifyExportColumnCastsAreSafe below.
+                    continue;
 
                 verifyPartitionKeyColumn(
                     source_columns[source_it->second], destination_column, source_it->second, destination_storage_id);
