@@ -195,7 +195,9 @@ void MergeTreeDataPartWriterWide::addStreams(
             max_compress_block_size = settings.max_compress_block_size;
 
         WriteSettings query_write_settings = settings.query_write_settings;
-        query_write_settings.use_adaptive_write_buffer = settings.use_adaptive_write_buffer_for_dynamic_subcolumns && ISerialization::isDynamicSubcolumn(substream_path, substream_path.size());
+        query_write_settings.use_adaptive_write_buffer =
+            (settings.min_columns_to_activate_adaptive_write_buffer && columns_list.size() >= settings.min_columns_to_activate_adaptive_write_buffer)
+            || (settings.use_adaptive_write_buffer_for_dynamic_subcolumns && ISerialization::isDynamicSubcolumn(substream_path, substream_path.size()));
         query_write_settings.adaptive_write_buffer_initial_size = settings.adaptive_write_buffer_initial_size;
 
         fiu_do_on(FailPoints::wide_part_writer_fail_in_add_streams,

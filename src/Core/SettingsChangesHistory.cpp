@@ -907,6 +907,10 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     static std::once_flag initialized_flag;
     std::call_once(initialized_flag, [&]
     {
+        addSettingsChanges(merge_tree_settings_changes_history, "25.8.15.10001",
+        {
+            {"min_columns_to_activate_adaptive_write_buffer", 500, 500, "New setting"}
+        });
         addSettingsChanges(merge_tree_settings_changes_history, "25.8",
         {
             {"merge_max_dynamic_subcolumns_in_wide_part", "auto", "auto", "Add a new setting to limit number of dynamic subcolumns in Wide part after merge regardless the parameters specified in the data type"},

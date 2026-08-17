@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
+# Tags: no-fasttest, no-ubsan
 # no-fasttest: needs pyarrow to write the GeoParquet file.
+# no-ubsan: memory tracking isn't reliably enforced in the standalone UBSan build (jemalloc off), so the oversized reserve isn't rejected. See Altinity/ClickHouse#2049.
 
 # Regression test for an untracked-allocation DoS in the Parquet V3 GeoParquet (WKB) reader.
 # The WKB reader took an element count straight off the wire and `reserve`d a std::vector of that

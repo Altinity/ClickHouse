@@ -1,4 +1,5 @@
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueIFileMetadata.h>
+#include <Storages/ObjectStorageQueue/ObjectStorageQueueMetadata.h>
 #include <Common/SipHash.h>
 #include <Common/CurrentThread.h>
 #include <Common/DNSResolver.h>
@@ -30,11 +31,6 @@ namespace ErrorCodes
 
 namespace
 {
-    zkutil::ZooKeeperPtr getZooKeeper()
-    {
-        return Context::getGlobalContextInstance()->getZooKeeper();
-    }
-
     time_t now()
     {
         return std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -126,6 +122,7 @@ ObjectStorageQueueIFileMetadata::NodeMetadata ObjectStorageQueueIFileMetadata::N
 
 ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     const std::string & path_,
+    const std::string & zookeeper_name_,
     const std::string & processing_node_path_,
     const std::string & processed_node_path_,
     const std::string & failed_node_path_,
@@ -135,6 +132,7 @@ ObjectStorageQueueIFileMetadata::ObjectStorageQueueIFileMetadata(
     bool use_persistent_processing_nodes_,
     LoggerPtr log_)
     : path(path_)
+    , zookeeper_name(zookeeper_name_)
     , node_name(getNodeName(path_))
     , file_status(file_status_)
     , max_loading_retries(max_loading_retries_)
@@ -168,7 +166,7 @@ ObjectStorageQueueIFileMetadata::~ObjectStorageQueueIFileMetadata()
         LOG_TEST(log, "Removing processing node in destructor for file: {}", path);
         try
         {
-            auto zk_client = getZooKeeper();
+            auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
 
             Coordination::Requests requests;
             requests.push_back(zkutil::makeCheckRequest(processing_node_id_path, processing_id_version.value()));
@@ -350,7 +348,7 @@ void ObjectStorageQueueIFileMetadata::resetProcessing()
     prepareResetProcessingRequests(requests);
 
     Coordination::Responses responses;
-    const auto zk_client = getZooKeeper();
+    const auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
     const auto code = zk_client->tryMulti(requests, responses);
     if (code == Coordination::Error::ZOK)
         return;
@@ -493,7 +491,7 @@ void ObjectStorageQueueIFileMetadata::prepareFailedRequestsImpl(
     /// the number of already done retries in trySetProcessing.
 
     auto retrieable_failed_node_path = failed_node_path + ".retriable";
-    auto zk_client = getZooKeeper();
+    auto zk_client = ObjectStorageQueueMetadata::getZooKeeper(log, zookeeper_name);
 
     /// Extract the number of already done retries from node_hash.retriable node if it exists.
     Coordination::Stat retriable_failed_node_stat;

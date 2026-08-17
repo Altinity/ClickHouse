@@ -83,6 +83,10 @@
   reason: KNOWN - Unstable upstream
 - name: 03644_object_storage_correlated_subqueries
   reason: KNOWN - Unstable in upstream 25.8.
+- name: 04299_constraint_subst_correlated_subquery_root
+  reason: 'KNOWN: Issue #2051'
+  check_types:
+  - ParallelReplicas
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
@@ -202,6 +206,11 @@
 - name: test_async_load_databases/test.py::test_materialized_views_replicated
   reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
   message: 'DATABASE_ALREADY_EXISTS'
+- name: 03579_create_table_populate_from_s3
+  reason: 'KNOWN: Regression from #1875 (backport of upstream #104881); upstream fix pending in ClickHouse#109266.'
+  message: 'Not found column __table1.'
+  check_types:
+  - DatabaseReplicated
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.

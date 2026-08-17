@@ -54,6 +54,7 @@ public:
 
     explicit ObjectStorageQueueIFileMetadata(
         const std::string & path_,
+        const std::string & zookeeper_name_,
         const std::string & processing_node_path_,
         const std::string & processed_node_path_,
         const std::string & failed_node_path_,
@@ -143,6 +144,7 @@ protected:
     void prepareFailedRequestsImpl(Coordination::Requests & requests, bool retriable);
 
     const std::string path;
+    const std::string zookeeper_name;
     const std::string node_name;
     const FileStatusPtr file_status;
     const size_t max_loading_retries;

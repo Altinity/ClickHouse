@@ -514,6 +514,17 @@ protected:
 
     /// A flag, used to distinguish between user query and internal query to a database engine (MaterializedPostgreSQL).
     bool is_internal_query = false;
+    /// True when this context belongs to the inner query of an expanded view.
+    /// Positional arguments inside views must be resolved even on remote/secondary nodes where
+    /// enable_positional_arguments would otherwise be skipped (views are expanded on remote nodes,
+    /// not on the initiator).
+    bool is_view_inner_query = false;
+    /// True when positional arguments in the outer query have already been resolved by the
+    /// initiator node. Set by distributed/parallel-replicas local plan builders to prevent
+    /// double-resolution. Unlike disabling enable_positional_arguments, this flag is a context
+    /// field and does not propagate through settings copies (e.g. getSQLSecurityOverriddenContext),
+    /// so view-inner queries on the same node are unaffected.
+    bool positional_arguments_already_resolved = false;
     /// Set for queries created internally by the server for DDL replication (ON CLUSTER, DatabaseReplicated)
     /// and internal backup coordination.
     /// Unlike query_kind == SECONDARY_QUERY (which comes from the client and can be spoofed),
@@ -1457,6 +1468,12 @@ public:
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
+
+    bool isViewInnerQuery() const { return is_view_inner_query; }
+    void setIsViewInnerQuery(bool value) { is_view_inner_query = value; }
+
+    bool isPositionalArgumentsAlreadyResolved() const { return positional_arguments_already_resolved; }
+    void setPositionalArgumentsAlreadyResolved(bool value) { positional_arguments_already_resolved = value; }
 
     bool isDDLOrOnClusterInternal() const { return is_ddl_or_on_cluster_internal; }
     void setDDLOrOnClusterInternal(bool value) { is_ddl_or_on_cluster_internal = value; }

@@ -46,10 +46,11 @@ std::pair<QueryPlanPtr, bool> createLocalPlanForParallelReplicas(
     /// and we can produce query, inconsistent with remote plans.
     auto select_query_options = SelectQueryOptions(processed_stage).ignoreASTOptimizations();
 
-    /// For Analyzer, identifier in GROUP BY/ORDER BY/LIMIT BY lists has been resolved to
-    /// ConstantNode in QueryTree if it is an alias of a constant, so we should not replace
-    /// ConstantNode with ProjectionNode again(https://github.com/ClickHouse/ClickHouse/issues/62289).
-    new_context->setSetting("enable_positional_arguments", Field(false));
+    /// Positional arguments in the outer query were already resolved by the initiator.
+    /// Use a context flag instead of disabling enable_positional_arguments so that
+    /// view-inner queries on this node are still processed correctly.
+    /// See https://github.com/ClickHouse/ClickHouse/issues/62289.
+    new_context->setPositionalArgumentsAlreadyResolved(true);
     new_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(0));
     auto interpreter = InterpreterSelectQueryAnalyzer(query_ast, new_context, select_query_options);
     query_plan = std::make_unique<QueryPlan>(std::move(interpreter).extractQueryPlan());
