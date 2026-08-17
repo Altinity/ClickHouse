@@ -39,6 +39,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.6.1.20001.altinityantalya",
+        {
+            {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
+        });
+
         addSettingsChanges(settings_changes_history, "26.6",
         {
             {"analyzer_compatibility_apply_final_to_all_joined_tables", true, false, "Fixed a bug in the analyzer where FINAL on the left-most table of a JOIN was incorrectly applied to the other joined tables as well. previous_value=true so `compatibility` with versions before 26.6 restores the old behavior."},
@@ -95,8 +100,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_retry_initial_backoff_seconds", 5, 5, "New setting for exponential back-off between failed part export retries in an export partition task"},
             {"export_merge_tree_partition_retry_max_backoff_seconds", 300, 300, "New setting capping the exponential back-off between failed part export retries in an export partition task"},
             {"export_merge_tree_partition_max_retries", 3, 3, "Obsolete and ignored: export partition tasks now retry retryable failures until the task timeout and fail immediately on non-retryable errors, instead of using a fixed retry budget"},
-            {"object_storage_cluster_fallback_if_empty", false, false, "New setting"},
-            {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
         });
 
         addSettingsChanges(settings_changes_history, "26.5",
