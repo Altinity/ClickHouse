@@ -26,10 +26,12 @@ namespace Iceberg
 namespace
 {
 
-/// ~year 2286 as DateTime64(6) microseconds. Spec-correct Iceberg `timestamp` bounds
-/// for realistic dates stay below this; nanosecond ticks for dates after ~1970-04
-/// sit well above it (2024 is ~1.7e18).
-constexpr Int64 microseconds_implausible_threshold = 10'000'000'000'000'000LL;
+/// 1e16 µs is ~year 2286. That is not an Iceberg `timestamp` max: Spark sentinels
+/// such as `9999-12-31` (`~2.53e17` µs) and ClickHouse `DateTime64` max
+/// `2299-12-31` (`~1.04e16` µs) are spec-correct microseconds above this.
+/// 1e18 ns is ~year 2001; customer 2026 ns bounds are `~1.76e18`.
+constexpr Int64 microseconds_ambiguous_threshold = 10'000'000'000'000'000LL;
+constexpr Int64 nanoseconds_lower_threshold = 1'000'000'000'000'000'000LL;
 constexpr Int64 nanoseconds_per_microsecond = 1000;
 
 bool magnitudeExceeds(Int64 value, Int64 threshold)
@@ -57,12 +59,11 @@ Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
     return microseconds;
 }
 
-/// Iceberg timestamps are 8-byte little-endian (spec Appendix D). `insertData`
-/// memcpy's native DateTime64 ticks, which is correct when the bound scale
-/// matches the column. Some writers store nanosecond stats on Iceberg
-/// `timestamp` (`DateTime64(6)`); treating those as microseconds yields dates
-/// around year 2299 and over-prunes. Rescale those bounds; if they are still
-/// implausible, fail open (`nullopt`) so min/max pruning is skipped.
+/// Iceberg timestamps are 8-byte little-endian (spec Appendix D).
+/// Some writers store nanosecond stats on Iceberg `timestamp` (`DateTime64(6)`).
+/// Convert only in a true nanosecond band (`|ticks| > 1e18`). Between 1e16 and
+/// 1e18 the value may be far-future microseconds (do not convert; fail open so
+/// min/max pruning is skipped). `|ticks| <= 1e16` is kept as microseconds.
 std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
 {
     if (str.size() != sizeof(Int64))
@@ -71,11 +72,12 @@ std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str
     Int64 unscaled = unalignedLoadLittleEndian<Int64>(str.data());
     const UInt32 scale = getDecimalScale(type);
 
-    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_implausible_threshold))
+    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_ambiguous_threshold))
     {
-        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
-        if (magnitudeExceeds(unscaled, microseconds_implausible_threshold))
+        if (!magnitudeExceeds(unscaled, nanoseconds_lower_threshold))
             return std::nullopt;
+
+        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
     }
 
     return DecimalField<DateTime64>(DateTime64(unscaled), scale);
