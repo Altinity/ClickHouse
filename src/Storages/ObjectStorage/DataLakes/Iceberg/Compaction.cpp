@@ -401,7 +401,9 @@ static void writeMetadataFiles(
     auto log = getLogger("IcebergCompaction");
 
     ColumnsDescription columns_description = ColumnsDescription::fromNamesAndTypes(sample_block_->getNamesAndTypes());
-    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(table_path, columns_description, nullptr, nullptr, context);
+    const auto format_version = plan.initial_metadata_object->getValue<UInt64>(Iceberg::f_format_version);
+    auto [metadata_object, metadata_object_str] = createEmptyMetadataFile(
+        table_path, columns_description, nullptr, nullptr, context, format_version);
 
     auto current_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
     Poco::JSON::Object::Ptr current_schema;
