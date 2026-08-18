@@ -4,6 +4,7 @@
 #include <cctype>
 #include <limits>
 
+#include <base/unaligned.h>
 #include <Columns/IColumn.h>
 #include <Common/Exception.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -21,6 +22,66 @@ extern const int BAD_ARGUMENTS;
 
 namespace Iceberg
 {
+
+namespace
+{
+
+/// ~year 2286 as DateTime64(6) microseconds. Spec-correct Iceberg `timestamp` bounds
+/// for realistic dates stay below this; nanosecond ticks for dates after ~1970-04
+/// sit well above it (2024 is ~1.7e18).
+constexpr Int64 microseconds_implausible_threshold = 10'000'000'000'000'000LL;
+constexpr Int64 nanoseconds_per_microsecond = 1000;
+
+bool magnitudeExceeds(Int64 value, Int64 threshold)
+{
+    return value > threshold || value < -threshold;
+}
+
+/// Convert ns ticks to us ticks without shrinking a [lower, upper] range.
+Int64 nanosecondsToMicrosecondsForBound(Int64 nanoseconds, bool lower_bound)
+{
+    Int64 microseconds = nanoseconds / nanoseconds_per_microsecond;
+    if (nanoseconds % nanoseconds_per_microsecond == 0)
+        return microseconds;
+
+    /// C++ integer division truncates toward zero.
+    if (lower_bound)
+    {
+        if (nanoseconds < 0)
+            --microseconds;
+    }
+    else if (nanoseconds > 0)
+    {
+        ++microseconds;
+    }
+    return microseconds;
+}
+
+/// Iceberg timestamps are 8-byte little-endian (spec Appendix D). `insertData`
+/// memcpy's native DateTime64 ticks, which is correct when the bound scale
+/// matches the column. Some writers store nanosecond stats on Iceberg
+/// `timestamp` (`DateTime64(6)`); treating those as microseconds yields dates
+/// around year 2299 and over-prunes. Rescale those bounds; if they are still
+/// implausible, fail open (`nullopt`) so min/max pruning is skipped.
+std::optional<Field> deserializeDateTime64FromBinaryRepr(const std::string & str, const IDataType & type, bool lower_bound)
+{
+    if (str.size() != sizeof(Int64))
+        return std::nullopt;
+
+    Int64 unscaled = unalignedLoadLittleEndian<Int64>(str.data());
+    const UInt32 scale = getDecimalScale(type);
+
+    if (scale == 6 && magnitudeExceeds(unscaled, microseconds_implausible_threshold))
+    {
+        unscaled = nanosecondsToMicrosecondsForBound(unscaled, lower_bound);
+        if (magnitudeExceeds(unscaled, microseconds_implausible_threshold))
+            return std::nullopt;
+    }
+
+    return DecimalField<DateTime64>(DateTime64(unscaled), scale);
+}
+
+}
 
 Int64 fieldToInt64(const Field & value, std::string_view context, std::string_view arg_name)
 {
@@ -104,6 +165,9 @@ std::vector<Int64> fieldToInt64Array(const Field & value, std::string_view conte
 std::optional<Field> deserializeFieldFromBinaryRepr(const std::string & str, DataTypePtr expected_type, bool lower_bound)
 {
     auto non_nullable_type = removeNullable(expected_type);
+    if (WhichDataType(non_nullable_type).isDateTime64())
+        return deserializeDateTime64FromBinaryRepr(str, *non_nullable_type, lower_bound);
+
     auto column = non_nullable_type->createColumn();
     if (WhichDataType(non_nullable_type).isDecimal())
     {

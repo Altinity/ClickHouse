@@ -7,6 +7,7 @@
 #include <Columns/ColumnsDateTime.h>
 #include <Common/DateLUTImpl.h>
 #include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <Common/logger_useful.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -23,6 +24,37 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 using namespace DB;
+
+namespace
+{
+
+/// Avro does not map timestamp-nanos to DateTime64, so identity partition values for
+/// Iceberg `timestamp_ns` / `timestamptz_ns` (and similarly `Time64`) arrive as Int64.
+/// `KeyCondition` compares DateTime64/Time64 predicates as DecimalField with a scale,
+/// so wrap the raw ticks before `mayBeTrueInRange`. Calendar transforms stay Int64.
+void wrapIntegerPartitionValuesAsDateTime64(Row & partition_values, const DataTypes & data_types)
+{
+    const size_t size = std::min(partition_values.size(), data_types.size());
+    for (size_t i = 0; i < size; ++i)
+    {
+        auto & field = partition_values[i];
+        if (field.isNull() || field.getType() != Field::Types::Int64)
+            continue;
+
+        auto type = removeNullable(data_types[i]);
+        WhichDataType which(type);
+        if (which.isDateTime64())
+        {
+            field = DecimalField<DateTime64>(DateTime64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+        else if (which.isTime64())
+        {
+            field = DecimalField<Time64>(Time64(field.safeGet<Int64>()), getDecimalScale(*type));
+        }
+    }
+}
+
+}
 
 namespace DB::Iceberg
 {
@@ -149,7 +181,9 @@ PruningReturnStatus ManifestFilesPruner::canBePruned(
 {
     if (partition_key_condition.has_value())
     {
-        const auto & partition_value = entry->parsed_entry->partition_key_value;
+        Row partition_value = entry->parsed_entry->partition_key_value;
+        wrapIntegerPartitionValuesAsDateTime64(partition_value, partition_key->data_types);
+
         std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
         for (auto & field : index_value)
         {

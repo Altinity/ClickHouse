@@ -9,6 +9,7 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -537,8 +538,24 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
         case TypeIndex::Date32:
             return {"date", true};
         case TypeIndex::DateTime:
-        case TypeIndex::DateTime64:
             return {"timestamp", true};
+        case TypeIndex::DateTime64:
+        {
+            /// Iceberg `timestamp` is microseconds; `timestamp_ns` is nanoseconds (v3).
+            /// Mapping all DateTime64 to `timestamp` while dumping unscaled ticks made
+            /// ClickHouse-written DateTime64(9) recreate ns-bounds-on-us-schema over-pruning.
+            const auto scale = getDecimalScale(*type);
+            if (scale == 9)
+            {
+                auto date_time64 = std::static_pointer_cast<const DataTypeDateTime64>(type);
+                if (date_time64->hasExplicitTimeZone())
+                    return {Iceberg::f_timestamptz_ns, true};
+                return {Iceberg::f_timestamp_ns, true};
+            }
+            if (scale <= 6)
+                return {Iceberg::f_timestamp, true};
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+        }
         case TypeIndex::Time:
             return {"time", true};
         case TypeIndex::Time64:
