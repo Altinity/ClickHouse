@@ -7,6 +7,7 @@ Spark 3.5 + Iceberg 1.8.1 and pyiceberg 0.11 cannot write Iceberg v3
 
 import json
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import avro.datafile
@@ -206,6 +207,52 @@ def check_minmax_ns_bounds_on_timestamp_schema(node, table, column, pruned_files
     assert node.query(count_query, settings=PRUNE_ON) == "2\n"
 
 
+def _utc_datetime_to_micros(dt):
+    """Integer microseconds from Unix epoch. Do not use float `timestamp` * 1e6."""
+    delta = dt - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+# Spec-correct Iceberg `timestamp` microseconds that sit in the ambiguous band
+# (1e16, 1e18]: converting them as nanoseconds over-prunes.
+SPARK_TIMESTAMP_SENTINEL_US = _utc_datetime_to_micros(
+    datetime(9999, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+)
+DATETIME64_MAX_US = _utc_datetime_to_micros(
+    datetime(2299, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+)
+
+
+def check_minmax_far_future_us_upper_bound(node, table, column, pruned_files):
+    """Iceberg `timestamp` with a far-future microsecond *upper* bound must not over-prune.
+
+    Lower bound stays a real 2024 microsecond value. If the decoder treats the
+    upper bound as nanoseconds, max becomes ~1978, the [min, max] range inverts,
+    and `WHERE col <= toDateTime64('2024-03-15 ...', 6)` drops the file.
+    """
+    type_name = node.query(
+        f"SELECT toTypeName({column}) FROM {table} LIMIT 1",
+        settings=PRUNE_OFF,
+    )
+    assert "DateTime64(6" in type_name, type_name
+    assert "DateTime64(9" not in type_name, type_name
+
+    ids = node.query(f"SELECT id FROM {table} ORDER BY id", settings=PRUNE_OFF)
+    assert ids == "1\n2\n3\n4\n"
+    micros = node.query(
+        f"SELECT toUnixTimestamp64Micro({column}) FROM {table} WHERE id = 1",
+        settings=PRUNE_OFF,
+    ).strip()
+    assert micros == "1704067200123456", micros
+
+    le_after_row2 = datetime64_literal(
+        "2024-03-15 12:00:00.000001000", scale=6, timezone=None
+    )
+    query = f"SELECT id FROM {table} WHERE {column} <= {le_after_row2} ORDER BY id"
+    assert pruned_files(query) == 0
+    assert node.query(query, settings=PRUNE_ON) == "1\n2\n"
+
+
 def _scale_bound_bytes(raw, factor=1000):
     if not isinstance(raw, (bytes, bytearray)) or len(raw) != 8:
         return raw
@@ -315,6 +362,110 @@ def patch_iceberg_timestamp_bounds_us_to_ns(
             tmp.unlink()
         scaled_total += scaled
     assert scaled_total > 0, f"no timestamp min/max bounds scaled under {table_location}"
+
+
+def _set_bound_bytes(raw, value):
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) != 8:
+        return raw
+    return struct.pack("<q", value)
+
+
+def set_timestamp_upper_bounds(obj, micros, field_ids=(1, 2)):
+    """Replace Iceberg timestamp upper bounds with `micros`; leave lower bounds alone."""
+    field_ids = set(field_ids)
+    updated = 0
+    if isinstance(obj, dict):
+        bounds = obj.get("upper_bounds")
+        if isinstance(bounds, dict):
+            for bound_key, bound_value in list(bounds.items()):
+                try:
+                    column_id = int(bound_key)
+                except (TypeError, ValueError):
+                    continue
+                if column_id in field_ids:
+                    new_value = _set_bound_bytes(bound_value, micros)
+                    if new_value != bound_value:
+                        bounds[bound_key] = new_value
+                        updated += 1
+        elif isinstance(bounds, list):
+            for item in bounds:
+                if not isinstance(item, dict):
+                    continue
+                bound_key = item.get("key", item.get("field_id"))
+                try:
+                    column_id = int(bound_key)
+                except (TypeError, ValueError):
+                    continue
+                if column_id in field_ids and "value" in item:
+                    new_value = _set_bound_bytes(item["value"], micros)
+                    if new_value != item["value"]:
+                        item["value"] = new_value
+                        updated += 1
+        for value_key, value in obj.items():
+            if value_key == "upper_bounds":
+                continue
+            updated += set_timestamp_upper_bounds(value, micros, field_ids)
+    elif isinstance(obj, list):
+        for value in obj:
+            updated += set_timestamp_upper_bounds(value, micros, field_ids)
+    return updated
+
+
+def rewrite_avro_set_timestamp_upper_bounds(
+    src: Path, dst: Path, micros, old=None, new=None, field_ids=(1, 2)
+):
+    with open(src, "rb") as handle:
+        reader = avro.datafile.DataFileReader(handle, avro.io.DatumReader())
+        schema = reader.datum_reader.writers_schema
+        codec = reader.codec
+        meta = dict(reader.meta)
+        records = []
+        updated = 0
+        for record in reader:
+            if old is not None and new is not None:
+                record = _deep_replace(record, old, new)
+            updated += set_timestamp_upper_bounds(record, micros, field_ids)
+            records.append(record)
+        reader.close()
+
+    with open(dst, "wb") as handle:
+        writer = avro.datafile.DataFileWriter(handle, avro.io.DatumWriter(), schema, codec=codec)
+        for key, value in meta.items():
+            key_str = key.decode("utf-8") if isinstance(key, (bytes, bytearray)) else key
+            if key_str.startswith("avro."):
+                continue
+            text = _meta_text(value)
+            if old is not None and new is not None:
+                text = text.replace(old, new)
+            writer.set_meta(key_str, text.encode("utf-8"))
+        for record in records:
+            writer.append(record)
+        writer.close()
+    return updated
+
+
+def patch_iceberg_timestamp_upper_bounds(
+    table_location: Path, micros, old_prefix=None, new_prefix=None, field_ids=(1, 2)
+):
+    """Keep Iceberg `timestamp` / parquet microseconds, but set upper bounds to `micros`."""
+    meta_dir = table_location / "metadata"
+    if old_prefix is not None and new_prefix is not None:
+        for metadata_file in meta_dir.glob("*.metadata.json"):
+            text = metadata_file.read_text().replace(old_prefix, new_prefix)
+            metadata_file.write_text(text)
+
+    updated_total = 0
+    for avro_file in list(meta_dir.glob("*.avro")):
+        tmp = avro_file.with_suffix(".avro.tmp")
+        updated = rewrite_avro_set_timestamp_upper_bounds(
+            avro_file, tmp, micros, old_prefix, new_prefix, field_ids=field_ids
+        )
+        if updated or old_prefix is not None:
+            tmp.replace(avro_file)
+        else:
+            tmp.unlink()
+        updated_total += updated
+    assert updated_total > 0, f"no timestamp upper bounds patched under {table_location}"
 
 
 def upgrade_long_to_iceberg_timestamp(obj, iceberg_type="timestamp_ns"):

@@ -21,16 +21,20 @@ from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import IntegerType, LongType, TimestampType
 
 from helpers.iceberg_timestamp_ns import (
+    DATETIME64_MAX_US,
     FILTER_LITERAL_IDS,
     FILTER_LITERALS,
     PRUNE_OFF,
     PRUNE_ON,
     ROWS,
+    SPARK_TIMESTAMP_SENTINEL_US,
+    check_minmax_far_future_us_upper_bound,
     check_minmax_ns_bounds_on_timestamp_schema,
     check_ns_pruning,
     check_ns_pruning_datetime64_microseconds,
     patch_iceberg_table_long_to_timestamp_ns,
     patch_iceberg_timestamp_bounds_us_to_ns,
+    patch_iceberg_timestamp_upper_bounds,
 )
 from helpers.iceberg_utils import check_validity_and_get_prunned_files_general
 
@@ -72,8 +76,8 @@ def _arrow_timestamp_row(ts_ns, row_id):
     )
 
 
-def _create_timestamp_table_with_ns_bounds(started_cluster, table_name):
-    """Iceberg v2 `timestamp` (microseconds) whose manifest min/max bytes are nanoseconds."""
+def _create_timestamp_table(started_cluster, table_name, patch):
+    """Iceberg v2 `timestamp` (microseconds parquet) with a custom manifest-bound patch."""
     work = Path(tempfile.mkdtemp(prefix="iceberg_ns_bounds_"))
     try:
         catalog = SqlCatalog(
@@ -102,7 +106,7 @@ def _create_timestamp_table_with_ns_bounds(started_cluster, table_name):
         s3_key = f"iceberg_ns_bounds_{uuid.uuid4().hex}"
         new_prefix = f"s3://{started_cluster.minio_bucket}/{s3_key}"
 
-        patch_iceberg_timestamp_bounds_us_to_ns(table_location, old_prefix, new_prefix)
+        patch(table_location, old_prefix, new_prefix)
 
         uploader = started_cluster.default_s3_uploader
         for path in table_location.rglob("*"):
@@ -113,6 +117,23 @@ def _create_timestamp_table_with_ns_bounds(started_cluster, table_name):
         return f"{s3_key}/"
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def _create_timestamp_table_with_ns_bounds(started_cluster, table_name):
+    """Iceberg v2 `timestamp` (microseconds) whose manifest min/max bytes are nanoseconds."""
+    return _create_timestamp_table(
+        started_cluster, table_name, patch_iceberg_timestamp_bounds_us_to_ns
+    )
+
+
+def _create_timestamp_table_with_upper_bound_us(started_cluster, table_name, micros):
+    """Iceberg v2 `timestamp` whose upper bounds are spec-correct far-future microseconds."""
+    def patch(table_location, old_prefix, new_prefix):
+        patch_iceberg_timestamp_upper_bounds(
+            table_location, micros, old_prefix, new_prefix
+        )
+
+    return _create_timestamp_table(started_cluster, table_name, patch)
 
 
 def _create_v3_table(
@@ -242,3 +263,31 @@ def test_minmax_pruning_ns_bounds_on_timestamp_schema(started_cluster_iceberg_no
         )
 
     check_minmax_ns_bounds_on_timestamp_schema(node, table, "value", pruned_files)
+
+
+@pytest.mark.parametrize(
+    "upper_bound_us",
+    [SPARK_TIMESTAMP_SENTINEL_US, DATETIME64_MAX_US],
+    ids=["spark_9999_12_31", "datetime64_2299_12_31"],
+)
+def test_minmax_pruning_far_future_us_upper_bound_on_timestamp_schema(
+    started_cluster_iceberg_no_spark, upper_bound_us
+):
+    """Spec-correct far-future Iceberg `timestamp` upper bounds must not be treated as ns."""
+    node = started_cluster_iceberg_no_spark.instances["node1"]
+    s3_filename = _create_timestamp_table_with_upper_bound_us(
+        started_cluster_iceberg_no_spark, "minmax_far_future_us", upper_bound_us
+    )
+    table = _iceberg_table(s3_filename)
+
+    def pruned_files(select_expression):
+        return check_validity_and_get_prunned_files_general(
+            node,
+            "minmax_far_future_us",
+            PRUNE_OFF,
+            PRUNE_ON,
+            "IcebergMinMaxIndexPrunedFiles",
+            select_expression,
+        )
+
+    check_minmax_far_future_us_upper_bound(node, table, "value", pruned_files)
