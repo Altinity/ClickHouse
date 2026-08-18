@@ -207,6 +207,7 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
         makeColumn<DataTypeInt32>("id"),
         makeColumn<DataTypeInt32>("year"),
         makeColumn<DataTypeString>("payload"),
+        makeColumn<DataTypeString>("extra"),
     };
     const ColumnsWithTypeAndName destination_columns = {
         makeColumn<DataTypeString>("payload"),
@@ -231,6 +232,50 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
         destination_columns,
         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name,
         destination_storage_id));
+}
+
+TEST(ExportColumnCastsTest, MatchingByNameNoOpWithoutExtraSourceColumns)
+{
+    const ColumnsWithTypeAndName source_columns = {
+        makeColumn<DataTypeInt32>("id"),
+        makeColumn<DataTypeInt32>("year"),
+        makeColumn<DataTypeString>("payload"),
+    };
+    const ColumnsWithTypeAndName reordered_destination_columns = {
+        makeColumn<DataTypeString>("payload"),
+        makeColumn<DataTypeInt64>("year"),
+        makeColumn<DataTypeInt64>("id"),
+    };
+    const StorageID destination_storage_id{"test", "destination"};
+
+    for (const auto mode :
+        {MergeTreePartExportSchemaMismatchMode::strict,
+         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position,
+         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name})
+    {
+        expectExceptionCode(
+            [&]
+            {
+                ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+                    source_columns, reordered_destination_columns, mode, destination_storage_id);
+            },
+            ErrorCodes::INCOMPATIBLE_COLUMNS);
+    }
+
+    const ColumnsWithTypeAndName same_order_destination_columns = {
+        makeColumn<DataTypeInt64>("id"),
+        makeColumn<DataTypeInt64>("year"),
+        makeColumn<DataTypeString>("payload"),
+    };
+
+    for (const auto mode :
+        {MergeTreePartExportSchemaMismatchMode::strict,
+         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position,
+         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name})
+    {
+        EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+            source_columns, same_order_destination_columns, mode, destination_storage_id));
+    }
 }
 
 TEST(ExportColumnCastsTest, RejectsLossyCastAfterMatchingByName)

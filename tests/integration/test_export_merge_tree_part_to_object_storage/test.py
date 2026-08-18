@@ -989,7 +989,7 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
     "mismatch_mode,expected_error",
     [
         pytest.param("ignore_extra_source_columns_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
-        pytest.param("ignore_extra_source_columns_by_name", "THERE_IS_NO_COLUMN", id="by-name"),
+        pytest.param("ignore_extra_source_columns_by_name", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
     ],
 )
 def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(

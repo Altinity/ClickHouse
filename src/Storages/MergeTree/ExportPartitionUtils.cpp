@@ -972,7 +972,10 @@ namespace
         MergeTreePartExportSchemaMismatchMode schema_mismatch_mode,
         const StorageID & destination_storage_id)
     {
-        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name)
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
+
+        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+            && src_has_extra_columns)
         {
             std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
             source_columns_by_name.reserve(source_columns.size());
@@ -1030,10 +1033,11 @@ namespace
         /// `makeConvertingActions`, in both modes.
         const auto schema_mismatch_mode =
             context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
         const bool ignore_extra_source_columns_by_position =
             schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
-        if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
+        if (ignore_extra_source_columns_by_position && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartitionUtils"),
                 "Source has {} columns while destination has {} columns, "
@@ -1044,10 +1048,14 @@ namespace
             source_columns.resize(destination_columns.size());
         }
 
+        const bool ignore_extra_source_columns_by_name =
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+            && src_has_extra_columns;
+
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+            ignore_extra_source_columns_by_name
                 ? ActionsDAG::MatchColumnsMode::Name
                 : ActionsDAG::MatchColumnsMode::Position,
             context);
@@ -1066,7 +1074,7 @@ namespace
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name)
+        if (ignore_extra_source_columns_by_name)
         {
             std::unordered_map<String, size_t> source_positions_by_name;
             source_positions_by_name.reserve(source_columns.size());

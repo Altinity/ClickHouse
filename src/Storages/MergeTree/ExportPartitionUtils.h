@@ -104,8 +104,10 @@ namespace ExportPartitionUtils
     /// source with more columns than the destination is allowed: the extra trailing
     /// source columns (by position) are excluded from the comparison here, matching
     /// what `ExportPartTask::addExportConvertingActions` drops from the actual data.
-    /// If the mode is `ignore_extra_source_columns_by_name`, destination columns are
-    /// matched to source columns by their exact names and may appear in a different order.
+    /// If the mode is `ignore_extra_source_columns_by_name` and the source has more columns
+    /// than the destination, destination columns are matched to source columns by their exact
+    /// names and may appear in a different order. With an equal (or smaller) column count this
+    /// mode has no extra source columns to ignore and behaves exactly like `strict`.
     ///
     /// Throws BAD_ARGUMENTS on any violation.
     void verifyExportSchemaCastable(

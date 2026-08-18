@@ -142,7 +142,7 @@ Notes:
 - **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` allows the source `MergeTree` table to have more columns than the destination table and how destination columns are matched in that case. Possible values:
   - `strict` - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`, and the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
   - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
-  - `ignore_extra_source_columns_by_name` - the source may have more columns than the destination. Every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be reordered and additional source columns may occur in any position. Unmatched source columns are not exported. If a destination column is absent from the source, including when it was renamed, the export throws `THERE_IS_NO_COLUMN`; there is no positional fallback. Use `ignore_extra_source_columns_by_position` when renamed columns should be matched by position.
+  - `ignore_extra_source_columns_by_name` - only takes effect when the source has more columns than the destination. In that case, every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be reordered and the extra source columns may occur in any position. Unmatched source columns are not exported. If a destination column is absent from the source, including when it was renamed, the export throws `THERE_IS_NO_COLUMN`; there is no positional fallback. When the source does **not** have more columns than the destination, this mode behaves exactly like `strict` - columns are matched positionally, and a column-count mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Use `ignore_extra_source_columns_by_position` when renamed columns should be matched by position.
 
   Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
 
@@ -150,8 +150,8 @@ Notes:
 
   - In `strict` mode, a different number of source and destination columns throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
   - In `ignore_extra_source_columns_by_position` mode, the destination having more columns than the source throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
-  - In `ignore_extra_source_columns_by_name` mode, a destination column which is absent from the source throws `THERE_IS_NO_COLUMN`.
-  - Renaming a destination column in `ignore_extra_source_columns_by_name` mode throws `THERE_IS_NO_COLUMN`; the mode does not fall back to positional matching.
+  - In `ignore_extra_source_columns_by_name` mode, when the source has more columns than the destination, a destination column absent from the source (including a renamed one) throws `THERE_IS_NO_COLUMN`; the mode does not fall back to positional matching in that case.
+  - In `ignore_extra_source_columns_by_name` mode, when the source does not have more columns than the destination, a column-count mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`, same as `strict`.
   - After columns have been matched successfully, a cast rejected by the export type-safety check throws `INCOMPATIBLE_COLUMNS`.
 
 ## Examples

@@ -7632,7 +7632,7 @@ Controls whether `EXPORT PART`/`EXPORT PARTITION` allows the source `MergeTree` 
 Possible values:
 - `strict` (default) - columns are matched positionally and the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
 - `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
-- `ignore_extra_source_columns_by_name` - every destination column is matched to a source column with the same exact, case-sensitive name. Destination columns may be reordered and additional source columns may occur in any position. A destination column absent from the source throws `THERE_IS_NO_COLUMN`; there is no positional fallback.
+- `ignore_extra_source_columns_by_name` - the source may have more columns than the destination. If it does, every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be reordered and the extra source columns may occur in any position; a destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback. When the source does not have more columns than the destination, this mode behaves exactly like `strict`: columns are matched positionally, and a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
 )", 0) \
     \
     /* ####################################################### */ \

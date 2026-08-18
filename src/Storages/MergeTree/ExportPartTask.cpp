@@ -128,8 +128,9 @@ namespace
             schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
+        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        if (ignore_extra_source_columns_by_position && source_columns.size() > destination_columns.size())
+        if (ignore_extra_source_columns_by_position && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartTask"),
                 "Source has {} columns while destination has {} columns, "
@@ -158,10 +159,14 @@ namespace
             source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         }
 
+        const bool ignore_extra_source_columns_by_name =
+            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+            && src_has_extra_columns;
+
         auto dag = ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
+            ignore_extra_source_columns_by_name
                 ? ActionsDAG::MatchColumnsMode::Name
                 : ActionsDAG::MatchColumnsMode::Position,
             local_context);
