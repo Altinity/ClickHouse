@@ -1082,27 +1082,16 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
-@pytest.mark.parametrize(
-    "source_columns,values",
-    [
-        pytest.param("id Int32, year Int32", "(1, 2020), (2, 2020)", id="same-column-count"),
-        pytest.param(
-            "id Int32, year Int32, extra String",
-            "(1, 2020, 'first'), (2, 2020, 'second')",
-            id="extra-source-column",
-        ),
-    ],
-)
-def test_export_part_match_by_name_requires_every_destination_column(cluster, source_columns, values):
+def test_export_part_match_by_name_requires_every_destination_column(cluster):
     node = cluster.instances["node1"]
     sfx = unique_suffix()
     mt = f"mt_match_by_name_missing_{sfx}"
     iceberg = f"iceberg_match_by_name_missing_{sfx}"
 
-    make_mt(node, mt, source_columns, "year")
+    make_mt(node, mt, "id Int32, year Int32, extra String", "year")
     make_iceberg_s3(node, iceberg, "renamed_id Int32, year Int32", "year")
 
-    node.query(f"INSERT INTO {mt} VALUES {values}")
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'first'), (2, 2020, 'second')")
     part_2020 = get_part(node, mt, "2020")
 
     error = node.query_and_get_error(
@@ -1116,6 +1105,32 @@ def test_export_part_match_by_name_requires_every_destination_column(cluster, so
     )
 
     assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_match_by_name_falls_back_to_positional_without_extra_source_columns(cluster):
+    # No extra source column here, so `ignore_extra_source_columns_by_name` behaves like `strict`.
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_match_by_name_fallback_{sfx}"
+    iceberg = f"iceberg_match_by_name_fallback_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32", "year")
+    make_iceberg_s3(node, iceberg, "renamed_id Int32, year Int32", "year")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
+    part_2020 = get_part(node, mt, "2020")
+
+    export_part(
+        node, mt, part_2020, iceberg,
+        extra_settings="export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_name'",
+    )
+    wait_for_export_part(node, mt, part_2020)
+
+    result = node.query(f"SELECT renamed_id, year FROM {iceberg} ORDER BY renamed_id").strip()
+    assert result == "1\t2020\n2\t2020", f"Unexpected data:\n{result}"
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
