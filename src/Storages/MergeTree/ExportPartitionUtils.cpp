@@ -938,19 +938,21 @@ namespace
         const ColumnWithTypeAndName & source_column,
         const ColumnWithTypeAndName & destination_column,
         size_t position,
-        const StorageID & destination_storage_id)
+        const StorageID & destination_storage_id,
+        bool match_by_name)
     {
         if (source_column.name != destination_column.name)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export to {}: partition key column '{}' is at position {} in the source "
                 "table, but the destination's column at that position is named '{}'. EXPORT "
-                "PART/PARTITION matches columns by position, so partition key columns must be "
-                "declared at the same position in both tables.",
+                "PART/PARTITION {} so partition key columns must be declared {} in both tables.",
                 destination_storage_id.getFullTableName(),
                 source_column.name,
                 position,
-                destination_column.name);
+                destination_column.name,
+                match_by_name ? "matches columns by name" : "matches columns by position",
+                match_by_name ? "with the same name" : "at the same position");
 
         if (!haveSameTupleElementLayout(source_column.type, destination_column.type))
             throw Exception(
@@ -1081,7 +1083,8 @@ namespace
                     continue;
 
                 verifyPartitionKeyColumn(
-                    source_columns[source_it->second], destination_column, source_it->second, destination_storage_id);
+                    source_columns[source_it->second], destination_column, source_it->second, destination_storage_id,
+                    /*match_by_name=*/ true);
             }
         }
         else
@@ -1089,7 +1092,8 @@ namespace
             const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
             for (size_t i = 0; i < num_columns; ++i)
                 if (partition_key_owner_columns.contains(source_columns[i].name))
-                    verifyPartitionKeyColumn(source_columns[i], destination_columns[i], i, destination_storage_id);
+                    verifyPartitionKeyColumn(source_columns[i], destination_columns[i], i, destination_storage_id,
+                        /*match_by_name=*/ false);
         }
 
         /// Lossy casts may silently change values, so reject them unless the user opts in.
