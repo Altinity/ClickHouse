@@ -15,7 +15,7 @@ $CLICKHOUSE_CLIENT -q "ATTACH TABLE t_merge_tmp_attach_full UUID '${UUID}' (dumm
 
 # A short ATTACH (stored metadata) of a legitimate definition still works.
 # `send_logs_level=fatal` suppresses the "full table definition is not recommended" warning.
-$CLICKHOUSE_CLIENT --send_logs_level fatal -q "ATTACH TABLE t_merge_tmp_attach_full UUID '${UUID}' (dummy UInt8) ENGINE = Merge('system', '^one$');"
+$CLICKHOUSE_CLIENT --allow_repeated_settings --send_logs_level=fatal -q "ATTACH TABLE t_merge_tmp_attach_full UUID '${UUID}' (dummy UInt8) ENGINE = Merge('system', '^one$');"
 $CLICKHOUSE_CLIENT -q "SELECT * FROM t_merge_tmp_attach_full;"
 $CLICKHOUSE_CLIENT -q "DETACH TABLE t_merge_tmp_attach_full;"
 $CLICKHOUSE_CLIENT -q "ATTACH TABLE t_merge_tmp_attach_full;"
