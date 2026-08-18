@@ -218,13 +218,7 @@ Converts
     localtable as t
   ON s3.key == t.key
 
-to (object_storage_cluster_join_mode='local')
-
-  SELECT s3.c1, s3.c2, s3.key
-  FROM
-    s3Cluster(...) AS s3
-
-or (object_storage_cluster_join_mode='global')
+to (object_storage_cluster_join_mode='global')
 
   SELECT s3.c1, s3.c2, t.c3
   FROM
@@ -241,89 +235,8 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
     switch (object_storage_cluster_join_mode)
     {
-    case ObjectStorageClusterJoinMode::LOCAL:
-    {
-        if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
-
-        auto info = getQueryTreeInfo(query_info.query_tree, context);
-
-        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
-        {
-            auto modified_query_tree = query_info.query_tree->clone();
-
-            SearcherVisitor left_table_expression_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, 1, context);
-            left_table_expression_searcher.visit(modified_query_tree);
-            auto table_function_node = left_table_expression_searcher.getNode();
-            if (!table_function_node)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find left table function node");
-
-            QueryTreeNodePtr query_tree_distributed;
-
-            auto & query_node = modified_query_tree->as<QueryNode &>();
-
-            if (info.has_join)
-            {
-                auto join_node = query_node.getJoinTree();
-                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
-            }
-            else if (info.has_cross_join)
-            {
-                SearcherVisitor join_searcher({QueryTreeNodeType::CROSS_JOIN}, 1, context);
-                join_searcher.visit(modified_query_tree);
-                auto cross_join_node = join_searcher.getNode();
-                if (!cross_join_node)
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
-                // CrossJoinNode contains vector of nodes. 0 is left expression, always exists.
-                query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
-            }
-
-            // Find add used columns from table function to make proper projection list
-            // Need to do before changing WHERE condition
-            CollectUsedColumnsForSourceVisitor collector(table_function_node, context);
-            collector.visit(modified_query_tree);
-            const auto & columns = collector.getColumns();
-
-            if (columns.empty())
-            {
-                auto column_nodes_to_select = std::make_shared<ListNode>();
-                column_nodes_to_select->getNodes().reserve(1);
-                column_nodes_to_select->getNodes().emplace_back(std::make_shared<ConstantNode>(1));
-                query_node.getProjectionNode() = column_nodes_to_select;
-            }
-            else
-            {
-                query_node.resolveProjectionColumns(columns);
-                auto column_nodes_to_select = std::make_shared<ListNode>();
-                column_nodes_to_select->getNodes().reserve(columns.size());
-                for (auto & column : columns)
-                    column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
-                query_node.getProjectionNode() = column_nodes_to_select;
-            }
-
-            if (info.has_local_columns_in_where)
-            {
-                if (query_node.getPrewhere())
-                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), table_function_node, context);
-                if (query_node.getWhere())
-                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), table_function_node, context);
-            }
-
-            query_node.getOrderByNode() = std::make_shared<ListNode>();
-            query_node.getGroupByNode() = std::make_shared<ListNode>();
-
-            if (query_tree_distributed)
-            {
-                // Left only table function to send on cluster nodes
-                modified_query_tree = modified_query_tree->cloneAndReplace(query_node.getJoinTree(), query_tree_distributed);
-            }
-
-            query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
-        }
-
+    case ObjectStorageClusterJoinMode::LOCAL: // Legacy mode, equal to 'allow'
         return;
-    }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
         auto info = getQueryTreeInfo(query_info.query_tree, context);
@@ -690,22 +603,15 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
 }
 
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
-    ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
+    ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & /*query_info*/) const
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
 
-    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::ALLOW)
+    if (object_storage_cluster_join_mode == ObjectStorageClusterJoinMode::GLOBAL)
     {
         if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
-
-        if (object_storage_cluster_join_mode == ObjectStorageClusterJoinMode::LOCAL)
-        {
-            auto info = getQueryTreeInfo(query_info.query_tree, context);
-            if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
-                return QueryProcessingStage::Enum::FetchColumns;
-        }
+                "object_storage_cluster_join_mode=='global' is not supported without allow_experimental_analyzer=true");
     }
 
     /// Initiator executes query on remote node.
