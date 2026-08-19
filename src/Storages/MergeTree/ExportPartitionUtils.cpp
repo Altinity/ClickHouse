@@ -944,20 +944,6 @@ namespace
                 destination_column.type->getName());
     }
 
-    void 
-    (
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata)
-    {
-        constexpr auto query_to_string = [] (const ASTPtr & ast)
-        {
-            return ast ? ast->formatWithSecretsOneLine() : "";
-        };
-
-        if (query_to_string(source_metadata->getPartitionKeyAST()) != query_to_string(destination_metadata->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
-
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
