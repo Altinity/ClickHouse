@@ -1,4 +1,6 @@
--- Tags: long, no-random-settings
+-- Tags: long, no-random-settings, no-old-analyzer
+-- no-old-analyzer: the old analyzer rejects arrayJoin() in JOIN ON outright, and the plan step
+-- under test (query_plan_use_new_logical_join_step) only exists on the analyzer path.
 -- Regression test for oncall 62315: `arrayJoin()` inside JOIN ON was
 -- executed twice in the new logical-join-step plan, producing rowcount
 -- multiplied by |array| an extra time. Every query pins

@@ -28,11 +28,11 @@ check_reader() {
     local kernel="$1"
     echo "--- allow_experimental_delta_kernel_rs = ${kernel} ---"
 
-    ${CLICKHOUSE_LOCAL} --allow_experimental_delta_kernel_rs="${kernel}" -q \
+    ${CLICKHOUSE_LOCAL} --allow_experimental_delta_kernel_rs="${kernel}" --allow_local_data_lakes=1 -q \
         "SELECT * FROM deltaLakeLocal('${TABLE_DIR}', 'RawBLOB') LIMIT 100 FORMAT TabSeparated" 2>&1 \
         | grep -q 'PATH_ACCESS_DENIED' && echo "GOT ACCESS DENIED ERROR"
 
-    ${CLICKHOUSE_LOCAL} --allow_experimental_delta_kernel_rs="${kernel}" -q \
+    ${CLICKHOUSE_LOCAL} --allow_experimental_delta_kernel_rs="${kernel}" --allow_local_data_lakes=1 -q \
         "SELECT * FROM deltaLakeLocal('${TABLE_DIR}', 'RawBLOB') LIMIT 100 FORMAT TabSeparated" 2>&1 \
         | grep -q 'TOP_SECRET_CONTENTS' && echo "LEAKED" || echo "NO LEAK"
 }

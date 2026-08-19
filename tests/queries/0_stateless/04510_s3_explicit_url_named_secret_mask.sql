@@ -1,5 +1,7 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-replicated-database
 -- no-fasttest: the S3 table engine is not available in the fast test build.
+-- no-replicated-database: the final assertion dumps every query_log row of the database in order,
+-- and a Replicated database logs a second row per DDL from the internal DDL-worker execution.
 
 -- session_token, the Google ADC secrets (google_adc_client_secret, google_adc_refresh_token) and
 -- the extra_credentials assume-role material (external_id) passed to the explicit-url S3 form must
