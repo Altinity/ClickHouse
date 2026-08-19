@@ -14,23 +14,22 @@
 #include <Core/Block.h>
 #include <Core/Settings.h>
 #include <DataTypes/Utils.h>
-#include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
+#include <Storages/ColumnsDescription.h>
+#include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTExpressionList.h>
-#include <Functions/FunctionFactory.h>
 #include <Functions/CastOverloadResolver.h>
+#include <Functions/IFunction.h>
 #include <Interpreters/castColumn.h>
-#include <DataTypes/DataTypeString.h>
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #endif
 
 namespace ProfileEvents
@@ -567,123 +566,6 @@ namespace ExportPartitionUtils
 
 namespace
 {
-    /// Terms of a given partition key expression.
-    /// E.g. for "PARTITION BY (toYYYYMM(ts), country)", the terms are "toYYYYMM(ts)" and "country".
-    struct PartitionTerm
-    {
-        String column;
-        String function;
-        std::optional<Int64> argument;
-        std::optional<String> time_zone;
-
-        bool operator==(const PartitionTerm & other) const
-        {
-            return column == other.column && function == other.function && argument == other.argument
-                && time_zone == other.time_zone;
-        }
-    };
-
-    std::vector<PartitionTerm> parsePartitionTerms(const ASTPtr & partition_key_ast)
-    {
-        std::vector<PartitionTerm> terms;
-        if (!partition_key_ast)
-            return terms;
-
-        auto parse_one = [&](const ASTPtr & element)
-        {
-            if (const auto * ident = element->as<ASTIdentifier>())
-            {
-                terms.push_back({ident->name(), "", std::nullopt, std::nullopt});
-                return;
-            }
-
-            const auto * func = element->as<ASTFunction>();
-            if (!func)
-                return;
-
-            PartitionTerm term;
-            term.function = func->name;
-            for (const auto & child : func->children)
-            {
-                const auto * expression_list = child->as<ASTExpressionList>();
-                if (!expression_list)
-                    continue;
-                /// A nested function such as toYYYYMM(toDate(ts)) is not unwrapped: it yields no column and
-                /// stays unmatched, as the monotonicity proof only handles a single function of a single column.
-                for (const auto & arg : expression_list->children)
-                {
-                    if (const auto * id = arg->as<ASTIdentifier>())
-                        term.column = id->name();
-                    /// Integer literal is the bucket/truncate width; a string literal is a date transform's timezone.
-                    /// In theory, the string literal could mean a different thing, but among the partition expressions iceberg supports
-                    /// time_zone is the only option
-                    else if (const auto * lit = arg->as<ASTLiteral>())
-                    {
-                        if (lit->value.getType() == Field::Types::String)
-                            term.time_zone = lit->value.safeGet<String>();
-                        else
-                            term.argument = lit->value.safeGet<Int64>();
-                    }
-                }
-            }
-            terms.push_back(std::move(term));
-        };
-
-        if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
-        {
-            for (const auto & child : func->children)
-                if (const auto * expression_list = child->as<ASTExpressionList>())
-                    for (const auto & element : expression_list->children)
-                        parse_one(element);
-        }
-        else
-            parse_one(partition_key_ast);
-
-        return terms;
-    }
-
-#if USE_AVRO
-    std::vector<PartitionTerm> parseIcebergPartitionTerms(
-        const Poco::JSON::Object::Ptr & partition_spec_json,
-        const std::unordered_map<Int32, String> & source_id_to_column_name,
-        const String & partition_timezone)
-    {
-        auto source_id_to_name = [&](Int32 id) -> String
-        {
-            auto it = source_id_to_column_name.find(id);
-            return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
-        };
-
-        const auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
-        const size_t spec_size = spec_fields ? spec_fields->size() : 0;
-
-        std::vector<PartitionTerm> terms;
-        terms.reserve(spec_size);
-        for (UInt32 i = 0; i < spec_size; ++i)
-        {
-            const auto field = spec_fields->getObject(i);
-            const auto dest_transform = field->getValue<String>(Iceberg::f_transform);
-            const String column = source_id_to_name(field->getValue<Int32>(Iceberg::f_source_id));
-            const auto transform_and_argument = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
-
-            if (!transform_and_argument)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition to Iceberg table: destination field on column '{}' uses transform "
-                    "'{}', which has no ClickHouse equivalent.", column, dest_transform);
-
-            /// A bare source column parses to an empty function name, which is what Iceberg calls identity.
-            terms.push_back({
-                column,
-                transform_and_argument->transform_name == "identity" ? "" : transform_and_argument->transform_name,
-                transform_and_argument->argument
-                    ? std::optional<Int64>(static_cast<Int64>(*transform_and_argument->argument)) : std::nullopt,
-                transform_and_argument->time_zone});
-        }
-
-        return terms;
-    }
-#endif
-
     /// Two types are interchangeable for partitioning only if their canonical names match. IDataType::equals
     /// is too weak here: it deliberately treats DateTime and DateTime64 with different time zones as equal,
     /// since they are interchangeable for INSERT, but a time zone changes what a temporal transform returns,
@@ -693,21 +575,51 @@ namespace
         return lhs->getName() == rhs->getName();
     }
 
-    /// asserts that the source column maps to a single destination partition by checking the monotonicity on the min/max ranges
-    void verifyColumnMapsToSinglePartition(
-        const PartitionTerm & term,
+    /// The structural match is kind of permissive and is matching terms by name, not by type.
+    /// We also need to ensure types are the same if they are wrapped by functions.
+    bool castCannotBreakStructuralMatch(
+        const ActionsDAG::Node * destination_output,
+        const Names & minmax_column_names,
+        const DataTypes & minmax_column_types)
+    {
+        if (destination_output->type == ActionsDAG::ActionType::INPUT)
+            return true;
+
+        for (const auto & required : ActionsDAG::cloneSubDAG({destination_output}, /*remove_aliases=*/ true).getRequiredColumns())
+        {
+            const auto it = std::find(minmax_column_names.begin(), minmax_column_names.end(), required.name);
+            if (it == minmax_column_names.end())
+                return false;
+
+            if (!isSameTypeForPartitioning(minmax_column_types[static_cast<size_t>(it - minmax_column_names.begin())], required.type))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// Dynamically verifies the destination expression maps to a single partition by checking its monotonicity over the source range.
+    void verifyOutputMapsToSinglePartition(
+        const ActionsDAG::Node * destination_output,
         const Names & minmax_column_names,
         const DataTypes & minmax_column_types,
-        const Block & destination_sample,
         const IMergeTreeDataPart::MinMaxIndex & minmax,
         const String & partition_id,
         const ContextPtr & context)
     {
-        const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
+        auto chain = buildPossiblyMonotonicChain(destination_output);
+        if (!chain.input_node)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition: the destination partition expression '{}' is not a chain of functions "
+                "with known monotonicity over a single column, so it cannot be proven that the source partition "
+                "maps to a single destination partition.", destination_output->result_name);
+
+        const auto & column = chain.input_node->result_name;
+        const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
         if (slot_it == minmax_column_names.end())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: the destination partition expression uses column '{}', which is "
-                "not part of the source MergeTree partition key.", term.column);
+                "not part of the source MergeTree partition key.", column);
         const size_t slot = static_cast<size_t>(slot_it - minmax_column_names.begin());
         const auto & source_type = minmax_column_types[slot];
 
@@ -716,138 +628,108 @@ namespace
         if (source_type->isNullable())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: column '{}' is Nullable, so a NULL forms a separate destination "
-                "partition; partition the source by the matching destination partition expression.", term.column);
+                "partition; partition the source by the matching destination partition expression.", column);
 
         if (!minmax.initialized || slot >= minmax.hyperrectangle.size())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: no min/max statistics available for column '{}' in partition "
-                "'{}'; cannot validate partitioning.", term.column, partition_id);
+                "'{}'; cannot validate partitioning.", column, partition_id);
         const auto & min_value = minmax.hyperrectangle[slot].left;
         const auto & max_value = minmax.hyperrectangle[slot].right;
 
-        if (!destination_sample.has(term.column))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition: destination column '{}' not found.", term.column);
-        const auto destination_type = destination_sample.getByName(term.column).type;
+        const auto & destination_type = chain.input_node->result_type;
 
-        /// The written value is transform(cast(source)), and the endpoints only bound the interior rows if
-        /// the cast preserves order. Preserving every value is not enough: Int -> String loses nothing, yet
-        /// "10" sorts before "2", so an interior row can fall outside the endpoints. With identical types the
-        /// order holds trivially; otherwise CAST must prove it over the partition's actual range.
-        const bool is_cast_needed = !isSameTypeForPartitioning(source_type, destination_type);
-        if (is_cast_needed)
+        /// If the types are not the same, we need to check if the cast is monotonic
+        if (!isSameTypeForPartitioning(source_type, destination_type))
         {
             const auto cast_function
-                = createInternalCast({source_type, term.column}, destination_type, CastType::nonAccurate, {}, context);
+                = createInternalCast({source_type, column}, destination_type, CastType::nonAccurate, {}, context);
             if (!cast_function->hasInformationAboutMonotonicity()
                 || !cast_function->getMonotonicityForRange(*source_type, min_value, max_value).is_monotonic)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Cannot export partition '{}': values of column '{}' cross a non-monotonic cast boundary to "
                     "the destination type {}, so it spans multiple destination partitions.",
-                    partition_id, term.column, destination_type->getName());
+                    partition_id, column, destination_type->getName());
         }
 
-        auto values_column = source_type->createColumn();
-        values_column->insert(min_value);
-        values_column->insert(max_value);
-        const auto cast_column = castColumn({std::move(values_column), source_type, term.column}, destination_type);
+        if (!isMonotonicChain(destination_output, chain))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition '{}': the destination partition expression '{}' is not monotonic in "
+                "column '{}' (a hash such as icebergBucket never is), so its values at the endpoints of the "
+                "partition do not bound the rows in between.",
+                partition_id, destination_output->result_name, column);
 
-        Field cast_min;
-        Field cast_max;
-        cast_column->get(0, cast_min);
-        cast_column->get(1, cast_max);
+        auto endpoints = source_type->createColumn();
+        endpoints->insert(min_value);
+        endpoints->insert(max_value);
 
-        /// A bare destination column is single-valued iff its two cast endpoints are equal; otherwise the
-        /// destination transform applied to [cast(min), cast(max)] must be monotonic (so the endpoints
-        /// bound every interior row; a hash such as bucket is not) and map both endpoints to one value.
-        bool spans_multiple_partitions;
-        if (term.function.empty() || term.function == "identity")
-        {
-            spans_multiple_partitions = cast_min != cast_max;
-        }
-        else
-        {
-            auto resolver = FunctionFactory::instance().get(term.function, context);
-            ColumnsWithTypeAndName arguments;
-            if (term.argument)
-                arguments.push_back({DataTypeUInt64().createColumnConst(2, *term.argument), std::make_shared<DataTypeUInt64>(), "width"});
-            arguments.push_back({cast_column, destination_type, term.column});
-            if (term.time_zone)
-                arguments.push_back({DataTypeString().createColumnConst(2, *term.time_zone), std::make_shared<DataTypeString>(), "timezone"});
+        Block block{{castColumn({std::move(endpoints), source_type, column}, destination_type), destination_type, column}};
+        ExpressionActions(ActionsDAG::cloneSubDAG({destination_output}, /*remove_aliases=*/ true)).execute(block);
 
-            const auto function = resolver->build(arguments);
-            if (!function->hasInformationAboutMonotonicity()
-                || !function->getMonotonicityForRange(*destination_type, cast_min, cast_max).is_monotonic)
-            {
-                spans_multiple_partitions = true;
-            }
-            else
-            {
-                const auto result = function->execute(arguments, function->getResultType(), /*input_rows_count=*/ 2, /*dry_run=*/ false);
-                Field first;
-                Field second;
-                result->get(0, first);
-                result->get(1, second);
-                spans_multiple_partitions = first != second;
-            }
-        }
+        const auto & result = *block.getByName(destination_output->result_name).column;
+        Field at_min;
+        Field at_max;
+        result.get(0, at_min);
+        result.get(1, at_max);
 
-        if (spans_multiple_partitions)
+        if (at_min != at_max)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition '{}': the source partition might span multiple destination partitions "
-                "for column '{}'. A source MergeTree partition must map to a single destination partition.",
-                partition_id, term.column);
+                "for expression '{}'. A source MergeTree partition must map to a single destination partition.",
+                partition_id, destination_output->result_name);
     }
 
-    bool sourceHasMatchingPartitionTerm(
-        const PartitionTerm & term,
-        const std::vector<PartitionTerm> & source_terms,
-        const Names & minmax_column_names,
-        const DataTypes & minmax_column_types,
-        const Block & destination_sample)
-    {
-        if (std::find(source_terms.begin(), source_terms.end(), term) == source_terms.end())
-            return false;
-
-        if (term.function.empty())
-            return true;
-
-        const auto it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
-        return it != minmax_column_names.end() && destination_sample.has(term.column)
-            && isSameTypeForPartitioning(
-                minmax_column_types[it - minmax_column_names.begin()], destination_sample.getByName(term.column).type);
-    }
-
-    /// Asserts every destination partition term maps the whole source partition to a single destination
-    /// partition, either because the source already partitions by that term or because the min/max proof holds.
-    void verifyPartitionTermsCompatibility(
-        const std::vector<PartitionTerm> & destination_terms,
-        const StorageMetadataPtr & source_metadata,
-        const StorageMetadataPtr & destination_metadata,
+    /// A source partition is not split in the destination when every destination partition expression is
+    /// single-valued over it. That holds structurally when the expression is a deterministic function of the
+    /// source partition key, because rows agreeing on the source key then agree on it as well; the remaining
+    /// expressions have to be proven from the partition's min/max values.
+    void verifyPartitionKeyCompatibility(
+        const KeyDescription & source_key,
+        const KeyDescription & destination_key,
         const MergeTreeData::DataPartsVector & parts,
         const String & partition_id,
         const ContextPtr & context)
     {
-        const auto source_terms = parsePartitionTerms(source_metadata->getPartitionKeyAST());
+        /// An unpartitioned destination holds everything in a single partition.
+        if (destination_key.column_names.empty())
+            return;
 
-        const auto & source_partition_key = source_metadata->getPartitionKey();
-        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
-        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
-        const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
+        const auto & destination_dag = destination_key.expression->getActionsDAG();
+        const auto source_dag = ActionsDAG::cloneSubDAG(
+            source_key.expression->getActionsDAG().findInOutputs(source_key.column_names), /*remove_aliases=*/ true);
 
-        /// The bounds of the whole partition are the union of its parts' bounds, so fold them once here
-        /// rather than per term.
+        /// ARRAY JOIN turns one row into many, which neither the tree matcher nor min/max models.
+        if (source_dag.hasArrayJoin() || destination_dag.hasArrayJoin())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition: a partition key containing ARRAY JOIN is not supported.");
+
+        /// Injective functions do not group rows, so the values they are applied to are what a destination
+        /// expression has to be a function of.
+        const auto irreducible_source_nodes = removeInjectiveFunctionsFromResultsRecursively(source_dag);
+        const auto matches = matchTrees(source_dag.getOutputs(), destination_dag);
+
+        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_key);
+        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_key);
+
+        /// Compute the global min/max index of the parts
         IMergeTreeDataPart::MinMaxIndex minmax;
         for (const auto & part : parts)
             if (part->minmax_idx)
                 minmax.merge(*part->minmax_idx);
 
-        for (const auto & term : destination_terms)
+        /*
+            1. If there is a structural match between the source and destination key, we accept it
+            2. If there is not a structural match, we check if the destination expression maps to a single partition by checking its monotonicity over the source range.
+        */
+        NodeMap visited;
+        for (const auto * destination_output : destination_dag.findInOutputs(destination_key.column_names))
         {
-            if (sourceHasMatchingPartitionTerm(term, source_terms, minmax_column_names, minmax_column_types, destination_sample))
+            if (allOutputsDependsOnlyOnAllowedNodes(irreducible_source_nodes, matches, destination_output, visited)
+                && castCannotBreakStructuralMatch(destination_output, minmax_column_names, minmax_column_types))
                 continue;
 
-            verifyColumnMapsToSinglePartition(term, minmax_column_names, minmax_column_types, destination_sample, minmax, partition_id, context);
+            verifyOutputMapsToSinglePartition(
+                destination_output, minmax_column_names, minmax_column_types, minmax, partition_id, context);
         }
     }
 }
@@ -908,13 +790,48 @@ namespace
             }
         }
 
-        const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
+        const auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
+        const UInt32 spec_size = spec_fields ? static_cast<UInt32>(spec_fields->size()) : 0;
+        if (spec_size == 0)
+            return;
 
-        /// Rebuild the destination spec as ClickHouse partition terms, mirroring ChunkPartitioner and the commit
-        /// path, so the same compatibility rule applies as for a plain object storage destination.
-        verifyPartitionTermsCompatibility(
-            parseIcebergPartitionTerms(partition_spec_json, source_id_to_column_name, partition_timezone),
-            source_metadata, destination_metadata, parts, partition_id, context);
+        /// Rebuild the destination spec as a ClickHouse partition key, the way the Iceberg read path does in
+        /// ManifestFileIterator, so the same compatibility rule applies as for a plain object storage
+        /// destination and the transform arguments keep the order the writer will use.
+        const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
+        auto partition_key_ast = make_intrusive<ASTFunction>();
+        partition_key_ast->name = "tuple";
+        partition_key_ast->arguments = make_intrusive<ASTExpressionList>();
+        partition_key_ast->children.push_back(partition_key_ast->arguments);
+
+        for (UInt32 i = 0; i < spec_size; ++i)
+        {
+            const auto field = spec_fields->getObject(i);
+            const auto transform = field->getValue<String>(Iceberg::f_transform);
+            const auto source_id = field->getValue<Int32>(Iceberg::f_source_id);
+
+            const auto column_it = source_id_to_column_name.find(source_id);
+            if (column_it == source_id_to_column_name.end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination partition spec refers to source_id "
+                    "{}, which is not part of the current schema.", source_id);
+
+            auto transform_ast = Iceberg::getASTFromTransform(transform, column_it->second, partition_timezone);
+            if (!transform_ast)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination field on column '{}' uses transform "
+                    "'{}', which has no ClickHouse equivalent.", column_it->second, transform);
+
+            partition_key_ast->arguments->children.emplace_back(std::move(transform_ast));
+        }
+
+        const auto destination_columns = ColumnsDescription::fromNamesAndTypes(
+            destination_metadata->getSampleBlockNonMaterialized().getNamesAndTypes());
+
+        verifyPartitionKeyCompatibility(
+            source_metadata->getPartitionKey(),
+            KeyDescription::getKeyFromAST(partition_key_ast, destination_columns, context),
+            parts, partition_id, context);
     }
 #endif
 
@@ -925,18 +842,8 @@ namespace
         const String & partition_id,
         const ContextPtr & context)
     {
-        const auto source_key_ast = source_metadata->getPartitionKeyAST();
-        const auto destination_key_ast = destination_metadata->getPartitionKeyAST();
-
-        auto ast_to_string = [](const ASTPtr & ast) { return ast ? ast->formatWithSecretsOneLine() : String{}; };
-
-        /// Fast path: identical partition keys are single-valued per source partition by construction.
-        if (ast_to_string(source_key_ast) == ast_to_string(destination_key_ast))
-            return;
-
-        /// If the partition keys are not identical, we need to verify that the source partition maps to a single destination partition
-        verifyPartitionTermsCompatibility(
-            parsePartitionTerms(destination_key_ast), source_metadata, destination_metadata, parts, partition_id, context);
+        verifyPartitionKeyCompatibility(
+            source_metadata->getPartitionKey(), destination_metadata->getPartitionKey(), parts, partition_id, context);
     }
 
     void verifyExportSchemaCastable(

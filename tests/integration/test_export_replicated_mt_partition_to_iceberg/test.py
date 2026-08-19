@@ -1005,9 +1005,16 @@ def test_partition_transform_equivalence_gate(cluster):
         {"name": "coarser_day", "columns": dt, "source_key": "toYYYYMM(event_time)",
          "dest_key": "toRelativeDayNum(event_time)",
          "rows": "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", "expect_ok": False},
-        # bucket is non-monotonic: an identity source cannot satisfy a bucket destination.
-        {"name": "bucket_needs_structural", "columns": "id Int64, k Int64", "source_key": "k",
-         "dest_key": "icebergBucket(8, k)", "rows": "(1, 10), (2, 10)", "expect_ok": False},
+        # A hash is never monotonic, so min/max cannot prove anything about it, but an identity source key
+        # pins k within the partition and a bucket of a single value is a single bucket.
+        {"name": "bucket_from_identity_source", "columns": "id Int64, k Int64", "source_key": "k",
+         "dest_key": "icebergBucket(8, k)", "rows": "(1, 10), (2, 10)", "expect_ok": True,
+         "verify": [("k", "icebergBucket(8, k)")]},
+        # The same bucket destination over a source key that does not pin k: nothing proves the rows of one
+        # source partition hash into the same bucket.
+        {"name": "bucket_needs_structural", "columns": "id Int64, k Int64",
+         "source_key": "intDiv(k, 100)", "dest_key": "icebergBucket(8, k)",
+         "rows": "(1, 10), (2, 20)", "expect_ok": False},
         # Identical expressions on a Nullable column: accepted structurally. The min/max proof refuses
         # Nullable (a NULL forms its own destination partition and the endpoints cannot rule it out),
         # so this only passes because the source already groups by exactly this transform. DateTime64(6)

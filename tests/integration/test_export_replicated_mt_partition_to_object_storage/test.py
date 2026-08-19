@@ -1953,3 +1953,136 @@ def test_export_partition_column_timezone_rendered_in_destination_zone(cluster):
         f"export and INSERT SELECT disagree on the partition directory:"
         f" {exported_directory!r} vs {inserted_directory!r}"
     )
+
+
+def create_wildcard_destination(node, table, columns, partition_key):
+    """A wildcard destination, the only partition strategy that accepts an expression as its
+    partition key: the hive strategy allows storage columns only."""
+    node.query(
+        f"CREATE TABLE {table} ({columns})"
+        f" ENGINE = S3(s3_conn, filename='{table}/{{_partition_id}}/{{_file}}.parquet',"
+        f" format=Parquet, partition_strategy='wildcard')"
+        f" PARTITION BY {partition_key}"
+    )
+
+
+def test_export_partition_dest_argument_order_rejected(cluster):
+    """The destination key intDiv(x, 100) has to be validated as written. This source part holds
+    x in [201, 350], which covers the destination partitions 2 and 3, so the export must be rejected.
+    Reading the arguments in the reverse order would validate intDiv(100, x) instead, which is 0 at
+    both endpoints and would silently write both destination partitions into one directory."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"argorder_mt_{uid}"
+    s3_table = f"argorder_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, x UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY intDiv(x, 1000) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 201), (2, 350)")
+    create_wildcard_destination(node, s3_table, "id UInt64, x UInt64", "intDiv(x, 100)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+
+
+def test_export_partition_dest_finer_expression_single_partition_accepted(cluster):
+    """The same shape as the rejected case, with x in [100, 150]: the whole source partition maps to
+    the single destination partition 1, so it is accepted and every row lands in one directory. The
+    swapped-argument reading would refuse this one, since intDiv(100, 100) != intDiv(100, 150)."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"argorder_ok_mt_{uid}"
+    s3_table = f"argorder_ok_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, x UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY intDiv(x, 1000) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 100), (2, 150)")
+    create_wildcard_destination(node, s3_table, "id UInt64, x UInt64", "intDiv(x, 100)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    src = node.query(f"SELECT id, x FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, x FROM {s3_table} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    directories = node.query(
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {s3_table}"
+    ).strip()
+    assert directories == f"{s3_table}/1", f"unexpected destination directories: {directories!r}"
+
+
+def test_export_partition_dest_nested_expression_accepted(cluster):
+    """A destination key that wraps the source key in a coarser transform - toYYYYMM(toDate(ts)) over
+    a source keyed by toDate(ts) - is a function of the source key, so every source partition sits
+    inside one destination partition whatever the data is."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"nested_mt_{uid}"
+    s3_table = f"nested_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, ts DateTime)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toDate(ts) ORDER BY tuple()"
+    )
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')"
+    )
+    create_wildcard_destination(node, s3_table, "id UInt64, ts DateTime", "toYYYYMM(toDate(ts))")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
+    wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    src = node.query(f"SELECT id, ts FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, ts FROM {s3_table} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    directories = node.query(
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {s3_table}"
+    ).strip()
+    assert directories == f"{s3_table}/202403", (
+        f"unexpected destination directories: {directories!r}"
+    )
+
+
+def test_export_partition_dest_term_over_two_columns_rejected(cluster):
+    """A destination expression over two columns is only single-valued when the source key pins both.
+    This source pins b but only intDiv(a, 100), so a spans [10, 90] within one source partition and
+    intDiv(a + b, 100) takes both 0 and 1 there. Per-column min/max cannot bound such an expression,
+    so it is rejected; a source keyed by (a, b) would be accepted, since it pins both columns."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"twocol_mt_{uid}"
+    s3_table = f"twocol_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, a UInt64, b UInt64)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY (intDiv(a, 100), b) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 10, 20), (2, 90, 20)")
+    create_wildcard_destination(
+        node, s3_table, "id UInt64, a UInt64, b UInt64", "intDiv(a + b, 100)"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"

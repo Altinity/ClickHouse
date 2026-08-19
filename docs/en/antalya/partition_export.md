@@ -28,8 +28,8 @@ The Iceberg manifest files contain statistics about the data. Exporting a merge 
 
 The source partition must not be split in the destination. This is validated at schedule time through two mechanisms:
 
-1. Identical expressions; or
-2. Destination partition expression is monotonically increasing in the min/max column ranges and the destination expression columns are a subset of the source expression;
+1. Structural match: in case the source and destination are identical, the destination expression is a subset of the source expression or the destination expression can be entirely computed using only constants and the exact values guaranteed (pinned) by the source.
+2. Dynamic proof: the destination expression is monotonic over the source partition min/max range.
 
 ### On plain object storage exports:
 
