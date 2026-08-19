@@ -193,7 +193,9 @@ bool astContainsInTableIdentifier(const ASTPtr & node)
         if (isNameOfInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2)
         {
             const auto & rhs = function->arguments->children[1];
-            if (rhs && rhs->as<ASTIdentifier>())
+            /// GLOBAL IN is rewritten to an external table (`_subqueryN`) as `ASTTableIdentifier`.
+            /// `as<ASTIdentifier>` is an exact typeid match and does not see that subclass.
+            if (rhs && (rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>()))
                 return true;
         }
     }
@@ -717,6 +719,14 @@ void IStorageCluster::rewriteQueryForInitiatorLocalJoin(
         TreeRewriterResult rewriter_result = *query_info.syntax_analyzer_result;
         if (!removeJoin(*select_query, rewriter_result, context))
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to strip JOIN from query sent to cluster nodes");
+
+        /// `removeJoin` keeps left-table WHERE, including `GLOBAL IN (_subqueryN)`, which remotes cannot resolve.
+        if (astContainsInTableIdentifier(select_query->where()) || astContainsInTableIdentifier(select_query->prewhere())
+            || astContainsSubquery(select_query->where()) || astContainsSubquery(select_query->prewhere()))
+        {
+            select_query->setExpression(ASTSelectQuery::Expression::PREWHERE, {});
+            select_query->setExpression(ASTSelectQuery::Expression::WHERE, {});
+        }
     }
     else if (info.has_local_columns_in_where)
     {
