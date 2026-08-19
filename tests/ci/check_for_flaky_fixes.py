@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pattern",
-        default="fix flaky test",
+        default="fix flaky",
         help="case-insensitive substring to match in commit subjects",
     )
     parser.add_argument(
