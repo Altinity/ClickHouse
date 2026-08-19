@@ -739,7 +739,7 @@ def test_partition_transform_compatibility_accepted(cluster):
     supported transform when the MergeTree and Iceberg partition specs match.
 
     Cases covered:
-    1. Compound identity (year, region)
+    1. Compound identity (year, region), exported to a spec that lists the fields in reverse order
     2. Year transform  – toYearNumSinceEpoch(event_date)
     3. Month transform – toMonthNumSinceEpoch(event_date)
     4. truncate[4]     – icebergTruncate(4, category)
@@ -757,12 +757,13 @@ def test_partition_transform_compatibility_accepted(cluster):
         )
         return pid
 
-    # 1. Compound identity: (year, region)
+    # 1. Compound identity, with the destination listing the fields in the opposite order: the
+    # source key pins both columns, so the partition is single-valued for either field order.
     cols = "id Int64, year Int32, region String"
     t = f"mt_acc_1_{uid}"; i = f"iceberg_acc_1_{uid}"
     make_rmt(node, t, cols, "(year, region)")
     node.query(f"INSERT INTO {t} VALUES (1, 2023, 'EU')")
-    make_iceberg_s3(node, i, cols, "(year, region)")
+    make_iceberg_s3(node, i, cols, "(region, year)")
     pid = check_accepted(t, i, "compound identity (year, region)")
     wait_for_export_status(node, t, i, pid, "COMPLETED")
     count = int(node.query(f"SELECT count() FROM {i}").strip())
@@ -841,17 +842,7 @@ def test_partition_transform_compatibility_rejected(cluster):
             f"[{description}] Expected BAD_ARGUMENTS, got: {error!r}"
         )
 
-    # 1. Compound field order reversed
-    cols = "id Int64, year Int32, region String"
-    t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
-    make_rmt(node, t, cols, "(year, region)")
-    node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
-    make_iceberg_s3(node, i, cols, "(region, year)")
-    assert_rejected(t, i, "compound field order reversed")
-    count = int(node.query(f"SELECT count() FROM {i}").strip())
-    assert count == 0, f"[compound field order reversed] Expected 0 rows in destination, got {count}"
-
-    # 2. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
+    # 1. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
     cols = "id Int64, event_date Date"
     t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
     make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
@@ -2095,7 +2086,7 @@ REJECTED_PARTITION_EXPORT_CASES = [
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
-            error_substrings=("partition scheme mismatch",),
+            error_substrings=("column 'c', which is not part of the source MergeTree partition key",),
         ),
         id="multi_column_partition_key_more_in_destination",
     ),
