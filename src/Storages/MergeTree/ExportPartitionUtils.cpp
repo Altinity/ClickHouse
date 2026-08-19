@@ -640,7 +640,7 @@ namespace
 
         /// A NULL value forms its own destination partition, so a Nullable column may split the source
         /// partition; min/max cannot rule that out. Require a structural match for such columns.
-        if (source_type->isNullable())
+        if (isNullableOrLowCardinalityNullable(source_type))
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Cannot export partition: column '{}' is Nullable, so a NULL forms a separate destination "
                 "partition; partition the source by the matching destination partition expression.", column);
