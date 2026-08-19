@@ -69,7 +69,11 @@ protected:
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(
+        ASTPtr & query_to_send,
+        SelectQueryInfo query_info,
+        const ContextPtr & context,
+        const Names & column_names);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 
@@ -127,6 +131,11 @@ private:
     };
 
     static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
+    static QueryTreeInfo getQueryJoinInfoFromAST(const ASTPtr & query);
+    static QueryTreeInfo getQueryJoinInfo(const SelectQueryInfo & query_info, const ContextPtr & context);
+    static bool needsInitiatorLocalJoin(const QueryTreeInfo & info);
+    static void rewriteQueryTreeForInitiatorLocalJoin(ASTPtr & query_to_send, const QueryTreeNodePtr & query_tree, const ContextPtr & context);
+    static void rewriteASTForInitiatorLocalJoin(ASTPtr & query_to_send, const Names & column_names);
 };
 
 

@@ -1432,7 +1432,7 @@ def test_namespace_filter(started_cluster):
 
 
 # TODO - turn on after merge alternative syntax
-@pytest.mark.parametrize("join_mode", ["local", "global"])
+@pytest.mark.parametrize("join_mode", ["allow", "local", "global"])
 def _test_cluster_joins(started_cluster, join_mode):
     node = started_cluster.instances["node1"]
 

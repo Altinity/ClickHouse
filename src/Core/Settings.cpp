@@ -2130,14 +2130,14 @@ ClickHouse applies this setting when the query contains the product of object st
 
 Restrictions:
 
-- Only applied for JOIN subqueries.
-- Only if the FROM section uses a object storage cluster function or table.
+- Only applied for `JOIN` and for `IN`/`WHERE` subqueries that reference other tables.
+- Only if the FROM section uses an object storage cluster function or table.
 
 Possible values:
 
-- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
-- `allow` — Default value. Allows the use of these types of subqueries.
-- `local` — deprecated, legacy mode. The same as 'allow'.
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table. Requires `allow_experimental_analyzer=1`.
+- `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes. Works with `allow_experimental_analyzer=0`.
+- `local` — Deprecated legacy alias of `allow`.
 )", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
