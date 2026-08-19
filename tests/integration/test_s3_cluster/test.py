@@ -1080,9 +1080,6 @@ def test_remote_no_hedged(started_cluster):
 @pytest.mark.parametrize("join_mode", ["allow", "local", "global"])
 @pytest.mark.parametrize("allow_experimental_analyzer", [0, 1])
 def test_joins(started_cluster, join_mode, allow_experimental_analyzer):
-    if join_mode == "global" and allow_experimental_analyzer == 0:
-        pytest.skip("object_storage_cluster_join_mode='global' requires allow_experimental_analyzer=1")
-
     node = started_cluster.instances["s0_0_0"]
 
     # Table join_table only exists on the node 's0_0_0'.

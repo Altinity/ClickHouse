@@ -63,6 +63,9 @@ public:
     const String & getOriginalClusterName() const { return cluster_name; }
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
+    /// Old interpreter: rewrite JOIN / IN to GLOBAL JOIN / GLOBAL IN so GlobalSubqueriesVisitor can broadcast right tables.
+    static void rewriteASTForGlobalJoin(ASTPtr & query);
+
 protected:
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,

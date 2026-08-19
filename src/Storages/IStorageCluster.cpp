@@ -35,6 +35,7 @@
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Core/Joins.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -42,6 +43,7 @@
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -209,6 +211,73 @@ bool astContainsInTableIdentifier(const ASTPtr & node)
     return false;
 }
 
+bool astIsNestedSelect(const ASTPtr & node)
+{
+    return node && (node->as<ASTSelectQuery>() || node->as<ASTSelectWithUnionQuery>() || node->as<ASTSubquery>());
+}
+
+void rewriteASTInFunctionsToGlobalIn(ASTPtr & node)
+{
+    if (!node)
+        return;
+
+    if (auto * function = node->as<ASTFunction>())
+    {
+        if (isNameOfLocalInFunction(function->name) && function->arguments && function->arguments->children.size() >= 2)
+        {
+            const auto & rhs = function->arguments->children[1];
+            if (rhs
+                && (rhs->as<ASTSubquery>() || rhs->as<ASTSelectQuery>() || rhs->as<ASTSelectWithUnionQuery>()
+                    || rhs->as<ASTIdentifier>() || rhs->as<ASTTableIdentifier>()))
+            {
+                function->name = getGlobalInFunctionNameForLocalInFunctionName(function->name);
+            }
+        }
+    }
+
+    for (auto & child : node->children)
+    {
+        if (astIsNestedSelect(child))
+            continue;
+        rewriteASTInFunctionsToGlobalIn(child);
+    }
+}
+
+void rewriteASTJoinsToGlobal(ASTPtr & query)
+{
+    ASTSelectQuery * select_query = query->as<ASTSelectQuery>();
+    if (!select_query)
+    {
+        if (auto * union_query = query->as<ASTSelectWithUnionQuery>())
+        {
+            if (union_query->list_of_selects)
+            {
+                for (auto & child : union_query->list_of_selects->children)
+                    rewriteASTJoinsToGlobal(child);
+            }
+        }
+        return;
+    }
+
+    if (auto tables = select_query->tables())
+    {
+        auto & tables_in_select_query = tables->as<ASTTablesInSelectQuery &>();
+        for (auto & child : tables_in_select_query.children)
+        {
+            auto & tables_element = child->as<ASTTablesInSelectQueryElement &>();
+            if (tables_element.table_join)
+                tables_element.table_join->as<ASTTableJoin &>().locality = JoinLocality::Global;
+        }
+    }
+
+    rewriteASTInFunctionsToGlobalIn(query);
+}
+
+}
+
+void IStorageCluster::rewriteASTForGlobalJoin(ASTPtr & query)
+{
+    rewriteASTJoinsToGlobal(query);
 }
 
 /*
@@ -257,6 +326,9 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
     {
+        if (!query_info.query_tree)
+            return;
+
         auto info = getQueryTreeInfo(query_info.query_tree, context);
 
         if (needsInitiatorLocalJoin(info))
@@ -391,9 +463,11 @@ void IStorageCluster::read(
 
     auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
 
-    std::optional<Tables> external_tables = std::nullopt;
+    std::optional<Tables> external_tables;
     if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
+    if (!external_tables || external_tables->empty())
+        external_tables = context->getExternalTables();
 
     auto reading = std::make_unique<ReadFromCluster>(
         column_names,
@@ -771,13 +845,8 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
 {
     auto object_storage_cluster_join_mode = context->getSettingsRef()[Setting::object_storage_cluster_join_mode];
 
-    if (object_storage_cluster_join_mode == ObjectStorageClusterJoinMode::GLOBAL)
-    {
-        if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode=='global' is not supported without allow_experimental_analyzer=true");
-    }
-    else if (needsInitiatorLocalJoin(getQueryJoinInfo(query_info, context)))
+    if (object_storage_cluster_join_mode != ObjectStorageClusterJoinMode::GLOBAL
+        && needsInitiatorLocalJoin(getQueryJoinInfo(query_info, context)))
     {
         return QueryProcessingStage::Enum::FetchColumns;
     }

@@ -2135,8 +2135,8 @@ Restrictions:
 
 Possible values:
 
-- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table. Requires `allow_experimental_analyzer=1`.
-- `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes. Works with `allow_experimental_analyzer=0`.
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN`. Right table executes first and is added to the secondary query as a temporary table.
+- `allow` — Default value. Reads the left object-storage table on cluster nodes and executes `JOIN` / local `IN` on the initiator, so the right table does not need to exist on remote nodes.
 - `local` — Deprecated legacy alias of `allow`.
 )", 0) \
     \
