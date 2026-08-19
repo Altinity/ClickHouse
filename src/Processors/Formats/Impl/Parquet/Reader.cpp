@@ -318,10 +318,13 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     for (const auto & col : format_filter_info->additional_columns)
         extended_sample_block.insert(col);
     extended_sample_block_data_types = extended_sample_block.getDataTypes();
-    PrewhereInfoPtr prewhere_info = format_filter_info->prewhere_info;
+    const auto & row_level_filter = format_filter_info->row_level_filter;
+    const auto & prewhere_info = format_filter_info->prewhere_info;
 
     /// Process schema.
     SchemaConverter schemer(file_metadata, options, &extended_sample_block);
+    if (row_level_filter && !row_level_filter->do_remove_column)
+        schemer.external_columns.push_back(row_level_filter->column_name);
     if (prewhere_info && !prewhere_info->remove_prewhere_column)
         schemer.external_columns.push_back(prewhere_info->prewhere_column_name);
     schemer.column_mapper = format_filter_info->column_mapper.get();
@@ -513,7 +516,7 @@ void Reader::prepareBloomFilterCondition()
 
 void Reader::initializePrefetches()
 {
-    bool use_offset_index = options.format.parquet.use_offset_index || format_filter_info->prewhere_info
+    bool use_offset_index = options.format.parquet.use_offset_index || format_filter_info->prewhere_info || format_filter_info->row_level_filter
         || std::any_of(primitive_columns.begin(), primitive_columns.end(), [](const auto & c) { return c.column_index_condition; });
     bool need_to_find_bloom_filter_lengths_the_hard_way = false;
 
@@ -659,8 +662,9 @@ void Reader::initializePrefetches()
 
 void Reader::preparePrewhere()
 {
-    PrewhereInfoPtr prewhere_info = format_filter_info->prewhere_info;
-    if (prewhere_info)
+    const auto & row_level_filter = format_filter_info->row_level_filter;
+    const auto & prewhere_info = format_filter_info->prewhere_info;
+    if (row_level_filter || prewhere_info)
     {
         /// TODO [parquet]: We currently run prewhere after reading all prewhere columns of the row
         ///     subgroup, in one thread per row group. Instead, we could extract single-column conditions
@@ -671,24 +675,30 @@ void Reader::preparePrewhere()
 
         /// Convert ActionsDAG to ExpressionActions.
         ExpressionActionsSettings actions_settings;
-        if (prewhere_info->row_level_filter.has_value())
+        if (row_level_filter)
         {
-            ExpressionActions actions(prewhere_info->row_level_filter->clone(), actions_settings);
+            ExpressionActions actions(row_level_filter->actions.clone(), actions_settings);
             prewhere_steps.push_back(PrewhereStep
             {
                 .actions = std::move(actions),
-                .result_column_name = prewhere_info->row_level_column_name,
+                .result_column_name = row_level_filter->column_name,
             });
+
+            if (!row_level_filter->do_remove_column)
+                prewhere_steps.back().idx_in_output_block = sample_block->getPositionByName(row_level_filter->column_name);
         }
-        ExpressionActions actions(prewhere_info->prewhere_actions.clone(), actions_settings);
-        prewhere_steps.push_back(PrewhereStep
-            {
-                .actions = std::move(actions),
-                .result_column_name = prewhere_info->prewhere_column_name,
-                .need_filter = prewhere_info->need_filter,
-            });
-        if (!prewhere_info->remove_prewhere_column)
-            prewhere_steps.back().idx_in_output_block = sample_block->getPositionByName(prewhere_info->prewhere_column_name);
+        if (prewhere_info)
+        {
+            ExpressionActions actions(prewhere_info->prewhere_actions.clone(), actions_settings);
+            prewhere_steps.push_back(PrewhereStep
+                {
+                    .actions = std::move(actions),
+                    .result_column_name = prewhere_info->prewhere_column_name,
+                    .need_filter = prewhere_info->need_filter,
+                });
+            if (!prewhere_info->remove_prewhere_column)
+                prewhere_steps.back().idx_in_output_block = sample_block->getPositionByName(prewhere_info->prewhere_column_name);
+        }
     }
     /// Look up expression inputs in extended_sample_block.
     for (PrewhereStep & step : prewhere_steps)
@@ -2077,6 +2087,24 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
 
 void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_group)
 {
+    /// Materialize the input columns of every step before running any step. formOutputColumn takes
+    /// the decoded subchunk, which still has rows_total rows because the decoders only saw the
+    /// filter as it stood before any step ran. A column first formed by a later step would
+    /// therefore disagree with the columns an earlier step already filtered down to rows_pass, and
+    /// the filtering below only shrinks what is already in row_subgroup.output - pending subchunks
+    /// are never touched. Forming them all up front keeps every step's block at rows_pass.
+    ///
+    /// rows_pass, not rows_total, is the row count every block here has: the decoded subchunks hold
+    /// rows_pass rows (see decodePrimitiveColumn), and each step shrinks them further.
+    for (const PrewhereStep & step : prewhere_steps)
+        for (size_t output_idx : step.input_column_idxs)
+        {
+            const auto & output_info = output_columns.at(output_idx);
+            auto & col = row_subgroup.output.at(output_info.idx_in_output_block.value());
+            if (!col)
+                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_pass);
+        }
+
     for (size_t step_idx = 0; step_idx < prewhere_steps.size(); ++step_idx)
     {
         const PrewhereStep & step = prewhere_steps.at(step_idx);
@@ -2086,11 +2114,12 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
         {
             const auto & output_info = output_columns.at(output_idx);
             auto & col = row_subgroup.output.at(output_info.idx_in_output_block.value());
+            /// Unreachable: the loop above materialized every step's inputs.
             if (!col)
-                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_total);
+                col = formOutputColumn(row_subgroup, output_idx, row_subgroup.filter.rows_pass);
             block.insert({col, output_info.type, output_info.name});
         }
-        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_total);
+        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_pass);
 
         step.actions.execute(block);
 

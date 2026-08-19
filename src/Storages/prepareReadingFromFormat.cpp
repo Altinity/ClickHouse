@@ -246,19 +246,23 @@ ReadFromFormatInfo prepareReadingFromFormat(
     return info;
 }
 
-ReadFromFormatInfo updateFormatPrewhereInfo(const ReadFromFormatInfo & info, const PrewhereInfoPtr & prewhere_info)
+ReadFromFormatInfo updateFormatPrewhereInfo(const ReadFromFormatInfo & info, const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info)
 {
-    chassert(prewhere_info);
+    chassert(prewhere_info || row_level_filter);
 
     if (info.prewhere_info)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "updateFormatPrewhereInfo called more than once");
 
     ReadFromFormatInfo new_info;
     new_info.prewhere_info = prewhere_info;
+    new_info.row_level_filter = row_level_filter;
 
     /// Removes columns that are only used as prewhere input.
     /// Adds prewhere result column if !remove_prewhere_column.
-    new_info.format_header = SourceStepWithFilter::applyPrewhereActions(info.format_header, prewhere_info);
+    /// If row_level_filter was already applied in a previous call, don't re-apply it;
+    /// only apply the new prewhere_info on top.
+    new_info.format_header = SourceStepWithFilter::applyPrewhereActions(
+        info.format_header, info.row_level_filter ? nullptr : row_level_filter, prewhere_info);
 
     /// We assume that any format that supports prewhere also supports subset of subcolumns, so we
     /// don't need to replace subcolumns with their nested columns etc.
@@ -367,7 +371,7 @@ ReadFromFormatInfo ReadFromFormatInfo::deserialize(IQueryPlanStep::Deserializati
     bool has_prewhere_info;
     readBinary(has_prewhere_info, ctx.in);
     if (has_prewhere_info)
-        result.prewhere_info = PrewhereInfo::deserialize(ctx);
+        result.prewhere_info = std::make_shared<PrewhereInfo>(PrewhereInfo::deserialize(ctx));
 
     ctx.in >> "\n";
 
