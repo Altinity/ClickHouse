@@ -694,3 +694,26 @@ FIX (SCHEDULED: tomorrow, pre-release — see docs/superpowers/cas/final-checks-
   six-property suite lives in clickhouse-regression (`cas/tests/freeze_isolation.py`).
 Trade acknowledged: cross-replica readability of freezes goes away — that is the correct (local)
 FREEZE semantics; shared backup access belongs to the BACKUP machinery, not UNFREEZE.
+
+## Issue #2244 (filed by us): lease/remount retry asymmetry — CI RCA of job 96307284077 (2026-08-20) {#issue-2244-lease-retry-asymmetry}
+
+https://github.com/Altinity/ClickHouse/issues/2244 — full RCA in the issue. One-line mechanism: the
+two operations keeping a CAS mount alive are the ONLY S3 ops with no retries (renewal = one 5s-timeout
+PUT per 10s period, no in-period retry, never re-armed after failure; remount claim = SingleAttempt
+inside a ~15-op sequential chain with a 36.5s observation window), so an intermittent-timeout episode
+the data plane rides out on `Attempt 2/501 succeeded` trips the fence and costs ~15 min of full-disk
+write refusal. Field evidence #2 for {#fence-window blast radius} and {#fence-window observability}
+(both got their priority raised by this incident); same lease-resilience work as #2243's fix (2).
+
+Fix directions (tracked in the issue, value order): (1) in-period renewal retries while
+`now + margin < confirmed_deadline` — would have prevented this trip outright; (2) per-step retries in
+the remount chain + investigate the own-ambiguous-claim observation-window reset (STID-3982 family);
+(3) observability: log the trip reason + every remount attempt step at default level, ProfileEvents
+for renewals/remounts; (4) rate-limit the snapshot-publication refusal loop (125,952 warnings/16 min
+on one table — NEW defect, no backoff on that loop). CI-env extra: RustFS logs at ERROR-only — raise
+its log level in the CA lanes (re-opens the [CAS CI observability gaps] rustfs item at the level
+dimension).
+
+Triage bonus recorded: the RustFS "Erasure decode failed ... downstream_closed" error class is a red
+herring = ClickHouse's silent-by-design mid-body aborts (cancellations, LIMIT, abandoned prefetch);
+do not chase it in future triage.
