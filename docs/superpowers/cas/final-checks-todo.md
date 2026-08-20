@@ -38,7 +38,17 @@ short-lived TODO, not the record.
   skip builtin `S3AuthSettings`/`S3RequestSettings` names in `ContentAddressedSettings.cpp` instead
   of enumerating them into `non_cas_keys`; blocks the #2243 CI mitigation until fixed.
 
-## 5. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 5. Fix #2211 — `GC RUN` follower row must name the outcome and the leader {#fix-2211}
+
+- Issue: https://github.com/Altinity/ClickHouse/issues/2211 (CONFIRMED; contract decided 2026-08-21)
+- Full adjudication + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#issue-2211-gc-run-follower-noop}`
+- Plan: keep the quiet idempotent OK (no exception — `ON CLUSTER` inversion); add `finish` column to
+  the `RUN` result set; add advisory `hostname`/`server_uuid`/`pid` to `GcLease` (MountLease
+  precedent, `owner` fencing token untouched) + `leader_host` in the row; populate
+  `system.cas_mounts.is_leader` for all mounts; one-sentence leadership note in `{#sql-gc-run}` docs.
+- No-steal on manual `RUN` stays untouched.
+
+## 6. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
