@@ -631,3 +631,40 @@ Housekeeping folded in:
 - **Soak-harness blind spot**: `soak/cluster.py` classifies "mount lease not held" as retryable
   `NETWORK_ERROR` — our own soaks would ride through a #2243 event and score it recoverable; add a
   lease-loss detector (count `TransientNotLive` windows / `CasMountLeaseKeeper` errors) to checkpoints.
+
+## Issue #2173 CONFIRMED: cross-disk `ATTACH PARTITION FROM` (local -> CAS) — `freezeRemote` lacks the CAS single-transaction branch (2026-08-20) {#issue-2173-freezeremote-gap}
+
+https://github.com/Altinity/ClickHouse/issues/2173 — `ALTER TABLE dst ATTACH PARTITION 1 FROM src`
+(src on a local disk, dst on a CAS disk) fails on the FIRST attach with the promote unique-ref refusal
+on `tmp_replace_from_1_1_1_0`. CONFIRMED and REPRODUCED on current HEAD first-try (clickhouse-local,
+inline local-backend CA disk, 3 statements; trace at tmp/repro2173_trace.log).
+
+Mechanism (traced to code): of the three part-clone paths, `freeze()` (same-disk,
+`DataPartStorageOnDiskBase.cpp:534` — the "B21" comment) and `clonePart()` (MOVE, `:735` — the
+"L2 (MOVE-to-CA fix)" branch) already wrap the whole clone in ONE CAS disk transaction;
+`freezeRemote()` (`:615`, used by `ATTACH`/`REPLACE PARTITION FROM` via
+`MergeTreeData::cloneAndLoadDataPart`'s byte-copy branch at `MergeTreeData.cpp:9717`) has NO such
+branch. Without a transaction, `Backup` -> `IDisk::copyDirectoryContent` -> `copyThroughBuffers`
+fans the part's files onto a 16-thread pool, each file becoming an INDEPENDENT autocommit CAS
+transaction against the same ref: >=2 resolve the ref as absent concurrently, both `promoteBuild`
+different one-file manifests, the loser hits the unique-ref guard (`CasPartWriteTxn.cpp:1168`).
+The race also yields the alternate `NOT_IMPLEMENTED` signature (blob-mandatory files reject
+autocommit, `ContentAddressedTransaction.cpp:770`) — which error appears depends on which file the
+pool reaches first. No retry involved ("retrying later" is message text). Nothing changed since the
+reporter's binary (9b5cbc314bc).
+
+FIX (SCHEDULED: tomorrow, pre-release — see docs/superpowers/cas/final-checks-todo.md): mirror
+`clonePart`'s CAS branch inside `freezeRemote` — when `dst_disk->isContentAddressed()` and no
+`params.external_transaction`, self-create one `dst_disk->createTransaction()`, stream files through
+the existing `copyDirectoryContentIntoTransaction` (`DataPartStorageOnDiskBase.cpp:686`, sequential
+by design), commit once — one manifest, one promote; the post-clone `metadata_version.txt` /
+`txn_version.txt` writes become legal single repoints. Plus a stateless test from the 3-statement
+repro. Related: `{#...}` bulk-op batching known-issue cc9a8e63401's "option 1" (shared
+external_transaction through bulk clone paths) is the strategic superset of this fix.
+
+STATUS UPDATE folded in: BACKLOG/replication.md's
+`[move-part-to-ca-architecturally-unimplemented]` header ("architecturally unimplemented — HARD")
+is STALE — both its layers landed for MOVE (L1 routing + L2 clonePart transaction, R2 fix); the
+entry's remaining live content is the S36/S37 verification legs and the sibling items
+(`[VERIFY-ca-ca-same-pool-move]`, `[killed-mid-move-partition-duplicate]`). The unfixed member of
+the family is exactly this `freezeRemote` gap.
