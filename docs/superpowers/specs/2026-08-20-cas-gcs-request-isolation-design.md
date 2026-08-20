@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS GCS request isolation design {#cas-gcs-request-isolation-design}
 
-**Status:** DRAFT for review, rev.5 (2026-08-20). This specification defines the target state. The
+**Status:** DRAFT for review, rev.6 (2026-08-20). This specification defines the target state. The
 current branch already contains the GCS conditional adapter and response generation override
 (`41a247e3310`), plus their authentication-wide wiring and the `gcs_hmac` client
 (`9604d6a5be9`); their current behavior and the required target-state changes are described below.
@@ -165,16 +165,24 @@ server ETag, and does not acquire generation preconditions. Existing targeted `A
 CopyObject mappings remain active.
 
 Before GOOG4 signing, authentication preparation removes stale AWS authentication artifacts and
-maps only documented headers needed by current ClickHouse operations: `x-amz-meta-*`,
-`x-amz-storage-class`, and `x-amz-acl` to their `x-goog-*` equivalents. Copy source, metadata
-directive, storage class, and CopyObject metadata continue through the existing targeted
-`ApiMode::GCS` mappings. Unsupported remaining `x-amz-*` extension headers cause an exception
-instead of being guessed or sent in a mixed-prefix request. Customer-supplied encryption headers
-are not mechanically renamed because GCS uses a different contract.
+uses an explicit per-operation allowlist for headers needed by current ClickHouse requests. This
+includes user-visible `x-amz-meta-*` and `x-amz-storage-class`, plus SDK-generated checksum and
+stream-framing headers when the SDK emits them: `x-amz-sdk-checksum-algorithm`,
+`x-amz-checksum-*`, `x-amz-trailer`, and `x-amz-decoded-content-length`. Every allowed header has a
+documented disposition: translate to its GCS contract, preserve it because GCS accepts it, or
+consume it before transmission. There is no generic prefix rename.
+
+Copy source, metadata directive, storage class, and CopyObject metadata continue through the
+existing targeted `ApiMode::GCS` mappings. Unsupported remaining `x-amz-*` extension headers cause
+an exception instead of being guessed or sent in a mixed-prefix request. Customer-supplied
+encryption headers are not mechanically renamed because GCS uses a different contract. ACL headers
+are not included without an actual ClickHouse call site and a validated GCS mapping.
 
 A live GCS characterization test covers `Default` HEAD, GET, LIST, PUT with metadata, CopyObject,
-and multipart before the blanket adapter is removed. This is a release gate: unit tests can prove
-the allowlist, but cannot prove that GCS accepts the resulting authenticated wire requests.
+DELETE, batch `DeleteObjects`, multipart, and an upload that exercises any SDK checksum or chunked
+framing selected by the production configuration before the blanket adapter is removed. This is a
+release gate: unit tests can prove the allowlist, but cannot prove that GCS accepts the resulting
+authenticated wire requests.
 
 This characterization is separate from the compatibility test for the established ordinary-S3
 HMAC path. Neither path may require a configuration migration for non-CAS users.
@@ -202,9 +210,11 @@ The mode is represented only by C++ fields:
 - request and response adaptation read the field from that same HTTP request object;
 - headers, `extra_headers`, signatures, and serialized bytes contain no representation of the mode.
 
-The AWS SDK creates a fresh HTTP request for each retry and post-redirect attempt, then calls
-`Client::BuildHttpRequest` again. Persistence therefore comes from deriving and copying the mode on
-every attempt, not from preserving state on an earlier HTTP request object.
+The vendored AWS SDK creates the initial HTTP request before the retry loop and unconditionally
+replaces it with a fresh request at the retry tail; a redirect changes the URI used for that
+replacement. It calls `Client::BuildHttpRequest` at the start of every attempt. Persistence
+therefore comes from deriving and copying the mode on every attempt, not from preserving state on
+an earlier HTTP request object.
 
 ### One CAS token dialect per backend {#one-cas-token-dialect-per-backend}
 
@@ -222,16 +232,17 @@ Every GCS `removeObjectIfTokenMatches` request uses `NativeConditional` before i
 client. Its numeric token must become `x-goog-if-generation-match`; it must never be sent as an
 ordinary ETag-valued `If-Match`.
 
-This invariant is safety- and liveness-critical. Missing the mode would make an exact GCS delete
-send the numeric generation as an ETag and return a visible false precondition failure. It cannot
-become an unconditional deletion because `SetIfMatch` is independent of the mode.
+This invariant is safety- and liveness-critical. Missing the mode would send the numeric generation
+as an ETag-valued `If-Match`. The design does not assume whether GCS rejects, compares, or ignores
+that raw header on DELETE; the presence of `SetIfMatch` alone is not a safety proof.
 
 The production mount capability battery exercises the same
 `ObjectStorageBackend::deleteExact` to `S3ObjectStorage::removeObjectIfTokenMatches` path with a
-known-correct token. A missing mode therefore rejects mount instead of becoming a later GC-only
-failure. Writable generation backends prohibit `skip_access_check=true`, so this protection applies
-to every writable GCS CAS mount. Read-only mounts may skip the battery because they expose no
-mutating surface and run no GC.
+known-wrong token and verifies that the object remains, then repeats with the known-correct token
+and verifies deletion. Rejection, incorrect comparison, or silent ignoring of the raw header fails
+one of those checks and rejects mount. Writable generation backends prohibit
+`skip_access_check=true`, so this protection applies to every writable GCS CAS mount. Read-only
+mounts may skip the battery because they expose no mutating surface and run no GC.
 
 ### Exact successful-write token {#exact-successful-write-token}
 
@@ -371,9 +382,10 @@ CAS GCS request cannot obtain its required generation and its caller raises an e
 implementation commit runs both CAS integration coverage and an ordinary S3 lane with this assertion
 enabled to expose any unanticipated construction path.
 
-On every AWS SDK attempt, including an attempt after redirect, the factory creates a new
-`ExtendedHttpRequest` and `Client::BuildHttpRequest` re-derives the mode from the persistent AWS
-operation wrapper. Interceptors mutate this same HTTP object; body chunking wraps only its stream.
+The factory creates the initial `ExtendedHttpRequest` and the replacement used by every retry. A
+redirect only changes the URI before retry construction. `Client::BuildHttpRequest` re-derives the
+mode from the persistent AWS operation wrapper on every attempt. Interceptors mutate the current
+HTTP object; body chunking wraps only its stream.
 
 ### CAS metadata API {#cas-metadata-api}
 
@@ -597,15 +609,19 @@ Add characterization coverage for the HMAC path present in merge base `5e8eaeb4d
 client selection, `access_key_id` and `secret_access_key`, AWS SigV4, and `x-amz-*` interoperability
 headers. For non-CAS HEAD, GET, LIST, PUT with metadata, CopyObject, DELETE, and multipart, assert
 that configuration parsing, authentication selection, request headers, response ETags, and errors
-are unchanged. This path must retain `native_conditional=false` and must not require
-`http_client=gcs_hmac`.
+are unchanged. Include batch `DeleteObjects` and the SDK-generated checksum headers it requires. This
+path must retain `native_conditional=false` and must not require `http_client=gcs_hmac`.
 
 ### Dedicated GOOG4 characterization {#dedicated-goog4-characterization}
 
 Add a separate live-GCS characterization for `gcs_hmac` `Default` requests that proves the explicit
-authentication allowlist supports HEAD, GET, LIST, PUT with metadata, CopyObject, and multipart,
-preserves response ETags, and never applies generation preconditions. The existing
-`http_client=gcs_hmac` configuration spelling and credential fields remain accepted unchanged.
+authentication allowlist supports HEAD, GET, LIST, PUT with metadata, CopyObject, DELETE, batch
+`DeleteObjects`, multipart, and production checksum/chunked upload behavior. It preserves response
+ETags and never applies generation preconditions. The existing `http_client=gcs_hmac`
+configuration spelling and credential fields remain accepted unchanged.
+
+Unit tests enumerate the disposition of every allowed SDK-generated `x-amz-*` header, including
+checksum and stream-framing headers, and prove that an unknown extension still raises an exception.
 
 ### User-visible ETag and cache consistency {#user-visible-etag-and-cache-consistency}
 
@@ -630,8 +646,9 @@ ordinary HEAD
 
 Assert that the factory creates `ExtendedHttpRequest` for every operation, only CAS operations have
 its typed field set, and the final ordinary operation is unaffected by prior CAS traffic. Force an
-SDK retry and redirect; assert that the mode is copied again to each newly-created HTTP request from
-the AWS operation wrapper and receives the same request/response dialect.
+ordinary retry and a redirect; assert that the factory creates the retry request in both cases and
+that `Client::BuildHttpRequest` copies the mode again on every attempt from the AWS operation
+wrapper.
 
 Run the initial CAS integration and ordinary S3 lane with the `ExtendedHttpRequest` cast assertion
 enabled. A dedicated unit test also supplies a foreign `HttpRequest` and verifies the release-path
@@ -651,7 +668,9 @@ Capture `removeObjectIfTokenMatches` and prove:
 - matching generation removes the object;
 - stale generation maps to `TokenMismatch`;
 - a `Default` ordinary DELETE remains unchanged;
-- the production capability battery uses this exact method and rejects a missing typed mode;
+- the production capability battery uses this exact method, verifies both wrong-token preservation
+  and correct-token deletion, and rejects a missing typed mode whether GCS rejects or ignores the
+  resulting raw `If-Match`;
 - writable generation mode rejects `skip_access_check=true`, while read-only mode remains allowed.
 
 ### Single-PUT and multipart tests {#single-put-and-multipart-tests}
@@ -814,6 +833,9 @@ The design is acceptable only if reviewers can confirm all of the following:
 - ordinary `gcp_oauth` traffic is identical to pre-CAS upstream behavior;
 - `Default` `gcs_hmac` traffic has an explicit authentication-only contract and live
   characterization;
+- the dedicated GOOG4 allowlist covers SDK-generated checksum and stream-framing headers, while
+  unknown `x-amz-*` extensions still fail closed;
+- live `Default` `gcs_hmac` coverage includes DELETE and batch `DeleteObjects`;
 - no existing non-CAS authentication selector or credential field is renamed or removed;
 - request mode, retry profile, and authentication are independent;
 - every transmitted S3 request is an `ExtendedHttpRequest`, and `Client::BuildHttpRequest` derives
