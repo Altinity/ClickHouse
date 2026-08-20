@@ -18,3 +18,9 @@ short-lived TODO, not the record.
 - Plan: prefix `shadowNamespace` with `server_root_id` + the two `"shadow/"` enumeration scopes
   (`ContentAddressedMetadataStorage.cpp:1281`, `:1513`, `:1700`) + stateless two-root isolation test.
 - Scheduled: tomorrow, before the release.
+
+## 3. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+
+- Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
+  `docs/superpowers/specs/` — same date/topic).
+- Owned by the parallel session; before release: confirm it landed (or record its cut-line), gate green.
