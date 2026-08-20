@@ -90,10 +90,10 @@ namespace ProfileEvents
     extern const Event DataLakeRestCatalogGetTableMetadataMicroseconds;
     extern const Event DataLakeRestCatalogGetCredentials;
     extern const Event DataLakeRestCatalogGetCredentialsMicroseconds;
-    extern const Event DataLakeRestCatalogAuthTokenCacheHits;
-    extern const Event DataLakeRestCatalogAuthTokenRefreshed;
+    extern const Event DataLakeRestCatalogAuthTokenCachedValid;
+    extern const Event DataLakeRestCatalogAuthTokenRetrieve;
     extern const Event DataLakeRestCatalogAuthTokenRefreshedMicroseconds;
-    extern const Event DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized;
+    extern const Event DataLakeRestCatalogUnauthorized;
     extern const Event DataLakeRestCatalogCreateNamespace;
     extern const Event DataLakeRestCatalogCreateNamespaceMicroseconds;
     extern const Event DataLakeRestCatalogCreateTable;
@@ -402,7 +402,7 @@ String OneLakeCatalog::getBearerToken() const
 
 AccessToken RestCatalog::retrieveAccessToken() const
 {
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
 
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
@@ -587,7 +587,7 @@ AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() con
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessToken() const
 {
-    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshed);
+    ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRetrieve);
     auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedMicroseconds);
 
     if (!google_adc_client_id.empty() && !google_adc_client_secret.empty() && !google_adc_refresh_token.empty())
@@ -731,7 +731,7 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
         bool used_cached_oauth_token = false;
         auto buf = create_buffer(false, used_cached_oauth_token);
         if (used_cached_oauth_token)
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
         return buf;
     }
     catch (const DB::HTTPException & e)
@@ -741,7 +741,7 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
             (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
             bool used_cached_oauth_token_on_retry = false;
             return create_buffer(true, used_cached_oauth_token_on_retry);
         }
@@ -1450,7 +1450,7 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
             wb->ignoreAll();
 
         if (used_cached_oauth_token)
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCachedValid);
     }
     catch (const DB::HTTPException & e)
     {
@@ -1459,7 +1459,7 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
             (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogUnauthorized);
             bool used_cached_oauth_token_on_retry = false;
             auto wb = create_buffer(true, used_cached_oauth_token_on_retry);
 
