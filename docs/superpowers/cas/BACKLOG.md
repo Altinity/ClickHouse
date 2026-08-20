@@ -578,3 +578,56 @@ silent-refusal upstream bug (below). Items:
   both sides; the receiver collapses refusal vs transport failure vs timeout into one message — the
   reporter's logs could not distinguish them even in principle. This adjudication would have taken
   minutes with (b)+(c) implemented.
+
+## Issue #2243 CONFIRMED: local port exhaustion fences out the mount lease (2026-08-20) {#issue-2243-port-exhaustion-lease}
+
+https://github.com/Altinity/ClickHouse/issues/2243 — read-heavy concurrent `SELECT FINAL` on a CAS
+default-policy disk exhausts the container's ephemeral ports (errno 99 `EADDRNOTAVAIL`), which kills
+the mount-lease renewal → fence → `TransientNotLive` → ~42 s full-disk refusal → self-remount discards
+in-flight `PartWriteTxn`s. CONFIRMED REAL (adjudicated from code; mechanism matches our own S07 finding
+from 2026-07-06). The rev.8 fail-close chain itself worked exactly as designed; the defects are in the
+trigger and its classification.
+
+Mechanism (verified at file:line): the S3 client keep-alive default is 5 s (`S3Defines.h:12`); pooled
+DISK connections expire at 0.8×5 s idle (0.1×5 s once the group crosses `disk_connections_soft_limit`),
+`mustReconnect` resets any connection whose request STARTED > 4.5 s ago, and `http_keep_alive_max_requests`
+rotates every 100 requests. With P pooled connections and R req/s, reuse survives only while P/R < 4 s —
+concurrent FINAL prefetch puts P in the dead band, so nearly every request connects fresh and the CLIENT
+closes on return → TIME_WAIT at request rate (reporter: ~430 GET/s × 60 s ≈ 26k of 28,232 ports). The
+store honoring keep-alive is irrelevant. Retry amplification: `EADDRNOTAVAIL` is classified as remote
+transient at EVERY layer (Poco → `CoreErrors::NETWORK_CONNECTION` → retryable; CAS controller →
+`Unresolved`); reads ride `s3_retry_attempts=500`. Lease renewal = ONE bare single-attempt PUT per 10 s
+through the same DISK pool (no reserve, no controller budget — WEAKER than any data write); outage length
+is constructive: `mountObservationThresholdMs = ttl + 5% + cadence = 36.5 s` (field answer to
+{#fence-window blast radius}'s "measure where remount time goes").
+
+Fix directions, in value order:
+- (1) **Classify local socket-resource errors as local** (`EADDRNOTAVAIL`, `EMFILE`, `ENFILE`): hard
+  backoff instead of retry-at-rate. Template = the existing DNS sub-classification branch
+  (`PocoHTTPClient.cpp:840`); CAS side maps it out of `Unresolved`'s full budget. Retry loops are the
+  positive-feedback term — this cuts the amplifier.
+- (2) **Mount-lease resilience**: in-period fast retry (today a failed renewal waits the FULL next
+  period — `CasServerRoot.cpp:1437` `continue` re-enters `wait_for(period)`), and/or reserved
+  connection / dedicated small budget for the renewal PUT. Note the margin arithmetic: ttl=30s /
+  period=10s / margin=2s allows at most TWO ride-out warnings per lease generation, not three.
+- (3) **Keep-alive defaults for CAS-over-S3 profiles**: 5 s TTL + 100-request rotation is the churn
+  engine under sustained read concurrency; evaluate raising `http_keep_alive_timeout` (60 s) and
+  `http_keep_alive_max_requests` in the CAS disk profile / docs. Caveat: the server-advertised
+  `Keep-Alive: timeout=N` header mins the client value (`HTTPClientSession.cpp:377`) — capture what
+  RustFS advertises first. Diagnostic BEFORE any change: `DiskConnectionsCreated/Reused/Expired/Reset/
+  Preserved` + `DiskConnectionsTotal/Stored` (prediction: Created≈request rate, Expired>>Reset, Stored≈0;
+  if Reset>>Expired the cause is the non-drained-body branch and the fix belongs in the read path).
+- (4) NOT a fix: capping pool limits below the ephemeral range (reporter's #1) — limits gate KEEPING,
+  not CREATING; TIME_WAIT is invisible to them (hence errno 99, never `HTTP_CONNECTION_LIMIT_REACHED`);
+  lower caps flip the pool into the 0.5 s TTL regime sooner and worsen churn.
+
+Housekeeping folded in:
+- **S07 wide-part port-exhaustion finding re-rated**: was closed 2026-07-06 as "cost/latency only, not a
+  data bug" (`performance.md:131`, DESIRABLE) — #2243 refutes that scope: the same condition takes the
+  LEASE down and discards in-flight write txns. Availability class, not just cost.
+- **[B196] is stale as written**: `s3_max_connections` is dead code for the disk path (an AWS-SDK
+  `ClientConfiguration` field; `PocoHTTPClient` never reads `maxConnections`) — the disk path is governed
+  by `disk_connections_*` + keep-alive, and NONE of those caps concurrent socket creation either.
+- **Soak-harness blind spot**: `soak/cluster.py` classifies "mount lease not held" as retryable
+  `NETWORK_ERROR` — our own soaks would ride through a #2243 event and score it recoverable; add a
+  lease-loss detector (count `TransientNotLive` windows / `CasMountLeaseKeeper` errors) to checkpoints.
