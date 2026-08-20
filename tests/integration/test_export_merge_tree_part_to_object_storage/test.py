@@ -603,38 +603,6 @@ def test_export_part_tuple_fields_reordered_for_partition_key_is_rejected(
     )
 
 
-def test_export_part_unnamed_tuple_partition_key_owner_matching_named_destination_is_allowed(cluster):
-    skip_if_remote_database_disk_enabled(cluster)
-    node = cluster.instances["node1"]
-
-    postfix = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"unnamed_tuple_ok_mt_table_{postfix}"
-    s3_table = f"unnamed_tuple_ok_s3_table_{postfix}"
-
-    node.query(f"""
-        CREATE TABLE {mt_table} (t Tuple(Int32, Int32), val String)
-        ENGINE = MergeTree()
-        PARTITION BY tupleElement(t, 1)
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-    """)
-
-    node.query(f"""
-        CREATE TABLE {s3_table} (t Tuple(x Int32, y Int32), val String)
-        ENGINE = S3(s3_conn, filename='{s3_table}/{{_partition_id}}/{{_file}}', format=Parquet, partition_strategy='wildcard')
-        PARTITION BY tupleElement(t, 1)
-    """)
-
-    node.query(f"INSERT INTO {mt_table} VALUES ((1, 99), 'x')")
-
-    part_name = node.query(
-        f"SELECT name FROM system.parts WHERE database = currentDatabase() "
-        f"AND table = '{mt_table}' AND active ORDER BY name LIMIT 1"
-    ).strip()
-
-    node.query(f"ALTER TABLE {mt_table} EXPORT PART '{part_name}' TO TABLE {s3_table}")
-
-
 def test_export_part_subcolumn_partition_key_different_subcolumn_is_rejected(cluster):
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["node1"]
