@@ -56,7 +56,14 @@ short-lived TODO, not the record.
   every persisted format — only cheap pre-release, never again.
 - Mechanical sweep: codex dispatch, review here.
 
-## 7. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 7. Fix #2219 — relink refusal must not log Error + stack trace {#fix-2219}
+
+- Issue: https://github.com/Altinity/ClickHouse/issues/2219 (CONFIRMED, cosmetic; misdirects triage)
+- Full record + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#issue-2219-relink-refusal-log-level}`
+- Plan: new generic error code `FETCH_ABANDONED_WILL_RETRY` at both relink retry-later throw sites in
+  `DataPartsExchange.cpp` + fourth demotion branch in `processQueueEntry` (`LOG_INFO`, no stack trace).
+
+## 8. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).

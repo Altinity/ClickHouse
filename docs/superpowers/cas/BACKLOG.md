@@ -813,3 +813,25 @@ while nothing persisted exists — [[feedback_ca_no_compat_scaffolding_predev]])
 - rewrite the README key-naming convention line in the same commit (its own rule).
 Mechanical sweep → codex candidate per [[feedback_delegate_mechanical_to_codex_luna]], with the
 golden regeneration reviewed here.
+
+## Issue #2219: relink refusals logged at Error with stack trace (adjudicated 2026-08-21, fix queued) {#issue-2219-relink-refusal-log-level}
+
+https://github.com/Altinity/ClickHouse/issues/2219 — CONFIRMED, cosmetic but worth fixing (the issue
+documents a multi-hour false triage chasing a network fault that wasn't there; up to 53% of relink
+proofs refuse under small-part load, each printing `Error` + stack trace + `NETWORK_ERROR`).
+
+Mechanism: the throw site is fine (`DataPartsExchange.cpp` taxonomy row 3, ~:1550 — deliberately
+thrown so the byte-fallback does NOT run); the noise comes from the generic queue handler
+`StorageReplicatedMergeTree::processQueueEntry` (:4224-4239), whose demotion list
+(`NO_REPLICA_HAS_PART`/`ABORTED`/`PART_IS_TEMPORARILY_LOCKED` → `LOG_INFO`, no stack trace) does not
+know this code. `NETWORK_ERROR` is NOT load-bearing on this path — no `e.code()` branch in the queue
+or fetch path tests it; "retry-later" is the default for any stored exception.
+
+Fix: dedicated generically-named error code (e.g. `FETCH_ABANDONED_WILL_RETRY`), thrown from taxonomy
+row 3 AND the adjacent `CaRelinkPromote::Unresolved` throw (same retry-later class), plus a fourth
+branch in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace. Generic-code touch is
+one branch with generic semantics ("fetch abandoned, will be retried"), no CA-specific concept —
+compatible with [[feedback_cas_upstream_coupling_minimization]]. Rejected: reusing `ABORTED`
+(overloaded with shutdown semantics); demoting all `NETWORK_ERROR` (hides real network faults).
+Sender side already logs at `Debug` — receiver only. Also fixes the misdirecting `(NETWORK_ERROR)`
+label the issue complains about.
