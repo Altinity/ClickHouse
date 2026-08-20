@@ -16,7 +16,7 @@
 
 | ID | Статус | Приоритет | BACKLOG | До релиза? | Summary |
 |----|--------|-----------|---------|------------|---------|
-| CAS-001 | ⏳ | — | — | — | — |
+| CAS-001 | подтверждено (↗ #2212) | P1 | [{#issue-2212-shadow-namespace}](BACKLOG.md#issue-2212-shadow-namespace) | да | shadow/FREEZE namespace пул-глобальный; UNFREEZE одного сервера удаляет frozen-парты другого |
 | CAS-002 | ⏳ | — | — | — | — |
 | CAS-003 | ⏳ | — | — | — | — |
 | CAS-004 | ⏳ | — | — | — | — |
@@ -155,3 +155,28 @@
 ---
 
 # Детали по findings {#details}
+
+## CAS-001 — shadow/FREEZE namespace пул-глобальный (подтверждено, P1) {#cas-001}
+
+**Вердикт: подтверждено; уже выделено в #2212 и стоит в предрелизном списке.**
+
+Ядро утверждения верно и было независимо подтверждено при адьюдикации
+https://github.com/Altinity/ClickHouse/issues/2212 (2026-08-20): `shadowNamespace`
+(`ContentAddressedMetadataStorage.cpp:1281`) строит namespace из literal
+`shadow/<backup>/...`-пути **без** `serverPrefix()`, в отличие от `liveNamespace`. Комментарий на
+месте называет это намеренным («backups are read by any replica»), но следствие — два сервера с
+разными `server_root_id` на одном пуле являются несинхронизированными писателями одной shadow
+ref-таблицы, и `UNFREEZE` любого из них удаляет frozen-парты обоих — принято как data-loss-класс.
+Фикс (префикс `server_root_id` + две точки перечисления `"shadow/"`: `:1281`, `:1513`, `:1700` +
+тест изоляции двух рутов) записан: BACKLOG `{#issue-2212-shadow-namespace}`, предрелизный список
+`final-checks-todo.md` пункт 2.
+
+Побочные утверждения detail-файла:
+- «`DROP TABLE` оставляет shadow-refs, пиннящие байты навсегда» — **by-design**: это семантика
+  апстримного `FREEZE` (бэкап переживает DROP таблицы и на локальном диске; освобождение — через
+  `SYSTEM UNFREEZE`). Не дефект CAS.
+- «отсутствие префикса отключает watermark floor / orphan-manifest sweep для этих namespace» —
+  пересекается с CAS-022 (sweep и namespace без catalog-строки); разобрано там; на вердикт CAS-001
+  не влияет — фикс #2212 переводит shadow-namespace в обычную per-root форму.
+
+Статус в issue (`↗ split-out (#2212)`) корректен.
