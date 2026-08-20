@@ -19,7 +19,17 @@ short-lived TODO, not the record.
   (`ContentAddressedMetadataStorage.cpp:1281`, `:1513`, `:1700`) + stateless two-root isolation test.
 - Scheduled: tomorrow, before the release.
 
-## 3. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 3. Fix #2244 — lease/remount retry asymmetry {#fix-2244}
+
+- Issue: https://github.com/Altinity/ClickHouse/issues/2244 (filed from the CI RCA of job 96307284077)
+- Full record + fix directions (value order): `docs/superpowers/cas/BACKLOG.md`
+  `{#issue-2244-lease-retry-asymmetry}` — (1) in-period renewal retries, (2) per-step remount-chain
+  retries + own-ambiguous-claim window-reset check, (3) trip/remount observability + ProfileEvents,
+  (4) rate-limit the snapshot-publication refusal loop.
+- Minimum pre-release cut: (1) alone prevents the observed trip class; (3)-(4) are cheap; (2) can
+  follow the release if time runs out.
+
+## 4. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
