@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS GCS request isolation design {#cas-gcs-request-isolation-design}
 
-**Status:** DRAFT for review, rev.4 (2026-08-20). This specification defines the target state. The
+**Status:** DRAFT for review, rev.5 (2026-08-20). This specification defines the target state. The
 current branch already contains the GCS conditional adapter and response generation override
 (`41a247e3310`), plus their authentication-wide wiring and the `gcs_hmac` client
 (`9604d6a5be9`); their current behavior and the required target-state changes are described below.
@@ -56,6 +56,33 @@ Three authentication paths must not be conflated:
 
 “Fork-specific GOOG4 implementation” therefore does not mean that GCS HMAC authentication itself
 is new. It identifies only the dedicated GOOG4 path behind `http_client=gcs_hmac`.
+
+### Authentication paths and user impact {#authentication-paths-and-user-impact}
+
+HMAC credentials describe key material and a cryptographic primitive, not one unique wire
+protocol. ClickHouse therefore has two HMAC paths with different compatibility contracts, plus the
+OAuth path:
+
+| User configuration | Wire authentication | Target non-CAS behavior | CAS generation behavior |
+|---|---|---|---|
+| Ordinary S3 client with `access_key_id` and `secret_access_key` | AWS SigV4 with `x-amz-*` through GCS S3 interoperability | Existing configuration, operations, errors, and ETag semantics remain unchanged | Does not opt into generations implicitly; select `http_client=gcs_hmac` when the GCS generation contract is required |
+| `http_client=gcp_oauth` | OAuth Bearer authentication | Pre-CAS OAuth behavior and server ETags | CAS-owned `NativeConditional` requests use GCS generations |
+| `http_client=gcs_hmac` | GOOG4-HMAC-SHA256 with `x-goog-*` | GOOG4 authentication with server ETags; the existing selector and credential fields remain unchanged | CAS-owned `NativeConditional` requests use GCS generations |
+
+The ordinary HMAC path is retained because it is an established user-facing S3-compatible API and
+does not need Google-native generation semantics. Migrating it automatically to GOOG4 would change
+authentication headers, signing, and ETag behavior for non-CAS users without providing them a
+benefit.
+
+The dedicated GOOG4 path exists because CAS must translate its exact-write and exact-delete
+conditions into Google generation headers and then authenticate the translated request. It applies
+the adapter before GOOG4 signing, so the final `x-goog-*` request is signed consistently. Request
+mode remains independent of authentication: `Default` means authentication plus ordinary ETag
+semantics, while only `NativeConditional` adds generation semantics.
+
+Consequently, existing non-CAS users do not migrate configuration. CAS over GCS with OAuth keeps
+`gcp_oauth`; CAS over GCS with HMAC generations uses the already-exposed
+`http_client=gcs_hmac`. No storage-wide CAS flag changes ordinary requests sharing either client.
 
 The OAuth behavior is already a concrete bug, not merely a future risk. HEAD and GET response
 headers can yield a numeric generation through the SDK ETag field, while LIST parses its ETag from
@@ -780,6 +807,8 @@ The design is acceptable only if reviewers can confirm all of the following:
 
 - the current landed behavior and the provenance of all three GCS authentication paths are stated
   accurately;
+- the two HMAC paths are distinguished by their signing protocol and compatibility contract, not
+  described as different kinds of credentials;
 - existing ordinary-S3 GCS HMAC authentication is recognized as a merge-base feature and remains
   behaviorally and configurationally unchanged for non-CAS use;
 - ordinary `gcp_oauth` traffic is identical to pre-CAS upstream behavior;
