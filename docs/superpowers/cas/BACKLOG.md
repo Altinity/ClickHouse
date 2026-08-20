@@ -772,10 +772,20 @@ first-class and visible:
 - add a `finish` column (`Success`/`NotALeader`/`Deferred` — already exists in `cas_gc_log`, the
   interpreter row just doesn't emit it) to the `RUN` result set, so the operator reads a word, not
   infers from `acquired_lease=0` + zeros;
-- docs `{#sql-gc-run}`: state the leadership model + the leader-discovery query
-  (`clusterAllReplicas('{cluster}', system.cas_mounts) WHERE is_leader = 1` — works today, executes
-  locally per replica);
-- optional cheap extra: host identity in `GcLease` (durable-format, pre-release so no compat
-  scaffolding — [[feedback_ca_no_compat_scaffolding_predev]]) so a follower row can carry
-  `leader_host` and name the holder directly.
+- add advisory identity to `GcLease`, mirroring the existing `MountLease` precedent
+  (`CasServerRootFormats.h` carries `hostname`/`pid`/`server_uuid` next to its protocol fields for
+  exactly this purpose): `hostname` (+ `server_uuid`/`pid` for symmetry), written at acquire/steal.
+  The protocol part stays untouched — `owner` MUST remain a random per-process-instance UInt128
+  (a restarted server is a NEW GC actor and must not resume the old lease; hostname is neither
+  unique nor per-instance), which is WHY host identity was never the owner: the advisory field was
+  simply never needed until #2211 (YAGNI, not a considered rejection — no record deciding against
+  it). Durable-format change, pre-release so no compat scaffolding
+  ([[feedback_ca_no_compat_scaffolding_predev]]);
+- follower `RUN` row then carries `leader_host` — `NotALeader, leader_host='replica-2'` in one read,
+  no operator discovery query. Rejected as contract (user call): documenting a
+  `clusterAllReplicas(system.cas_mounts) WHERE is_leader=1` discovery recipe as the way to find the
+  leader — too strange a requirement once the row can name the holder;
+- bonus: `system.cas_mounts.is_leader` can be populated for ALL rows (match `gc/state`
+  hostname/server_uuid against mount slots), not local-only;
+- docs `{#sql-gc-run}`: state the leadership model in one sentence.
 No-steal on manual `RUN` stays untouched.
