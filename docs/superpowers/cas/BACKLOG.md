@@ -527,16 +527,17 @@ Follow-ups, in recommended packaging:
   rename the pin tests to read as spec. ~150-250 line diff + test renames; controller = adversarial
   review mandatory. This addresses the CORE of CAS-021 at the type level: the external auditor's
   reading becomes impossible to write.
-- (2) **Stale condemn-marker memoization fix** (small BEHAVIOR change, separate commit): the
-  in-process `condemn_markers_confirmed` note survives a legitimate `Condemned -> Clean` transition
-  (`forgetCondemnMarker` fires on redelete/spare/supersede but not on resurrect-without-intervening-
-  fold), so `confirm_condemned_marker` (`CasGc.cpp:1885`) can graduate an entry whose durable meta
-  says Clean → spurious `delete_pending` + no-op `deleteExact` (TokenMismatch; NO data loss — body
-  saved by incarnation rotation; GC self-heals at `:862-870`). Fix: drop the memoized short-circuit
-  at graduation (the `loadMeta` fallback at `:1890-1897` already exists — always take it), keeping
-  memoization at most round-local. COST TO ASSESS FIRST: +1 GET per graduating condemned entry per
-  round (P9 GET-budget lesson); mitigation = re-read only confirmations memoized in earlier rounds.
-  1-2 gtests (resurrect-between-folds), gate + short soak.
+- (2) **Stale condemn-marker memoization — ACCEPTED RESIDUAL, do NOT fix with re-reads** (user
+  decision 2026-08-20): the in-process `condemn_markers_confirmed` note survives a legitimate
+  `Condemned -> Clean` transition (no `forgetCondemnMarker` on resurrect-without-intervening-fold),
+  so `confirm_condemned_marker` (`CasGc.cpp:1885`) can graduate an entry whose durable meta says
+  Clean. Consequence when it fires (ultra-rare race): ONE spurious `deleteExact` — an S3 DELETE,
+  which is FREE — self-healing at `CasGc.cpp:862-870` (TokenMismatch drops the confirmation, meta
+  untouched). The re-read fix would cost +1 BILLABLE GET per graduating condemned entry on the
+  COMMON path (P9 GET-budget class) to save free DELETEs in a rare race — worse than the disease.
+  No zero-cost invalidation exists either (the window is by definition "nothing observed the
+  resurrect"). Only sanctioned improvement: the observability LABEL at the self-heal site (counter/
+  log as "spared by token rotation", not an anomaly) — zero extra requests; fold into (1) if done.
 - (3) One trust-model paragraph for conditional writes in the numbered doc set
   (`03-writer-protocol.md`) — documentation only.
 
