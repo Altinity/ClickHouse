@@ -1162,9 +1162,10 @@ def test_export_part_tuple_subcolumn_partition_key_iceberg_rejected(cluster):
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1"
     )
-    assert "Unknown field to partition" in export_error, (
-        f"Expected export validation to reject the tuple subcolumn partition key of {mt}, "
-        f"got: {export_error!r}"
+    assert "different Tuple element layout" in export_error, (
+        f"The destination declares the elements of `t` in the opposite order, so the export "
+        f"of the tuple subcolumn partition key of {mt} has to be rejected, got: "
+        f"{export_error!r}"
     )
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())

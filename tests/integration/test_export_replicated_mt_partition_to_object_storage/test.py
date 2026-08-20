@@ -2016,12 +2016,14 @@ def test_export_partition_dest_finer_expression_single_partition_accepted(cluste
     node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
     wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
 
+    # A wildcard destination cannot be read as a table, so read the objects it wrote.
+    exported = f"s3(s3_conn, filename='{s3_table}/**/*.parquet', format='Parquet', structure='id UInt64, x UInt64')"
     src = node.query(f"SELECT id, x FROM {mt_table} ORDER BY id")
-    dst = node.query(f"SELECT id, x FROM {s3_table} ORDER BY id")
+    dst = node.query(f"SELECT id, x FROM {exported} ORDER BY id")
     assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
 
     directories = node.query(
-        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {s3_table}"
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {exported}"
     ).strip()
     assert directories == f"{s3_table}/1", f"unexpected destination directories: {directories!r}"
 
@@ -2050,12 +2052,13 @@ def test_export_partition_dest_nested_expression_accepted(cluster):
     node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}")
     wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
 
+    exported = f"s3(s3_conn, filename='{s3_table}/**/*.parquet', format='Parquet', structure='id UInt64, ts DateTime')"
     src = node.query(f"SELECT id, ts FROM {mt_table} ORDER BY id")
-    dst = node.query(f"SELECT id, ts FROM {s3_table} ORDER BY id")
+    dst = node.query(f"SELECT id, ts FROM {exported} ORDER BY id")
     assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
 
     directories = node.query(
-        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {s3_table}"
+        f"SELECT DISTINCT extract(_path, '{s3_table}/[^/]*') FROM {exported}"
     ).strip()
     assert directories == f"{s3_table}/202403", (
         f"unexpected destination directories: {directories!r}"
@@ -2123,38 +2126,12 @@ REJECTED_PARTITION_EXPORT_CASES = [
     pytest.param(
         RejectedPartitionExportCase(
             src_columns="a Int32, b Int32, c Int32, val String",
-            src_partition_by="(a, b, c)",
-            dst_columns="a Int32, b Int32, c Int32, val String",
-            dst_partition_by="(c, b, a)",
-            insert_values="(1, 2, 3, 'x')",
-            error_substrings=(
-                "Tables have different partition key",
-            ),
-        ),
-        id="multi_column_partition_key_order_mismatch",
-    ),
-    pytest.param(
-        RejectedPartitionExportCase(
-            src_columns="a Int32, b Int32, c Int32, val String",
-            src_partition_by="(a, b, c)",
-            dst_columns="a Int32, b Int32, c Int32, val String",
-            dst_partition_by="(a, b)",
-            insert_values="(1, 2, 3, 'x')",
-            error_substrings=(
-                "Tables have different partition key",
-            ),
-        ),
-        id="multi_column_partition_key_fewer_in_destination",
-    ),
-    pytest.param(
-        RejectedPartitionExportCase(
-            src_columns="a Int32, b Int32, c Int32, val String",
             src_partition_by="(a, b)",
             dst_columns="a Int32, b Int32, c Int32, val String",
             dst_partition_by="(a, b, c)",
             insert_values="(1, 2, 3, 'x')",
             error_substrings=(
-                "Tables have different partition key",
+                "column 'c', which is not part of the source MergeTree partition key",
             ),
         ),
         id="multi_column_partition_key_more_in_destination",
@@ -2203,7 +2180,15 @@ def test_export_partition_partition_key_mismatch_variants_are_rejected(cluster, 
     assert count == 0, f"Expected 0 rows in destination after rejected export, got {count}"
 
 
-def test_export_partition_multi_column_partition_key_success(cluster):
+@pytest.mark.parametrize(
+    "dst_partition_by",
+    ["(a, b, c)", "(c, b, a)", "(a, b)"],
+    ids=["same", "reordered", "coarser"],
+)
+def test_export_partition_multi_column_partition_key_success(cluster, dst_partition_by):
+    """The source key pins every column the destination partitions by, so the destination may
+    also name them in another order or leave some out: each destination expression is still
+    single-valued over a source partition."""
     skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
@@ -2221,7 +2206,7 @@ def test_export_partition_multi_column_partition_key_success(cluster):
     node.query(f"""
         CREATE TABLE {s3_table} (a Int32, b Int32, c Int32, val String)
         ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
-        PARTITION BY (a, b, c)
+        PARTITION BY {dst_partition_by}
     """)
 
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2, 3, 'x'), (1, 2, 3, 'y')")
