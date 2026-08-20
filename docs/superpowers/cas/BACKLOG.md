@@ -762,11 +762,20 @@ Also confirmed: `GcLease` is `{owner: UInt128 random gc_id, seq}` — no host id
 (`CasGcStateFormat.h:17`), and `system.cas_mounts.is_leader` is populated only for the local mount,
 so a follower cannot name the leader today.
 
-Fix shape (agrees with the issue's preference order):
-- Follower `RUN` → exception (`this node does not hold the GC lease; no round was run`), pointing at
-  `ON CLUSTER` / `system.cas_mounts`. Decide the `ON CLUSTER` semantics at fix time: per-host errors
-  from followers make the fan-out noisy-but-honest; the alternative is a dedicated aggregate check.
-- Optionally add a host identity to `GcLease` so the error can name the holder — durable-format
-  change, pre-release so no compat scaffolding needed ([[feedback_ca_no_compat_scaffolding_predev]]);
-  cheap now, expensive later.
-- Docs: `{#sql-gc-run}` must state the leadership model either way.
+Fix shape (DECIDED 2026-08-21, user call): keep the quiet idempotent OK — no exception. Rationale:
+with default `distributed_ddl_output_mode=throw`, a throwing follower inverts the bug for
+`ON CLUSTER` (leader ran the round, N-1 followers threw, the statement reports failure), and a node
+inside the DDL fan-out cannot tell it is part of `ON CLUSTER`, so selective throwing is impossible.
+A follower's "not my lease" is a valid outcome of "run a round here if this node may", and quiet OK
+keeps scripts/harnesses that poke `RUN` on every node working. Instead, make the outcome
+first-class and visible:
+- add a `finish` column (`Success`/`NotALeader`/`Deferred` — already exists in `cas_gc_log`, the
+  interpreter row just doesn't emit it) to the `RUN` result set, so the operator reads a word, not
+  infers from `acquired_lease=0` + zeros;
+- docs `{#sql-gc-run}`: state the leadership model + the leader-discovery query
+  (`clusterAllReplicas('{cluster}', system.cas_mounts) WHERE is_leader = 1` — works today, executes
+  locally per replica);
+- optional cheap extra: host identity in `GcLease` (durable-format, pre-release so no compat
+  scaffolding — [[feedback_ca_no_compat_scaffolding_predev]]) so a follower row can carry
+  `leader_host` and name the holder directly.
+No-steal on manual `RUN` stays untouched.
