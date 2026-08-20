@@ -498,3 +498,46 @@ Not urgent: the emulated mode serves CI lanes, local development, and tests — 
 deployment runs CAS over local paths, and a single materialized body was this path's behaviour for
 its whole life. It is recorded because the current shape is a contradiction (a disk-backed backend
 buffering in memory), not because anything is on fire.
+
+## CAS-021 (issue #2207) adjudication follow-ups: controller-outcome honesty + condemn-memo staleness (2026-08-20) {#cas-021-followups}
+
+Adjudication of https://github.com/Altinity/ClickHouse/issues/2207 (two read-only code sweeps against
+HEAD `684161dcc03`): all six quoted controller behaviors are real, but every claimed integrity
+consequence is neutralized on the current tree — the delete path is guarded by the normative
+delete-site in-degree re-read (`CasBlobInDegree.cpp:423`, spec §5 arm 3), the exact-token delete
+against a resurrect-rotated `incarnation_tag` (`CasPartWriteTxn.cpp:741`), and the [C2] fence checks;
+the equality-resolved meta etag is consumed by NOBODY (`writeCondemnedMeta` reads only `.outcome`);
+the ref-log lane adjudicates authorship by byte equality over a payload that carries txn identity
+(`classifyRefLogOccupant`, `CasRefLedger.cpp:2240`); a false-`Occupied` → mount-fault path does not
+exist. GC's gate predicate is "durable Condemned evidence exists" — which the equality-resolve GET
+literally proves — same as the already-Condemned arm at `CasGc.cpp:137`.
+
+Follow-ups, in recommended packaging:
+
+- (1) **Honesty patch over the request controller** (one coherent change, NO durable-op/wire/behavior
+  change): split the equality-resolved outcome out of `Committed` (e.g. `IntendedStateDurable`), stop
+  returning the observed occupant token on that arm (it claims authorship no caller has; today unused
+  — make that structural); rename `slotOccupy`'s misleading `NotUnresolved` label; add the
+  "trust model" doc-block at the resolution ladder (what equality-resolve proves / does not prove,
+  pointers to the three system invariants that make it safe) and the ownership-decidability table by
+  key class (immutable content-addressed / mutable identity-in-payload / mutable identity-free /
+  owner-anchor `claimOwnerOrThrow`); cross-reference sentences at `writeCondemnedMeta` ("a foreign
+  Condemned marker satisfies the predicate by design, same as the `:137` arm") and
+  `writeResurrectMetaClean` ("false Committed = desired Clean record already durable — benign");
+  rename the pin tests to read as spec. ~150-250 line diff + test renames; controller = adversarial
+  review mandatory. This addresses the CORE of CAS-021 at the type level: the external auditor's
+  reading becomes impossible to write.
+- (2) **Stale condemn-marker memoization fix** (small BEHAVIOR change, separate commit): the
+  in-process `condemn_markers_confirmed` note survives a legitimate `Condemned -> Clean` transition
+  (`forgetCondemnMarker` fires on redelete/spare/supersede but not on resurrect-without-intervening-
+  fold), so `confirm_condemned_marker` (`CasGc.cpp:1885`) can graduate an entry whose durable meta
+  says Clean → spurious `delete_pending` + no-op `deleteExact` (TokenMismatch; NO data loss — body
+  saved by incarnation rotation; GC self-heals at `:862-870`). Fix: drop the memoized short-circuit
+  at graduation (the `loadMeta` fallback at `:1890-1897` already exists — always take it), keeping
+  memoization at most round-local. COST TO ASSESS FIRST: +1 GET per graduating condemned entry per
+  round (P9 GET-budget lesson); mitigation = re-read only confirmations memoized in earlier rounds.
+  1-2 gtests (resurrect-between-folds), gate + short soak.
+- (3) One trust-model paragraph for conditional writes in the numbered doc set
+  (`03-writer-protocol.md`) — documentation only.
+
+Issue response drafted (2026-08-20); post/adaptation is the user's call.
