@@ -542,3 +542,39 @@ Follow-ups, in recommended packaging:
   (`03-writer-protocol.md`) — documentation only.
 
 Issue response drafted (2026-08-20); post/adaptation is the user's call.
+
+## Issue #2233 adjudication residue: soak-harness observability + Poco shared-pool risk (2026-08-20) {#issue-2233-followups}
+
+Adjudication of https://github.com/Altinity/ClickHouse/issues/2233 ("replica HTTP dies on green-path soak
+after relink NETWORK_ERROR storm"): the refusal storm is the known, designed
+`{#relink-confirm-busy-lane}` behavior (all four remediations there still open — the per-ref rule-3
+refinement is the availability fix); the claimed causality "storm -> HTTP death" is contradicted by our
+own artifacts (a 90-minute phase-3 soak absorbed 112,598 refusals — peak 9,219/min — and ended
+`PHASE3 OK` with both replicas alive; the reporter saw ~278 total), and no fd/socket/thread leak exists
+on the abandoned-relink path (drain-then-throw + `SCOPE_EXIT` verified). Prime suspects for the
+reporter's observation: VM-level OOM (28g `mem_limit` x2 on a 16 GiB Docker Desktop VM; their upstream-
+compose symptom was "Connection refused after the peer exits") and the Poco shared-`server_pool`
+silent-refusal upstream bug (below). Items:
+
+- (1) **ca-soak compose: `ch2` has NO healthcheck** (`docker-compose.yml` — only `ch1` has the HTTP
+  `/ping` probe, added for capability-probe serialization). "Container healthy while HTTP dead" on ch2
+  is therefore vacuous. Add the same healthcheck to ch2. Trivial.
+- (2) **soak driver: `TRANSPORT FAILURE` is an `else`-branch catch-all** (`soak/run.py:2020-2026`) that
+  names a subsystem it never diagnosed — the same triage-misdirection failure mode #2219 complains
+  about, one layer up. Phase 1 additionally does exactly one attempt (`transport_resilient=False`) and
+  checkpoints do not gate on HTTP health (phase-2-only wait), so any transient `OSError` becomes the
+  issue's exact headline. Split the label (name the errno/op) and consider a phase-1 HTTP-health gate
+  at checkpoints. Small.
+- (3) **Poco shared-`server_pool` silent connection refusal — assess exposure** (upstream bug, comment
+  in `base/poco/Net/src/TCPServerDispatcher.cpp:154-180`): one `Poco::ThreadPool` capped at
+  `max_connections` is shared by 8123/HTTPS/native/9009; `_currentThreads` is per-dispatcher, so
+  saturation by long-lived interserver byte fetches can make the 8123 dispatcher drop accepted sockets
+  with NO ClickHouse-level error (client sees RST; at most a Poco `Warning`). Relink-storm second-order
+  effect: refusals suppress zero-byte relinks and FORCE long byte fetches, i.e. the storm converts
+  cheap transfers into thread-holding ones. Candidate observability first: expose refused-connection
+  counts / alarm on pool saturation before considering upstream surgery (upstream file = consult-first).
+- (4) **Confirm-path observability gaps** (feeds `{#relink-confirm-busy-lane}` items (b)/(c)): no
+  ProfileEvents pair for proven/refused confirms; refusal reason (which rule) logged only at Debug on
+  both sides; the receiver collapses refusal vs transport failure vs timeout into one message — the
+  reporter's logs could not distinguish them even in principle. This adjudication would have taken
+  minutes with (b)+(c) implemented.
