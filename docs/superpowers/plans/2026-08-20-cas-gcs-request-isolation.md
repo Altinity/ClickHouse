@@ -396,7 +396,8 @@ authentication artifacts: delete before GOOG4 signing
 native OAuth authentication artifacts: delete before installing Bearer
 targeted metadata: x-amz-meta-* -> x-goog-meta-*
 targeted storage/copy headers: preserve existing ApiMode::GCS mappings
-SDK checksums/framing: explicit pass/drop/map disposition
+GOOG4 SDK checksums/framing: explicit pass/drop/map disposition
+native OAuth SDK checksums/framing: unchanged pass-through
 unknown x-amz extension: BAD_ARGUMENTS before network I/O
 conditions: translate only in NativeConditional mode
 response ETag/generation/metadata: adapt only in NativeConditional mode
@@ -426,6 +427,8 @@ Keep the existing conditional translation in `applyGcsConditionalDialectToReques
 Implement `prepareGcsRequestForGoog4Authentication` as an explicit allowlist. It deletes AWS authentication artifacts, applies only proven compatibility mappings, and throws `BAD_ARGUMENTS` for an unknown remaining `x-amz-*` header. Keep the comment beside each SDK-generated header explaining whether GOOG4 accepts it, it must be renamed, or it must be removed before signing.
 
 Implement `prepareGcsRequestForOAuthAuthentication` for marked requests. It removes stale AWS signing artifacts (`authorization`, `x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`, and `x-amz-api-version`) before Bearer authentication. Do not run this cleanup for Default OAuth traffic: pre-CAS upstream OAuth overwrites `Authorization` but otherwise leaves ordinary SDK headers unchanged.
+
+After that targeted cleanup, native OAuth deliberately passes every remaining `x-amz-*` header through unchanged, matching Default OAuth; it has no GOOG4-style allowlist. Unit tests pin unchanged pass-through for `x-amz-sdk-checksum-algorithm`, representative `x-amz-checksum-*`, `x-amz-trailer`, and `x-amz-decoded-content-length` so a later adapter change cannot silently broaden OAuth rewriting.
 
 Implement `applyGcsConditionalDialectToResponse` so a native request:
 
@@ -741,7 +744,7 @@ Count HTTP client construction and metadata-server token fetches while alternati
 Gate the suite on explicit live bucket and credential environment variables and skip when they are absent. Run three groups against live GCS:
 
 1. Default `gcs_hmac`: HEAD, GET, LIST, PUT with metadata, CopyObject, DELETE, batch `DeleteObjects`, multipart, checksum-required requests, and chunked upload. Assert preserved response ETags, no generation precondition, accepted existing selector/credential spelling, and typed errors.
-2. NativeConditional `gcp_oauth`: conditional PUT, native-token HEAD, and exact DELETE. Assert GCS accepts each request, the wire uses `x-goog-if-generation-match`, attributes round-trip, the response token is the created generation, and stale AWS signing artifacts (`x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-api-version`) are absent.
+2. NativeConditional `gcp_oauth`: conditional PUT, native-token HEAD, and exact DELETE. Exercise both a checksum-bearing conditional PUT and a chunked/framed conditional PUT that produces `x-amz-decoded-content-length`/`x-amz-trailer`. Assert GCS accepts each request, the wire uses `x-goog-if-generation-match`, non-authentication `x-amz-*` checksum/framing headers remain unchanged, attributes round-trip, the response token is the created generation, and stale AWS signing artifacts (`x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`, `x-amz-api-version`) are absent.
 3. NativeConditional `gcs_hmac`: the same conditional PUT, native HEAD, and exact DELETE assertions under GOOG4 signing, including the final signed-header allowlist.
 
 The mock proves routing and failure direction only. This live suite is the release gate for GCS acceptance of the OAuth cleanup, generation adapter, metadata prefixes, exact DELETE, and GOOG4 allowlist.
