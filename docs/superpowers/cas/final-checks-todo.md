@@ -29,7 +29,16 @@ short-lived TODO, not the record.
 - Minimum pre-release cut: (1) alone prevents the observed trip class; (3)-(4) are cheap; (2) can
   follow the release if time runs out.
 
-## 4. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 4. Fix CAS disk settings whitelist — valid S3 keys rejected {#fix-s3-key-whitelist}
+
+- Field report: `Unknown setting 'http_keep_alive_timeout'` kills the server at startup when the
+  #2243 mitigation is applied to a CAS disk block
+  (https://github.com/Altinity/clickhouse-regression/actions/runs/32408309167/job/96552561919).
+- Full record + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#cas-disk-s3-key-whitelist-gap}` —
+  skip builtin `S3AuthSettings`/`S3RequestSettings` names in `ContentAddressedSettings.cpp` instead
+  of enumerating them into `non_cas_keys`; blocks the #2243 CI mitigation until fixed.
+
+## 5. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).

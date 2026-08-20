@@ -717,3 +717,26 @@ dimension).
 Triage bonus recorded: the RustFS "Erasure decode failed ... downstream_closed" error class is a red
 herring = ClickHouse's silent-by-design mid-body aborts (cancellations, LIMIT, abandoned prefetch);
 do not chase it in future triage.
+
+## CAS disk settings whitelist rejects valid S3 keys (found by #2243 mitigation attempt, 2026-08-20) {#cas-disk-s3-key-whitelist-gap}
+
+Field report (Carlos, clickhouse-regression run 32408309167/job 96552561919): adding
+`<http_keep_alive_timeout>60</http_keep_alive_timeout>` to a CAS disk block — the mitigation
+suggested in #2243 — kills the server at startup with `Unknown setting 'http_keep_alive_timeout'
+(UNKNOWN_SETTING)` during metadata loading.
+
+Mechanism: on a CAS disk the S3 keys are direct children of the same block as the CAS settings, and
+`ContentAddressedSettings.cpp` fail-closes on any key that is neither a CAS setting nor in the
+`non_cas_keys` whitelist. The whitelist was built by enumerating in-repo configs, so it contains only
+the S3 keys those configs happened to use — `http_keep_alive_timeout` and
+`http_keep_alive_max_requests` (both genuinely consumed on the disk path,
+`ObjectStorages/S3/diskSettings.cpp:169-170`) are missing, as is every other unused-in-repo
+`S3AuthSettings` key (`connect_timeout_ms`, `max_connections`, `session_token`, ...). No workaround
+exists: the disk path reads S3 auth settings only from the disk block
+(`S3Settings::loadFromConfigForObjectStorage`), never from the global `<s3>` per-endpoint section.
+
+Fix: instead of growing the enumerated whitelist, skip every key whose name is a builtin
+`S3AuthSettings` or `S3RequestSettings` name (BaseSettings exposes the builtin-name enumeration),
+keeping `non_cas_keys` only for the genuinely ad-hoc generic-disk-layer keys (`type`, `name`,
+`use_fake_transaction`, ...). Update the four-way-scan comment accordingly. Release-relevant: this
+blocks the #2243 CI mitigation on CAS disks.
