@@ -789,3 +789,27 @@ first-class and visible:
   hostname/server_uuid against mount slots), not local-only;
 - docs `{#sql-gc-run}`: state the leadership model in one sentence.
 No-steal on manual `RUN` stays untouched.
+
+## Reviewer ask: full-word wire keys in all CAS persisted formats (2026-08-21) {#wire-keys-full-words}
+
+Reviewer feedback: after the move to JSON text formats, the 2-5-char field keys (`su`, `eat`, `fen`,
+`nwe`, ...) are illegible and force manual remapping when reading raw objects. Wanted: human-readable
+identifiers everywhere, matching the struct/enum names, no mapping table needed.
+
+Adjudication: the terse convention is deliberate (`Formats/README.md`: "Key naming: keys 2-5 chars")
+but its size rationale is weak — every can-grow-large object is `.zst`, where repeated long keys
+compress to almost nothing, and the raw objects are tiny singletons. Enum VALUES are already
+full words (`CasWireVocab`). Agreed with the reviewers.
+
+Fix (pre-release only-cheap-now: breaking change to every persisted format, zero compat scaffolding
+while nothing persisted exists — [[feedback_ca_no_compat_scaffolding_predev]]):
+- rename every field key to the exact struct-field name (`su`→`server_uuid`,
+  `eat`→`expires_at_ms`, `fen`→`gc_fenced`, ...; prefixed triples `ome/omb/omo`→
+  `old_manifest_epoch/...` via the existing prefix mechanism);
+- scope: 71 distinct keys across ~14 codecs in `Formats/*.cpp`, mirrored read-side key branches,
+  and every golden test pinning wire bytes; check ca-soak/scenario asserts that grep raw JSON;
+- decide at fix time: header/trailer structural keys (`type`, `v`, `n`→`count`?) and the `!`
+  critical-key prefix spelling;
+- rewrite the README key-naming convention line in the same commit (its own rule).
+Mechanical sweep → codex candidate per [[feedback_delegate_mechanical_to_codex_luna]], with the
+golden regeneration reviewed here.

@@ -48,7 +48,15 @@ short-lived TODO, not the record.
   `system.cas_mounts.is_leader` for all mounts; one-sentence leadership note in `{#sql-gc-run}` docs.
 - No-steal on manual `RUN` stays untouched.
 
-## 6. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 6. Wire-key rename — full-word keys in all persisted formats {#fix-wire-keys}
+
+- Reviewer ask; full record + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#wire-keys-full-words}`
+- Plan: rename all 71 short field keys to exact struct-field names across ~14 codecs in
+  `Formats/*.cpp` + readers + golden tests + `Formats/README.md` convention line. Breaking change to
+  every persisted format — only cheap pre-release, never again.
+- Mechanical sweep: codex dispatch, review here.
+
+## 7. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
