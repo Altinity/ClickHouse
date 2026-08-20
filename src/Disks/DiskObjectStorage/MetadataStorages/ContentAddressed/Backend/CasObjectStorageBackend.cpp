@@ -115,7 +115,7 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 
 std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 {
-    auto metadata = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
+    auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(key, /*with_tags=*/false);
     if (!metadata)
         return std::nullopt;
 

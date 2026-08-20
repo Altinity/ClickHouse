@@ -492,6 +492,9 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const Stored
     request.SetBucket(uri.bucket);
     request.SetKey(object.remote_path);
     request.SetIfMatch(etag);
+    /// This is a content-addressed exact-token DELETE: mark it eligible for the typed NativeConditional
+    /// mode, so a GCS-native client can send the generation token this etag actually encodes.
+    request.setNativeConditional();
 
     ProfileEvents::increment(ProfileEvents::DiskS3DeleteObjects);
 
@@ -530,7 +533,7 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const Stored
 
 bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
 {
-    return client.get()->usesGcsConditionalDialect();
+    return client.get()->supportsGcsNativeConditionalRequests();
 }
 
 std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
@@ -618,8 +621,19 @@ void S3ObjectStorage::tagObjects(const StoredObjects & objects, const std::strin
 
 std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const
 {
+    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::Default);
+}
+
+std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const
+{
+    return tryGetObjectMetadataImpl(path, with_tags, ObjectStorageRequestMode::NativeConditional);
+}
+
+std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadataImpl(const std::string & path, bool with_tags, ObjectStorageRequestMode request_mode) const
+{
     auto settings_ptr = s3_settings.get();
-    auto object_info = S3::getObjectInfoIfExists(*client.get(), uri.bucket, path, {}, /* with_metadata= */ true, with_tags);
+    auto object_info = S3::getObjectInfoIfExists(
+        *client.get(), uri.bucket, path, {}, /* with_metadata= */ true, with_tags, request_mode);
 
     if (object_info.size == 0 && object_info.last_modification_time == 0 && object_info.metadata.empty())
         return {};

@@ -325,6 +325,13 @@ struct Client : DB::S3::Client
     {
         ++counters.headObject;
 
+        /// The request's DYNAMIC type is still the production `DB::S3::HeadObjectRequest` wrapper --
+        /// this override only sees it through the SDK base-class reference. Mirrors the dynamic_cast
+        /// `Client::BuildHttpRequest` itself does, so a test can observe the mark this mock never
+        /// forwards through an HTTP layer.
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_head_object_native_conditional = wrapper->isNativeConditional();
+
         if (injections)
         {
             if (auto opt_val = injections->call(request))
@@ -464,6 +471,9 @@ struct Client : DB::S3::Client
     {
         ++counters.deleteObject;
 
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_delete_object_native_conditional = wrapper->isNativeConditional();
+
         if (injections)
         {
             if (auto opt_val = injections->call(request))
@@ -495,6 +505,8 @@ struct Client : DB::S3::Client
     std::shared_ptr<S3MemStrore> store;
     mutable EventCounts counters;
     mutable std::shared_ptr<InjectionModel> injections;
+    mutable bool last_head_object_native_conditional = false;
+    mutable bool last_delete_object_native_conditional = false;
     void resetCounters() const { counters = {}; }
 };
 
@@ -1397,6 +1409,53 @@ TEST_F(S3ObjectStorageConditionalOpsTest, RemoveObjectIfTokenMatchesNotFoundIsNo
     auto result = object_storage->removeObjectIfTokenMatches(StoredObject("missing-key"), "any-etag");
 
     ASSERT_EQ(result.outcome, ConditionalRemoveOutcome::NotFound);
+}
+
+/// `tryGetObjectMetadataWithNativeToken` must mark its HEAD wrapper eligible for the typed
+/// NativeConditional mode (the old blanket GCS dialect stays authoritative over the wire until a
+/// later task; this only proves the mark reaches the production request object), and it must keep
+/// tryGetObjectMetadata's existing missing-object contract of returning nullopt.
+TEST_F(S3ObjectStorageConditionalOpsTest, NativeTokenHeadIsMarkedAndMissingIsNullopt)
+{
+    store->GetBucketStore(bucket).PutObject("existing-key", "some-body");
+
+    auto found = object_storage->tryGetObjectMetadataWithNativeToken("existing-key", /*with_tags=*/false);
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->size_bytes, 9u);
+    EXPECT_TRUE(mock_client->last_head_object_native_conditional);
+
+    auto missing = object_storage->tryGetObjectMetadataWithNativeToken("missing-key", /*with_tags=*/false);
+    EXPECT_FALSE(missing.has_value());
+    EXPECT_TRUE(mock_client->last_head_object_native_conditional);
+}
+
+/// The token-exact DELETE removeObjectIfTokenMatches issues (CAS's `If-Match` reclaim) must be marked
+/// eligible for the typed NativeConditional mode -- it is the exact-delete path a GCS generation token
+/// belongs on.
+TEST_F(S3ObjectStorageConditionalOpsTest, GenerationDeleteUsesNativeConditionalMode)
+{
+    store->GetBucketStore(bucket).PutObject("key1", "data");
+
+    auto result = object_storage->removeObjectIfTokenMatches(StoredObject("key1"), "etag-1");
+
+    ASSERT_EQ(result.outcome, ConditionalRemoveOutcome::Removed);
+    EXPECT_TRUE(mock_client->last_delete_object_native_conditional);
+}
+
+/// An ordinary (non-conditional) delete must NOT pick up the native mark -- only the exact-token
+/// delete path is content-addressed-storage-owned.
+TEST_F(S3ObjectStorageConditionalOpsTest, OrdinaryDeleteRemainsDefault)
+{
+    store->GetBucketStore(bucket).PutObject("key1", "data");
+
+    object_storage->removeObjectIfExists(StoredObject("key1"));
+
+    /// Pin that the ordinary delete actually reached the singular DeleteObject hook this test reads --
+    /// otherwise a future refactor onto the batch DeleteObjects path would silently stop exercising
+    /// this assertion (the field would sit unwritten at its `false` initializer) and this test would
+    /// keep passing while proving nothing.
+    ASSERT_EQ(mock_client->counters.deleteObject, 1);
+    EXPECT_FALSE(mock_client->last_delete_object_native_conditional);
 }
 
 TEST_F(S3ObjectStorageConditionalOpsTest, CopyObjectConditionalSuccess)

@@ -227,6 +227,14 @@ public:
     /// Same as getObjectMetadata(), but ignores if object does not exist.
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const = 0;
 
+    /// Same as tryGetObjectMetadata(), but lets a backend that speaks a native conditional-request
+    /// dialect (GCS generation tokens) read one while consulting this metadata. Object storages with
+    /// no such dialect fall back to the ordinary read.
+    virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const
+    {
+        return tryGetObjectMetadata(path, with_tags);
+    }
+
     /// Read single object
     virtual std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
         const StoredObject & object,

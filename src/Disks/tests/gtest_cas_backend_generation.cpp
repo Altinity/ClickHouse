@@ -5,6 +5,69 @@
 
 using namespace DB::Cas;
 
+namespace
+{
+/// A `LocalObjectStorage` that records which of the two metadata-read virtuals a caller reached, so a
+/// test can prove `nativeHead` calls `tryGetObjectMetadataWithNativeToken` specifically -- reverting
+/// that one line back to `tryGetObjectMetadata` makes `NativeHeadUsesNativeTokenMetadataApi` fail.
+class RecordingObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    mutable int ordinary_calls = 0;
+    mutable int native_calls = 0;
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        ++ordinary_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override
+    {
+        ++native_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+};
+
+/// Same unique-temp-root convention as `DB::Cas::tests::makeLocalObjectStorageForTest`, but returning
+/// the concrete recording type so the test can read its call counters.
+std::shared_ptr<RecordingObjectStorage> makeRecordingObjectStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_unit_native_head_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<RecordingObjectStorage>(std::move(settings));
+}
+}
+
+/// `ObjectStorageBackend::nativeHead` must route through `tryGetObjectMetadataWithNativeToken` (the
+/// hook that lets a GCS-native client read a generation token), not the ordinary `tryGetObjectMetadata`.
+TEST(CASBackendGeneration, NativeHeadUsesNativeTokenMetadataApi)
+{
+    auto storage = makeRecordingObjectStorageForTest();
+    auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native);
+
+    ASSERT_EQ(b->putIfAbsent("p/native-head/key", "v1").outcome, PutOutcome::Done);
+
+    /// putIfAbsent's own HEAD-fallback stamping path calls the ordinary API (untouched by this task);
+    /// reset the counters so only nativeHead's call, below, is observed.
+    storage->ordinary_calls = 0;
+    storage->native_calls = 0;
+
+    const auto hr = b->head("p/native-head/key");
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(storage->native_calls, 1);
+    EXPECT_EQ(storage->ordinary_calls, 0);
+}
+
 /// Every Token{...} the backend mints must carry native_token_type instead of a hardcoded
 /// TokenType::ETag (Task 5). Mode::Native over a LocalObjectStorage has no write-time ETag, so
 /// putIfAbsent's PutResult falls back to a HEAD internally — that HEAD is also a stamping site,

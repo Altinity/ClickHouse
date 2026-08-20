@@ -118,6 +118,10 @@ public:
 
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
 
+    /// Marks the HEAD request eligible for the typed NativeConditional mode, so the CAS backend's
+    /// `nativeHead` can read a GCS generation token where the client's HTTP layer supports one.
+    std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override;
+
     void copyObject( /// NOLINT
         const StoredObject & object_from,
         const StoredObject & object_to,
@@ -186,6 +190,10 @@ public:
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);
+
+    /// Shared by tryGetObjectMetadata/tryGetObjectMetadataWithNativeToken: the only difference between
+    /// the two public overrides is which ObjectStorageRequestMode the HEAD wrapper carries.
+    std::optional<ObjectMetadata> tryGetObjectMetadataImpl(const std::string & path, bool with_tags, ObjectStorageRequestMode request_mode) const;
 
     const S3::URI uri;
 
