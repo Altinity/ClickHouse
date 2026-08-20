@@ -740,3 +740,33 @@ Fix: instead of growing the enumerated whitelist, skip every key whose name is a
 keeping `non_cas_keys` only for the genuinely ad-hoc generic-disk-layer keys (`type`, `name`,
 `use_fake_transaction`, ...). Update the four-way-scan comment accordingly. Release-relevant: this
 blocks the #2243 CI mitigation on CAS disks.
+
+## Issue #2211: `SYSTEM CAS GC RUN` on a follower silently does nothing (adjudicated 2026-08-21) {#issue-2211-gc-run-follower-noop}
+
+https://github.com/Altinity/ClickHouse/issues/2211 — CONFIRMED as described; the report's code anchors
+all check out on HEAD. History splits it in two:
+
+1. **No-steal on manual runs is DELIBERATE** — commit `74d67b85021` (2026-07-13, "manual GC rounds
+   never steal a lease"): the observation-window steal protocol's safety argument needs the two
+   "incumbent frozen" observations spaced by real wall time (the loop's paced ticks); two manual
+   calls can land microseconds apart and fake a frozen incumbent → two concurrent destructive GC
+   actors. The pre-fix manual path also never heartbeat-protected an acquired lease. Keep as is;
+   the issue itself agrees steal is the wrong fix.
+2. **The silent success row was NOT a chosen contract** — commit `cb111510c1a` (2026-07-20) merely
+   surfaced the already-computed `RoundReport` as a result set ("mirroring the DROP POOL MEMBER
+   precedent", deferred-register item 11). No record anywhere (commits, specs, backlogs) weighs
+   throw-vs-row for the follower case; the docs (`operations/debugging.md` `{#sql-gc-run}`) don't
+   mention the follower no-op either. Genuine operator-contract gap.
+
+Also confirmed: `GcLease` is `{owner: UInt128 random gc_id, seq}` — no host identity
+(`CasGcStateFormat.h:17`), and `system.cas_mounts.is_leader` is populated only for the local mount,
+so a follower cannot name the leader today.
+
+Fix shape (agrees with the issue's preference order):
+- Follower `RUN` → exception (`this node does not hold the GC lease; no round was run`), pointing at
+  `ON CLUSTER` / `system.cas_mounts`. Decide the `ON CLUSTER` semantics at fix time: per-host errors
+  from followers make the fan-out noisy-but-honest; the alternative is a dedicated aggregate check.
+- Optionally add a host identity to `GcLease` so the error can name the holder — durable-format
+  change, pre-release so no compat scaffolding needed ([[feedback_ca_no_compat_scaffolding_predev]]);
+  cheap now, expensive later.
+- Docs: `{#sql-gc-run}` must state the leadership model either way.
