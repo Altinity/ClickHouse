@@ -9,6 +9,7 @@
 #include <IO/S3/PocoHTTPClient.h>
 #include <IO/S3/GCSConditionalDialect.h>
 #include <IO/S3/GOOG4Signer.h>
+#include <IO/S3/PocoHTTPClientFactory.h>
 #include <IO/S3/Requests.h>
 
 #include <algorithm>
@@ -472,6 +473,12 @@ void PocoHTTPClient::makeRequestInternalImpl(
     Aws::Utils::RateLimits::RateLimiterInterface *,
     Aws::Utils::RateLimits::RateLimiterInterface *) const
 {
+    /// Every request reaching this common HTTP boundary was built by `PocoHTTPClientFactory`, the
+    /// sole process-wide `Aws::Http::HttpClientFactory`, and so must be an `ExtendedHttpRequest`.
+    /// A foreign request would still read safely as `Default` via `isNativeConditionalRequest`, so
+    /// this is a construction-invariant check, not the read path itself.
+    chassert(dynamic_cast<const ExtendedHttpRequest *>(&request) != nullptr);
+
     LoggerPtr log = getLogger("AWSClient");
 
     auto uri = request.GetUri().GetURIString();

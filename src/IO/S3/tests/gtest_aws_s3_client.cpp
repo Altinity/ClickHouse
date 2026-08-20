@@ -33,6 +33,7 @@
 #include <IO/S3Common.h>
 #include <IO/S3/Client.h>
 #include <IO/S3/PocoHTTPClient.h>
+#include <IO/S3/PocoHTTPClientFactory.h>
 #include <IO/HTTPHeaderEntries.h>
 #include <IO/S3Settings.h>
 #include <Poco/Util/ServerApplication.h>
@@ -902,6 +903,131 @@ TEST(IOTestAwsS3Client, WebIdentityConfiguredFromKmsRoleOverrideAndTokenFile)
 
     EXPECT_TRUE(DB::S3::AwsAuthSTSAssumeRoleWebIdentityCredentialsProvider::isWebIdentityConfigured(
         "arn:aws:iam::123456789012:role/from_kms_role_arn_override"));
+}
+
+namespace
+{
+
+/// Builds a real `DB::S3::Client` with the given `http_client` value, wired the same way
+/// `ClientFactory::create` wires disk configuration, but never sent over the wire: these tests only
+/// exercise `Client::BuildHttpRequest`, which does no I/O.
+std::unique_ptr<DB::S3::Client> makeClientWithHttpClient(const std::string & http_client)
+{
+    DB::RemoteHostFilter remote_host_filter;
+    DB::S3::URI uri("https://storage.googleapis.com/bucket/key");
+
+    DB::S3::PocoHTTPClientConfiguration client_configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
+        /*force_region=*/"us-east-1",
+        remote_host_filter,
+        /*s3_max_redirects=*/100,
+        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = 0},
+        /*s3_slow_all_threads_after_network_error=*/true,
+        /*s3_slow_all_threads_after_retryable_error=*/true,
+        /*enable_s3_requests_logging=*/false,
+        /*for_disk_s3=*/false,
+        /*opt_disk_name=*/{},
+        /*request_throttler=*/{},
+        uri.uri.getScheme());
+
+    client_configuration.endpointOverride = uri.endpoint;
+    client_configuration.http_client = http_client;
+
+    DB::S3::ClientSettings client_settings{
+        .use_virtual_addressing = uri.is_virtual_hosted_style,
+        .disable_checksum = false,
+        .gcs_issue_compose_request = false,
+        .is_s3express_bucket = false,
+    };
+
+    return DB::S3::ClientFactory::instance().create(
+        client_configuration,
+        client_settings,
+        /*access_key_id=*/"ACCESS_KEY_ID",
+        /*secret_access_key=*/"SECRET_ACCESS_KEY",
+        /*server_side_encryption_customer_key_base64=*/"",
+        /*sse_kms_config=*/{},
+        /*headers=*/{},
+        DB::S3::CredentialsConfiguration{
+            .use_environment_credentials = false,
+            .use_insecure_imds_request = false,
+        });
+}
+
+}
+
+TEST(IOTestAwsS3Client, RequestModeDefaultsToDefault)
+{
+    DB::WriteSettings settings;
+    EXPECT_EQ(settings.object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
+}
+
+TEST(IOTestAwsS3Client, FactoryAlwaysCreatesExtendedHttpRequest)
+{
+    DB::S3::PocoHTTPClientFactory factory;
+    const Aws::IOStreamFactory stream_factory = [] { return nullptr; };
+
+    auto from_string_uri = factory.CreateHttpRequest(
+        Aws::String("http://localhost/bucket/key"), Aws::Http::HttpMethod::HTTP_GET, stream_factory);
+    ASSERT_TRUE(from_string_uri);
+    EXPECT_TRUE(dynamic_cast<DB::S3::ExtendedHttpRequest *>(from_string_uri.get()));
+
+    auto from_uri = factory.CreateHttpRequest(
+        Aws::Http::URI("http://localhost/bucket/key"), Aws::Http::HttpMethod::HTTP_PUT, stream_factory);
+    ASSERT_TRUE(from_uri);
+    EXPECT_TRUE(dynamic_cast<DB::S3::ExtendedHttpRequest *>(from_uri.get()));
+}
+
+TEST(IOTestAwsS3Client, NativeConditionalModeRequiresExplicitGcsHttpClient)
+{
+    EXPECT_TRUE(makeClientWithHttpClient("gcp_oauth")->supportsGcsNativeConditionalRequests());
+    EXPECT_TRUE(makeClientWithHttpClient("gcs_hmac")->supportsGcsNativeConditionalRequests());
+    /// The comparison is case-insensitive, matching how `ClientFactory::create` already lower-cases
+    /// this same field before dispatching on it.
+    EXPECT_TRUE(makeClientWithHttpClient("GCS_HMAC")->supportsGcsNativeConditionalRequests());
+    EXPECT_FALSE(makeClientWithHttpClient("")->supportsGcsNativeConditionalRequests());
+    EXPECT_FALSE(makeClientWithHttpClient("some_other_client")->supportsGcsNativeConditionalRequests());
+}
+
+TEST(IOTestAwsS3Client, ForeignHttpRequestReadsAsDefault)
+{
+    Aws::Http::Standard::StandardHttpRequest foreign_request(Aws::Http::URI("http://localhost/x"), Aws::Http::HttpMethod::HTTP_GET);
+    EXPECT_FALSE(DB::S3::isNativeConditionalRequest(foreign_request));
+}
+
+TEST(IOTestAwsS3Client, RetryAndRedirectRederiveRequestMode)
+{
+    /// `Client::BuildHttpRequest` is invoked at the start of every SDK attempt (see
+    /// `AWSClient::AttemptOneRequest`), and both a retry and a redirect discard the old HTTP request
+    /// and construct a fresh one before the next attempt (see `AWSClient::AttemptExhaustively`). This
+    /// drives that same shape directly: a new `ExtendedHttpRequest` per simulated attempt, against one
+    /// operation wrapper whose `NativeConditional` opt-in flips over the sequence
+    /// ordinary -> native (twice, standing in for a retry and a redirect) -> ordinary.
+    auto client = makeClientWithHttpClient("gcp_oauth");
+    ASSERT_TRUE(client->supportsGcsNativeConditionalRequests());
+
+    DB::S3::PutObjectRequest request;
+    request.SetBucket("bucket");
+    request.SetKey("key");
+
+    DB::S3::PocoHTTPClientFactory factory;
+    const Aws::IOStreamFactory stream_factory = [] { return nullptr; };
+
+    auto buildAndCheck = [&](bool expected)
+    {
+        auto http_request = factory.CreateHttpRequest(
+            Aws::Http::URI("https://storage.googleapis.com/bucket/key"), Aws::Http::HttpMethod::HTTP_PUT, stream_factory);
+        client->BuildHttpRequest(request, http_request);
+        EXPECT_EQ(DB::S3::isNativeConditionalRequest(*http_request), expected);
+    };
+
+    buildAndCheck(false); /// first attempt, ordinary request
+
+    request.setNativeConditional(true);
+    buildAndCheck(true); /// simulated retry: a new HTTP request, same wrapper, still native
+    buildAndCheck(true); /// simulated redirect: another new HTTP request, still native
+
+    request.setNativeConditional(false);
+    buildAndCheck(false); /// the final ordinary request stays false
 }
 
 TEST(IOTestAwsS3Client, WrongSigningRegionBadRequest)

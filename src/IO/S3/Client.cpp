@@ -985,6 +985,12 @@ bool Client::supportsMultiPartCopy() const
     return provider_type != ProviderType::GCS;
 }
 
+bool Client::supportsGcsNativeConditionalRequests() const
+{
+    const auto http_client = Poco::toLower(client_configuration.http_client);
+    return http_client == "gcp_oauth" || http_client == "gcs_hmac";
+}
+
 void Client::BuildHttpRequest(const Aws::AmazonWebServiceRequest& request,
                       const std::shared_ptr<Aws::Http::HttpRequest>& httpRequest) const
 {
@@ -996,6 +1002,15 @@ void Client::BuildHttpRequest(const Aws::AmazonWebServiceRequest& request,
         /// all "x-amz-*" headers have to be either converted or deleted
         /// note that "amz-sdk-invocation-id" and "amz-sdk-request" are preserved
         httpRequest->DeleteHeader("x-amz-api-version");
+    }
+
+    /// Re-derived on every attempt: a retry or redirect discards the old HTTP request and builds a
+    /// fresh one (see AWSClient::AttemptExhaustively), so the bit cannot be left to survive on it.
+    if (auto * extended_http_request = dynamic_cast<ExtendedHttpRequest *>(httpRequest.get()))
+    {
+        const auto * wrapper = dynamic_cast<const RequestWithNativeConditionalMode *>(&request);
+        extended_http_request->setNativeConditional(
+            wrapper && wrapper->isNativeConditional() && supportsGcsNativeConditionalRequests());
     }
 }
 
