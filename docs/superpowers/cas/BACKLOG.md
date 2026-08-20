@@ -668,3 +668,29 @@ is STALE — both its layers landed for MOVE (L1 routing + L2 clonePart transact
 entry's remaining live content is the S36/S37 verification legs and the sibling items
 (`[VERIFY-ca-ca-same-pool-move]`, `[killed-mid-move-partition-duplicate]`). The unfixed member of
 the family is exactly this `freezeRemote` gap.
+
+## Issue #2212 CONFIRMED: FREEZE shadow namespace is pool-global — UNFREEZE on another replica destroys the backup (2026-08-20) {#issue-2212-shadow-namespace}
+
+https://github.com/Altinity/ClickHouse/issues/2212 (CAS-001) — `FREEZE WITH NAME` on a CAS disk
+publishes frozen-part refs into a POOL-GLOBAL namespace (`shadowNamespace`,
+`ContentAddressedMetadataStorage.cpp:1281-1288`: `RootNamespace{canonicalDiskPath(shadow_table_dir)}`,
+with the comment "pool-global (backups are read by any replica)" — a DELIBERATE choice that missed
+that UNFREEZE is a destructive, local-intent statement). Live parts are correctly namespaced under
+`server_root_id + "/"` (`ownsNamespace`, `:2023`). With one table UUID on two replicas (the
+`CREATE ... ON CLUSTER` shape), `UNFREEZE WITH NAME` on replica 2 releases replica 1's freeze; after
+`DROP TABLE` + GC the frozen blobs are gone. Data loss on the backup path; correct semantics = the
+local-disk baseline (shadow is strictly per-replica, the issue's P6).
+
+FIX (SCHEDULED: tomorrow, pre-release — see docs/superpowers/cas/final-checks-todo.md), small radius:
+- (1) `shadowNamespace` -> `server_root_id + "/" + canonicalDiskPath(shadow_table_dir)` (the DISK
+  path `shadow/...` stays; only the pool-namespace derivation changes);
+- (2) the two `"shadow/"` enumeration scopes -> `<server_root>/shadow/`
+  (`ContentAddressedMetadataStorage.cpp:1513`, `:1700`);
+- (3) `PartPathParser`/`route()` untouched (they parse the unchanged disk path); GC/fsck have no
+  shadow special-cases — prefixed shadow namespaces become ordinarily owned;
+- (4) pre-release no-compat policy: no migration;
+- (5) tests: stateless P3/P5-style (two `server_root_id` on one pool: foreign UNFREEZE must be a
+  no-op on the other replica's freeze; DROP+GC must leave the freeze intact); the reporter's
+  six-property suite lives in clickhouse-regression (`cas/tests/freeze_isolation.py`).
+Trade acknowledged: cross-replica readability of freezes goes away — that is the correct (local)
+FREEZE semantics; shared backup access belongs to the BACKUP machinery, not UNFREEZE.
