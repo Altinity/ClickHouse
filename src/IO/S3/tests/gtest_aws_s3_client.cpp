@@ -6,6 +6,7 @@
 
 #if USE_AWS_S3
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -953,6 +954,156 @@ std::unique_ptr<DB::S3::Client> makeClientWithHttpClient(const std::string & htt
         });
 }
 
+/// A minimal scripted HTTP server: the Nth request it receives is answered with
+/// `responses[min(N, responses.size() - 1)]`, so a short script (e.g. one retryable response then one
+/// success) naturally "then always succeeds" once it runs out. Lets a test drive one genuine SDK-level
+/// retry through a real `DB::S3::Client`, rather than standing in for the SDK's own per-attempt
+/// behaviour by calling the same functions twice by hand.
+struct ScriptedResponse
+{
+    Poco::Net::HTTPResponse::HTTPStatus status;
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+class ScriptedResponseServer
+{
+public:
+    explicit ScriptedResponseServer(std::vector<ScriptedResponse> responses_)
+        : responses(std::move(responses_))
+        , server_socket(std::make_unique<Poco::Net::ServerSocket>(0))
+        , handler_factory(new Factory(*this))
+        , server_params(new Poco::Net::HTTPServerParams())
+        , server(std::make_unique<Poco::Net::HTTPServer>(handler_factory, *server_socket, server_params))
+    {
+        server->start();
+    }
+
+    /// `server_socket->address()` is the wildcard bind address (`0.0.0.0:PORT`), which is not a usable
+    /// connection target and could silently conflate distinct servers under the same host string. Build
+    /// the URL from an explicit loopback address plus the bound port instead.
+    std::string getUrl() const { return "http://127.0.0.1:" + std::to_string(server_socket->address().port()); }
+
+private:
+    class Handler : public Poco::Net::HTTPRequestHandler
+    {
+    public:
+        explicit Handler(ScriptedResponseServer & owner_) : owner(owner_) { }
+
+        void handleRequest(Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response) override
+        {
+            const size_t index = owner.request_count.fetch_add(1);
+            const auto & scripted = owner.responses[std::min(index, owner.responses.size() - 1)];
+            response.setStatus(scripted.status);
+            for (const auto & [name, value] : scripted.headers)
+                response.set(name, value);
+            response.setContentLength(0);
+            response.send();
+        }
+
+    private:
+        ScriptedResponseServer & owner;
+    };
+
+    class Factory : public Poco::Net::HTTPRequestHandlerFactory
+    {
+    public:
+        explicit Factory(ScriptedResponseServer & owner_) : owner(owner_) { }
+        Poco::Net::HTTPRequestHandler * createRequestHandler(const Poco::Net::HTTPServerRequest &) override { return new Handler(owner); }
+
+    private:
+        ScriptedResponseServer & owner;
+    };
+
+    std::vector<ScriptedResponse> responses;
+    std::atomic<size_t> request_count{0};
+    std::unique_ptr<Poco::Net::ServerSocket> server_socket;
+    Poco::SharedPtr<Factory> handler_factory;
+    Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
+    std::unique_ptr<Poco::Net::HTTPServer> server;
+};
+
+/// `Client::BuildHttpRequest` is not `final`, and the protected constructor `Client` exposes is
+/// commented "visible for testing" — this subclass uses exactly that seam to observe every real
+/// `BuildHttpRequest` call the vendored SDK makes for a genuine attempt, without adding any
+/// observability to production code (the mode has no wire representation by design, so there is no
+/// other way to see it from outside the process).
+class RecordingClient : public DB::S3::Client
+{
+public:
+    RecordingClient(
+        size_t max_redirects_,
+        DB::S3::ServerSideEncryptionKMSConfig sse_kms_config_,
+        const std::shared_ptr<Aws::Auth::AWSCredentialsProvider> & credentials_provider_,
+        const DB::S3::PocoHTTPClientConfiguration & client_configuration_,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy sign_payloads_,
+        const DB::S3::ClientSettings & client_settings_)
+        : DB::S3::Client(max_redirects_, std::move(sse_kms_config_), credentials_provider_, client_configuration_, sign_payloads_, client_settings_)
+    {
+    }
+
+    /// One entry per real `BuildHttpRequest` call, i.e. one per genuine SDK attempt.
+    mutable std::vector<bool> observed_native_conditional;
+
+    void BuildHttpRequest(const Aws::AmazonWebServiceRequest & request, const std::shared_ptr<Aws::Http::HttpRequest> & httpRequest) const override
+    {
+        DB::S3::Client::BuildHttpRequest(request, httpRequest);
+        observed_native_conditional.push_back(DB::S3::isNativeConditionalRequest(*httpRequest));
+    }
+};
+
+std::unique_ptr<RecordingClient> makeRecordingClient(const std::string & endpoint, unsigned int max_retries, unsigned int max_redirects)
+{
+    DB::RemoteHostFilter remote_host_filter;
+    DB::S3::URI uri(endpoint + "/bucket");
+
+    DB::S3::PocoHTTPClientConfiguration client_configuration = DB::S3::ClientFactory::instance().createClientConfiguration(
+        /*force_region=*/"us-east-1",
+        remote_host_filter,
+        max_redirects,
+        DB::S3::PocoHTTPClientConfiguration::RetryStrategy{.max_retries = max_retries},
+        /*s3_slow_all_threads_after_network_error=*/false,
+        /*s3_slow_all_threads_after_retryable_error=*/false,
+        /*enable_s3_requests_logging=*/false,
+        /*for_disk_s3=*/false,
+        /*opt_disk_name=*/{},
+        /*request_throttler=*/{},
+        uri.uri.getScheme());
+
+    client_configuration.endpointOverride = uri.endpoint;
+    /// `gcs_hmac`, not `gcp_oauth`: both make `supportsGcsNativeConditionalRequests()` true, but
+    /// `gcp_oauth` fetches a bearer token from the GCE metadata server on every real request
+    /// (`PocoHTTPClientGCPOAuth::requestBearerToken`) -- a real network call this test cannot make.
+    /// `gcs_hmac` signs locally from the credentials handed to it below, no token fetch involved.
+    client_configuration.http_client = "gcs_hmac";
+    /// `ClientFactory::create` would clamp this to 1 when `s3_slow_all_threads_after_retryable_error`
+    /// is set (external retry coordination); here we want the SDK's own retry loop to actually run.
+    client_configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(client_configuration.retry_strategy);
+
+    DB::S3::ClientSettings client_settings{
+        .use_virtual_addressing = uri.is_virtual_hosted_style,
+        .disable_checksum = false,
+        .gcs_issue_compose_request = false,
+        .is_s3express_bucket = false,
+    };
+
+    Aws::Auth::AWSCredentials credentials("ACCESS_KEY_ID", "SECRET_ACCESS_KEY");
+    auto credentials_provider = DB::S3::getCredentialsProvider(
+        client_configuration,
+        credentials,
+        DB::S3::CredentialsConfiguration{.use_environment_credentials = false, .use_insecure_imds_request = false});
+    /// `PocoHTTPClientGCSHMAC`'s constructor throws `LOGICAL_ERROR` without this -- `ClientFactory::create`
+    /// wires it the same way for the real `gcs_hmac` path.
+    client_configuration.gcs_hmac_credentials_provider = credentials_provider;
+
+    return std::make_unique<RecordingClient>(
+        max_redirects,
+        DB::S3::ServerSideEncryptionKMSConfig{},
+        credentials_provider,
+        client_configuration,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+        client_settings);
+}
+
 }
 
 TEST(IOTestAwsS3Client, RequestModeDefaultsToDefault)
@@ -994,40 +1145,88 @@ TEST(IOTestAwsS3Client, ForeignHttpRequestReadsAsDefault)
     EXPECT_FALSE(DB::S3::isNativeConditionalRequest(foreign_request));
 }
 
-TEST(IOTestAwsS3Client, RetryAndRedirectRederiveRequestMode)
+TEST(IOTestAwsS3Client, NativeConditionalStaysFalseThroughBuildHttpRequestOnNonGcsClient)
 {
-    /// `Client::BuildHttpRequest` is invoked at the start of every SDK attempt (see
-    /// `AWSClient::AttemptOneRequest`), and both a retry and a redirect discard the old HTTP request
-    /// and construct a fresh one before the next attempt (see `AWSClient::AttemptExhaustively`). This
-    /// drives that same shape directly: a new `ExtendedHttpRequest` per simulated attempt, against one
-    /// operation wrapper whose `NativeConditional` opt-in flips over the sequence
-    /// ordinary -> native (twice, standing in for a retry and a redirect) -> ordinary.
-    auto client = makeClientWithHttpClient("gcp_oauth");
-    ASSERT_TRUE(client->supportsGcsNativeConditionalRequests());
+    /// Closes a coverage gap: nothing else in this file drives `Client::BuildHttpRequest` with a
+    /// native-marked request against a non-GCS `http_client`. Without this, dropping or inverting the
+    /// `&& supportsGcsNativeConditionalRequests()` conjunct would not fail any test here, even though
+    /// that conjunct is exactly what keeps the HTTP bit false for AWS-compatible CAS requests.
+    auto client = makeClientWithHttpClient("some_other_client");
+    ASSERT_FALSE(client->supportsGcsNativeConditionalRequests());
 
     DB::S3::PutObjectRequest request;
     request.SetBucket("bucket");
     request.SetKey("key");
+    request.setNativeConditional(true);
 
     DB::S3::PocoHTTPClientFactory factory;
     const Aws::IOStreamFactory stream_factory = [] { return nullptr; };
+    auto http_request = factory.CreateHttpRequest(
+        Aws::Http::URI("https://s3.amazonaws.com/bucket/key"), Aws::Http::HttpMethod::HTTP_PUT, stream_factory);
+    client->BuildHttpRequest(request, http_request);
+    EXPECT_FALSE(DB::S3::isNativeConditionalRequest(*http_request));
+}
 
-    auto buildAndCheck = [&](bool expected)
+TEST(IOTestAwsS3Client, NativeConditionalModeIsRederivedOnEverySdkAttempt)
+{
+    /// Drives real `DB::S3::Client::GetBucketVersioning` calls through a `RecordingClient`, which
+    /// records `isNativeConditionalRequest` on every real `Client::BuildHttpRequest` call -- i.e. once
+    /// per genuine SDK attempt, including the extra attempt a real SDK-level retry triggers.
+    ///
+    /// This does not separately drive a real 301 redirect: in the vendored SDK, `AttemptExhaustively`
+    /// recreates the HTTP request unconditionally at the retry tail regardless of cause
+    /// (`contrib/aws/src/aws-cpp-sdk-core/source/client/AWSClient.cpp:405`), and `BuildHttpRequest` runs
+    /// at the top of the next `AttemptOneRequest` exactly as in the retry case (`AWSClient.cpp:564`) --
+    /// a redirect only changes the URI passed into that same recreation, it is not a separate mechanism.
+    /// `Client::doRequest`'s own manual redirect loop is even less in doubt: it re-enters `MakeRequest`
+    /// wholesale, which calls `BuildHttpRequest` fresh by construction. So the retry case below already
+    /// exercises the machinery a redirect would use.
+    auto runOnce = [](const std::string & endpoint, bool native_conditional) -> std::vector<bool>
     {
-        auto http_request = factory.CreateHttpRequest(
-            Aws::Http::URI("https://storage.googleapis.com/bucket/key"), Aws::Http::HttpMethod::HTTP_PUT, stream_factory);
-        client->BuildHttpRequest(request, http_request);
-        EXPECT_EQ(DB::S3::isNativeConditionalRequest(*http_request), expected);
+        /// Note: `ASSERT_*` cannot be used in this lambda -- it returns `std::vector<bool>`, not
+        /// `void`, and the macro expands to a bare `return;` on failure. `EXPECT_*` only records.
+        auto client = makeRecordingClient(endpoint, /*max_retries=*/2, /*max_redirects=*/2);
+        EXPECT_TRUE(client->supportsGcsNativeConditionalRequests());
+
+        DB::S3::GetBucketVersioningRequest request;
+        request.SetBucket("bucket");
+        request.setNativeConditional(native_conditional);
+
+        auto outcome = client->GetBucketVersioning(request);
+        EXPECT_TRUE(outcome.IsSuccess());
+        return client->observed_native_conditional;
     };
 
-    buildAndCheck(false); /// first attempt, ordinary request
+    {
+        SCOPED_TRACE("ordinary request: one successful attempt, mode stays false");
+        ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+        const auto observed = runOnce(server.getUrl(), /*native_conditional=*/false);
+        ASSERT_EQ(observed.size(), 1u);
+        EXPECT_FALSE(observed[0]);
+    }
 
-    request.setNativeConditional(true);
-    buildAndCheck(true); /// simulated retry: a new HTTP request, same wrapper, still native
-    buildAndCheck(true); /// simulated redirect: another new HTTP request, still native
+    {
+        SCOPED_TRACE("native request through a genuine SDK-level retry: both attempts see the mode");
+        ScriptedResponseServer server({
+            {Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR, {}},
+            {Poco::Net::HTTPResponse::HTTP_OK, {}},
+        });
+        const auto observed = runOnce(server.getUrl(), /*native_conditional=*/true);
+        /// The size assertion is load-bearing, not cosmetic: a 500 that was silently not retried (or a
+        /// retry that reused a stale HTTP request) would leave a one-element vector, and an
+        /// all-elements-true assertion alone would not catch that.
+        ASSERT_EQ(observed.size(), 2u);
+        EXPECT_TRUE(observed[0]);
+        EXPECT_TRUE(observed[1]);
+    }
 
-    request.setNativeConditional(false);
-    buildAndCheck(false); /// the final ordinary request stays false
+    {
+        SCOPED_TRACE("ordinary again: the mode does not leak from a previous native call");
+        ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+        const auto observed = runOnce(server.getUrl(), /*native_conditional=*/false);
+        ASSERT_EQ(observed.size(), 1u);
+        EXPECT_FALSE(observed[0]);
+    }
 }
 
 TEST(IOTestAwsS3Client, WrongSigningRegionBadRequest)
