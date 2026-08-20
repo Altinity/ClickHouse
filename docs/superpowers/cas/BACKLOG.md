@@ -827,11 +827,15 @@ thrown so the byte-fallback does NOT run); the noise comes from the generic queu
 know this code. `NETWORK_ERROR` is NOT load-bearing on this path — no `e.code()` branch in the queue
 or fetch path tests it; "retry-later" is the default for any stored exception.
 
-Fix: dedicated generically-named error code (e.g. `FETCH_ABANDONED_WILL_RETRY`), thrown from taxonomy
-row 3 AND the adjacent `CaRelinkPromote::Unresolved` throw (same retry-later class), plus a fourth
-branch in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace. Generic-code touch is
-one branch with generic semantics ("fetch abandoned, will be retried"), no CA-specific concept —
-compatible with [[feedback_cas_upstream_coupling_minimization]]. Rejected: reusing `ABORTED`
-(overloaded with shutdown semantics); demoting all `NETWORK_ERROR` (hides real network faults).
-Sender side already logs at `Debug` — receiver only. Also fixes the misdirecting `(NETWORK_ERROR)`
-label the issue complains about.
+Fix (revised per user constraint: NETWORK_ERROR was chosen deliberately as a retriable code
+precisely to avoid touching upstream code, and the fix must keep that property — ZERO generic-code
+changes): reuse `ABORTED`, which is already in the `processQueueEntry` demotion list with the
+comment "Interrupted merge or downloading a part is not an error" → `LOG_INFO`, no stack trace.
+Change only the exception code at the two CA retry-later throw sites in `DataPartsExchange.cpp`
+(taxonomy row 3 and the `CaRelinkPromote::Unresolved` promote); the message text stays
+self-describing. Verified: nothing on the fetch/queue path branches on `ABORTED` except the
+demotion itself (shutdown-`ABORTED` overload is theoretical there). Also removes the misdirecting
+`(NETWORK_ERROR)` label the issue complains about. Rejected: a dedicated new error code + a fourth
+demotion branch (touches upstream, vetoed); `PART_IS_TEMPORARILY_LOCKED` (foreign semantics + a
+`cleanup_thread.wakeup()` side effect); demoting all `NETWORK_ERROR` (hides real network faults).
+Sender side already logs at `Debug` — receiver only.

@@ -60,8 +60,9 @@ short-lived TODO, not the record.
 
 - Issue: https://github.com/Altinity/ClickHouse/issues/2219 (CONFIRMED, cosmetic; misdirects triage)
 - Full record + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#issue-2219-relink-refusal-log-level}`
-- Plan: new generic error code `FETCH_ABANDONED_WILL_RETRY` at both relink retry-later throw sites in
-  `DataPartsExchange.cpp` + fourth demotion branch in `processQueueEntry` (`LOG_INFO`, no stack trace).
+- Plan: switch both relink retry-later throw sites in `DataPartsExchange.cpp` from `NETWORK_ERROR`
+  to `ABORTED` (already in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace).
+  Zero upstream-code changes (user constraint).
 
 ## 8. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
