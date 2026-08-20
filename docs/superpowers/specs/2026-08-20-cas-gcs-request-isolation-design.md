@@ -9,10 +9,10 @@ doc_type: 'design'
 
 # CAS GCS request isolation design {#cas-gcs-request-isolation-design}
 
-**Status:** DRAFT for review, rev.3 (2026-08-20). This specification defines the target state. The
+**Status:** DRAFT for review, rev.4 (2026-08-20). This specification defines the target state. The
 current branch already contains the GCS conditional adapter and response generation override
 (`41a247e3310`), plus their authentication-wide wiring and the `gcs_hmac` client
-(`9604d6a5be9`); their current behavior and the required migration are described below.
+(`9604d6a5be9`); their current behavior and the required target-state changes are described below.
 
 ## Decision {#decision}
 
@@ -28,6 +28,10 @@ another clone cache. Credential, throttling, connection-pool, and OAuth-token be
 exactly as they are for those two existing clients. No GCS generation client matrix or storage-wide
 user setting is introduced.
 
+No existing non-CAS user-facing configuration is renamed, removed, or made conditional on CAS.
+This includes both the established GCS interoperability path using ordinary S3 HMAC credentials
+and the existing `http_client` values.
+
 Unsupported combinations fail at CAS mount or before sending a mutation. GCS CAS never falls back
 from generations to ordinary ETags.
 
@@ -39,13 +43,19 @@ forces `gcs_conditional_dialect` for both `gcp_oauth` and `gcs_hmac`.
 the common response path substitutes `x-goog-generation` into the AWS SDK ETag field whenever the
 header is present.
 
-The compatibility impact is asymmetric:
+Three authentication paths must not be conflated:
 
+- GCS HMAC authentication already exists in the merge base (`5e8eaeb4d7dd`) through the ordinary
+  S3 client, `access_key_id` and `secret_access_key`, AWS SigV4, and GCS's S3 interoperability
+  protocol. It is an established non-CAS path and must remain unchanged.
 - `gcp_oauth` is an upstream ClickHouse feature with existing users. Changing all of its requests
   and responses is an upgrade regression.
-- `gcs_hmac` was added in this fork with the CAS/GCS work. It has no pre-existing compatibility
-  contract, although its authentication and conditional-token responsibilities must still be
-  separated for maintainability.
+- the explicit `http_client=gcs_hmac` selector, `PocoHTTPClientGCSHMAC`, and the GOOG4 signer were
+  added in this fork by `8138a8313f2` and `9604d6a5be9`. The implementation is fork-specific, but
+  the user-facing selector now exists and is not renamed by this design.
+
+“Fork-specific GOOG4 implementation” therefore does not mean that GCS HMAC authentication itself
+is new. It identifies only the dedicated GOOG4 path behind `http_client=gcs_hmac`.
 
 The OAuth behavior is already a concrete bug, not merely a future risk. HEAD and GET response
 headers can yield a numeric generation through the SDK ETag field, while LIST parses its ETag from
@@ -67,6 +77,8 @@ the operation routing around them.
 ## Goals {#goals}
 
 - Restore pre-CAS upstream behavior for every GCS operation that is not explicitly owned by CAS.
+- Preserve the existing user-facing configuration and behavior of non-CAS GCS HMAC through the
+  ordinary S3 interoperability path.
 - Support CAS over GCS using generation-match preconditions and generation-valued incarnation
   tokens.
 - Make isolation structural so future upstream conditional operations default to ordinary ETag
@@ -76,6 +88,7 @@ the operation routing around them.
 - Keep fork changes small, explicit, and concentrated in existing request wrappers and CAS-owned
   call sites.
 - Preserve existing CAS configuration and persistent token formats.
+- Do not rename or remove a non-CAS authentication option.
 - Fail closed when generation semantics, exact deletion, single-PUT limits, metadata round trips,
   or bucket-versioning safety cannot be verified.
 
@@ -83,6 +96,8 @@ the operation routing around them.
 
 - This design does not make ordinary ClickHouse operations consume GCS generations.
 - This design does not change OAuth token acquisition or refresh behavior.
+- This design does not rename `http_client=gcs_hmac` or require existing non-CAS GCS HMAC users to
+  select it.
 - The metadata-server OAuth expiry margin and token sharing between the base client and the existing
   single-attempt retry clone are separate pre-existing concerns and are not changed here; the
   selected design creates no additional token cache or refresh timeline.
@@ -100,6 +115,8 @@ the operation routing around them.
 For a request whose mode is `Default`, behavior must be identical to the upstream behavior before
 the CAS/GCS commits for that `http_client`:
 
+- the established GCS S3-interoperability path continues to use its existing access key, secret
+  key, AWS SigV4, ordinary HTTP client, `x-amz-*` headers, and ETag semantics;
 - `gcp_oauth` performs its established OAuth authentication and no CAS transformation;
 - standard ETag preconditions retain their upstream meaning;
 - response ETags are not replaced by generations;
@@ -112,10 +129,11 @@ the CAS/GCS commits for that `http_client`:
 The compatibility requirement is not “never rename a header.” It is “perform exactly the targeted
 upstream transformations that existed before CAS, and no CAS-wide blanket transformation.”
 
-### Default `gcs_hmac` contract {#default-gcs-hmac-contract}
+### Dedicated GOOG4 `gcs_hmac` contract {#dedicated-goog4-gcs-hmac-contract}
 
-Because `gcs_hmac` is fork-added, its `Default` contract is defined here rather than inherited from
-older upstream behavior. A `Default` request performs GOOG4 authentication only, preserves the
+The dedicated `http_client=gcs_hmac` selector and its GOOG4 implementation are fork-added; GCS HMAC
+authentication through the ordinary S3 client is not. The selector remains a supported user-facing
+name and is not renamed. Its `Default` request performs GOOG4 authentication only, preserves the
 server ETag, and does not acquire generation preconditions. Existing targeted `ApiMode::GCS`
 CopyObject mappings remain active.
 
@@ -130,6 +148,9 @@ are not mechanically renamed because GCS uses a different contract.
 A live GCS characterization test covers `Default` HEAD, GET, LIST, PUT with metadata, CopyObject,
 and multipart before the blanket adapter is removed. This is a release gate: unit tests can prove
 the allowlist, but cannot prove that GCS accepts the resulting authenticated wire requests.
+
+This characterization is separate from the compatibility test for the established ordinary-S3
+HMAC path. Neither path may require a configuration migration for non-CAS users.
 
 ### Explicit per-request selection {#explicit-per-request-selection}
 
@@ -357,6 +378,8 @@ the new API by calling ordinary `tryGetObjectMetadata` and rewriting the result 
 configured `http_client`:
 
 - `gcp_oauth` and `gcs_hmac` support GCS generation tokens;
+- the established GCS S3-interoperability HMAC path does not acquire generation semantics merely
+  from its credentials or endpoint;
 - other modes do not acquire generation semantics implicitly;
 - endpoint substring matching and the base client's former dialect flag are not consulted.
 
@@ -494,6 +517,11 @@ Removing authentication-wide dialect activation restores upstream behavior witho
 change. New upstream code defaults to `ObjectStorageRequestMode::Default`, and ordinary metadata
 APIs do not mark requests. It therefore cannot acquire CAS semantics accidentally.
 
+Existing non-CAS configurations keep the same public API: ordinary GCS HMAC continues through the
+standard S3 client, `gcp_oauth` remains OAuth, and `http_client=gcs_hmac` remains the dedicated
+GOOG4 selector. No option is renamed, no new option is required, and CAS request mode is not exposed
+as a user setting.
+
 The fix also restores one stable ETag domain for `_etag` and cache consumers: HEAD-derived metadata
 no longer changes to generation while LIST retains an ETag.
 
@@ -536,9 +564,21 @@ Add regression tests proving that a `Default` `gcp_oauth` request preserves pre-
 - ordinary GET, HEAD, LIST, PUT, COPY, and multipart requests retain `native_conditional=false` and
   contain no generation preconditions.
 
+### Existing GCS HMAC compatibility {#existing-gcs-hmac-compatibility}
+
+Add characterization coverage for the HMAC path present in merge base `5e8eaeb4d7dd`: ordinary S3
+client selection, `access_key_id` and `secret_access_key`, AWS SigV4, and `x-amz-*` interoperability
+headers. For non-CAS HEAD, GET, LIST, PUT with metadata, CopyObject, DELETE, and multipart, assert
+that configuration parsing, authentication selection, request headers, response ETags, and errors
+are unchanged. This path must retain `native_conditional=false` and must not require
+`http_client=gcs_hmac`.
+
+### Dedicated GOOG4 characterization {#dedicated-goog4-characterization}
+
 Add a separate live-GCS characterization for `gcs_hmac` `Default` requests that proves the explicit
 authentication allowlist supports HEAD, GET, LIST, PUT with metadata, CopyObject, and multipart,
-preserves response ETags, and never applies generation preconditions.
+preserves response ETags, and never applies generation preconditions. The existing
+`http_client=gcs_hmac` configuration spelling and credential fields remain accepted unchanged.
 
 ### User-visible ETag and cache consistency {#user-visible-etag-and-cache-consistency}
 
@@ -604,6 +644,8 @@ proves an attributable generation. Unit tests may not manufacture the missing co
 - `gcp_oauth` and `gcs_hmac` select generation capability through explicit configuration even on a
   proxy endpoint with no `storage.googleapis.com` substring.
 - Other clients do not select generation capability merely because the URL resembles GCS.
+- Ordinary GCS S3-interoperability HMAC does not select generation capability from its endpoint or
+  credentials and retains its existing ETag behavior.
 - Enabled and unknown versioning states both reject writable GCS CAS mount; verified disabled state
   passes.
 - Writable generation mode rejects `skip_access_check=true`; read-only generation mode may skip the
@@ -635,8 +677,8 @@ The implementation should remain within these responsibilities:
 - `src/IO/S3/Client.h` and `Client.cpp`: per-attempt typed-state propagation, explicit `http_client`
   capability, and removal of authentication-wide dialect activation;
 - `src/IO/S3/PocoHTTPClient.h` and `PocoHTTPClient.cpp`: typed-mode inspection, response
-  generation/metadata handling, `gcs_hmac` authentication allowlist, and preservation of the
-  existing Expect gate;
+  generation/metadata handling, the dedicated `gcs_hmac` authentication allowlist, and preservation
+  of the existing ordinary-S3 HMAC and Expect paths;
 - `src/IO/S3/GCSConditionalDialect.h` and `GCSConditionalDialect.cpp`: targeted generation and
   metadata mappings;
 - `src/IO/S3/getObjectInfo.h` and `getObjectInfo.cpp`: `NativeConditional` CAS HEAD request
@@ -659,11 +701,15 @@ The implementation should remain within these responsibilities:
 
 No new S3 client cache, bearer-token provider abstraction, storage-wide setting, or duplicate S3
 object-storage implementation belongs in this change.
+No existing non-CAS `http_client`, credential field, or ordinary GCS HMAC configuration is renamed
+or removed.
 
 ## Merge and maintenance properties {#merge-and-maintenance-properties}
 
 - New upstream operations retain upstream behavior because `ObjectStorageRequestMode` defaults to
   `Default`.
+- Existing GCS HMAC through the ordinary S3 client remains outside the GOOG4 and generation
+  adapters.
 - Authentication changes can evolve independently of CAS token semantics.
 - Retry strategy remains client-level and continues to use the existing single-attempt clone;
   request dialect remains request-level.
@@ -691,6 +737,13 @@ stronger isolation with less code and keeps the one retry-driven clone that is g
 A default-off setting protects installations without CAS but changes every ordinary operation on an
 enabled CAS disk. Future upstream ETag users on that disk could regress. Per-request selection
 removes this class of failure structurally.
+
+### Renaming `gcs_hmac` {#rejected-renaming-gcs-hmac}
+
+A name such as `gcs_goog4` would distinguish the dedicated GOOG4 implementation from the
+established ordinary-S3 HMAC path more explicitly. It is rejected because `http_client` is
+user-facing configuration and `gcs_hmac` already exists on this branch. The specification explains
+the distinction without requiring non-CAS users to rename or migrate configuration.
 
 ### Conditional-header detection {#rejected-conditional-header-detection}
 
@@ -725,10 +778,14 @@ token or require a racy follow-up HEAD.
 
 The design is acceptable only if reviewers can confirm all of the following:
 
-- the current landed behavior and the upstream/fork asymmetry are stated accurately;
+- the current landed behavior and the provenance of all three GCS authentication paths are stated
+  accurately;
+- existing ordinary-S3 GCS HMAC authentication is recognized as a merge-base feature and remains
+  behaviorally and configurationally unchanged for non-CAS use;
 - ordinary `gcp_oauth` traffic is identical to pre-CAS upstream behavior;
 - `Default` `gcs_hmac` traffic has an explicit authentication-only contract and live
   characterization;
+- no existing non-CAS authentication selector or credential field is renamed or removed;
 - request mode, retry profile, and authentication are independent;
 - every transmitted S3 request is an `ExtendedHttpRequest`, and `Client::BuildHttpRequest` derives
   its typed mode again on every retry and post-redirect attempt;
