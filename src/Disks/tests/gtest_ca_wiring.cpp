@@ -673,7 +673,9 @@ TEST(CASWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
 TEST(CASWiringRead, ShadowFreezeTree)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+    publishWiredPart(*storage, storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+    EXPECT_EQ(storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111").string(),
+              storage->serverRootId() + "/shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
 
     /// Intermediate dirs derive from the registered shadow namespaces.
     EXPECT_TRUE(storage->existsDirectory("shadow/bk1"));
@@ -772,7 +774,7 @@ TEST(CASWiringRoute, DirShapeDispatchOrderIsStable)
 {
     auto storage = openWiringStorage();
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
-    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+    publishWiredPart(*storage, storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
     using DS = DB::ContentAddressedMetadataStorage::DirShape;
     EXPECT_EQ(storage->classifyDirectoryForTest("store/uui").shape,             DS::AtomicShard);

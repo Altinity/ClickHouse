@@ -1312,15 +1312,19 @@ ContentAddressedMetadataStorage::readableNamespaceFilesLife(const Cas::RootNames
     return store()->namespaceFilesLifeIfReadable(ns);
 }
 
-Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir)
+Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir) const
 {
-    /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>):
-    /// bijective with the disk path for both layouts, pool-global (backups are read by any
-    /// replica), and the shadow tree enumerates from Pool::listNamespaces("shadow/").
-    /// Canonicalize because the unfreezer can hand the directory a trailing slash.
-    return Cas::RootNamespace{canonicalDiskPath(shadow_table_dir)};
+    /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>) is
+    /// bijective with the disk path for both layouts, and the disk path itself is unchanged by this
+    /// prefix. Canonicalize because the unfreezer can hand the directory a trailing slash.
+    return Cas::RootNamespace{serverPrefix() + "/" + canonicalDiskPath(shadow_table_dir)};
 }
 
+std::string ContentAddressedMetadataStorage::shadowScope(const std::string & path) const
+{
+    const std::string canonical = canonicalDiskPath(path);
+    return serverPrefix() + "/" + (canonical.empty() ? "shadow/" : canonical + "/");
+}
 
 std::optional<ContentAddressedMetadataStorage::Route>
 ContentAddressedMetadataStorage::route(const Cas::PartFilePath & p) const
@@ -1543,9 +1547,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
             /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so
             /// existence is consistent with the ref-level signal and independent of GC timing.
-            const std::string canonical = canonicalDiskPath(path);
-            const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-            const Cas::NamespaceListing listing = store()->listNamespaces(scope);
+            const Cas::NamespaceListing listing = store()->listNamespaces(shadowScope(path));
             for (const auto & ns : listing.namespaces)
                 if (store()->hasAnyRefWithPrefix(Cas::RootNamespace{ns}, ""))
                     return true;
@@ -1730,10 +1732,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// table dirs; strip the trailing `@cas@` for the logical view. Loose LIST is fine: the
             /// existing listRefs re-check filters out dropped-but-registered archives so they don't
             /// appear as false children.
-            const std::string canonical = canonicalDiskPath(path);
-            const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
             std::unordered_set<std::string> result;
-            for (const auto & child : store()->listMirroredChildren(scope))
+            for (const auto & child : store()->listMirroredChildren(shadowScope(path)))
                 result.emplace(stripCasArchiveSuffix(child));
             return toVector(std::move(result));
         }
