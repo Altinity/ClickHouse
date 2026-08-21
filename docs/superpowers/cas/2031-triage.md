@@ -136,9 +136,9 @@
 | CAS-118 | частично | P3 | [{#read-path-repeated-view-lookup-per-open}](BACKLOG.md#read-path-repeated-view-lookup-per-open) | нет | Формы кода реальны (обязательный `HEAD` до пробы decode-кеша, `resolve` до пробы view-кеша, каждая точка входа парсит/роутит/резолвит сама), но головное следствие «ни один кеш не отдаёт чтение без сетевого round trip» факт-неверно: `resolveRef` — чисто in-memory, а тёплый `CachedForLoad`-хит вообще не доходит до `readManifestShared`; стоимость `HEAD`-на-хит уже отслежена, реальный остаток — дублирование parse+route+getView на одно открытие файла (новый P3-пункт). |
 | CAS-119 | частично | P3 | [{#conditional-write-retry-pacing-and-jitter}](BACKLOG.md#conditional-write-retry-pacing-and-jitter) | нет | Single-attempt-клиент для условных записей и 16 попыток подтверждены (осознанный дизайн RFC `cas-s3-timeout-retry-control` с fail-closed mount-гейтом), но «fixed backoff» неверно (capped exponential 200 ms→5 s), «SDK jittered» неверно (дефолтный `jitter_factor = 0`), и «клиент давит сильнее, чем throttling просил» инвертировано: 16 попыток CAS против дефолтных 500 у SDK; реальный остаток — отсутствие jitter при fan-out'е загрузок и выпадение lane'а из общедисковой pacing-логики. |
 | CAS-120 | частично | P3 | [{#same-pool-move-reads-every-byte}](BACKLOG.md#same-pool-move-reads-every-byte) | нет | Форма кода подтверждена (CA-назначение всегда идёт через побайтовый последовательный `readFile`/`writeFile`-цикл, relink-быстрого пути для локального move нет), но «re-writes every byte» неверно — на одном пуле publish целиком съедается dedup-гейтом, реальная цена односторонняя (полный `GET` источника + рестейджинг); тема уже отслежена как `[VERIFY-ca-ca-same-pool-move]`, добавил уточняющий пункт про сторону чтения. |
-| CAS-121 | ⏳ | — | — | — | — |
-| CAS-122 | ⏳ | — | — | — | — |
-| CAS-123 | ⏳ | — | — | — | — |
+| CAS-121 | частично | P3 | — | нет | Отказ BACKUP через временные хардлинки подтверждён, но это осознанный fail-closed гейт и достижим только для deprecated Ordinary-базы; вторая половина находки («каждый BACKUP перечитывает все байты из-за `areBlobPathsRandom()==false`») факт��чески неверна — у part-файлов есть precalculated checksum, и он проверяется РАНЬШЕ пути FromRemotePath. |
+| CAS-122 | дубликат CAS-042 | P3 | [{#operability} (B180 / format-freeze), {#manifest-digest-by-reencode}](BACKLOG.md#operability} (B180 / format-freeze), {#manifest-digest-by-reencode) | нет | Обе цитаты на HEAD верны, но следствие «additive-поле читается как CORRUPTED_DATA» недостижимо (гейт `checkCompatibility` по `v` срабатывает ДО тела и даёт `UNKNOWN_FORMAT_VERSION`), а «нет продюсера у `!`-ключа» — это осознанно дремлющая compat-плоскость pre-release-политики recreate-only; ровно эта земля уже адъюдицирована как CAS-042. |
+| CAS-123 | частично | P3 | [{#byte-accounting-blobs-only-and-preview-size-units} (новый), примыкает к {#mpu-and-probe-debris-unaccounted}](BACKLOG.md#byte-accounting-blobs-only-and-preview-size-units} (новый), примыкает к {#mpu-and-probe-debris-unaccounted) | нет | Учёт байт действительно ограничен телами блобов (плюс один непрофильный счётчик `namespace_janitor_pending_bytes`), и reclaim-forecast-поверхности нет; в `previewDeletes` подтвердилась конкретная смесь физического и логического размера в одной колонке, но «считает записи, которые не удалит» преувеличено — они помечены в колонке `reason`, а двойного счёта нет. |
 | CAS-124 | ⏳ | — | — | — | — |
 | CAS-125 | ⏳ | — | — | — | — |
 | CAS-126 | ⏳ | — | — | — | — |
@@ -5228,3 +5228,252 @@ P3: без порчи данных, все недоказанные исходы
 Не отслежена именно сторона ЧТЕНИЯ: даже когда publish бесплатен, `clonePart` всё равно скачивает часть целиком и последовательно, тогда как manifest-relink (`getRelinkOffer`/`confirmExactRef`, уже используемые interserver-путём) переместили бы ноль байт. Записал (незакоммиченным) `docs/superpowers/cas/BACKLOG/replication.md` → `{#same-pool-move-reads-every-byte}` как уточнение к `[VERIFY-ca-ca-same-pool-move]`, с явным порядком: сначала прогон S37-леги (решает, поддерживаемая ли форма вообще), только потом оптимизация.
 
 P3: фоновая, не чувствительная к латентности операция; ни порчи, ни отказа — только лишний трафик чтения в конфигурации, которая сама по себе физически бессмысленна.
+
+## CAS-121 — Отказ BACKUP через временные хардлинки подтверждён, но это осознанный fail-closed гейт и достижим только для deprecated Ordinary-базы; вторая половина находки («каждый BACKUP перечитывает все байты из-за `areBlobPathsRandom()==false`») факт��чески неверна — у part-файлов есть precalculated checksum, и он проверяется РАНЬШЕ пути FromRemotePath. (частично, P3) {#cas-121}
+
+## 1. Отказ для non-Atomic базы — подтверждён, но by-design и узко достижим
+
+Код на HEAD есть ровно в заявленной форме: `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:420-429`
+— `if (make_temporary_hard_links && disk->isContentAddressed()) throw Exception(SUPPORT_IS_DISABLED,
+"BACKUP via temporary hard links is not supported on a CAS disk yet (B16/B34); use an Atomic database
+(which backs up via pointer-holding) instead; disk '{}'")`. Анкер находки `:417-422` слегка устарел
+(файлы/строки сдвинулись), символ тот же.
+
+Развилка `make_temporary_hard_links` — `MergeTreeData::backupParts`,
+`src/Storages/MergeTree/MergeTreeData.cpp:7580-7597`: значение по умолчанию `true`, сбрасывается в
+`false` при `getStorageID().hasUUID()` (`:7584-7590`, Atomic/Replicated базы) или при zero-copy
+(`:7592-7595`). Анкер находки `7213-7231` устарел, содержимое совпадает.
+
+Существенно для приоритета:
+- Это НЕ тихий сбой, а громкий `SUPPORT_IS_DISABLED` с указанием обходного пути в тексте — по шкале
+  «fail-closed loud failure» это низкий грейд.
+- Единственный достижимый носитель — deprecated `Ordinary`-база: UUID есть у Atomic и Replicated,
+  а `DatabaseOrdinary` при CREATE отказывает без `allow_deprecated_database_ordinary`
+  (дефолт `false`, `src/Core/Settings.cpp`; тот же анализ достижимости уже зафиксирован для
+  соседних находок — `docs/superpowers/cas/2031-triage.md:234` (CAS-006) и `:4344` (CAS-087)).
+- Гейт введён намеренно, коммит `30312a9375e` («CAS M6: B33/B34 gates + content_addressed-default
+  stateless config + smoke»), с комментарием, объясняющим, почему второй путь (pointer-holding)
+  оставлен нетронутым.
+- Основной путь протестирован: `tests/queries/0_stateless/05005_cas_backup_restore.sh:38-40` —
+  полный `BACKUP` → `DROP` → `RESTORE` round-trip на CA-диске, включая проекцию.
+
+Формулировка находки «cannot be backed up at all» верна буквально для Ordinary-базы, но «a CAS table»
+без квалификатора вводит в заблуждение: поддерживаемая (не-deprecated) раскладка бэкапится штатно.
+
+## 2. «Каждый BACKUP перечитывает каждый байт» — неверно
+
+Факт про сам предикат верен: `canCalculateChecksumFromRemotePath` требует
+`getDisk()->areBlobPathsRandom()` (`src/Backups/BackupEntryWithChecksumCalculation.cpp:126`), а CA
+возвращает `false`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h:264`).
+Но следствие инвертировано:
+
+1. Порядок выбора метода в `chooseChecksumCalculationMethod`
+   (`src/Backups/BackupEntryWithChecksumCalculation.cpp:87-113`): `EmptyZero` → **`Precalculated`
+   (`:96-99`)** → `FromRemotePath` (`:100-103`) → … → `FromReading` (`:108-111`). Precalculated
+   проверяется РАНЬШЕ FromRemotePath, поэтому отсутствие FromRemotePath ничего не «форсирует».
+2. У part-файлов precalculated checksum есть: `DataPartStorageOnDiskBase::backup` берёт
+   `file_size`/`file_hash` из `checksums.files` и передаёт их в `BackupEntryFromImmutableFile`
+   (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:483-493`); `getPrecalculatedChecksum`
+   возвращает их (`src/Backups/BackupEntryFromImmutableFile.h:39`). То есть все файлы из
+   `checksums.txt` (то есть все крупные данные части) идут веткой `Precalculated`, без чтения.
+3. Инкрементальный (base-backup) путь тоже не читает: `buildFileInfoForBackupEntry` в ветках
+   `HasFull`/`HasNothing` вызывает `calculateNewEntryChecksumsIfNeeded(entry, 0, ...)`
+   (`src/Backups/BackupFileInfo.cpp:178`), внутри — `getPartialChecksum(0)` + `getChecksum()`;
+   `getPrecalculatedChecksumIfFull` (`BackupEntryWithChecksumCalculation.cpp:155-171`) отдаёт
+   `nullopt` для префикса и precalculated для полного — I/O нет. Настоящее чтение префикса нужно
+   только в ветке `HasPrefix` (файл в базовом бэкапе МЕНЬШЕ текущего), что для иммутабельных
+   part-файлов MergeTree не наступает.
+4. Читаются только `files_without_checksums` (`count.txt`, `columns.txt`, `checksums.txt`,
+   `metadata_version.txt` и т.п.) — это как раз inline-файлы CA (≤1 MiB), а не «весь датасет».
+5. CA здесь вообще не выделен: `false` возвращают также `DiskLocal.h:94`, `DiskBackup.h:94`,
+   `MetadataStorageFromPlainObjectStorage.h:51`, `MetadataStorageFromPlainRewritableObjectStorage.h:52`,
+   `MetadataStorageFromStaticFilesWebServer.h:59`. `true` — только у `MetadataStorageFromDisk.h:77`
+   (локальные метаданные со случайными ключами, где случайность пути и есть идентичность записи).
+   Возвращать `true` на CA было бы неверно по смыслу предиката (см. и второе использование,
+   `MergeTreeSettings.cpp:2355`, где `areBlobPathsRandom()` означает «карта блобов лежит вне
+   object storage»).
+
+## 3. BACKLOG / история
+
+- Ровно этот предикат уже разобран в предыдущей триаге как часть CAS-020:
+  `docs/superpowers/cas/2031-triage.md:764-767` — «Контрольные суммы по удалённому пути ОТКАЗАНЫ
+  заранее… так что `calculateChecksumFromRemotePath` не вызывается». То есть находка переиспользует
+  уже адъюдицированный факт и навешивает на него новое (неверное) следствие. Заметьте: там же
+  показано, что отказ FromRemotePath на CA — ЗАЩИТА, а не потеря: `getStorageObjects` на CA теряет
+  смещение payload (это и есть подтверждённый CAS-020, `{#cas-020}`), так что «включить» этот путь
+  на CA было бы багом целостности.
+- Про сам хардлинк-гейт в BACKLOG отдельного пункта нет; ближайшее — `[B198] backup/restore runbook`
+  (`docs/superpowers/cas/BACKLOG/operability-and-introspection.md:18`, GATE): именно там место для
+  фразы «BACKUP поддержан для Atomic/Replicated баз; Ordinary отказан». Нового пункта не добавляю:
+  это документационный нюанс внутри уже отслеживаемого gate-а, а не отдельный технический остаток.
+  Ссылка находки на «carried from prev CAS-042» неверна — CAS-042 в
+  `docs/superpowers/cas/2031-triage.md:1645` про формат-версию/`changePoints`, не про BACKUP.
+
+## Итог
+
+Остаток к починке: ноль кода. Половина №1 — верная, но by-design и узкая (deprecated Ordinary,
+громкий отказ, обходной путь в тексте ошибки); половина №2 — фактически неверная, следствие
+инвертировано. Единственное действие — строка в runbook B198; отсюда P3 и `PRE-RELEASE: нет`.
+
+## CAS-122 — Обе цитаты на HEAD верны, но следствие «additive-поле читается как CORRUPTED_DATA» недостижимо (гейт `checkCompatibility` по `v` срабатывает ДО тела и даёт `UNKNOWN_FORMAT_VERSION`), а «нет продюсера у `!`-ключа» — это осознанно дремлющая compat-плоскость pre-release-политики recreate-only; ровно эта земля уже адъюдицирована как CAS-042. (дубликат CAS-042, P3) {#cas-122}
+
+## Цитаты на HEAD (пути обновлены: `Formats/` подкаталог, коммит `592b9b83568`)
+
+- `!`-ключ → `UNKNOWN_FORMAT_VERSION`:
+  `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.cpp:245-250`
+  (`skipUnknown`: `if (!key.empty() && key[0] == '!') throw … UNKNOWN_FORMAT_VERSION`). Анкер находки
+  `:240-242` близок, строки сдвинуты.
+- Strict → `CORRUPTED_DATA`: там же `:251-253`.
+- Strict-форматы: `Formats/CasFormat.cpp:152` (`RefCkpt`), `:163` (`RefCatalog`), `:164`
+  (`GcMaintenanceState`), `:166` (`RunFile`), `:167` (`FoldSeal`) — список находки точен.
+- `emit_unknown_critical_key`: объявлен в `Formats/CasBlobEnvelopeFormat.h:73` (`= false`),
+  единственный писатель — `Formats/CasBlobEnvelopeFormat.cpp:122-126`, и он в самом коде помечен
+  комментарием **«Test-only critical extension: an unknown `!`-key BEFORE `ref`»** (`:122`).
+  Единственная установка в `true` — `src/Disks/tests/gtest_cas_blob_envelope_format.cpp:140`.
+  Продакшн-вызовов нет — это факт, но это тестовый хук для reader-side гейта, а не заявленная
+  «escape hatch для писателей».
+
+## Почему следствие недостижимо
+
+Порядок декодирования жёсткий: `expectHeaderLine` читает строку заголовка и вызывает
+`checkCompatibility(h.v, t.type)` (`Formats/CasTextFormat.cpp:327`) ДО чтения тела, а
+`checkCompatibility` бросает `UNKNOWN_FORMAT_VERSION` при `compatibility_version > G_BUILD`
+(`Formats/CasFormat.cpp:110-117`). Каждый писатель штампует `v = currentCompatibilityVersion()`,
+которое равно `G_BUILD` без исключений (`Formats/CasFormat.cpp:104-108`, комментарий: «Until
+roster-based write-down is implemented, every object carries the current build as its compatibility
+floor»); `writeHeaderLine` — `CasTextFormat.cpp:264-268`. Конкретно для strict-форматов из находки
+это видно end-to-end: `decodeRefCkpt` — `Formats/CasRefCkptFormat.cpp:118` (`expectHeaderLine`) и
+только потом `:127` (`JsonObjectReader(…, KeyStrictness::Strict, …)`); аналогично
+`CasRefCatalogFormat.cpp:176`, `CasGcMaintenanceStateFormat.cpp:42`, `CasRecordStreamFormat.cpp:137`
+(там `checkCompatibility` прямо в чтении заголовка) → `:240`, `CasFoldSealFormat.cpp:337`/`:352`.
+
+Значит сценарий «новая сборка добавила поле в strict-формат → старый ридер видит `CORRUPTED_DATA`»
+требует, чтобы новая сборка добавила поле БЕЗ бампа генерации — то есть нарушения политики
+`CasFormat.h:13-16` / `Formats/README.md:52-53`. При соблюдённой политике старый ридер получает
+именно `UNKNOWN_FORMAT_VERSION`, то есть ровно тот «version problem»-сигнал, отсутствие которого
+находка и вменяет. Следствие инвертировано.
+
+Второе: заявление «routes an operator to fsck/rebuild instead of a rollback» — ничем не подкреплено в
+коде. Автоматического самолечения по `CORRUPTED_DATA` в CA-слое нет: единственная ветка, которая
+вообще смотрит на код ошибки, — `Formats/CasTextFormat.cpp:128` (перебрасывает `CORRUPTED_DATA` и
+`UNKNOWN_FORMAT_VERSION` как есть). Никакого удаления/квaрантина/rebuild по этому коду не
+запускается: это громкий отказ, который читает человек, а не деструктивное действие. По шкале
+fail-closed-loud vs silent-corruption — низший грейд.
+
+## Уже адъюдицировано / BACKLOG
+
+- **CAS-042** (`docs/superpowers/cas/2031-triage.md:1645`, статус `by-design`, P2) — та же тема с той
+  же аргументацией, только для `Tolerant`-стороны: пункт 4 (`:1677-1686`) дословно строит то же
+  доказательство недостижимости (`expectHeaderLine` → `checkCompatibility` до тела; `!`-ключи
+  отвергаются даже толерантными форматами, `CasTextFormat.cpp:249-251`) и заключает: «риск дисциплины,
+  а не дефект HEAD, и он fail-closed, а не silent». Пункт 3 (`:1672-1675`) фиксирует отсутствие
+  машинной проверки «изменение формата ⇒ бамп `G_BUILD`». CAS-122 — тот же дефект, повёрнутый на
+  `Strict`.
+- **CAS-041** → `docs/superpowers/cas/BACKLOG/formats-and-storage.md:290-305`
+  ({#manifest-digest-by-reencode}) — там уже записано словами то же самое: «The audit's stated
+  consequence … is NOT reachable today: `currentCompatibilityVersion()` always stamps `G_BUILD` and
+  there is no write-down-to-floor policy (tracked as B180), so a newer object is refused earlier and
+  louder by `checkCompatibility` … and every generation bump so far is recreate-only», плюс прямая
+  развилка на решение «либо сделать толерантность реальной, либо перевести формат в `Strict` и честно
+  сказать, что additive-эволюция требует бампа генерации».
+- **CAS-043** (`docs/superpowers/cas/2031-triage.md:1730`, `{#relink-fallback-unknown-format-version}`)
+  — уже разобрал сигнальную пару «`UNKNOWN_FORMAT_VERSION` для гейта версии и для `!`-ключа» и
+  зафиксировал, что перекос генераций в одном пуле сегодня невозможен (mount держит точный гейт).
+- Отслеживающий gate — `[B180 / format-freeze]`,
+  `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:19`: «durable roster +
+  `max_content_addressable_pool_format` setting/rollout machinery not built (Part IV)». Именно там
+  оживает вся дремлющая compat-плоскость, включая `!`-ключи и write-down-to-floor. Смежный пункт —
+  `{#cas-format-version-floor}` (`formats-and-storage.md:79`).
+
+## Что реально осталось
+
+Ничего нового к починке: рабочего продюсера `!`-ключей действительно нет, но это по построению —
+пока пул одногенерационный, писать «критическое расширение» некому и нечего, а сам ридерный гейт
+покрыт тестами (`gtest_cas_blob_envelope_format.cpp:140`, `gtest_cas_text_format.cpp:155`). Претензия
+находки про «одна из половин сделки — мёртвый код» верна как наблюдение, но у неё уже есть владелец
+(B180) и уже вынесенный вердикт (CAS-042). Нового пункта в BACKLOG не добавляю — это дубликат.
+Ссылка oneliner-а на «prev CAS-075» неверна: CAS-075
+(`docs/superpowers/cas/2031-triage.md:3684`) про порядок «тело блоба durable → потом `.meta`»,
+не про `header_hash`/`!`-ключи.
+
+## CAS-123 — Учёт байт действительно ограничен телами блобов (плюс один непрофильный счётчик `namespace_janitor_pending_bytes`), и reclaim-forecast-поверхности нет; в `previewDeletes` подтвердилась конкретная смесь физического и логического размера в одной колонке, но «считает записи, которые не удалит» преувеличено — они помечены в колонке `reason`, а двойного счёта нет. (частично, P3) {#cas-123}
+
+## Что подтверждается
+
+1. **`physical_bytes` — только тела блобов.** `runFsckImpl` листит `layout.blobsPrefix()`, отделяет
+   `.meta`-ключи от тел и суммирует ТОЛЬКО тела:
+   `Tools/CasFsck.cpp:727-744` (`for (const auto & [_, sz] : present_blobs) report.physical_bytes += sz;`),
+   плюс два HEAD-доначисления `:759` и `:1071`. То есть даже `.meta`-сиблинги в сумму не входят, не
+   говоря о манифестах, ref-логах, снапшотах, `_ckpt`, run-файлах, fold-seal-ах, `gc/state`, staging.
+   Анкер находки `CasFsck.cpp:578-596` устарел (файл переехал в `Tools/`, коммит `592b9b83568`);
+   символы найдены по grep.
+2. **`FsckReport` не имеет per-class байтовых полей** — `Tools/CasFsck.h:158-161`
+   (`physical_bytes`, `referenced_logical_bytes`, `total_blob_refs`, `distinct_blobs`);
+   `referenced_logical_bytes` набирается из `e.blob_size` записей манифеста (`Tools/CasFsck.cpp:695`),
+   то есть тоже про блобы.
+3. **GC-лог не считает байты вообще.** Все счётчики раунда — количества объектов:
+   `src/Interpreters/ContentAddressedGarbageCollectionLog.h:32-43`
+   (`objects_deleted`, `manifests_deleted`, `entries_redeleted`, …), ни одной байтовой колонки. Так что
+   «сколько байт освободил раунд» не отвечается и из
+   `system.content_addressed_garbage_collection_log`.
+4. **Reclaim-forecast для «сколько освободит DROP таблицы X» — поверхности нет.** Подтверждаю: ни
+   `SYSTEM ... FSCK` (`src/Interpreters/InterpreterSystemQuery.cpp:2455-2504`), ни `ca-inspect`
+   (`Tools/CasInspect.*`), ни `cas-gc-dryrun` такого не дают.
+5. **`previewDeletes` смешивает единицы — верно и конкретно.** Ветка zero-in-degree пишет сырой
+   HEAD-размер (`Gc/CasGc.cpp:4441-4444`, `e.size = observed.size` — с конвертом), а ветка
+   retired-in-snapshot — сохранённый размер условно-осуждённой строки (`:4470`, `e.size = row.size`),
+   который на записи уже прогнан через `retiredLogicalSize` = `object_size - blob_header_len`
+   (`Gc/CasGc.cpp:320-329`, вызовы `:1849`, `:1871`). `clickhouse-disks cas-gc-dryrun` печатает колонку
+   как есть (`programs/disks/CommandCaGcDryRun.cpp:47`), так что сумма колонки смешана на
+   `blob_header_len` за строку — 256 байт по умолчанию (`Pool/CasPool.h:54`). Дефект реальный, но
+   мелкий и однострочный.
+
+## Что преувеличено / неверно
+
+- **«no byte accounting outside `blobs/`» — не абсолютно.** Один непрофильный класс байт всё же
+  считается и репортится: `namespace_janitor_pending_bytes` — поле `FsckReport`, печатается в текстовом
+  саммари (`Tools/CasFsck.cpp:1166`) И присутствует как SQL-колонка
+  (`src/Interpreters/InterpreterSystemQuery.cpp:2497`). Это ключи namespace-дерева, не `blobs/`.
+  Типовая ошибка «reported nowhere», когда SQL-строка это репортит — здесь она частичная, но есть.
+- **«counts entries it will not delete» — преувеличено.** Каждая строка несёт `reason`:
+  `unreachable` | `delete_pending` | `awaiting_graduation` (`Gc/CasGc.h:448`, заполняется
+  `CasGc.cpp:4445`, `:4472`), и CLI печатает его первой колонкой
+  (`programs/disks/CommandCaGcDryRun.cpp:47`), то есть оператор отфильтровывает
+  «удалится следующим fold-ом» от «ждёт graduation». Over-report при неквиесценции задокументирован в
+  контракте API (`Gc/CasGc.h:453-457`: «at NON-QUIESCENCE it can OVER-REPORT … The {preview} ⊆
+  {genuinely-unreachable} guarantee holds ONLY at quiescence. No CAS/delete»), и весь инструмент
+  объявлен «Diagnostic / cross-check ONLY — its output must never feed a real delete».
+- **Двойного счёта нет** (проверил, потому что фраза «Output is a superset of the above» в
+  `CasGc.cpp:4450` к этому подталкивает): fold эмитит НЕ БОЛЕЕ ОДНОЙ sentinel-строки на блоб —
+  `kCondemned`, иначе `kZeroMarker` (`Gc/CasBlobInDegree.cpp:573-589`, комментарий «Emit at most one
+  sentinel row per blob»), а `zeroInDegree` пропускает `kCondemned`-строки
+  (`Gc/CasBlobInDegree.cpp:706-708`). Так что один блоб в превью встречается один раз.
+- Ссылка oneliner-а на «carried from prev CAS-040» неверна: CAS-040
+  (`docs/superpowers/cas/2031-triage.md:2407`) — про `\n` в имени проекции и заклинивание GC.
+
+## BACKLOG / история
+
+- Узкая форма первой половины уже отслежена: `{#mpu-and-probe-debris-unaccounted}`
+  (`docs/superpowers/cas/BACKLOG/operability-and-introspection.md:256-283`, из 2031-триажа CAS-082) —
+  там прямо сказано «CAS is the storage whose docs promise a complete byte accounting for the pool
+  (fsck `physical_bytes` sums HEAD sizes of visible objects only — `Tools/CasFsck.cpp:744`, `:759`,
+  `:1071`)» и что `_probe/`-ключи «neither reported nor reclaimed». Но покрыты там только два класса
+  (незавершённые MPU и `_probe/`), а не общая проблема «байты по классам объектов».
+- Отдельного пункта про отсутствие per-class байтового учёта, про отсутствие байтовых колонок в
+  GC-логе и про смесь единиц в `previewDeletes` в `BACKLOG.md`/`BACKLOG/*.md` нет (grep по
+  `byte accounting`, `capacity`, `forecast`, `reclaim-forecast`, `previewDeletes` — попаданий по теме
+  нет, кроме `{#mpu-and-probe-debris-unaccounted}` и `[S11 capacity]` в `performance.md:134`, который
+  про GC-лаг, а не про учёт).
+- Записал новую секцию (не коммичена):
+  `docs/superpowers/cas/BACKLOG/operability-and-introspection.md`
+  `{#byte-accounting-blobs-only-and-preview-size-units}` — оба остатка, с указанием, что
+  per-table reclaim-forecast на дедуплицирующем пуле сначала требует спецификации модели
+  разделяемых байт (уникальные байты таблицы vs её доля в общих блобах), а не счётчика.
+
+## Итог
+
+Класс — day-2 наблюдаемость, ни одной проблемы корректности: P3, не pre-release. Реальный остаток —
+(а) байты считаются только по телам блобов, и ни fsck, ни GC-лог не дают разбивку по классам объектов;
+(б) однострочная несогласованность единиц в `PreviewEntry::size`. «Reclaim-forecast» как фича
+корректно назван отсутствующим, но это не дефект, а неспецифицированная функция.

@@ -601,3 +601,45 @@ so the mount-lease inequality is checked against the CONFIGURED values rather th
 and land it together with the reload gap ({#cas-settings-not-reloadable-silently}) so a configured
 value is not silently ignored on `SYSTEM RELOAD CONFIG`. Not a gate: the defaults are the ones every
 soak ran on, and `Pool::open` already refuses an inconsistent budget out loud.
+
+## Byte accounting covers only blob bodies, and `previewDeletes` reports two different size units in one column (2031-triage CAS-123) {#byte-accounting-blobs-only-and-preview-size-units}
+
+Two P3 observability residuals, neither of them a correctness issue.
+
+**No per-object-class byte accounting.** `FsckReport::physical_bytes` is summed exclusively from the
+`blobs/` listing, and even there only from BODY keys — `.meta` siblings are split out of
+`present_blobs` before the sum (`Tools/CasFsck.cpp:727-744`, plus the two HEAD top-ups at `:759` and
+`:1071`). Nothing anywhere sums the bytes of manifests, ref logs, ref snapshots, `_ckpt`, run files,
+fold seals, GC state, or staging keys. The only non-blob byte counter in the whole surface is
+`namespace_janitor_pending_bytes` (`Tools/CasFsck.h`, rendered at `Tools/CasFsck.cpp:1166` and exposed
+as a SQL column at `src/Interpreters/InterpreterSystemQuery.cpp:2497`), which covers one debris class
+only. The GC log has no byte columns at all — every counter in
+`ContentAddressedGarbageCollectionLogElement` is an object count
+(`src/Interpreters/ContentAddressedGarbageCollectionLog.h:32-43`), so "how many bytes did this round
+reclaim" is not answerable from `system.content_addressed_garbage_collection_log` either. Consequence:
+a bucket-total-versus-`physical_bytes` gap cannot be attributed to any object class. This is the
+general form of the narrow case already named under {#mpu-and-probe-debris-unaccounted} (incomplete
+MPU parts and `_probe/` debris); that item's owed doc line should say which classes `physical_bytes`
+covers, and the cheap fix here is a per-prefix byte breakdown in the fsck report (it already walks
+every plane) plus a `bytes_deleted` column on the GC-round row.
+
+Related but distinct, and NOT owed here: there is no per-table reclaim forecast ("how much would
+dropping table X free"), and on a deduplicating pool that number is not even well defined without
+naming the sharing model (unique-to-this-table bytes vs its share of shared blobs). If it is ever
+wanted, it needs a spec first, not a counter.
+
+**`previewDeletes` mixes physical and logical sizes.** `Gc::PreviewEntry::size` carries the raw HEAD
+size for zero-in-degree candidates (`Gc/CasGc.cpp:4441-4444`, envelope-inclusive) but the condemned
+row's stored size for retired-in-snapshot rows (`:4470`), and that stored value was written through
+`retiredLogicalSize` — i.e. already payload-only, `object_size - blob_header_len`
+(`Gc/CasGc.cpp:320-329`, applied at `:1849` and `:1871`). `clickhouse-disks cas-gc-dryrun` prints that
+column raw (`programs/disks/CommandCaGcDryRun.cpp:47`), so summing it mixes units by
+`blob_header_len` (256 by default, `Pool/CasPool.h:54`) per condemned row. Small in absolute terms and
+the command is documented diagnostic-only, but it is a one-line fix: either subtract the header in the
+zero-in-degree branch too, or carry both fields.
+
+Not defects in the same tool, for the record: rows the round will not delete are labeled in the
+`reason` column (`unreachable` / `awaiting_graduation` / `delete_pending`), the non-quiescence
+over-report is documented at the API (`Gc/CasGc.h:453-457`), and no blob is double-counted — the fold
+emits at most one sentinel row per blob (`Gc/CasBlobInDegree.cpp:573-589`) and `zeroInDegree` skips
+`kCondemned` rows (`:706-708`).
