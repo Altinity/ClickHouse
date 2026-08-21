@@ -306,3 +306,39 @@ manifest and calls `encodePartManifest`). Two residuals, neither of them a live 
   2.9 ms), i.e. roughly 1.4×–2.7× the decode work, plus two extra transient copies of the payload
   (the probe manifest and its encoded bytes) on top of the decoded model — with a 256 MiB
   `object_cap` for this format, that peak is worth bounding. Digesting the wire bytes removes both.
+
+## Emulated token-state expiry compares an fs-mtime etag against the local clock (2031-triage CAS-067) {#emu-token-state-clock-skew-leak}
+
+MINOR (emulated mode only — CI, unit tests, local development; no S3/GCS pool is affected).
+
+`emuMintToken` seeds its token from the object's etag, which `LocalObjectStorage` derives from the
+file's mtime in nanoseconds (`ObjectStorages/Local/LocalObjectStorage.cpp:391`, `:427`). The bound on
+`emu_token_state` (added 2026-07-18, `08ea8d1200e`) expires an entry only when that etag is
+"comfortably in the past" relative to the process's own `system_clock`:
+`etagComfortablyInThePast` requires `now_ns > etag_ns && now_ns - etag_ns >= 2s`
+(`Backend/CasObjectStorageBackend.cpp:447-464`).
+
+Those two clocks are the same clock on a local filesystem, but not necessarily on a shared mount, and
+not across an NTP step:
+
+- **mtimes from a clock AHEAD of ours** (NFS/CIFS server ahead): `etag_ns > now_ns` forever, so
+  `etagComfortablyInThePast` never returns true. `deleteExact` then always takes the retain branch
+  (`:1050-1057`), and the lazy sweep pops the queue record after the age check without erasing the map
+  entry (`:513-520`) — so `emu_token_expiry` stays bounded, but each deleted key leaks one
+  `emu_token_state` entry for the lifetime of the backend instance.
+- **local clock stepped BACK**: while `now_ns <= candidate.queued_at_ns`, the sweep breaks at the
+  oldest record (`:512-513`) and prunes nothing at all. This one self-heals once the clock passes the
+  queued timestamp — it is not permanent.
+
+No correctness impact: a leaked entry only makes a later same-key recreate mint a disambiguated
+`etag#N` token (still unique, still fail-closed against a stale token), and a recreate with an
+advanced etag overwrites the entry outright (`:577-579`). The cost is memory: ~100 B per distinct
+deleted key in a long-running emulated-mode process under skew.
+
+Fix direction: derive the expiry decision from a monotonic, locally-generated stamp (the
+`queued_at_ns` already recorded in `EmuTokenExpiry`) instead of re-reading the storage-supplied etag,
+so the guard never compares two unrelated clocks; or cap `emu_token_state` by size as a backstop.
+The existing unit coverage
+(`gtest_cas_backend.cpp:847-919`, `DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfortablyOld` /
+`EmuTokenStateEventuallyPrunesDistinctShortLivedKeys`) already has the injectable clock/etag doubles
+needed for a failing-first test.
