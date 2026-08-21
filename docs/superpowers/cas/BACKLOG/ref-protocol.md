@@ -57,3 +57,19 @@ Consult-flagged, controller-verified, deliberately deferred with measurement/des
 
 - **[recovery-seal-greatest-applied-gap] recovery can publish a seal without advancing `greatest_applied` to it** — DESIRABLE — Codex review finding: next epoch's first log could use a stale `prev`, letting GC accept a late void log below the cursor. No evidence this specific ordering gap was independently closed by the Stage A/B rework — distinct from the general `committed_through` ceiling proof (verified separately), which does not cover `greatest_applied` specifically.
 - **[recovery-repair-buffer-unbounded] verify recovery-repair memory bound matches the streaming-replay design** — DESIRABLE — Recovery repair buffering allegedly retains a whole omitted transaction (up to 20 MiB) rather than one decoded transaction at a time. Re-check against HEAD's `runRecoveryWalkOnce`/streaming replay path; if the buffering is now bounded, close as done, else this is a real soak-risk on large pools.
+
+## No query-cancellation checks in the CA tree (2031-triage CAS-015) {#no-query-cancellation-checks}
+
+Every CA wait (ref-lane single flight, leader election, namespace recovery, part-folder single
+flight) is bounded by the I/O underneath it — the `CasRequestController` budget (16 attempts / 90 s),
+the 120 s `recovery_retry_budget_ms`, or a mount-fence loss — so the "hangs forever" framing is
+wrong, and the shutdown drain is explicitly timed (`CasRefLedger.cpp:1877-1895`, `wait_until` on a
+shared deadline, fail-closed). What is genuinely missing: not one wait in the CA tree polls query
+cancellation, so `KILL QUERY` and `max_execution_time` cannot interrupt a query parked behind a slow
+leader, and several bounded operations in sequence can still add up to minutes.
+
+Fix: thread a cancellation callback (the standard `isCancelled`/`QueryStatus` poll used elsewhere in
+the read path) into the waits that run on a query thread — read/single-flight first, ledger waits
+after. Related, already listed here: `[timeout-retry RFC residuals]` item (c) —
+`PartFolderAccess` single flight rides the disk's default S3 retry profile instead of the CA
+controller.

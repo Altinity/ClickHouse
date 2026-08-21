@@ -30,7 +30,7 @@
 | CAS-012 | частично | P3 | [{#bucket-requirements-lifecycle-worm-glacier}](BACKLOG/docs-and-cleanup.md#bucket-requirements-lifecycle-worm-glacier) | нет | Урегулированная позиция (by-design + docs) на HEAD держится, но док-половина закрыта только по versioning: lifecycle expiration, Object Lock/WORM и storage-class transitions в `docs/en/antalya/cas/` не описаны нигде, а Glacier-чтение падает сырым `S3Exception` без restore-and-retry и без классифицированной подсказки. |
 | CAS-013 | частично | P3 | — | нет | Механика подтверждена (допуск алгоритма CAS-поднимает пул-глобальный `min_reader_generation` до `G_BUILD` без записи блоба), но заявленного вреда сегодня нет: обратный порог формата уже равен `G_BUILD`, поэтому старые сборки и так не читают пул — дефект латентный, на будущее окно совместимости. |
 | CAS-014 | частично | P2 | [{#part-file-suffix-allowlist-memory}](BACKLOG/performance.md#part-file-suffix-allowlist-memory) | нет | Классификатор действительно закрытый allowlist и не знает `primary.cidx`, `.mrk4`/`.cmrk4` и файлов вторичных индексов — но это не corruption: есть cap 1 MiB и спилл в blob, реальная цена — буферизация всего файла в памяти и двойная запись. |
-| CAS-015 | ⏳ | — | — | — | — |
+| CAS-015 | частично | P2 | [{#no-query-cancellation-checks}](BACKLOG/ref-protocol.md#no-query-cancellation-checks) | нет | Ожидания на single-flight/лидере/восстановлении действительно без дедлайна и без отмены запроса, но каждое из них стоит за ограниченным по времени I/O (бюджет `CasRequestController` 90 с/16 попыток, бюджет восстановления 120 с, потеря mount-fence), поэтому «вечного» зависания нет — остаётся неотменяемость (`KILL QUERY`/`max_execution_time`) и суммирование ограниченных операций в минуты. |
 | CAS-016 | ⏳ | — | — | — | — |
 | CAS-017 | ⏳ | — | — | — | — |
 | CAS-018 | ⏳ | — | — | — | — |
@@ -472,3 +472,87 @@ Cap ЕСТЬ: `constexpr size_t INLINE_CAP = 1024 * 1024; /// 1 MiB` (`:98`), з
 История: предикат добавлен в `c623713479f` («CA: add partFileMustStayBlob predicate (.bin/.mrk*/primary.idx)»), inline-путь — `27c5f790d19`, перенос в транзакцию — `41a70357f31`. Ревизия-снапшот `842f2b37b8f` в этом репозитории отсутствует (`fatal: Not a valid object name`), поэтому диффа «со снапшота» нет; по `git log -S partFileMustStayBlob` предикат с момента добавления не менялся.
 
 Что остаётся: заменить закрытый allowlist на решение по размеру (ровно направление уже записанного пункта `[B121 / B202 / one-GET-open]`: «drop the file-type predicate, inline < ~512 KiB, `.bin` carve-out») либо, минимально, стримить всё, что не является inline-кандидатом по природе (никаких файлов с неизвестным расширением в память), и добавить наблюдаемость на «неизвестное имя файла парта». Отдельно стоит поправить мёртвую ветку `primary.idx` → `primary.cidx`/оба.
+
+## CAS-015 — Ожидания на single-flight/лидере/восстановлении действительно без дедлайна и без отмены запроса, но каждое из них стоит за ограниченным по времени I/O (бюджет `CasRequestController` 90 с/16 попыток, бюджет восстановления 120 с, потеря mount-fence), поэтому «вечного» зависания нет — остаётся неотменяемость (`KILL QUERY`/`max_execution_time`) и суммирование ограниченных операций в минуты. (частично, P2) {#cas-015}
+
+Нумерация строк в находке устарела (файлы сдвинулись); ниже — HEAD `9b887ac8886`. Все пути:
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`.
+
+1) Восстановление, ожидающий читатель — `Pool/CasRefLedger.cpp:1342-1348`:
+`while (rt.recovery_in_progress) { ... rt.recovery_cv.wait(lock); ... }` — дедлайна нет, проверки отмены у ждущего нет.
+ЧЕМ ОГРАНИЧЕНО ФАКТИЧЕСКИ: пробуждение гарантировано `SCOPE_EXIT` (`CasRefLedger.cpp:1355-1359`,
+сбрасывает `recovery_in_progress` и делает `notify_all` на любом выходе, включая исключение), а сам
+обход ограничен внешним retry-бюджетом `recovery_retry_budget_ms = 120000`
+(`Backend/CasRequestControl.h:195`) с проверками `fence_ok_fn()`, `superseded_by_remount`,
+`catalog_life_invalidated` и `fence_generation_fn() != admitted_generation` ПЕРЕД каждым сном
+(`CasRefLedger.cpp:1487-1495`), плюс латч `cancelled`, который выставляет опрос внутри обхода.
+Итог: «каждый читатель восстанавливающегося namespace висит вечно» — не подтверждается; висит на
+время одного ограниченного восстановления.
+
+2) Single-flight ref-очереди (конкурентные INSERT в одну таблицу) — `Pool/CasRefLedger.cpp:2044`
+(`rt->cv.wait(lk);` внутри `while (!item->done)` в `appendRefOpsOnRuntime`): дедлайна нет, отмены нет.
+ЧЕМ ОГРАНИЧЕНО: это не «follower навсегда» — как только `leader_active` освобождается, ждущий сам
+становится лидером (`:1988-2010`); тенура лидера состоит из вызовов `CasRequestController`, каждый из
+которых ограничен `operation_deadline_ms = 90000` / `max_attempts = 16` /
+`attempt_timeout_ms = 5000` (`Backend/CasRequestControl.h:151-173`) и гейтится `fence_ok` — при полной
+недоступности стора fence отваливается через ≈TTL и лидер падает fail-closed;
+`completeOwnedItemsAndReleaseLeadership` гарантирует, что каждый принадлежащий лидеру item уходит
+`done` (с ошибкой) на ЛЮБОМ выходе, т.е. ждущие не остаются осиротевшими.
+ОСТАЁТСЯ: ожидание не отменяемо — во всём CA-дереве нет ни одной проверки `QueryStatus`/`isCancelled`
+(grep по каталогу даёт только `shutdown_called` в `ContentAddressedMetadataStorage.cpp:396,626,892,1023`),
+поэтому `KILL QUERY`/`max_execution_time` не прерывают ни этот `cv.wait`, ни `future.get()` ниже.
+
+3) Shutdown-дренаж — ОПРОВЕРГАЕТ «нигде нет дедлайна»: `CasRefLedger.cpp:1877-1895` использует
+`cv.wait_until(lk, deadline)` против ОДНОГО общего дедлайна, при таймауте ставит `timed_out` и
+возвращает `false` (fail-closed: чистый farewell-маркер не пишется). Бюджет задаёт вызывающий:
+`CasPool.cpp:880-881` = `attempt_timeout_ms + lease_safety_margin_ms` (≈7 с). Новые заявки при этом
+отклоняются в том же критическом участке (`CasRefLedger.cpp:1972-1975`, `shutting_down`), т.е. DROP/
+release не может «залипнуть» на дренаже.
+
+4) Барьер отмены восстановлений — `CasRefLedger.cpp:1577-1600`: `recovery_cv.wait(slock, pred)` без
+дедлайна, НО перед ожиданием всем таблицам выставляется `recovery_cancel_requested`
+(`:1595-1596`), который обход опрашивает; это by-design join, ограниченный именно отменой.
+
+5) `DROP TABLE`/`dropNamespace` — `CasRefLedger.cpp:4933-4939`: `rt->cv.wait(queue_lock, ...)` до
+`!leader_active && pending.empty()`, без дедлайна/отмены; и `:5105-5110`
+`publish_settle_cv.wait(...)` до нуля фоновых публикаторов. Оба ограничены чужим ограниченным I/O
+(тенура лидера — см. п.2; публикатор видит потерянный fence и выходит без коммита). Тот же
+`publish_settle_cv.wait` без дедлайна — в `enforceRefTableCacheBudget` (`:1710-1713`).
+
+6) Single-flight part-folder — `Parts/PartFolderAccess.cpp:273-287`: `future.get()` без таймаута и без
+отмены (только для `Freshness::CachedForLoad`); лидер делает `store->readManifestShared(...)`, и его
+исключение прокидывается всем ждущим (`:298-303`), т.е. висят они ровно на одном GET манифеста.
+ЧЕМ ОГРАНИЧЕНО: обычным ретрай-политиком S3-диска, а НЕ `CasRequestController` — это ровно известный
+остаток `[timeout-retry RFC residuals]` пункт (c) в `docs/superpowers/cas/BACKLOG/ref-protocol.md:20`
+(«bounded read/HEAD/LIST retries … non-ref plain-object paths still use the disk's default retry
+policy»). Именно здесь заявленная «неограниченность» ближе всего к правде.
+
+7) `CasPool.cpp`: `writer_cleanup_cv.wait(lock, ...)` (`:1288-1293`) ждёт снятия флага `draining`
+другого дренажа — без дедлайна, ограничено его I/O. Ожидание истечения аренды при монтировании
+(`claimMountAwaitingExpiry`, `CasPool.cpp:658-661`, `:1105`) — ограниченный опрос по `ttl_ms` /
+`poll_interval_ms` через `mount_runtime.waitSleep`, с явным fail-closed на `LiveDoubleStart`/
+`ForeignOwner` (`:687-695`). Утверждение находки про «`remount_mutex` удерживается через опрос
+истечения и два ожидания quiescence» верно по факту удержания (`CasPool.cpp:998`
+`std::lock_guard serialize(remount_mutex)`), но эти ожидания ограничены (TTL-опрос + отменяемый
+join `cancelRecoveriesAndAwaitQuiescence`, см. п.4; комментарий `:1154` это и фиксирует).
+
+ЧТО ОСТАЁТСЯ (собственно дефект, P2):
+(a) ни одно из ожиданий не отменяемо запросом: нет проверки `QueryStatus::isCancelled`/
+    `checkTimeLimit`, так что `KILL QUERY` и `max_execution_time` не действуют на INSERT/SELECT,
+    припаркованный на CA-барьере;
+(b) плановые read/HEAD/LIST-пути (в т.ч. `PartFolderAccess` single-flight) не заведены под
+    `CasRequestController` — BACKLOG `[timeout-retry RFC residuals]` (c), без anchor,
+    `docs/superpowers/cas/BACKLOG/ref-protocol.md:20`;
+(c) латентность складывается: одна тенура лидера/один обход восстановления может состоять из многих
+    операций по 90 с (комментарий `Backend/CasRequestControl.h:189-193` прямо это признаёт: «one
+    recovery attempt may itself burn ~90s inside a single seal PUT»), т.е. наблюдаемая задержка
+    измеряется минутами, а не бесконечностью. Смежный уже зафиксированный дизайн-вопрос —
+    `[fence-window blast radius]` в `docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md:21`
+    (ограниченное ожидание remount на пути записи).
+Проверенный anchor `{#gc-budgets-need-a-deadline}` (`docs/superpowers/cas/BACKLOG.md:391`) к этим
+местам НЕ относится — он про отсутствие wall-clock дедлайна у раунда GC, другие сайты.
+Фиксов, закрывающих именно эти ожидания, в истории нет; релевантные коммиты, ограничившие соседние
+пути: `fb0963cb408`/`ad6c0cac3b7`/`3ee4e296da9` (retry-бюджет восстановления) и `2332baf8250`
+(дренаж ref-lanes с дедлайном при чистом release).
+Не P1/не pre-release: нет потери данных и нет вечного зависания; это качество отмены и латентность
+под деградированным стором.
