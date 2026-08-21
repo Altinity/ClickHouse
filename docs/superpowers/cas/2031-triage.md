@@ -87,8 +87,8 @@
 | CAS-069 | частично | P3 | [{#rebuild-gcstate-decode-reason-unreported}](BACKLOG.md#rebuild-gcstate-decode-reason-unreported) | нет | Пустые catch существуют и причину действительно теряют, но «неотличимо от порчи → полный rebuild → вечные орфаны по CAS-025» не выводится: rebuild запускается только руками (`SYSTEM CAS GC REBUILD`), а на undecodable-ветке он не сбрасывает holds, а находит seal перечислением и отказывается с `CORRUPTED_DATA`; про `stoull`-катчи утверждение о недосчёте `max_gen` неверно. |
 | CAS-070 | ⏳ | — | — | — | — |
 | CAS-071 | ⏳ | — | — | — | — |
-| CAS-072 | ⏳ | — | — | — | — |
-| CAS-073 | ⏳ | — | — | — | — |
+| CAS-072 | частично | P3 | [{#precommit-add-single-slot-guard}](BACKLOG.md#precommit-add-single-slot-guard) | нет | Форма кода реальна (один слот precommit, перезаписывается без проверки), но второй `precommitAdd` на одном `PartWriteTxn` не достижим ни на одном рабочем пути — остаётся латентный инвариант без исполняемой защиты. |
+| CAS-073 | by-design | P3 | [{#cas-021-followups}](BACKLOG.md#cas-021-followups) | нет | Все три формы верны, но следствие изобретено: маркер по определению не является авторитетом удаления — удаляет exact-token delete по токену из retired-строки, а resurrect ротирует incarnation-tag, так что маркер «прошлой инкарнации» ничего удалить не разрешает. |
 | CAS-074 | ⏳ | — | — | — | — |
 | CAS-075 | ⏳ | — | — | — | — |
 | CAS-076 | ⏳ | — | — | — | — |
@@ -2973,3 +2973,154 @@ P3: emulated-режим, не продакшн, без порчи данных, 
 (4) Второе утверждение — «malformed generation key is skipped with no log, under-computing `max_gen`» — ФАКТИЧЕСКИ НЕВЕРНО в части «under-computing». Катчи на `:1490`, `:1621`, `:4096` защищают только `std::stoull`, который падает исключительно детерминированно (`std::invalid_argument`/`std::out_of_range`) — транзиентная ошибка тут невозможна, то есть «reclassify transient read failures as corruption» к ним не относится вообще. Корректно сформированный ключ генерации `gc/gen/<N>/…` разбирается всегда (`N` — десятичное число, помещающееся в uint64), поэтому пропустить настоящую генерацию и недосчитать `max_gen` эти катчи не могут; отбрасывается только посторонний мусор под префиксом, что и написано в комментариях («foreign key shape under `gc/gen` is debris, not a generation number», `:1492`, `:4098`). Отсутствие лога здесь — сознательный выбор (мусор под `gc/gen` штатно возможен после потерянной эры), а не потеря сигнала о повреждении. Отдельно: ненадёжность самого перечисления (LIST может скрыть генерацию) — это уже оттрекованный класс `BACKLOG/gc.md`{#gc-followups} `[REBUILD-SEAL-POINT-READ]` и settled-вердикт по доверию к LIST (`docs/superpowers/cas/2026-08-03-list-trust-verdict.md`), а не следствие пустого catch; в самом коде эта недоверчивость проговорена на `:1468-1472` и рефьюзом «seal above the listing's maximum» (`:1608-1612`).
 
 (5) Что реально осталось (P3, диагностика). В `rebuildBaseline` отброшенное исключение — единственное свидетельство того, ПОЧЕМУ `gc/state` не декодировался; ни лога, ни поля в `RebuildReport` нет, поэтому оператор ручной DR-команды не может отличить настоящее байтовое повреждение от сбоя самого decode, хотя рядом в этом же файле принят обратный стиль (`:485` — `LOG_WARNING(... e.what())` для janitor, `:1897` — `tryLogCurrentException` для перепроверки condemn-маркера). Существующее покрытие в BACKLOG: `BACKLOG.md`{#damaged-object-repair} пункт 1 требует ровно этого различения (present-and-undecodable vs absent vs decodable-but-inconsistent) — но для fsck, а не для отчёта rebuild; `BACKLOG/gc.md`{#gc-followups} `[gc-rebuild follow-ups]` уже должен rebuild-у отдельную строку gc-round-log, куда причина и просится. Точного пункта про потерянную причину decode не было, поэтому добавлен новый (незакоммиченный) раздел `docs/superpowers/cas/BACKLOG/gc.md` {#rebuild-gcstate-decode-reason-unreported} — с фиксацией того, что защитная половина (перечисление seal + отказ) менять нельзя, и с явной пометкой, что `stoull`-катчи дефектом не являются.
+
+## CAS-072 — Форма кода реальна (один слот precommit, перезаписывается без проверки), но второй `precommitAdd` на одном `PartWriteTxn` не достижим ни на одном рабочем пути — остаётся латентный инвариант без исполняемой защиты. (частично, P3) {#cas-072}
+
+**Что подтверждается в коде на HEAD.**
+
+1. `PartWriteTxn` держит РОВНО ОДНУ precommit-привязку: тройка полей
+   `precommit_target_ns` / `precommit_final_ref` / `precommit_manifest`
+   (`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h:383-385`) плюс
+   `precommit_state` (`:374`). Комментарий там же прямо описывает единственность и то, что поля
+   «never cleared afterwards» (`CasPartWriteTxn.h:377-382`).
+
+2. `precommitAdd` безусловно перезаписывает эту тройку на каждом вызове, никакой проверки
+   `precommit_state == NotAttempted` нет:
+   `Pool/CasPartWriteTxn.cpp:950-953` (`precommit_target_ns = target_ns; precommit_final_ref = ...;
+   precommit_manifest = id.ref; precommit_state = PrecommitState::Uncertain;`).
+
+3. Уборка мусора действительно пропускает только ОДНУ (последнюю) привязку:
+   `Pool/CasPartWriteTxn.cpp:1426-1427`
+   (`if (precommit_attempted && id.ref == precommit_manifest && id.root_namespace == precommit_target_ns) continue;`),
+   а остальные staged-манифесты удаляются writer-ом exact-token (`:1429-1436`).
+
+4. Оба «терминальных» потребителя тоже однослотовые: `abandon` добавляет удаление ровно этой одной
+   привязки (`Pool/CasPartWriteTxn.cpp:1338-1352`), а деструктор передаёт mount-у cleanup-duty ровно на
+   неё же (`Pool/CasPartWriteTxn.cpp:132-136`).
+
+Итого: описанная в находке ФОРМА кода верна, и при двух вызовах `precommitAdd` первая привязка осталась бы
+жить в ref-логе, а её тело было бы удалено writer-ом — то есть заявленное следствие механически вытекает
+из формы.
+
+**Что не подтверждается — достижимость.**
+
+Ни один продуктивный путь не вызывает `precommitAdd` дважды на одном объекте:
+
+- `ContentAddressedTransaction::publishStaging` — два места вызова, но это ВЗАИМОИСКЛЮЧАЮЩИЕ ветви:
+  scratch-ветка (`ContentAddressedTransaction.cpp:357`) заканчивается `abandon()` + `st.build.reset()` и
+  `return` (`:386-392`) до того, как поток дойдёт до обычной ветки (`:411`).
+- Каждый `PartStaging` владеет собственным build-ом (`ContentAddressedTransaction.cpp:148-153`,
+  `buildFor`), ключ карты — `(ns, ref)` (`:143-145`); в `commit()` каждая staging публикуется ровно один
+  раз (`:496`, флаг `st.published` на `:315`).
+- Повторный `commit()` после сбоя запрещён fail-closed: `ContentAddressedTransaction.cpp:436-438`
+  («retrying a failed content-addressed transaction is not supported»), поэтому «re-stage retry» на том
+  же объекте, о котором говорит находка, невозможен.
+- `moveDirectory` переносит build с src-ключа на dst-ключ (`:1363-1365`), а лишний build прямо
+  `abandon()`-ится (`:1377`) — всё ещё один precommit на build.
+- `CachedPartFolderAccess::prepareEntries` создаёт СВЕЖИЙ build на каждый handle
+  (`Parts/PartFolderAccess.cpp:474-485`), а `PreparedPartWrite` «owes exactly one terminal operation»
+  (`Parts/PartFolderAccess.cpp:459-463`). Путь relink/exchange идёт через него же.
+
+**Класс последствия завышен.** Даже в гипотетическом сценарии это не DATA-LOSS: precommit-привязка — это
+интент, а не ссылка на данные, и «живой precommit без тела» обрабатывается fail-safe: fold считает такую
+кромку неактивирующей и либо держит барьер, либо (когда build доказуемо мёртв по watermark-полу) прямо
+пропускает её, вместо вечного clamp — `Gc/CasGc.cpp:2540-2567` («live precommit body absent AND its build
+is below the watermark floor (provably dead); skip the non-activating edge instead of clamping forever»),
+плюс rebuild-ветка `Gc/CasGc.cpp:4217-4241`. Так что худший исход — утечка привязки до
+stale-precommit-sweep/remount и временный clamp, а не потеря данных.
+
+**История / BACKLOG.** Ничего по этому пункту в `docs/superpowers/cas/BACKLOG.md` и
+`docs/superpowers/cas/BACKLOG/*.md` не нашлось (`grep` по `precommitAdd`, `precommit_manifest`,
+`one precommit` даёт только несвязанные упоминания: `BACKLOG/performance.md:202`, `BACKLOG/gc.md:155`).
+Однослотовая дисциплина складывалась вместе с `PrecommitState` (мотивация — `Uncertain`-append, см.
+`CasPartWriteTxn.h:283-298` и тест `gtest_cas_ref_install_safety.cpp:873-911`), но исполняемой проверки
+«не более одного precommit на build» так и не появилось.
+
+**Что реально осталось.** Латентный инвариант без защиты: будущий вызывающий код может добавить второй
+`precommitAdd` и получить именно описанный молчаливый сирота-биндинг. Записал новый пункт (не
+закоммичен) в `docs/superpowers/cas/BACKLOG/ref-protocol.md`, якорь
+`{#precommit-add-single-slot-guard}`: сделать инвариант исполняемым (`LOGICAL_ERROR` при
+`precommit_state != NotAttempted`) либо заменить тройку контейнером, по которому итерируются `abandon`,
+duty деструктора и уборка мусора. Там же отмечен побочный наблюдённый момент: идемпотентный re-add
+(no-op-ветка замыкания `Pool/CasPartWriteTxn.cpp:961-975`) всё равно оставляет
+`precommit_state == Durable`, поэтому последующий `abandon` такого build-а добавит удаление никогда не
+существовавшей привязки и упадёт по строгой ветке — fail-closed, но шумно.
+
+## CAS-073 — Все три формы верны, но следствие изобретено: маркер по определению не является авторитетом удаления — удаляет exact-token delete по токену из retired-строки, а resurrect ротирует incarnation-tag, так что маркер «прошлой инкарнации» ничего удалить не разрешает. (by-design, P3) {#cas-073}
+
+**Утверждение 1 — «маркер не incarnation-scoped» (форма верна, следствие ложно).**
+`BlobMeta` действительно не несёт токен:
+`Formats/CasBlobMetaFormat.h:28-34` (`version` / `state` / `condemn_round` / `size`). Но это явно
+описанный design-выбор, а не упущение: там же, `Formats/CasBlobMetaFormat.h:10-14` — «This marker is
+only a point-read hint, not the linearization point for blob lifetime: the body's in-body
+`incarnation_tag` and the body's exact-token delete provide the safety guarantee… it is never authority
+for deleting the body». Код это подтверждает:
+
+- ЕДИНСТВЕННОЕ место удаления тела — `Gc/CasGc.cpp:802`:
+  `backend.deleteExact(layout.blobKey(entry.ref), entry.token)`, где `entry.token` — токен, снятый
+  HEAD-ом в момент condemn (`Gc/CasBlobInDegree.cpp:560-568` / `:576-584`), а не свежий HEAD. Пометка
+  сайта — `Gc/CasGc.cpp:767-769` («THE SINGLE CONTENT-DELETE SITE»).
+- Resurrect ротирует инкарнацию и никогда не читает умирающее тело:
+  `Pool/CasPartWriteTxn.cpp:709-716` (fresh `buildHeader()` ⇒ иной ETag) и `:769-771`
+  (`backend().resurrect(*payload, source.size, key, buildHeader())`), плюс INV-1 отказ читать
+  condemned-тело — `Pool/CasPartWriteTxn.cpp:373-390`.
+- Следовательно любой отложенный `deleteExact(t1)` по новой инкарнации даёт `TokenMismatch`, что
+  обрабатывается как `Replaced` — «terminal-OK: the fresh incarnation is a live object»
+  (`Gc/CasGc.cpp:826-833`, `:864-868`: meta намеренно не трогается, её уже перевёл в `Clean` writer).
+
+Так что «marker written for a previous incarnation licenses deleting the new one» на HEAD неверно.
+
+**Утверждение 2 — «`writeCondemnedMeta` возвращает true, когда уже `Condemned`» (форма верна,
+интерпретация неверна).**
+`Gc/CasGc.cpp:127-137`: при уже `Condemned` возвращается `true` без записи. Предикат гейта — не «мы
+написали маркер», а «durable Condemned evidence exists», и именно это нужно gate-у: смысл маркера —
+адопт-гейт writer-а (`Pool/CasPartWriteTxn.cpp:372-373` — point-read `Condemned` ⇒ ABORTED ⇒
+re-upload), поэтому любой durable `Condemned` (чьей бы инкарнации он ни был) закрывает same-token
+адопт. Это выписано в дереве дословно, включая ровно ту оговорку, которую находка выдаёт за дыру:
+`Gc/CasGc.cpp:1874-1885` — «(`BlobMeta` carries no token, so the re-check is per-hash by design; the
+two-phase pipeline + the exact-token delete carry the rest)» и `:1903-1912` — «Accepted race… This is
+never destructive — the eventual exact-token delete is a no-op against the fresh token…worst case…
+re-uploads once (a spurious resurrect)». In-process реестр подтверждений keyed по (hash, exact token)
+(`Gc/CasGc.cpp:441-458`, `Gc/CasGc.h:959-967`) и после рестарта деградирует к синхронному
+`loadMeta`-перечтению — то есть «in-process only» (`Gc/CasGc.cpp:691` из находки — это область
+`scheduleMetaJob`/`scheduleCondemnMarkerWrite`) не даёт никакого небезопасного следствия, только
+fail-safe перенос.
+
+**Утверждение 3 — «спасённый blob навсегда сохраняет durable `Condemned`» (верно и намеренно).**
+`Gc/CasGc.cpp:896-911`: spare намеренно НЕ трогает meta; add-only политика с выписанной причиной —
+`Gc/CasGc.cpp:107-118` («GC freshness meta is ADD-ONLY… a deposed leader that cleared a spare's meta
+then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body… live-blob data
+loss (INV_NO_LOSS)»). Это следствие закрывающего коммита `730b59cd686`
+(«cas: GC freshness meta is add-only — remove spare-side clearSparedMeta (deposed-leader fix)»), то есть
+удаление spare-side очистки — сознательный фикс, а не пропуск. Самозалечивание описано на месте
+(`Gc/CasGc.cpp:909-910`): следующий `putBlob` по этому хэшу отказывается от same-token адопта и делает
+resurrect, который единственный переводит `Condemned -> Clean` (`Pool/CasPartWriteTxn.cpp:537-556`,
+причём не «best-effort»: не уложившись в 8 попыток, он бросает retry-later). Остаточная цена — один
+лишний re-upload на живом, но помеченном хэше; корректность не страдает.
+
+**Утверждение 4 — «`closeBlob` может записать замену только для entry, которую раунд уже коснулся»
+(верно; последствие — fail-safe).**
+`Gc/CasBlobInDegree.cpp:530-546`: supersede-ветка гейтится `cur_edges == 0 && cur_touched && peek_head`.
+Если resurrect произошёл, но в этом раунде хэш не был «тронут», stale-строка со старым токеном
+переносится дальше; её последующий `deleteExact` попадает в `TokenMismatch` ⇒ `Replaced` ⇒ запись
+покидает конвейер, живое тело не тронуто (`Gc/CasGc.cpp:815-833`, `:864-870`). Никакого удаления «новой»
+инкарнации не происходит. При этом «нетронутый resurrect» и сам по себе почти невозможен: resurrect
+происходит из-за writer-а, чья precommit-кромка durable ДО наблюдения тела (EDGE-BEFORE-OBSERVE), то
+есть в общем случае хэш и оказывается тронутым.
+
+**BACKLOG / история.** Эта тема уже адъюдицирована и зафиксирована как settled position:
+`docs/superpowers/cas/BACKLOG.md` `{#cas-021-followups}` («CAS-021 (issue #2207) adjudication
+follow-ups», решение пользователя 2026-08-20). Там прямо сказано: «GC's gate predicate is "durable
+Condemned evidence exists"… same as the already-Condemned arm at `CasGc.cpp:137`», а пункт (2) —
+«Stale condemn-marker memoization — ACCEPTED RESIDUAL, do NOT fix with re-reads» с обоснованием цены
+(+1 billable GET на каждую graduating-запись против бесплатных DELETE в редкой гонке). Пункт (1) того же
+раздела уже планирует именно то, что осталось по CAS-073: doc/тип-патч, который делает прочтение
+аудитора невозможным — в том числе cross-reference-фраза у `writeCondemnedMeta` («a foreign Condemned
+marker satisfies the predicate by design, same as the `:137` arm»). Также релевантен закрывающий коммит
+гейта градации `21a6051e8ff` («cas: gc — condemn marker is load-bearing: graduation gated on confirmed
+durable meta (triage #4)»).
+
+**Что реально осталось.** Кода менять нечего; остаётся только уже отслеживаемая косметика/док-работа под
+`{#cas-021-followups}` (пункты (1) и (3)) — поэтому P3 и никакого нового пункта в BACKLOG не добавлял.
+Дубликатом CAS-YYY внутри этой партии не помечаю, но по существу это повторение внешнего CAS-021 (issue
+#2207), уже разобранного на HEAD `684161dcc03`.
