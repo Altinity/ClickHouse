@@ -70,7 +70,7 @@ affects S3/GCS production pools.
 
 - **[TXN-ONE-PIPELINE follow-up] committed-ref DDL overlay** — HARD — The TXN-ONE-PIPELINE initial landing (decision Tension 1) implements the one-overlay invariant for the part-build write path only. Committed-ref DDL ops (DROP/MOVE/RENAME TABLE via `removeDirectory`/`removeRecursive`/`republishRef`/`dropNamespace`) and verbatim table/mountpoint files stay the immediate class (durable-at-call-time), not overlay-deferred. Follow-up = execute Appendix-A Tasks 1.2/1.3-DDL/1.4-DDL (a `pending_ref_ops` overlay `{Drop,Move,Replace}` keyed by `(ns,ref)`, materialized in `commit` after `publishStaging`, plus the new read surface so transaction reads answer "ref dropped/moved"). Deferred because it fixes no known motivating bug and has the highest regression risk (interacts with the empty-cover `commitTransaction` workaround and DROP/DETACH/ATTACH rollback); gate before doing it — audit that no single CA transaction interleaves an overlay-deferred part op with an immediate DDL/verbatim op order-sensitively. Abandon-path note: the funnel converts durable DDL/verbatim ref-ops from commit-time-queue-drain to call-time (immediate class), applying at call-time and NOT compensated on abort, consistent with spec §Transaction-Model. Interim risk: a DDL/ALTER that applies a durable ref-op then aborts before disk commit leaves the early-applied drop — narrow, not hit by the INSERT-sink abort, and covered by the DDL-exercising stateless/soak gates (a dangling/lost-part there = STOP + pull that op's overlay-deferral forward). (Confirmed 2026-08-04: orphaned-open cluster C-1118 describes this same `pending_ref_ops` overlay mechanism — already tracked, folded in as confirmation.)
 - **[ca-scratch-path-docker-entrypoint-permission] a CA disk's default scratch path can be root-locked by the docker entrypoint** — {#ca-scratch-path-docker-entrypoint} — DOC — If a sibling `local`-type disk declares an explicit `<path>` under the same `<data-path>/disks/` tree as a CA disk's default (undeclared) scratch path, the official docker image's entrypoint `chown`s only the leaf it was told about, leaving the shared `disks/` parent root-owned — the CA disk's later scratch-dir creation then throws `Permission denied` and the server exits before listening. Not a code bug (fail-closed is correct); a deployment nuance worth documenting: keep any sibling local disk's declared path outside the CA disk's `disks/<name>/` namespace. Already worked around in the ca-soak harness configs; open ask is to carry the warning into user-facing deployment docs.
-- **[SEAL-DECODE-REMAINING-FIELDS] the rest of the silently-defaulting-field family in the fold-seal codec** — {#seal-decode-remaining-fields} — SMALL FOLLOW-UP (2026-07-29, T16 concern 2, deliberately left out to keep the F1 diff reviewable) — `btr` missing `key`/`ck` and `cnd` missing `shard` default silently exactly the way `cls` did before T16's fix; same treatment owed (required-field refusal, CORRUPTED_DATA). One small task, same test file, after T16 merges.
+- **[SEAL-DECODE-REMAINING-FIELDS] ✅ CLOSED at HEAD by `2bbcbb18683` (verified 2031-triage CAS-038); kept for provenance** — {#seal-decode-remaining-fields} — was SMALL FOLLOW-UP (2026-07-29, T16 concern 2, deliberately left out to keep the F1 diff reviewable) — `btr` missing `key`/`ck` and `cnd` missing `shard` default silently exactly the way `cls` did before T16's fix; same treatment owed (required-field refusal, CORRUPTED_DATA). One small task, same test file, after T16 merges.
 - **[cas-format-version-floor] `checkCompatibility` never rejects a version below a type's own birth generation** — {#cas-format-version-floor} — DESIRABLE — `checkCompatibility` (`Formats/CasFormat.cpp`) throws `UNKNOWN_FORMAT_VERSION` above `G_BUILD` but accepts anything below it, including a version under the type's own birth generation (e.g. a header claiming generation 1 for a type born at generation 4 decodes as legal); `decodeRefCatalog` also discards the parsed header once the check passes, so nothing downstream can recover the version for logging. Not required by the empty-universe GC gate fix that surfaced it — closing this floor would only shrink an already-accepted residual, not remove it. Fix: a per-type birth-generation floor enforced centrally in `checkCompatibility`, refusing a version below `changePoints(id).front().generation` as `CORRUPTED_DATA`; blast radius is the shared format layer used by every CAS object type, so needs its own failing-first coverage and a fixture/artifact audit.
 - **[codecs.md standardization]** — DOC (proposed) — Complete the magic table (`OwnerProto`/`ServerEpochProto`/`MountLeaseProto`/`FoldSealProto`); decide the `RunRef.checksum` / `PartManifest.payload_digest` CRC-boundary before release; standardize binary version fields (`compatibility_version` vs local `format_version`); type `CARN` record streams at open. A proposed target structure exists but is not adopted; one pre-release cutover.
 
@@ -146,3 +146,54 @@ and on any S3-compatible store regardless of the config check. Three narrow resi
   the shared delete helper;
 - the GCS config check fails open, and `skip_access_check` skips the probe entirely (see
   {#skip-access-check-no-signal}).
+
+## Optional-field / bound residuals in the control-object decoders {#decoder-optional-field-residuals}
+
+Residuals left after the 2026-08-21 audit-verification pass over the control-object decoders (most of
+the reported family turned out to be either already required or a safe default; these two are the
+real leftovers).
+
+- **[outcome-log-oc-not-required] `decodeOutcomeLog` does not require `oc` (or `k`)** — {#outcome-log-oc-not-required} — MINOR — `Formats/CasGcOutcomesFormat.cpp:113` requires `ha`/`h`/`tt` but not `oc`, so a record without the outcome word it exists to carry decodes as the struct default `OutcomeKind::Spared` (`CasGcOutcomesFormat.h:37`), and `k` defaults to `ObjectKind::Blob`. The header comment two lines above the decoder claims "required record fields ... are checked", so code and contract disagree. Reachable only through the byte-adopt arm (`Gc/CasGc.cpp:981`) on a foreign/damaged log, and the sole consumer is the round report's tally (`Gc/CasGc.cpp:989-996`) — no deletion or liveness decision reads it — so the impact is a skewed counter, not a safety hole. Owed treatment: the same required-field refusal `cls`/`btr`/`cnd` already got in the fold-seal codec.
+- **[gc-state-encode-no-line-cap] `encodeGcState` does not enforce the line cap its own decoder enforces** — {#gc-state-encode-no-line-cap} — MINOR — `decodeGcState` reads the body with the 64 KiB `line_cap` (`Formats/CasGcStateFormat.cpp:43`, `Formats/CasFormat.cpp:168`) while `encodeGcState` checks only `gc_shards >= 1` (`:21`), so unlike `encodeFoldSeal` (which calls `checkLineBytes` per line) nothing stops the writer from persisting a `gc/state` its own reader would refuse. The only variable-length field is `msc`, an object key returned by a LIST page (`Gc/CasOrphanManifestSweep.cpp:910`), bounded by the backend's key length (~1 KiB) — so this is unreachable today and would fail closed (`CORRUPTED_DATA`, GC wedged until repaired) rather than corrupt anything. Owed: the symmetric encode-side cap check, for the same reason the fold-seal codec has one.
+
+Also verified in that pass: {#seal-decode-remaining-fields} is CLOSED — `btr` now requires
+`key`/`ck`/`shard`/`gen` and `cnd` requires `shard`/`ct`/`pt`/`ocr` (`Formats/CasFoldSealFormat.cpp:495`,
+`:515`), landed in `2bbcbb18683`.
+
+## `gc_shards` has no upper bound anywhere {#gc-shards-no-upper-bound}
+
+- **[gc-shards-no-upper-bound]** — MINOR — `gc_shards` is validated for `!= 0` at every boundary (setting: `ContentAddressedSettings.cpp:178`; mint: `Pool/CasPoolMeta.cpp:116`; `_pool_meta` decode: `Formats/CasPoolMetaFormat.cpp:164`; `gc/state` decode: `Formats/CasGcStateFormat.cpp:66`) and never for an upper bound, while the value sizes per-round vectors (`Gc/CasGc.cpp:1804`, `:3178`, `:3181`, `:4109-4111`). A pool-write-capable party (or a fat-fingered creation-time setting) can therefore make every GC round die in allocation. Fails closed and loudly — no corruption, no out-of-range indexing (`blobShard` is `% gc_shards`; a seal's `run.shard >= gc_shards` is refused at `Formats/CasFoldSealFormat.cpp:113`) — and the durable pair is cross-checked (`Gc/CasGc.cpp:4540`). Owed: a sane ceiling (a small constant, or one derived from the fold-seal reservation) at the setting boundary and in `decodePoolMeta`. Same family as {#sec4-decoder-size-bounds}.
+- **[gc-shards-config-override-silent] adopting the pool's `gc_shards` over the node's configured value is silent** — {#gc-shards-config-override-silent} — MINOR (operability) — `Pool::open`/`openForDecommission` overwrite the configured value with the durable one (`Pool/CasPool.cpp:497`, `:842`) and `PoolMeta::createOrValidate` returns the existing `_pool_meta` without ever looking at the passed `gc_shards` (`Pool/CasPoolMeta.cpp:124-128`, same treatment `blob_header_len` gets). Pool-authority is the intended design and the setting is documented creation-time-only, but an operator who edits `<gc_shards>` on an existing pool gets no signal at all. Owed: one `WARNING` naming both values when they differ.
+
+## The 16 MiB per-manifest inline budget has no re-classification path (2031-triage CAS-044) {#manifest-inline-budget-no-spill}
+
+`PartWriteTxn::stageManifest` enforces three fail-closed caps
+(`Pool/CasPartWriteTxn.cpp:813-834`): `kMaxManifestEntries`, the per-entry
+`kMaxLargestInlineEntryBytes = 1 MiB`, and the aggregate
+`kMaxManifestInlineBytesTotal = 16 MiB` (`:55-57`). The per-entry cap has a spill path — an inline
+candidate above `INLINE_CAP = 1 MiB` is written to a local temp file and staged as an ordinary blob
+(`ContentAddressedTransaction.cpp:932-970`) — but the aggregate cap has none: nothing tracks a
+running inline total while files are staged, and `stageManifest` cannot re-place an entry, so a part
+whose inline-eligible files sum past 16 MiB throws `LIMIT_EXCEEDED` and the INSERT (or the merge that
+would produce that part, or a repoint through the same call at `:356`) fails permanently and
+reproducibly for that schema/data shape.
+
+Reachability is wider than the audit's "many projections or skip indexes" framing, because the
+inline-candidate set is the complement of the `partFileMustStayBlob` allowlist
+(`ContentAddressedTransaction.cpp:65-73`) and that allowlist misses the shipped default names (see
+{#part-file-suffix-allowlist-memory}): `primary.cidx`, `.cmrk4` (compact-part marks with substreams),
+every skip-index `.idx`, and — because the `primary.idx` branch is an exact-name compare — every
+projection's `<proj>.proj/primary.idx`. Projection files live in the PARENT part's manifest (routing
+keeps them as `<proj>.proj/<file>` entries under one ref, `ContentAddressedMetadataStorage.h:459-472`),
+so ~8-17 near-1-MiB files across a handful of projections reach the aggregate cap while each stays
+under the per-entry cap that would have spilled it.
+
+Loudness: fail-closed and loud (`LIMIT_EXCEEDED` before the body PUT and before
+`uploadPendingBlobs`, `ContentAddressedTransaction.cpp:410-412`) — no corruption, no partial
+publication, only local scratch work wasted. Hence P2, not a release blocker; the failure mode is a
+table whose parts can never be written, discovered at the first INSERT.
+
+Owed: track the inline total during staging and demote the largest inline candidates to blobs before
+the cap (the machinery already exists on the per-entry path), so the cap becomes a placement decision
+instead of a write refusal. Fixing {#part-file-suffix-allowlist-memory} shrinks the exposure but does
+not close it (projection metadata and skip-index bodies stay inline-eligible by design).

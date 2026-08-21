@@ -53,8 +53,8 @@
 | CAS-035 | подтверждено | P2 | [{#fold-edge-run-memory}](BACKLOG/gc.md#fold-edge-run-memory) | нет | Подтверждено по всем пунктам, причём пик памяти хуже, чем описано: раунд GC делает полное перечисление `cas/ns/stream/` с удержанием всех ключей в памяти и материализует ВЕСЬ новый edge-run в одной строке в памяти (при дефолтном `gc_shards=1` — целиком по пулу); класс уже полностью отслежен в BACKLOG как O(pool)-per-round. |
 | CAS-036 | ⏳ | — | — | — | — |
 | CAS-037 | ⏳ | — | — | — | — |
-| CAS-038 | ⏳ | — | — | — | — |
-| CAS-039 | ⏳ | — | — | — | — |
+| CAS-038 | частично | P3 | [{#decoder-optional-field-residuals} (новая секция; внутри {#outcome-log-oc-not-required} и {#gc-state-encode-no-line-cap}); ранее существующий {#seal-decode-remaining-fields} — устарел (закрыт)](BACKLOG.md#decoder-optional-field-residuals} (новая секция; внутри {#outcome-log-oc-not-required} и {#gc-state-encode-no-line-cap}); ранее существующий {#seal-decode-remaining-fields} — устарел (закрыт) | нет | Из семи подпретензий пять факту на HEAD не соответствуют или имеют безопасное значение по умолчанию; реально остались только необязательный `oc` в журнале исходов GC и отсутствие проверки line cap на стороне записи `gc/state` — и то и другое косметика. |
+| CAS-039 | частично | P3 | [{#gc-shards-no-upper-bound} (новая секция; внутри {#gc-shards-config-override-silent}); родственный существующий {#sec4-decoder-size-bounds}](BACKLOG.md#gc-shards-no-upper-bound} (новая секция; внутри {#gc-shards-config-override-silent}); родственный существующий {#sec4-decoder-size-bounds) | нет | Форма описана верно (верхней границы у `gc_shards` нет нигде, а локальное значение из XML молча замещается пуловым), но последствия — громкий fail-closed отказ аллокации и отсутствие warning'а, а не порча данных; отдельно неверно утверждение об отсутствии сравнения — расхождение durable-пары ловится и бросает. |
 | CAS-040 | ⏳ | — | — | — | — |
 | CAS-041 | ⏳ | — | — | — | — |
 | CAS-042 | by-design | P2 | [{#operability} (B180 / format-freeze), {#cas-format-version-floor}](BACKLOG.md#operability} (B180 / format-freeze), {#cas-format-version-floor) | нет | Форма кода описана верно (одна глобальная генерация как min-reader, `changePoints` не читается на декоде), но это осознанная pre-release политика recreate-only; следствия про «тихое стирание полей» и про `Roster` недостижимы. |
@@ -1800,3 +1800,180 @@ B180 под {#operability}); (в) отсутствие машинной прив
 означают «чужой объект») — и сделать это до первого релиза, который допустит пул со смешанными
 генерациями, потому что после этого узкий catch превратит деградируемый fetch в жёсткий стопор
 репликации.
+
+## CAS-038 — Из семи подпретензий пять факту на HEAD не соответствуют или имеют безопасное значение по умолчанию; реально остались только необязательный `oc` в журнале исходов GC и отсутствие проверки line cap на стороне записи `gc/state` — и то и другое косметика. (частично, P3) {#cas-038}
+
+Замечание по якорям: все пути в находке даны в снапшотном виде `CA/Formats/...`; на HEAD это
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/...`, номера строк из находки
+устарели (в частности `CasFoldSealFormat.cpp:294-305`/`:286` теперь `:455-540`). Все цитаты ниже — по HEAD
+(`684161dcc03`, ветка `cas-gc-rebuild`).
+
+1) `decodeMountLease` требует только `su`/`we`, а `eat`/`ma`/`fen` дефолтятся — ФОРМА ВЕРНА,
+СЛЕДСТВИЕ ПЕРЕВЁРНУТО. Код: `Formats/CasServerRootFormats.cpp:147-148` (`saw_su`/`saw_we`),
+`:171-172` (единственный обязательный набор), дефолты структуры — `CasServerRootFormats.h:55-57`
+(`expires_at_ms = 0`, `min_active = 0`, `gc_fenced = false`).
+
+   а) «truncated или partially written lease» НЕДОСТИЖИМО: тело — единственная строка, читаемая
+   `readLine`, которая на отсутствии терминатора бросает `CORRUPTED_DATA` («truncated object (line
+   without terminator)», `Formats/CasTextFormat.cpp:286-287`). Любой обрыв записи (единственное окно —
+   локальный/emulated бэкенд; на S3 PUT атомарен) отрезается ДО конца строки, значит объект не
+   декодируется вообще, а не декодируется с пропущенными полями. Остаётся только сценарий
+   «подложили руками», т.е. запись в бакет — а это уже за границей модели доверия.
+
+   б) Даже в подложенном виде дефолты — это САМОЕ БЕЗОПАСНОЕ, а не «least-safe», направление.
+   Отбор аренды принципиально не делается по настенным часам: `Pool/CasServerRoot.cpp:411-427`
+   («never by comparing `expires_at_ms` against `now_ms`») требует для reclaim одного из трёх:
+   `gc_fenced` (дефолт `false` — не даёт), маркер чистого прощания `min_active == UINT64_MAX`
+   (дефолт `0` — не даёт), либо proven-dead-токен. `fen=false` = «не фенсили», `ma=0` = минимальный
+   этаж, при котором уборка не имеет права ничего забирать (`Gc/CasOrphanManifestSweep.cpp:491-493`:
+   eligible только при `min_active == UINT64_MAX` или `min_active > build_sequence`). То есть
+   «expired, unfenced» из находки не даёт ни захвата аренды, ни удаления.
+
+   в) Единственная точка, где `expires_at_ms` читается напрямую —
+   `Pool/CasServerRoot.cpp:236` (`live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms`),
+   путь `EpochMintPolicy::DecommissionRecovery`. Там же, в комментарии `:228-235`, разобрано, почему
+   ошибочное чтение безопасно: минтимая эпоха по построению отличается от эпохи выжившего
+   (`:245`: `max(1, surviving.writer_epoch + 1)`, а `we` — обязательное поле), и следующий за этим
+   `claimMount` применяет свой сильный гейт. Вердикт по (1): not-a-bug.
+
+2) `CasGcStateFormat.cpp:50-63` — ФАКТИЧЕСКИ НЕВЕРНО. Якорь показывает только маппинг полей;
+обязательность и нижняя граница стоят строкой ниже: `Formats/CasGcStateFormat.cpp:64-65`
+(«CAS gc/state: missing gcs», с комментарием `:62-63` «Do NOT silently keep the struct default (1)»)
+и `:66-67` («gc_shards must be >= 1»). Сторона записи тоже фейлится закрыто: `:21-22`. Ни одного
+дефолта «в наименее безопасную сторону» здесь нет. Хартбит рядом (`:111-112`) требует и `by`, и `seq`.
+
+3) `CasBlobMetaFormat.cpp:66-81` / «`{"st":"condemned"}` декодируется как condemn round 0» — форма
+верна (`Formats/CasBlobMetaFormat.cpp:87-88` требует только `st`; `cr`/`sz` опциональны), но
+следствия нет. Единственный потребитель декодированного `cr` — `Gc/CasGc.cpp:129-137`
+(`writeCondemnedMeta`), и он ветвится ИСКЛЮЧИТЕЛЬНО на `state`: уже-`Condemned` мету он оставляет в
+покое, «rather than clobbering a possibly-newer condemn_round» (`Gc/CasGc.cpp:121-122`) — то есть
+прочитанное значение `cr` вообще не используется как число. Решение о градации к удалению принимается
+по `condemn_round` из shard-строки in-degree-таблицы, а не из `_meta`:
+`Gc/CasBlobInDegree.cpp:418`, `:480` (`e.condemn_round < current_round`). Писатель ветвится на
+`state` (`Pool/CasPartWriteTxn.cpp:372`, `:681`). Вердикт: not-a-bug.
+
+4) `CasFoldSealFormat.cpp:294-305` «no required-field or junk check» — ФАКТИЧЕСКИ НЕВЕРНО на HEAD.
+Junk-проверка: `Formats/CasFoldSealFormat.cpp:526-527` («junk after record»). Обязательные поля:
+`rfl` — `:412-414` (нулевой/отсутствующий life id), `:419-420` (`cls` обязателен, с комментарием
+именно про «absent read as 0 — a claim about a fold, not the absence of one»), `:435-457` (полная
+грамматика hold), `:462-472` (cleanup evidence); `btr` — `:495-497`; `cnd` — `:515-517`. Плюс
+трейлер-счётчик (`:364-366`), запрет байтов после трейлера (`:362-363`), `KeyStrictness::Strict` на
+каждой строке (`:349`), запрет повторного life id (`:475-479`). Требования по `btr`/`cnd` пришли
+коммитом `2bbcbb18683` «Make CAS shard authority durable» (`git log -S "btr requires key, ck, shard,
+and gen"`) — то есть уже существующий бэклог-пункт {#seal-decode-remaining-fields} (docs/superpowers/
+cas/BACKLOG/formats-and-storage.md:73), описывающий ровно эту дыру, УСТАРЕЛ и закрыт; я отметил это в
+приписанной секции. Единственное, что действительно не требуется в meta-строке, — `g`/`pg`
+(`:337-343`), но подмена генерации ловится параметром `expected_generation` (`:367-370`), который
+передают все три продакшн-вызова с генерацией.
+
+5) «два из четырёх входов fold seal пропускают структурную валидацию» — форма верна, следствие нет.
+Перегрузок две (`Formats/CasFoldSealFormat.h:212` и `:217`) плюс `validateFoldSealForWrite` (`:223`).
+Валидирующую 4-аргументную использует единственный путь adoption — `Gc::readFoldSeal`
+(`Gc/CasGc.cpp:3685-3686`, с `poolConfig().gc_shards` и `generation`), и запись
+(`Gc/CasGc.cpp:3318`). Продакшн-потребители 2-аргументной: `Tools/CasInspect.cpp:614` (рендер),
+`Tools/CasFsck.cpp:836` (читает `blob_target_runs`) и `Gc/CasOrphanManifestSweep.cpp:104`. Последний —
+единственный «принимающий решения» из трёх, и он берёт из печати только coverage-строки
+(`coverageOf`, `Gc/CasOrphanManifestSweep.cpp:108-115`), которые 2-аргументный декодер валидирует
+полностью; то, что добавляет 4-аргументный (`validateFoldSealStructure`,
+`Formats/CasFoldSealFormat.cpp:100-141`: каноничность ключей run, ≤1 run на шард, тотальность
+condemned summary по `gc_shards`), к этому пути отношения не имеет. Для fsck нетолерантный декодер был
+бы прямым регрессом (диагностический инструмент должен ДОКЛАДЫВАТЬ повреждение, а не падать).
+
+6) «журнал исходов GC не требует того исхода, ради которого существует» — ПОДТВЕРЖДЕНО, но косметика.
+`Formats/CasGcOutcomesFormat.cpp:113-114` требует `ha`/`h`/`tt`, но не `oc` и не `k`; запись без `oc`
+декодируется как дефолт структуры `OutcomeKind::Spared` (`Formats/CasGcOutcomesFormat.h:37`), `k` — как
+`ObjectKind::Blob` (`:35`). При этом doc-комментарий обещает обратное:
+`Formats/CasGcOutcomesFormat.h:53-55` («required record fields ... are checked»), т.е. код и контракт
+расходятся. Достижимость: только через byte-adopt чужого/повреждённого журнала
+(`Gc/CasGc.cpp:979-987`; недекодируемый — `ABORTED`). Единственный потребитель — счётчики отчёта
+раунда (`Gc/CasGc.cpp:988-997`), никаких решений об удалении. Итог — перекошенный счётчик; занесено
+как {#outcome-log-oc-not-required}.
+
+7) «кодировщик `gc/state` не проверяет line cap, который проверяет его декодер» — ПОДТВЕРЖДЕНО,
+недостижимо. `decodeGcState` читает тело с `line_cap` = 64 KiB
+(`Formats/CasGcStateFormat.cpp:43` + `Formats/CasFormat.cpp:168`), `encodeGcState` проверяет только
+`gc_shards >= 1` (`:21-22`) — в отличие от `encodeFoldSeal`, у которого есть построчный
+`checkLineBytes`. Единственное переменной длины поле — `msc` (`:31`), а это ключ страницы LIST
+(`Gc/CasOrphanManifestSweep.cpp:905`, `:910`), ограниченный длиной ключа бэкенда (~1 KiB на S3), то есть
+на два порядка ниже cap. Если бы это всё же произошло, отказ был бы громкий и fail-closed
+(`CORRUPTED_DATA` при следующем чтении, GC заклинивает до ремонта), без тихой порчи. Занесено как
+{#gc-state-encode-no-line-cap}.
+
+Итог: класс «декодеры делают критичные поля опциональными и дефолтят их в наименее безопасное
+значение» на HEAD не подтверждается — по mount lease дефолты консервативны, по `gc/state` поле
+обязательно, по blob meta и fold seal утверждения о коде неверны (в том числе потому, что часть уже
+закрыта `2bbcbb18683`). Остаточное — два пункта косметики (6) и (7), оба fail-closed/только-отчётность,
+поэтому P3 и не блокируют релиз.
+
+## CAS-039 — Форма описана верно (верхней границы у `gc_shards` нет нигде, а локальное значение из XML молча замещается пуловым), но последствия — громкий fail-closed отказ аллокации и отсутствие warning'а, а не порча данных; отдельно неверно утверждение об отсутствии сравнения — расхождение durable-пары ловится и бросает. (частично, P3) {#cas-039}
+
+Якоря находки — снапшотные (`CA/Pool/...`, `CA/Gc/...`); на HEAD это
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/{Pool,Gc,Formats}/...`, номера строк
+сместились (`CasPool.cpp:351-354`/`:547-550` → `:492-497`/`:837-842`; `CasGc.cpp:1294`/`:2140-2147`/
+`:2808-2810` → `:1804`/`:3178-3208`/`:4108-4111`). Всё цитируется по HEAD `684161dcc03`.
+
+Происхождение шейпа. Вся описываемая конструкция (durable `gcs` в `_pool_meta` + принятие его в
+`PoolConfig`) появилась коммитом `2bbcbb18683` «Make CAS shard authority durable» (2026-08-02): он
+добавил `gcs` в кодек (`Formats/CasPoolMetaFormat.cpp:80-81`, `:135-140`), обязательность+ненулевость
+(`:164`), поднял floor формата до генерации 8 (`Formats/CasFormat.h:87`) и добавил
+`config.gc_shards = meta.gc_shards` в оба открытия пула. То есть находка описывает не старый огрех, а
+намеренно введённую «пул — источник истины» модель.
+
+1) «Значение из `_pool_meta` задаёт размеры векторов и границы циклов, проверенное только на `>= 1`» —
+ПОДТВЕРЖДЕНО по форме. Проверки на ноль есть на каждой границе и НИ ОДНОЙ верхней:
+`ContentAddressedSettings.cpp:178-181` (только `== 0`), `Pool/CasPoolMeta.cpp:115-116` (BAD_ARGUMENTS
+на 0 при минте), `Formats/CasPoolMetaFormat.cpp:164` («missing or zero gcs»),
+`Formats/CasGcStateFormat.cpp:66-67`, `Gc/CasGcShardPlan.cpp:31-35`,
+`Formats/CasFoldSealFormat.cpp:103-104`, `Formats/CasRefCatalogFormat.cpp:333`, `:349`.
+Потребители-размеры: `Gc/CasGc.cpp:1804` (`retired_merge.resize(state.gc_shards)`), `:3178`, `:3181`
+(`buckets`/`retirement_buckets`), `:4109-4111` (`buckets`/`prior_runs`/`attempt_of` в rebuild).
+
+   Но последствие — громкий fail-closed отказ, а не порча и не выход за границы:
+   - индексация всегда в диапазоне: `blobShard` — это `% gc_shards` (`Gc/CasGcShardPlan.h:42`,
+     `Gc/CasGcShardPlan.cpp:25`), цикл `for (shard = 0; shard < state.gc_shards; ++shard)`
+     (`Gc/CasGc.cpp:3185`), а взятый из печати `run.shard >= gc_shards` отвергается
+     (`Formats/CasFoldSealFormat.cpp:113-116`); проход по `retired_merge` идёт по `.size()`
+     самого вектора (`Gc/CasGc.cpp:780-782`);
+   - при абсурдном значении раунд GC умирает на аллокации (`std::bad_alloc`/`length_error`) — виден в
+     логах, ничего не удаляет; тот же класс, что уже зафиксирован как {#sec4-decoder-size-bounds}
+     («a pool-write-capable party could place an enormous but validly-framed object»);
+   - подложить `_pool_meta` = иметь право записи в бакет, т.е. сценарий вне модели доверия CAS
+     (та же граница, что в `feedback_cas_relink_trust_model`).
+   Реальный остаток — отсутствие санитарного потолка (дёшево: константа или потолок, выведенный из
+   `checkFoldSealReservation`, `Formats/CasRefCatalogFormat.cpp:363-384`). Занесено как
+   {#gc-shards-no-upper-bound}.
+
+2) «расхождение с локальным конфигом решается перезаписью локального значения без лога и сравнения» —
+РАЗДЕЛЯЕТСЯ НА ДВЕ ЧАСТИ.
+
+   а) Перезапись без сравнения и без лога — ПОДТВЕРЖДЕНО: `Pool/CasPool.cpp:494-497` и `:839-842`
+   (`config.gc_shards = meta.gc_shards;`), а `PoolMeta::createOrValidate` на существующем пуле вообще
+   не смотрит на переданное значение — `Pool/CasPoolMeta.cpp:124-128` с комментарием «Present => the
+   pool is authoritative; ignore the passed config's blob_header_len and run the flag-gated admission
+   check». Ровно то же обращение с `blob_header_len`, так что это последовательная модель, а не
+   недосмотр; настройка задокументирована как creation-time-only
+   (`ContentAddressedSettings.cpp:73`: «creation-time only»). Дефект — чисто операбельность: оператор,
+   поправивший `<gc_shards>` на существующем пуле, не получает никакого сигнала. Занесено как
+   {#gc-shards-config-override-silent}; починка = один WARNING с двумя значениями.
+
+   б) «без сравнения» как утверждение обо всей системе — НЕВЕРНО: расхождение durable-пары
+   ловится и фейлится закрыто. `Gc/CasGc.cpp:4540-4543`:
+   `if (current.gc_shards != store->poolConfig().gc_shards) throw Exception(CORRUPTED_DATA, "CAS
+   gc/state gc_shards {} disagrees with the pool-authoritative _pool_meta value {}")`. Первичная
+   установка — единожды при первом acquire (`Gc/CasGc.cpp:4525-4528`). Кроме того, чтение печати на
+   adoption сверяет её структуру именно с пуловым `gc_shards` (`Gc/CasGc.cpp:3686`,
+   `Formats/CasFoldSealFormat.cpp:130-141` — condemned summary обязана быть тотальной по шардам), а
+   несоответствие тотальности форсирует fail-closed fold (`Gc/CasGc.cpp:3746`, `:3760-3765`,
+   `:2988-2998`). Так что «тихого» расхождения между durable-объектами не бывает — тихо теряется
+   только незаписанное пожелание из XML.
+
+3) Побочно проверено: генерационный floor не даёт открыть пул без `gcs`
+(`Formats/CasPoolMetaFormat.cpp:110-116`, `UNKNOWN_FORMAT_VERSION`, «recreate the pool ... CAS is
+pre-release: there is no in-place migration») — то есть «пул без durable gc_shards» не деградирует
+молча в 1, а отвергается. `gc_shards > 1` при этом рабочий однопроцессный путь
+(`Gc/CasGc.cpp:3169-3208`); параллельный многоворкерный планировщик — отдельный открытый пункт
+BACKLOG/gc.md `[distributed gc_shards>1 parallel GC]`, к этой находке не относится.
+
+Итог: подтверждается отсутствие верхней границы и молчаливость adoption'а — оба пункта мелкие
+(fail-closed / только-операбельность), опровергается «без сравнения» и снимается класс DECODE/DoS как
+release-блокер. P3, до релиза не обязательно.
