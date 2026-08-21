@@ -344,7 +344,10 @@ rule — that rule is what keeps a live twin from being decommissioned across tw
 Falsification: if a rerun passes on unchanged code, it is a cadence race rather than a deterministic
 gap, which changes the fix but not the mismatch.
 
-## `[gc-round-budgets-are-not-backpressure]` Round budgets throttle the consumer while the producer is unaware — four defaults changed, the real fix is a time deadline {#gc-round-budgets-not-backpressure}
+## `[gc-round-budgets-are-not-backpressure]` Round budgets throttle the consumer while the producer is unaware — the real fix is a time deadline {#gc-round-budgets-not-backpressure}
+
+> Correction (2031-triage CAS-034, 2026-08-21): the title used to claim "four defaults changed" — those
+> four budgets are still 5000 at HEAD, so the claim was stale and is removed rather than restated.
 
 A per-round count cap is not backpressure. It bounds what GC does in one round while inserts and
 merges — the producers of the work — know nothing about it. If arrival exceeds `budget × rounds/sec`,

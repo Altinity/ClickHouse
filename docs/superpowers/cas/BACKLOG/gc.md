@@ -160,3 +160,27 @@ Mitigations keep this out of data-loss class: `promote` is fail-closed on a miss
 `BlobSourceRetirement` is idempotent (`Gc/CasBlobInDegree.h:167-174`). Fix: make the paged planner
 require the same durable premise as `sweepNamespace` (no row ⇒ skip, not nominate), and correct the
 stale ordering comment. P2.
+
+## Janitor page size is hardcoded and pages the whole namespace prefix (2031-triage CAS-034) {#janitor-page-hardcoded}
+
+The namespace janitor's page is a hardcoded 1000 keys (`Gc/CasGc.cpp:470`) with no setting, and it
+pages over the whole `namespaceRootPrefix()` rather than over the debris it means to reclaim — so
+post-`DROP` erase latency is O(all namespace objects), not O(debris). Erase SLA itself is not part of
+the disk contract (settled position: the operator can `GC RUN` at any time), which is why this is
+latency, not loss; but the hardcoding and the prefix width are both fixable: make the page a setting
+and scope the LIST to the removed namespace's own prefix.
+
+Corrected premise while checking CAS-034: ref mutations batch into ONE `_log` object per flush
+(`Pool/CasRefLedger.cpp:2615`, `:3148`), so the ref-object creation rate is latency-bounded, not
+two-objects-per-part-commit as the audit assumed.
+
+## GC fold materializes a whole shard edge-run twice in memory (2031-triage CAS-035) {#fold-edge-run-memory}
+
+The round's real peak-memory site is `foldDeltasIntoGeneration`'s `WriteBufferFromOwnString` plus
+`out.str()` (`Gc/CasBlobInDegree.cpp:389`, `:678-681`) — two full copies of the entire shard edge-run
+in memory, and `gc_shards=1` by default means the whole pool. The input side is already streamed, so
+this is the one unstreamed hop. Belongs to the tracked O(pool)-per-round class ({#gc-scalability}
+`[Lever B]`, `[gc-snapshot-log-structured-runs]`, `[gc-frontier-one-list]`); recorded here because the
+existing items name the LIST, not this materialization. Note the enumeration itself cannot simply be
+skipped on deferred rounds — the defer signal is computed FROM it (`Gc/CasGc.cpp:628-646`), which is
+what `[Lever B]`'s change-signal is for.
