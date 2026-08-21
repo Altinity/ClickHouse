@@ -16,7 +16,7 @@
 
 | ID | Статус | Приоритет | BACKLOG | До релиза? | Summary |
 |----|--------|-----------|---------|------------|---------|
-| CAS-001 | подтверждено (↗ #2212) | P1 | [{#issue-2212-shadow-namespace}](BACKLOG.md#issue-2212-shadow-namespace) | да | shadow/FREEZE namespace пул-глобальный; UNFREEZE одного сервера удаляет frozen-парты другого |
+| CAS-001 | исправлено (`8e5ee61b6cc`, `11f5397a629`) | — | — | закрыто | Shadow namespace теперь rooted by `server_root_id`; foreign `UNFREEZE` закреплён RED/GREEN-тестом. |
 | CAS-002 | by-design | P3 | — | нет | Отсутствие probe/condemn-check в `adoptEvidence` — сознательный дизайн §4 (manifest-trust, коммит `8fe6331a431`); заявленное окно data-loss на HEAD закрыто на каждом call-site (relink publish-then-confirm, `republishRef` commit-before-release, MergeTree-пиннинг источника при hardlink), остаток — принятый D4 trade-off с fsck-backstop. |
 | CAS-003 | частично | P3 | [{#gc-budgets-need-a-deadline}](BACKLOG.md#gc-budgets-need-a-deadline) | нет | Факты (нет wall-clock TTL, кража по дифференциальному наблюдению, deposed-лидер узнаёт о потере на round-commit CAS) верны, но это дизайн: разрушительные pre-CAS действия обоснованы только ранее опубликованным durable-состоянием + exact-token delete, а каталожные/ref-фазы явно ревалидируют lease перед каждым delete — утверждение «destructive phases are never revalidated» на HEAD ложно; остаток — только liveness (учтён в BACKLOG). |
 | CAS-004 | частично | P2 | [gc-rebuild-lease-interlock] (docs/superpowers/cas/BACKLOG/gc.md:142, без {#}-якоря) | нет | Серверный `SYSTEM CAS GC REBUILD` на HEAD безопасен на живом диске (ничего не condemn-ит, GC-lease + барьеры), «противоположные read-only позы» двух входов — задокументированный дизайн; реально остался только зафиксированный в BACKLOG пробел: у офлайн `clickhouse-disks cas-gc-rebuild` нет mount-lease интерлока против живого сервера. |
@@ -160,24 +160,24 @@
 |---|---|---|
 | частично | 87 | форма кода описана верно, но следствие завышено, недостижимо или инвертировано |
 | by-design | 21 | намеренное поведение, позиция зафиксирована (часть — с цитатами решений) |
-| подтверждено | 17 | реальная проблема на HEAD |
+| подтверждено | 16 | реальная проблема на HEAD |
 | not-a-bug | 8 | утверждение фактически неверно (галлюцинация) |
-| исправлено | 1 | было реально, закрыто до триажа |
+| исправлено | 2 | было реально, теперь закрыто |
 | дубликат | 1 | та же земля, что у другого CAS-### |
 
-Приоритеты: **P1 — 4**, P2 — 38, P3 — 83, без действия — 10.
+Приоритеты: **P1 — 3**, P2 — 38, P3 — 83, без действия — 11.
 
 ### P1 — чинить до релиза {#p1-list}
 
 | ID | Суть | Где отслеживается |
 |---|---|---|
-| CAS-001 | shadow/FREEZE namespace пул-глобальный → `UNFREEZE` одного сервера удаляет frozen-парты другого | issue #2212, `final-checks-todo.md` п.2 |
 | CAS-040 | перевод строки в пути файла парта → недекодируемый осиротевший манифест → каждый GC-раунд в пуле падает навсегда (ВОСПРОИЗВЕДЕНО) | `final-checks-todo.md` п.8 |
 | CAS-058 | `freezeRemote` без CAS-транзакции → кросс-дисковый `ATTACH PARTITION FROM` не работает | issue #2173, `final-checks-todo.md` п.1 |
 | CAS-106 | перечислительный `non_cas_keys` отвергает легальные S3-ключи диска → сервер падает на старте с `UNKNOWN_SETTING` | `final-checks-todo.md` п.4 (полевой отчёт) |
 
-Ни один P1 не был найден впервые этим триажем: CAS-001/058/106 пришли из независимых issue и полевого
-отчёта, CAS-040 — единственный, где триаж добавил воспроизведение и вскрыл настоящее следствие
+Из четырёх исходных P1 CAS-001 закрыт коммитами `8e5ee61b6cc` и `11f5397a629`. Остальные не были
+найдены впервые этим триажем: CAS-058/106 пришли из независимого issue и полевого отчёта, CAS-040 —
+единственный, где триаж добавил воспроизведение и вскрыл настоящее следствие
 (аудит утверждал «закоммиченная часть навсегда нечитаема», в реальности INSERT падает fail-closed, а
 ломается GC всего пула).
 
@@ -208,20 +208,22 @@
 
 # Детали по findings {#details}
 
-## CAS-001 — shadow/FREEZE namespace пул-глобальный (подтверждено, P1) {#cas-001}
+## CAS-001 — shadow/`FREEZE` namespace был пул-глобальным (исправлено) {#cas-001}
 
-**Вердикт: подтверждено; уже выделено в #2212 и стоит в предрелизном списке.**
+**Вердикт: исправлено 2026-08-21 (`8e5ee61b6cc`, `11f5397a629`).**
 
-Ядро утверждения верно и было независимо подтверждено при адьюдикации
-https://github.com/Altinity/ClickHouse/issues/2212 (2026-08-20): `shadowNamespace`
-(`ContentAddressedMetadataStorage.cpp:1281`) строит namespace из literal
-`shadow/<backup>/...`-пути **без** `serverPrefix()`, в отличие от `liveNamespace`. Комментарий на
-месте называет это намеренным («backups are read by any replica»), но следствие — два сервера с
+Ядро утверждения было верно и независимо подтверждено при адьюдикации
+https://github.com/Altinity/ClickHouse/issues/2212 (2026-08-20): до исправления `shadowNamespace`
+строил namespace из literal `shadow/<backup>/...`-пути **без** `serverPrefix`, в отличие от
+`liveNamespace`. Комментарий на месте называл это намеренным («backups are read by any replica»),
+но следствие — два сервера с
 разными `server_root_id` на одном пуле являются несинхронизированными писателями одной shadow
 ref-таблицы, и `UNFREEZE` любого из них удаляет frozen-парты обоих — принято как data-loss-класс.
-Фикс (префикс `server_root_id` + две точки перечисления `"shadow/"`: `:1281`, `:1513`, `:1700` +
-тест изоляции двух рутов) записан: BACKLOG `{#issue-2212-shadow-namespace}`, предрелизный список
-`final-checks-todo.md` пункт 2.
+Исправление добавляет префикс `server_root_id` к derivation и всем трём enumeration scopes; новый
+`05024_cas_freeze_two_roots` закрепляет foreign no-op, self-release и сохранность через GC. Форма
+исправления и проверки записаны в плане
+`docs/superpowers/plans/2026-08-21-cas-shadow-namespace-server-root.md` и в выполненном пункте 2
+`final-checks-todo.md`; закрытый пункт удалён из live BACKLOG.
 
 Побочные утверждения detail-файла:
 - «`DROP TABLE` оставляет shadow-refs, пиннящие байты навсегда» — **by-design**: это семантика
@@ -231,7 +233,7 @@ ref-таблицы, и `UNFREEZE` любого из них удаляет frozen
   пересекается с CAS-022 (sweep и namespace без catalog-строки); разобрано там; на вердикт CAS-001
   не влияет — фикс #2212 переводит shadow-namespace в обычную per-root форму.
 
-Статус в issue (`↗ split-out (#2212)`) корректен.
+Issue #2212 можно закрыть при публикации этой ветки.
 
 ## CAS-004 — Серверный `SYSTEM CAS GC REBUILD` на HEAD безопасен на живом диске (ничего не condemn-ит, GC-lease + барьеры), «противоположные read-only позы» двух входов — задокументированный дизайн; реально остался только зафиксированный в BACKLOG пробел: у офлайн `clickhouse-disks cas-gc-rebuild` нет mount-lease интерлока против живого сервера. (частично, P2) {#cas-004}
 
@@ -3937,7 +3939,7 @@ condemned-маркер без тела».
 
 ЧТО НЕ ПОДТВЕРЖДАЕТСЯ — «traversal is real» как достижимое поведение. Триггер аудита («a namespace derived from a path with a `..` segment») не реализуем ни одним продовым источником namespace:
    - live: `liveNamespace` = `serverPrefix() + "/" + Cas::mirroredArchiveNamespace(table_uuid)` (`ContentAddressedMetadataStorage.cpp:1267-1273`). Префикс — конфигурационный `server_root_id`, который УЖЕ прогнан через `Cas::validateServerRootId` при чтении настроек (`ContentAddressedSettings.cpp:192`, обязательность — `:188-190`), то есть `.`/`..` там отбиты фатально и громко (`BAD_ARGUMENTS`). Хвост — `store/<u3>/<uuid>@cas@` из hex-UUID или `data/<db>/<tbl>@cas@` из экранированных идентификаторов (`Parts/PartPathParser.cpp:376-386`).
-   - shadow (FREEZE): `shadowNamespace(canonicalDiskPath(shadow_table_dir))` (`ContentAddressedMetadataStorage.cpp:1279-1288`), и единственная пользовательская строка на этом пути — имя бэкапа `WITH NAME`, которое MergeTree экранирует ДО того, как оно станет каталогом: `MergeTreeData.cpp:9947` `String backup_name = (!with_name.empty() ? escapeForFileName(with_name) : toString(increment));`, а `escapeForFileName` (`src/Common/escapeForFileName.cpp:8-30`) пропускает только `isWordCharASCII`, поэтому `..` превращается в `%2E%2E`. То есть `ALTER TABLE ... FREEZE WITH NAME '../../etc'` не даёт `..` в ключе.
+   - shadow (`FREEZE`): `shadowNamespace` строит `serverPrefix() + "/" + canonicalDiskPath(shadow_table_dir)`; валидированный `server_root_id` покрывает префикс, а единственная пользовательская строка в хвосте — имя бэкапа `WITH NAME`, которое `MergeTree` экранирует ДО того, как оно станет каталогом: `MergeTreeData.cpp:9947` `String backup_name = (!with_name.empty() ? escapeForFileName(with_name) : toString(increment));`, а `escapeForFileName` (`src/Common/escapeForFileName.cpp:8-30`) пропускает только `isWordCharASCII`, поэтому `..` превращается в `%2E%2E`. То есть `ALTER TABLE ... FREEZE WITH NAME '../../etc'` не даёт `..` в ключе.
    - GC ref-intake: `validateNamespace` (`Formats/CasLayout.h:451`) — это как раз хук ре-валидации namespace, восстановленного из НЕдоверенного перечисленного ключа (док `:444-449`), и он делегирует в тот же дефектный `checkNamespace`. Но чтобы такой ключ появился, его сперва должен кто-то записать; на локальной ФС каталог с именем `..` создать нельзя, а в S3-пуле запись ключа уже требует прав на пул.
    Итого: это hygiene / defense-in-depth и несогласованность инвариантов, а не эксплуатируемый traversal. Ни тихой порчи, ни отказа тут нет; при появлении `..` из будущего источника поведение было бы «ключи ушли не туда», но такого источника сейчас нет.
 

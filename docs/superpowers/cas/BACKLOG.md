@@ -674,52 +674,6 @@ entry's remaining live content is the S36/S37 verification legs and the sibling 
 (`[VERIFY-ca-ca-same-pool-move]`, `[killed-mid-move-partition-duplicate]`). The unfixed member of
 the family is exactly this `freezeRemote` gap.
 
-## Issue #2212 CONFIRMED: FREEZE shadow namespace is pool-global — UNFREEZE on another replica destroys the backup (2026-08-20) {#issue-2212-shadow-namespace}
-
-https://github.com/Altinity/ClickHouse/issues/2212 (CAS-001) — `FREEZE WITH NAME` on a CAS disk
-publishes frozen-part refs into a POOL-GLOBAL namespace (`shadowNamespace`,
-`ContentAddressedMetadataStorage.cpp:1281-1288`: `RootNamespace{canonicalDiskPath(shadow_table_dir)}`,
-with the comment "pool-global (backups are read by any replica)" — a DELIBERATE choice that missed
-that UNFREEZE is a destructive, local-intent statement). Live parts are correctly namespaced under
-`server_root_id + "/"` (`ownsNamespace`, `:2023`). With one table UUID on two replicas (the
-`CREATE ... ON CLUSTER` shape), `UNFREEZE WITH NAME` on replica 2 releases replica 1's freeze; after
-`DROP TABLE` + GC the frozen blobs are gone. Data loss on the backup path; correct semantics = the
-local-disk baseline (shadow is strictly per-replica, the issue's P6).
-
-FIX (SCHEDULED: pre-release — see docs/superpowers/cas/final-checks-todo.md):
-- (1) `shadowNamespace` -> `serverPrefix() + "/" + canonicalDiskPath(shadow_table_dir)`, mirroring
-  `liveNamespace` (the DISK path `shadow/...` stays; only the pool-namespace derivation changes). It
-  stops being `static`, because `serverPrefix()` is a member — which is what surfaces the call sites
-  in (2).
-- (2) SIX sites, not three. An earlier revision of this entry listed three and missed the most
-  dangerous one; the corrected enumeration, re-derived against the tree:
-  | site | role |
-  |---|---|
-  | `ContentAddressedMetadataStorage.cpp` `shadowNamespace` | the derivation itself |
-  | `ContentAddressedTransaction.cpp` UNFREEZE of one frozen part's ref | call site, breaks on the `static` drop |
-  | `ContentAddressedTransaction.cpp` UNFREEZE of a table-dir namespace | call site, breaks on the `static` drop |
-  | `ContentAddressedMetadataStorage.cpp` intermediate-shadow-dir existence probe | enumeration scope |
-  | `ContentAddressedMetadataStorage.cpp` its listing counterpart | enumeration scope |
-  | **`ContentAddressedTransaction.cpp` `UNFREEZE WITH NAME` bulk drop** | **enumeration scope — the one that was missed** |
-  Why the last one matters more than the others: prefix the derivation without prefixing that scope
-  and `UNFREEZE WITH NAME` enumerates `shadow/<backup>/`, finds nothing (namespaces now live under
-  `<server_root>/shadow/...`), and stops releasing its OWN freeze. It would fix the cross-replica
-  destruction and replace it with a permanent leak of every frozen ref, in the same statement.
-- (3) `PartPathParser`/`route()` untouched (they parse the unchanged disk path); GC/fsck have no
-  shadow special-cases — prefixed shadow namespaces become ordinarily owned;
-- (4) pre-release no-compat policy: no migration;
-- (5) tests. `05003_cas_freeze.sh` already asserts that `UNFREEZE WITH NAME` FINDS AND REMOVES its own
-  snapshot on a single server root, so the leak in (2) cannot ship silently — that test fails first.
-  The new coverage is the isolation dimension: a stateless test with two `server_root_id` on one pool
-  asserting (a) a foreign `UNFREEZE` is a no-op on the other root's freeze, (b) `DROP TABLE` + a GC
-  round leave that freeze intact, and (c) each root's own `UNFREEZE` still releases its own freeze —
-  (c) is not redundant with 05003: without it a two-root isolation test stays green under a total
-  leak. The reporter's six-property suite lives in clickhouse-regression
-  (`cas/tests/freeze_isolation.py`).
-- (6) no existing test asserts cross-replica shadow visibility, so losing it breaks nothing.
-Trade acknowledged: cross-replica readability of freezes goes away — that is the correct (local)
-FREEZE semantics; shared backup access belongs to the BACKUP machinery, not UNFREEZE.
-
 ## Issue #2244 (filed by us): lease/remount retry asymmetry — CI RCA of job 96307284077 (2026-08-20) {#issue-2244-lease-retry-asymmetry}
 
 https://github.com/Altinity/ClickHouse/issues/2244 — full RCA in the issue. One-line mechanism: the

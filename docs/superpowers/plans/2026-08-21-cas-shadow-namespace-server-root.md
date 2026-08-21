@@ -17,7 +17,21 @@ doc_type: 'guide'
 
 **Tech Stack:** C++ (ClickHouse fork), stateless `.sh` tests, `clickhouse-local` for output shaping, gtest.
 
-**Spec:** `docs/superpowers/cas/BACKLOG.md` `{#issue-2212-shadow-namespace}` (corrected in commit `6309169135f`). Read it first: it is the authority, it enumerates the six production sites, and it explains why one of them is a silent-leak risk.
+**Spec:** `docs/superpowers/cas/2031-triage.md` `{#cas-001}` records the adjudication. This plan
+enumerates the six production sites and explains why one of them is a silent-leak risk.
+
+## Execution status {#execution-status}
+
+Completed on 2026-08-21: regression `8e5ee61b6cc`, behavior `11f5397a629`, and source-contract
+updates `7c4d4124133`.
+
+The Task 1 recipe below is retained as the reviewed design record, but its first executable form was
+superseded while establishing RED. Making both roots publish the same backup does not reach the
+foreign `UNFREEZE`: two independent ref-writer lifecycles collide first. The implemented
+`05024_cas_freeze_two_roots` instead gives root B a distinct own backup, verifies that B's lookup of
+A's name is a no-op, verifies B's self-release, drains the pool with `SYSTEM CAS GC RUN` through a
+live anchor disk, and finally verifies that A's backup remains releasable. The committed test and
+reference are authoritative for the executable details.
 
 ## Global Constraints {#global-constraints}
 

@@ -11,13 +11,16 @@ short-lived TODO, not the record.
   `DataPartStorageOnDiskBase::freezeRemote` + stateless test from the issue's 3-statement repro.
 - Scheduled: tomorrow, before the release.
 
-## 2. Fix #2212 — FREEZE shadow namespace must be under server_root_id {#fix-2212}
+## 2. DONE — Fix #2212: `FREEZE` shadow namespace under `server_root_id` {#fix-2212}
 
-- Issue: https://github.com/Altinity/ClickHouse/issues/2212 (CONFIRMED; CAS-001, data loss on backups)
-- Full adjudication + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#issue-2212-shadow-namespace}`
-- Plan: prefix `shadowNamespace` with `server_root_id` + the two `"shadow/"` enumeration scopes
-  (`ContentAddressedMetadataStorage.cpp:1281`, `:1513`, `:1700`) + stateless two-root isolation test.
-- Scheduled: tomorrow, before the release.
+- Issue: https://github.com/Altinity/ClickHouse/issues/2212 (fixed on this branch; CAS-001)
+- Adjudication: `docs/superpowers/cas/2031-triage.md` `{#cas-001}`; implementation plan:
+  `docs/superpowers/plans/2026-08-21-cas-shadow-namespace-server-root.md`
+- Implemented 2026-08-21: `8e5ee61b6cc` adds the two-root regression and `11f5397a629`
+  prefixes `shadowNamespace` plus all three shadow enumeration scopes; `7c4d4124133` updates the
+  source contracts and examples.
+- Verified: `05024_cas_freeze_two_roots`, existing self-release guard `05003_cas_freeze`, Release
+  and Debug builds, and the full `CAS*:Cas*:CA*` gate (2058 tests).
 
 ## 3. Fix #2244 — lease/remount retry asymmetry {#fix-2244}
 
