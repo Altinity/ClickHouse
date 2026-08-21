@@ -395,7 +395,7 @@ ordinary round emits `walk_plan_dropped_parent_rows` / `_listed_lives` / `_tails
 (`Gc/CasGc.cpp:660-662`). The other two are unreachable in production: `RefScanSummary::holds` and
 `RefScanSummary::checkpoint_observations` (`Gc/CasGc.h:215-216`) are populated by nothing outside
 `src/Disks/tests/gtest_cas_ref_catalog.cpp:1438-1453`, so `dropped_holds` (`Gc/CasGc.cpp:281`) and
-`dropped_checkpoints` (`:293`) are always zero and `droppedHolds` / `droppedCheckpoints`
+`dropped_checkpoints` (`:292`) are always zero and `droppedHolds` / `droppedCheckpoints`
 (`Gc/CasGc.h:298-299`) have no caller at all. A durable hold reaches the walk inside a parent row's
 `RefLifeFoldState::coverage.hold`, so when its row is dropped the hold rides out on
 `dropped_parent_rows`, never on `dropped_holds` — the counter that looks like the hold-loss signal is
@@ -410,3 +410,39 @@ Same round, prose only: `CASGCUnmatchedAdoptedParentLives`'s description still s
 deliberately removed that warning (it fired once per healthy completed removal and turned
 `05023_cas_dropns_leaked_namespace` red). The counter is now the whole signal; the description must
 say so.
+
+## The round report's delete counters are tallied from the budget-capped outcome logs, and the fold events carry the previous round number (2031-triage CAS-101) {#gc-outcome-budget-skews-round-report-counters}
+
+P3, observability only — two refinements to `BACKLOG.md`{#gc-round-budgets-not-backpressure} item D
+("Audit loss"), which says the only casualty of `gc_round_outcome_entry_budget` is the `GcOutcomes`
+audit row. It is also the operator-facing round row:
+
+1. `report.deleted` / `absent` / `replaced` / `spared` are tallied by replaying the FINAL durable
+   outcome logs (`Gc/CasGc.cpp:989-998`), and entries only enter those logs while the budget holds
+   (`:852-856` for deletes, `:897-902` for spares; default 5000,
+   `ContentAddressedSettings.cpp:83`). So on a round whose cohort exceeds the cap,
+   `system.content_addressed_garbage_collection_log.objects_deleted` (fed by
+   `Gc/CasGcScheduler.cpp:215-218`) undercounts deletes that really executed — precisely on the
+   busiest rounds. The exact counter for the same work is `entries_redeleted`
+   (`report.redeleted`, incremented unconditionally at `Gc/CasGc.cpp:857`, mirrored by
+   `ProfileEvents::CASGCRetiredRedeleted`), so `objects_deleted + objects_absent + objects_replaced`
+   silently stops equalling `entries_redeleted` past the cap with nothing saying why. Owed: either
+   tally the report from the in-memory decisions rather than from the capped log, or document the
+   skew at both the tally site and the column, and point readers at `entries_redeleted`.
+2. `GcFoldBegin` and `GcFoldEnd` stamp `e.round = state.round` (`Gc/CasGc.cpp:719`, `:756`) — the
+   round already committed BEFORE this one — while every other event of the same folding round stamps
+   `new_round` (`:594`, `:607`, `:839`, `:889`, `:927`, `:949`). The defer path's use of
+   `state.round` IS deliberate and documented (`:676-685`); these two are not, and `GcFoldEnd`
+   additionally pairs that stale round with the POST-fold generation (`state.snap_generation` is
+   mutated in-memory by `fold`, see `:764`). Effect: in
+   `system.content_addressed_log`, a round's fold rows sit one round below its own delete rows. Owed:
+   stamp `new_round` on both fold events (a one-line change) or say at the site why they differ.
+
+NOT a defect, checked while triaging: `Phase` rows carrying `round = 0` is by design — the phase sink
+copies the `Start` record (`Gc/CasGcScheduler.cpp:167`) and rows are correlated by `round_id`, which
+`GcRoundLogRecord::round_id` (`CasGcScheduler.h:57-63`) documents as "DELIBERATELY NOT `round`"
+because the round number does not exist yet on `Start` and never exists on a `NotALeader` round. Only
+the column comment is imprecise: `ContentAddressedGarbageCollectionLog.cpp:40` says "0 on Start" and
+should say "0 on Start and Phase rows; join on `round_id`". Likewise the constant phase metrics
+(`walk_plan_builds=1`, `fold_seal_reads=2`, `Gc/CasGc.cpp:658`, `:670`) are recorded facts about how
+many times the round reads one key, explained at `:667-670`, not measurements that broke.

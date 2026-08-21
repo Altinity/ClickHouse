@@ -399,3 +399,37 @@ correctly placed — a HEAD really was issued. Related stale prose: `Pool/CasPoo
 says the dedup-cache seam is probed "up to twice ... once more just to attribute
 `CASBlobBodyPutAvoided` to the cache" and names the caller `putBlob`; at HEAD the membership is read
 exactly once into `cache_hit` (`CasPartWriteTxn.cpp:202`) and the caller is `uploadBlobDetached`.
+
+## `FsckReport::clean` asserts more than the scan checked — no coverage flag for a skipped check family (2031-triage CAS-100) {#fsck-clean-verdict-has-no-coverage-flag}
+
+P3, verdict-honesty only — no scan misclassifies anything, and every skipped family is skipped for a
+stated cost reason. What is missing is the machine-readable "this family did not run" companion that
+`FsckReport::partial` already is for the deadline case.
+
+Three families are conditionally skipped, and in none of the three does the report say so:
+
+1. The GC-snapshot run read — and with it the whole-file seal-checksum check that produces
+   `corrupted_runs` — runs only when the pool has at least one present-but-unreferenced blob
+   (`Tools/CasFsck.cpp:815`, checksum compare at `:877`). On a pool with none, `corrupted_runs` reads
+   0 without a single run having been read. Mitigation, and why this is P3 rather than higher: the
+   deletion-deriving consumers verify the same checksum fail-closed
+   (`Gc/CasBlobInDegree.cpp:130`, `:718`, `Gc/CasGc.cpp:4478` → `SourceEdgeRunReader::verifyAgainst`,
+   `Formats/CasRecordStreamFormat.cpp:316-322`), so a corrupt run stops GC loudly whether or not fsck
+   looked.
+2. `stale_edge` is computed only under `detail` (`Tools/CasFsck.cpp:905`), and the SQL path always
+   passes `detail=false` (`src/Interpreters/InterpreterSystemQuery.cpp:2599`), so the `stale_edge`
+   column is structurally 0 (acknowledged at `:2456-2458`). This one has a documented exception plus a
+   compensating soak gate (`Tools/CasFsck.h:220-226`), so only the report-side "was it checked" bit is
+   owed, not the gating decision.
+3. A `--namespace`-scoped run skips the whole pool-wide physical/pipeline classification
+   (`Tools/CasFsck.cpp:719`, scoped branch `:1048-1087`). The CLI help says so
+   (`programs/disks/CommandFsck.cpp:29-31`), but the summary line, the report struct and `clean()`
+   carry no scope marker, so a scoped run's `reachable=… dangling=0 …` line is byte-shaped exactly
+   like a full run's.
+
+Owed, cheapest first: a per-family coverage bit (or one `checked_families` bitmask) on `FsckReport`,
+rendered on the summary line and the SQL row next to the counters it qualifies, so "0 because nothing
+was found" and "0 because nothing was checked" stop being the same output — the same distinction
+`partial` already makes for the deadline. Related: {#fsck-meta-body-counters-unrendered} (counters
+computed and rendered nowhere) and {#lifecycle-verbs-wait-out-uncancellable-scans} (the SQL FSCK
+passes none of the CLI's bounding parameters).
