@@ -103,12 +103,12 @@
 | CAS-085 | частично | P2 | [{#always-copy-instead-of-hardlinks-no-gate}](BACKLOG.md#always-copy-instead-of-hardlinks-no-gate) | нет | Ядро находки верно и достижимо — при `always_use_copy_instead_of_hardlinks=1` мутации и однодисковые клоны разделов на CA-таблице падают громким `NOT_IMPLEMENTED`, и настройка ничем не отвергается; но `FREEZE`, BACKUP/RESTORE-клон и «неявный zero-copy» этот путь не достают, а отказ fail-closed, без порчи данных. |
 | CAS-086 | ⏳ | — | — | — | — |
 | CAS-087 | ⏳ | — | — | — | — |
-| CAS-088 | ⏳ | — | — | — | — |
-| CAS-089 | ⏳ | — | — | — | — |
+| CAS-088 | частично | P3 | [{#c2-displacement-comment-stale}](BACKLOG.md#c2-displacement-comment-stale) | нет | Безусловность `resurrect` — осознанный дизайн с тремя структурными обоснованиями; «fence-unchecked» неверно (проверка есть с `1fe585ea078` и запинена тестами), «возвращает токен, который не писал» закрыто сегодняшним `9b887ac8886`; остаток — только устаревшие комментарии/имена тестов про `putOverwrite` и мёртвый BACKLOG-анкор. |
+| CAS-089 | by-design | P3 | [{#blob-envelope-never-read-back}](BACKLOG.md#blob-envelope-never-read-back) | нет | Кодовый шейп верен (offset из pool meta, декодер конверта зовёт только `INSPECT`), но расхождение длины конверта структурно недостижимо, «идентичность» в конверте не хранится (усекается только диагностический `ref`), а версия гейтится на уровне пула через `min_reader_generation`; INTEGRITY-последствие не подтверждается, остаток — решение к format-freeze. |
 | CAS-090 | частично | P3 | [{#encrypted-wrapper-hides-content-addressed} + {#encrypted-over-cas-missing-gate} + [B17]](BACKLOG.md#encrypted-wrapper-hides-content-addressed} + {#encrypted-over-cas-missing-gate} + [B17) | нет | Все четыре описанные формы кода реальны, но ни одно из последствий не является тихой порчей: SSE-C ломает только опциональный `staging_backend=s3`, и там стоит fail-closed mount-probe с откатом на local staging; «нет MAC / не перепроверяем дайджест» — дубликат settled-позиции CAS-008; плейнтекст-метаданные манифеста и невозможность re-key — уже [B17] и два анкера BACKLOG; про «плейнтекстовые тела мелких файлов» утверждение неверно. |
 | CAS-091 | частично | P3 | [{#checknamespace-admits-dot-segments}](BACKLOG.md#checknamespace-admits-dot-segments) | нет | Расхождение валидаторов реально — `Layout::checkNamespace` действительно единственный, кто пропускает сегменты `.`/`..`, и механизм побега по ФС в emulated-режиме над local object storage тоже реален; но продовой достижимости нет: любой live-namespace префиксуется уже провалидированным `server_root_id`, UUID/имена экранированы, а имя FREEZE-бэкапа проходит `escapeForFileName`. |
-| CAS-092 | ⏳ | — | — | — | — |
-| CAS-093 | ⏳ | — | — | — | — |
+| CAS-092 | частично | P2 | [{#boottime-not-portable} (новый), {#decommission-wrong-predicate} (существующий)](BACKLOG.md#boottime-not-portable} (новый), {#decommission-wrong-predicate} (существующий) | нет | Из трёх подпунктов реальным остаётся только один — непортируемый `CLOCK_BOOTTIME` (сборка Darwin); «разные часы у фенса и запроса» опровергнуто, wall-clock в decommission-минте by-design и уже описан в BACKLOG. |
+| CAS-093 | исправлено | — | — | — | Форма кода описана верно (вложенная scratch-транзакция под tmp-путём части + no-op `removeRecursive`), но утечка закрыта целевым `dropRefIfPresent` в `moveDirectory` (B183, `2027de8346a`) и покрыта отдельным gtest (`3a32e0259f8`), так что «temp ref и его блобы выживают» на HEAD неверно. |
 | CAS-094 | ⏳ | — | — | — | — |
 | CAS-095 | ⏳ | — | — | — | — |
 | CAS-096 | ⏳ | — | — | — | — |
@@ -3892,3 +3892,378 @@ condemned-маркер без тела».
 BACKLOG / история. По грепу `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` (`traversal`, `checkNamespace`, `'..'`) существующего покрытия НЕ нашлось: единственные попадания — `formats-and-storage.md:283` (про `DecodeRejectsMalformedEntryPaths`, то есть про манифестный валидатор, который как раз корректен) и два несвязанных пункта в `operability-and-introspection.md:20`/`gc.md:106`. `git log -S` по телу функции даёт только переносы/введение (`6cf7d6589f8` «CA core M-C2: opaque root namespaces», `1e157538806` «required+validated server_root_id config», `4fafb4edb28` — вынос `checkNamespace` из `CasLayout.h`, `147875b6748`) — проверка `.`/`..` в `checkNamespace` не существовала никогда и ничем не закрывалась. Показательно, что `1e157538806` добавил ровно эту проверку в `validateServerRootId` и не перенёс её в `checkNamespace`.
 
 Реальный остаток (не отслеженный ранее) я оформил новым разделом в `docs/superpowers/cas/BACKLOG/formats-and-storage.md` — анкер {#checknamespace-admits-dot-segments} (оставлен незакоммиченным). Объём фикса: одна ветка в `checkNamespace` (или вызов общего хелпера) + gtest-кейс + правка трёх ложных комментариев о паритете (`CasPartManifestFormat.cpp:198-200`, `CasServerRoot.h:192`, `gtest_cas_part_manifest_format.cpp:215`). P3, pre-release-блокером не является.
+
+## CAS-088 — Безусловность `resurrect` — осознанный дизайн с тремя структурными обоснованиями; «fence-unchecked» неверно (проверка есть с `1fe585ea078` и запинена тестами), «возвращает токен, который не писал» закрыто сегодняшним `9b887ac8886`; остаток — только устаревшие комментарии/имена тестов про `putOverwrite` и мёртвый BACKLOG-анкор. (частично, P3) {#cas-088}
+
+## Что проверялось
+
+Анкор находки (`CA/Backend/CasObjectStorageBackend.cpp:814-856`) устарел по путям и строкам: на HEAD это
+`Backend/CasObjectStorageBackend.cpp:1099-1175` (`ObjectStorageBackend::resurrect`), вызывающие места —
+`Pool/CasPartWriteTxn.cpp:700-762` (`PartWriteTxn::uploadFromSource`, ветка condemned-displacement).
+
+## Утверждение 1 — «unconditional overwrite»: верно, но by design
+
+`Backend/CasObjectStorageBackend.cpp:1147-1148`: `object_storage->writeObject(StoredObject(blob_key),
+WriteMode::Rewrite, …, tokenProducingWriteSettings())` — действительно без `If-Match`/`If-None-Match`.
+Обоснование записано прямо в коде (`:1127-1135`) как три независимых структурных свойства, а не как
+«не успели добавить precondition»:
+
+1. ключ контент-адресуемый ⇒ любая инкарнация под ним побайтово идентична по PAYLOAD, перезапись
+   вращает только конверт и токен (пары «живой объект другого содержимого» под этим ключом не бывает);
+2. ЗНАЧЕНИЕ токена адоптированной зависимости никогда не является гейтом promote — консультируется
+   только `has_value()`, поэтому никакой потребитель не наблюдает и не реагирует на конкретные байты
+   старого токена;
+3. свежий `incarnation_tag` в `fresh_header` (`Pool/CasPartWriteTxn.cpp:713-716`, `buildHeader`) делает
+   токен воскрешённой инкарнации отличным от осуждённой, поэтому любой уже поставленный в очередь
+   exact-token DELETE осуждённой инкарнации промахивается (`INV-NO-RETURN`).
+
+Эта же безусловность зафиксирована как СОЗНАТЕЛЬНОЕ сужение в BACKLOG:
+`docs/superpowers/cas/BACKLOG.md:424-430` («SCOPE NARROWED (2026-08-04): the resurrect path no longer
+has this problem… is now an UNCONDITIONAL write»). Инвариант «никогда не GET-ить осуждённое тело,
+воскрешение = только свежая пере-загрузка» — settled-позиция (`feedback_ca_resurrect_invariant`), и
+код ей соответствует: staged-ветка читает СВОЙ staging-объект (`Pool/CasPartWriteTxn.cpp:727-732`),
+локальная — свой источник (`:753-759`).
+
+## Утверждение 2 — «fence-unchecked … asserts only against the generation captured one line earlier»: НЕВЕРНО
+
+Проверка есть и она не «одна строка назад»:
+
+- захват на РЕШЕНИИ о displacement: `Pool/CasPartWriteTxn.cpp:700`
+  `const uint64_t displace_admitted_generation = store->fenceGeneration();` — до `getStream` staging-объекта
+  и до `source.open()`;
+- пере-проверка непосредственно перед сырой записью: `Pool/CasPartWriteTxn.cpp:724` (staged-ветка,
+  запись на `:732`) и `:754` (локальная ветка, запись на `:759`);
+- сама проверка — не только сравнение генерации: `Pool/CasMountRuntime.cpp:106`
+  `if (!mayMutate() || fenceGeneration() != admitted_generation) throwCasTransientUnavailable(...)`,
+  т.е. лизинг должен быть жив (латч + дедлайн) И инкарнация не сменилась с момента admission
+  (`Pool/CasMountRuntime.h:142-157`).
+
+Это шаблон capture-at-admission → check-before-durable-write, тот же, что на plain-object поверхности
+(`CasPlainObjects::casPutObject`); атомарности с удалённой записью здесь не существует ни для одного
+call site, поэтому «проверка не атомарна» — не дефект, а форма гейта.
+
+Закрыто коммитом `1fe585ea078` («ca: GC self-exit on Vanished (C1); observer bails on FORGET intent (M1);
+**fence checks on condemned displacement (I2)**», 2026-07-23) — то есть находка описывает состояние до
+этого коммита. Есть пинящие тесты: `src/Disks/tests/gtest_cas_fence_generation.cpp:376-422` (локальная
+ветка) и `:426-470` (`CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurableCall`) — оба проверяют,
+что осуждённое тело осталось с исходным токеном («no stale displacement»).
+
+## Утверждение 3 — «returns a token it did not write»: было верно, СТАЛО НЕВЕРНО (закрыто на HEAD)
+
+До `9b887ac8886` («Bind GCS CAS writes to exact response generations», 2026-08-21) `resurrect` делал
+пост-записи `nativeHead(blob_key)` и возвращал `hr->token` — на гонке это действительно мог быть токен
+инкарнации ДРУГОГО писателя (см. удалённые строки в `git show 9b887ac8886 -- …/CasObjectStorageBackend.cpp`).
+На HEAD: `Backend/CasObjectStorageBackend.cpp:1169`
+`const Token token = tokenFromWriteResult(blob_key, out->getResultObjectETag());` — токен берётся из
+ОТВЕТА нашей же записи; `tokenFromWriteResult` (`:874-896`) на generation-диалекте (GCS) требует
+валидную числовую генерацию и иначе бросает `CORRUPTED_DATA` без всякого HEAD, на ETag-диалекте берёт
+ETag ответа. HEAD-fallback (`:894`) остаётся только там, где у бэкенда вообще нет write-time токена
+(локальные файлы) либо ETag пуст — узкий остаток, последствие которого гасится свойством (2) выше
+(значение токена dep-записи никто не читает как гейт; расхождение даёт максимум промах exact-token
+DELETE, т.е. утечку-с-fsck-детекцией, а не потерю данных).
+
+Тот же коммит закрыл и «budget-free» в его единственной опасной части: запись идёт через
+`tokenProducingWriteSettings()` (`:1148`), который на generation-store принудительно делает
+одночастный PUT под `token_producing_single_put_cap` — иначе безусловная перезапись могла бы
+незаметно уйти в multipart, где GCS теряет preconditions (`:1136-1146`).
+
+## Утверждение 4 — «budget-free»: формально верно, последствие ничтожно
+
+`resurrect` действительно не идёт через `CasRequestController` (нет budgeted attempts / resolve-before-reissue),
+и это прямо задокументировано на месте (`Pool/CasPartWriteTxn.cpp:691-693`: «RAW backend writes with NO
+controller/fence coupling»). Но: (а) профиль `SingleAttempt` навешивает только `conditionalWriteSettings`
+(`Backend/CasObjectStorageBackend.cpp:823-831`), а `resurrect` его СОЗНАТЕЛЬНО не наследует (`:832-834`) —
+т.е. обычные ретраи слоя object storage сохраняются; (б) безусловная перезапись идемпотентна, resolve-логика
+контроллера ей не нужна; (в) при исчерпании — исключение, т.е. падение сборки части (fail-loud, retryable
+на уровне INSERT/merge), а не молчаливая порча. Отдельный item я не завожу.
+
+Проверка размера тоже fail-closed: `:1152-1163` считает переданные байты и при расхождении делает
+`out->cancel()` ДО `finalize()` («nothing published»), пин — `gtest_cas_backend_contract.cpp:264`
+(`ResurrectWrongSizePublishesNothing`), `:282` (`ResurrectReplacesBodyAndMintsFreshToken`).
+
+## Утверждение 5 — «two writers … can each believe they own the object»: изобретённое последствие
+
+«Владение» объектом в этом протоколе ничего не решает: payload-ы двух воскрешений побайтово идентичны,
+значение токена не гейт, а долговременные ссылки именуют контент-хеши, а не инкарнации
+(`Backend/CasObjectStorageBackend.cpp:1127-1135`, `Pool/CasPartWriteTxn.cpp:741-750`). Гонка «писатель
+против хвоста GC-DELETE» закрыта с другой стороны — нормативным пере-чтением in-degree на месте удаления
+(`Gc/CasBlobInDegree.cpp`, спец §5 arm 3) и exact-token семантикой DELETE против вращённого тега; см.
+уже принятую адъюдикацию `docs/superpowers/cas/BACKLOG.md:511` ({#cas-021-followups}) — там ровно этот
+класс разобран и признан нейтрализованным. INTEGRITY-класс находки не подтверждается.
+
+## Что реально осталось (P3, косметика)
+
+Только проза и имена тестов, поэтому завёл новый пункт
+`docs/superpowers/cas/BACKLOG/docs-and-cleanup.md` {#c2-displacement-comment-stale} (не закоммичено):
+
+- комментарий `Pool/CasPartWriteTxn.cpp:691-693` говорит про «the two displacement calls below
+  (`resurrect` / `putOverwrite`)», но обе ветки зовут `resurrect` (`:732`, `:759`); `putOverwrite`
+  живёт только как helper контроллера (`Backend/CasRequestControl.cpp:504-521`), в этот путь не попадает;
+  тесты несут ту же устаревшую лексику (`gtest_cas_fence_generation.cpp:376,394,417`);
+- комментарии `Pool/CasPartWriteTxn.cpp:691`, `:719` и `gtest_cas_fence_generation.cpp:376` ссылаются на
+  анкор `{#c2-resurrect-putoverwrite-fence-check}`, которого в BACKLOG больше нет — вырезан
+  `f95458a1b79`; по политике комментариев (никаких внутренних ссылок) надо оставить ПРИЧИНУ и убрать
+  анкор и провенанс «rev.7 [C2]».
+
+## CAS-089 — Кодовый шейп верен (offset из pool meta, декодер конверта зовёт только `INSPECT`), но расхождение длины конверта структурно недостижимо, «идентичность» в конверте не хранится (усекается только диагностический `ref`), а версия гейтится на уровне пула через `min_reader_generation`; INTEGRITY-последствие не подтверждается, остаток — решение к format-freeze. (by-design, P3) {#cas-089}
+
+## Утверждение 1 — «offset берётся из pool meta»: верно, by design
+
+`Pool/CasManifestReader.cpp:143-165` (`locate`): `BlobLocation{ .key = layout.blobKey(entry.ref),
+.offset = meta.blob_header_len, .length = entry.blob_size }` — и это записано как намерение
+(`:145-147`, `:151-153`: «the payload starts at a constant offset for blobs (the pool's fixed
+blob_header_len — no per-object header read)»). Единственный байто-читающий путь применяет это
+смещение: `ContentAddressedMetadataStorage.cpp:1987-1989` (`plan.payload_offset = location.offset`) и
+`:2002-2004` (`ReadBufferFromFileView(std::move(impl), path, location.offset, location.offset + location.length)`).
+Дизайн зафиксирован в `Formats/CasBlobEnvelopeFormat.h:76-93`.
+
+## Утверждение 2 — «any divergence … is read at the wrong offset and never detected»: недостижимо, и не молча
+
+Расхождения «реальная длина конверта ≠ `blob_header_len` пула» на HEAD взяться неоткуда:
+
+- `blob_header_len` минтится один раз при создании пула, и при повторном открытии АВТОРИТЕТ — пул, а не
+  конфиг: `Pool/CasPoolMeta.cpp:122` («Present => the pool is authoritative; ignore the passed config's
+  blob_header_len»), `:150` `pm.blob_header_len = blob_header_len`;
+- монтирование с несовпадающим ожидаемым значением отвергается: `Pool/CasPool.cpp:124-128`
+  (`fresh.pool_id == expected_pool_id && fresh.blob_header_len == expected_blob_header_len`), причём
+  `min_reader_generation`/`algos_used` там же названы «legally mutable» и сознательно не сравниваются
+  (`Pool/CasPool.cpp:99`);
+- значение валидируется на каждом декоде и при создании: `Formats/CasPoolMetaFormat.cpp:36-46`
+  (минимум 240 — арифметически выведенный минимум под обязательные поля v3-конверта, кратность 8,
+  максимум 16384), вызовы `:171` и `Pool/CasPoolMeta.cpp:113`;
+- запись конверта берёт ту же величину из pool meta: `ContentAddressedTransaction.cpp:616`, `:744`
+  (`encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len))`), а сам `encode` либо
+  укладывается в фиксированную длину, либо бросает `LOGICAL_ERROR` (`Formats/CasBlobEnvelopeFormat.cpp:131-135`,
+  `:143-146`) — т.е. объект «не той» длины конверта опубликовать нельзя.
+
+Если бы расхождение всё же возникло (например, побайтовый клон пула другого поколения формата),
+последствие — не молчаливая порча: MergeTree получил бы сдвинутые байты, которые ловит его собственная
+контрольная сумма сжатого блока; плюс окно чтения `[offset, offset+length)` при коротком объекте даёт EOF.
+Это громкий отказ, а не «mismatch is never detected». Дополнительно смежный уже принятый пункт
+{#move-out-copies-envelope-bytes} (`BACKLOG/formats-and-storage.md:86`) фиксирует единственный реальный
+случай, где байты конверта утекают наружу (server-side copy-out), и там тоже вывод «падает громко».
+
+## Утверждение 3 — «its identity field is silently truncatable»: фактически неверно
+
+В конверте НЕТ поля идентичности. Идентичность блоба — алгоритм+дайджест в КЛЮЧЕ объекта и в ссылке
+манифеста, что прямо сказано в `Formats/CasBlobEnvelopeFormat.h:53-58` («The envelope intentionally does
+not duplicate identity … the identity algorithm and digest are already present in the object key and
+manifest reference, `domain_id` had no validating consumer, and `header_hash` had no consumer»).
+Усекается единственное поле `ref` — `intended_ref`, помеченное как диагностическое
+(`Formats/CasBlobEnvelopeFormat.h:69`, `:78-79`; писатель — `Formats/CasBlobEnvelopeFormat.cpp:126-140`
+с явным бюджетом и «shortened, never dropped»). Обязательные (не-`ref`) поля при нехватке места дают
+`LOGICAL_ERROR` (`:131-135`), т.е. write-путь fail-closed, а не «truncates with no error», как
+утверждает находка про `:74-87` снапшота.
+
+## Утверждение 4 — «the stamped version is never enforced on a production read path»: верно как факт, но не дефект
+
+Единственный не-тестовый вызов декодера — `SYSTEM CAS INSPECT`: `Tools/CasInspect.cpp:630`
+`renderEnvelopeHeader(decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob))` (grep по дереву даёт
+только его и gtest-ы). `runFsck` тела вообще не GET-ит (Tools/CasFsck.* — листинги и достижимость),
+это сознательная экономия GET-бюджета.
+
+Гейт совместимости при этом существует, просто он пул-широкий, а не по-объектный:
+`Formats/CasPoolMetaFormat.cpp:174-177` — `if (G_BUILD < pm.min_reader_generation) throw …`, а пишущий
+билд поднимает `min_reader_generation` до своего пола при admission (`Pool/CasPoolMeta.cpp:69-90`, `:152`).
+То есть сборка, которая не понимала бы новый конверт, не смонтирует пул целиком — проверять `v` в каждом
+блобе не нужно. Внутри же конверта `checkCompatibility` вызывается на декоде (`Formats/CasBlobEnvelopeFormat.cpp:187`),
+и «неизвестный `!`-критический ключ» → `UNKNOWN_FORMAT_VERSION`; тесты формата зарегистрированы в общей
+батарее (`gtest_cas_blob_envelope_format.cpp:168`, см. `docs/superpowers/cas/2031-triage.md:2708`).
+
+## Заявленное «carried from prev CAS-024» / поиск по BACKLOG
+
+В `docs/superpowers/cas/2031-triage.md` CAS-024 этого раунда — про два CAS-диска на одном
+`server_root_id` (not-a-bug), к конверту отношения не имеет; отдельного открытого item про
+«конверт не читают обратно» в `BACKLOG.md`/`BACKLOG/*.md` нет (грепы по «envelope», «blob_header_len»
+дают только {#move-out-copies-envelope-bytes}, {#gc-snap-codec-tlv-review}, [codecs.md standardization]
+и разбор арифметики в {#numeric-parse-and-window-wrap}, где underflow `blob_header_len - 1` уже признан
+недостижимым — `2031-triage.md:2091`).
+
+## Что реально осталось (P3, к format-freeze)
+
+Завёл новый пункт `docs/superpowers/cas/BACKLOG/formats-and-storage.md`
+{#blob-envelope-never-read-back} (не закоммичено): зафиксировать решением, остаётся ли конверт
+write-only форензикой; если да — либо убрать неиспользуемый параметр `object_size` у
+`decodeEnvelopeHeader` (`Formats/CasBlobEnvelopeFormat.cpp:162`, параметр уже безымянный), либо дать ему
+реального потребителя, и опционально в `detail`-режиме fsck декодировать конверт выборочного блоба,
+чтобы `header_len == blob_header_len` и `v` доказывались где-то кроме `INSPECT`. INTEGRITY-item не
+завожу — обоснование выше.
+
+## CAS-092 — Из трёх подпунктов реальным остаётся только один — непортируемый `CLOCK_BOOTTIME` (сборка Darwin); «разные часы у фенса и запроса» опровергнуто, wall-clock в decommission-минте by-design и уже описан в BACKLOG. (частично, P2) {#cas-092}
+
+## 1. bc6-5 «фенс и запрос, который он допускает, живут на разных часах» — NOT-A-BUG (описана форма кода, следствие изобретено)
+
+Форма кода описана верно: фенс живёт в домене `CLOCK_BOOTTIME`, а контроллер запросов — в домене
+`steady_clock`.
+
+- Фенс: `Pool/CasMountRuntime.cpp:59-63` (`CasMountRuntime::bootMs` → `clock_gettime(CLOCK_BOOTTIME, &ts)`),
+  `:65-68` (`bootMsNow`), проверка `Pool/CasMountRuntime.cpp:79-83` (`mayMutate`: `bootMsNow() <
+  mount_fence.deadline_boot_ms`), и «бюджетная» версия `:117-126` (`refAppendFenceOk`).
+- Контроллер: `Backend/CasRequestControl.cpp:88-92` (`steadyClockNowMs`), подставляется по умолчанию в
+  `:221`.
+
+Но следствие («приостановка хоста или live-migration между допуском фенса и conditional PUT невидима
+для дедлайна, который его допустил») не выполняется, потому что **два домена нигде не сравниваются
+между собой**, и именно тот дедлайн, который допускает запись, читается по boot-часам:
+
+1. Дедлайн фенса выставляется из **локального** boot-якоря, а не из чужого `expires_at_ms`:
+   `Pool/CasServerRoot.cpp:909-911` (`prepareRenew`: `last_attempt_boot_ms = boot_ms_fn()`, pre-I/O
+   anchor) → `:1046` (`on_renew_ok(last_attempt_boot_ms)`) → `Pool/CasMountRuntime.cpp:129-132`
+   (`setMountDeadline`) / `:134-147` (`armMountFence`). Кросс-нодовое `expires_at_ms` в boot-домен
+   никогда не переводится.
+2. `fence_ok()` (то есть `refAppendFenceOk` → `bootMsNow`) вызывается **перед каждой попыткой**
+   (`Backend/CasRequestControl.cpp:333-338` и `:432-435`), **перед backoff-сном**
+   (`:250-255`, комментарий «Fence BEFORE the sleep»), и **после наблюдения ответа**
+   (`:405-414`, `:468-473`), где потеря фенса даёт `CasUnresolvedReason::FenceLostPostWrite` +
+   ProfileEvent `CASConditionalWriteFenceLostPostWrite` (`Common/ProfileEvents.cpp:899`).
+   Поэтому VM-suspend внутри окна «допуск → PUT» именно ВИДЕН: после возобновления boot-часы уже
+   ушли вперёд, фенс просрочен, вызов возвращает `Unresolved`, а не ложный `Committed`. Это
+   fail-closed поведение, а не молчаливая порча.
+3. `steady_clock` в контроллере используется только против дедлайна, посчитанного тем же
+   `now_ms` (`Backend/CasRequestControl.cpp:305` — `deadline_ms = now_ms() + operation_deadline_ms`;
+   сравнения `:337`, `:262`, `:434`). Это локальный бюджет попыток, а не гарантия безопасности:
+   его «недосчёт» времени сна лишь делает бюджет чуть щедрее, тогда как решение о праве на запись
+   принимает boot-фенс.
+
+Выбор `CLOCK_BOOTTIME` именно ради suspend-семантики явно задокументирован в коде:
+`Pool/CasMountRuntime.h:68-72` («monotonic time does not advance while a VM is suspended … a resumed
+sleeper sees its fence expired»), а wall-часы для операторского `since` — сознательно отдельно
+(`Pool/CasMountRuntime.cpp:32-38`). Есть и тест на это свойство: `src/Disks/tests/gtest_cas_pool.cpp:1314`
+(«the write-fence deadline is a CLOCK_BOOTTIME instant»). То есть «разные часы» — это заявленный
+дизайн с непересекающимися доменами, а не рассогласование.
+
+## 2. bc6-6 «в минте decommission-эпохи выжил кросс-нодовый wall-clock gate ликвидности» — BY-DESIGN + уже в BACKLOG
+
+Строка существует и читается верно: `Pool/CasServerRoot.cpp:236` —
+`const bool live = !surviving.gc_fenced && surviving.expires_at_ms > now_ms;`, где `now_ms` — wall-clock
+вызывающего (`Pool/CasPool.cpp:561-566`, `std::chrono::system_clock`). Но «решает ликвидность другой
+ноды» — с последствием «деструктивное действие по перекошенным часам» — неверно, и обоснование
+безопасности лежит прямо над строкой (`Pool/CasServerRoot.cpp:222-234`), причём оно проверяется кодом:
+
+- Достижимость узкая: ветка срабатывает только при `policy == EpochMintPolicy::DecommissionRecovery`
+  (`Pool/CasServerRoot.cpp:221`), который выставляется исключительно для `MountClaimPolicy::NoWait`
+  (`Pool/CasPool.cpp:578-580`), то есть только из `Pool::openForDecommission` (`Pool/CasPool.cpp:857`),
+  и вдобавок только когда объект `epoch` ОТСУТСТВУЕТ, а `mount` есть (`Pool/CasServerRoot.cpp:195-220`) —
+  это путь восстановления после потери durable-эпохи, а не обычный decommission.
+- Сравнение используется только для ОТКАЗА: `live == true` → `throw ABORTED`
+  (`Pool/CasServerRoot.cpp:238-243`). Ошибка в «живую» сторону = ложный отказ (fail-closed).
+- Ошибка в «мёртвую» сторону не даёт ничего деструктивного: минтится эпоха, ЗАВЕДОМО отличная от
+  выжившей (`Pool/CasServerRoot.cpp:245-247`, `next_writer_epoch = max(1, surviving.writer_epoch + 1)`),
+  так что пара (uuid, epoch) не может повториться; а сразу после этого `claimMount` применяет свой
+  СИЛЬНЫЙ гейт, который принципиально не верит wall-часам: перезахват возможен только по
+  `gc_fenced` / clean-marker (`min_active == UINT64_MAX`) / совпадению `proven_dead_token`
+  (`Pool/CasServerRoot.cpp:410-427`), а `NoWait` передаёт пустой `proven_dead_token`
+  (`Pool/CasPool.cpp:668`) и любой иной исход немедленно превращает в `ABORTED`
+  (`Pool/CasPool.cpp:684-694`). Т.е. перекос часов может максимум «сжечь» один номер эпохи на
+  обречённой попытке.
+- Второе wall-clock сравнение (`Pool/CasServerRoot.cpp:786`, `now_ms <= expires_at_ms + skew_margin_ms`) —
+  это классификация строки для introspection-представления `cas_mounts`, никакого решения о записи
+  или удалении оно не принимает.
+
+Эта же строка уже отслеживается в бэклоге: `docs/superpowers/cas/BACKLOG.md`, раздел
+`{#decommission-wrong-predicate}` («`cas_mounts` liveness and `NoWait` decommission disagree about
+what "dead" means»), где цитируется ровно `CasServerRoot.cpp:236` и ровно комментарий
+`CasServerRoot.cpp:410-424`, и где прямо записано: «Do not "fix" it by weakening the
+certificate-of-death rule». Так что оценка одиночника («один такой gate остался на деструктивном
+пути») переворачивает картину: на деструктивном пути как раз стоит сильный гейт, а wall-часы стоят
+на пути отказа. Ничего нового к `{#decommission-wrong-predicate}` добавлять не требуется.
+
+## 3. bc6-9 «оба чтения `CLOCK_BOOTTIME` не защищены на Darwin/FreeBSD» — ПОДТВЕРЖДЕНО (единственный реальный остаток)
+
+- `Pool/CasMountRuntime.cpp:61-63` и `Pool/CasServerRoot.cpp:56-58` — два безусловных
+  `clock_gettime(CLOCK_BOOTTIME, &ts)`; в обоих TU подключён только `<ctime>`
+  (`Pool/CasMountRuntime.cpp:9`), никакого `#if defined(OS_LINUX)` и никакого shim-заголовка нет.
+- Файлы компилируются на всех платформах безусловно: `src/CMakeLists.txt:139`
+  (`add_headers_and_sources(dbms Disks/.../ContentAddressed/Pool)`), без платформенных условий.
+- Прецедент shim'а в дереве есть и он ровно про это: `base/base/time.h:5-9` доопределяет
+  `CLOCK_MONOTONIC_COARSE` для `OS_DARWIN`/`OS_SUNOS`/`OS_FREEBSD`. Для `CLOCK_BOOTTIME` такого
+  маппинга нет нигде (grep по `src/` и `base/` даёт только сами CAS-строки; в дереве он встречается
+  лишь в `contrib/aws-c-common/source/posix/clock.c:12`, и там он корректно обёрнут в
+  `#if defined(CLOCK_BOOTTIME)`).
+- Уточнение к формулировке находки: FreeBSD, скорее всего, не ломается — там `CLOCK_BOOTTIME`
+  определён как алиас `CLOCK_UPTIME` под `__BSD_VISIBLE`. Реально красной будет сборка Darwin,
+  где имени нет вовсе (boot-домен там — `CLOCK_UPTIME_RAW`, и он, в отличие от `CLOCK_BOOTTIME`, НЕ
+  включает время сна, то есть не является прямой заменой под требование `Pool/CasMountRuntime.h:68-72`).
+- Класс отказа — ошибка компиляции, то есть максимально громкий fail-closed, нулевой runtime-риск;
+  поэтому P2, а не P1: правится до первого запуска darwin-джобов, данные под угрозой не бывают.
+
+В BACKLOG покрытия не было (grep по `BACKLOG.md` и `BACKLOG/*.md` на `boottime|darwin|freebsd|portab`
+— пусто), поэтому добавлен новый раздел (не закоммичен):
+`docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md` → {#boottime-not-portable}.
+
+## CAS-093 — Форма кода описана верно (вложенная scratch-транзакция под tmp-путём части + no-op `removeRecursive`), но утечка закрыта целевым `dropRefIfPresent` в `moveDirectory` (B183, `2027de8346a`) и покрыта отдельным gtest (`3a32e0259f8`), так что «temp ref и его блобы выживают» на HEAD неверно. (исправлено, —) {#cas-093}
+
+## Что в находке верно
+
+1. Временное хранилище действительно открывает СВОЮ транзакцию на sibling-каталоге ВНУТРИ части:
+   `src/Storages/MergeTree/TextIndexUtils.cpp:601-609` —
+   `DataPartStorageOnDiskFull(volume, part_relative_path, "text_index_tmp")`, затем
+   `storage->beginTransaction()` (`:606`) и `createDirectories()` (`:607`).
+2. Путь — это ЕЩЁ tmp-путь новой части (то есть источник переименования tmp→final):
+   `src/Storages/MergeTree/MutateTask.cpp:1821-1822`
+   (`ctx->new_data_part->getDataPartStorage().getRelativePath()`) и
+   `src/Storages/MergeTree/MergeTask.cpp:2856-2859` (то же для merge).
+3. Эта транзакция коммитится ОТДЕЛЬНО, до существования части:
+   `src/Storages/MergeTree/MutateTask.cpp:1941-1944` (`temporary_text_index_storage->commitTransaction()`)
+   и `src/Storages/MergeTree/MergeTask.cpp:2247-2248`. Значит, в CA действительно durably публикуется
+   ref по ключу самой (tmp-)части, содержащий только файлы `<part>/text_index_tmp/*` — якорь находки
+   по номерам строк устарел, но по сути точен.
+4. Очистка через `removeRecursive` в CA — действительно молчаливый no-op:
+   `src/Storages/MergeTree/MutateTask.cpp:2016-2017` и `src/Storages/MergeTree/MergeTask.cpp:2323-2324`
+   → `DataPartStorageOnDiskBase::removeRecursive` (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:1149-1152`,
+   `disk.removeRecursive(root_path/part_dir)`) → `ContentAddressedTransaction::removeRecursive`
+   (`.../ContentAddressed/ContentAddressedTransaction.cpp:1035`). Путь
+   `<table>/<tmp_part>/text_index_tmp` парсится так, что ВСЁ после компонента части склеивается в
+   `file` (`Parts/PartPathParser.cpp:269-272`), поэтому маршрут даёт непустые `ref` И `file` и
+   исполняется ветка «A projection subdir: virtual … removal is a no-op»
+   (`ContentAddressedTransaction.cpp:1119-1122`) — bare `return`, без ошибки.
+
+## Почему следствие («temp ref и его блобы выживают») на HEAD неверно
+
+Оба терминальных маршрута tmp-части снимают ref целиком, компенсируя no-op из п.4:
+
+- **Успех (tmp→final).** В `ContentAddressedTransaction::moveDirectory` ветка `had_staged_source`
+  прямо предусматривает ровно этот случай и снимает чужой committed scratch-ref ДО публикации
+  авторитетного манифеста: `ContentAddressedTransaction.cpp:1393-1402` — комментарий дословно
+  называет виновника («A nested text-index sub-storage (MergeTask/MutateTask
+  createTemporaryTextIndexStorage) may have DURABLY published a committed scratch ref at THIS part's
+  own path holding only `<part>/text_index_tmp/` files … drop it now»), реализация —
+  `metadata_storage.partAccess()->dropRefIfPresent(src->refKey())` (`:1400`). Что это и есть
+  production-форма (файлы части остаются staged до `renameParts`, а durable-публикация происходит в
+  commit этой же транзакции), зафиксировано комментарием там же: `:1385-1391`.
+- **Отказ / перезапуск.** Удаление всего tmp-каталога части идёт в ветку «A single part dir (live or
+  detached): drop its ref» (`ContentAddressedTransaction.cpp:1114-1118`,
+  `dropRefIfPresent(r->refKey())`) — тот же ref-ключ, под которым лежит scratch. Блобы после снятия
+  ref становятся недостижимыми и забираются обычным GC-раундом.
+
+Для проекций (`parent_part`) путь равен `<tmp_part>/<proj>.proj/text_index_tmp`, то есть тот же
+ref-ключ родительской tmp-части, и его снимает тот же `dropRefIfPresent` — поэтому ранний возврат
+`MergeTask::MergeTextIndexStage::finalize` при `parent_part` (`MergeTask.cpp:2317-2318`) ничего не
+теряет.
+
+## Покрытие и история
+
+- Заявление одиночника «promoted from test-gap to defect» не выполняется: на HEAD есть выделенный
+  целевой тест именно на этот сценарий — `src/Disks/tests/gtest_ca_transaction.cpp:184-222`,
+  `TEST(CASTransactionLockScope, StagedFinalizeDropsForeignScratchRef)`, чей комментарий
+  (`:184-190`) прямо ссылается на `createTemporaryTextIndexStorage` и на то, что scratch публикуется
+  под ЕЩЁ-tmp путём — «which is exactly what `moveDirectory`'s `dropRefIfPresent(src->refKey())`
+  drops». Тест проверяет и что финальный манифест содержит `data.bin` и НЕ содержит `scratch.bin`
+  (`:216-218`), и что scratch-ref под tmp-путём исчез (`:221`). Тест входит в CA-гейт (`CAS*`/`CA*`
+  фильтр gtest).
+- История: сама утечка была регрессией и закрыта коммитом `2027de8346a` (2026-06-20, «CA: fix
+  transactions (B182) and text indexes (B183) — both were regressions»); текущая форма ветки
+  `had_staged_source` пришла с `8008f863aed` (2026-07-09, «CAS wiring: committed part-ref mutations go
+  through facade primitives»), тест добавлен `3a32e0259f8` (2026-07-16, «cas txn-one-pipeline: B183
+  migration-gate test — staged finalize drops foreign scratch ref»).
+- В BACKLOG (`docs/superpowers/cas/BACKLOG.md`, `docs/superpowers/cas/BACKLOG/*.md`) отдельного
+  пункта по text-index scratch нет и не требуется: остатка нет.
+
+## Что реально остаётся
+
+Ничего исправимого. Единственный «шершавый» остаток — тот, что уже проходит по CAS-086: no-op-ветка
+`removeRecursive` для внутричастевого подкаталога (`ContentAddressedTransaction.cpp:1119-1122`)
+отвечает успехом, ничего не сделав; здесь это безопасно (компенсируется снятием ref-а целиком) и
+относится к контрактному кластеру CAS-086, а не к отдельному дефекту text-index'а. Соответственно
+CAS-093 не порождает нового backlog-пункта; частично он является следствием (не дубликатом)
+контрактного CAS-086.
