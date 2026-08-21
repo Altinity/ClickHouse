@@ -283,3 +283,25 @@ size rather than the nominal cap. Owed, in increasing cost: clamp the subtractio
 a `ContentAddressedSettings` entry plus a `CurrentMetrics` gauge; and call the pass from a second,
 growth-driven trigger (for example after a snapshot publish updates `base_snapshot_bytes`) so the cap
 means something for a long-lived stable table set.
+
+## `createHardLink` pays one manifest `HEAD` per file of the source part (2031-triage CAS-055) {#hardlink-per-file-forcefresh-head}
+
+The committed-source carry-forward branch of `ContentAddressedTransaction::createHardLink` resolves the
+source part `ForceFresh` on every call (`ContentAddressedTransaction.cpp:1190`), and with the shipped
+`part_folder_validate = always` default (`ContentAddressedSettings.cpp:89`) `ForceFresh` never serves a
+retained view (`Parts/PartFolderAccess.cpp:197` gates the short-circuit on
+`validate.mode != Always`), so each call reaches `buildView` → `readManifestShared`, whose `HEAD` is
+mandatory even on a decode-cache hit (`Pool/CasManifestReader.cpp:63-65`). A `FREEZE`/clone or an
+`ALTER ... UPDATE` hardlinks every unchanged file of the part through ONE CA transaction
+(`DataPartStorageOnDiskBase.cpp:530-540` self-creates the clone transaction;
+`MutateTask.cpp:3445` opens one for the new part), so a wide part costs one `HEAD` per file for work
+that copies nothing. The manifest decode is served from cache on a token match, so the audit's "full
+view rebuild per file" overstates it — the residual is the `HEAD` round trip, not a re-decode.
+
+The fix already exists one function away and needs no protocol change: `unlinkFile` memoizes the proof
+per `(transaction, ref)` in `force_fresh_validated_refs` and downgrades the rest of the burst to
+`CachedForLoad` (`ContentAddressedTransaction.cpp:1595-1603`), which still revalidates the manifest id
+against a fresh resolve and rebuilds on mismatch (`Parts/PartFolderAccess.cpp:177-186`). Apply the same
+memo to the createHardLink committed-source branch. The `Always` default itself stays — it is the
+fail-closed policy, and relaxing it is the separate, gated `part_folder_validate` question
+(`{#part-folder-validate-never-gating}`).
