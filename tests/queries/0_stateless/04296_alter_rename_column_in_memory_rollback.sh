@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-parallel
+# Tags: no-parallel, no-replicated-database
 # Tag no-parallel: uses fail points which affect the whole server.
 #
 # Regression test for https://github.com/ClickHouse/ClickHouse/pull/104822

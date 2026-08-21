@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-replicated-database
 -- no-fasttest: the S3 table engine is not available in the fast test build.
 
 -- session_token, the Google ADC secrets (google_adc_client_secret, google_adc_refresh_token) and
