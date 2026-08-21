@@ -252,3 +252,34 @@ rethrown — appears in no log line at all. Owed: a rate-limited `LOG_DEBUG`/`LO
 classified exception at the classification point (the `logCasWriteRetryLater` limiter already exists in
 this file), so a wedged ref lane can be root-caused without a rebuild with instrumentation. Same class
 as `{#fsck-meta-body-counters-unrendered}`: a signal computed and then not shown to anyone.
+
+## Incomplete multipart uploads and `_probe/` debris are invisible to every CAS accounting surface (2031-triage CAS-082) {#mpu-and-probe-debris-unaccounted}
+
+Two cost-only (never correctness) residuals, both P3:
+
+**Incomplete multipart uploads.** CAS adds no multipart bookkeeping of its own — every remote body
+goes out through `IObjectStorage::writeObject` → `WriteBufferFromS3`, which already aborts the upload
+on cancel and in its destructor (`src/IO/WriteBufferFromS3.cpp:244`, `:313-316`,
+`abortMultipartUpload` at `:469`), so an exception or a normal-shutdown teardown leaves nothing
+behind. What survives is the process-kill case (SIGKILL/OOM/host loss) and a failed `AbortMultipartUpload`
+call: the parts stay billed until the bucket's own lifecycle rule expires them. This is identical to
+every other ClickHouse S3 disk and cannot be fixed inside the process, but CAS is the storage whose
+docs promise a complete byte accounting for the pool (fsck `physical_bytes` sums HEAD sizes of visible
+objects only — `Tools/CasFsck.cpp:744`, `:759`, `:1071`), so the gap is worth naming where the
+operator reads. Owed: one line in the CAS operations docs recommending an
+`AbortIncompleteMultipartUpload` lifecycle rule on the pool bucket, plus a note in the fsck docs that
+`physical_bytes` counts committed objects and not in-flight multipart parts. Nothing in `docs/en` or
+the CAS doc set mentions incomplete multipart uploads today.
+
+**Capability-probe debris.** `runCapabilityProbe` cleans up on every exit path (`Backend/CasProbe.cpp:252`,
+`:258`; the lambda HEADs then `deleteExact`s both keys, `:26-41`), and a mis-provisioned bucket fails at
+step 0/0b (`:47-53`) before any object is written — so the audit's "left behind on exactly the
+mis-provisioned buckets the probe exists to detect" is wrong. The real residual is a hard kill mid-probe:
+two tiny objects under `<pool>/_probe/<u128hex>/` (`Pool/CasPool.cpp:466-467`), bounded by the number of
+crashed mounts, never per-write. Nothing ever sweeps them: the bootstrap residual scan skips the whole
+`_probe/` subtree deliberately (`Backend/CasSentinelProbe.cpp:18-30`, `:54-55`) — correct there, since
+that scan decides whether a fresh `_pool_meta` may be minted and probe scratch must not fail-close a
+healthy open — and fsck's unaccounted pipeline classifies only keys under the blob plane, so `_probe/`
+keys are neither reported nor reclaimed. Owed (cheap): have `Pool::open` best-effort delete stale
+`_probe/*` entries older than a threshold, or have fsck count them under a `probe_debris` line so the
+class is at least visible. Not urgent — the bytes are negligible and cannot mask real data.
