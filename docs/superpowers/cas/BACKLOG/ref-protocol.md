@@ -130,3 +130,29 @@ cross-check but sample it (every apply on `admits` previews, which are single-op
 scoped; on `applyTxnInPlace` only on the first apply after an install, or under an explicit test-only
 flag), so recovery replay in an ASan/TSan run is not quadratic. Not correctness-affecting either way —
 the assert is a real invariant defence and must not simply be deleted.
+
+## `precommitAdd` has no guard against a second call on the same `PartWriteTxn` (2031-triage CAS-072) {#precommit-add-single-slot-guard}
+
+`PartWriteTxn` carries exactly ONE precommit binding — the triple
+`precommit_target_ns` / `precommit_final_ref` / `precommit_manifest` plus `precommit_state`
+(`Pool/CasPartWriteTxn.h:383-385`) — and every consumer assumes that: `abandon` appends the exact
+precommit removal for that one binding (`Pool/CasPartWriteTxn.cpp:1338-1352`), the destructor hands the
+mount a cleanup duty for that one binding (`:134-135`), and
+`cleanupStagedManifestDebrisBestEffort` writer-deletes every staged manifest body EXCEPT that one
+(`:1426-1427`). Nothing enforces the assumption: `precommitAdd` (`:910`) plainly overwrites the triple
+on every call, so a second call on the same object would silently orphan the first binding — the first
+manifest body would be writer-deleted while its precommit binding stays live in the ref log, and neither
+`abandon` nor the destructor duty would ever remove that binding.
+
+No production path calls `precommitAdd` twice on one build today: `publishStaging`'s two call sites are
+mutually exclusive branches over one `PartStaging` (`ContentAddressedTransaction.cpp:357` returns before
+`:411`), each `PartStaging` owns its own build (`:148-153`), a failed commit refuses to retry
+(`:436-438`), and `prepareEntries` mints a fresh build per handle (`Parts/PartFolderAccess.cpp:474-485`).
+So this is a latent-invariant item, not a live bug. Cheapest fix: make the invariant executable — reject
+a `precommitAdd` whose `precommit_state != NotAttempted` with `LOGICAL_ERROR` (a programming-invariant
+violation, exactly like the A3 mint-tightening refusal next to it), or, if a build ever legitimately needs
+two bindings, replace the single triple with a container that `abandon`, the destructor duty and the
+debris cleanup all iterate. Also worth deciding while in there: an idempotent re-add (the closure's
+already-committed no-op arm at `:961-975`) still leaves `precommit_state == Durable`, so a subsequent
+`abandon` of that build appends a removal for a binding that never existed and fails loudly under the
+strict arm — fail-closed, but noisy for a path the code deliberately supports.

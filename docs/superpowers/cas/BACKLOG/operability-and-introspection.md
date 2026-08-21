@@ -234,3 +234,21 @@ The rest of CAS-062 is not new: the SQL FSCK's missing deadline / scoping / canc
 per-object surface), and "no repair path" is `gc.md`{#ckpt-damage-no-repair-path} for `_ckpt` — while
 `SYSTEM CAS GC REBUILD` (`InterpreterSystemQuery.cpp:2545`) already is the repair path for the
 in-degree/`stale_edge` class.
+
+## `putIfAbsentControlled` discards the exception that decided the attempt's outcome (2031-triage CAS-068) {#putifabsent-swallowed-attempt-cause}
+
+The byte-exact ref/manifest lane's classification point (`Backend/CasRequestControl.cpp:358-361`)
+does `catch (const std::exception & e) { attempt_outcome = classifyConditionalWriteResult(e); }` — the
+exception object is never logged and never carried out. This is the DELIBERATE half of the
+`isDeterministicLocalFailure` decision (`4f4f93c6bc6`: "`putIfAbsentControlled` (the byte-exact
+ref/manifest lane) is deliberately unchanged", because its resolve-by-identical-bytes makes retrying
+any unproven error harmless), and it is not a correctness item: every exit is fail-closed
+(`Pool/CasRefLedger.cpp:3869` wedges the lane on a sent-attempt `Unresolved`; `resolveByExactGet`
+throws `CORRUPTED_DATA` on a genuine different-object conflict, `Backend/CasRequestControl.cpp:299`).
+What is missing is the diagnosis: on a lane that wedges after burning `max_attempts`, the wedge
+message names only `describeUnresolvedReason` (`CasRefLedger.cpp:3919`), so the actual per-attempt
+failure — socket error, timeout, S3 code, or a deterministic local bug the sibling ops would have
+rethrown — appears in no log line at all. Owed: a rate-limited `LOG_DEBUG`/`LOG_WARNING` of the
+classified exception at the classification point (the `logCasWriteRetryLater` limiter already exists in
+this file), so a wedged ref lane can be root-caused without a rebuild with instrumentation. Same class
+as `{#fsck-meta-body-counters-unrendered}`: a signal computed and then not shown to anyone.

@@ -184,3 +184,24 @@ this is the one unstreamed hop. Belongs to the tracked O(pool)-per-round class (
 existing items name the LIST, not this materialization. Note the enumeration itself cannot simply be
 skipped on deferred rounds — the defer signal is computed FROM it (`Gc/CasGc.cpp:628-646`), which is
 what `[Lever B]`'s change-signal is for.
+
+## `SYSTEM CAS GC REBUILD` never says WHY it judged `gc/state` unhealthy (2031-triage CAS-069) {#rebuild-gcstate-decode-reason-unreported}
+
+`Gc::rebuildBaseline`'s health probe decodes `gc/state` inside `try { decoded = decodeGcState(...) }
+catch (...) { /* undecodable state = scenario (а) */ }` (`Gc/CasGc.cpp:3874-3883`) and then treats
+`!decoded` as scenario (а) — the disaster the command exists for. The safety half is sound and must not
+be changed: the undecodable branch does not hand back a hold-free baseline, it re-discovers the newest
+fold seal by enumeration and REFUSES with `CORRUPTED_DATA` when that seal is undecodable or vanished
+(`:3955-3990`), so the only hold-free outcome is a pool with no seal object anywhere, reported on the
+command's own row (`rep.virgin_by_enumeration`, `:3963`). The gap is purely diagnostic: the discarded
+exception is the only evidence of WHY the state did not decode, so an operator cannot distinguish real
+byte damage from an environmental failure of the decode itself, and the `RebuildReport` carries no field
+for it either. Owed: log the caught exception (as the janitor does with `e.what()` at `:485` and the
+condemn-marker re-check does with `tryLogCurrentException` at `:1897`) and name the reason on the
+report row. Peer
+items: `BACKLOG.md`{#damaged-object-repair} item 1 asks fsck for exactly this present-and-undecodable
+vs absent distinction on the same object kinds; `{#gc-followups}` `[gc-rebuild follow-ups]` already owes
+the rebuild a dedicated gc-round-log row, which is where the reason belongs. Not a defect, checked in
+the same pass: the `std::stoull` empty catches under `gc/gen/` (`:1490`, `:1621`, `:4096`) cannot
+misclassify a transient failure — `stoull` fails only deterministically — and cannot skip a well-formed
+generation key, so `max_gen` is not under-computed by them.
