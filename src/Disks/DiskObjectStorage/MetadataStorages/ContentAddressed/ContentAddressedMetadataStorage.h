@@ -127,10 +127,10 @@ struct CasLifecycleSnapshot
 /// Namespace mapping:
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR
 ///   detached part  SERVER_ID/TABLE_UUID            ref = detached/DETACHED_PART_DIR
-///   FREEZE shadow  the LITERAL shadow table dir     ref = PART_DIR
-///                  (shadow/BACKUP/store/U3/UUID or shadow/BACKUP/data/DB/TBL — bijective with
-///                  the disk path for both Atomic and non-Atomic layouts, so the shadow tree
-///                  enumerates from `Pool::listNamespaces("shadow/...")`)
+///   `FREEZE` shadow SERVER_ID/shadow/BACKUP/...      ref = PART_DIR
+///                   (the literal shadow table dir is shadow/BACKUP/store/U3/UUID or
+///                   shadow/BACKUP/data/DB/TBL — bijective with the disk path for both Atomic and
+///                   non-Atomic layouts; the pool namespace and its enumeration are server-root-scoped)
 ///   generic files  SERVER_ID/_disk                  verbatim namespace files (access probes)
 ///
 /// Small per-part files (`uuid.txt`, `metadata_version.txt`, `txn_version.txt`, `checksums.txt`, ...)

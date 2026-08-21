@@ -136,7 +136,7 @@ const char * casLifecycleReasonWord(Cas::PoolLifecycle lc)
 ///   readable in EVERY lifecycle state including a not-live/vanished/null pool, spec §7),
 ///   parseStagingBackend/parsePartFolderValidate/
 ///   tryFromDisk (static), checkNotReadOnly, the *ForTest seams, serverPrefix/liveNamespace/
-///   shadowNamespace/route/classifyDirectory (pure path computation, no pool I/O),
+///   shadowNamespace/shadowScope/route/classifyDirectory (pure path computation, no pool I/O),
 ///   ownsNamespace (the relink-confirm routing predicate -- a string comparison against
 ///   `server_root_id`, deliberately answerable in EVERY lifecycle state).
 /// Probe:       existsFile, existsDirectory, existsFileOrDirectory, listDirectory, iterateDirectory,
@@ -2044,11 +2044,11 @@ bool ContentAddressedMetadataStorage::ownsNamespace(const String & other_server_
 {
     /// Routing for the relink confirm (spec §wire-protocol). `pool_uuid` says which POOL a token refers
     /// to and is compared by the caller; every server root writing into that pool shares it, so the
-    /// namespace's owner is decided here. `liveNamespace` builds live and detached namespaces as
-    /// `<server_root_id>/<mirrored table dir>`, so ownership is exactly "rooted at MY server root".
+    /// namespace's owner is decided here. `liveNamespace` and `shadowNamespace` build every owned
+    /// namespace under `<server_root_id>/`, so ownership is exactly "rooted at MY server root".
     /// The strict prefix (not a bare equality, not `starts_with(server_root_id)`) is what keeps
-    /// `srv1` from claiming `srv10/...`, and it deliberately does not match a pool-global shadow
-    /// namespace: a FREEZE tree belongs to no single mount and is never a relink source.
+    /// `srv1` from claiming `srv10/...`; the `FREEZE` tree follows the same ownership rule as live
+    /// and detached content.
     ///
     /// Factory-class: no `store()`, no gate, no I/O, no throw. A misrouted question must come back as
     /// an unproven answer, never as an error.
