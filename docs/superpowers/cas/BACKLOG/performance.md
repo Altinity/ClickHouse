@@ -191,3 +191,52 @@ consumer is this weight; a `manifest_size` sourced from the ref ledger cannot be
 the ledger never learns the body size. A gtest should assert a manifest with a large inline body
 weighs more than an empty one (today `gtest_cas_part_folder_view.cpp:50` passes `manifest_size=1000`
 by hand, which is why the unit tests never noticed).
+
+## The DROP/REPLACE PARTITION covering part is published under `DataPartsLock` (2031-triage CAS-048) {#covering-part-publish-under-datapartslock}
+
+P3, narrow. `MergeTreeData::removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper`
+(`src/Storages/MergeTree/MergeTreeData.cpp:5842`) receives the caller's `DataPartsLock` and, on a
+content-addressed disk, creates AND publishes the empty covering part inside it: `createEmptyPart`
+(`:5913`), the tmp→final rename (`:5916`), and the explicit
+`getDataPartStorage().commitTransaction()` at `:5937-5939`. On CA that last call is the whole remote
+publish — `stageManifest` + `precommitAdd` + blob uploads + `promoteBuild` with a ref-log CAS
+(`ContentAddressed/ContentAddressedTransaction.cpp:409-425`) — so the table's exclusive parts lock is
+held across several object-store round trips, including a CAS append that retries under writer
+contention. Callers that reach it: `StorageReplicatedMergeTree.cpp:2987` (`executeDropRange`), `:9343`
+and `:9608` (REPLACE/MOVE PARTITION), and `MergeTreeData.cpp:5766` for plain MergeTree.
+
+Why it is P3 and not a gate: the part is EMPTY (a few small blobs + one manifest + one log append);
+the same lock already spans `createEmptyPart`'s object-store writes on an ordinary object-storage
+disk, so lock-held remote I/O on this path is inherited upstream behaviour rather than a CA
+regression; the trigger is DDL only; and a failure is loud (the exception propagates and the queue
+entry retries) with the per-ref rollback in `commit` preventing a silent partial publish.
+
+Why it was not fixed with the off-lock move: `77484196b0d` moved the disk commit off the parts lock in
+`Transaction::renameParts` (`MergeTreeData.cpp:8995`), but this path deliberately never reaches
+`Transaction::commit` — it rolls the in-memory transaction back so the cover stays `Outdated`
+(`:5942`), which is exactly why the hand-placed `commitTransaction` exists (see the comment at
+`:5921-5936`). Moving it off-lock requires a three-phase restructuring of the caller (compute the
+covering `MergeTreePartInfo` under the lock, release, create+publish, re-acquire and re-validate that
+the range is still the one that was computed) — the re-validation is the hard part, so this is a
+design task, not a code move.
+
+## Background snapshot-publish fan-out is unbounded pool-wide (2031-triage CAS-051) {#snapshot-publish-fanout-unbounded}
+
+The single-in-flight gate on background snapshot publishes is PER TABLE —
+`admitSnapshotPublishUnderStateLock` reads the per-runtime counter (`Pool/CasRefLedger.cpp:3971`, `Pool/CasRefLedger.h:826`) —
+and `dispatchSnapshotPublisher` spawns a fresh detached `ThreadFromGlobalPool` per admitted publish
+(`Pool/CasRefLedger.cpp:4005-4017`). There is no pool-wide counter, semaphore, or dedicated pool. The
+trigger threshold is per namespace and low (`snapshot_log_count_threshold = 256`,
+`snapshot_log_bytes_threshold = 1 MiB` — `Pool/CasPool.h:234-235`), so an ingest wave that crosses it on
+N tables of one pool starts N concurrent whole-namespace re-encodes plus conditional PUTs at once.
+
+Fail-soft, so not a correctness item: a global-pool exhaustion throw is caught, the pending count is
+undone and the publish is retried on the next trigger (`Pool/CasRefLedger.cpp:4019-4032`), and the
+per-table backoff (`:4082-4092`, honoured at `:3974`) suppresses PUT storms after a non-durable publish.
+The bound is "number of CA tables", not infinity. Owed: a pool-wide limiter on concurrent snapshot
+publishes (a configurable max, or a shared `ThreadPool`), keeping the existing per-table single-flight
+gate underneath it.
+
+Note for readers of the same finding: the claimed pending-count leak on a failed dispatch (which would
+hang the untimed waits at `Pool/CasRefLedger.cpp:1710-1713` and `:5106-5111`) does NOT exist — it was
+closed by `829ad698ef6`.

@@ -100,3 +100,28 @@ so the constraint is visible where it is relied upon rather than only here.
 - **[decommission-successor-mount-race] decommission can delete a successor's fresh mount/epoch objects after releasing an impersonated lease** — HARD — Review finding №9: a durable epoch-monotonicity violation. No evidence this specific race was closed — distinct from the general decommission two-phase-heal flow (verified separately), which does not address this successor-race angle.
 - **[gc-scheduler-lazy-init-race] `gc_scheduler` lazily created without a mutex in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`** — MINOR — Concurrent `SYSTEM GC` calls could race construction; a plausible narrow concurrency bug, distinct from `[A7-residual]` above (which is about post-shutdown resurrection, not concurrent first-construction).
 - **[fence-costs-epoch-distinct-mint] mint `epochCeiling + 1` instead of literal `1` in `RemintEpoch`'s honest branch** — DESIRABLE — Its own source (`CaCasMountCore_RESULTS.md`) explicitly flags this as "NOT implemented... a candidate refinement for a later task/round" that would close the documented `FenceCostsEpoch` gap.
+
+## `CasGcScheduler::stop` joins the worker threads outside the mutex that guards them (2031-triage CAS-050) {#gc-scheduler-stop-join-race}
+
+`stop()` takes `mutex` only to set `stopping`, then touches the thread objects without it
+(`CasGcScheduler.cpp:82-85`: `if (thread.joinable()) thread.join(); if (hb_thread.joinable())
+hb_thread.join();`), while `start()` (`:67-72`) and `requestRoundSoon()` (`:98-101`) read/write the same
+`thread`/`hb_thread` members under `mutex`. `ThreadFromGlobalPool::join` does `state.reset()` and
+`joinable()` reads that same `shared_ptr` (`src/Common/ThreadPool.h:390-410`), so the overlap is a real
+data race (UB, and a TSan red), not a formality.
+
+`start()`/`stop()` are mutually serialized on every published path by `gc_scheduler_mutex` (+
+`lifecycle_mutex` for the verbs), so the reachable pair is `requestRoundSoon` vs `stop`:
+`ContentAddressedMetadataStorage::requestGcRoundSoon` takes only `pointer_mutex`
+(`ContentAddressedMetadataStorage.cpp:419-428`) and its sole caller is `SYSTEM CAS DROP POOL MEMBER`
+(`src/Interpreters/InterpreterSystemQuery.cpp:1077`); `SYSTEM CAS GC STOP` deliberately leaves the
+scheduler in the member, so the window stays open for its whole `stop()`. Needs two concurrent operator
+actions (or `DROP POOL MEMBER` racing server `shutdown()`), no data loss and no silent corruption — hence
+P2. Fix: move the thread objects into locals under `mutex` (or add a dedicated join mutex) and join
+outside the lock.
+
+The audit's second half — a self-exited loop leaving a "joinable-but-dead scheduler that reports itself
+as running" — is not a defect: self-exit fires only on `isVanished()` /`vanishedIntentPublished()` /
+`IdentityLost` (`CasGcScheduler.cpp:281-282`, `:369-370`), `gcStart` refuses loudly on exactly those
+states via `checkOpAdmitted(Admin)`, and `i_am_leader` is cleared before the return so `gcHealth` stays
+honest.

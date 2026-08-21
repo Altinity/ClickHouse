@@ -124,3 +124,39 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 - **[storageproxy-mergetree-virtuals-not-forwarded] `StorageProxy` doesn't forward `isMergeTree`/`supportsTTL`** — DESIRABLE — A plausible functional bug: queries checking these virtuals on a not-yet-materialized lazy table would get wrong answers. Verify against HEAD `StorageProxy.h`; if still unforwarded, this affects any lazy-loaded MergeTree, not just CAS, so scope and file it generically.
 - **[storageproxy-ast-interface-guard] Clang AST CI check for `StorageProxy` interface growth** — DESIRABLE — Compares virtual `IStorage` declarations against `StorageProxy` overrides, requires rationale for allowlisted omissions; concrete tooling proposal, no existing coverage.
 - **[storageproxy-subcolumn-forwarding-bug] `StorageProxy` inherits `supportsOptimizationToSubcolumns`, over-reporting support for opted-out nested engines** — MINOR — A real, specific, scoped correctness finding from the storageproxy-forwarding-audit.
+
+## Lifecycle verbs wait out an uncancellable GC round or FSCK scan (2031-triage CAS-049) {#lifecycle-verbs-wait-out-uncancellable-scans}
+
+P2, operability only — nothing is corrupted or lost, and no data path is blocked
+(`poolAccess`/`gcHealth` never take these mutexes; the snapshot at
+`ContentAddressed/ContentAddressedMetadataStorage.cpp:432` is explicitly forbidden from waiting behind
+`gc_scheduler_mutex`). What is missing is cooperative cancellation:
+
+- A GC round has no stop hook. `CasGcScheduler::stop` (`Gc/CasGcScheduler.cpp:72-88`) sets `stopping`,
+  notifies `wake`, and then `join()`s — an in-flight round runs to completion, and the loop comment at
+  `:295-297` records the accepted extra round. `SYSTEM CAS GC STOP` (`:978`), `SYSTEM CAS FORGET`
+  (`:926`) and `shutdown` (`:887`) therefore all wait it out (the synchronous round through
+  `gc_scheduler_mutex`, held for the whole round at `:389`/`:619`/`:665`; the background one through
+  the join). The round's destructive/recovery work IS capped (`GcRoundWorkBudget`,
+  `Gc/CasBlobInDegree.h:251`, filled from the non-zero defaults at `ContentAddressedSettings.cpp:76-83`),
+  so the wait is finite — but there is no time budget at all in the settings, and against a slow bucket
+  the wall-clock wait is whatever the bucket makes it.
+- `SYSTEM CAS FSCK` passes none of the bounding parameters the CLI passes and cannot be killed.
+  `runFsckNow` calls `Cas::runFsck(*store(), detail)` (`:1063`) while holding `lifecycle_mutex` for the
+  whole scan (`:1051`), whereas `programs/disks/CommandFsck.cpp:67` passes `on_progress`, `deadline`,
+  `partial` and `namespace_prefix` (signature: `Tools/CasFsck.h:269-271`). The scan checks no query
+  cancellation either, so the statement (`src/Interpreters/InterpreterSystemQuery.cpp:2599`) ignores
+  `KILL QUERY` and `max_execution_time`, and `FORGET`/`GC STOP`/`GC START` block behind it for the
+  duration. Serializing them against FSCK is deliberate (see the comment at `:1052-1053`); being
+  unable to bound or interrupt the scan is not.
+
+Owed: a stop token threaded through the round phases, and a SQL FSCK that derives a deadline from
+`max_execution_time`, sets `partial_on_deadline`, and polls query cancellation. Related and already
+tracked: `gc.md`{#fsck-scale-timeout} (fsck does not finish on a ~30 GiB pool) and
+{#fsck-large-pool-fixed} item (c). Not tracked before this entry: the cancellation gap itself and the
+SQL-vs-CLI parameter asymmetry.
+
+Corrected while triaging: `shutdown` does NOT serialize behind an in-flight FSCK — it takes
+`gc_scheduler_mutex` and `pointer_mutex` only (`:891`), never `lifecycle_mutex`, and the pool stays
+alive through the `shared_ptr` the scan holds. Its only wait is on a GC round, which is the documented
+priority choice at `:889-890` ("clean GC completion over fast shutdown").
