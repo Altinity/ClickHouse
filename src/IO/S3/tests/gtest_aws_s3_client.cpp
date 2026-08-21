@@ -1422,9 +1422,11 @@ TEST(IOTestAwsS3Client, OrdinaryHmacRequestsKeepUpstreamHeadersAndAuth)
         request.SetKey("key");
         request.AddMetadata("cas-envelope", "v1");
         /// `SetContentLength` explicitly, matching every production caller (e.g. `copyS3File.cpp`'s
-        /// `fillPutRequest`): without it, a keep-alive connection reused for a later request in this
-        /// same test can desync, since the client may frame the body differently than a length-less
-        /// request implies.
+        /// `fillPutRequest`) for stylistic consistency -- the SDK computes it from the body itself when
+        /// omitted (`ExtendedRequest::IsStreaming` is always `false`, so the chunked path never engages),
+        /// so this call is not load-bearing for the keep-alive corruption below. That corruption's sole
+        /// cause is `ScriptedResponseServer` not draining the request body before responding; see the
+        /// fix in `ScriptedResponseServer::Handler::handleRequest`.
         request.SetContentLength(7);
         request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "payload"));
         client->PutObject(request);
@@ -1434,13 +1436,13 @@ TEST(IOTestAwsS3Client, OrdinaryHmacRequestsKeepUpstreamHeadersAndAuth)
         EXPECT_FALSE(captured[0].headers.has("x-goog-meta-cas-envelope"));
         EXPECT_TRUE(captured[0].headers.get("authorization", "").starts_with("AWS4-HMAC-SHA256"));
         /// An earlier version of this assertion claimed the SDK's default checksum is always present;
-        /// a real run showed that is wrong. `WriteBufferFromS3::getUploadRequest` only ever computes
-        /// and sets a checksum `if (client_ptr->isS3ExpressBucket())` (see `ChecksumHeaderIsPresentForS3Express`,
-        /// whose name says exactly this), and `ExtendedRequest::GetChecksumAlgorithmName` only forces
-        /// checksum-off when explicitly disabled -- neither path adds a checksum for an ordinary bucket
-        /// on its own. So the correct, verified claim is the opposite: an ordinary write does NOT gain
-        /// the S3Express-only checksum machinery. This would fail if that machinery were ever made
-        /// unconditional (i.e. applied to every bucket, not just S3Express).
+        /// a real run showed that is wrong. This narrower claim is what the test actually pins: a bare
+        /// `PutObjectRequest` with no `SetChecksumAlgorithm` call -- exactly what this test constructs --
+        /// has nothing for the SDK to compute a checksum from, so no checksum header reaches the wire.
+        /// That is a real fact about ordinary HMAC clients not implicitly injecting a checksum, but it is
+        /// NOT a test of `WriteBufferFromS3`'s S3Express-only checksum policy (`WriteBufferFromS3.cpp:526-530`):
+        /// this test never goes through `WriteBufferFromS3` at all, so widening that policy tomorrow would
+        /// not be caught here.
         EXPECT_FALSE(captured[0].headers.has("x-amz-checksum-crc32"));
         EXPECT_FALSE(captured[0].headers.has("x-amz-sdk-checksum-algorithm"));
     }
@@ -1457,9 +1459,11 @@ TEST(IOTestAwsS3Client, OrdinaryHmacRequestsKeepUpstreamHeadersAndAuth)
         request.SetKey("key");
         request.SetIfNoneMatch("some-non-star-value");
         /// `SetContentLength` explicitly, matching every production caller (e.g. `copyS3File.cpp`'s
-        /// `fillPutRequest`): without it, a keep-alive connection reused for a later request in this
-        /// same test can desync, since the client may frame the body differently than a length-less
-        /// request implies.
+        /// `fillPutRequest`) for stylistic consistency -- the SDK computes it from the body itself when
+        /// omitted (`ExtendedRequest::IsStreaming` is always `false`, so the chunked path never engages),
+        /// so this call is not load-bearing for the keep-alive corruption below. That corruption's sole
+        /// cause is `ScriptedResponseServer` not draining the request body before responding; see the
+        /// fix in `ScriptedResponseServer::Handler::handleRequest`.
         request.SetContentLength(7);
         request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "payload"));
         EXPECT_NO_THROW(client->PutObject(request));
@@ -1555,11 +1559,12 @@ TEST(IOTestAwsS3Client, GcsHmacDefaultMultipartPassesTheAuthenticationAllowlist)
         upload_part_request.SetKey("key");
         upload_part_request.SetUploadId("test-upload-id");
         upload_part_request.SetPartNumber(1);
-        /// `SetContentLength` explicitly, matching `copyS3File.cpp`'s `makeUploadPartRequest` -- the
-        /// missing call here was diagnosed as the cause of a real failure: the SDK framed the body
-        /// differently than a length-less request implied, and the leftover bytes on this keep-alive
-        /// connection corrupted the following CompleteMultipartUpload request's parse on the server
-        /// side (`captured[2].method` read back as `"part-bodyPOST"`).
+        /// `SetContentLength` explicitly, matching `copyS3File.cpp`'s `makeUploadPartRequest` for
+        /// stylistic consistency -- not load-bearing here (see the comment on the `PutObjectRequest`
+        /// above). The real failure this test once hit -- `captured[2].method` reading back as
+        /// `"part-bodyPOST"`, the following CompleteMultipartUpload's parse corrupted by this request's
+        /// unread body on the shared keep-alive connection -- was caused solely by
+        /// `ScriptedResponseServer` not draining the request body before responding.
         upload_part_request.SetContentLength(9);
         upload_part_request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "part-body"));
         EXPECT_NO_THROW(client->UploadPart(upload_part_request));
