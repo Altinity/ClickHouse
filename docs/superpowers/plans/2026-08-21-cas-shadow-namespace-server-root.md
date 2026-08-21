@@ -13,7 +13,7 @@ doc_type: 'guide'
 
 **Goal:** Make a `FREEZE` snapshot on a content-addressed disk private to the server root that created it, so `UNFREEZE` on one replica can no longer destroy another replica's backup.
 
-**Architecture:** `shadowNamespace` gains the `serverPrefix()` prefix, exactly as `liveNamespace` already does, so a frozen part's pool namespace becomes `<server_root_id>/shadow/<backup>/...`. The disk path stays `shadow/...`; only the pool-namespace derivation changes. Because a mirrored object key is built as `<pool>/roots/<namespace path>`, prefixing the namespace moves its mirrored files with it — the write side needs no change, and every *read* scope that enumerates the shadow subtree needs the same prefix.
+**Architecture:** `shadowNamespace` gains the `serverPrefix` prefix, exactly as `liveNamespace` already does, so a frozen part's pool namespace becomes `<server_root_id>/shadow/<backup>/...`. The disk path stays `shadow/...`; only the pool-namespace derivation changes. Because a mirrored object key is built as `<pool>/roots/<namespace path>`, prefixing the namespace moves its mirrored files with it — the write side needs no change, and every *read* scope that enumerates the shadow subtree needs the same prefix.
 
 **Tech Stack:** C++ (ClickHouse fork), stateless `.sh` tests, `clickhouse-local` for output shaping, gtest.
 
@@ -53,7 +53,7 @@ Explicit UUIDs are available in stateless tests — `02990_rmt_replica_path_uuid
 Two further traps this test avoids:
 
 - `ALTER … UNFREEZE` returns rows only under `alter_partition_verbose_result = 1`. The setting defaults to `false` and `MergeTreeData` returns an empty result without it, so any reference file expecting rows without the setting is unreachable.
-- The `PARTITION` clause is omitted deliberately. `UNFREEZE WITH NAME` alone removes the backup of all partitions, so the statement does not have to resolve a partition expression against a table whose live data was dropped.
+- The `PARTITION` clause is omitted deliberately: `UNFREEZE WITH NAME` alone removes the backup of all partitions, so the statement does not have to resolve a partition expression against a table whose live data was dropped. That choice is also why the reported `command_type` is `UNFREEZE ALL` rather than `UNFREEZE PARTITION` — the reference below matches the command actually built.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -122,8 +122,14 @@ ${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_b FREEZE PARTITION 1 WITH
 echo 'unfreeze_b'
 unfreeze_and_print t_cas_freeze_b
 
+# A collection round with A's table already dropped: A's freeze is an independent root and must
+# survive it. The round is started through B, which is still alive, so this does not depend on an
+# inline disk outliving the only table that referenced it. A round folds the whole pool, so starting
+# it on either disk covers A's namespaces. Its result row is suppressed: the command returns a row
+# with dynamic values, and only the side effect is wanted here.
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS COLLECT GARBAGE ON DISK '05024_cas_freeze_b';" >/dev/null
+
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_b;"
-${CLICKHOUSE_CLIENT} --query "SYSTEM CAS COLLECT GARBAGE ON DISK '05024_cas_freeze_a';"
 
 # (2) A's freeze must still be there. Recreate A's table on root A with the same UUID -- the freeze is
 # addressed by path, so the recreated table reaches its predecessor's snapshot -- and release it.
@@ -141,18 +147,21 @@ Write `tests/queries/0_stateless/05024_cas_freeze_two_roots.reference`:
 ```
 unfreeze_b
 command_type	partition_id	backup_name
-UNFREEZE PARTITION	1	shared_05024
+UNFREEZE ALL	1	shared_05024
 unfreeze_a
 command_type	partition_id	backup_name
-UNFREEZE PARTITION	1	shared_05024
+UNFREEZE ALL	1	shared_05024
 dropped_ok
 ```
+
+`UNFREEZE ALL`, not `UNFREEZE PARTITION`: omitting the `PARTITION` clause builds the
+all-partitions command, and that is the string it reports.
 
 - [ ] **Step 2: Report for a run and state the expected failure precisely**
 
 Expected on today's code: the `unfreeze_b` block prints its row, and the `unfreeze_a` block prints **only the header** — B's unfreeze already dropped the namespace A's freeze shared. The single production line responsible is `ContentAddressedMetadataStorage::shadowNamespace`, which derives the namespace from the shadow path alone with no server-root prefix.
 
-**Do not proceed to Task 2 until the controller confirms it fails that way.** Three failure modes mean a broken test rather than a pinned bug, and each needs fixing here rather than in production: `command_type` printing something other than `UNFREEZE PARTITION`; `SYSTEM CAS COLLECT GARBAGE ON DISK` rejecting that disk name; or the recreated table failing because the UUID or the inline disk is still held.
+**Do not proceed to Task 2 until the controller confirms it fails that way.** Two failure modes mean a broken test rather than a pinned bug, and each needs fixing here rather than in production: `SYSTEM CAS COLLECT GARBAGE ON DISK` rejecting that disk name, or the recreated table failing because the UUID or the inline disk is still held. The stateless configuration sets `database_atomic_wait_for_drop_and_detach_synchronously`, so the drop before the reuse needs no explicit `SYNC`.
 
 - [ ] **Step 3: Commit (controller only, after the failing run is confirmed)**
 
@@ -296,11 +305,11 @@ with:
 While there, assert the prefix rather than leaving it implied. In whichever of the two tests reads back the namespace, add:
 
 ```cpp
-    EXPECT_EQ(storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111").value,
-              std::string(storage->serverRootIdForTest()) + "/shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
+    EXPECT_EQ(storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111").string(),
+              storage->serverRootId() + "/shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
 ```
 
-If no such accessor exists, use the literal `server_root_id` the fixture configures rather than adding a new seam; report which you did and why.
+`string` is the accessor — `RootNamespace` exposes its underlying string only that way — and `serverRootId` is already public, so no new test seam is needed.
 
 - [ ] **Step 5: Update the ownership expectation that changes meaning**
 
@@ -361,7 +370,7 @@ Task 2 removes a special case rather than moving a prefix: shadow used to be a s
 
 - [ ] **Step 1: Correct the two contracts**
 
-`CasPool.h`'s `listMirroredChildren` says `prefix` is "a server-relative or shadow-relative path ending in '/'". Shadow is no longer a separate relative root: say `prefix` is a server-relative path ending in `/`, and say nothing about shadow — needing no mention is the point.
+`CasPool.h`'s `listMirroredChildren` contract says `prefix` is "a server-relative or shadow-relative path ending in '/'". Shadow is no longer a separate relative root: say `prefix` is a server-relative path ending in `/`, and say nothing about shadow — needing no mention is the point.
 
 `ownsNamespace`'s comment says the predicate "deliberately does not match a pool-global shadow" tree. That clause is now wrong in its reason: a shadow namespace IS matched, because it is rooted at a server root like everything else. Replace it with the current truth — ownership is exactly "rooted at MY server root", and the freeze tree is no exception.
 
@@ -373,7 +382,7 @@ The mapping table's `FREEZE shadow` row still reads "the LITERAL shadow table di
 
 - [ ] **Step 3: Correct the remaining comments**
 
-Add `shadowScope` to the lifecycle grouping list beside `shadowNamespace`. That list claims "pure path computation, no pool I/O", which stays true — `serverPrefix()` returns a member set in the constructor — so verify that rather than weakening the claim.
+Add `shadowScope` to the lifecycle grouping list beside `shadowNamespace`. That list claims "pure path computation, no pool I/O", which stays true — `serverPrefix` returns a member set in the constructor — so verify that rather than weakening the claim.
 
 In `gtest_ca_wiring.cpp`, the comment "the staged shadow part publishes at commit (pool-global - any replica reads the backup)" is now false in both halves. State what is true: the staged shadow part publishes at commit under this server root.
 
@@ -399,7 +408,7 @@ git commit -m 'Shadow content is ordinary server-relative content now'
 
 Not part of the fix. A separate decision for the controller; do not fold it into Task 2.
 
-After Task 2, `liveNamespace` and `shadowNamespace` have the same shape — `serverPrefix() + "/" + <a mirrored path>` — differing only in how the path is derived. A single `serverScoped(path)` helper used by both would make "everything this server owns is rooted at its own id" explicit in code instead of by convention repeated twice, and give the next namespace kind one obvious place to hook into.
+After Task 2, `liveNamespace` and `shadowNamespace` have the same shape — `serverPrefix() + "/" + <path>` — differing only in how the path is derived. A single `serverScoped(path)` helper used by both would make "everything this server owns is rooted at its own id" explicit in code instead of by convention repeated twice, and give the next namespace kind one obvious place to hook into.
 
 Against it: two callers is a thin basis for an abstraction, and the derivations are otherwise unrelated. Take it only if the invariant is judged worth naming.
 
@@ -413,4 +422,4 @@ Against it: two callers is a thin basis for an abstraction, and the derivations 
 
 **Type consistency.** `shadowNamespace` is a const member returning `Cas::RootNamespace`, used that way in both production callers and both gtests. `shadowScope` is a const member returning `std::string`, used at all three enumeration sites. The transaction reaches both through `metadata_storage`, held as `ContentAddressedMetadataStorage &`.
 
-**Risks this plan cannot remove.** Task 1's reference predicts the exact `command_type` string and relies on an inline disk plus a table UUID being reusable after `DROP TABLE`. If any of those is wrong the first run says so, and each is a test fix rather than a production finding — Step 2 names all three so they are not mistaken for one. Task 2 Step 4's prefix assertion depends on an accessor for the configured `server_root_id` existing in that fixture; if it does not, the literal is the fallback and no new seam should be added for it.
+**Risks this plan cannot remove.** Task 1's reference predicts the exact `command_type` string and relies on an inline disk plus a table UUID being reusable after `DROP TABLE`. If any of those is wrong the first run says so, and each is a test fix rather than a production finding — Step 2 names all three so they are not mistaken for one. Task 2 Step 4's prefix assertion uses the existing public `serverRootId` accessor and `RootNamespace::string`; both were checked against the headers rather than assumed.
