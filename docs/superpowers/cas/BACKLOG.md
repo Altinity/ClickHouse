@@ -839,3 +839,23 @@ demotion itself (shutdown-`ABORTED` overload is theoretical there). Also removes
 demotion branch (touches upstream, vetoed); `PART_IS_TEMPORARILY_LOCKED` (foreign semantics + a
 `cleanup_thread.wakeup()` side effect); demoting all `NETWORK_ERROR` (hides real network faults).
 Sender side already logs at `Debug` — receiver only.
+
+## Nested `server_root_id` + prefix-based decommission victim selection (2031-triage CAS-007) {#nested-srid-decommission}
+
+`validateServerRootId` accepts slashes (`Pool/CasServerRoot.h:199-229`; `gtest_cas_mount.cpp:97` asserts
+`shard-01/replica-a` valid, and multi-segment srid support was deliberately fixed in `b97847d32f9`),
+while `CasDecommission` picks victims by path prefix (`Tools/CasDecommission.cpp:146,150` +
+prefix-LIST drains of `cas/manifests/<srid>/`, `staging/`, `roots/`). So
+`SYSTEM CAS DROP POOL MEMBER 'a'` destroys the namespaces and control objects of a LIVE member
+`a/b`. Existing test covers only the sibling case (`gtest_cas_decommission.cpp:699-716`). Partial
+mitigation exists in one direction only: mounting `a` when `a/b` already exists fails closed
+(`CasServerRoot.cpp:145-149`); the reverse order is unguarded. Note the asymmetry — relink routing
+compares srid for EXACT equality (`ContentAddressedMetadataStorage.cpp:2021`), i.e. the prefix rule
+is decommission-local.
+
+Fix options (decide at fix time): (1) make decommission victim selection exact-srid + an explicit
+refusal when any other member's srid is prefixed by the victim's, or (2) forbid nesting at validation
+(reject a srid that is a prefix of, or prefixed by, an existing member's) — cheaper but removes the
+multi-segment layouts that were deliberately enabled. Either way add the nesting case to
+`gtest_cas_decommission.cpp`. P2: destructive but operator-initiated and requires a nested-srid
+layout.
