@@ -307,3 +307,106 @@ per-round blob LIST was deliberately removed (the GC-DISCOVERY-LIST-QUADRATIC co
 staging-separation conclusion still holds for a strictly stronger reason (GC cannot reach a key no edge
 names), so this is prose only — but the test named
 `CASS3Staging.GcBlobDiscoveryPrefixExcludesStagingObjects` pins a premise that no longer exists. P3.
+
+## A refused `GC REBUILD` is not side-effect free, and its own header says it is (2031-triage CAS-094) {#rebuild-refusal-leaves-run-and-seal-residue}
+
+`Gc::rebuildBaseline`'s LAST refusal — the state CAS lost to a competing writer
+(`Gc/CasGc.cpp:4377-4381`) — happens AFTER the unconditional per-shard `flush_shard` loop
+(`:4335-4336`, each call a `foldDeltasIntoGeneration` that PUTs run objects) and AFTER the fold seal
+itself (`putDeterministicArtifact`, `:4366`). So every lost-CAS refusal returns `performed == false`
+while leaving a complete, `validateFoldSealForWrite`-passing seal plus its whole run set durable at
+generation `max_gen + 1` (`:4102`). The earlier data-loss refusal (`:4209`, a committed ref naming a
+missing manifest) can also land after run PUTs, but only on a pool that overflowed
+`rebuild_edge_budget` (default 8 000 000 edges per shard, `Pool/CasPool.h:167`) in an earlier
+namespace; the two health refusals (`:3997`, `:4074`) and the lease refusal (`:4012`) precede every
+`gc/`-plane write.
+
+What the residue does NOT do, contrary to the finding as filed: it is not adoptable by a later regular
+round. A round reads the baseline only through `gc/state`'s `snap_generation`/`snap_attempt`
+(`listRefPrefix` `:2871`-ish `readFoldSeal`, `graduationDue`), and the refused CAS left that pointer
+untouched. The only reader of an unadopted seal is a LATER rebuild's `newestFoldSealRef` (`:1464`),
+and carrying an unadopted attempt's holds is the deliberate, documented over-hold (`:3941-3957`), not
+a loss. The residue is also not a permanent leak: it sits at `snap_generation + 1`, which the
+wholesale generation prune reaches once the adopted generation advances past it plus `keep`
+(`:3618-3662`) — unlike {#stranded-generation-prefix-invisible-to-fsck}, whose prefixes sit BELOW the
+monotone cursor.
+
+What is genuinely open, all of it minor:
+
+1. **Prose that is false at HEAD.** `ContentAddressedMetadataStorage.h:199-200` states "A refused
+   rebuild (`report.performed == false`) writes nothing". The lost-CAS refusal always writes runs and a
+   seal. Fix the comment (cheapest, and a false claim about a disaster-recovery tool is the worst kind).
+2. **The refusal is unreported.** Only the success path emits a `GcRebuild` event (`:4386-4404`); each
+   refusal `return`s a string with no event and no log, so nothing in
+   `system.content_addressed_log` records that a generation's worth of run objects and a seal were
+   minted and abandoned. Pairs with `{#gc-followups}` `[gc-rebuild follow-ups]`, which already owes the
+   rebuild a dedicated gc-round-log row.
+3. **The rebuild's attempt numbering is not lease-derived.** A regular round stamps
+   `attempt = state.lease.seq` (`:1921`) while the rebuild counts `++attempt_of[shard]` from 1
+   (`:4121`). Both write under `gcGenAttemptPrefix`, and the rebuild's generation `max_gen + 1` is
+   exactly the generation the next regular round mints (`snap_generation + 1`, `:1915`). A collision on
+   `(generation, attempt, shard, seq)` therefore needs a later round whose `lease.seq` is ≤ the
+   rebuild's flush count — reachable only when the pool overflowed the 8 M edge budget while the GC
+   lease had been acquired a handful of times (`acquireOrRenewLease` bumps `seq` on every acquire,
+   `:4548`, `:4602`), i.e. in practice only under `setRebuildEdgeBudgetForTest`. The outcome is loud and
+   self-healing anyway: `putDeterministicArtifact` refuses divergent bytes with `CORRUPTED_DATA`
+   (`Gc/CasBlobInDegree.cpp:341-350`) and the next round's `seq` no longer collides. Structural
+   closure is one line — derive the rebuild's attempt from `state.lease.seq` (e.g.
+   `lease.seq * K + flush`), or seal/flush under `lease.seq` and keep the flush index in the run `seq`.
+
+P3 — no silent corruption, no data loss; a bounded, eventually-pruned residue plus a false comment and
+a missing audit row.
+
+## `cas-gc-dryrun` reports `preview_deletes=0` for the damaged states a round fails closed on (2031-triage CAS-095) {#gc-dryrun-silent-on-damaged-state}
+
+`Gc::previewDeletes` returns an empty vector when `gc/state` is absent
+(`Gc/CasGc.cpp:4411-4413`), and — the sharper case the finding did not name — also when `gc/state` is
+present and names an adopted seal that is GONE: `readFoldSeal` returns `nullopt`, `runs_by_shard`
+stays empty, and every shard yields nothing (`:4424-4426`). A regular round treats that exact
+condition as `CORRUPTED_DATA` ("adopted fold seal (generation {}, attempt {}) is missing",
+`:3835-3838`, `listRefPrefix`), and `rebuildBaseline` refuses on it outright (`:3923-3931`). The
+dry-run prints `preview_deletes=0` (`programs/disks/CommandCaGcDryRun.cpp:45`), indistinguishable from
+a healthy pool with nothing to reclaim — in the one situation the tool exists for.
+
+Two claims in the finding do NOT hold at HEAD. An UNREADABLE `gc/state` is not silent:
+`decodeGcState` at `:4414` is outside any `try`, so it throws and the disks client surfaces it. And
+the checksum verification (`reader.verifyAgainst(run.checksum)`, `:4478`) is likewise a loud
+`CORRUPTED_DATA`, not silence — but the finding's consequence is right in kind: because the command
+prints only after the whole vector returns, one bad run object discards every other shard's preview
+instead of reporting per-shard. Related, prose only: the shipped description "Preview the next GC
+round's deletes" (`CommandCaGcDryRun.cpp:23`) promises more than the API doc delivers — the preview
+reads the durable sealed generation without folding new owner events and is explicitly a
+quiescence-only subset (`Gc/CasGc.h:453-457`), which is the same gap `{#gc-followups}` `[F3]` tracks
+from the measurement side.
+
+Owed, cheapest first: (a) make the three no-baseline outcomes distinguishable in the output
+(`state=absent` / `adopted_seal=missing` / `baseline=empty` beside `preview_deletes=0`), with the
+missing-seal case an error exit since every other GC entry point fails closed on it; (b) emit
+per-shard results and report a failed run as a per-shard error rather than losing the whole preview;
+(c) align the CLI description with the `previewDeletes` contract. P3 — read-only diagnostic tool; its
+output never authorizes a delete (`Gc/CasGc.h:440-441`).
+
+## The ref-walk plan has two drop counters no production producer can ever raise (2031-triage CAS-096) {#refplan-dead-drop-counters}
+
+P3, dead code plus one stale prose claim — no behaviour is wrong.
+
+`RefPlan` counts five kinds of dropped adapter input (`Gc/CasGc.h:311-316`). Three are read: the
+ordinary round emits `walk_plan_dropped_parent_rows` / `_listed_lives` / `_tails` as phase metrics
+(`Gc/CasGc.cpp:660-662`). The other two are unreachable in production: `RefScanSummary::holds` and
+`RefScanSummary::checkpoint_observations` (`Gc/CasGc.h:215-216`) are populated by nothing outside
+`src/Disks/tests/gtest_cas_ref_catalog.cpp:1438-1453`, so `dropped_holds` (`Gc/CasGc.cpp:281`) and
+`dropped_checkpoints` (`:293`) are always zero and `droppedHolds` / `droppedCheckpoints`
+(`Gc/CasGc.h:298-299`) have no caller at all. A durable hold reaches the walk inside a parent row's
+`RefLifeFoldState::coverage.hold`, so when its row is dropped the hold rides out on
+`dropped_parent_rows`, never on `dropped_holds` — the counter that looks like the hold-loss signal is
+the one that can never fire. Owed: delete the two adapters and their counters, or give them a
+producer; and while there, put the dropped-row counters on the REBUILD path's own row, which today
+carries eleven fields but none of them (`Gc/CasGc.h:94-118`,
+`src/Interpreters/InterpreterSystemQuery.cpp:2385-2424`) — the reporting half is the debt already
+owed by {#gc-followups} `[gc-rebuild follow-ups]`.
+
+Same round, prose only: `CASGCUnmatchedAdoptedParentLives`'s description still says each occurrence
+"is logged with its exact physical life id" (`src/Common/ProfileEvents.cpp:884`), but `4d40d453347`
+deliberately removed that warning (it fired once per healthy completed removal and turned
+`05023_cas_dropns_leaked_namespace` red). The counter is now the whole signal; the description must
+say so.

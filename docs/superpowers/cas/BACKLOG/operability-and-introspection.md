@@ -318,3 +318,84 @@ and neither does BACKUP/RESTORE cloning; the zero-copy implicit `copy_instead_of
 (`StorageReplicatedMergeTree.cpp:3357`, `:9220`) is dead on CA because
 `DiskObjectStorage::supportZeroCopyReplication` returns false for `MetadataStorageType::CAS`
 (`src/Disks/DiskObjectStorage/DiskObjectStorage.h:53-58`).
+
+## `cas-inspect` decodes 10 of the 17 live object formats, and drops the fold seal's hold (2031-triage CAS-097) {#cas-inspect-format-coverage-and-hold}
+
+P3, observability only — every gap is fail-loud (`BAD_ARGUMENTS`/`CORRUPTED_DATA`), never a silent
+mis-read of a decodable object.
+
+`caInspectToJson`'s dispatch (`ContentAddressed/Tools/CasInspect.cpp:566-635`) has a branch for
+`PartManifest`, `RefCkpt`, `RefLog`, `RefSnapshot`, `GcState`, `MountLease`, `FoldSeal`, `RunFile`,
+`BlobMeta` and the blob envelope. Seven live formats have no branch and land on the closing
+`BAD_ARGUMENTS`: `PoolMeta` (`_pool_meta`), `RefCatalog` (`cas/ref_catalog`), `GcMaintenanceState`
+(`gc/maintenance_state`), `GcHeartbeat` (`gc/hb`), `GcOutcomes`, `Owner` and `ServerEpoch`
+(`Formats/CasFormat.h:98-128`; `Roster` is reserved and never written, `Formats/CasFormat.cpp:83`, so
+the live set is 17, not 18). Two of them — `cas/ref_catalog` and `gc/maintenance_state` — are exactly
+the control objects an operator reaches for when GC or a namespace lifecycle is stuck.
+
+Two rendering residuals inside the branches that DO exist: (a) `renderRefCoverage`
+(`Tools/CasInspect.cpp:357-363`) renders `classification` and `last_folded_ref_id` but omits
+`RefCoverage::hold`, which by the format's own strict grammar is present iff `classification == 4`
+(`Formats/CasFoldSealFormat.h:104-118`) — so a fold-seal dump shows `"classification":4` with no
+reason and no offending position, dropping the one field that says WHY the fold refuses to advance
+past that life; nothing pins the seal rendering (`src/Disks/tests/gtest_cas_inspect.cpp` has no
+fold-seal test). (b) Sentinel and enumerated values render as bare numbers —
+`"classification":4`, and a never-folded cursor as `{"writer_epoch":0,"ref_sequence":0}`
+(`renderRefTxnIdObj`, `:121-127`) — so the reader must know the encoding.
+
+Also real but harmless: a `cas/ns/state/<life>/_files/<name>` key falls through the namespace-state
+branch (only `parseRefCkptKey` is tried, `:530-534`) and, for the two names `mount` and `fold_seal`,
+is caught by the suffix branches at `:610-614` before the closing throw, so it is decoded as the
+wrong format. The outcome is a `CORRUPTED_DATA` decode error instead of "unrecognized key layout" —
+a worse message, not a wrong answer; a `parseNamespaceFileKey` branch (or a namespace-state throw
+before the suffix checks) closes it.
+
+Two claims from the source finding do NOT hold. Raw pool keys ARE enumerable: `cas-fsck --detail`
+prints `class\tkey\tsize` per object (`programs/disks/CommandFsck.cpp:118-138`), which is exactly
+what the shipped runbook tells the operator to feed `cas-inspect`
+(`docs/en/antalya/cas/operations/debugging.md:185`), and the fixed control-object keys are documented
+in `docs/en/antalya/cas/architecture/storage-layout.md`. And a wedged ref lane IS nameable at the
+moment it wedges: the writer's own error names the namespace and the txn id
+(`Pool/CasRefLedger.cpp:3934-3940`, `:2232-2234`) alongside `CASRefAppendWedged`. What is missing is
+a QUERYABLE surface listing the currently-wedged namespaces —
+`content_addressed_mounts.wedged_namespace_count` is an aggregate
+(`src/Storages/System/StorageSystemContentAddressedMounts.cpp:55`, from `wedgedRefLaneCount`,
+`Pool/CasRefLedger.cpp:1833-1851`, whose own map is keyed by namespace) — which is the
+`per-part/ref system.* views` half of {#operability} `[B15/B99/B169/B159]`.
+
+## ProfileEvents surface residuals {#profileevents-surface-residuals}
+
+Two small, non-correctness residuals in the CAS `ProfileEvents` surface. Both are cosmetic
+observability debt: nothing in the write or GC protocol depends on these counters, and neither can
+lose or corrupt data.
+
+**(a) The `CASServer*` row is unreachable, so eleven shipped counters are permanently zero.**
+`classifyCasNs` returns only `Blob`, `Manifest`, `Root`, `Gc` and `Other`
+(`ContentAddressed/Backend/CasInstrumentedBackend.cpp:113-130`); `CasNs::Server`
+(`CasInstrumentedBackend.h:33`) still occupies a row of `cas_event_table`
+(`CasInstrumentedBackend.cpp:103-106`), and the eleven `CASServer*` events it points at are declared
+with operator-facing descriptions in `src/Common/ProfileEvents.cpp:844-854`. The per-server control
+subtree moved under `<prefix>/gc/server-roots/<srid>/` (`Formats/CasLayout.h:388-417`), so owner
+claims, epoch bumps, mount-lease claims and heartbeat renewals all classify as `Gc` — deliberately,
+per the classifier cleanup in `44e41878ff0`, and documented at `CasInstrumentedBackend.h:18-20` and
+pinned by `src/Disks/tests/gtest_cas_backend.cpp:304-308`. The residual is the user-visible half: an
+operator reading `system.events` sees eleven documented counters that can never move. Close it by
+either deleting the `Server` row plus its eleven descriptions, or classifying
+`/gc/server-roots/` as `Server` before the `/gc/` rule (which would move mount/lease/epoch traffic
+out of the `CASGC*` counters — a dashboard-visible change, so it needs a deliberate call). Mount and
+lease activity itself is not unobservable meanwhile: `system.content_addressed_log` carries
+`MountClaim`/`MountRelease`/`MountConflict`/`WatermarkRenew`/`GcLease*`
+(`Primitives/CasEvent.h:30-33`) and `system.content_addressed_mounts` exposes the slots.
+
+**(b) `CASBlobBodyPutAvoided` over-counts on the condemned HEAD-first hit.** In the HEAD-first
+branch the counter (and `CASBlobDeduplicationCacheHit`) is incremented as soon as the `head` reports
+present (`Pool/CasPartWriteTxn.cpp:210-214`), before `observeAndAdmit` decides whether that
+incarnation is admissible. When it is condemned, `observeAndAdmit` throws `ABORTED`
+(`:391`), the branch swallows exactly that code (`:222-228`) and falls through to
+`uploadFromSource` (`:241`) — the body IS sent, yet the "body PUT avoided" event already fired. Only
+`ABORTED` is swallowed, so this is drift on a rare race path, not a hidden failure; move both
+increments below the successful `observeAndAdmit` to close it. `CASBlobHeadFirst` (`:208`) is
+correctly placed — a HEAD really was issued. Related stale prose: `Pool/CasPool.cpp:250-253` still
+says the dedup-cache seam is probed "up to twice ... once more just to attribute
+`CASBlobBodyPutAvoided` to the cache" and names the caller `putBlob`; at HEAD the membership is read
+exactly once into `cache_hit` (`CasPartWriteTxn.cpp:202`) and the caller is `uploadBlobDetached`.

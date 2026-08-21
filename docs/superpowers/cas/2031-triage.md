@@ -101,8 +101,8 @@
 | CAS-083 | by-design | — | — | — | Форма кода на HEAD подтверждается (hardlink/repoint переносят тот же `BlobRef`), но это и есть суть CAS-дедупликации и ровно то же поведение, что у обычного MergeTree при lightweight `DELETE`; позиция «не фиксим» в силе. |
 | CAS-084 | частично | P3 | [{#file-cache-stale-after-gc-reclaim}](BACKLOG.md#file-cache-stale-after-gc-reclaim) | нет | Механизм реален — CA-удаления идут в обход кэширующего object storage, так что записи файлового кэша для отобранных GC блобов не инвалидируются; но «ёмкость держится бесконечно» и «удалённый контент читается» — преувеличение: кэш обязательно ограничен и вытесняется по LRU, а ключи контент-адресные, поэтому устаревшая запись физически не может вернуть чужие/неверные байты. |
 | CAS-085 | частично | P2 | [{#always-copy-instead-of-hardlinks-no-gate}](BACKLOG.md#always-copy-instead-of-hardlinks-no-gate) | нет | Ядро находки верно и достижимо — при `always_use_copy_instead_of_hardlinks=1` мутации и однодисковые клоны разделов на CA-таблице падают громким `NOT_IMPLEMENTED`, и настройка ничем не отвергается; но `FREEZE`, BACKUP/RESTORE-клон и «неявный zero-copy» этот путь не достают, а отказ fail-closed, без порчи данных. |
-| CAS-086 | ⏳ | — | — | — | — |
-| CAS-087 | ⏳ | — | — | — | — |
+| CAS-086 | частично | P3 | [{#freeze-name-reuse-merges-shadow-ref}](BACKLOG.md#freeze-name-reuse-merges-shadow-ref) | нет | Все пять форм в коде есть и почти все — сознательный, затестированный контракт CA (part-dir = один атомарный ref); заявленные последствия либо недостижимы (`getHardlinkCount` → zero-copy отключён для CAS), либо уже закрыты (`unlinkFile` больше не молчит), реальный остаток один и узкий — повторный `FREEZE WITH NAME` молча мержит shadow-ref вместо `DIRECTORY_ALREADY_EXISTS`. |
+| CAS-087 | by-design | P3 | [{#nonatomic-reserved-name-fold-no-refusal}](BACKLOG.md#nonatomic-reserved-name-fold-no-refusal) | нет | Оба описанных порядка разбора реальны, но это осознанно принятое и запинненное тестом ограничение чисто строкового парсера, достижимое только для deprecated `Ordinary`-базы: в Atomic-раскладке uuid-анкер выигрывает всегда, а «unclassified part dir как table-level file» в Atomic недостижим; остался лишь отсутствующий fail-closed отказ на зарезервированное имя. |
 | CAS-088 | частично | P3 | [{#c2-displacement-comment-stale}](BACKLOG.md#c2-displacement-comment-stale) | нет | Безусловность `resurrect` — осознанный дизайн с тремя структурными обоснованиями; «fence-unchecked» неверно (проверка есть с `1fe585ea078` и запинена тестами), «возвращает токен, который не писал» закрыто сегодняшним `9b887ac8886`; остаток — только устаревшие комментарии/имена тестов про `putOverwrite` и мёртвый BACKLOG-анкор. |
 | CAS-089 | by-design | P3 | [{#blob-envelope-never-read-back}](BACKLOG.md#blob-envelope-never-read-back) | нет | Кодовый шейп верен (offset из pool meta, декодер конверта зовёт только `INSPECT`), но расхождение длины конверта структурно недостижимо, «идентичность» в конверте не хранится (усекается только диагностический `ref`), а версия гейтится на уровне пула через `min_reader_generation`; INTEGRITY-последствие не подтверждается, остаток — решение к format-freeze. |
 | CAS-090 | частично | P3 | [{#encrypted-wrapper-hides-content-addressed} + {#encrypted-over-cas-missing-gate} + [B17]](BACKLOG.md#encrypted-wrapper-hides-content-addressed} + {#encrypted-over-cas-missing-gate} + [B17) | нет | Все четыре описанные формы кода реальны, но ни одно из последствий не является тихой порчей: SSE-C ломает только опциональный `staging_backend=s3`, и там стоит fail-closed mount-probe с откатом на local staging; «нет MAC / не перепроверяем дайджест» — дубликат settled-позиции CAS-008; плейнтекст-метаданные манифеста и невозможность re-key — уже [B17] и два анкера BACKLOG; про «плейнтекстовые тела мелких файлов» утверждение неверно. |
@@ -4267,3 +4267,89 @@ ref-ключ родительской tmp-части, и его снимает �
 относится к контрактному кластеру CAS-086, а не к отдельному дефекту text-index'а. Соответственно
 CAS-093 не порождает нового backlog-пункта; частично он является следствием (не дубликатом)
 контрактного CAS-086.
+
+## CAS-086 — Все пять форм в коде есть и почти все — сознательный, затестированный контракт CA (part-dir = один атомарный ref); заявленные последствия либо недостижимы (`getHardlinkCount` → zero-copy отключён для CAS), либо уже закрыты (`unlinkFile` больше не молчит), реальный остаток один и узкий — повторный `FREEZE WITH NAME` молча мержит shadow-ref вместо `DIRECTORY_ALREADY_EXISTS`. (частично, P3) {#cas-086}
+
+## 1. `isDirectoryEmpty` возвращает `true` для part-директорий — форма подтверждена, следствие by-design
+
+`ContentAddressedMetadataStorage::isDirectoryEmpty` (`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp:1799`) действительно коротко замыкает part-dir и projection-dir:
+
+- `:1809-1815` — `if (r && !r->ref.empty() && r->file.empty()) return true;` и такой же арм для `projectionDirPrefix`;
+- табличные и контейнерные директории сохраняют listing-ответ: `:1817` `return !iterateDirectory(path)->isValid();`.
+
+Это не оговорка, а заявленный контракт, объяснённый на месте (`:1804-1808`: «report it EMPTY so `DiskObjectStorage::removeDirectory` proceeds straight to the ref-unlink instead of throwing `CANNOT_RMDIR`») и запинненный тестами: `src/Disks/tests/gtest_ca_wiring.cpp:463` (part dir — empty), `:464` (табличная — НЕ empty), `:580` (projection dir — empty). Введено ещё структурным свопом `7133ba900b1` (`git log -S "report it EMPTY so"`).
+
+Утверждение находки «a populated part directory is dropped without error» — верно буквально (гард `DiskObjectStorage.cpp:441-443` не срабатывает), но следствие «where every other metadata storage would have refused» безадресно: **все** production-вызовы `removeDirectory` на part-директории — это как раз штатное удаление части:
+
+- `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:1082` — быстрый путь `IMergeTreeDataPart::remove`: сначала `removeSharedFiles(request)` по всем ожидаемым файлам, затем `disk->removeDirectory(dir)`; на CA именно этот вызов — единственная авторитетная точка unlink'а ref'а (`ContentAddressedTransaction.cpp:1009-1032`), и он же гасит staged removal-marks, чтобы шторм per-file unlink'ов стоил ноль repoint'ов;
+- `src/Storages/MergeTree/MergeTreeData.cpp:4301-4302` (`dropIfEmpty`) — это `detached` контейнер и табличная директория, т.е. как раз shape'ы, где listing-гард СОХРАНЁН;
+- `MergeTreeData.cpp:4245` (`isDirectoryEmpty(relative_data_path)`) — табличная директория, listing-ответ, и дополнительно за `disk->supportZeroCopyReplication()`, который для CAS `false`.
+
+То есть на всех достижимых сайтах «drop без ошибки» = ровно то, чего хочет вызывающий. Классификация: by-design, не тихая порча.
+
+## 2. `getLastModified` — форма верна, вызывающих нет, ошибка громкая
+
+`getLastModified` (`ContentAddressedMetadataStorage.cpp:1638`):
+
+- берёт `RefPayload.published_at_ms` (`:1647-1656`), т.е. «не консультируется с манифестом» — верно, но в манифесте per-file mtime и не хранится; отсутствие штампа → `Poco::Timestamp(0)` (`:1652-1653`), усечение мс→с — `:1655`, оба факта верны и косметичны;
+- для табличных/verbatim файлов — epoch (`:1665-1666`), т.е. «epoch 0 значит две разные вещи» — верно, косметика;
+- для части-директории **не** бросает: `parsePartFilePath` даёт `r->ref != ""` и `resolve_stamp` работает (`:1658-1663`). Бросает `FILE_DOESNT_EXIST` (`:1667`) для табличной директории, `detached`/`moving` контейнера и промежуточных mirrored-директорий, которые `existsDirectory` показывает существующими — форма подтверждена;
+- достижимости в продукте не нашёл: `MergeTreeData::isOldPartDirectory` (`src/Storages/MergeTree/MergeTreeData.cpp:3316`, `:3320`) получает только part-директории и их детей; `StorageSystemDetachedParts.cpp:231` — detached PART dir, который через `route` (`ContentAddressedMetadataStorage.cpp:1301-1311`) резолвится в `detached/<part>` ref и штамп отдаёт; `MergeTreeData.cpp:2199`, `:6574`, `:9786`, `MergeTreePartsMover.cpp:301` — part-директории; `DatabaseCatalog.cpp:1405` и `DatabaseOnDisk.cpp:645` — metadata-диск, не CA-данные. Триггер находки `system.parts_columns` — изобретён: эта таблица отдаёт закешированный в памяти `part->modification_time`, `getLastModified` не вызывает.
+- Сам gist это и признаёт («reachability in product code is thin … so this is Low», `tmp/2031/gist/idisk-contract.md:108`), и там же отмечает, что `MetadataStorageFromPlainObjectStorage::getLastModified` ведёт себя так же — т.е. это не CA-регрессия.
+
+Единственная неточность в коде, которую находка описала верно («dates files that do not exist»): part-file арм не проверяет наличие файла в манифесте, `getLastModified("<part>/nosuch.bin")` вернёт штамп части вместо `FILE_DOESNT_EXIST`. Ни один вызывающий не зависит от этого (все спрашивают mtime после `existsFile`/итерации). Косметика.
+
+## 3. `getHardlinkCount == 0` при `supportsHardLinks() == true` — форма верна, следствие недостижимо
+
+- `ContentAddressedMetadataStorage.h:264` — `uint32_t getHardlinkCount(const std::string &) const override { return 0; }` (анкер находки `.h:121` устарел);
+- `src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:755-770` — `supportsHardLinks()` действительно `true` для CA, с развёрнутым обоснованием.
+
+Но «getRefCount always answers not shared» ни к чему не ведёт, потому что все потребители за zero-copy-гейтом, а `supportZeroCopyReplication()` для CAS — `false` (`src/Disks/DiskObjectStorage/DiskObjectStorage.h:53-57`):
+
+- `StorageReplicatedMergeTree.cpp:10605` — ранний `return` по `!supportZeroCopyReplication()` ещё до `getRefCount` на `:10627`;
+- `StorageReplicatedMergeTree.cpp:11571` — `removeDetachedPart` заходит в `removeSharedDetachedPart` (и его `getRefCount` на `:11600`) только при `disk->supportZeroCopyReplication() && allow_remote_fs_zero_copy_replication`;
+- `src/Storages/Freeze.cpp:192` — `Unfreezer::removeFrozenPart` тот же гард.
+
+Плюс это ровно поведение существующих upstream-storage'ей: `MetadataStorageFromPlainObjectStorage.h:47`, `MetadataStorageFromPlainRewritableObjectStorage.h:48` и дефолт `IDisk.h:553` тоже отдают 0. Не дефект CA.
+
+## 4. «Silent no-op removes on unclassified paths» — частично УСТАРЕЛО
+
+- `unlinkFile` больше не молчит: `ContentAddressedTransaction.cpp:1555-1651` покрывает part-file (`:1583-1615`, включая `FILE_DOESNT_EXIST` при `!if_exists`), verbatim table-level файл (`:1620-1641`) и loose mountpoint object (`:1642-1650`) — каждый арм честно бросает `FILE_DOESNT_EXIST`, если объекта нет. Закрыто коммитом `8fc0c964a5b` «cas: unlinkFile honors the if_exists contract instead of silently accepting a nonexistent path (triage #24)»; committed-file unlink с repoint-remove — `3b4d0f20933`.
+- `removeDirectory` (`:994-1033`) и `removeRecursive` (`:1035-1142`) действительно тихо возвращаются для нераспознанных shape'ов — но это директории, у которых в объектном хранилище нет собственного состояния: `removeRecursive` покрывает shadow (`:1049-1086`), табличную директорию (`:1088-1093`), detached/moving контейнеры и part dir (`:1095-1123`), табличные подкаталоги (`:1126-1141`); остаётся только «голая директория без табличной идентичности» (например `store`), где удалять нечего. Комментарий `:1010-1012` это и фиксирует. Не дефект.
+- `setLastModified` (`:1205-1211`) — no-op, но уже под `Write`-гейтом (rev.7 §1), т.е. на Vanished/uncertain диске не «молча принимает». Согласовано с `supportsStat() == false` / `supportsChmod() == false` (`ContentAddressedMetadataStorage.h:232-233`); единственный потребитель флагов — `src/Interpreters/DatabaseCatalog.cpp:2025`. `truncateFile`/`chmod` — громкий `NOT_IMPLEMENTED` (`ContentAddressedTransaction.cpp:1653-1658`, `:1213-1216`).
+
+## 5. Что реально осталось (новый бэклог-пункт)
+
+Побочный эффект part-dir short-circuit'а, которого находка не увидела: он распространяется и на SHADOW part dir (`route` для `shadow/...` даёт `ref = <part>`, `file = ""`, `ContentAddressedMetadataStorage.cpp:1292-1299`), а `Backup` использует ровно этот гард как защиту от повторного использования имени бэкапа (`src/Storages/MergeTree/Backup.cpp:146`, `DIRECTORY_ALREADY_EXISTS`). На CA гард не срабатывает, второй `FREEZE WITH NAME 'x'` уходит в тот же shadow-ref и `publishStaging` берёт repoint-арм по существующему view (`ContentAddressedTransaction.cpp:338-392`), домешивая старые записи манифеста. Для неизменившейся части — идемпотентно; для другой части с тем же именем (после `REPLACE PARTITION`/`ATTACH PARTITION FROM`) — один frozen ref, смешивающий два снапшота, тихо, там где upstream отказал бы. Узко, но молча — записал новым пунктом бэклога `docs/superpowers/cas/BACKLOG/formats-and-storage.md` `{#freeze-name-reuse-merges-shadow-ref}` (не коммичено), P3.
+
+Прежнего покрытия по этому кластеру в `BACKLOG.md`/`BACKLOG/*.md` не нашлось (grep по `isDirectoryEmpty`/`getHardlinkCount`/`getLastModified`/`published_at_ms` — пусто).
+
+## CAS-087 — Оба описанных порядка разбора реальны, но это осознанно принятое и запинненное тестом ограничение чисто строкового парсера, достижимое только для deprecated `Ordinary`-базы: в Atomic-раскладке uuid-анкер выигрывает всегда, а «unclassified part dir как table-level file» в Atomic недостижим; остался лишь отсутствующий fail-closed отказ на зарезервированное имя. (by-design, P3) {#cas-087}
+
+## 1. Приоритет `detached`/`moving` над part-dir-грамматикой — подтверждён, by-design
+
+`findPartDirComponent` (`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.cpp:186`) идёт в три шага:
+
+1. `:188-200` — uuid-анкер (`findTableUuidComponent`, `:110-128`): для Atomic-раскладки компонент сразу после `<uuid>` и есть part dir, независимо от его имени;
+2. `:205-212` — если uuid-анкера нет, скан слева направо на `kDetachedDirName`/`kMovingDirName`;
+3. `:225-227` — только потом скан справа налево по `looksLikePartDir` (`:136-166`, требует три последние числовые группы).
+
+Порядок 2 перед 3 — не оплошность, он несущий и объяснён на месте (`:180-184`, `:201-210`): при обратном порядке анкером стал бы ВНУТРЕННИЙ part-shaped компонент, а `detached`/`moving` въехал бы в состав табличного namespace, которого `DROP TABLE` не чистит — то есть навсегда живой orphan-ref. Ссылка находки `:140-162` устарела (файл двигался коммитом `592b9b83568`).
+
+Само следствие («база или таблица, буквально названная `detached`, misroutes every part in it») — верно, и оно ЯВНО принято как известная неоднозначность:
+
+- комментарий-анкер `:214-221`: «structurally indistinguishable … resolving the ambiguity requires caller-supplied knowledge of existing databases and tables, which this pure string parser intentionally does not have»;
+- тест-пиннинг `CASPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir` (`src/Disks/tests/gtest_ca_wiring.cpp:229-245`): `data/db/detached/all_1_1_0/data.bin` → `table_uuid = "data/db"`, `part_name = "detached"`, `file = "all_1_1_0/data.bin"`, и `parseTableUuid("data/db/detached")` — `nullopt`.
+
+Достижимость узкая ровно так же, как уже зафиксировано в предыдущей триаге для той же non-Atomic ветки (`docs/superpowers/cas/2031-triage.md:234`, CAS-006): Atomic-раскладка (`store/<u3>/<uuid>`) под этот арм не попадает вообще, потому что uuid-анкер проверяется первым — таблица, названная `detached`, в Atomic-базе разбирается корректно. Нужна deprecated `Ordinary`-база: `allow_deprecated_database_ordinary` по умолчанию `false` (`src/Core/Settings.cpp:6712`), и без него `DatabaseOrdinary` при CREATE отказывает (`src/Databases/DatabaseOrdinary.cpp:781-785`).
+
+Что при этом происходит фактически (находка не разбирала): `route` (`ContentAddressedMetadataStorage.cpp:1301-1311`) складывает такой путь в `ns = liveNamespace(<db-путь>)` и ref `detached/<первый компонент>`, поэтому у таблицы с именем `detached` все части становятся `detached/<part>`-ref'ами namespace'а базы, а у БАЗЫ с именем `detached` все таблицы схлопываются в `detached/<table>`-ref'ы — то есть части одной таблицы делят ОДИН ref и конкурентные публикации конфликтуют. Отказы при этом громкие (конфликт promote/`ABORTED`), тихой порчи нет; `DROP TABLE` такую таблицу, кстати, вычищает (`removeRecursive` попадает в detached-контейнерный/part-арм `ContentAddressedTransaction.cpp:1095-1118`).
+
+## 2. «Unclassified part dir молча становится table-level file» — форма верна, достижимость почти нулевая
+
+Catch-all — `parseTableFilePath`, `PartPathParser.cpp:370-372` (`r.table_uuid = joinTableId(p, 0, p.size()-1); r.tail = p.back();`); анкер находки `:274-277` устарел. Но этот арм — исключительно non-Atomic ветка: он стоит ПОСЛЕ uuid-арма (`:339-347`) и после проверки `findPartDirComponent(p)` (`:352`). Для Atomic-раскладки (единственной не-deprecated) любой компонент после `<uuid>` — part dir по анкеру, без всякой эвристики, так что «будущий формат имён частей» разбор не ломает. Существующие реальные имена грамматику проходят (`tmp_insert_all_1_1_0`, `delete_tmp_all_1_1_0`, `all_1_1_0_2`, `202401_1_1_0`), а detached-имена с префиксами (`broken_all_1_1_0` и пр.) вообще не разбираются грамматикой — их накрывает зарезервированный анкер из п.1. Формулировка находки «discovered only on read» верна как модель, но не имеет достижимого сценария в поддерживаемой раскладке.
+
+## 3. История/бэклог
+
+- Прямого анкера по этому парсеру в `docs/superpowers/cas/BACKLOG.md` и `BACKLOG/*.md` нет; ближайшее — `[partpathparser-duplicated-path-constants]` (`BACKLOG/docs-and-cleanup.md:80`, про дублирование path-констант, другая тема) и упоминание prefix-robustness анкера в `BACKLOG/mounts-and-lifecycle.md:148-149`. Комментарий теста говорит «backlogged by the stabilization campaign», но после консолидации доков (`project_cas_docs_map_reduce_consolidation`) такого пункта в живом бэклоге не осталось.
+- Реальный остаток — не сам fold (он корректная и лучшая из двух интерпретаций), а отсутствие fail-closed отказа: CA молча принимает non-Atomic таблицу/базу с зарезервированным именем вместо того, чтобы отказать при mount/attach. Записал новым пунктом `docs/superpowers/cas/BACKLOG/formats-and-storage.md` `{#nonatomic-reserved-name-fold-no-refusal}` (не коммичено), P3 — тот же класс, что уже записанный отказ на DiskEncrypted-над-CA.
