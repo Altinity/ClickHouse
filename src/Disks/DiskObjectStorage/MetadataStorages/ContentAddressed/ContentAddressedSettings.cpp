@@ -55,10 +55,13 @@ static const std::set<std::string> non_cas_keys = {
     "type", "object_storage_type", "metadata_type", "path", "name", "use_fake_transaction",
     "endpoint", "access_key_id", "secret_access_key", "region", "use_environment_credentials",
     "readonly", "expect_continue_min_bytes", "http_client", "key_compatibility_prefix",
-    /// The GCP OAuth token-source keys that accompany `http_client = gcp_oauth`, consumed by
-    /// `diskSettings.cpp` into the client configuration. Without them a CAS pool could not be
-    /// configured against a non-default metadata endpoint or a non-`default` service account.
+    /// `http_client = gcp_oauth` has TWO token sources, and `requestBearerToken` picks between them:
+    /// the GCE metadata server, and Application Default Credentials. Both sets are consumed by
+    /// `diskSettings.cpp` into the client configuration, and both must be accepted here — the ADC
+    /// triple is the only way to run `gcp_oauth` off a GCE instance, which is what a developer or a
+    /// non-GCE deployment uses.
     "metadata_service", "request_token_path", "service_account",
+    "google_adc_client_id", "google_adc_client_secret", "google_adc_refresh_token",
     "max_single_part_upload_size",
 };
 

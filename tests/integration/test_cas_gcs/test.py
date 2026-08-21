@@ -10,6 +10,11 @@ assertion below can pass by accident on a value that would serve as either token
 contains no `storage.googleapis.com`, so a mount that selects generation tokens proves the capability
 came from the explicit `http_client` value.
 
+Marking is observable on the wire on the OAuth path, by absence rather than presence: marking a
+request deletes `x-amz-api-version`, so a `Default` request still carries it. That is what lets this
+suite assert per-request marking on a single client rather than only per disk. It does not hold on
+`gcs_hmac`, where the header is stripped from every request regardless of mode.
+
 Not covered here, deliberately: CAS object attributes. The attribute parameter is plumbed through the
 CAS write paths but no production caller fills it — every call site uses the `Backend` overloads that
 forward an empty `ObjectMeta` — so an attribute round trip driven from SQL would be asserting the
@@ -154,6 +159,43 @@ def _has_goog_metadata(record):
 
 def _is_translated(record):
     return "x-goog-if-generation-match" in record["headers"] or _has_goog_metadata(record)
+
+
+# `AWS_HEADERS_CLEARED_BEFORE_GCS_AUTHENTICATION` in GCSConditionalDialect.cpp lists
+# `x-amz-api-version`, and `prepareGcsRequestForOAuthAuthentication` — which runs ONLY for a marked
+# request on the OAuth client — deletes every header in it. So on a `gcp_oauth` client the header's
+# PRESENCE means the request was `Default` and its ABSENCE means the request was marked. That makes
+# marking observable on the wire for the request kinds the SDK stamps with it, which measurement says
+# are GET, HEAD and DELETE but not PUT.
+#
+# This does NOT hold on `gcs_hmac`: `prepareGcsRequestForGoog4Authentication` runs for every request
+# that client sends, marked or not, so the header is always absent there and says nothing about mode.
+#
+# One other thing deletes the same header, and understanding why it does not fire here is what makes
+# the discriminator trustworthy. `Client::BuildHttpRequest` also drops `x-amz-api-version` when
+# `api_mode == ApiMode::GCS`, for every request and before the marking logic runs. `api_mode` becomes
+# GCS only inside a block gated on `provider_type == ProviderType::GCS`, and `deduceProviderType` is
+# pure endpoint-substring matching: GCS requires `storage.googleapis.com` in the URL. This fixture's
+# endpoint deliberately contains no such substring, so `provider_type` is UNKNOWN, that block never
+# runs, and the header survives to become a marking signal.
+#
+# Note what this does NOT mean. It is not that these disks have credentials: `gcp_oauth` deliberately
+# builds an EMPTY credentials provider chain ("we don't provide any credentials to avoid signing" in
+# Credentials.cpp), which is also why no SigV4 artifact such as `x-amz-content-sha256` ever appears.
+# Against a real `storage.googleapis.com` endpoint `provider_type` WOULD be GCS, those empty
+# credentials would select `ApiMode::GCS`, and the header would be stripped from every request. So
+# this discriminator is an artifact of the fixture's non-GCS hostname and could not be reproduced
+# against production GCS. Marking itself is unaffected — it depends on `http_client`, not the endpoint
+# — so the test still fences the behaviour; only the ability to OBSERVE it is endpoint-dependent.
+#
+# Consequence for a future reader: if these assertions ever start failing uniformly rather than for
+# one request, suspect that the endpoint or `provider_type` changed and the discriminator is gone,
+# before suspecting that marking broke.
+_MARKING_OBSERVABLE_METHODS = ("GET", "HEAD", "DELETE")
+
+
+def _looks_default_on_oauth(record):
+    return "x-amz-api-version" in record["headers"]
 
 
 def test_data_is_readable_on_every_disk():
@@ -324,9 +366,17 @@ def test_list_stays_unmarked_and_its_etag_never_becomes_a_cas_token(disk):
 def test_ordinary_gcp_oauth_traffic_keeps_upstream_semantics():
     """The upgrade regression this change exists to remove, checked on a non-CAS disk.
 
-    Would fail if: generation semantics were reattached to a whole `gcp_oauth` client rather than to
-    individual marked requests — this disk's bucket would then show generation preconditions or
-    `x-goog-meta-*` headers.
+    The two absence assertions alone would be vacuous, and that is worth spelling out: a generation
+    precondition is only ever emitted for a request that already carried `If-Match`/`If-None-Match`,
+    and `x-goog-meta-*` only for one that carried `x-amz-meta-*`. An ordinary disk sends none of
+    those, so marking every request on the client — the exact regression this plan removes — would
+    leave those two assertions green. They are kept because they are cheap and true, not because they
+    fence anything.
+
+    The assertion that DOES fence it is the last one. Marking a request runs
+    `prepareGcsRequestForOAuthAuthentication`, which deletes `x-amz-api-version`, so an ordinary
+    request must still carry it. Would fail if: `Client::BuildHttpRequest` marked requests it should
+    not — the header would vanish from this bucket.
     """
     records = _captured(PLAIN_BUCKET)
     assert records, "the ordinary disk sent no request, so this test would be vacuous"
@@ -334,31 +384,78 @@ def test_ordinary_gcp_oauth_traffic_keeps_upstream_semantics():
         assert "x-goog-if-generation-match" not in record["headers"], record["query"]
         assert not _has_goog_metadata(record), record["query"]
 
+    observable = [r for r in records if r["method"] in _MARKING_OBSERVABLE_METHODS]
+    assert observable, "no GET/HEAD/DELETE on the ordinary disk, so the check below would be vacuous"
+    for record in observable:
+        assert _looks_default_on_oauth(record), (
+            "an ordinary {} on {} lost x-amz-api-version, so it was marked".format(
+                record["method"], record["key"] or "(list)"
+            )
+        )
+
+
+def test_marked_and_default_heads_coexist_on_one_oauth_client():
+    """Per-request marking, observed on ONE client, for ONE method, in ONE bucket.
+
+    The CAS `gcp_oauth` disk owns a single S3 client and issues HEADs of both kinds: CAS metadata
+    reads are marked, while `probeSentinelRaw` deliberately goes through the ordinary throwing
+    `getObjectMetadata` because it must tell no-such-key from no-such-bucket from a transient failure,
+    and it discards the metadata anyway. Marking deletes `x-amz-api-version`, so the two kinds are
+    distinguishable on the wire even though they are the same verb on the same key space.
+
+    This is the assertion I earlier reported the fixture could not make. I was wrong for a specific
+    reason worth keeping: marking adds no header, which is true, but it REMOVES one, and an absence is
+    just as observable as a presence.
+
+    Would fail if: every request were marked (the `Default` HEAD would lose the header) or none were
+    (all the marked HEADs would keep it). Both directions fire, which is what makes it a partition
+    rather than a one-sided check.
+
+    Only the OAuth disk can support this. On `gcs_hmac`,
+    `prepareGcsRequestForGoog4Authentication` runs for every request the client sends, so the header
+    is absent regardless of mode and carries no information.
+    """
+    heads = [r for r in _captured(CAS_DISKS["cas_gcs_oauth"]) if r["method"] == "HEAD"]
+    assert heads, "no HEAD reached the fake, so this test would be vacuous"
+
+    default_heads = [r for r in heads if _looks_default_on_oauth(r)]
+    marked_heads = [r for r in heads if not _looks_default_on_oauth(r)]
+
+    assert marked_heads, "no HEAD was marked — CAS metadata reads lost their request mode"
+    assert default_heads, (
+        "every HEAD was marked — the sentinel probe's ordinary metadata read was marked too, "
+        "which is the whole-client marking regression this plan removes"
+    )
+
 
 @pytest.mark.parametrize("disk", sorted(CAS_DISKS))
-def test_translated_and_untranslated_requests_interleave_on_one_disk(disk):
-    """One disk owns one S3 client, so this is one client alternating request modes.
+def test_translated_requests_are_confined_to_conditional_operations(disk):
+    """Translated headers appear only where a precondition or custom metadata was actually sent.
 
-    Would fail if: the mode became client state again — every request on the client would then be
-    translated and no untranslated request would sit between two translated ones.
+    Weaker than the test above and deliberately kept for both disks, since it is the only isolation
+    statement available on `gcs_hmac`: a request carrying no CAS precondition must carry no
+    `x-goog-if-generation-match`, so a blanket translation would show up here as a generation
+    precondition on a plain read.
 
-    What it does not prove: that a specific untranslated request was constructed as `Default` rather
-    than as a marked request needing no header. A marked HEAD is byte-identical to an ordinary HEAD
-    on the wire — by design, since the mode is a typed field with no wire representation, chosen over
-    a marker header so it cannot be spoofed or signed. So per-request marking on one client object
-    stays the unit tests' claim
-    (`IOTestAwsS3Client.ResponseGenerationAndMetadataAdaptedOnlyWhenMarked`), and the assertion here
-    is at per-disk granularity instead.
+    Would fail if: the dialect began emitting generation preconditions for requests that carried no
+    ETag precondition — for instance by defaulting a missing precondition to `0`.
     """
     records = _captured(CAS_DISKS[disk])
-    translated = [r["seq"] for r in records if _is_translated(r)]
-    assert len(translated) >= 2, "fewer than two translated requests, nothing to interleave"
+    translated = [r for r in records if _is_translated(r)]
+    assert translated, "nothing was translated at all, so this test would be vacuous"
 
-    first, last = min(translated), max(translated)
-    between = [
-        r for r in records if first < r["seq"] < last and not _is_translated(r)
-    ]
-    assert between, "no untranslated request sits between two translated ones"
+    for record in records:
+        if record["method"] == "GET" and not record["key"]:
+            assert not _is_translated(record), "a LIST carried a translated header"
+
+    # Every translated request is a mutation: a conditional PUT, a CAS-owned copy, or an exact DELETE.
+    # A plain read must never acquire one.
+    for record in translated:
+        assert record["method"] in ("PUT", "DELETE", "POST"), (
+            "a {} on {} carried a translated header but is not a mutation".format(
+                record["method"], record["key"] or "(list)"
+            )
+        )
 
 
 @pytest.mark.parametrize("disk", sorted(CAS_DISKS))

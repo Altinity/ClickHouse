@@ -44,6 +44,34 @@ _GENERATION_STRIDE = 7919
 
 _XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
+# Query parameters this service actually models. Anything else — `?acl`, `?lifecycle`,
+# `?encryption`, `?requestPayment`, an unmodelled subresource of any kind — is refused rather than
+# silently treated as a listing or as an object write. An ALLOWLIST rather than a denylist on purpose:
+# a denylist grows stale the moment the SDK learns a new subresource, and the failure mode of a stale
+# denylist here is a half-served request that looks like a ClickHouse bug.
+_MODELLED_LIST_PARAMS = frozenset(
+    {
+        "list-type",
+        "prefix",
+        "delimiter",
+        "max-keys",
+        "marker",
+        "continuation-token",
+        "start-after",
+        "encoding-type",
+        "fetch-owner",
+    }
+)
+
+# Subresources handled explicitly by their own branch in the handlers below.
+_MODELLED_SUBRESOURCES = frozenset({"versioning", "location", "tagging", "delete", "uploads", "uploadId", "partNumber"})
+
+
+def _unmodelled_params(query):
+    """Query keys that are neither a modelled listing parameter nor a modelled subresource."""
+    return sorted(set(query) - _MODELLED_LIST_PARAMS - _MODELLED_SUBRESOURCES)
+
+
 _LOCK = threading.Lock()
 
 
@@ -248,6 +276,9 @@ def _split_source(raw):
 
 
 def handle_put(bucket, key, query, headers, body):
+    unmodelled = _unmodelled_params(query)
+    if unmodelled:
+        return _unsupported("PUT with the subresource/parameter " + ", ".join(unmodelled))
     if "uploadId" in query or "uploads" in query or "partNumber" in query:
         return _unsupported("multipart upload")
     if "tagging" in query:
@@ -429,6 +460,13 @@ def handle_list(bucket, query):
 
 
 def handle_get_or_head(bucket, key, query, headers):
+    unmodelled = _unmodelled_params(query)
+    if unmodelled:
+        return _unsupported(
+            "{} with the subresource/parameter {}".format(
+                "GET/HEAD", ", ".join(unmodelled)
+            )
+        )
     if "versioning" in query and not key:
         # No versioning: an absent Status is what the AWS SDK reads as "not enabled".
         payload = (

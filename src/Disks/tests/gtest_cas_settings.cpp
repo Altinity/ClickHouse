@@ -77,16 +77,18 @@ TEST(CASContentAddressedSettings, ObjectStorageKeysSkipped)
         /// a CAS-specific check), must reach that check rather than being rejected here as unknown --
         /// `05015_cas_reject_fake_transaction` depends on it doing so.
         "<use_fake_transaction>1</use_fake_transaction>"
-        /// Regression pin: the GCP OAuth token-source keys that accompany `http_client = gcp_oauth`,
-        /// consumed by `diskSettings.cpp` into the client configuration. All three were missing, so a
-        /// CAS pool could not be configured against a non-default metadata endpoint or a
-        /// non-`default` service account at all -- the disk threw `UNKNOWN_SETTING` at startup. Found
-        /// by the CAS-over-GCS integration fixture, which needed to point the OAuth client at a fake
-        /// metadata server.
+        /// Regression pin: `http_client = gcp_oauth` has TWO token sources and `requestBearerToken`
+        /// picks between them, so BOTH key sets must be accepted. The metadata-server triple was
+        /// missing (found by the CAS-over-GCS integration fixture, which had to point the OAuth client
+        /// at a fake metadata server); the ADC triple was missing too, and it is the only way to run
+        /// `gcp_oauth` off a GCE instance. Either omission threw `UNKNOWN_SETTING` at startup.
         "<http_client>gcp_oauth</http_client>"
         "<metadata_service>metadata.example.invalid</metadata_service>"
         "<request_token_path>computeMetadata/v1/instance/service-accounts</request_token_path>"
         "<service_account>cas@example.invalid</service_account>"
+        "<google_adc_client_id>cas-adc-client</google_adc_client_id>"
+        "<google_adc_client_secret>cas-adc-secret</google_adc_client_secret>"
+        "<google_adc_refresh_token>cas-adc-refresh</google_adc_refresh_token>"
         /// Same class: a generic S3 request setting, not a CAS one.
         "<max_single_part_upload_size>1073741824</max_single_part_upload_size>");
     ContentAddressedSettings s;
