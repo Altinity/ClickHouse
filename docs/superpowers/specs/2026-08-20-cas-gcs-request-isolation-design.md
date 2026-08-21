@@ -241,14 +241,41 @@ The production mount capability battery exercises the same
 known-wrong token and verifies that the object remains, then repeats with the known-correct token
 and verifies deletion. Rejection, incorrect comparison, or silent ignoring of the raw header fails
 one of those checks and rejects mount. Writable generation backends prohibit
-`skip_access_check=true`, so this protection applies to every writable GCS CAS mount. Read-only
-mounts may skip the battery because they expose no mutating surface and run no GC.
+`skip_access_check=true`, so this protection applies to every ordinary writable GCS CAS mount.
+Read-only mounts may skip the battery because they expose no mutating surface and run no GC.
+
+Decommission is a deliberate exception: it opens the pool with the access check skipped and never
+runs the battery. The fail-closed trade-off inverts there. Refusing an ordinary mount on a bucket
+whose versioning cannot be verified costs availability and protects data, whereas refusing a
+decommission strands a pool that still contains a dead replica and leaves the operator no way
+forward. The guarantee is therefore about ordinary writable mounts, and an operator decommissioning
+a pool on a versioned bucket carries the archiving hazard knowingly.
 
 ### Exact successful-write token {#exact-successful-write-token}
 
 A successful GCS CAS mutation must return the generation created by that response. A missing
 `x-goog-generation` is an exception. The code must not perform a follow-up HEAD and claim that a
 later observed generation belongs to the original write.
+
+That prohibition holds on every write path, but "is an exception" describes what token attribution
+does, not what always becomes of the operation. The attribution raises `CORRUPTED_DATA`, and the two
+controlled write primitives then differ, so a reader should not conclude that such a write always
+fails:
+
+- `conditionalCreateControlled` classifies `CORRUPTED_DATA` as a deterministic local failure and
+  propagates it unchanged, without resolving. The write fails. This is the blob-create path.
+- `putIfAbsentControlled` catches a raising attempt without filtering on the error code, treats it as
+  an unresolved attempt, and calls `resolveByExactGet`. That reads the stored object's body, compares
+  it against the bytes this attempt intended to write, and returns the observed token only on an exact
+  match; different bytes raise. So the omitted generation can be recovered and the operation can
+  succeed. This is the manifest and journal path.
+
+The recovery is admissible for the reason the prohibition exists. A follow-up HEAD is forbidden because
+it *assumes* the attribution — it returns whatever incarnation happens to be current, which on a lost
+race belongs to another writer. `resolveByExactGet` *proves* it, because the bytes it compares are the
+ones this attempt authored. A content proof is stronger evidence than the metadata read the rule was
+written to forbid, and refusing the write anyway would trade a proven attribution for an abort. The
+distinction is the comparison, not merely that some check occurred.
 
 All GCS CAS writes whose result token enters protocol state use a single PUT. They fail before
 upload when their size exceeds `gcs_max_token_producing_put_bytes`. This includes unconditional
@@ -588,6 +615,16 @@ All token-producing GCS writes, including unconditional resurrection, are subjec
 proven to return an attributable generation. The old pre-release name
 `gcs_max_conditional_put_bytes` is renamed because its scope is no longer limited to conditional
 writes; no compatibility alias is retained.
+
+S3-native staging (`staging_backend=s3`) is unsupported on a generation-token backend and mutually
+exclusive with it: a writable mount over a generation-token backend takes no S3-staging capability
+probe at all and stays on local staging. The mount-time probe issues its conditional copies with a
+default request mode, so it never receives the GCS conditional-dialect mapping and would misreport
+whether the backend enforces the precondition. Even a probe corrected for that would not help --
+`promoteStaged`'s server-side copy needs the generation the copy minted, and that value comes back
+in a response header, while the copy call site reads only the `ETag` field of the response body,
+which a generation write never populates. Since `staging_backend=s3` is opt-in and off by default,
+this closes a gap without changing any default configuration's behavior.
 
 ### Existing CAS over AWS-compatible storage {#existing-cas-over-aws-compatible-storage}
 
