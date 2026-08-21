@@ -172,6 +172,7 @@ private:
     LoggerPtr log;
 
     std::optional<RemoteQueryExecutor::Extension> extension;
+    bool extension_has_predicate = false;
     std::optional<Tables> external_tables;
 
     void createExtension(const ActionsDAG::Node * predicate);

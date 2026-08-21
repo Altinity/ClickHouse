@@ -98,7 +98,9 @@ void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
 
 void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
 {
-    if (extension)
+    /// Listing is one-shot. Recreate only when a real predicate arrives after an
+    /// empty listing (e.g. `initializePipeline` ran before `applyFilters`).
+    if (extension && !(predicate && !extension_has_predicate))
         return;
 
     extension = storage->getTaskIteratorExtension(
@@ -107,6 +109,7 @@ void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
         context,
         cluster,
         getStorageSnapshot()->metadata);
+    extension_has_predicate = predicate != nullptr;
 }
 
 namespace
@@ -596,7 +599,9 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
 
-    createExtension(nullptr);
+    const ActionsDAG * filter = filter_actions_dag ? filter_actions_dag.get() : query_info.filter_actions_dag.get();
+    const ActionsDAG::Node * predicate = filter ? filter->getOutputs().at(0) : nullptr;
+    createExtension(predicate);
 
     ProfileEvents::increment(ProfileEvents::Shards, max_replicas_to_use);
 
