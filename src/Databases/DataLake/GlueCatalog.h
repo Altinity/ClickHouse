@@ -79,7 +79,7 @@ public:
         Int32 new_last_column_id,
         Poco::JSON::Object::Ptr metadata = nullptr) const override;
 
-    void dropTable(const String & namespace_name, const String & table_name) const override;
+    void dropTable(const String & namespace_name, const String & table_name, bool delete_data) const override;
 
     /// Returns a callback that re-vends fresh AWS credentials from the configured
     /// credentials provider chain. Invoked by `ReadBufferFromS3` when an S3 call
