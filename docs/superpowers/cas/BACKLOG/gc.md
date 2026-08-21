@@ -205,3 +205,105 @@ the rebuild a dedicated gc-round-log row, which is where the reason belongs. Not
 the same pass: the `std::stoull` empty catches under `gc/gen/` (`:1490`, `:1621`, `:4096`) cannot
 misclassify a transient failure — `stoull` fails only deterministically — and cannot skip a well-formed
 generation key, so `max_gen` is not under-computed by them.
+
+## A dead member whose slot is never reclaimed keeps its abandoned build prefixes ineligible forever (2031-triage CAS-077) {#dead-member-frozen-build-floor}
+
+`prefixEligible` derives eligibility ONLY from the victim's own mount lease
+(`Gc/CasOrphanManifestSweep.cpp:476-493` via `floorForNamespace`, `:45-64`): old epoch ⇒ eligible,
+same epoch ⇒ eligible only when `min_active > build_sequence`, `min_active == UINT64_MAX` (farewell)
+⇒ everything eligible. Node loss does NOT delete the mount object, so the floor is not *missing* — it
+is FROZEN at the last heartbeat: `min_active` never advances again, and neither GC's fence-out nor the
+`gc_fenced` flag it stamps touch `writer_epoch`/`min_active`. So for a member that dies and whose slot
+is never reclaimed (no same-`srid` restart, no successor claim — both bump `writer_epoch` and drain the
+old epoch — and no `SYSTEM CAS DROP POOL MEMBER`), the builds that were in flight at the moment of loss
+stay ineligible indefinitely: their manifest bodies AND the blobs those manifests pin (the fold treats a
+not-eligible unowned manifest as a live edge — `Gc/CasGc.cpp:4290-4297`). Retention, not loss, and
+bounded by the in-flight build concurrency at the moment of loss — but the bytes can be part-sized, and
+the only reclaimer left is the decommission verb, which by design erases the member's namespaces first
+(see {#owner-only-slot-invisible-in-mounts} / CAS-063's "data first, then slot" invariant).
+
+Deliberate posture, not an oversight: control #9 (`CASOrphanManifestSweep.NoWatermarkIsNotAuthority`)
+exists precisely to forbid replacing the durable floor with a frozen-sequence or judged-dead guess, and
+`gc_fenced` is a weaker certificate than it looks for THIS purpose — a fenced predecessor's in-flight
+PUT can still materialize a manifest body afterwards (`BACKLOG/ref-protocol.md` `[Late Predecessor
+PUT]`), so promoting "fenced" to "every seq of this epoch is retired" needs the same landing analysis,
+not a one-line change.
+
+Owed (cheap half first): (1) observability — a fenced/never-reclaimed slot's retained prefixes are
+invisible; `sweepNamespace` returns 0 with no retain class (they fall into the undifferentiated
+`skipped` tally, `Gc/CasGc.cpp` `reportSweepRetention`), and `ca-fsck` labels them
+`in-flight-pre-precommit` (`Tools/CasFsck.cpp:1113-1116`) — a lie for a member that is provably gone.
+Owed: a distinct retain/report class ("stranded behind a dead member's frozen build floor") naming the
+`srid`, so the operator sees the retained bytes and knows the remedy. (2) the reclaim decision proper —
+either a non-destructive administrative verb that stamps only the farewell sentinel on a proven-dead
+slot (leaving the namespaces), or an explicit statement that decommission is the only answer. PROTOCOL
+ADJACENT (it licenses deletes on a dead member's behalf) — user consult before any change.
+
+## The namespace janitor rewinds its durable cursor on ANY LIST failure (2031-triage CAS-078) {#janitor-cursor-rewind-on-list-error}
+
+`NamespaceJanitor::runOnePage` wraps its single LIST in `catch (...) { (void)casGcMaintenanceState(...,
+GcMaintenanceState{}); throw; }` (`Gc/CasNamespaceJanitor.cpp:22-31`), so a transient S3 5xx / throttle /
+timeout publishes an EMPTY cursor and the next round restarts the ownership-tree enumeration from the
+beginning. The reset is deliberate and pinned
+(`gtest_cas_namespace_janitor.cpp:548-561`, `CASNamespaceJanitor.BackendRejectedCursorResetsExactlyAndDeletesNothing`),
+but the code cannot tell a rejected cursor from an ordinary transient failure — and the cursor is not an
+opaque expiring continuation token, it is the last returned key, resumed with `start_after`
+(`Backend/CasBackend.h:124-129`, `:260-262`), so a transient failure never invalidates it. Combined with
+the one-1000-key-page-per-round pacing ({#janitor-page-hardcoded}, `Gc/CasGc.cpp:470`, one call per round
+at `:710`/`:1221`) a backend with a per-LIST failure probability comparable to the page rate can keep the
+janitor pinned to the head of the prefix, so dead-life debris deeper in the tree is never reached. Not
+loss and not silent: the exception is logged (`Gc/CasGc.cpp:485-488`) and the residue is counted by fsck
+(`Tools/CasFsck.h:155-157` `namespace_janitor_pending*`); erase latency is not part of the disk contract
+(settled position under {#janitor-page-hardcoded}). Owed: keep the cursor on a transient failure — reset
+only for a cursor the backend genuinely refuses (deterministic invalid-argument class), or only after N
+consecutive failures at the same cursor. P3.
+
+## GC ref-object trimming still gates on whole-catalog token stillness (2031-triage CAS-079) {#ref-cleanup-whole-catalog-token-stillness}
+
+`Gc::cleanupRefObjects`'s per-key revalidation refuses when `current_catalog.token !=
+folded.catalog_cut->token` (`Gc/CasGc.cpp:3424`) even though the same condition already compares THIS
+namespace's row by value and re-resolves its life (`:3425-3428`); the ref catalog is one pool-global
+object ({#ref-catalog-write-hotspot}), so any `CREATE`/`DROP`/state transition of any table in the pool
+during the (long, O(pool)) window between the fold's catalog read and post-CAS cleanup refuses the
+delete — and the refusal `return`s out of the WHOLE function (`:3506`, `:3518`), abandoning the remaining
+namespaces' trimming too, not just the affected one. This is the exact class `684161dcc03` ("prove
+namespace absence per-row, not by whole-catalog stillness") removed from the ref-writer presence probe
+and cold-reader admission after `01069_database_memory` failed 193 of 194 retries on it; the GC cleanup
+site was not part of that commit and is pinned to the old contract by
+`CASRefGcCleanupAuthority.CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete`
+(`gtest_cas_ref_gc.cpp:563-579`), whose injected move rewrites the catalog with BYTE-IDENTICAL content
+(`:159-176`) — i.e. it pins the over-sensitivity itself. Bounded to reclaim latency, not loss:
+`planRefCleanup` recomputes the same candidates from durable state next round (`Gc/CasGc.cpp:3497-3501`).
+Owed: per-row revalidation as in the ledger fix (row by value + life resolution + explicit
+`throwIfAmbiguous`, which is what catches the aliasing incarnation the token compare used to catch), the
+refusal scoped to its own namespace rather than the whole pass, and the two pinning tests re-aimed at the
+per-row contract. P2.
+
+## A stranded generation prefix is reclaimed by nothing AND enumerated by nothing — the "fsck is the backstop" claim is false (2031-triage CAS-074) {#stranded-generation-prefix-invisible-to-fsck}
+
+Three sites promise that a generation prefix the wholesale prune skipped and the one-shot hand-off then
+failed to reclaim (suppressed round, crash between the round CAS and `handoff_reclaim`, or hand-off budget
+exhaustion) is "left to `fsck`, which is the backstop": `Gc/CasGc.cpp:1105-1107`, `:1126-1128`,
+`:1144-1149`, and this file's own {#suppressed-handoff-consumption} ("bounded leak, fsck-visible").
+`runFsck` never enumerates `gc/` at all: its only listings are `layout.blobsPrefix()`
+(`Tools/CasFsck.cpp:728`) and the manifest prefixes (`:914`, `:1099`), and the only `gc/` keys it reads are
+the CURRENT `gc/state` and the CURRENT fold seal by exact key (`:817`, `:833`). So a stranded
+`gc/gen/<g>/` prefix appears in no counter, no `FsckObject` row, and no soak residual metric — it is
+neither reclaimable (`snap_pruned_through` is monotone and `pruneSupersededGenerations` only walks forward
+from `next.snap_pruned_through + 1`, `Gc/CasGc.cpp:3621`; `rebuildBaseline` carries the cursor over
+unchanged) nor observable. Magnitude is also understated: the prefix holds that generation's snapshot RUN
+objects, which are `O(edges)` in a hot pool ({#gc-snapshot-log-structured-runs}), not "one small run per
+shard". Owed, cheapest first: (a) correct the three prose claims and the {#suppressed-handoff-consumption}
+"fsck-visible" wording, since a false backstop is worse than a named leak; (b) give fsck a bounded
+`gc/gen/` enumeration that reports prefixes strictly below `snap_pruned_through` as an advisory count, so
+the class stops being invisible; (c) only then consider a reclaimer (a prune pass keyed on that advisory,
+not a lowering of the monotone cursor). P2 — bounded, no correctness or data-loss dimension.
+
+Same-shape false prose found alongside it, unrelated to the hand-off: `Pool/CasServerRoot.h:768-771` and
+`src/Disks/tests/gtest_cas_s3_staging.cpp:895-897` both state that "GC blob discovery LISTs
+`Layout::blobsPrefix()`" as the reason `staging/` is safe from GC. GC lists nothing under `blobs/` at HEAD
+— it only HEADs and deletes keys derived from edges (`Gc/CasGc.cpp:802`, `:817`, `:1820`, `:4437`); the
+per-round blob LIST was deliberately removed (the GC-DISCOVERY-LIST-QUADRATIC concern, `:3665-3680`). The
+staging-separation conclusion still holds for a strictly stronger reason (GC cannot reach a key no edge
+names), so this is prose only — but the test named
+`CASS3Staging.GcBlobDiscoveryPrefixExcludesStagingObjects` pins a premise that no longer exists. P3.

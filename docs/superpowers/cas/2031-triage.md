@@ -93,8 +93,8 @@
 | CAS-075 | ⏳ | — | — | — | — |
 | CAS-076 | ⏳ | — | — | — | — |
 | CAS-077 | ⏳ | — | — | — | — |
-| CAS-078 | ⏳ | — | — | — | — |
-| CAS-079 | ⏳ | — | — | — | — |
+| CAS-078 | подтверждено | P3 | [{#janitor-cursor-rewind-on-list-error}](BACKLOG.md#janitor-cursor-rewind-on-list-error) | нет | Сброс курсора уборщика namespace на любой ошибке LIST реален и запинен тестом, но это только задержка реклейма (громкая, посчитанная fsck), а не потеря данных. |
+| CAS-079 | подтверждено | P2 | [{#ref-cleanup-whole-catalog-token-stillness}](BACKLOG.md#ref-cleanup-whole-catalog-token-stillness) | нет | Ревалидация ref-cleanup в GC действительно требует неподвижности токена всего пул-глобального каталога и при отказе выходит из всей фазы — живой остаток того самого класса, который для ref-writer уже убран коммитом 684161dcc03. |
 | CAS-080 | ⏳ | — | — | — | — |
 | CAS-081 | ⏳ | — | — | — | — |
 | CAS-082 | ⏳ | — | — | — | — |
@@ -3169,3 +3169,90 @@ durable meta (triage #4)»).
 `EventDispatcher::setSink` меняет `sink` под `mutex` (`Pool/CasEventDispatcher.cpp:10-15`), а путь доставки читает `sink` с отпущенным мьютексом (`CasEventDispatcher.cpp:33-42`, комментарий «`sink` is set pre-traffic and never swapped concurrently with delivery»); контракт задокументирован в `CasEventDispatcher.h:38-45`. В продакшне `setEventSink` вызывается ровно один раз сразу после конструирования пула, до старта любого потока: `CasPool.cpp:502` (в `Pool::open`) и `CasPool.cpp:847` (в writer-only фабрике); ср. `CasPool.cpp:1100` («setEventSink ran long ago»). Поздние вызовы есть только в gtest'ах (`src/Disks/tests/gtest_cas_gc_rebuild.cpp:643/661`, `gtest_ca_wiring.cpp:1292/1327`). Это же остаточное место было отмечено при закрытии CAS-091 (см. прошлый раунд: `Pool/CasEventDispatcher.cpp:37-42` как residual при вердикте «fixed»), т.е. известно и принято.
 
 ИСТОРИЯ/BACKLOG: прежний вердикт этой формы — CAS-090, «📐 by-design (latent, unenforced)» с анкерами `Pool/CasMountRuntime.h:400`, `CasMountRuntime.cpp:156-163`, `:226-249` (`tmp/clickhouse-regression/cas/docs/cas-audit-rerun-20260730/verdicts.tsv:128`, `RECONCILIATION.md:132`). На HEAD анкеры сместились (`.h:379`, `.cpp:162-169`, `:232-255`), содержательно позиция та же — и стала СИЛЬНЕЕ: взаимоисключение теперь обеспечено гейтом `background_watermark` в `scheduleRemount`. Открытого пункта в `docs/superpowers/cas/BACKLOG.md` / `BACKLOG/*.md` по этому классу нет и не требуется. Формально дубликатом CAS-090 назвать нельзя: CAS-071 склеивает четыре разные позиции, из которых одна (fence/deadline tearing) просто неверна.
+
+## CAS-078 — Сброс курсора уборщика namespace на любой ошибке LIST реален и запинен тестом, но это только задержка реклейма (громкая, посчитанная fsck), а не потеря данных. (подтверждено, P3) {#cas-078}
+
+Код на HEAD (пути сместились в `Gc/`, файл `Gc/CasNamespaceJanitor.cpp`):
+
+- Механика подтверждена буквально: `Gc/CasNamespaceJanitor.cpp:21` читает `progress.state->janitor_cursor`, а LIST обёрнут в
+  `Gc/CasNamespaceJanitor.cpp:22-31`: `catch (...) { (void)casGcMaintenanceState(backend, layout, progress.token, GcMaintenanceState{}); throw; }`.
+  `GcMaintenanceState{}` — это пустой `janitor_cursor` (`Formats/CasGcMaintenanceStateFormat.h:14`), т.е. именно откат к началу префикса.
+  Исключение при этом улетает наружу, но у вызывающего оно только логируется: `Gc/CasGc.cpp:485-488`
+  (`LOG_WARNING(... "CAS namespace janitor skipped this round: {}")`), т.е. раунд продолжается, а курсор уже стёрт.
+- Пейсинг тоже подтверждён: `Gc/CasGc.cpp:470` создаёт `NamespaceJanitor janitor(backend, layout, 1000)`, и `runNamespaceJanitorPage`
+  вызывается ровно один раз за раунд (`Gc/CasGc.cpp:710` — suppressed-путь, `Gc/CasGc.cpp:1221` — обычный). Так что «одна страница в 1000 ключей
+  на раунд» — факт, и откат курсора действительно стоит всего накопленного прогресса.
+- Ключевая проверка, которую аудит не сделал, но которая играет в его пользу: курсор — НЕ непрозрачный истекающий continuation token, а последний
+  выданный ключ, возобновление через `start_after` (`Backend/CasBackend.h:124-129`: «cursor resumes strictly after the last returned key»,
+  `:129` «`next_cursor` — Last returned key», `:260-262`; реализация — `Backend/CasObjectStorageBackend.cpp:1177-1185`, комментарий прямо говорит
+  «The backend cursor is "last key returned" (exclusive on resume)»). Значит транзиентный 5xx/throttle/timeout курсор не портит, и сброс для
+  восстановления не нужен — сброс здесь безусловный и потому чрезмерный.
+- Поведение преднамеренное и запинено тестом: `gtest_cas_namespace_janitor.cpp:548-561`
+  `CASNamespaceJanitor.BackendRejectedCursorResetsExactlyAndDeletesNothing` с бэкендом `RejectCursorBackend` (`:140-149`), который швыряет
+  «backend rejected cursor» на любой непустой курсор; тест ожидает `EXPECT_TRUE(readGcMaintenanceState(...).state->janitor_cursor.empty())`.
+  То есть замысел — вылезти из «отравленного» курсора, но код не различает отказ по курсору и обычный транзиентный сбой. Введено сразу при
+  рождении уборщика: `git log -S 'casGcMaintenanceState(backend, layout, progress.token, GcMaintenanceState{})'` → единственный коммит
+  `111bb12a407` «Add perpetual namespace janitor» (2026-08-02); поздних изменений этого блока нет, находка НЕ устарела.
+
+Что в утверждениях аудита неточно/преувеличено:
+- «one S3 5xx … discards all prior progress» — верно; но «can make no net progress at all» требует, чтобы вероятность отказа LIST была
+  сравнима с темпом продвижения страниц. У S3-бэкенда LIST идёт через обычный клиент ClickHouse с его retry-стратегией, так что до уровня
+  уборщика доходят в основном не-транзиентные или упорные (throttling-шторм) отказы. Как «может» — корректно, как «типично» — нет.
+- Класс «LEAK» — только в смысле отложенного реклейма. Тихой порчи нет: удаления делаются exact-token (`Gc/CasNamespaceJanitor.cpp:111`),
+  повторный проход по уже пройденным ключам идемпотентен; сброс курсора — best-effort CAS под `progress.token`, проигрыш CAS просто игнорируется.
+  Провал громкий и посчитанный: аномалии логируются (`Gc/CasGc.cpp:481-482`), остаток виден в fsck как
+  `namespace_janitor_pending`/`_bytes`/`_lives` (`Tools/CasFsck.h:144-157`).
+- Плюс уже устоявшаяся позиция: латентность стирания не входит в контракт диска (оператор может дать `GC RUN` в любой момент) — зафиксировано в
+  `docs/superpowers/cas/BACKLOG/gc.md`{#janitor-page-hardcoded} (2031-triage CAS-034). Это ограничивает серьёзность именно этим классом.
+
+BACKLOG: существующего пункта именно про сброс курсора не было (грепы по `janitor` в `BACKLOG.md` и `BACKLOG/*.md` дают только
+{#janitor-page-hardcoded}, `[gc-files-prefix-not-listed]` и упоминание в {#rebuild-gcstate-decode-reason-unreported}). Остаточек реальный и
+неотслеженный, поэтому добавлен новый (незакоммиченный) раздел
+`docs/superpowers/cas/BACKLOG/gc.md`{#janitor-cursor-rewind-on-list-error} с формулировкой долга: не сбрасывать курсор на транзиентном сбое —
+сбрасывать только на детерминированном отказе по курсору (класс invalid-argument) либо после N подряд неудач на одном и том же курсоре;
+тест `BackendRejectedCursorResetsExactlyAndDeletesNothing` при этом надо перецелить на «детерминированный отказ», а не «любое исключение».
+
+## CAS-079 — Ревалидация ref-cleanup в GC действительно требует неподвижности токена всего пул-глобального каталога и при отказе выходит из всей фазы — живой остаток того самого класса, который для ref-writer уже убран коммитом 684161dcc03. (подтверждено, P2) {#cas-079}
+
+Оба утверждения аудита подтверждены на HEAD (файл переехал в `Gc/CasGc.cpp`, символ — `Gc::cleanupRefObjects`, начало `Gc/CasGc.cpp:3374`):
+
+1. Ревалидация по токену ВСЕГО каталога: внутри лямбды `deleteRefObject` перед каждым `deleteExact` делается свежий
+   `CasRefCatalog::read` (`Gc/CasGc.cpp:3417`), и первым же дисъюнктом отказа стоит
+   `if (current_catalog.token != folded.catalog_cut->token` (`Gc/CasGc.cpp:3424`) — при несовпадении `LOG_DEBUG` «catalog observation/life moved»
+   и `return false` (`:3429-3433`). При этом остальные дисъюнкты того же условия уже проверяют СТРОКУ этого namespace по значению и
+   переразрешают его life: `current_entry_it->ns != ns || *current_entry_it != observed_entry || !current_life || *current_life != life`
+   (`:3425-3428`), а неоднозначность life-индекса проверяется отдельно (`:3418` `throwIfAmbiguous("CAS GC ref cleanup revalidation")`).
+   То есть сравнение токена — строго избыточное усиление: оно отказывает и тогда, когда изменилась чужая строка каталога.
+2. Каталог — один объект на весь пул: `layout.refCatalogKey()` — единственный ключ, это же зафиксировано измерением в
+   `docs/superpowers/cas/BACKLOG/performance.md`{#ref-catalog-write-hotspot} («every table creation in a pool writes the same catalog object
+   `cas/ref_catalog`»). Мутации каталога происходят на событиях жизненного цикла namespace (создание при первой записи —
+   `precommitAdd` → `appendRefOps` → `createNamespace`, см. `BACKLOG/gc.md:155`; DROP; переходы Creating→Live→Removing), а не на каждый INSERT.
+3. Выход из ВСЕЙ функции при первом отказе: `if (!deleteRefObject(layout.refLogKey(life, log_id))) return;` (`Gc/CasGc.cpp:3506`) и
+   `if (!deleteRefObject(layout.refSnapshotKey(life, snap_id))) return;` (`Gc/CasGc.cpp:3518`) — оба внутри цикла `for (const auto & [ns_str, listing] : folded.ref_tables)`
+   (`Gc/CasGc.cpp:3388`), так что отказ на namespace A обрывает подрезку и всех оставшихся namespace B..Z этого раунда. Комментарий это и декларирует:
+   «A moved token, changed row/life, … stops the whole cleanup pass» (`:3405-3409`).
+4. Окно — длинное: `folded.catalog_cut` берётся во время fold, а cleanup идёт уже после единственного `gc/state` CAS раунда (см. комментарий
+   теста `gtest_cas_ref_gc.cpp:490-491` «The SAME round that folds the whole tail also runs post-CAS cleanup»), т.е. окно накрывает весь
+   O(pool)-fold. На занятом кластере с созданием/удалением таблиц отказ действительно вероятен в большинстве раундов — как аудит и говорит.
+
+Это ЖИВОЙ остаток известного класса, а не новая гипотеза. HEAD-коммит `684161dcc03` «cas: prove namespace absence per-row, not by whole-catalog
+stillness» убрал ровно такое условие из двух мест `Pool/CasRefLedger.cpp` (presence probe и cold-reader admission), с измеренным симптомом:
+`01069_database_memory` падал 193 из 194 ретраев на «catalog changed while probing table-root cleanup completeness». GC-шный сайт в тот коммит не
+попал (`git show --stat 684161dcc03` — только `Pool/CasRefLedger.cpp/.h` и `gtest_cas_ref_writer.cpp`). Более того, старый контракт здесь ЗАПИНЕН
+тестом `CASRefGcCleanupAuthority.CatalogTokenMoveBeforeFirstDeleteRefusesEveryRefObjectDelete` (`gtest_cas_ref_gc.cpp:563-579`), и инъекция
+двигает токен, перезаписывая каталог БАЙТ-В-БАЙТ тем же содержимым (`RefCleanupAuthorityRaceBackend::moveAuthority`, `gtest_cas_ref_gc.cpp:159-176`:
+для `Authority::Catalog` `bytes = got->bytes` без изменений) — то есть тест пинит именно чрезмерную чувствительность, а парный тест
+`CatalogTokenMoveBetweenKeysAllowsFirstAndRefusesSecondDelete` (`gtest_cas_ref_gc.cpp:582-599`) пинит обрыв «после первого удаления».
+
+Границы серьёзности (почему P2, а не P1): это только латентность/накопление ref-объектов, не потеря и не тихая порча. Направление отказа
+fail-closed: ни одного удаления без подтверждённой авторизации, и кандидаты пересчитываются из durable-состояния в следующем раунде — комментарий
+`Gc/CasGc.cpp:3497-3501` («`planRefCleanup` recomputes the SAME remaining candidates from durable state next round, so nothing here needs its own
+cursor»). Практический вред: неограниченный рост `_log`/`_snap` под lifecycle-нагрузкой (стоимость хранения, длиннее LIST, длиннее реплей при
+восстановлении) — тот же симптом starvation, который уже наблюдался в CI на аналогичном месте.
+
+BACKLOG: пункта на это не было (грепы `catalog token`/`stillness`/`ref cleanup`/`whole-catalog` по `BACKLOG.md` и `BACKLOG/*.md` — пусто; ближайший
+сосед — `BACKLOG/docs-and-cleanup.md:36-38` «The destructive gate collapses per-namespace facts into a pool-wide boolean», другой механизм).
+Добавлен новый (незакоммиченный) раздел `docs/superpowers/cas/BACKLOG/gc.md`{#ref-cleanup-whole-catalog-token-stillness}. Owed: (а) ревалидация
+по СТРОКЕ, как в `684161dcc03` — строка по значению + переразрешение life + явный `throwIfAmbiguous` (именно он ловит aliasing-инкарнацию, которую
+раньше ловило сравнение токена); (б) отказ ограничить своим namespace (`continue`), а не всей фазой; (в) перецелить оба пинящих теста на
+per-row-контракт, добавив регресс на «чужая мутация каталога не должна останавливать подрезку».
