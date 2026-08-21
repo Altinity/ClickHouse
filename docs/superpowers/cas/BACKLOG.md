@@ -859,3 +859,21 @@ refusal when any other member's srid is prefixed by the victim's, or (2) forbid 
 multi-segment layouts that were deliberately enabled. Either way add the nesting case to
 `gtest_cas_decommission.cpp`. P2: destructive but operator-initiated and requires a nested-srid
 layout.
+
+## Empty conditional token passes as an unconditional write on the Native backend (2031-triage CAS-010) {#empty-token-unconditional-write-guard}
+
+`CasObjectStorageBackend`'s conditional-write path validates only the token TYPE
+(`mintingTypeMatches`, `CasObjectStorageBackend.cpp:918-930`), and `Token::type` defaults to `ETag`
+(`Primitives/CasTypes.h:259`), so a default-constructed `Token{}` passes every check; the S3 writer
+then omits `If-Match` for an empty string (`WriteBufferFromS3.cpp:656-657,746-747`) and the "fenced"
+write becomes an unconditional clobber. Emulated/InMemory backends fail closed, so the gap is
+Native-only and invisible to the emu doubles.
+
+No call site passes an empty token by construction (all guard `head.exists` or use
+`optional<Token>`), and `resurrect` already throws on one (`:1154`) — i.e. the guard is intended,
+just not applied uniformly. The one path that can legitimately produce an empty token on a `Done`
+write is `tokenFromWriteResult`'s HEAD-fallback (`:879-880`), whose value flows into
+`SingleWriterSlot::last_token` (`CasServerRoot.cpp:1291-1295 → :1186/:1337`); reaching it needs two
+simultaneous store anomalies. Fix: reject an empty ETag token at the conditional-write entry
+(fail-closed `LOGICAL_ERROR`-class throw) so no future call site can turn a fence into a clobber,
+plus a Native-backend unit test. P2 — missing guard, not a demonstrated data-loss path.
