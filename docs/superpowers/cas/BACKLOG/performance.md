@@ -396,3 +396,96 @@ the window in which another actor publishes `Removing` after the cached runtime'
 a cache needs the same invalidation edges {#ckpt-read-policy} lists (fence-generation change, wedge,
 remount supersession, `catalog_life_invalidated`) plus the terminal-removal path staying always-exact
 (`Pool/CasRefLedger.cpp:3223-3235`). Not correctness-affecting today; pure request-count/scale cost.
+
+## The dedup presence cache charges 64 B/entry against a real ~176 B (2031-triage CAS-115) {#dedup-cache-weight-constant-64}
+
+`DedupWeight::operator()` returns a constant `64` (`Pool/CasPool.h:1097-1100`) and the cache is built
+with `NO_MAX_COUNT` (`Pool/CasPool.cpp:212-214`), so `deduplication_cache_bytes` (default 64 MiB,
+`ContentAddressedSettings.cpp:78`) is the ONLY bound and it is charged at roughly a third of the real
+per-entry footprint. What one entry actually costs, with `Key = BlobRef` (33 B: `BlobHashAlgo` +
+`std::array<uint8_t,32>`, `Primitives/CasBlobDigest.h:207-214`) and `Mapped = DedupPresent`:
+
+- the `LRUCachePolicy::Cells` node — `std::unordered_map<Key, Cell>` with
+  `Cell{MappedPtr, LRUQueueIterator}` (`src/Common/LRUCachePolicy.h:204-216`): 16 B libc++ node header
+  + 64 B `pair<const BlobRef, Cell>` (33 padded to 40, plus 24) = 80 B;
+- one bucket-array slot: ~8 B;
+- the `LRUQueue` (`std::list<Key>`) node: 16 B links + 33 B key, padded = 56 B;
+- the per-entry `std::make_shared<DedupPresent>()` control block (`Pool/CasPool.cpp:269`): ~32 B.
+
+That is ~176 B, i.e. a 64 MiB budget resolves to 1,048,576 admitted entries holding ~176 MiB. The
+saturation point the audit named (a pool that has written ~1M distinct blobs) is arithmetically right.
+`CurrentMetrics::CASDeduplicationCacheBytes` reports the same fiction the weight does, so an operator
+cannot see the overshoot; the only workaround is to set `deduplication_cache_bytes` to a third of what
+they want.
+
+P3, accounting only: the overshoot is a fixed ~2.7x of a configured cap, not unbounded growth, the
+entries are ordinary tracked allocations, and a dropped entry only costs a HEAD (the cache is a
+presence hint, never an authority — `Pool/CasPool.cpp:245-264`). Owed: charge the structural cost
+(`sizeof` of the node + list node + key, i.e. a constant near 176 rather than 64), or drop the
+`shared_ptr`-per-entry by sharing one `DedupPresent` instance across all entries and charging the rest.
+
+The sibling half of the audit finding — `PartManifestWeight` (`Pool/CasManifestReader.h:81-91`) — does
+NOT belong here: its dominant term is `inline_bytes.size()`, which is exactly the memory that matters,
+and the manifest decode cache additionally carries a `max_count=16384` backstop
+(`Pool/CasManifestReader.cpp:38-40`). Its only inaccuracy is container overhead (96 B charged against a
+112 B `ManifestEntry` plus up to ~1.5x vector-capacity slack and libc++ string-allocation rounding),
+which is a ~1.3-1.8x undercount for path-only manifests and near-exact for the inline-heavy ones that
+actually consume the budget. Not worth a change on its own; if the constant is ever revisited, 176 is
+the honest per-entry figure.
+
+## Part staging is a linear-scanned vector, so a part costs O(F^2) path compares (2031-triage CAS-116) {#staging-vector-quadratic-path-scans}
+
+`PartStaging::entries` is a `std::vector<Cas::ManifestEntry>` (`ContentAddressedTransaction.h:139`) with
+no by-path index, and every mutation upserts by rescanning it: `std::erase_if(st.entries, … e.path ==
+entry.path)` at `ContentAddressedTransaction.cpp:718` (blob stage), `:951` (inline stage), `:1180`,
+`:1201` (`createHardLink`), `:1352` (`moveDirectory` re-key), `:1525` (`moveFile`), `:1550`
+(`replaceFile`), plus the linear `std::find_if` lookups at `:549` (`findStagedEntry`, the
+read-your-writes probe), `:1163`, `:1345`, `:1504`. Staging F files therefore costs ~F^2/2 path
+comparisons before any I/O, and `moveDirectory`'s re-key loop (`:1345-1353`) is a nested scan of the
+destination per source entry (the destination grows inside the loop, so the "destination is freshly
+created" note at `:1327-1329` does not make it linear).
+
+Real shape, small price: the comparisons are `std::string ==` on short names (length check first), so
+even a 3000-file wide-plus-projections part is a few million compares — single-digit milliseconds —
+against 3000 staged temp files and 3000 blob PUTs on the same path. Nothing is quadratic in BYTES and
+nothing is quadratic across parts (each `parts` entry is scanned independently,
+`ContentAddressedTransaction.h:157`). Also note the one place that WAS a real duplicate-membership
+quadratic is already fixed: `uploadPendingBlobs` builds an
+`unordered_set<BlobRef>` of referenced hashes (`ContentAddressedTransaction.cpp:261-264`) and the
+fan-out groups by unique ref.
+
+P3. Owed if the file count per part ever grows an order of magnitude (very wide tables with many
+projections and secondary indexes): keep a `std::unordered_map<std::string, size_t>` path->index
+alongside `entries`, or make `entries` a `std::map<std::string, ManifestEntry>` and drop the sorted-order
+re-derivation in `encodePartManifest`. Not worth touching before there is a measurement showing staging
+CPU on a profile.
+
+## Every blob body has a `.meta` sibling, so the blob namespace holds two objects per part file (2031-triage CAS-117) {#per-blob-meta-sibling-object-count}
+
+Mostly a re-statement of the tracked packing/inlining class ({#read-write} `[B121 / B202 / one-GET-open]`
+and {#writepath-candidates-post-stage1} item (3), which already carries the measured ~239 `PUT`/part /
+~8 objects/column). The one part of that audit finding with no home yet is the freshness marker:
+`Layout::blobMetaKey` is `blobKey(ref) + ".meta"` (`Formats/CasLayout.cpp:41`), every fresh upload
+creates it (`Pool/CasPartWriteTxn.cpp:540-547`, `writeFreshMetaClean` -> `putMetaIfAbsent`) and every
+adopt back-fills it when absent (`:422-423`), so a blob-placement part file costs TWO objects and two
+`PUT`s, not one. Because the sibling shares `blobsPrefix()` (`Tools/CasFsck.cpp:721-726`), every LIST of
+the blob namespace — fsck's physical listing and the GC fold's sweep — enumerates twice the keys, and
+the fsck pairing pass exists only because of it (`:1030-1033`). On top of that each body carries a
+`blob_header_len`-padded envelope (256 B by default, `Pool/CasPool.h:54`, padding at
+`Formats/CasBlobEnvelopeFormat.cpp:153-155`), which for a tiny `.mrk` is a large relative inflation of
+stored bytes; the envelope's own open question is `formats-and-storage.md`{#blob-envelope-never-read-back}.
+
+Scope correction worth keeping: this does NOT apply to "a wide part of small files" generally. Small
+eager metadata files are inlined into the manifest and cost no object at all (`INLINE_CAP` = 1 MiB,
+`ContentAddressedTransaction.cpp:98`, `:932`); only `.bin`, `.mrk*`/`.cmrk*` and `primary.idx` are
+forced to stay blobs (`Cas::partFileMustStayBlob`, declared `ContentAddressedTransaction.h:236-243`).
+For those, a plain object-storage MergeTree also stores one object per file, so CAS's INCREMENTAL cost
+is the `.meta` sibling plus the envelope, not a doubling of the whole part. Content-identical files
+across parts and replicas dedup to one body+meta pair.
+
+P3, and the cheap half is already someone else's item. What is owed specifically here: decide whether
+the marker can be folded (e.g. only materialized on condemn/resurrect rather than on every birth), which
+is a protocol-step change and therefore under the standing `HEAD`-before-`PUT` veto — so it needs an
+explicit user decision with a risk analysis, not an opportunistic optimization. Cheap and unblocked in
+the meantime: quantify it, i.e. report the body/`.meta` object split in `SYSTEM CAS FSCK` output so the
+2x LIST cost is visible rather than inferred.
