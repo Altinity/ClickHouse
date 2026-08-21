@@ -6807,10 +6807,6 @@ void MergeTreeData::exportPartToTable(
             query_context);
     }
 
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
-    ExportPartitionUtils::verifyExportSchemaCastable(
-        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
-
     if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
