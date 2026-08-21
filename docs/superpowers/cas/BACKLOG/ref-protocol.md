@@ -114,3 +114,19 @@ it). Two genuine residuals came out of the check:
 - **One `Faulted` arm never fires the anomaly policy** — the "occupant unreadable" arm sets
   `Faulted` without invoking the anomaly path, so that lane alone has no automatic remount and
   needs an operator. Wire it to the same policy the other terminal arms use.
+
+## The debug/sanitizer body-counter cross-check restores the O(K·N) replay it was meant to avoid (2031-triage CAS-054) {#debug-body-counter-assert-on-replay}
+
+`RefTableState::debugAssertBodyCounters` (`Pool/CasRefProtocol.cpp:483-504`) recomputes both body-byte
+totals and the `owned_manifests` membership from scratch — two row re-encodes per committed ref plus two
+per precommit — and it runs under `DEBUG_OR_SANITIZER_BUILD` at the end of every `applyTxnInPlace`
+(`:585`) and on every `admits` preview scratch (`:730`). Shipped builds are unaffected and the
+incremental counters themselves are O(1) (`b5f448e9b41`, `13ab814869c`), so this is purely a
+debug/sanitizer cost — but it is the one place where a documented complexity claim is inverted for those
+builds: the in-place apply comment at `:575-578` says a K-transaction replay over an N-row base was
+deliberately dropped from `O(K*N)` to `O(K + N)`, and the per-apply full rescan puts the `O(K*N)` back
+for exactly the builds where the soak and correctness runs execute. Cheapest honest fix: keep the
+cross-check but sample it (every apply on `admits` previews, which are single-op and already scratch-
+scoped; on `applyTxnInPlace` only on the first apply after an install, or under an explicit test-only
+flag), so recovery replay in an ASan/TSan run is not quadratic. Not correctness-affecting either way —
+the assert is a real invariant defence and must not simply be deleted.

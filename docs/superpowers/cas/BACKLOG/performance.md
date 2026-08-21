@@ -305,3 +305,39 @@ against a fresh resolve and rebuilds on mismatch (`Parts/PartFolderAccess.cpp:17
 memo to the createHardLink committed-source branch. The `Always` default itself stays — it is the
 fail-closed policy, and relaxing it is the separate, gated `part_folder_validate` question
 (`{#part-folder-validate-never-gating}`).
+
+## A standalone write on a committed part pays a second, throwaway manifest body (2031-triage CAS-056) {#standalone-write-scratch-manifest-cost}
+
+Any effective single-file write on an already-committed part goes through the carry-forward repoint
+branch of `ContentAddressedTransaction::publishStaging`. When the transaction staged content
+(`st.build` is non-null) that branch stages and precommits a SCRATCH manifest over the DELTA entries
+only, purely to hold the EDGE-BEFORE-OBSERVE closure across the upload loop
+(`ContentAddressedTransaction.cpp:356-358`), and then republishes the merged full manifest through
+`repointRef` → `publishEntries` → `prepareEntries`, which stages a SECOND manifest body
+(`Parts/PartFolderAccess.cpp:484`). `stageManifest` durably `PUT`s each body
+(`Pool/CasPartWriteTxn.cpp:854-881`), so the scratch body is a real object; because it was
+precommitted, `abandon` may not writer-delete it and appends an exact precommit-removal instead
+(`Pool/CasPartWriteTxn.cpp:1312-1318`), leaving the body for GC's delete-after-sealed-decrements.
+Per single-file write or unlink on a committed part that costs: 2 manifest `PUT`s, ~4 ledger appends
+(scratch precommit, repoint precommit, promote, scratch removal), the promote-time manifest `GET`
+(`Pool/CasPartWriteTxn.cpp:1035`, the separate `{#writepath-candidates-post-stage1}` item (5)), and
+one GC deletion — for one changed file. A mutation-style version bump that touches every part
+multiplies this by the part count.
+
+Secondary, same call: the promote closure walks the WHOLE merged entry list and, for every
+carried-forward (tokenless, adopted) blob leaf, increments `CASBlobAdoptTrusted` and emits one
+`BlobReuseAdopt` row into `system.content_addressed_log`
+(`Pool/CasPartWriteTxn.cpp:1123-1155`). Fresh-build entries are tokened and skipped, so this is
+specific to repoints: a repoint of a wide part writes one audit row per file of the part. Compounds
+`{#ca-log-tables-restart-cost}` in `gc.md`. `adoptEvidence` itself is a pure in-memory dep insert
+with no backend call (`Pool/CasPartWriteTxn.cpp:766-781`), and `build_ops` runs at most once per item
+(`Pool/CasRefLedger.cpp:2891-2900`), so this is O(entries) per publish, not per CAS retry.
+
+Nothing here is a correctness problem, and the byte-equal short-circuit already makes a genuinely
+no-op repoint zero-mutation on the `repointRef` side (`Parts/PartFolderAccess.cpp:555-568`) — the
+scratch `PUT` still happens on that path. Fix direction (protocol-adjacent, so it needs the same
+explicit go-ahead as items (4)/(5) above): the two-phase `prepareEntries` + `promote` handle already
+exists, so the repoint path could stage the MERGED manifest once, precommit it, upload the pending
+blobs under that edge, then promote — one body instead of two, with no weakening of
+EDGE-BEFORE-OBSERVE. The audit-row volume can be addressed independently (aggregate one
+`BlobReuseAdopt`-class row per publish with a count, keeping the per-leaf `ProfileEvent`).
