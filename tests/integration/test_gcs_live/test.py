@@ -30,12 +30,15 @@ suite touches a real bucket and issues real, billable requests, so it must never
   - `GCS_LIVE_HMAC_SECRET_ACCESS_KEY`
   - `GCS_LIVE_OAUTH_FROM_METADATA=1` — declares that the HOST running this suite can reach the GCE
                                     metadata server and that its service account may write to the
-                                    bucket. Enables group 2. It is a declaration rather than a
-                                    credential because a CAS disk rejects `metadata_service` as an
-                                    unknown setting (`non_cas_keys` in `ContentAddressedSettings.cpp`
-                                    lists `http_client` but not `metadata_service`), so the OAuth
-                                    client must find the real default metadata host. There is nothing
-                                    to point elsewhere.
+                                    bucket. Enables group 2 on a GCE instance.
+  - `GCS_LIVE_OAUTH_ADC_CLIENT_ID` — Application Default Credentials, the alternative that enables
+  - `GCS_LIVE_OAUTH_ADC_CLIENT_SECRET`  group 2 from ANYWHERE, not just on GCE. A CAS disk accepts
+  - `GCS_LIVE_OAUTH_ADC_REFRESH_TOKEN`  these: `non_cas_keys` in `ContentAddressedSettings.cpp` lists
+                                    `metadata_service`, `request_token_path`, `service_account` and the
+                                    whole ADC triple, and its own comment says the triple "is the only
+                                    way to run `gcp_oauth` off a GCE instance". Either source is
+                                    enough; the ADC one exists because requiring a GCE host is what
+                                    would keep this gate from ever being run.
 
 Only disks whose gates are satisfied are written into the configuration. That is deliberate: a CAS
 disk mounts and runs its capability battery at server startup with no fallback, so an unusable CAS
@@ -111,9 +114,14 @@ BASE_PREFIX = os.environ.get("GCS_LIVE_PREFIX", "clickhouse-gcs-live-gate")
 HMAC_KEY_ID = os.environ.get("GCS_LIVE_HMAC_ACCESS_KEY_ID", "")
 HMAC_SECRET = os.environ.get("GCS_LIVE_HMAC_SECRET_ACCESS_KEY", "")
 OAUTH_FROM_METADATA = os.environ.get("GCS_LIVE_OAUTH_FROM_METADATA", "") == "1"
+ADC_CLIENT_ID = os.environ.get("GCS_LIVE_OAUTH_ADC_CLIENT_ID", "")
+ADC_CLIENT_SECRET = os.environ.get("GCS_LIVE_OAUTH_ADC_CLIENT_SECRET", "")
+ADC_REFRESH_TOKEN = os.environ.get("GCS_LIVE_OAUTH_ADC_REFRESH_TOKEN", "")
+ADC_AVAILABLE = bool(ADC_CLIENT_ID and ADC_CLIENT_SECRET and ADC_REFRESH_TOKEN)
 
 HMAC_AVAILABLE = bool(BUCKET and HMAC_KEY_ID and HMAC_SECRET)
-OAUTH_AVAILABLE = bool(BUCKET and OAUTH_FROM_METADATA)
+# Either token source satisfies group 2 — the GCE metadata server, or Application Default Credentials.
+OAUTH_AVAILABLE = bool(BUCKET and (OAUTH_FROM_METADATA or ADC_AVAILABLE))
 
 # The endpoint must be spelled with `storage.googleapis.com`, not a regional or private alias: that
 # substring is the whole of `deduceProviderType`, and the api-mode transformations this gate exists to
@@ -187,6 +195,18 @@ def _disk_xml(name, subprefix, cas, client, bucket=None, skip_access_check=False
         lines += [
             "                <access_key_id>{}</access_key_id>".format(HMAC_KEY_ID),
             "                <secret_access_key>{}</secret_access_key>".format(HMAC_SECRET),
+        ]
+    if client == "gcp_oauth" and ADC_AVAILABLE:
+        # `requestBearerToken` picks between the GCE metadata server and these; a CAS disk accepts them
+        # (they are in `non_cas_keys`). Present only when supplied, so a GCE run keeps using metadata.
+        lines += [
+            "                <google_adc_client_id>{}</google_adc_client_id>".format(ADC_CLIENT_ID),
+            "                <google_adc_client_secret>{}</google_adc_client_secret>".format(
+                ADC_CLIENT_SECRET
+            ),
+            "                <google_adc_refresh_token>{}</google_adc_refresh_token>".format(
+                ADC_REFRESH_TOKEN
+            ),
         ]
     lines.append("            </{}>".format(name))
     return "\n".join(lines)
@@ -348,7 +368,8 @@ requires_hmac = pytest.mark.skipif(
 )
 requires_oauth = pytest.mark.skipif(
     not OAUTH_AVAILABLE,
-    reason="set GCS_LIVE_OAUTH_FROM_METADATA=1 on a host with GCE metadata credentials",
+    reason="set GCS_LIVE_OAUTH_FROM_METADATA=1 on a GCE host, or the GCS_LIVE_OAUTH_ADC_* triple "
+    "anywhere else",
 )
 
 
@@ -365,9 +386,10 @@ def test_default_gcs_hmac_accepts_the_ordinary_object_storage_operation_set():
     whether GCS accepts a batch delete is what this gate is asking. Pinning the mapping would make this
     test fail on refactors that say nothing about GCS.
 
-    Object LISTING is not covered by this group at all — see the comment on `counters` below. It is the
-    one operation in the ordinary set that an ordinary MergeTree lifecycle on a local-metadata disk
-    never issues, so no statement here can drive it.
+    Object LISTING is not covered by THIS test — an ordinary MergeTree lifecycle on a local-metadata
+    disk never issues one, see the comment on `counters` below.
+    `test_default_gcs_hmac_accepts_an_object_listing` covers it on the same `gcs_hmac` client through
+    the table-engine path, which is a lister.
 
     Would fail if: GOOG4 signing produced a signature Google rejects for some operation, or the
     existing `access_key_id`/`secret_access_key` spelling stopped being accepted by the `gcs_hmac`
@@ -436,10 +458,43 @@ def test_default_gcs_hmac_accepts_the_ordinary_object_storage_operation_set():
             )
         )
 
-    # `S3DeleteObjects` counts the singular `DeleteObject` and the batch `DeleteObjects` together --
-    # ProfileEvents.cpp describes it as "DeleteObject(s) calls" -- so the two cannot be separated from
-    # here. Both are exercised by the statements above (a merge removes single objects, a dropped
-    # partition removes them in batches), but only their sum is observable.
+    # `S3DeleteObjects` counts the singular and batch forms together, so the counter alone cannot say
+    # the batch form was accepted. The two paths log differently, which separates them:
+    # `deleteFileFromS3` logs "Object with path <k> was removed from S3" and `deleteFilesFromS3` logs
+    # "Objects with paths [<k>,...] were removed from S3".
+    #
+    # The load-bearing one is the third line. When GCS refuses a batch `DeleteObjects`,
+    # `deleteFilesFromS3` logs "DeleteObjects is not supported", calls
+    # `s3_capabilities.setIsBatchDeleteSupported(false)` and silently retries with plain
+    # `DeleteObject` — so the batch form failing looks EXACTLY like success at both the counter and the
+    # data level. Asserting that line is absent while the plural line is present is the only way to say
+    # GCS accepted the batch shape rather than the fallback having covered for it.
+    #
+    # LOG LEVEL, because this assertion's ability to FAIL depends on it. The two lines sit at different
+    # levels: the plural "Objects with paths [...]" is `LOG_DEBUG`, the fallback notice is `LOG_TRACE`.
+    # A server that did not admit TRACE would make the absence check pass unconditionally — a test that
+    # cannot fail. It is admitted here because `add_instance` copies
+    # `helpers/0_common_instance_config.xml` unconditionally and that sets `<level>test</level>`, and
+    # `Poco::Message` orders `PRIO_TEST` BELOW `PRIO_TRACE`, so `test` admits trace messages. (The
+    # `with_installed_binary` path rewrites it to `trace`, which also admits them.) If this suite ever
+    # sets `copy_common_configs=False` or overrides the logger level, re-check this before trusting the
+    # absence half.
+    # Filtered to this test's own key prefix: the log carries every disk's traffic, and the CAS disks
+    # in this configuration delete objects too, so an unfiltered match would be the same
+    # someone-else's-traffic confound the module docstring warns about for counters.
+    batch_lines = [
+        line
+        for line in node.grep_in_log("Objects with paths [").splitlines()
+        if PREFIX in line
+    ]
+    assert batch_lines, (
+        "no batch delete was logged for this run's own keys, so GCS acceptance of the batch "
+        "DeleteObjects shape is unproven"
+    )
+    assert not node.grep_in_log("DeleteObjects is not supported"), (
+        "GCS refused the batch DeleteObjects shape and ClickHouse fell back to singular deletes; the "
+        "counter and the row counts cannot see this, which is why it is asserted here"
+    )
 
 
 @requires_hmac
@@ -464,6 +519,45 @@ def test_default_gcs_hmac_reports_a_typed_error_for_a_refused_request():
     # A parsed S3 error names the bucket problem. An unparsed one surfaces as a bare transport or
     # timeout failure, which is what must not appear.
     assert ("NoSuchBucket" in error) or ("S3_ERROR" in error) or ("ACCESS_DENIED" in error), error
+
+
+@requires_hmac
+def test_default_gcs_hmac_accepts_an_object_listing():
+    """GCS accepts a LIST under GOOG4 signing, driven by a glob over the named collection.
+
+    The disks above cannot produce one: they use local metadata, so MergeTree's directory iteration
+    reads the local metadata directory and `IObjectStorage::iterate` is never called. The table-engine
+    path IS a lister — `StorageObjectStorageSource` calls `object_storage->iterate` to expand a glob —
+    and the named collection puts that on the same `gcs_hmac` client, so the listing is signed the same
+    way as everything else in this group.
+
+    The reachability proof is the DATA, not a counter, and that is deliberate: `S3ListObjects` is
+    exactly the counter the module's OPEN QUESTION section warns about, since the CAS disks in this
+    configuration list too. Reading rows that came from two separate objects through one glob cannot be
+    satisfied by anyone else's traffic — the listing must have enumerated both to return their union.
+
+    Would fail if: GCS rejected a GOOG4-signed `ListObjectsV2`, or returned a body the SDK cannot parse
+    into keys — the glob would resolve to fewer objects and the union would be short.
+    """
+    node = cluster.instances["node"]
+    for part in (1, 2):
+        node.query(
+            "INSERT INTO FUNCTION s3({}, filename='listing-probe-{}.parquet', format='Parquet') "
+            "SELECT {} AS part, number AS id FROM numbers(10)".format(
+                PARQUET_NAMED_COLLECTION, part, part
+            ),
+            settings={"s3_truncate_on_insert": 1},
+        )
+
+    glob = "s3({}, filename='listing-probe-*.parquet', format='Parquet')".format(
+        PARQUET_NAMED_COLLECTION
+    )
+    assert int(node.query("SELECT count() FROM {}".format(glob))) == 20
+    # Both objects, through one glob: the listing enumerated them rather than a single key being read.
+    assert (
+        node.query("SELECT DISTINCT part FROM {} ORDER BY part FORMAT TSV".format(glob)).split()
+        == ["1", "2"]
+    )
 
 
 @requires_hmac
@@ -576,6 +670,27 @@ def test_native_conditional_gcp_oauth_mounts_and_keeps_generation_tokens():
     a stale AWS signing artifact on the request that Google rejects, which is one of the two things
     only a live endpoint can settle: against `storage.googleapis.com` the `ApiMode::GCS` block in
     `Client::BuildHttpRequest` becomes active, and `test_cas_gcs` cannot reach it.
+
+    Two shapes the plan asks of this group are NOT here, because no configuration this suite can hold
+    produces them. Both enumerations are written out rather than asserted, since "nothing can drive
+    this" is a claim about a set:
+
+    A CHECKSUM-BEARING or CHUNKED/FRAMED PUT. The only producer of `x-amz-checksum-*` is
+    `RequestChecksumRequired`, which returns `is_s3express_bucket`, and `setChecksumAlgorithm` has
+    exactly one caller, `setIsS3ExpressBucket`. `is_s3express_bucket` has one source,
+    `S3::isS3ExpressEndpoint(url.endpoint)`, which is `endpoint.contains("s3express")`. This gate
+    REQUIRES the endpoint to be `storage.googleapis.com` — that substring is what makes
+    `deduceProviderType` report GCS, which is the property the gate exists to exercise. `disable_checksum`
+    only suppresses `Content-MD5`; it never turns checksum headers on. So against a real GCS endpoint
+    the aws-chunked framing headers cannot appear, and the allowlist's `Consume` rule for
+    `x-amz-checksum-` and `Reject` rules for `x-amz-trailer` / `x-amz-decoded-content-length` are
+    reachable only from the dialect unit tests. They guard a future SDK change, not a current config.
+
+    An ATTRIBUTE ROUND TRIP. No production path fills object attributes on any object storage: every
+    `writeObject` caller outside the object-storage layer passes `/* attributes= */ {}`, no
+    `ObjectAttributes{...}` is constructed outside tests, and every CAS `putIfAbsent` /
+    `nativeConditionalPut` site forwards a `meta` parameter without ever building a non-empty one. So
+    there is no SQL statement that writes custom metadata, and nothing to read back.
     """
     _run_cas_group(CAS_OAUTH_DISK)
 
