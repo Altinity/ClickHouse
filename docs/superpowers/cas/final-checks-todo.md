@@ -84,7 +84,30 @@ short-lived TODO, not the record.
   needed: the first stops new occurrences, the second unwedges an existing pool.
 - Pre-release: yes. A single unlucky DDL permanently disables reclamation for the whole pool.
 
-## 9. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 9. Fix the three untracked P1s from the 2026-08-05 umbrella review {#fix-umbrella-p1}
+
+Re-verified against HEAD on 2026-08-21 (`docs/superpowers/cas/fable-review-triage.md`): still open,
+and none of the three was tracked anywhere until now.
+
+- **B1 — `~Gc` vs `meta_pool` drain (UAF class).** No explicit `~Gc` exists and `meta_pool` is
+  declared BEFORE `condemn_marker_mutex`/`condemn_markers_confirmed`, so members destroy in an order
+  that leaves a live pool worker locking a destroyed mutex when a round throws after scheduling a
+  condemn-marker write. rev.8 made `Gc` destruction a routine event (UNMOUNT, GC STOP), not just
+  shutdown — which widens the window rather than closing it. Fix: explicit destructor that
+  waits `meta_pool` first (or declare it last), plus a drain on the scheduler's exception path.
+- **B2a — `MountLeaseKeeper::claim()` throws `LOGICAL_ERROR`** on four "environment changed under us"
+  branches reachable from the background self-remount thread; in debug/ASan that is `abort()` on the
+  very lanes that certify the feature. The sibling renewal path was already reclassified to
+  `ABORTED`/`MountFencedException`; apply the same to `claim()` and update the death test that pins
+  the current behaviour. (2b, the GC delete-marker site, is tracked separately as
+  `{#versioning-enabled-after-mount}`.)
+- **B3 — inline `disk(metadata_type='cas', …)` bypasses the whole `SYSTEM CAS` privilege model.**
+  The factory still has no `custom_disk` gate, so any user who can `CREATE TABLE` mints a permanent
+  pool member with a pool-wide view of other tenants' namespaces. The ready-made pattern is the
+  `use_fake_transaction` rejection one file over. Decide: reject `custom_disk` for pool-joining
+  metadata types, or require a dedicated grant.
+
+## 10. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
