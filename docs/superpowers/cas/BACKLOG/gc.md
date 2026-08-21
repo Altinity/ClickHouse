@@ -477,3 +477,22 @@ destructive `SYSTEM CAS DROP POOL MEMBER`, and the disk-side `shutdown()` is wir
 server shutdown (`src/Disks/DiskSelector.cpp:254-259` → `DiskObjectStorage.cpp:504-513`). The
 decommission verb's immediate refusal on a live member is the certificate-of-death rule
 (`BACKLOG.md`{#decommission-wrong-predicate}), not a missing drain.
+
+## `GC REBUILD FORCE` cannot recover from an undecodable `gc/state` — the very disaster it exists for (opus review B8) {#rebuild-cannot-recover-undecodable-gc-state}
+
+`rebuildBaseline` correctly classifies an undecodable `gc/state` as its own disaster case and passes
+the gate — and then unconditionally re-decodes the same bytes inside `acquireOrRenewLease`
+(`Gc/CasGc.cpp:4539`, no `try`), so `SYSTEM CAS GC REBUILD … FORCE` throws `CORRUPTED_DATA` and the
+DR verb is inoperable in exactly the scenario it was written for. The only workaround — deleting the
+object with an external S3 client — is named in no message.
+
+Why the sibling triages missed it: CAS-069 and CAS-095 both stopped at the empty `catch` (or at the
+dry run's loud throw) and declared the safety half sound; neither followed the sequence through to
+the lease acquisition. No test plants garbage at `gcStateKey()` either — every rebuild test deletes
+the state instead, which is the one case that works.
+
+P2, not P1: fail-closed, a manual workaround exists, and the trigger (byte damage) sits outside the
+trusted-store fault model. Fix: make the lease acquisition on the rebuild path tolerate an
+undecodable state (that is what "rebuild" means), and name the external-delete workaround in the
+error until it does. Class-level neighbours: {#damaged-object-repair} (names `gc/state` explicitly)
+and {#rebuild-gcstate-decode-reason-unreported}.
