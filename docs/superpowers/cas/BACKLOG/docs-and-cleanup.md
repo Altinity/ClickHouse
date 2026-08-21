@@ -110,3 +110,19 @@ backup/log-shipping/analytics roles pointed at the pool should be read-only. Add
 trust-boundary section (index or bucket-requirements) saying exactly that. Consequence of the gap is
 operational, not a code defect: an operator can hand out pool credentials believing them to be
 narrower than they are.
+
+## Bucket requirements never state "one pool = one bucket+prefix, no replication over it" (2031-triage CAS-032) {#pool-exclusive-prefix-undocumented}
+
+Pool identity is deliberately not tied to an endpoint or bucket (`ContentAddressedExchange.h:156-158`
+rejects endpoint-based identity; `PoolMeta` carries only pool_id / blob_header_len / gc_shards /
+min_reader_generation / algos_used, and `CasPool.cpp:124-128` only catches a FOREIGN pool_id — a
+cross-region-replicated copy shares it, so it looks like the same pool). Read-only mounts of such a
+copy fail loud or read stale rather than corrupt; the corrupting case is a WRITABLE mount of a
+replication destination, or bidirectional replication over the prefix, which violates the
+CAS-exclusive-prefix premise the design already assumes.
+
+That premise is nowhere in the user docs: `docs/en/antalya/cas/.../bucket-requirements.md` never says
+"one pool lives in exactly one bucket+prefix, nothing else writes there, and no bucket replication
+may target it". Add it (same pass as {#bucket-requirements-lifecycle-worm-glacier}). Optional
+belt-and-braces: record the endpoint advisorily in the mount lease so a mismatch can be reported —
+advisory only, identity stays pool_id-based.

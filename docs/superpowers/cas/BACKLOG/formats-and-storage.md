@@ -130,3 +130,19 @@ defense" the audit claims: the single-attempt gate and the residual proof stay (
 observability: nothing tells the operator the probe was skipped, and the probe's own step-8 text
 claims the versioning check "has no override", which is false. Fix: log the skip at default level
 (with what is consequently unverified) and correct the message. P3.
+
+## Versioning enabled AFTER mount: misclassified error, delete-marker check at 1 of 8 sites (2031-triage CAS-029) {#versioning-enabled-after-mount}
+
+The audit's headline (versioning slips through because the GCS config check fails open) is false: a
+mandatory BEHAVIOURAL probe at every writable mount detects it — `CasProbe.cpp:209-224` checks
+`created_delete_marker`, tested at `gtest_cas_probe.cpp:61`, and it rejects a versioned bucket on AWS
+and on any S3-compatible store regardless of the config check. Three narrow residuals do stand:
+
+- versioning turned ON **after** the mount surfaces as `LOGICAL_ERROR` (`Gc/CasGc.cpp:804`) for a
+  state an operator can reach — reclassify (`CORRUPTED_DATA`-class or a named CAS error), per
+  [[feedback_logical_error_tests_death_split]];
+- `created_delete_marker` is consulted at only ONE of the eight destructive delete sites, so the
+  post-mount case is caught late and only on the blob-body path — decide whether the check belongs in
+  the shared delete helper;
+- the GCS config check fails open, and `skip_access_check` skips the probe entirely (see
+  {#skip-access-check-no-signal}).

@@ -43,12 +43,12 @@
 | CAS-025 | by-design | P3 | [{#gc-followups}](BACKLOG.md#gc-followups) | нет | Механика описана верно (rebuild стартует с пустых priors, свод edge-only, condemn-универсум сбрасывается, инкрементальный fold такие блобы больше не найдёт), но это осознанный fail-closed компромисс, уже зафиксированный в BACKLOG как «REBUILD R4 residual»: это удержание (retention), а не потеря, видимое как недренирующийся fsck `unaccounted`. |
 | CAS-026 | by-design | P3 | — | нет | Идентичность relink — не «только `pool_uuid`»: это pool_uuid + server_root_id + namespace + ref + part + точный `ManifestRef`, доказываемый publish-then-confirm у источника; отсутствие probe блобов — сознательный §4 manifest-trust (`8fe6331a431`), а `check_consistency=false` — байт-в-байт то же, что и в upstream байтовом пути. |
 | CAS-027 | by-design | P3 | [{#pool-trust-boundary-undocumented}](BACKLOG/docs-and-cleanup.md#pool-trust-boundary-undocumented) | нет | Код на HEAD ровно соответствует урегулированной позиции (никакой intra-pool аутентификации нет, bucket-credential = вся граница доверия); единственный реальный остаток — эта граница доверия не описана нигде в `docs/en/antalya/cas/`. |
-| CAS-028 | ⏳ | — | — | — | — |
-| CAS-029 | ⏳ | — | — | — | — |
+| CAS-028 | by-design | P3 | `BACKLOG/operability-and-introspection.md` {#operability} — пункты **[B14]** (expedited/GDPR right-to-erasure delete) и **[B17]** (encryption-at-rest × content-addressing, «dedup scope per-encryption-key») | нет | Ключи блобов на HEAD действительно неподсолённые пул-глобальные хеши контента — это и есть суть CAS-дедупа (не пересматриваем); dedup-оракул через `system.cas_log` требует явного гранта (не доступен непривилегированному пользователю), а вот отсутствие crypto-shred-примитива подтверждается и в операторской документации не написано ни одной строкой. |
+| CAS-029 | частично | P3 | [{#versioning-enabled-after-mount}](BACKLOG/formats-and-storage.md#versioning-enabled-after-mount) | нет | Центральное утверждение находки ложно: versioning-предусловие проверяется НЕ конфигурационной GCS-проверкой, а обязательным поведенческим mount-пробом (`created_delete_marker`), который отбивает любой versioned-бакет на AWS и любом S3-совместимом сторе; реально остались три узких остатка — fail-open GCS-проверки, включение versioning ПОСЛЕ монтирования (там `LOGICAL_ERROR` вместо нормальной ошибки, и только на пути тела блоба) и `skip_access_check`. |
 | CAS-030 | частично | P3 | [{#skip-access-check-no-signal}](BACKLOG/formats-and-storage.md#skip-access-check-no-signal) | нет | Механика верна (probe целиком пропускается, decommission выставляет флаг жёстко), но «removes every bucket-configuration defense» преувеличено — single-attempt gate и residual-proof остаются, а реальный остаток — отсутствие ЛЮБОГО сигнала оператору о пропущенном probe и самопротиворечивое сообщение про versioning «has no override». |
 | CAS-031 | подтверждено | P2 | [{#write-once-probe-misses-multipart}](BACKLOG/formats-and-storage.md#write-once-probe-misses-multipart) | нет | Верно: обе write-once CREATE-примитивы (streaming `putIfAbsentStream` и server-side `promoteStaged`) для больших тел переносят `If-None-Match` на `CompleteMultipartUpload`, а обе probe-проверки экзерсайзят только маленький single-operation путь — т.е. батарея сертифицирует не тот путь, по которому идёт основной объём блобов; но эксплуатируемо только на сторонних S3-совместимых хранилищах (AWS требование поддерживает, GCS отказывается громко). |
-| CAS-032 | ⏳ | — | — | — | — |
-| CAS-033 | ⏳ | — | — | — | — |
+| CAS-032 | частично | P2 | [{#pool-exclusive-prefix-undocumented}](BACKLOG/docs-and-cleanup.md#pool-exclusive-prefix-undocumented) | нет | Форма кода подтверждена — идентичность пула нигде не привязана к endpoint/бакету, но вредное следствие требует операторской ошибки (запись в CRR-приёмник / двунаправленная репликация поверх префикса), которая нарушает уже подразумеваемое, но НЕ задокументированное требование «префикс принадлежит только CAS»; фикс = требование в docs + необязательная advisory-запись endpoint в mount-lease. |
+| CAS-033 | by-design | P2 | [{#ckpt-damage-no-repair-path}](BACKLOG.md#ckpt-damage-no-repair-path) | нет | Ворота действительно пул-широкие и без границы — это осознанный fail-closed выбор («лучше не рекламировать, чем удалить лишнее»), позиция в коде подтверждается; но «нет сигнала оператору» — фактически неверно (WARNING с разбором причин, ProfileEvent, `suppressed` в phase-метриках, `pending_reclaim`/`wedged_namespace_count`), а гранулярность уже трекается в BACKLOG. |
 | CAS-034 | ⏳ | — | — | — | — |
 | CAS-035 | ⏳ | — | — | — | — |
 | CAS-036 | ⏳ | — | — | — | — |
@@ -1241,3 +1241,333 @@ if (!write_settings.object_storage_write_if_match.empty())
 **(4) Что реально надо сделать (и это отсутствует на HEAD).** Батарею нужно расширить одним шагом, который экзерсайзит именно multipart-путь: conditional create тела размером выше `max_single_part_upload_size` (или с `s3_min_upload_part_size`, приведённым вниз, чтобы шаг оставался дешёвым), повторно на занятый ключ → ожидание `PreconditionFailed`; и то же для `probeConditionalCopy`. Альтернатива в духе уже принятого GCS-решения — не сертифицировать, а сузить: форсить single-part для условных записей на любом не сертифицированном store и падать громко выше cap. Ни того, ни другого в коде нет; `Pool/CasPool.cpp:457-481` вызывает батарею как есть.
 
 **BACKLOG/история.** Прямого анкера нет: по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` все совпадения по «multipart» — про GCS (`BACKLOG.md:419-457` `{#gcs-conditional-overwrite-rethink}`, `BACKLOG/formats-and-storage.md:23` «[GCS production-grade follow-ups]») и про emulated-resurrect в RAM (`{#emulated-resurrect-spill-to-disk}`); ETag-хранилища там не рассматриваются, что подтверждает: пробел не отслеживается. Ближайший по КЛАССУ отслеживаемый пункт — `BACKLOG/formats-and-storage.md:24` `{#list-consistency-real-s3}`: «Add a LIST-consistency probe in `Cas::Probe` before LIST-derived discovery is trusted on a given store», т.е. та же идея «passport'а для конкретного store» (и `BACKLOG/gc.md:22` про сертификацию LIST). Разумно оформить новый пункт того же вида: «conditional-write passport must cover the multipart finalize path». По истории: `git log -S "SetIfNoneMatch" -- src/IO/WriteBufferFromS3.cpp` даёт только `1f6b7ba9c5c` — строка на CMU не менялась после введения, ничего это не закрывало.
+
+## CAS-032 — Форма кода подтверждена — идентичность пула нигде не привязана к endpoint/бакету, но вредное следствие требует операторской ошибки (запись в CRR-приёмник / двунаправленная репликация поверх префикса), которая нарушает уже подразумеваемое, но НЕ задокументированное требование «префикс принадлежит только CAS»; фикс = требование в docs + необязательная advisory-запись endpoint в mount-lease. (частично, P2) {#cas-032}
+
+## 1. Что реально в коде на HEAD (якорь устарел)
+
+Якорь `CA/Pool/CasPoolMeta.cpp:100-104`, `:111-119` устарел: файл лежит в
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPoolMeta.cpp` (168 строк),
+релевантная функция — `PoolMeta::createOrValidate` (`Pool/CasPoolMeta.cpp:108-168`).
+
+Утверждение «ничто не связывает идентичность пула с endpoint или регионом» — **держится**:
+
+- Состав `PoolMeta` — `Formats/CasPoolMetaFormat.h:24-32`: `pool_id`, `blob_header_len`,
+  `gc_shards`, `min_reader_generation`, `algos_used`. Ни endpoint, ни бакета, ни региона, ни
+  какого-либо URL-производного поля нет.
+- `pool_id` минтится из RNG (`Pool/CasPoolMeta.cpp:24-29` `mintPoolId`), т.е. это чистая
+  случайная метка, не производная от адреса хранилища.
+- Единственная проверка идентичности на открытии/переоткрытии — сравнение `pool_id` и
+  `blob_header_len` со «своими»: `Pool/CasPool.cpp:124-128` (`fresh.pool_id == expected_pool_id`,
+  иначе `Vanished(replaced)` с текстом «data root replaced by a foreign pool (pool_id …)»),
+  диагностика — `Pool/CasPool.cpp:85`, `:324`. Для **CRR-копии** `pool_id` побитово тот же, так
+  что этот детектор по построению молчит. Это ровно то, о чём говорит находка.
+- Аренда монтирования тоже не несёт адреса хранилища: `Formats/CasServerRootFormats.h:47-58`
+  (`MountLease`: `server_uuid`, `writer_epoch`, `hostname`, `pid`, `started_at_ms`, `seq`,
+  `expires_at_ms`, `min_active`, `gc_fenced`) — `hostname` относится к серверу, не к endpoint.
+- В интроспекции тоже нет: `grep -n "endpoint|bucket" src/Storages/System/StorageSystemContentAddressedMounts.cpp`
+  даёт пусто; `CasLifecycleSnapshot` (`ContentAddressedMetadataStorage.h:109-117`) содержит
+  `pool_id`/`server_root_id` и никакого адреса.
+- Счётчик эпох писателя (`ServerEpoch`, `Formats/CasServerRootFormats.h:38-41`, «stored value is
+  the next epoch to allocate») хранится **только в самом бакете**; локального floor нет
+  (сознательное решение, ср. «recovery cold-LIST trusted, no local floor»). То есть на отстающей
+  копии счётчик отстаёт и `writer_epoch` может быть переиспользован.
+
+## 2. Где находка перегибает
+
+Находка помечена `INTEGRITY` с формулировкой «conditional writes are then made against a bucket
+whose contents lag». Проверка достижимости:
+
+(а) **Read-only монтирование реплики «для read scale-out».** Отстающая копия даёт устаревший
+ref-log/каталог — это чтение старого состояния, а не порча. Если манифест уже прилетел, а тело
+блоба ещё нет, чтение падает **громко** (отсутствующий объект — ошибка, не подстановка). На
+relink-пути это тоже fail-closed: `ContentAddressedExchange.h:148-151` — «When the local manifest
+cannot be committed — for example a required blob body is absent at precommit — adoption publishes
+nothing and the caller falls back to fetching the part bytes». Так что «read scale-out на реплике»
+= stale reads + громкие ошибки, не тихая порча.
+
+(б) **Writable монтирование CRR-приёмника / двунаправленная репликация поверх префикса.** Вот
+здесь следствие реально: репликация перезаписывает объекты **без** условных предикатов, поэтому
+она способна откатить/подменить объекты, на исключительность которых опирается протокол (аренда
+монтирования, `gc/state`, тела манифестов под ключом `writer_epoch:build_sequence:ordinal`), а
+отставший `ServerEpoch` позволяет заново выдать уже использованную эпоху. Это путь к тихому
+расхождению. Но он требует операторского действия, которое ломает базовую предпосылку CAS:
+«`pool_prefix` is exclusively CAS-owned» (`Pool/CasPoolMeta.cpp:139-146`, комментарий
+BOOTSTRAP GATE). Двунаправленно реплицируемый префикс — это по сути второй, неусловный писатель в
+префиксе; ни один детектор идентичности пула эту конфигурацию поймать не может, только запрет в
+требованиях.
+
+Формулировка «мониторование реплики неотличимо от primary» **верна**; формулировка impact
+«conditional writes are made against a lagging bucket» верна только для (б).
+
+Отдельно: предложенное «привязать идентичность к endpoint» противоречит явно зафиксированному
+решению в коде — `ContentAddressedExchange.h:156-158`: «Two replicas may relink iff equal —
+endpoint/prefix string-matching is unsafe (false positives => mis-relink)». То есть заменять
+`pool_id` строкой endpoint нельзя; допустимо только **дополнительное advisory-поле** (лог/аренда),
+которое не участвует в решениях протокола.
+
+## 3. Что нашлось в BACKLOG и истории
+
+- Прямого покрытия нет: `grep -niE "cross-region|CRR|failover|replica bucket|bucket replicat|pool identity"`
+  по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` — пусто. Анкер не выдаю.
+- Пользовательская документация требований к бакету (`docs/en/antalya/cas/bucket-requirements.md:18-31`)
+  перечисляет read-after-write, условные create/overwrite, exact-token delete, ranged GET, LIST,
+  «no versioning / no delete markers», `TOKEN ⟹ CONTENT` — и **не содержит** ни требования
+  «один пул = один бакет/префикс», ни запрета репликации бакета/префикса, ни предупреждения о
+  монтировании CRR-приёмника. Это и есть настоящая, проверяемая дыра.
+  Замечу: соседняя триажная работа уже открывала «bucket requirements docs gap»
+  (`a41d42ffe45 ca: 2031-triage — CAS-012 adjudicated; backlog: bucket requirements docs gap + Glacier classification`),
+  так что правку логично класть тем же абзацем требований.
+- В истории попыток привязать идентичность к адресу не было: `git log -S` по `endpoint` в
+  CAS-дереве не даёт коммита, вводившего/удалявшего такую привязку; единственное релевантное
+  зафиксированное решение — цитата выше из `ContentAddressedExchange.h`.
+
+## 4. Что реально осталось (предложение)
+
+1. (основное, дёшево) В `docs/en/antalya/cas/bucket-requirements.md` добавить явное требование:
+   пул живёт в ровно одном бакете+префиксе; репликация бакета/префикса (CRR/двунаправленная) поверх
+   `pool_prefix` запрещена; приёмник репликации нельзя монтировать writable, а read-only
+   монтирование копии даёт устаревшие данные и не поддерживается как «read scale-out».
+2. (необязательно, advisory) Писать endpoint+bucket в `MountLease`/`system.cas_mounts` **только как
+   диагностику** — чтобы «пул тот же, адрес другой» было видно оператору и в логе, без участия в
+   решениях протокола (иначе нарушим решение `ContentAddressedExchange.h:156-158`).
+
+Тихая порча возможна, но только за пределами контракта, который надо просто записать; кода,
+который бы ломался в поддерживаемой конфигурации, здесь нет. Отсюда P2 (трекать после релиза),
+PRE-RELEASE = нет.
+
+## CAS-033 — Ворота действительно пул-широкие и без границы — это осознанный fail-closed выбор («лучше не рекламировать, чем удалить лишнее»), позиция в коде подтверждается; но «нет сигнала оператору» — фактически неверно (WARNING с разбором причин, ProfileEvent, `suppressed` в phase-метриках, `pending_reclaim`/`wedged_namespace_count`), а гранулярность уже трекается в BACKLOG. (by-design, P2) {#cas-033}
+
+## 1. Форма кода на HEAD (якоря устарели)
+
+Якорь `CA/Gc/CasGc.cpp:2063-2064` устарел. На HEAD ворота вычисляются в
+`Gc/CasGc.cpp:3066-3068`:
+
+    result.suppress_destructive =
+        !report.anomalies.empty() || !carried_holds.empty() || frontier_incomplete;
+
+с большим блоком-обоснованием `/// ==== THE DESTRUCTIVE GATE ====` на `Gc/CasGc.cpp:3027-3067`
+(«Computed ONCE, here, from three independent terms, and consulted at every destructive site of the
+round»). Термы: аномалии раунда, перенесённые holds (`result.carriedHolds()`, `:3039`),
+неполный frontier (`result.frontier_complete`, `:3062-3065`).
+
+Точки потребления (старые номера `:609-610, :791-792, :799-800, :830-832, :862-863, :893-898` не
+соответствуют HEAD; фактические):
+`Gc/CasGc.cpp:750` (чтение из `folded`), `:799` (redelete блобов — `kNothingToDelete`),
+`:1052` (курсор manifest-sweep), `:1071` (`pruneSupersededGenerations`), `:1134` (parent seal runs),
+`:1188` (manifest cleanup), `:1221` (namespace janitor), `:1228` (`cleanupRefObjects`),
+плюс `Gc/CasBlobInDegree.cpp:471`, `:480` (merge/graduation) и `Gc/CasGcShardPlan.cpp:52-61`.
+Декларация — `Gc/CasGc.h:585` (`bool suppress_destructive = false;`), контракт — `Gc/CasGc.h:862`
+(«a suppressed round prunes NOTHING and leaves …»).
+
+Итого: «одно скалярное OR по всему пулу, потребляемое во всех деструктивных точках» — **держится**.
+Позиция «fail-closed под неопределённостью» тоже держится и явно записана в коде:
+`Gc/CasGc.cpp:790-796` («it stops the delete I/O, and nothing else … Do not read this as a licence
+to relax the merge-side gate»), а также в пользовательской документации —
+`docs/en/antalya/cas/architecture/garbage-collection.md:108-112` («Under suppression there is no
+graduation, no redelete, and no ref or namespace deletion; condemnation and sparing continue,
+because both are non-destructive»). Предзаполненный вердикт one-liner'а (Filimonov: «prefer
+fail-closed safety under GC uncertainty; reclaim may stall») соответствует коду на HEAD — не
+пересматриваю.
+
+## 2. Что в находке неверно
+
+**(а) «no operator signal» — фактически неверно.** На каждый подавленный раунд есть:
+
+- `ProfileEvents::increment(ProfileEvents::CASGCClampSuppressedPasses)` — `Gc/CasGc.cpp:3071`;
+- **WARNING** с полным разбором причин — `Gc/CasGc.cpp:3103-3111`: «CAS GC fold: destructive work
+  SUPPRESSED this pass — N anomaly(ies), M held namespace(s), frontier … (X of Y namespace(s)
+  proven…)», причём с явным `deficit_note` («per-cause breakdown of the unproven namespaces»,
+  `:3096-3100`) и `catalog_empty_note` (`:3089-3094`). Уровень сознательно разделён на
+  WARNING/INFO: WARNING только когда есть «per-round cause, которую оператор может отработать»
+  (`Gc/CasGc.cpp:3073-3087`);
+- `suppressed`-метрика в phase-строках `system.cas_gc_log`: `Gc/CasGc.cpp:1166`, `:1212`, `:1229`,
+  `:1269`, `:3259`;
+- события `GcFoldClamp` в `system.cas_log` с `namespace_`/`reason` для каждой причины
+  (`Gc/CasGc.cpp:2298-2301`, `:2574-2580`, `:2683-2686`);
+- накапливающийся `pending_reclaim` и `wedged_namespace_count` в `system.cas_mounts`
+  (`Gc/CasGcScheduler.h:123-130`), документированные как операторский запрос —
+  `docs/en/antalya/cas/operations/monitoring.md:92-98`;
+- документированная наблюдаемость GC, включая сам счётчик —
+  `docs/en/antalya/cas/architecture/garbage-collection.md:230-241`.
+
+**(б) «одна `lifeless` запись» — не тот механизм.** `lifeless` — понятие **fsck**, а не GC:
+`Tools/CasFsck.h:148` (`uint64_t lifeless_keys`), `Tools/CasFsck.cpp:460-470`,
+`Tools/CasFsck.h:210` (в списке hard findings). В `suppress_destructive` `lifeless` не участвует
+вообще (grep по CAS-дереву: только `Tools/CasFsck.*`). Пример в находке подобран неверно.
+
+**(в) «одна нераскодированная строка» — частично не тот механизм.** Аномалии **janitor'а** (то,
+что похоже на «undecodable row» при листинге namespace-объектов —
+`Gc/CasNamespaceJanitor.cpp:74`, `:80`, `:99`, `:117`) в ворота НЕ попадают: janitor запускается
+уже после вычисления ворот (`Gc/CasGc.cpp:1221`), его аномалии только логируются WARNING'ом
+(`Gc/CasGc.cpp:479-480`) и считаются как `CASGCNamespaceCleanupLeaks`; описание счётчика прямо
+говорит «remains leak-only: it neither suppresses destructive GC nor blocks catalog lifecycle
+progress» (`src/Common/ProfileEvents.cpp:886`). Ворота закрывают только **fold-аномалии**
+(`Gc/CasGc.cpp:1749`, `:2297`, `:2381`, `:2393`, `:2427`, `:2573`, `:2682`).
+
+**(г) «no bound» — верно, и это намеренно.** Никакого «через N подавленных раундов всё равно
+удаляем» нет и быть не должно; в BACKLOG есть отдельно зафиксированное решение того же класса
+(`docs/superpowers/cas/BACKLOG.md:79-81`: «The user decision was that the knob must not exist at
+all — a cap here converts a bounded burst into a permanent leak, which is worse than no cap»).
+
+**(д) «indefinitely» — только для стойких состояний.** Аномалии пересчитываются каждый раунд из
+живого состояния, holds едут в seal до устранения. Т.е. подавление длится ровно столько, сколько
+живёт причина. Причём часть причин — узкие транзиентные окна нормальной записи:
+`Gc/CasGc.cpp:2567-2573` записывает аномалию «fold barrier: live precommit body not yet present
+(non-activating)» — то есть параллельный INSERT в момент fold'а способен закрыть ворота на этот
+раунд по всему пулу. Это самая сильная реальная версия жалобы (чувствительность рекламации к
+конкурентной записи, а не к настоящим поломкам), но она не «бесконечна»: на следующем раунде тело
+уже видно, а провабельно мёртвый precommit пропускается без клампа (`Gc/CasGc.cpp:2540-2566`,
+`CASGCDeadPrecommitSkipped`). Что реклама на практике идёт — подтверждено измерением:
+`docs/superpowers/cas/BACKLOG.md:244-245` (944 155 `DiskS3DeleteObjects` за 90-минутный
+деструктивный soak).
+
+## 3. Покрытие в BACKLOG
+
+Гранулярность ворот уже трекается, и дважды:
+
+- `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md:36-38` — пункт 3 списка refactoring-кандидатов:
+  «The destructive gate collapses per-namespace facts into a pool-wide boolean. `suppress_destructive`
+  is a single scalar OR over every namespace's anomalies/holds/frontier state, so one un-cataloged
+  namespace stalls reclamation for the whole pool. Wants to be per-namespace.»
+- `docs/superpowers/cas/BACKLOG/gc.md:65` `{#ckpt-damage-no-repair-path}` — резидуал (a): «a held
+  namespace still shuts the ROUND-WIDE destructive gate, so one unrepaired `_ckpt` stops all
+  reclamation pool-wide until repaired — full isolation needs Stage B's per-namespace destructive
+  gate»; там же резидуал (b) — у повреждённого `_ckpt` нет пути ремонта, т.е. единственный
+  известный **стойкий** сценарий «навсегда» уже описан вместе с операторским действием.
+
+Как основной анкер беру `{#ckpt-damage-no-repair-path}` — он единственный с якорем и именно про
+пул-широкость ворот.
+
+## 4. Побочная находка (не часть CAS-033, но зафиксирую)
+
+`UniversePolicy::kDefault = Authoritative` на HEAD (`Gc/CasGc.h:63`), флип пришёл коммитом
+`58fd482a800` («ca: draft — gc universe authoritative flip (UNVERIFIED-DRAFT, no runs)», 2026-08-03).
+При этом:
+- описание счётчика в `src/Common/ProfileEvents.cpp:803` устарело — оно всё ещё утверждает «In the
+  current stage this is EVERY folding round by construction … the namespace universe is not yet
+  knowable», что было верно для Stage A `StageA_Suppressed`, а теперь вводит оператора в
+  заблуждение;
+- `docs/superpowers/cas/BACKLOG/gc.md:61` `{#stage-b-7b-sequencing}` объявляет этот флип ЖЁСТКИМ
+  ограничением: «`UniversePolicy::kDefault` must not flip before Stage B's incarnation-keyed cursors
+  land» — стоит проверить, закрыто ли ограничение (HEAD-коммит `684161dcc03` «cas: prove namespace
+  absence per-row, not by whole-catalog stillness» выглядит релевантным), либо снять запись.
+Оба пункта — мелкие, но их стоит оформить отдельными backlog-правками, а не внутри CAS-033.
+
+## 5. Что реально осталось
+
+Ничего пред-релизного: ворота — сознательный fail-closed, сигнал оператору есть и документирован.
+Остаётся уже трекаемая работа Stage B — сделать ворота **пер-namespace** ({#ckpt-damage-no-repair-path}
+резидуал (a) + `BACKLOG/docs-and-cleanup.md:36`), плюс путь ремонта повреждённого `_ckpt`
+(резидуал (b)), без которого один объект способен остановить рекламацию по всему пулу до ручной
+операции. Отсюда P2, PRE-RELEASE = нет.
+
+## CAS-028 — Ключи блобов на HEAD действительно неподсолённые пул-глобальные хеши контента — это и есть суть CAS-дедупа (не пересматриваем); dedup-оракул через `system.cas_log` требует явного гранта (не доступен непривилегированному пользователю), а вот отсутствие crypto-shred-примитива подтверждается и в операторской документации не написано ни одной строкой. (by-design, P3) {#cas-028}
+
+## (a) Код по-прежнему соответствует позиции «ключ = хеш контента, пул-глобально, без соли»
+
+Подтверждено дословно.
+
+- `Formats/CasLayout.cpp:34-37`: `String Layout::blobKey(const BlobRef & ref) const { return shardedKey("blobs/" + String(blobHashAlgoName(ref.algo)), blobHexOf(ref)); }` — в ключ входят только имя алгоритма и hex дайджеста.
+- `Formats/CasLayout.h:471-477`: `shardedKey` = `prefix + "/" + ns + "/" + id.substr(0,2) + "/" + id`, где `ns` здесь — литерал `"blobs/<algo>"`, а не пространство имён таблицы. Итоговая форма — `POOL/blobs/<algo>/S/<hex>` (задокументирована в `Formats/CasLayout.h:102-107`).
+- Ни namespace, ни `server_root_id`, ни UUID таблицы, ни tenant в ключ блоба не входят — в отличие от манифестов/рефов/state, которые как раз живут под `POOL/cas/ns/...` (`Formats/CasLayout.h:85-95`). То есть per-namespace изоляция в лейауте ЕСТЬ, и она сознательно не распространена на тела блобов.
+- Соли/keyed-hash в коде нет вообще: `grep -i salt` по всему каталогу `ContentAddressed/` не даёт ни одного попадания. Алгоритм выбирается из трёх неключеванных (`Primitives/CasBlobDigest.cpp:6-17`: `ch128`/`xxh3`/`sha256`), фиксируется на пул при создании.
+- Место, на которое ссылается находка, сохранилось (номер строки устарел): `Pool/CasPartWriteTxn.cpp:186` — `const String key = store->layout().blobKey(req.ref);`, и рядом комментарий `:182-185`: «`logical_ref` is the blob identity end-to-end».
+- Позиция «по замыслу» зафиксирована в пользовательской документации: `docs/en/antalya/cas/architecture/blob-protocol.md:79-84` («Two blobs are the same object **if and only if** they hash to the same digest… identity is *proven* by hash equality»), и там же прямо разобран многотенантный threat-model в части коллизий: `:94-99` — «`cityhash128` is not cryptographically collision-resistant. A pool shared across mutually untrusted writers should run `sha256` — CAS enforces no policy choice here; the operator picks the threat model via `blob_hash`».
+
+Вывод по (a): код полностью соответствует пред-заполненному вердикту. Дедуп по контенту не пересматриваем.
+
+Одно уточнение к формулировке находки: «unreclaimed deleted content stays addressable by anyone who can guess the digest» — **последствие недостижимо на уровне SQL**. Ни одной поверхности «прочитать блоб по хешу» в продукте нет: чтение всегда идёт ref → манифест → перечисленные в манифесте `BlobRef` (`Pool/CasManifestReader.cpp:157` — единственный способ получить ключ блоба на read-пути), а `SYSTEM CAS`-команды (`src/Parsers/ASTSystemQuery.h:150-156`: `CAS_GC_RUN`, `CAS_GC_REBUILD`, `CAS_DROP_POOL_MEMBER`, `CAS_FSCK`, `CAS_FORGET`, `CAS_GC_STOP`, `CAS_GC_START`) не содержат «прочитать объект». «Угадав дайджест», атакующий получает доступ к байтам только имея креды к бакету — а с кредами к бакету он и так читает всё. То есть это не эскалация, а свойство «дайджест — не секрет».
+
+## (b) Dedup-оракул: что `system.cas_log` реально отдаёт непривилегированному пользователю
+
+**Ничего — таблица закрыта грантом, как и любой другой системный лог.**
+
+- Таблица называется именно `system.cas_log` (имя находки верное): `src/Interpreters/SystemLog.h:21` — `M(ContentAddressedLog, cas_log, ...)`.
+- Гейт доступа: `src/Access/AccessControl.cpp:300` — `setSelectFromSystemDatabaseRequiresGrant(config_.getBool("access_control_improvements.select_from_system_db_requires_grant", true))`, и поставляемый конфиг это включает: `programs/server/config.xml:881` (`<select_from_system_db_requires_grant>true</select_from_system_db_requires_grant>`), то же в `programs/server/embedded.xml:78` и в тестовом `tests/config/config.d/enable_access_control_improvements.xml:6`.
+- Список неявно доступных системных таблиц — `src/Access/ContextAccess.cpp:199-231` (`always_accessible_tables`): `one`, `contributors`, `licenses`, `formats`, `privileges`, `databases`, `tables`, `columns`, `settings`, … . `cas_log` в нём **отсутствует**, как и `query_log`. Значит для чтения нужен явный `GRANT SELECT ON system.cas_log`.
+
+Что видит тот, у кого грант ЕСТЬ (то есть оператор, а не арендатор):
+
+- Колонки: `src/Interpreters/ContentAddressedLog.cpp:24-40` — в частности `object_hash` («Content hash (lowercase hex) of the object»), `namespace`, `ref_name`, `token`, `outcome`, `reason`, `query_id`.
+- Строка дедупа существует и говорит прямым текстом, что контент уже был: `Pool/CasPartWriteTxn.cpp:429-441` — `e.type = CasEventType::BlobReuseAdopt` (рендерится как `blob_reuse_adopt`, `Primitives/CasEvent.cpp:20`), `e.outcome = "adopt"`, `e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)"`.
+- Но **чужого владельца строка не называет**: билдер заполняет только `object_hash`/`token`/`round`/`outcome`/`reason`; `namespace_`/`ref_name` в этом событии не выставляются, а сток их не додумывает (`ContentAddressedMetadataStorage.cpp:571-596` — прямое копирование полей события, без обогащения). То есть один ряд говорит «этот хеш уже кто-то занял», а не «его занял tenant X».
+- Реальная (и более существенная) экспозиция — не оракул, а то, что лог **пул-/сервер-глобальный**: с одним грантом читаются строки ВСЕХ namespace одного диска, вместе с `query_id` (`ContentAddressedMetadataStorage.cpp:593`), что позволяет джойном с `system.query_log` атрибутировать `blob_put` конкретному пользователю и потом сопоставить с чужим `blob_reuse_adopt` по `object_hash`. Это ровно та же модель, что у `system.query_log`/`system.blob_storage_log`: гранулярности «свои строки» у системных логов в ClickHouse нет вообще.
+
+И главное для оценки серьёзности: **оракул не является привилегией `cas_log`**. Он доступен каждому инсертящему пользователю без всяких грантов через ProfileEvents собственного запроса (нативный протокол отдаёт их клиенту, плюс `system.query_log.ProfileEvents`): `src/Common/ProfileEvents.cpp:760` — `CASBlobPutDeduplicated` («Number of CAS blob deduplicating PUT requests. Grows when uploads reuse existing content»), `:766` — `CASBlobDeduplicationCacheHit`; инкременты — `Backend/CasInstrumentedBackend.cpp:87` и `Pool/CasPartWriteTxn.cpp:214`. Плюс сам латентностный сигнал (загруженные/не загруженные байты) неустраним при любом content-addressed дедупе. Так что закрывать `cas_log` как «фикс оракула» бессмысленно — оракул неотделим от дедупа, а `cas_log` и так закрыт.
+
+Вывод по (b): **не баг**. Таблица access-controlled по умолчанию поставляемым конфигом; одна строка не выдаёт владельца совпавшего контента; сам dedup-оракул существует, но он — прямое следствие пул-глобального дедупа (то есть та часть находки, которую мы не пересматриваем), и наблюдаем без `cas_log`.
+
+## (c) Crypto-shred: примитива нет, и это НЕ написано для оператора
+
+Примитива «удалить эти байты везде» в продукте нет — подтверждено:
+
+- Удаление всегда идёт через in-degree-фолд GC, а не через адресное стирание: `docs/en/antalya/cas/architecture/garbage-collection.md:135` — «In-degree is a set of source edges, not a refcount. A blob becomes a candidate when its edge set [becomes empty]»; `docs/en/antalya/cas/quick-start.md:138` — «get reclaimed once nothing references them anymore».
+- Самая близкая административная операция явно оговаривает, что общий контент она не трогает: `docs/en/antalya/cas/operations/migration.md:172-175` — `SYSTEM CAS DROP POOL MEMBER` «emits ordinary ref-edge deltas rather than a GC transition: it does not synchronously reclaim shared blob content, it only makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later».
+- Из семи `SYSTEM CAS`-команд (`src/Parsers/ASTSystemQuery.h:150-156`) ни одна не является стиранием по субъекту: `CAS_FORGET` — это забывание объекта в GC-состоянии (снятие 404-HEAD-штурма), а не удаление тела.
+- Единственный сайт удаления тела блоба — `Gc/CasGc.cpp:802` (`backend.deleteExact(layout.blobKey(entry.ref), entry.token)`), и он достижим только для записи с уже нулевым in-degree. То есть если тот же контент есть у другой таблицы/реплики в пуле, удалить его физически нельзя никакой командой — что и утверждает находка.
+
+BACKLOG: тема отслеживается, но именно как «желательная фича», а не как задокументированное ограничение:
+
+- `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:25` — «**[B14] expedited / GDPR right-to-erasure delete** — DESIRABLE — Under GC lock, confirm no live ref, then delete bypassing the two-phase graduation delay; no layout change». Обратите внимание: B14 УСКОРЯЕТ удаление уже нессылаемого блоба («confirm no live ref»), то есть **не решает** заявленный случай — блоб, который всё ещё ссылается чужой манифест. Постановка задачи в бэклоге уже́ неявно принимает «shared ⇒ не стираем».
+- `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:26` — «**[B17] encryption-at-rest × content-addressing** — DESIRABLE — Dedup scope per-encryption-key; local to key/hash derivation». Это ровно «half» находки про соль/шред: per-key дедуп-скоуп даёт и криптографический шред (уничтожил ключ — байты недоступны), и заодно устраняет кросс-тенантный оракул. Отслежено, не сделано.
+
+Чего **нет** — и это единственный реальный остаток находки:
+
+1. В `docs/en/antalya/cas/` нет ни слова `GDPR`, `shred`, `erasure`, «right to be forgotten» (проверено grep'ом по `docs/en/antalya/cas/*.md` и `*/*.md` — попаданий ноль). Оператор нигде не может прочитать, что (i) `DROP TABLE`/`ALTER DELETE` на CAS-диске не гарантирует физического исчезновения байтов, пока их разделяет другая таблица/реплика/бэкап-namespace, и (ii) продукт не предоставляет операции адресного стирания. Про механику сказано (`quick-start.md:138`, `migration.md:174`), про **последствие для регуляторного стирания** — нет. Это и есть то, что стоит закрыть.
+2. Симметрично: в `blob-protocol.md:{#dedup-identity}` многотенантный threat-model рассмотрен только в части коллизионной стойкости (`:94-99`), но не в части «дедуп — это канал подтверждения контента и барьер для стирания». Одна врезка на 3-4 предложения там же закрывает и (b), и (c) для читателя.
+
+## Что реально осталось
+
+Только документационная работа + уже отслеженный B17:
+
+- **DOC (это и есть остаток):** в `docs/en/antalya/cas/bucket-requirements.md` или в `blob-protocol.md#dedup-identity` (плюс ссылка из `operations/troubleshooting.md`) написать прямо: дедуп пул-глобален; удаление освобождает байты только когда исчезла последняя ссылка во всём пуле, включая другие серверы и `shadow/`-namespace бэкапов; примитива «стереть этот контент везде» нет; арендаторы, которым нужен изолированный шред, должны получать отдельный пул (отдельный `pool_prefix`/бакет), а не отдельный namespace. Заодно — что дайджест не является секретом и что факт дедупа наблюдаем через ProfileEvents.
+- **Отслежено, не блокер:** B17 (per-encryption-key дедуп-скоуп) закрывает и соль, и шред, и оракул архитектурно; B14 стоит переформулировать, чтобы он не читался как «GDPR-стирание сделано» — он про ускорение уже нессылаемого.
+- Кода менять не нужно: (a) — by-design, (b) — не баг (грант по умолчанию требуется, ряд не выдаёт владельца), (c) — ограничение, требующее не примитива, а честной строчки в документации.
+
+P3 и не pre-release: единственный дефект — пробел в операторской документации; никакой достижимой утечки данных или потери данных за находкой нет.
+
+## CAS-029 — Центральное утверждение находки ложно: versioning-предусловие проверяется НЕ конфигурационной GCS-проверкой, а обязательным поведенческим mount-пробом (`created_delete_marker`), который отбивает любой versioned-бакет на AWS и любом S3-совместимом сторе; реально остались три узких остатка — fail-open GCS-проверки, включение versioning ПОСЛЕ монтирования (там `LOGICAL_ERROR` вместо нормальной ошибки, и только на пути тела блоба) и `skip_access_check`. (частично, P3) {#cas-029}
+
+## Что находка описала верно (форма кода)
+
+1. **Диалект действительно объявляется конфигурацией, а не выводится.** `src/IO/S3/Client.cpp:988-991`: `bool Client::supportsGcsNativeConditionalRequests() const { const auto http_client = Poco::toLower(client_configuration.http_client); return http_client == "gcp_oauth" || http_client == "gcs_hmac"; }` — это чистое чтение настройки. CAS берёт его один-в-один: `Backend/CasObjectStorageBackend.cpp:49` — `if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens()) native_token_type = TokenType::Generation;`, а `S3ObjectStorage::conditionalOpsUseGenerationTokens` (`src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.cpp:535-538`) просто проксирует этот метод клиента.
+   Уточнение: «never detected» — преувеличение. `provider_type` в клиенте КАК РАЗ выводится из endpoint'а: `src/IO/S3/Client.cpp:263-272` (`deduceProviderType`: `.amazonaws.com` → AWS, `storage.googleapis.com` → GCS), присваивается в `:298`. Просто CAS-диалект привязан не к `provider_type`, а к `http_client`, потому что generation-диалект требует именно проводки GCS-нативного HTTP-клиента. И это **задокументировано для оператора**: `docs/en/antalya/cas/bucket-requirements.md:38` — «Generation-token dialect: … opted into via `http_client = gcs_hmac` or `gcp_oauth`». (Мелкий док-баг: `bucket-requirements.md:55` обещает описание «how the backend **detects** which one a given endpoint speaks» — это слово следует заменить на «is configured with».)
+
+2. **`checkPoolPreconditions` действительно выполняется только для Native+Generation и fail-open.** `Backend/CasObjectStorageBackend.cpp:56-59`: `if (mode != Mode::Native || native_token_type != TokenType::Generation) return;`; `:60-76` — при `!versioned.has_value()` только `LOG_WARNING` и `return`, причём с явным обоснованием в комментарии `:61-67` («We proceed on the ASSUMPTION that versioning is off rather than fail-closing the mount on an unknown»). Бросок — только при подтверждённом `true` (`:78-84`, `NOT_IMPLEMENTED`). Источник `nullopt` — `S3ObjectStorage::isBucketVersioningEnabled` (`S3ObjectStorage.cpp:540-551`: неуспешный `GetBucketVersioning` → `std::nullopt`) либо база `IObjectStorage`, не переопределяющая метод. Поведение прямо закреплено тестами: `src/Disks/tests/gtest_cas_backend_generation.cpp:114-122` (`CheckPoolPreconditionsProceedsOnUnknownVersioning`) и `:125-131` (`CheckPoolPreconditionsNoOpOnEtagDialect`).
+
+3. **`LOGICAL_ERROR` после уже выполненного удаления — есть.** `Gc/CasGc.cpp:802-806`: сначала `DeleteOutcome del = backend.deleteExact(layout.blobKey(entry.ref), entry.token);`, затем `if (del.created_delete_marker) throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS gc: delete of blob {} created a delete marker — versioning is enabled on the pool (mis-provisioned; the capability probe must reject this)", ...)`.
+
+## Что в находке ФАКТИЧЕСКИ НЕВЕРНО — и это её ядро
+
+«On AWS S3 and every S3-compatible store the versioning check is skipped entirely» — **неверно**. `checkPoolPreconditions` — это не единственная и не главная проверка; главная — обязательный поведенческий проб, провайдер-агностичный и работающий именно через тот сигнал, который находка объявила «unverifiable by construction».
+
+- `Backend/CasProbe.cpp:209-224` (шаг 8 батареи): после успешного `deleteExact` с верным токеном — `if (d.created_delete_marker) throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "CasProbe: deleteExact succeeded but created a versioning delete marker — the bucket has object VERSIONING enabled, and a content-addressed pool cannot run on a versioned bucket… This is NOT ignorable and has no override. Use a bucket where versioning was NEVER enabled — note that merely SUSPENDING versioning is not enough…")`. Это строго сильнее конфигурационной проверки: проверяется не заявленное состояние бакета, а фактическое поведение DELETE.
+- Проб выполняется на КАЖДОМ writable-монтировании: `Pool/CasPool.cpp:381` (`if (!config.read_only)`) → `:457` (`if (!config.skip_access_check)`) → `:467` `runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));`. Read-only монтирование пробу не делает, но и не удаляет ничего (GC на read-only отбивается `checkNotReadOnly`, `ContentAddressedMetadataStorage.cpp:602`). Сам `checkPoolPreconditions` тоже вызывается изнутри пробы (`Backend/CasProbe.cpp:47`), то есть это ДОПОЛНИТЕЛЬНЫЙ ранний шаг, а не замена.
+- Сигнал реален на настоящем S3: `S3ObjectStorage.cpp:515-516` — `if (outcome.IsSuccess()) return {ConditionalRemoveOutcome::Removed, outcome.GetResult().GetDeleteMarker()};` (то есть заголовок `x-amz-delete-marker` ответа `DeleteObject`), и он доносится до CAS: `Backend/CasObjectStorageBackend.cpp:1016` — `d.created_delete_marker = result.created_delete_marker;`.
+- Проб покрыт тестом: `src/Disks/tests/gtest_cas_probe.cpp:61` — `b->setSimulateDeleteMarkers(true); // versioning enabled on the prefix`, и он обязан отбить пул (`Backend/CasInMemoryBackend.cpp:251,282`, `CasInMemoryBackend.h:129`).
+- Требование задокументировано для оператора: `docs/en/antalya/cas/bucket-requirements.md:13-14` («a capability probe that runs at every writable mount and fails closed»), `:26` (строка таблицы «No versioning / no delete markers | probed by `runCapabilityProbe`; `created_delete_marker` on `DeleteOutcome`»), `:29-31`.
+
+История: поведенческая проверка старая, а не «была и сломалась» — `git log -S"created a versioning delete marker"` даёт единственный коммит `f6b8aa8eb8a` «CA core M-C1: fail-closed capability probe (enforced delete + versioning-off checks)». GCS-специфичная надстройка добавлена ПОЗЖЕ и именно потому, что на GCS поведенческий сигнал недоступен: `git log -S"isBucketVersioningEnabled"` → `101597fc585` («CAS/GCS: IObjectStorage token-kind + bucket-versioning capability surface»), `f46ea3db3e5` («CAS/GCS: probe store-preconditions hook; fail closed on a versioned GCS bucket»), `373f7becbf9`. Комментарий в коде говорит то же самое явно: `Backend/CasObjectStorageBackend.cpp:53-55` — «Only the Native, generation-dialect (GCS) combination has anything to check». То есть предыдущий вердикт CAS-011 («CAS checks at startup that versioning is off») **остаётся верным**, а классификация «was-fixed / still-present» в one-liner'е — результат чтения одной проверки в отрыве от пробы.
+
+Класс `DATA-LOSS` тоже завышен: delete-marker означает, что байты СОХРАНЕНЫ (архивированы как noncurrent version), а не потеряны. Ущерб — неосвобождаемое хранилище (счёт) + остановка reclaim + аварийный выход GC-раунда. Потери данных за находкой нет.
+
+## Что реально осталось (три узких остатка)
+
+1. **Fail-open GCS-проверки** (`CasObjectStorageBackend.cpp:60-76`) — подтверждается, но это осознанное решение с предупреждением в лог и без поведенческой альтернативы: на GCS удаление живой версии при включённом versioning возвращает успех без delete-marker'а, поэтому проб её увидеть НЕ может, а падать на «не смогли проверить» (типовой случай — просто нет права `storage.buckets.get`) означало бы отказ монтировать нормальный бакет. Худший исход — GC перестаёт освобождать место (стоимость), а не порча. Здесь fail-open обоснован; максимум — поднять уровень до однократного `LOG_ERROR` и вывести факт «versioning unverified» в `system.cas_mounts`, чтобы оператор видел это не только в текстовом логе.
+2. **Versioning включён ПОСЛЕ успешного монтирования** (это единственный триггер находки, который не отбивается пробой) — тогда первый же GC-раунд, дошедший до redelete тела блоба, ловит `Gc/CasGc.cpp:803-806`. Два дефекта в этом обработчике:
+   - **Код ошибки неверен.** `LOGICAL_ERROR` — это утверждение «состояние программы невозможно», а состояние здесь достигается внешним действием оператора (`aws s3api put-bucket-versioning` на живом пуле). Сообщение само это признаёт («mis-provisioned; the capability probe must reject this») — но проб отработал корректно ДО изменения. Должно быть `NOT_IMPLEMENTED`/`BAD_ARGUMENTS` с текстом «versioning was enabled on the bucket after this pool was mounted — disable it and restart the mount», иначе в debug-сборке это assert, а в релизе — строка «Logical error» в логе, которая уводит триаж в поиск бага CAS.
+   - **Покрыт только путь тела блоба.** `created_delete_marker` проверяется ровно в одном месте (`grep` по `Gc/` даёт единственное попадание `CasGc.cpp:803`), а остальные destructive-сайты раунда его игнорируют: удаление манифеста `Gc/CasGc.cpp:1193`, номинации `:1243`, generation-prune `:3461`, `:3563`, `:3569`, janitor `Gc/CasNamespaceJanitor.cpp:111`, orphan-sweep `Gc/CasOrphanManifestSweep.cpp:586`. Практически это не меняет исход (объёмный путь — тела блобов, он выстрелит), но детекция асимметрична: раунд, у которого в этот проход нет `redelete`-записей, тихо наплодит delete-marker'ов.
+   Заявленная в находке альтернатива «wedges all reclamation» силой не подтверждается как «silently»: раунд валится с исключением и валится снова на каждом следующем раунде — это громко, видно в `system.cas_gc_log`/тексте лога, и совпадает с сценарием из `operations/troubleshooting.md:21` («GC never seems to reclaim space»).
+3. **`skip_access_check` полностью выключает пробу** — `Pool/CasPool.cpp:457,469-479`: при `skip_access_check = true` (per-disk настройка, дефолт `false`, `ContentAddressedSettings.cpp:69`: «Skip the boot-time capability probe (start now, fix later)») выполняется только `checkConditionalWriteSingleAttemptSupport`, а versioning не проверяется ни поведенчески, ни на GCS. Комментарий `:476-478` это признаёт и оценивает как «purely environmental (slower GC reclaim, not data loss) and gets re-checked the next time this pool is opened without skip_access_check» — оценка корректная. Отдельного действия не требует, но при описании остатка (2) это второй путь в то же состояние.
+
+## BACKLOG / история
+
+Точного покрытия по versioning в бэклоге нет. Найдено смежное:
+- `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md:83-92` {#bucket-requirements-lifecycle-worm-glacier} (остаток прошлой триажи, CAS-012): «The settled position (a CAS pool requires a plain bucket: no lifecycle expiration, **no versioning**, no Object Lock/WORM, no storage-class transitions; CAS cannot detect any of them without admin access) is only half-delivered in the user docs. `bucket-requirements.md:26,29-31` documents versioning only» — то есть versioning как раз ТА часть, которая задокументирована; недостают lifecycle/WORM/Glacier.
+- `docs/superpowers/cas/BACKLOG/formats-and-storage.md:23` — «[GCS production-grade follow-ups] … `gcp_oauth` dialect probe validation against live GCS (ADC creds)» — ближайший пункт к остатку (1).
+- `docs/superpowers/cas/BACKLOG.md:419` {#gcs-conditional-overwrite-rethink} — про GCS-условную перезапись, не про versioning.
+
+Предлагаемый новый анкор — {#versioning-enabled-after-mount}, объём работы маленький: (а) переклассифицировать `Gc/CasGc.cpp:804` из `LOGICAL_ERROR` в достижимую ошибку с текстом «включили versioning после монтирования» + gtest на `simulate_delete_markers` через реальный раунд (in-memory backend это уже умеет); (б) проверять `created_delete_marker` на остальных destructive-сайтах раунда единым хелпером; (в) заменить «detects» на «is configured with» в `bucket-requirements.md:55` и дописать одну фразу «versioning must never be enabled later on a live pool either».
+
+P3 и не pre-release: заявленной дыры (незащищённый versioned AWS/MinIO/RustFS-бакет) на HEAD нет — она закрыта обязательной поведенческой пробой; остаток сводится к коду ошибки, симметрии детекции и одной формулировке в документации.
