@@ -317,10 +317,39 @@ IcebergIterator::IcebergIterator(
     , callback(std::move(callback_))
     , table_schema_id(table_snapshot_->schema_id)
 {
+<<<<<<< HEAD
     /// Decoding any manifest reads settings from the context, so a missing one is fatal either way.
     if (!local_context)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Context is required to construct IcebergIterator");
 
+=======
+    auto delete_file = deletes_iterator.next();
+    while (delete_file.has_value())
+    {
+        if (delete_file.value()->parsed_entry->equality_ids.has_value())
+        {
+            equality_deletes_files.emplace_back(std::move(delete_file.value()));
+        }
+        else if (delete_file.value()->parsed_entry->isDeletionVector())
+        {
+            deletion_vector_files.emplace_back(std::move(delete_file.value()));
+        }
+        else
+        {
+            parquet_position_deletes_files.emplace_back(std::move(delete_file.value()));
+        }
+        delete_file = deletes_iterator.next();
+    }
+    LOG_DEBUG(
+        logger,
+        "Taken {} deletion vector files, {} parquet position delete files and {} equality delete files in iceberg iterator",
+        deletion_vector_files.size(),
+        parquet_position_deletes_files.size(),
+        equality_deletes_files.size());
+    std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
+    std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
+    std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     producer_task = std::make_unique<ThreadFromGlobalPool>(
         [this, thread_group = CurrentThread::getGroup()]()
         {
@@ -490,6 +519,14 @@ ObjectInfoPtr IcebergIterator::next(size_t)
         const auto & data_file_path = object_info->info.data_object_file_path_key;
         bool has_deletion_vector = false;
 
+<<<<<<< HEAD
+=======
+        object_info->info.requires_external_storage = (storage_to_use != object_storage);
+
+        const auto & data_file_path = object_info->info.data_object_file_path_key;
+        bool has_deletion_vector = false;
+
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         for (const auto & deletion_vector :
              defineDeletesSpan(manifest_file_entry, deletion_vector_files, /* is_equality_delete */ false, logger))
         {
@@ -516,6 +553,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
             }
 
             const auto & parsed_entry = deletion_vector->parsed_entry;
+<<<<<<< HEAD
 
             /// For icebergCluster, next() runs on the initiator's task-distribution path: DV
             /// I/O / CRC / roaring materialization happen here, then excluded_rows is sent on
@@ -524,6 +562,20 @@ ObjectInfoPtr IcebergIterator::next(size_t)
             auto excluded_rows = Iceberg::loadDeletionVector(
                 object_storage,
                 persistent_components.path_resolver.resolve(parsed_entry->file_path_key),
+=======
+            const auto puffin_metadata_path = parsed_entry->file_path_key.serialize();
+            auto [puffin_storage, puffin_key] = resolveObjectStorageForPath(
+                persistent_components.table_location, puffin_metadata_path,
+                object_storage, *secondary_storages, local_context,
+                persistent_components.path_resolver);
+
+            /// For icebergCluster, next() runs on the initiator's task-distribution path: DV
+            /// I/O / CRC / roaring materialization happen here, then excluded_rows is sent on
+            /// the wire per task. Workers apply the bitmap and do not re-read the Puffin blob.
+            auto excluded_rows = Iceberg::loadDeletionVector(
+                puffin_storage,
+                puffin_key,
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
                 parsed_entry->content_offset.value(),
                 parsed_entry->content_size_in_bytes.value(),
                 data_file_path,
@@ -539,7 +591,11 @@ ObjectInfoPtr IcebergIterator::next(size_t)
             has_deletion_vector = true;
             LOG_DEBUG(
                 logger,
+<<<<<<< HEAD
                 "Attached deletion vector from file `{}` to data file `{}`",
+=======
+                "Attached deletion vector from puffin file `{}` to data file `{}`",
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
                 parsed_entry->file_path_key,
                 data_file_path);
         }
@@ -580,7 +636,11 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                         lower.has_value() ? lower->serialize() : "[no lower bound]",
                         upper.has_value() ? upper->serialize() : "[no upper bound]");
                     object_info->addPositionDeleteObject(
+<<<<<<< HEAD
                         position_delete, persistent_components.path_resolver.resolve(position_delete->parsed_entry->file_path_key));
+=======
+                        position_delete, position_delete->parsed_entry->file_path_key.serialize());
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
                 }
             }
         }

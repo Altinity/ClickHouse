@@ -8,8 +8,11 @@
 #include <IO/SeekableReadBuffer.h>
 #include <IO/WithFileSize.h>
 #include <base/arithmeticOverflow.h>
+<<<<<<< HEAD
 #include <base/defines.h>
 #include <fmt/format.h>
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
 #include <algorithm>
 #include <cstring>
@@ -109,6 +112,7 @@ void checkDeletionVectorBlobReadLimits(Int64 length, std::optional<UInt64> expec
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Deletion vector blob is too small");
 }
 
+<<<<<<< HEAD
 bool isPuffinFileMagic(const UInt8 * header)
 {
     return std::memcmp(header, PUFFIN_FILE_MAGIC, sizeof(PUFFIN_FILE_MAGIC)) == 0;
@@ -148,11 +152,28 @@ void validateDeletionVectorEnvelope(const UInt8 * header, Int64 length)
         if (common::addOverflow(static_cast<UInt64>(combined_length), UInt64{8}, expected_blob_size))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid deletion vector combined length: {}", combined_length);
 
+=======
+void validateDeletionVectorEnvelope(const UInt8 * header, Int64 length)
+{
+    const UInt32 combined_length = readBigEndianUInt32(header);
+    if (std::memcmp(header + sizeof(UInt32), DELETION_VECTOR_MAGIC, sizeof(DELETION_VECTOR_MAGIC)) != 0)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid deletion vector magic");
+
+    if (combined_length < sizeof(DELETION_VECTOR_MAGIC))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid deletion vector combined length: {}", combined_length);
+
+    UInt64 expected_blob_size = 0;
+    if (common::addOverflow(static_cast<UInt64>(combined_length), UInt64{8}, expected_blob_size))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid deletion vector combined length: {}", combined_length);
+
+    if (static_cast<UInt64>(length) != expected_blob_size)
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
             "Deletion vector blob size {} does not match combined length {}",
             length,
             combined_length);
+<<<<<<< HEAD
     }
 }
 
@@ -229,6 +250,8 @@ IcebergDeletionVectorContainer detectIcebergDeletionVectorContainer(
 
     throwUnknownDeletionVectorContainer(path, header, content_offset);
     UNREACHABLE();
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 std::vector<UInt64> deserializeDeletionVectorV1Blob(std::string_view blob_bytes, std::optional<UInt64> expected_cardinality)

@@ -110,8 +110,11 @@ private:
     ConcurrentBoundedQueue<Iceberg::ProcessedManifestFileEntryPtr> blocking_queue;
     std::unique_ptr<ThreadFromGlobalPool> producer_task;
     IDataLakeMetadata::FileProgressCallback callback;
+<<<<<<< HEAD
     /// Filled once under `deletes_mutex` and never mutated afterwards, so `next` may read them
     /// unguarded once it has gone through `ensureDeletesReady`.
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> deletion_vector_files;
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> parquet_position_deletes_files;
     std::vector<Iceberg::ProcessedManifestFileEntryPtr> equality_deletes_files;

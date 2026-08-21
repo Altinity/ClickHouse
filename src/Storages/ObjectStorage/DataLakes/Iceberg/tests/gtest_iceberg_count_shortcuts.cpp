@@ -124,7 +124,10 @@ ProcessedManifestFileEntryPtr makeDataEntryForRecordCount(
         /*row_number=*/0,
         ManifestEntryStatus::ADDED,
         /*written_sequence_number=*/std::nullopt,
+<<<<<<< HEAD
         /*written_file_sequence_number=*/std::nullopt,
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         /*written_snapshot_id=*/std::nullopt,
         DB::Row{},
         std::move(columns_infos),

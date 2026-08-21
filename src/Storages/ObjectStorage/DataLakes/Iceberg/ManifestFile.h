@@ -30,6 +30,7 @@ struct ColumnInfo
 #include <vector>
 
 #include <boost/noncopyable.hpp>
+#include <Poco/String.h>
 
 namespace DB::Iceberg
 {
@@ -104,14 +105,24 @@ struct ParsedManifestFileEntry : boost::noncopyable
     Int64 record_count;
     Int64 file_size_in_bytes;
 
+<<<<<<< HEAD
     /// Iceberg v3 deletion vector metadata (`content_offset` / `content_size_in_bytes`).
     /// Present for Puffin containers and for Delta-style `.bin` files that store the same envelope.
+=======
+    /// Iceberg v3 deletion vector metadata (position delete entries with puffin format)
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     std::optional<Int64> content_offset;
     std::optional<Int64> content_size_in_bytes;
 
     bool isDeletionVector() const
     {
+<<<<<<< HEAD
         return content_offset.has_value() && content_size_in_bytes.has_value();
+=======
+        return Poco::toLower(file_format) == "puffin"
+            && content_offset.has_value()
+            && content_size_in_bytes.has_value();
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     }
 
     ParsedManifestFileEntry(
@@ -184,9 +195,14 @@ std::optional<Int64> getRecordCountInAllFilesExcludingDeleted(
 std::optional<Int64> getBytesSizeInAllDataFilesExcludingDeleted(
     const std::vector<ProcessedManifestFileEntryPtr> & files);
 
+<<<<<<< HEAD
 /// Deletion vectors (Puffin or Delta `.bin`) must identify the data file via the dedicated
 /// `referenced_data_file` manifest field (non-empty). Position-delete lower/upper bounds
 /// must not be used as a fallback.
+=======
+/// Puffin deletion vectors must identify the data file via the dedicated `referenced_data_file`
+/// manifest field (non-empty). Position-delete lower/upper bounds must not be used as a fallback.
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 void requireDirectReferencedDataFileForPuffinDeletionVector(
     bool set_from_referenced_data_file_field,
     const std::optional<IcebergPathFromMetadata> & referenced_path,

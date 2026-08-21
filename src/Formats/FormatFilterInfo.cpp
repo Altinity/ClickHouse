@@ -86,6 +86,7 @@ bool FormatFilterInfo::hasFilter() const
     /// Any of these can reduce the number of rows emitted by the reader pipeline.
     /// Count-from-files cache must not be populated when they are present.
     return filter_actions_dag != nullptr || row_level_filter != nullptr || prewhere_info != nullptr;
+<<<<<<< HEAD
 }
 
 namespace
@@ -103,6 +104,8 @@ namespace
                 return true;
         return false;
     }
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 Block FormatFilterInfo::buildKeyConditionInputs(

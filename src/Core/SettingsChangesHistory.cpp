@@ -220,6 +220,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
         });
+
         addSettingsChanges(settings_changes_history, "26.6",
         {
             {"analyzer_compatibility_apply_final_to_all_joined_tables", true, false, "Fixed a bug in the analyzer where FINAL on the left-most table of a JOIN was incorrectly applied to the other joined tables as well. previous_value=true so `compatibility` with versions before 26.6 restores the old behavior."},

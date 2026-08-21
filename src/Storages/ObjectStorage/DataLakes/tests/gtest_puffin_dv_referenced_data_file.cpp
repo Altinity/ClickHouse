@@ -8,11 +8,14 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 
+<<<<<<< HEAD
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <utility>
 
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 using namespace DB;
 using namespace DB::Iceberg;
 
@@ -73,6 +76,7 @@ TEST(PuffinDeletionVectorReferencedDataFile, RejectsEmptyPath)
     }
 }
 
+<<<<<<< HEAD
 namespace
 {
 
@@ -113,4 +117,6 @@ TEST(IcebergDeletionVectorClassification, OffsetsClassifyAsDeletionVectorRegardl
     EXPECT_FALSE(makePositionDeleteEntry("parquet", 1, std::nullopt)->isDeletionVector());
 }
 
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #endif

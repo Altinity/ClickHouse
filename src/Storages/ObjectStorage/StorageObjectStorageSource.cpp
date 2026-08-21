@@ -242,6 +242,7 @@ static bool canUseCountFromFilesCache(const ObjectInfoPtr & object_info)
     return true;
 }
 
+<<<<<<< HEAD
 static bool readsIdentityPartitionColumn(
     const ActionsDAG & dag, const std::vector<std::pair<String, Field>> & identity_partition_columns)
 {
@@ -306,6 +307,8 @@ static std::optional<ActionsDAG> buildIdentityPartitionColumnsDag(
     return dag;
 }
 
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 StorageObjectStorageSource::StorageObjectStorageSource(
     const StorageID & storage_id_,
     String name_,
@@ -927,9 +930,14 @@ Chunk StorageObjectStorageSource::generate()
         /// reduce rows seen by generate(), while the cache key is file identity only.
         if (reader.getInputFormat() && read_context->getSettingsRef()[Setting::use_cache_for_count_from_files]
             && format_filter_info && !format_filter_info->hasFilter()
+<<<<<<< HEAD
             && canUseCountFromFilesCache(reader.getObjectInfo())
             && !reader.getObjectInfo()->rows_to_read)
             addNumRowsToCache(*reader.getObjectInfo(), total_rows_in_file);
+=======
+            && canUseCountFromFilesCache(reader.getObjectInfo()))
+            addNumRowsToCache(reader.getObjectInfo(), total_rows_in_file);
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         total_rows_in_file = 0;
 
         chassert(reader_future.valid());
@@ -1287,7 +1295,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     const bool effective_need_only_count = need_only_count;
 #endif
 
+<<<<<<< HEAD
     const bool can_use_count_cache = effective_need_only_count && !headers_requested
+=======
+    const bool can_use_count_cache = effective_need_only_count
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         && context_->getSettingsRef()[Setting::use_cache_for_count_from_files]
         && canUseCountFromFilesCache(object_info);
 
@@ -1577,6 +1589,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         builder.init(Pipe(input_format));
 
+<<<<<<< HEAD
         if (!identity_partition_columns.empty())
         {
             if (auto dag = buildIdentityPartitionColumnsDag(builder.getHeader(), identity_partition_columns))
@@ -1589,6 +1602,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             }
         }
 
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         /// Deletion vectors (and selection vectors) address absolute file row numbers via
         /// `ChunkInfoRowNumbers`. Iceberg equality deletes use a plain `FilterTransform` that
         /// shrinks the chunk without maintaining `applied_filter`, so DV must run first —

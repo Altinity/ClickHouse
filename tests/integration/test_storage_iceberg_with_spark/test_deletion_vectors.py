@@ -1,5 +1,8 @@
+<<<<<<< HEAD
 import json
 import os
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 import uuid
 
 import pytest
@@ -42,6 +45,7 @@ def _strip_file_uri_scheme(path):
     return path
 
 
+<<<<<<< HEAD
 PUFFIN_MAGIC = b"PFA1"
 PUFFIN_FOOTER_TRAILER_SIZE = 12
 ICEBERG_WAREHOUSE = "/var/lib/clickhouse/user_files/iceberg_data"
@@ -259,6 +263,8 @@ def convert_spark_puffin_dvs_to_delta_bin(table_name):
     return len(conversions)
 
 
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 def add_equality_deletes_by_id(spark, table_name, ids):
     """Commit an Iceberg equality-delete file for the given `id` values.
 
@@ -364,6 +370,7 @@ def test_deletion_vectors(started_cluster_iceberg_with_spark, storage_type, run_
 
 @pytest.mark.parametrize("run_on_cluster", [False, True])
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+<<<<<<< HEAD
 def test_deletion_vectors_delta_bin(started_cluster_iceberg_with_spark, storage_type, run_on_cluster):
     """Iceberg v3 DVs stored as Delta `.bin` files (Databricks UniForm), not Puffin.
 
@@ -426,6 +433,8 @@ def test_deletion_vectors_delta_bin(started_cluster_iceberg_with_spark, storage_
 
 @pytest.mark.parametrize("run_on_cluster", [False, True])
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+=======
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 def test_deletion_vectors_aggregates(started_cluster_iceberg_with_spark, storage_type, run_on_cluster):
     """Aggregates over Iceberg v3 tables must ignore rows covered by deletion vectors."""
     if storage_type == "local" and run_on_cluster:
