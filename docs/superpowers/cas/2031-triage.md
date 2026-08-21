@@ -113,16 +113,16 @@
 | CAS-095 | частично | P3 | [{#gc-dryrun-silent-on-damaged-state}](BACKLOG.md#gc-dryrun-silent-on-damaged-state) | нет | Тихий `preview_deletes=0` при отсутствующем `gc/state` (и, что острее, при пропавшем adopted seal) подтверждён, но «unreadable gc/state» и «one bad run object» — на самом деле громкие `CORRUPTED_DATA`, а не тишина; это диагностический read-only инструмент, P3. |
 | CAS-096 | частично | P3 | [{#refplan-dead-drop-counters} (новая секция; отчётная половина уже висит в {#gc-followups})](BACKLOG.md#refplan-dead-drop-counters} (новая секция; отчётная половина уже висит в {#gc-followups}) | нет | Форма верна — REBUILD действительно не показывает счётчики отброшенных строк плана — но «сообщает только performed=1» ложно (11 полей / 13 колонок), а `droppedHolds` в продакшене не считается вовсе: это тестовый адаптер. |
 | CAS-097 | частично | P3 | [{#cas-inspect-format-coverage-and-hold} (новая секция; зонтик — {#operability} `[B15/B99/B169/B159]`)](BACKLOG.md#cas-inspect-format-coverage-and-hold} (новая секция; зонтик — {#operability} `[B15/B99/B169/B159]`) | нет | Покрытие форматов и потеря `hold` в дампе fold seal подтверждены (10 из 17 живых форматов), но «сырые ключи никем не перечисляются» и «wedge неназываем» — неверно, а mis-decode `_files/` даёт громкую ошибку, не подмену данных. |
-| CAS-098 | ⏳ | — | — | — | — |
+| CAS-098 | частично | P2 | [{#gc-health-zero-is-ambiguous}](BACKLOG.md#gc-health-zero-is-ambiguous) | нет | Четыре из пяти утверждений держатся на HEAD (0 = «никогда не лидировал» и «только что успел», `is_leader=0` не отличает остановленный GC от follower, `pending_reclaim` не сбрасывает spared/replaced), пятое (счётчик клампа «срабатывает каждый раунд») устарело в коде и осталось только в тексте описания ProfileEvent. |
 | CAS-099 | ⏳ | — | — | — | — |
 | CAS-100 | частично | P3 | [{#fsck-clean-verdict-has-no-coverage-flag}](BACKLOG.md#fsck-clean-verdict-has-no-coverage-flag) | нет | Все четыре формы кода на HEAD подтверждаются, но следствия завышены: пропуск семейств проверок — заявленные cost-решения с компенсирующими механизмами (GC сам fail-closed проверяет чек-сумму run'ов, у `stale_edge` есть soak-гейт, `--namespace` предупреждает в справке), а единственный реальный остаток — у отчёта нет машиночитаемого признака покрытия («0, потому что не проверяли» неотличим от «0, потому что чисто»); пара meta/body-счётчиков уже отслежена. |
 | CAS-101 | частично | P3 | [{#gc-outcome-budget-skews-round-report-counters}](BACKLOG.md#gc-outcome-budget-skews-round-report-counters) | нет | Подтверждено, что счётчики раунда (`objects_deleted`/`absent`/`replaced`/`spared`) считаются по обрезанному бюджетом outcome-логу и что события `GcFoldBegin`/`GcFoldEnd` несут номер ПРЕДЫДУЩЕГО раунда, — но сами удаления при этом посчитаны точно (`entries_redeleted`), а `round = 0` на Phase-строках — задокументированный дизайн (корреляция по `round_id`), не дефект. |
 | CAS-102 | частично | P3 | [{#profileevents-surface-residuals}](BACKLOG.md#profileevents-surface-residuals) | нет | Оба факта верны (строка `CasNs::Server` недостижима, server-root-ключи классифицируются как `Gc`), но это осознанное состояние, задокументированное и закреплённое тестом; вывод «объём mount/lease нельзя измерить» неверен — остаётся косметический остаток: 11 всегда-нулевых счётчиков в `system.events`. |
 | CAS-103 | частично | P3 | [{#profileevents-surface-residuals}](BACKLOG.md#profileevents-surface-residuals) | нет | Форма кода верна — `CASBlobBodyPutAvoided`/`CASBlobDeduplicationCacheHit` инкрементируются до `observeAndAdmit`, и на condemned-ветке тело всё-таки грузится, так что счётчик запросов завышается на редкой гонке; но «байты» никто не считает, а сама ветка fail-closed по всем кодам кроме `ABORTED`. |
-| CAS-104 | ⏳ | — | — | — | — |
-| CAS-105 | ⏳ | — | — | — | — |
-| CAS-106 | ⏳ | — | — | — | — |
-| CAS-107 | ⏳ | — | — | — | — |
+| CAS-104 | частично | P3 | [{#cas-event-sink-installed-when-log-disabled}](BACKLOG.md#cas-event-sink-installed-when-log-disabled) | нет | Форма кода описана верно (один диспетчер с мьютексом на пул, сток включён шиппинг-конфигом), но заявленное следствие «каждый resolve и каждое чтение манифеста сериализуются на одном мьютексе» не подтверждается; реальный остаток один — при удалённой секции `<cas_log>` сток всё равно установлен, поэтому событие строится и выбрасывается. |
+| CAS-105 | частично | P3 | [{#pool-pacing-knobs-no-config-surface}](BACKLOG.md#pool-pacing-knobs-no-config-surface) | нет | Отсутствие конфиг-поверхности у lease/request-budget и части pool-кэпов подтверждается, но «валидатор — мёртвый код, который никогда не срабатывает» неверно: `validateCasRequestBudget` вызывается на каждом writable-mount и покрыт тестами; `ref_table_cache_bytes` — дубль уже отслеженного CAS-053. |
+| CAS-106 | подтверждено | P1 | [{#cas-disk-s3-key-whitelist-gap}](BACKLOG.md#cas-disk-s3-key-whitelist-gap) | да | Ядро находки верно и уже подтверждено полевым отчётом: перечислительный skip-set `non_cas_keys` отвергает почти все легальные S3-ключи диска, сервер падает на старте с `UNKNOWN_SETTING`; побочные утверждения (18 записей, непроверенные числовые диапазоны) неточны. |
+| CAS-107 | подтверждено | P2 | [{#cas-settings-not-reloadable-silently}](BACKLOG.md#cas-settings-not-reloadable-silently) | нет | Обе половины верны на HEAD — `ContentAddressedMetadataStorage` не переопределяет `applyNewSettings`, поэтому ни одна CAS-настройка не применяется по `SYSTEM RELOAD CONFIG` и об этом ничего не пишется в лог; удаление диска из конфига даёт только generic-предупреждение, а mount-lease продолжает продлеваться до перезапуска. |
 | CAS-108 | ⏳ | — | — | — | — |
 | CAS-109 | ⏳ | — | — | — | — |
 | CAS-110 | ⏳ | — | — | — | — |
@@ -4642,3 +4642,185 @@ follower never learns») и в описании колонки (`ContentAddresse
 {#gc-outcome-budget-skews-round-report-counters} — уточнение к пункту D (перекос доходит до
 операторской строки; `entries_redeleted` — точный счётчик), off-by-one в `GcFoldBegin`/`GcFoldEnd`, и
 две проз-неточности описаний колонок. P3.
+
+## CAS-098 — Четыре из пяти утверждений держатся на HEAD (0 = «никогда не лидировал» и «только что успел», `is_leader=0` не отличает остановленный GC от follower, `pending_reclaim` не сбрасывает spared/replaced), пятое (счётчик клампа «срабатывает каждый раунд») устарело в коде и осталось только в тексте описания ProfileEvent. (частично, P2) {#cas-098}
+
+**1. `last_success_age_seconds = 0` — двусмысленно. ПОДТВЕРЖДЕНО.**
+`gcHealth` вычисляет дискриминатор `ever_succeeded = last_ms != 0`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.cpp:398`, поле —
+`.../Gc/CasGcScheduler.h:126`) и обнуляет возраст, когда раунда не было
+(`CasGcScheduler.cpp:399-405`). Ни одна отображающая поверхность дискриминатор не выводит: в
+`system.cas_mounts` колонок ровно четыре — `is_leader`, `pending_reclaim`,
+`last_success_age_seconds`, `wedged_namespace_count`
+(`src/Storages/System/StorageSystemContentAddressedMounts.cpp:52-56`, вставка на `:196-209`, там же
+0 вставляется как есть), в асинхронных метриках — те же четыре
+(`src/Interpreters/ServerAsynchronousMetrics.cpp:378-392`, комментарий метрики прямо пишет «0 if it
+has never led one»). Операционное следствие реально: алерт вида
+`CASGCLastSuccessAgeSeconds_<disk> > N` никогда не сработает для диска, чей GC не преуспел ни разу,
+то есть именно тот молчаливый отказ, ради которого метрика и добавлялась (коммиты
+`080bbe224b4` «per-disk GC health on system.content_addressed_mounts (B3)» и `3b2c9abb822`
+«per-disk GC-health async metrics»), остаётся невидимым. Это подтверждает пометку one-liner'а
+«re-verify и он падает». Дешёвое честное исправление — отдавать NULL / не публиковать метрику при
+`!ever_succeeded`.
+
+**2. `is_leader = 0` смешивает follower, административно остановленный GC и self-exit. ПОДТВЕРЖДЕНО
+(наблюдаемость), но «не выживает после рестарта / не виден другим узлам» — by design.**
+`SYSTEM CAS GC STOP` — STOP-IN-PLACE: объект планировщика сознательно остаётся в члене, чтобы
+`gcHealth` продолжал отвечать правдой, а не «нет GC»
+(`.../ContentAddressedMetadataStorage.cpp:971-1001`, особенно комментарий `:973-977` и копия под
+`pointer_mutex` на `:985-990`). Поэтому остановленный GC выглядит ровно как follower: health есть,
+`is_leader = 0`. Колонки/метрики «gc_running» нет; единственный след — однократный `LOG_INFO`
+(`src/Interpreters/InterpreterSystemQuery.cpp:2656-2661`). Отдельно проверено: устойчивость
+верба — не дефект. Никакого durable-флага «GC остановлен» в протоколе нет: единственный durable
+maintenance-объект несёт только курсор джанитора
+(`.../Formats/CasGcMaintenanceStateFormat.h:11-19` — «no GC authority fields»), а сам верб
+документирован как гранулярный узловой контроль (`InterpreterSystemQuery.cpp:2640-2648`), что
+соответствует прецеденту `SYSTEM STOP MERGES`. Так что из этого пункта остаётся только
+наблюдаемость локального «GC выключен».
+
+**3. `pending_reclaim` монотонно растёт, spared/replaced не списываются. ПОДТВЕРЖДЕНО.**
+Аккумулятор — `condemned - redeleted` (`Gc/CasGcScheduler.cpp:202-205`), а запись, ушедшая из
+retired-списка как `spared` или `replaced` (`Gc/CasGc.h:136-137`, инкременты в
+`Gc/CasGc.cpp:995-996`), не вычитается никогда. Следствие: документированное чтение метрики
+(«persistently growing value indicates GC is not keeping up with reclaim»,
+`ServerAsynchronousMetrics.cpp:387-388`) выполняется и на совершенно здоровом пуле, который много
+спарит. При этом авторитетный датчик уже считается каждым раундом —
+`RoundReport::pending_condemned`/`pending_candidates`/`pending_retired` (`Gc/CasGc.h:146-155`,
+явно «current outstanding totals» против «this round's DELTAs»), но рендерится ТОЛЬКО в результате
+`SYSTEM CAS GC RUN` (`InterpreterSystemQuery.cpp:2356-2358`, `:2380-2382`); ни в
+`system.cas_mounts`, ни в GC-логе (`Gc/CasGcScheduler.h:44-56` — только дельты), ни в метриках его
+нет. То есть жалоба верна, но остаток — «показать существующий gauge там, где смотрит оператор»,
+а не «посчитать backlog заново».
+
+**4. Наши же документы читают эти колонки неправильно (найдено при проверке, аудитом не заявлено).**
+`docs/en/antalya/cas/operations/migration.md:199-203` предлагает перед
+`SYSTEM CAS DROP POOL MEMBER` смотреть у жертвы `state` и `last_success_age_seconds` — но GC-health
+колонки NULL на любой чужой строке by design (это верно сказано в
+`architecture/mounts-and-leases.md:219` и `operations/monitoring.md:98-101`), так что у строки
+жертвы этого значения не бывает; признаки живости там — `state`/`expires_at`.
+`operations/troubleshouting`-строка (`operations/troubleshooting.md:20`) предлагает
+«`last_success_age_seconds` not climbing» как доказательство, что продлевается mount-lease — это
+две несвязанные величины. Обе строки — дешёвые правки прозы.
+
+**5. `CASGCClampSuppressedPasses` «срабатывает каждый раунд by construction» — УСТАРЕЛО в коде,
+верно только про текст описания.**
+Гейт условный: `suppress_destructive = !anomalies.empty() || !carried_holds.empty() ||
+frontier_incomplete` (`Gc/CasGc.cpp:3061-3071`), где `frontier_complete` достижимо, потому что
+продакшен-политика — `UniversePolicy::kDefault = Authoritative` (`Gc/CasGc.h:42-63`;
+`StageA_Suppressed` «nothing in production selects it», единственное чтение политики —
+`Gc/CasGc.cpp:3043`). Флип сделан коммитом `58fd482a800` (2026-08-03, «gc universe authoritative
+flip»), см. также подтверждение в `BACKLOG/gc.md`{#stage-b-7b-sequencing}. Что осталось —
+операторский текст счётчика (`src/Common/ProfileEvents.cpp:803`) всё ещё утверждает «In the current
+stage this is EVERY folding round by construction… destructive gate is shut unconditionally»; он
+написан до флипа (последнее изменение строки — `e337bb2c87d`) и не пересматривался. Это тот же класс,
+что `{#fsck-rule-restated-in-unfenceable-prose}`: правило, пересказанное прозой, которую ничто не
+проверяет.
+
+**Что нашлось в BACKLOG.** Отдельного пункта про семантику GC-health не было. Смежные:
+`BACKLOG.md`{#issue-2211-gc-run-follower-noop} (там же зафиксировано, что `is_leader` заполняется
+только для локального маунта и follower не может назвать лидера — решение принято 2026-08-21,
+включая «bonus: `is_leader` can be populated for ALL rows»), `BACKLOG.md`{#decommission-wrong-predicate}
+(разные определения «мёртв» у `cas_mounts` и decommission),
+`BACKLOG/mounts-and-lifecycle.md`{#gc-scheduler-stop-join-race} (там же отдельно отмечено, что
+самовыход планировщика не делает `gcHealth` нечестным). Ничего из этого не покрывает пункты 1, 3, 4
+и устаревший текст счётчика — поэтому добавлен новый раздел
+`docs/superpowers/cas/BACKLOG/operability-and-introspection.md`{#gc-health-zero-is-ambiguous}
+(не закоммичен).
+
+**Оценка.** Ни один пункт не ведёт к потере или порче данных и не является тихой коррупцией: это
+поверхность наблюдаемости плюс устаревшая проза. Но «слепое пятно алерта на никогда не работавший
+GC» — ровно то, что метрика должна была ловить, а исправление тривиально (NULL вместо 0 / вывести
+`ever_succeeded`, вывести `pending_condemned`, две правки прозы). Отсюда P2, не P1: релиз это не
+блокирует, диск-usage всё равно виден другими средствами.
+
+## CAS-104 — Форма кода описана верно (один диспетчер с мьютексом на пул, сток включён шиппинг-конфигом), но заявленное следствие «каждый resolve и каждое чтение манифеста сериализуются на одном мьютексе» не подтверждается; реальный остаток один — при удалённой секции `<cas_log>` сток всё равно установлен, поэтому событие строится и выбрасывается. (частично, P3) {#cas-104}
+
+**Что подтверждается (форма кода).**
+- Единственный `EventDispatcher` — член `Pool`: `Pool/CasPool.h:814-821` (`EventDispatcher event_dispatcher_;` + `CasEventSink event_sink_;`), установка форвардера в `setEventSink` — `Pool/CasPool.h:771-778`. Все эмиттеры (сам `Pool`, ref-ledger, manifest-reader, mount-renewer) держат ссылку на этот один `event_sink_`, т.е. воронка действительно одна на диск (не глобальная, но и не по-компонентная). Введено коммитом `7927539a1ec` (stage-1 T2).
+- Мьютекс и inline-drain: `Pool/CasEventDispatcher.cpp:17-54` — `emit` берёт `mutex`, кладёт событие в `std::deque`, и если `draining` уже занят — просто возвращается; иначе сам становится дренажёром.
+- `CasEvent` действительно «толстый»: 7 `String` + `std::map<String,String> detail` (`Primitives/CasEvent.h:180-194`).
+- Сток включён в шиппинг-конфиге: `programs/server/config.xml:1196-1213` — секция `<cas_log>` присутствует по умолчанию (комментарий там же: «Enabled by default while the feature is experimental… Remove the section to disable»), `SystemLog.h:21` подтверждает «Enabled by default while the CA disk feature is experimental».
+- Эмиттеры существуют: `RefResolve` в `Pool/CasRefLedger.cpp:326-340`, зеркальный emit на пути `getView` — `Parts/PartFolderAccess.cpp:245-259`; GC — десятки точек, включая per-entry (по сути per-blob) `RootAdd`/`RootRemove` в фолде: `Gc/CasGc.cpp:1362-1377`, и per-manifest `ManifestDelete` `Gc/CasGc.cpp:1197-1207`.
+
+**Что неверно / переоценено (следствие).**
+1. «Funnels hot paths through one mutex» — сток вызывается ВНЕ мьютекса: `lock.unlock()` перед `sink(...)` и `lock.lock()` после (`Pool/CasEventDispatcher.cpp:36-51`). Критическая секция = `push_back` в `deque` + проверка `bool`. То есть сериализуется не доставка, а постановка в очередь.
+2. Сам сток не блокирующий и уже был сериализован СВОИМ мьютексом до появления диспетчера: `ContentAddressedMetadataStorage.cpp:571-597` кладёт строку в `SystemLog::add`, а `Common/SystemLogBase.cpp:93-123` — короткий `lock` и drop-по-переполнению (`queue.size() >= max_size_rows` → `++ignored_logs; return;`). Диспетчер добавляет ещё один короткий мьютекс к уже существовавшему, а не новое узкое место; неограниченного роста очереди диспетчера тоже нет, потому что сток никогда не ждёт.
+3. «Every manifest read builds a multi-String event» — фактически неверно: `CasManifestReader` эмитит ТОЛЬКО на аварийных ветках — `ReadMissing` при отсутствующем body (`Pool/CasManifestReader.cpp:66-81`) и два `CorruptDecode` при несовпадении `ref`/namespace (`:97-108`, `:116-127`). На успешном чтении манифеста событие не строится вообще.
+4. «Every ref resolve» — тоже с оговоркой, которая снимает суть: горячий кэш-хит `CachedForLoad` намеренно НЕ эмитит (`Parts/PartFolderAccess.cpp:177-190`, resolve вызывается с `ResolveAudit::Deferred` на `:165`), а каждый оставшийся emit сопровождает как минимум один поход в объектное хранилище (`buildView` → `readManifestShared`, обязательный `HEAD` — `Pool/CasManifestReader.cpp:63-65`). Стоимость события на 2-3 порядка ниже стоимости RTT, которое оно описывает.
+5. Contention-масштаб ограничен: эмитят потоки запросов и пул параллельной загрузки блобов (ровно тот сценарий, ради которого диспетчер и вводился — см. рационал в `Pool/CasEventDispatcher.h:68-85`), GC-фолд — один поток раунда; `meta_pool`-джобы (`Gc/CasGc.cpp:392-417`) событий не эмитят.
+
+**Что найдено в BACKLOG.** Класс «объём audit-строк» уже отслеживается, и именно с измеренными последствиями, а не с гипотезой про мьютекс: `docs/superpowers/cas/BACKLOG/gc.md:64` — `[CA-LOG-TABLES-RESTART-COST]` {#ca-log-tables-restart-cost} (138.1 s перезагрузки Outdated-частей system-log таблиц, 299 Outdated частей у `system.content_addressed_log`), и `docs/superpowers/cas/BACKLOG/performance.md` {#standalone-write-scratch-manifest-cost} — «repoint широкой части пишет одну audit-строку на файл части… The audit-row volume can be addressed independently (aggregate one `BlobReuseAdopt`-class row per publish with a count)». Обе записи покрывают per-emit объём лучше, чем данная находка.
+
+**Что реально осталось (новое, не покрытое).** `makeCasEventSink` возвращает непустой `std::function` всегда, когда есть `Context` (`ContentAddressedMetadataStorage.cpp:562-571`: единственный ранний выход — `if (!context) return {}`), а решение «а есть ли лог» принимается ВНУТРИ стока (`:573-575`: `auto log = ctx->getContentAddressedLog(); if (!log) return;`). При этом `createSystemLog` возвращает пустой указатель, если секции в конфиге нет (`src/Interpreters/SystemLog.cpp:135-142`), т.е. документированный способ отключения («Remove the section to disable», `programs/server/config.xml:1197-1199`) даёт ровно то состояние, в котором `Pool::hasEventSink()` (`Pool/CasPool.h:784`) продолжает возвращать `true`. Следствие: обещание в комментариях — «disabled path… a true no-op on the production hot path» (`Pool/CasPool.h:782-784`), «the query-frequency disabled hot path pays no mutex» (`Pool/CasEventDispatcher.h:99-101`) — при отключённом логе ложно: событие (7 `String` + `map`) конструируется, проходит мьютекс + deque, и выбрасывается. Правка тривиальна и без протокольных последствий: спрашивать `context->getContentAddressedLog()` при построении стока и возвращать пустой `std::function`, если лога нет (или установить сток лениво/переустанавливать по reload — что смыкается с {#cas-settings-not-reloadable-silently}). Отказ мягкий (лишние аллокации, не потеря данных, не тихая порча), поэтому P3; занесено новой секцией в `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` под анкером {#cas-event-sink-installed-when-log-disabled}.
+
+## CAS-105 — Отсутствие конфиг-поверхности у lease/request-budget и части pool-кэпов подтверждается, но «валидатор — мёртвый код, который никогда не срабатывает» неверно: `validateCasRequestBudget` вызывается на каждом writable-mount и покрыт тестами; `ref_table_cache_bytes` — дубль уже отслеженного CAS-053. (частично, P3) {#cas-105}
+
+**Что подтверждается.**
+- Полный список шиппинг-ключей — 29 `DECLARE` в `ContentAddressedSettings.cpp:63-92` (проверено `grep -c "^    DECLARE("` = 29), и в `PoolConfig` пробрасываются ровно они: `ContentAddressedMetadataStorage.cpp:747-775`.
+- Следовательно НЕ настраиваемы из конфига (значения только из дефолтов структуры либо из gtest'ов):
+  - `mount_lease_ttl_ms{30000}` и `mount_renew_period{10000}` — `Pool/CasPool.h:182-183`;
+  - весь `CasRequestBudget` — `Backend/CasRequestControl.h:145-198`: `attempt_timeout_ms=5000` (`:151`), `operation_deadline_ms=90000` (`:168`), `max_attempts=16` (`:173`), `lease_safety_margin_ms=2000` (`:177`), `retry_initial_backoff_ms=200`/`retry_max_backoff_ms=5000` (`:184-185`), `recovery_retry_budget_ms=120000`/`recovery_retry_initial_backoff_ms=1000`/`recovery_retry_max_backoff_ms=30000` (`:195-197`);
+  - `snapshot_log_count_threshold=256`, `snapshot_log_bytes_threshold=1 MiB`, `snapshot_publish_backoff_*`, `precommit_sweep_backoff_*` — `Pool/CasPool.h:234-253`;
+  - `gc_fold_threshold=1`, `gc_fold_max_defer_rounds=8` — `Pool/CasPool.h:159-165`; `rebuild_edge_budget=8000000` — `:172`; `gc_frontier_probe_budget=UINT64_MAX` — `:155`; `gc_stuck_removal_rounds=10` — `:166-168`; `ref_table_cache_bytes=256 MiB` — `:265`.
+- «`validateCasRequestBudget` ничего не проверяет про `mount_renew_period_ms`» — формально верно: параметр только логируется (`Backend/CasRequestControl.cpp:165-171`), в неравенствах не участвует (`:124-163`). Но это ЯВНО описанное решение, а не упущение: `Backend/CasRequestControl.h:212-214` — «`mount_renew_period_ms` takes no part in the inequality… accepted only so the effective-values log line records the full picture in one place». Пересматривать нечего, пока сам период не станет настраиваемым.
+
+**Что неверно.**
+1. «Валидатор — мёртвый код, который никогда не может сработать». `Pool::open` вызывает его на каждом writable-mount: `Pool/CasPool.cpp:589-595` (и это единственный продовый вызов; на успехе он печатает эффективный бюджет `LOG_INFO`, `CasRequestControl.cpp:165-171`). Он и покрыт тестами — как напрямую (`src/Disks/tests/gtest_cas_request_control.cpp:435,439,766,776,788,800,814,829`), так и ИМЕННО через `Pool::open` (`src/Disks/tests/gtest_cas_mount.cpp:892-982`: «Pool::open must call validateCasRequestBudget itself»). Корректная формулировка гораздо слабее: в проде он всегда получает дефолты и потому всегда проходит, оставаясь стартовым инвариантом для программных вызывающих (тесты, будущий конфиг) — но код исполняется и наблюдаем в логе.
+2. «Поэтому ни одну из проблем масштабирования в этом отчёте нельзя настроить» — преувеличение по составу списка: масштабные GC-кэпы как раз настраиваемы (`gc_round_graduation_budget`, `gc_round_redelete_budget`, `gc_round_sweep_*`, `gc_round_ref_cleanup_budget`, `gc_round_prefix_wholesale_budget`, `gc_round_handoff_prefix_wholesale_budget`, `gc_round_outcome_entry_budget`, `manifest_sweep_*`, `gc_interval_sec`, `gc_meta_pool_size` — `ContentAddressedSettings.cpp:66,74-83,91`), как и все прочие кэш-бюджеты (`deduplication_cache_bytes` `:70`, `part_folder_cache_*` `:86-88`, `manifest_decode_cache_bytes` `:90`).
+3. Два поля из перечисленных находкой закрыты по дизайну, а не по недосмотру: `gc_stuck_removal_rounds` — «Test/config struct seam only; no user-facing setting is registered» (`Pool/CasPool.h:166-168`), а `gc_frontier_probe_budget` намеренно фактически безграничен, потому что его исчерпание — не отложенная работа, а «permanent GC stop» (`Pool/CasPool.h:143-155`); выставлять его в конфиг без отдельного обоснования нельзя.
+
+**BACKLOG / история.** `ref_table_cache_bytes` — уже отслеженный дубль: `docs/superpowers/cas/BACKLOG/performance.md` {#ref-table-cache-budget-admission-only} (2031-triage CAS-053), там второй буллет буквально фиксирует «the only cache budget in `PoolConfig` with no `ContentAddressedSettings` entry… the 256 MiB default is effectively hardcoded in production», плюс отсутствие gauge. Смежно и релевантно: {#cas-settings-not-reloadable-silently} (2031-triage CAS-107) — даже уже объявленные ключи не применяются по `SYSTEM RELOAD CONFIG`; любая новая настройка должна ложиться в одну правку с этим. Записи про lease/бюджет/снапшот-пейсинг в BACKLOG не было.
+
+**Что реально осталось.** Настоящий остаток — именно tunability: оператор на медленном/деградировавшем эндпойнте не может ни поднять `operation_deadline_ms`/`max_attempts`, ни сдвинуть `mount_lease_ttl_ms`, ни ослабить снапшот-пороги, при том что пользовательская документация уже цитирует дефолты лизы как параметры и советует сравнивать сетевую задержку с `mount_lease_ttl_ms` (`docs/en/antalya/cas/architecture/mounts-and-leases.md:73`, `docs/en/antalya/cas/operations/troubleshooting.md:19`), а таблица `docs/en/antalya/cas/configuration.md:86-104` их не содержит — то есть документация обещает больше, чем есть. Класс отказа — не порча и не тихий фолбэк: неверный бюджет отвергается громко (`BAD_ARGUMENTS` из `Pool::open`), а отсутствие ключа означает лишь дефолт, на котором прогонялись все soak'и. Занесено новой секцией в `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` под анкером {#pool-pacing-knobs-no-config-surface} (с явным исключением `gc_stuck_removal_rounds`/`gc_frontier_probe_budget` и отсылкой к {#ref-table-cache-budget-admission-only}).
+
+## CAS-106 — Ядро находки верно и уже подтверждено полевым отчётом: перечислительный skip-set `non_cas_keys` отвергает почти все легальные S3-ключи диска, сервер падает на старте с `UNKNOWN_SETTING`; побочные утверждения (18 записей, непроверенные числовые диапазоны) неточны. (подтверждено, P1) {#cas-106}
+
+**Что подтверждается на HEAD.**
+
+1. Skip-set действительно фиксированный и перечислительный: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp:54-58` — `static const std::set<std::string> non_cas_keys = { "type", "object_storage_type", "metadata_type", "path", "name", "use_fake_transaction", "endpoint", "access_key_id", "secret_access_key", "region", "use_environment_credentials", "readonly", "expect_continue_min_bytes", "http_client", "key_compatibility_prefix" }`. Это **14**, а не 18 записей (см. «фактически неверно» ниже). Комментарий выше (`:23-53`) сам признаёт метод: список построен «four-way scan» по конфигам, присутствующим в репозитории.
+
+2. Любой ключ вне этого набора и вне таблицы CAS-настроек попадает в `impl->set(key, ...)` — `ContentAddressedSettings.cpp:131-136` — то есть в `BaseSettings::set`, который для неизвестного имени бросает `UNKNOWN_SETTING`. Исключение не перехватывается: `loadFromConfig` вызывается прямо из фабричной лямбды `cas` (`src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:232-241`), которая вызывается из `DiskFactory::create` внутри `DiskSelector::initialize` (`src/Disks/DiskSelector.cpp:119-120`); `initialize` имеет только `catch(...)` с `shutdown()` всех уже созданных дисков и `throw;` (`DiskSelector.cpp:138-143`), то есть исключение уходит наверх и роняет загрузку конфигурации/старт сервера, а не «помечает диск сломанным».
+
+3. Перечисленные аудитом ключи действительно легальны на дисковом пути и действительно НЕ входят в allowlist. Диск-путь читает S3-настройки прямо из блока диска: `S3Settings::loadFromConfigForObjectStorage` (`src/IO/S3Settings.cpp:36-54`) строит `S3AuthSettings`/`S3RequestSettings` из `config_prefix` того же самого блока. Имена: `connect_timeout_ms`, `request_timeout_ms`, `max_connections`, `http_keep_alive_timeout`, `http_keep_alive_max_requests`, `no_sign_request`, `session_token`, `server_side_encryption_customer_key_base64`, `role_arn`, `role_session_name`, `external_id`, `uri_style`, `is_virtual_hosted_style`, `disable_checksum` — `src/IO/S3AuthSettings.cpp:18-49`; `max_single_read_retries`, `retry_attempts`, `min_bytes_for_seek`, `list_object_keys_size`, `objects_chunk_size_to_delete`, `min_upload_part_size`, `max_single_part_upload_size`, `max_get_rps` и т. д. — `src/IO/S3RequestSettings.cpp:45-80`; `support_batch_delete` — `src/IO/S3/S3Capabilities.cpp:40-46`. То есть из ~60 валидных ключей S3-диска allowlist пропускает лишь горстку: `access_key_id`, `secret_access_key`, `region`, `use_environment_credentials`, `expect_continue_min_bytes`, `http_client`, `readonly` (+ generic `endpoint`, `key_compatibility_prefix`); все остальные роняют старт.
+
+4. Обходного пути нет: auth-настройки диска не читаются из глобальной секции `<s3>` per-endpoint, только из блока диска (тот же `loadFromConfigForObjectStorage`).
+
+**Что уже в BACKLOG / истории.** Находка не новая, несмотря на пометку «new this round» в one-liner. `docs/superpowers/cas/BACKLOG.md:724-746`, анкер `{#cas-disk-s3-key-whitelist-gap}` — «CAS disk settings whitelist rejects valid S3 keys (found by #2243 mitigation attempt, 2026-08-20)»: полевой отчёт (Carlos, clickhouse-regression 32408309167/job 96552561919), `<http_keep_alive_timeout>` в блоке CAS-диска убивает сервер на старте с `Unknown setting 'http_keep_alive_timeout' (UNKNOWN_SETTING)`. Там же зафиксирована и форма исправления: не наращивать перечисление, а пропускать любой ключ, чьё имя есть среди builtin-имён `S3AuthSettings`/`S3RequestSettings` (`BaseSettings` умеет перечислять builtin-имена), оставив `non_cas_keys` только для ad-hoc ключей generic-слоя (`type`, `name`, `use_fake_transaction`, ...). Помечено «Release-relevant: this blocks the #2243 CI mitigation on CAS disks».
+
+Происхождение гейта: `73f49694b37` (2026-07-21, «ContentAddressedSettings — declarative BaseSettings table with unknown-key rejection (F4a)»), плюс `1155665c18d` (того же дня) — точечное добавление generic-ключа `path` после падения stateless-линии, ровно тот же класс «нашли перечислением по факту падения». Ничем не закрыто: на HEAD код тот же.
+
+Смежный (не тот же) элемент: `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md:74` `[CLEANUP-dead-prerev6-keys]` — вычистить мёртвые ключи из `non_cas_keys`; он про обратную сторону (лишние записи), а не про недостающие.
+
+**Что фактически неверно в тексте находки.**
+- «fixed 18-entry set» — на HEAD 14 записей (`ContentAddressedSettings.cpp:54-58`).
+- Из перечисленных примеров `role_arn`, `connect_timeout_ms`, `max_connections`, `request_timeout_ms`, `support_batch_delete`, SSE-ключ — да, отвергаются; но `region` и `use_environment_credentials` в allowlist ЕСТЬ (`:56`), так что «ordinary object-storage keys» отвергаются не поголовно.
+- Анкер `CA/ContentAddressedSettings.cpp:23-27` устарел дважды: файл переехал в `.../MetadataStorages/ContentAddressed/` (переезд по подкаталогам — `592b9b83568`), а строки 23-27 сейчас — тело поясняющего комментария, сам набор на `:54-58`; «`:94-99` every other child key is fed to `impl->set`» → фактически `:131-136`; «`:119-137`» → `loadFromConfig` начинается на `:121`; `MetadataStorageFactory.cpp:233-237` → `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:232-241`.
+- «numeric ranges are unchecked for the keys that are accepted» — по большей части не дефект. `validate` (`ContentAddressedSettings.cpp:174-197`) проверяет `gc_interval_sec >= 1` и `gc_shards >= 1`, наличие/валидность `server_root_id`, и парсинг трёх enum-строк (`blob_hash`, `staging_backend`, `part_folder_validate`). Остальные числовые ключи — бюджеты и байтовые лимиты, для которых `0` документирован как «unbounded»/«disables» прямо в описаниях (`:70`, `:76-83`, `:86`, `:90`), то есть 0 — легальное значение, а не непроверенный диапазон. Единственный кандидат на «0 сломает» — `gc_meta_pool_size` (`:91`), но он зажат на месте использования: `const size_t pool_size = static_cast<size_t>(std::max<uint64_t>(1, configured_pool_size));` (`Gc/CasGc.cpp:375-378`). Это ровно тот шаблон, о котором предупреждает бриф: реальная форма кода + придуманное следствие.
+
+**Что реально осталось.** Ровно то, что описано в `{#cas-disk-s3-key-whitelist-gap}`: заменить перечисление на «skip, если имя — builtin S3AuthSettings/S3RequestSettings», оставив `non_cas_keys` для ad-hoc generic-ключей, и обновить комментарий про four-way scan. Отказ громкий (fail-closed, `UNKNOWN_SETTING`, порча данных исключена), но он делает штатную настройку S3 на CAS-диске невозможной и уже сорвал предложенную митигацию #2243 в полевом прогоне — поэтому P1/pre-release, несмотря на «loud», а не «silent» характер. Новых элементов бэклога не добавлял: покрытие уже есть.
+
+## CAS-107 — Обе половины верны на HEAD — `ContentAddressedMetadataStorage` не переопределяет `applyNewSettings`, поэтому ни одна CAS-настройка не применяется по `SYSTEM RELOAD CONFIG` и об этом ничего не пишется в лог; удаление диска из конфига даёт только generic-предупреждение, а mount-lease продолжает продлеваться до перезапуска. (подтверждено, P2) {#cas-107}
+
+**Половина 1: настройки не перечитываются, молча.** Подтверждено.
+
+- `ContentAddressedSettings::loadFromConfig` вызывается ровно из одного места — фабричной лямбды `cas` (`src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:232-241`), то есть только при СОЗДАНИИ объекта диска. Других вызовов в дереве нет (`grep -rn "loadFromConfig" src` по CAS-путям даёт только определение в `ContentAddressedSettings.cpp:121` и объявление в `.h:64`).
+- Путь перезагрузки существует и доходит до metadata storage: `DiskSelector::updateFromConfig` для уже существующего диска вызывает `disk->applyNewSettings(config, context, disk_config_prefix, ...)` (`src/Disks/DiskSelector.cpp:180`), `DiskObjectStorage::applyNewSettings` пробрасывает в `metadata_storage->applyNewSettings(config, config_prefix, context)` (`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:979-985`).
+- Базовая реализация — пустой no-op: `virtual void applyNewSettings(const Poco::Util::AbstractConfiguration &, const std::string &, ContextPtr) {}` (`src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:365-368`; в тексте находки указан анкер `:340-343` — устаревшие номера строк, символ тот же).
+- `ContentAddressedMetadataStorage` этот метод НЕ переопределяет: во всём каталоге `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` нет ни одного вхождения `applyNewSettings`; единственный переопределяющий класс в семействе — `MetadataStorageFromCacheObjectStorage` (`Cache/MetadataStorageFromCacheObjectStorage.cpp:260-262`), и он лишь пробрасывает вызов в underlying, то есть при `cache`-обёртке над CAS всё равно приходит в тот же no-op.
+- Значит `gc_interval_sec`, `gc_enabled`, `deduplication_cache_bytes`, `deduplication_head_first_min_bytes`, `part_folder_cache_*`, `part_folder_validate`, `manifest_decode_cache_bytes`, все `gc_round_*`/`manifest_sweep_*` бюджеты (`ContentAddressedSettings.cpp:63-92`) правки в конфиге не замечают. Молчание тоже подтверждено: на этом пути нет ни `LOG_*`, ни сравнения старых/новых значений.
+- Контраст, усиливающий сюрприз: S3-половина того же блока диска перечитывается по-настоящему — `object_storages->takePointingTo(location)->applyNewSettings(..., {.allow_client_change = true})` (`DiskObjectStorage.cpp:987-989`), как и `read_resource`/`write_resource`, `remove_shared_recursive_file_limit`, пулы (`:991-1004`). То есть один и тот же `<disk>`-блок частично горячий, частично мёртвый, без индикации где именно.
+- Что смягчает: (а) часть настроек по конструкции creation-time-only и правильно не перечитывается — `server_root_id`, `gc_shards` («creation-time only», `:73`), `blob_hash` («fixed at pool creation», `:67`), `scratch_path`, `staging_backend`; (б) `gc_enabled` имеет рантайм-верб: `SYSTEM CAS GC STOP`/`START` (`src/Interpreters/InterpreterSystemQuery.cpp:2642-2682`); (в) документация не обещает горячую перезагрузку — в `docs/en/antalya/cas/configuration.md` нет ни слова про reload/restart, так что нарушенного явного контракта нет, есть неозвученный пробел; (г) поведение согласовано с `plain`/`plain_rewritable`, которые тоже не переопределяют `applyNewSettings` (правда, у них и настраивать нечего, а у CAS ~30 ключей).
+- Побочный эффект, которого в находке нет, но он из того же корня: гейт неизвестных ключей (`{#cas-disk-s3-key-whitelist-gap}`) тоже вычисляется только при создании диска, поэтому опечатка, внесённая правкой + reload, не диагностируется до следующего перезапуска.
+
+**Половина 2: удалённый из конфига CAS-диск сохраняет mount-lease.** Подтверждено, но в основе это generic upstream-поведение.
+
+- `DiskSelector::updateFromConfig` для дисков, исчезнувших из конфига, не вызывает `shutdown()` — только собирает имена и печатает `LOG_WARNING(... "{} disappeared from configuration, this change will be applied after restart of ClickHouse")` (`src/Disks/DiskSelector.cpp:190-218`). Обратите внимание: анкер находки `DiskSelector.cpp:176-183`, `:192-219` — номера сдвинуты, но код тот же.
+- Это поведение одинаково для ВСЕХ типов дисков, не CAS-специфичное; CAS-специфично лишь следствие: объект диска жив, значит живы mount-heartbeat и GC-планировщик, значит lease на `server_root_id` продолжает продлеваться и слот не может быть перехвачен другим сервером до перезапуска процесса. Формулировка находки «the slot cannot be reclaimed by anyone else» верна, но неполна: ограничение снимается перезапуском, ровно про который и написано в предупреждении — просто предупреждение generic и про удерживаемый lease не говорит.
+- Никакой потери данных здесь нет: fencing работает как задумано, второй сервер получит громкий отказ, а не тихую двойную запись.
+- Класс уже известен: `docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md:25-37` `{#disk-lifecycle-rev8-closure}` — «disk-lifecycle-leak proper: a CA disk is still cached forever in the disk registry (`Context::getOrCreateDisk`) with no teardown/eject on `DROP TABLE`», deliberately deferred. Формулировка там про `DROP TABLE`/реестр дисков, а не про удаление из конфига, но механизм тот же (диск никогда не разбирается), поэтому это соседний, а не тождественный элемент. Смежное: `{#pool-refusal-node-fatal}` там же и цели редизайна жизненного цикла диска (UNMOUNT ejects / GC stop-start), которые как раз и должны это закрыть.
+
+**Поиск по истории.** `git log -S "applyNewSettings"` по CAS-путям даёт только `7133ba900b1`, `2837d6f8035`, `0953ce5c3ab` — все три про раннюю обвязку GC/структурный своп, ни одна не добавляла и не удаляла CAS-override `applyNewSettings`. То есть override не «был и потерялся» и нигде сознательно не отклонён: он просто никогда не писался. Не stale, не закрыто.
+
+**Что в BACKLOG было / что добавлено.** Прямого покрытия не было: `grep -rni "config reload|SYSTEM RELOAD CONFIG|reloadable|reloaded"` по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` не даёт ни одного попадания. Добавлен новый раздел (незакоммичен) `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` → `{#cas-settings-not-reloadable-silently}`: он фиксирует обе половины, отделяет реально динамическое подмножество (GC-каденс и per-round бюджеты, кэш-бюджеты, `part_folder_validate`, `gc_enabled`) от creation-time идентичностей (`server_root_id`, `gc_shards`, `blob_hash`, `scratch_path`, `staging_backend`), требует WARNING с перечислением изменённых игнорируемых ключей вместо нынешней тишины, упоминает попутно закрываемую дыру с проверкой неизвестных ключей только на старте, и отдельным абзацем — удержанный lease при удалении диска из конфига со ссылкой на `{#disk-lifecycle-rev8-closure}`.
+
+**Оценка.** Тихое игнорирование правки конфига — операционный дефект (оператор видит успешный reload и делает неверный вывод), но не риск для данных и не блокер релиза: ничего не портится, все опасные настройки по конструкции creation-time, а самое востребованное (`gc_enabled`) имеет SQL-верб. Отсюда P2 / pre-release нет. Половина про удалённый диск — P3-по-себе и в основном generic upstream; отдельным элементом не выделяю, она включена в тот же новый раздел.

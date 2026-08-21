@@ -487,3 +487,31 @@ ref and concurrent publishes fight over it. Failures there are loud (promote con
 config is silently accepted rather than refused. Fix: refuse at table-attach/mount time a non-Atomic
 relative data path whose db or table component equals `kDetachedDirName`/`kMovingDirName`, naming the
 reserved name in the message. Same class as the DiskEncrypted-over-CA refusal item.
+
+## The per-namespace 64 MiB ref-table budget is a hard per-table ref ceiling with no spill path (2031-triage CAS-111) {#ref-table-64mib-admission-ceiling}
+
+Every state-growing ref op is previewed against two whole-table encodings and refused when either
+would pass 64 MiB: `admits` encodes the hypothetical complete snapshot and the hypothetical
+whole-namespace removal transaction (`Pool/CasRefProtocol.cpp:718-736`, budgets
+`ref_snapshot_max_bytes = ref_removal_max_bytes = 64 MiB`,
+`Formats/CasRefSnapshotFormat.h:65`, `Formats/CasRefLogFormat.h:100`, per-table budgets minus wire
+overhead at `Pool/CasRefLedger.cpp:1205-1208`), and the refusal is
+`LIMIT_EXCEEDED` at `Pool/CasRefLedger.cpp:3021-3025`. One namespace is one table
+(`srv1/<table_uuid>`, `Primitives/CasTypes.h:42-44`), one committed row is one part folder
+(projection files live in the parent part's manifest), and a snapshot row is
+`{"k":"c","rn":…,"me":…,"mb":…,"mo":…,"ts":…}` (`Formats/CasRefSnapshotFormat.cpp:57-70`) — on the
+order of 75-95 bytes for realistic part names, i.e. a ceiling around 0.6-0.9 M refs per table.
+
+Failure class: fail-closed and loud, checked before any object is created, no corruption and no
+partial publication. But the refusal covers only GROWTH, and a merge grows before it shrinks, so a
+table at the ceiling cannot merge its way back down — only removals (`DROP PARTITION`, part removal,
+`DROP TABLE`) shrink the table. Reachability is well above MergeTree's own default active-part
+ceiling (`max_parts_in_total = 100000`, `src/Storages/MergeTree/MergeTreeSettings.cpp:976`, enforced
+at `MergeTreeData.cpp:6191`), so getting there needs that setting raised several-fold plus outdated
+parts still holding refs — hence P2, not a release blocker.
+
+Owed: (a) a `CurrentMetrics`/`system.` surface for per-table budget consumption plus a WARNING well
+before the wall, so the ceiling is observable instead of arriving as a write refusal; (b) a design
+answer for tables that legitimately want more refs — a chunked/multi-object snapshot, or a
+partitioned ref table — since today the only way out is deleting parts. Same family as
+{#manifest-inline-budget-no-spill} (a fail-closed format cap with no re-placement path).

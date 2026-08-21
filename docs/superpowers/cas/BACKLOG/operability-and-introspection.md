@@ -529,3 +529,75 @@ folding round by construction ... the round's destructive gate is shut unconditi
 before the flip (`e337bb2c87d`) and never revisited. Same class as
 `{#fsck-rule-restated-in-unfenceable-prose}`: a rule restated in prose no build can check. Fix the
 sentence; the pointer to the fold seal's hold set and `tables_held` stays useful.
+
+## The audit-event sink is installed even when `system.cas_log` is disabled, so the "disabled path is free" promise does not hold (2031-triage CAS-104) {#cas-event-sink-installed-when-log-disabled}
+
+`makeCasEventSink` returns a non-empty `std::function` whenever the metadata storage has a `Context` —
+its only early exit is `if (!context) return {}`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp:562-571`),
+and the "is the log actually there" question is answered INSIDE the sink
+(`:573-575`, `auto log = ctx->getContentAddressedLog(); if (!log) return;`). But
+`createSystemLog` returns an empty pointer when the config section is missing
+(`src/Interpreters/SystemLog.cpp:135-142`), and removing the section is the documented way to turn the
+log off (`programs/server/config.xml:1197-1199`, "Remove the section to disable"). So with the log
+disabled, `Pool::hasEventSink()` (`Pool/CasPool.h:784`) still answers `true`, every emission site still
+builds a full `CasEvent` (7 `String`s plus a `std::map`, `Primitives/CasEvent.h:180-194`), still pays
+the dispatcher's queue mutex (`Pool/CasEventDispatcher.cpp:19-22`), and the row is dropped at the very
+end.
+
+That contradicts two claims the code makes about itself: "disabled hot path still skips constructing
+events entirely" / "a true no-op on the production hot path" (`Pool/CasPool.h:769-770,782-784`) and
+"the query-frequency disabled hot path pays no mutex" (`Pool/CasEventDispatcher.h:99-101`). Nothing is
+corrupted and no path fails — it is wasted work on paths that also do object-storage round trips, which
+is why this is P3 and not a gate.
+
+Fix direction: ask `context->getContentAddressedLog()` when BUILDING the sink and return an empty
+`std::function` when the log is absent, so `hasEventSink` is again a truthful "delivery enabled"
+predicate. The honest version of that needs the sink to be re-derivable on config reload, which is the
+same missing plumbing as {#cas-settings-not-reloadable-silently} — a one-shot check at pool open is
+still strictly better than today, because the disabled case is a static config choice in practice.
+
+Related, and NOT this item: the per-emit event VOLUME (independent of whether the log is on) is already
+tracked as `{#ca-log-tables-restart-cost}` in `gc.md` and in the audit-row note inside
+`{#standalone-write-scratch-manifest-cost}` in `performance.md`. The dispatcher itself does not
+serialize delivery under its mutex — it releases the lock around the sink call
+(`Pool/CasEventDispatcher.cpp:36-51`), and the sink is the never-blocking `SystemLog::add`
+(`src/Common/SystemLogBase.cpp:93-123`) — so there is no read-path mutex bottleneck to track here.
+
+## The mount-lease / request-budget / snapshot-pacing knobs have no `ContentAddressedSettings` entry (2031-triage CAS-105) {#pool-pacing-knobs-no-config-surface}
+
+`ContentAddressedSettings` declares 29 disk keys
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp:63-92`)
+and `openPoolView` wires exactly those into `PoolConfig`
+(`ContentAddressedMetadataStorage.cpp:747-775`). Everything else in `PoolConfig` is therefore a
+struct default in production, reachable only from gtests:
+
+- `mount_lease_ttl_ms` (30 s) and `mount_renew_period` (10 s) — `Pool/CasPool.h:182-183`. They set the
+  write-fence deadline and the renewal cadence, and the user docs already quote both defaults as if
+  they were tunable (`docs/en/antalya/cas/architecture/mounts-and-leases.md:73`,
+  `docs/en/antalya/cas/operations/troubleshooting.md:19` even tells the operator to compare network
+  latency against `mount_lease_ttl_ms`).
+- the whole `CasRequestBudget` (`Backend/CasRequestControl.h:145-198`): `attempt_timeout_ms` 5 s,
+  `operation_deadline_ms` 90 s, `max_attempts` 16, `lease_safety_margin_ms` 2 s, the two inter-attempt
+  backoffs, and the three `recovery_retry_*` values (120 s / 1 s / 30 s).
+- `snapshot_log_count_threshold` / `snapshot_log_bytes_threshold` and the publish- and
+  precommit-sweep backoffs (`Pool/CasPool.h:234-253`) — these trade write-side full-snapshot `PUT`
+  volume against read-side cold-fold `GET`s, i.e. exactly a per-workload dial.
+- `gc_fold_threshold` (1) and `gc_fold_max_defer_rounds` (8) — `Pool/CasPool.h:159-165`; the
+  skip-unchanged batching dial is fixed at "fold as soon as anything changed".
+- `rebuild_edge_budget` (8 M edges ≈ 256 MB) — `Pool/CasPool.h:172`, an in-memory ceiling for
+  `rebuildBaseline`.
+
+Two members of the same struct are deliberately NOT part of this item: `gc_stuck_removal_rounds` is
+self-documented as a test seam ("no user-facing setting is registered", `Pool/CasPool.h:166-168`), and
+`gc_frontier_probe_budget` defaults to effectively unbounded with the explicit reasoning that a cap
+there converts into a permanent GC stop (`Pool/CasPool.h:136-155`) — exposing that one needs the
+argument for it, not just a `DECLARE`. `ref_table_cache_bytes` is the same class but already tracked
+with its own two extra residuals under {#ref-table-cache-budget-admission-only} in `performance.md`.
+
+Owed shape: `DECLARE` the pacing/budget subset (lease TTL + renew period, the request budget, the
+snapshot thresholds/backoffs, `rebuild_edge_budget`, the fold-batching pair), keep `validate` extended
+so the mount-lease inequality is checked against the CONFIGURED values rather than only the defaults,
+and land it together with the reload gap ({#cas-settings-not-reloadable-silently}) so a configured
+value is not silently ignored on `SYSTEM RELOAD CONFIG`. Not a gate: the defaults are the ones every
+soak ran on, and `Pool::open` already refuses an inconsistent budget out loud.

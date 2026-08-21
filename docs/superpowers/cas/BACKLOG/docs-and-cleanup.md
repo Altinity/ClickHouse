@@ -143,3 +143,22 @@ keep the REASON (a raw backend write with no controller/fence coupling, hence th
 capture-at-decision + check-before-write) and drop the anchor and the `rev.7 [C2]` provenance.
 
 Cosmetic only: the code and the fence checks themselves are correct.
+
+## `resolveRef`'s `allow_stale` is an inert parameter with one stale doc comment left behind it (2031-triage CAS-110) {#resolve-ref-allow-stale-inert-parameter}
+
+`CasRefLedger::resolveRef` names the parameter only in a comment
+(`Pool/CasRefLedger.cpp:275`, `bool /*allow_stale*/`) and the body never branches on it; both
+declarations keep it for source compatibility (`Pool/CasRefLedger.h:125`, `Pool/CasPool.h:509`) and
+`Pool::resolveRef` forwards it verbatim (`Pool/CasPool.cpp:1633-1635`). This is intended: with the
+snapshot+log protocol there is one authoritative cached `RefTableState` per mounted writer and no
+second (per-shard decode) cache to be stale against, so the knob has nothing to select — stated at
+the definition (`Pool/CasRefLedger.cpp:277-282`) and at the ledger declaration
+(`Pool/CasRefLedger.h:120-122`). No behavioural residue: every caller takes the identical path.
+
+What is owed is cleanup only: drop the parameter from both declarations and the forward and from the
+two remaining `/*allow_stale=*/` call sites (`Parts/PartFolderAccess.cpp:318`, `:607`), and fix the
+one comment that still describes a semantics that no longer exists —
+`Parts/PartFolderAccess.h:62` (`CachedForLoad`, "stale-tolerant resolve (allow_stale=true)").
+`Freshness` itself stays load-bearing: `ForceFresh`/`StrictValidate` still change `getView`'s
+manifest-body proof and single-flight participation (`Parts/PartFolderAccess.cpp:266-270`), only the
+resolve half of the distinction is gone. P3.
