@@ -23,7 +23,7 @@ protocol: rev.6 lease-boundary exclusivity, ref-log recovery, and the ref-lane s
 
 - **[ORPHANED-ADJUDICATION-COMMENT] `CasRefLedger.cpp:108-120` documents an adjudication its neighbouring code does not perform** — {#orphaned-adjudication-comment} — MINOR — A comment describes a `mine | successor's seal | foreign` adjudication with a narrow `catch`, which is NOT what the function beside it does — a comment that misdescribes its neighbour is worse than no comment, and this region is exactly where the next reader will look when INV-2's chain-link grammar is next touched. Take it with the next sweep that reaches the file; re-derive what the comment SHOULD say from the code rather than deleting it blind. Related: `chainLinkFor` stays in an anonymous namespace, so INV-2's grammar cannot be swept in isolation — asserted through `prepareRefChunk`'s validator instead (accepted disposition).
 - **[DEAD-INSTALL-PROBE-AND-STALE-REGION-COUNT] the post-durable install seam has a stale region-count comment** — {#dead-install-probe-and-stale-region-count} — MINOR — The dead-test-hook half is fixed (`gtest_cas_ref_ckpt.cpp`'s carve-time fence now sets the probe). Still open: `CasRefLedger.cpp:1903` says "Post-durable install region 2 of 3" although the restatement deleted the third region, and the fence's own comment now says "BOTH" while this comment still says "2 of 3" — a self-contradiction.
-- **[LANE-TERMINAL-REPORTED-AS-RETRYABLE] one arm sets `Faulted` and hands survivors the retry-later class** — {#lane-terminal-reported-as-retryable} — MINOR (one-line fix) — `commitRefChunk`'s "lane not `Ready` at new-id allocation" arm sets `RefLaneState::Faulted` but completes survivors with the retry-later exception class, contradicting the stated contract (`Faulted` should map to `CORRUPTED_DATA`). Self-limiting (one spurious retry, not a loop), but a contract worth stating is worth not contradicting in one arm.
+- **[LANE-TERMINAL-REPORTED-AS-RETRYABLE] ✅ CLOSED at HEAD by `21617aedda2` (verified 2031-triage CAS-017); kept for provenance** — {#lane-terminal-reported-as-retryable} — was MINOR (one-line fix) — `commitRefChunk`'s "lane not `Ready` at new-id allocation" arm sets `RefLaneState::Faulted` but completes survivors with the retry-later exception class, contradicting the stated contract (`Faulted` should map to `CORRUPTED_DATA`). Self-limiting (one spurious retry, not a loop), but a contract worth stating is worth not contradicting in one arm.
 - **[LANE-WITNESS-NAMES-MORE-THAN-IT-PROVES] a lane-battery witness proves less than its name, and one adoption arm has no witness at all** — {#lane-witness-names-more-than-it-proves} — MINOR — `saw_retry_created` witnesses that a retry created durability, not that the adoption install happened, but `CaRefLaneCore_RESULTS.md` calls it "retry-created adoption" — overstated. No witness asserts the `Wedged → Ready` durable-adoption arm at all. Fix: correct the RESULTS wording and add a witness on the adoption install itself. Does not affect the blocker-dissolved verdict.
 - **[PART-WRITE-RELEASE-SEAM] the `PartWriteTxn`/`PreparedPartWrite`/receiver-guard ownership seam needs its own contract spec** — HARD — USER-DIRECTED extraction, 2026-07-29. The relink redesign's review rounds kept grinding on one seam: three layers each with their own abort/retry, an overloaded `isTerminal`, nine scattered proven-no-send exits erased into a generic `NETWORK_ERROR`, false ERROR/WARNING log lines on settled-late releases, and no exactly-once emission contract for unproven releases. Extracted into a standalone spec as relink-independent prerequisite plumbing (single-`attempted`-bit proof channel, destructor-owned last-word emission, severity ladder, marker-sync fix); lands before relink implementation.
 
@@ -99,3 +99,18 @@ formatting / container work inside `noexcept` functions and destructors that can
 memory limit — `Gc/CasGcPhaseTimer.h:52-75`, the `Backend/CasProbe.cpp` cleanup lambdas,
 `Pool/CasMountRuntime.cpp:529-532`, and the fail-closed branch at `CasRefLedger.cpp:2085-2090`.
 P3: wrap or pre-size those, no behaviour change intended.
+
+## Ref-lane residuals from 2031-triage CAS-017 {#lane-residuals-2031-cas-017}
+
+The audit's "a transient backend error leaves the table permanently unusable" is refuted three ways
+at HEAD (the pinned reopen test `PredurableCatalogReadFailureReopensExactLiveLane`, GC reclaim of
+`Removing` per {#cas-join-set-truncate}, and a latch that lives only in memory so a restart clears
+it). Two genuine residuals came out of the check:
+
+- **Read path fabricates absence instead of retry-later** — inside the removal-latch window
+  `acquireReadableRefTableRuntime` returns `nullptr`, which the read path renders as "no such ref",
+  while the write path throws the retry-later class for the same state. A reader should not see
+  "absent" for "temporarily not admitting"; make the read path surface the same retry-later class.
+- **One `Faulted` arm never fires the anomaly policy** — the "occupant unreadable" arm sets
+  `Faulted` without invoking the anomaly path, so that lane alone has no automatic remount and
+  needs an operator. Wire it to the same policy the other terminal arms use.
