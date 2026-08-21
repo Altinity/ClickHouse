@@ -8,7 +8,9 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include <base/scope_guard.h>
@@ -23,6 +25,9 @@
 #include <aws/core/client/RetryStrategy.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/http/URI.h>
+#include <aws/core/utils/memory/AWSMemory.h>
+#include <aws/s3/model/Delete.h>
+#include <aws/s3/model/ObjectIdentifier.h>
 
 #include <Common/ProfileEvents.h>
 #include <Common/RemoteHostFilter.h>
@@ -1032,6 +1037,16 @@ struct ScriptedResponse
     std::vector<std::pair<std::string, std::string>> headers;
 };
 
+/// One real request as it reached the wire: method plus every header, captured before the scripted
+/// response is sent. Lets a test drive several real SDK calls (e.g. CreateMultipartUpload, UploadPart,
+/// CompleteMultipartUpload) against one server and inspect what each one actually carried, rather than
+/// only the single most-recent request `TestPocoHTTPServer` keeps.
+struct CapturedRequest
+{
+    std::string method;
+    Poco::Net::MessageHeader headers;
+};
+
 class ScriptedResponseServer
 {
 public:
@@ -1050,14 +1065,26 @@ public:
     /// the URL from an explicit loopback address plus the bound port instead.
     std::string getUrl() const { return "http://127.0.0.1:" + std::to_string(server_socket->address().port()); }
 
+    /// Requests in arrival order. The tests using this all drive their calls sequentially against a
+    /// single-threaded client, so no concurrent capture ever races with a concurrent read here.
+    const std::vector<CapturedRequest> & getCapturedRequests() const { return captured_requests; }
+
 private:
     class Handler : public Poco::Net::HTTPRequestHandler
     {
     public:
         explicit Handler(ScriptedResponseServer & owner_) : owner(owner_) { }
 
-        void handleRequest(Poco::Net::HTTPServerRequest &, Poco::Net::HTTPServerResponse & response) override
+        void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
         {
+            owner.captured_requests.push_back(CapturedRequest{request.getMethod(), request});
+
+            /// The connection is kept alive across requests (the SDK reuses it for the multipart/batch
+            /// sequences this server now handles), so an unread request body left in the socket buffer
+            /// corrupts the next request's parse -- its bytes prepend the following request line. Every
+            /// request body must be drained here even though nothing needs its content.
+            request.stream().ignore(std::numeric_limits<std::streamsize>::max());
+
             const size_t index = owner.request_count.fetch_add(1);
             const auto & scripted = owner.responses[std::min(index, owner.responses.size() - 1)];
             response.setStatus(scripted.status);
@@ -1083,6 +1110,7 @@ private:
 
     std::vector<ScriptedResponse> responses;
     std::atomic<size_t> request_count{0};
+    std::vector<CapturedRequest> captured_requests;
     std::unique_ptr<Poco::Net::ServerSocket> server_socket;
     Poco::SharedPtr<Factory> handler_factory;
     Poco::AutoPtr<Poco::Net::HTTPServerParams> server_params;
@@ -1118,7 +1146,8 @@ public:
     }
 };
 
-std::unique_ptr<RecordingClient> makeRecordingClient(const std::string & endpoint, unsigned int max_retries, unsigned int max_redirects)
+std::unique_ptr<RecordingClient> makeRecordingClient(
+    const std::string & endpoint, unsigned int max_retries, unsigned int max_redirects, const std::string & http_client = "gcs_hmac")
 {
     DB::RemoteHostFilter remote_host_filter;
     DB::S3::URI uri(endpoint + "/bucket");
@@ -1137,11 +1166,13 @@ std::unique_ptr<RecordingClient> makeRecordingClient(const std::string & endpoin
         uri.uri.getScheme());
 
     client_configuration.endpointOverride = uri.endpoint;
-    /// `gcs_hmac`, not `gcp_oauth`: both make `supportsGcsNativeConditionalRequests()` true, but
-    /// `gcp_oauth` fetches a bearer token from the GCE metadata server on every real request
+    /// The default `gcs_hmac`, not `gcp_oauth`: both make `supportsGcsNativeConditionalRequests()`
+    /// true, but `gcp_oauth` fetches a bearer token from the GCE metadata server on every real request
     /// (`PocoHTTPClientGCPOAuth::requestBearerToken`) -- a real network call this test cannot make.
-    /// `gcs_hmac` signs locally from the credentials handed to it below, no token fetch involved.
-    client_configuration.http_client = "gcs_hmac";
+    /// `gcs_hmac` signs locally from the credentials handed to it below, no token fetch involved. An
+    /// empty `http_client` selects the ordinary (non-GCS) HMAC path instead, wired the same way as a
+    /// plain S3-compatible disk -- it never invokes either GCS client class.
+    client_configuration.http_client = http_client;
     /// `ClientFactory::create` would clamp this to 1 when `s3_slow_all_threads_after_retryable_error`
     /// is set (external retry coordination); here we want the SDK's own retry loop to actually run.
     client_configuration.retryStrategy = std::make_shared<DB::S3::Client::RetryStrategy>(client_configuration.retry_strategy);
@@ -1335,6 +1366,318 @@ TEST(IOTestAwsS3Client, ResponseGenerationAndMetadataAdaptedOnlyWhenMarked)
         ASSERT_TRUE(outcome.IsSuccess());
         EXPECT_EQ(outcome.GetResult().GetETag(), "\"6654c734ccab8f440ff0825eb443dc7f\"");
         EXPECT_FALSE(outcome.GetResult().GetMetadata().contains("cas-envelope"));
+    }
+}
+
+/// Pins the ordinary S3-interoperability HMAC path (`http_client` left empty, exactly as configured for
+/// a plain S3-compatible disk): it never becomes a `PocoHTTPClientGCPOAuth` or `PocoHTTPClientGCSHMAC`,
+/// so none of the GCS request/response adaptation in `GCSConditionalDialect.cpp` is even reachable from
+/// it, CAS or no CAS. `native_conditional=true` is still passed on the HEAD below to prove that even a
+/// caller that mismarks a request cannot make this client honour it -- `supportsGcsNativeConditionalRequests`
+/// already gates the request-side bit off (see `NativeConditionalModeRequiresExplicitGcsHttpClient` /
+/// `NativeConditionalStaysFalseThroughBuildHttpRequestOnNonGcsClient`), and this closes the matching gap
+/// on the response side: this would fail if `applyGcsConditionalDialectToResponse` were ever hoisted out
+/// of the two GCS subclasses into the shared `PocoHTTPClient::makeRequestInternal`.
+TEST(IOTestAwsS3Client, OrdinaryHmacClientNeverAppliesGcsAdaptation)
+{
+    const std::vector<ScriptedResponse> script{{Poco::Net::HTTPResponse::HTTP_OK, {
+        {"ETag", "\"deadbeefcafebabe0000000000000001\""},
+        {"x-goog-generation", "1234567890123456"},
+        {"x-goog-meta-cas-envelope", "v1"},
+    }}};
+    ScriptedResponseServer server(script);
+    auto client = makeRecordingClient(server.getUrl(), /*max_retries=*/0, /*max_redirects=*/0, /*http_client=*/"");
+
+    DB::S3::HeadObjectRequest request;
+    request.SetBucket("bucket");
+    request.SetKey("key");
+    request.setNativeConditional(true);
+    auto outcome = client->HeadObject(request);
+
+    ASSERT_TRUE(outcome.IsSuccess());
+    EXPECT_EQ(outcome.GetResult().GetETag(), "\"deadbeefcafebabe0000000000000001\"");
+    EXPECT_FALSE(outcome.GetResult().GetMetadata().contains("cas-envelope"));
+
+    ASSERT_EQ(client->observed_native_conditional.size(), 1u);
+    EXPECT_FALSE(client->observed_native_conditional[0]);
+}
+
+/// Drives real `PutObject`, `CopyObject`, `DeleteObject`, and batch `DeleteObjects` requests through the
+/// same ordinary (non-GCS) HMAC client and inspects the literal wire headers. Every assertion here is
+/// falsifiable by a concrete regression: `EXPECT_TRUE(... has ...)` on an `x-amz-*` name fails if that
+/// header were ever renamed or dropped (e.g. by widening the GOOG4 allowlist's reach, or applying
+/// `renameToGoogPrefix` outside the two GCS clients), and the SigV4 `EXPECT_TRUE(starts_with(...))`
+/// checks fail if Bearer or GOOG4 authentication ever became reachable from a client with no
+/// `http_client` configured.
+TEST(IOTestAwsS3Client, OrdinaryHmacRequestsKeepUpstreamHeadersAndAuth)
+{
+    ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+    auto client = makeRecordingClient(server.getUrl(), /*max_retries=*/0, /*max_redirects=*/0, /*http_client=*/"");
+    const auto & captured = server.getCapturedRequests();
+
+    {
+        SCOPED_TRACE("PUT with x-amz-meta-*");
+        DB::S3::PutObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("key");
+        request.AddMetadata("cas-envelope", "v1");
+        /// `SetContentLength` explicitly, matching every production caller (e.g. `copyS3File.cpp`'s
+        /// `fillPutRequest`): without it, a keep-alive connection reused for a later request in this
+        /// same test can desync, since the client may frame the body differently than a length-less
+        /// request implies.
+        request.SetContentLength(7);
+        request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "payload"));
+        client->PutObject(request);
+
+        ASSERT_EQ(captured.size(), 1u);
+        EXPECT_TRUE(captured[0].headers.has("x-amz-meta-cas-envelope"));
+        EXPECT_FALSE(captured[0].headers.has("x-goog-meta-cas-envelope"));
+        EXPECT_TRUE(captured[0].headers.get("authorization", "").starts_with("AWS4-HMAC-SHA256"));
+        /// An earlier version of this assertion claimed the SDK's default checksum is always present;
+        /// a real run showed that is wrong. `WriteBufferFromS3::getUploadRequest` only ever computes
+        /// and sets a checksum `if (client_ptr->isS3ExpressBucket())` (see `ChecksumHeaderIsPresentForS3Express`,
+        /// whose name says exactly this), and `ExtendedRequest::GetChecksumAlgorithmName` only forces
+        /// checksum-off when explicitly disabled -- neither path adds a checksum for an ordinary bucket
+        /// on its own. So the correct, verified claim is the opposite: an ordinary write does NOT gain
+        /// the S3Express-only checksum machinery. This would fail if that machinery were ever made
+        /// unconditional (i.e. applied to every bucket, not just S3Express).
+        EXPECT_FALSE(captured[0].headers.has("x-amz-checksum-crc32"));
+        EXPECT_FALSE(captured[0].headers.has("x-amz-sdk-checksum-algorithm"));
+    }
+
+    {
+        SCOPED_TRACE("If-None-Match with a non-star value: passes through unmolested");
+        /// A non-star `If-None-Match` reaching `applyGcsConditionalDialectToRequest` aborts the process
+        /// with `LOGICAL_ERROR` (see ops notes) -- but that function is never called for this client at
+        /// all, so this is not the reachable case the death-test split exists for. `EXPECT_NO_THROW` is
+        /// the correct assertion here precisely because the guard is structurally unreachable, which is
+        /// exactly what this test is pinning.
+        DB::S3::PutObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("key");
+        request.SetIfNoneMatch("some-non-star-value");
+        /// `SetContentLength` explicitly, matching every production caller (e.g. `copyS3File.cpp`'s
+        /// `fillPutRequest`): without it, a keep-alive connection reused for a later request in this
+        /// same test can desync, since the client may frame the body differently than a length-less
+        /// request implies.
+        request.SetContentLength(7);
+        request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "payload"));
+        EXPECT_NO_THROW(client->PutObject(request));
+
+        ASSERT_EQ(captured.size(), 2u);
+        EXPECT_EQ(captured[1].headers.get("if-none-match", ""), "some-non-star-value");
+        EXPECT_FALSE(captured[1].headers.has("x-goog-if-generation-match"));
+    }
+
+    {
+        SCOPED_TRACE("CopyObject: existing targeted mappings are the AWS ones, no goog- rename");
+        /// Also a negative control for `CopyObjectRequestGetRequestSpecificHeadersRenamesOnlyUnderGcsApiMode`
+        /// below: this client's `api_mode` never becomes GCS (no `gcs_hmac`, no GCS-shaped endpoint, real
+        /// credentials), so `CopyObjectRequest::GetRequestSpecificHeaders` must leave these headers alone.
+        DB::S3::CopyObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("dest-key");
+        request.SetCopySource("bucket/src-key");
+        request.SetMetadataDirective(Aws::S3::Model::MetadataDirective::REPLACE);
+        request.SetStorageClass(Aws::S3::Model::StorageClass::STANDARD);
+        request.AddMetadata("cas-envelope", "v1");
+        client->CopyObject(request);
+
+        ASSERT_EQ(captured.size(), 3u);
+        EXPECT_TRUE(captured[2].headers.has("x-amz-copy-source"));
+        EXPECT_TRUE(captured[2].headers.has("x-amz-metadata-directive"));
+        EXPECT_TRUE(captured[2].headers.has("x-amz-storage-class"));
+        EXPECT_TRUE(captured[2].headers.has("x-amz-meta-cas-envelope"));
+        EXPECT_FALSE(captured[2].headers.has("x-goog-copy-source"));
+        EXPECT_FALSE(captured[2].headers.has("x-goog-metadata-directive"));
+        EXPECT_FALSE(captured[2].headers.has("x-goog-storage-class"));
+    }
+
+    {
+        SCOPED_TRACE("DELETE: single object");
+        DB::S3::DeleteObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("key");
+        client->DeleteObject(request);
+
+        ASSERT_EQ(captured.size(), 4u);
+        EXPECT_EQ(captured[3].method, "DELETE");
+        EXPECT_TRUE(captured[3].headers.get("authorization", "").starts_with("AWS4-HMAC-SHA256"));
+    }
+
+    {
+        SCOPED_TRACE("batch DeleteObjects");
+        DB::S3::DeleteObjectsRequest request;
+        request.SetBucket("bucket");
+        Aws::S3::Model::ObjectIdentifier obj1;
+        obj1.SetKey("key1");
+        Aws::S3::Model::ObjectIdentifier obj2;
+        obj2.SetKey("key2");
+        std::vector<Aws::S3::Model::ObjectIdentifier> objects{obj1, obj2}; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+        Aws::S3::Model::Delete del;
+        del.SetObjects(objects);
+        del.SetQuiet(true);
+        request.SetDelete(del);
+        client->DeleteObjects(request);
+
+        ASSERT_EQ(captured.size(), 5u);
+        EXPECT_EQ(captured[4].method, "POST");
+        EXPECT_TRUE(captured[4].headers.get("authorization", "").starts_with("AWS4-HMAC-SHA256"));
+    }
+}
+
+/// The deferred allowlist gap from Task 4: `GcsHmacDefaultPutPassesTheAuthenticationAllowlist` exercised
+/// only a small single-part PUT. Multipart is a distinct request shape family (`CreateMultipartUpload`,
+/// `UploadPart`, `CompleteMultipartUpload`), each with its own header set, and none of them were driven
+/// through the GOOG4 preparation before. Each `EXPECT_NO_THROW` below fails if the allowlist regresses
+/// to reject a header this shape actually carries (`BAD_ARGUMENTS` from `prepareGcsRequestForGoog4Authentication`);
+/// the header assertions fail if a `Rename` mapping stops firing and a stale `x-amz-*` header reaches the wire.
+/// `Default` mode is used throughout, so `applyGcsConditionalDialectToRequest` (with its `LOGICAL_ERROR`
+/// guards) is never invoked here -- no death-test split is needed for this test.
+TEST(IOTestAwsS3Client, GcsHmacDefaultMultipartPassesTheAuthenticationAllowlist)
+{
+    ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+    auto client = makeRecordingClient(server.getUrl(), /*max_retries=*/0, /*max_redirects=*/0, /*http_client=*/"gcs_hmac");
+    const auto & captured = server.getCapturedRequests();
+
+    {
+        DB::S3::CreateMultipartUploadRequest create_request;
+        create_request.SetBucket("bucket");
+        create_request.SetKey("key");
+        create_request.SetStorageClass(Aws::S3::Model::StorageClass::STANDARD);
+        create_request.AddMetadata("cas-envelope", "v1");
+        EXPECT_NO_THROW(client->CreateMultipartUpload(create_request));
+    }
+
+    {
+        DB::S3::UploadPartRequest upload_part_request;
+        upload_part_request.SetBucket("bucket");
+        upload_part_request.SetKey("key");
+        upload_part_request.SetUploadId("test-upload-id");
+        upload_part_request.SetPartNumber(1);
+        /// `SetContentLength` explicitly, matching `copyS3File.cpp`'s `makeUploadPartRequest` -- the
+        /// missing call here was diagnosed as the cause of a real failure: the SDK framed the body
+        /// differently than a length-less request implied, and the leftover bytes on this keep-alive
+        /// connection corrupted the following CompleteMultipartUpload request's parse on the server
+        /// side (`captured[2].method` read back as `"part-bodyPOST"`).
+        upload_part_request.SetContentLength(9);
+        upload_part_request.SetBody(Aws::MakeShared<std::stringstream>("gtest", "part-body"));
+        EXPECT_NO_THROW(client->UploadPart(upload_part_request));
+    }
+
+    {
+        DB::S3::CompleteMultipartUploadRequest complete_request;
+        complete_request.SetBucket("bucket");
+        complete_request.SetKey("key");
+        complete_request.SetUploadId("test-upload-id");
+        Aws::S3::Model::CompletedMultipartUpload completed;
+        Aws::S3::Model::CompletedPart part;
+        part.WithPartNumber(1).WithETag("\"etag1\"");
+        completed.AddParts(part);
+        complete_request.SetMultipartUpload(completed);
+        /// Deliberately not marked NativeConditional and no If-Match/If-None-Match is set, so this POST
+        /// (uploadId, no partNumber) never reaches `applyGcsConditionalDialectToRequest`'s conditional
+        /// CompleteMultipartUpload guard -- see the file-level comment above.
+        EXPECT_NO_THROW(client->CompleteMultipartUpload(complete_request));
+    }
+
+    ASSERT_EQ(captured.size(), 3u);
+
+    SCOPED_TRACE("CreateMultipartUpload: storage class and metadata renamed, nothing x-amz- left");
+    EXPECT_TRUE(captured[0].headers.has("x-goog-storage-class"));
+    EXPECT_TRUE(captured[0].headers.has("x-goog-meta-cas-envelope"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-storage-class"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-meta-cas-envelope"));
+
+    EXPECT_EQ(captured[2].method, "POST");
+}
+
+/// The second deferred shape: CopyObject through the GOOG4 preparation (`prepareGcsRequestForGoog4Authentication`
+/// in `GCSConditionalDialect.cpp`), not previously exercised at all. This is a DIFFERENT mechanism from
+/// the pre-existing, non-CAS `CopyObjectRequest::GetRequestSpecificHeaders` rename in `Requests.cpp`,
+/// which is gated on the request's `api_mode` field, not on `http_client`. The mock endpoint here
+/// (`127.0.0.1:PORT`) has no GCS-recognisable substring, so `Client`'s constructor never sets
+/// `api_mode` to `GCS` even for this `gcs_hmac` client (that requires `provider_type == GCS` first,
+/// which is endpoint-string-only) -- the `x-goog-copy-source` etc. observed below come entirely from
+/// the GOOG4 preparation step, not from `Requests.cpp`. See
+/// `CopyObjectRequestGetRequestSpecificHeadersRenamesOnlyUnderGcsApiMode` for that separate mechanism,
+/// tested directly against the request object with no client or server involved.
+TEST(IOTestAwsS3Client, GcsHmacDefaultCopyObjectPassesTheAuthenticationAllowlist)
+{
+    ScriptedResponseServer server({{Poco::Net::HTTPResponse::HTTP_OK, {}}});
+    auto client = makeRecordingClient(server.getUrl(), /*max_retries=*/0, /*max_redirects=*/0, /*http_client=*/"gcs_hmac");
+
+    DB::S3::CopyObjectRequest request;
+    request.SetBucket("bucket");
+    request.SetKey("dest-key");
+    request.SetCopySource("bucket/src-key");
+    request.SetMetadataDirective(Aws::S3::Model::MetadataDirective::REPLACE);
+    request.SetStorageClass(Aws::S3::Model::StorageClass::STANDARD);
+    request.AddMetadata("cas-envelope", "v1");
+
+    EXPECT_NO_THROW(client->CopyObject(request));
+
+    const auto & captured = server.getCapturedRequests();
+    ASSERT_EQ(captured.size(), 1u);
+    EXPECT_TRUE(captured[0].headers.has("x-goog-copy-source"));
+    EXPECT_TRUE(captured[0].headers.has("x-goog-metadata-directive"));
+    EXPECT_TRUE(captured[0].headers.has("x-goog-storage-class"));
+    EXPECT_TRUE(captured[0].headers.has("x-goog-meta-cas-envelope"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-copy-source"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-metadata-directive"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-storage-class"));
+    EXPECT_FALSE(captured[0].headers.has("x-amz-meta-cas-envelope"));
+}
+
+/// The pre-existing (pre-CAS), non-GOOG4 CopyObject header mapping: `CopyObjectRequest::GetRequestSpecificHeaders`
+/// in `Requests.cpp` renames `x-amz-copy-source`/`x-amz-metadata-directive`/`x-amz-storage-class`/
+/// `x-amz-meta-*` to their `x-goog-` counterparts, gated purely on the request's `api_mode` field (set
+/// by `Client::doRequest` from the CLIENT's own `api_mode`, itself derived from `deduceProviderType`
+/// matching the endpoint string against `storage.googleapis.com` -- see the file-level comment on
+/// `GcsHmacDefaultCopyObjectPassesTheAuthenticationAllowlist` above). Driving this end-to-end through a
+/// real `Client` would need a live server reachable AT a `storage.googleapis.com`-shaped hostname, which
+/// this test harness cannot provide cheaply (no local DNS/network alias for that name; see the
+/// integration test's own note on the same gap). `setApiMode` is public on `ExtendedRequest` for
+/// exactly this reason: it lets a unit test set the one bit `GetRequestSpecificHeaders` reads without
+/// needing a `Client` or any I/O at all.
+TEST(IOTestAwsS3Client, CopyObjectRequestGetRequestSpecificHeadersRenamesOnlyUnderGcsApiMode)
+{
+    auto makeRequest = []
+    {
+        DB::S3::CopyObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("dest-key");
+        request.SetCopySource("bucket/src-key");
+        request.SetMetadataDirective(Aws::S3::Model::MetadataDirective::REPLACE);
+        request.SetStorageClass(Aws::S3::Model::StorageClass::STANDARD);
+        request.AddMetadata("cas-envelope", "v1");
+        return request;
+    };
+
+    {
+        SCOPED_TRACE("api_mode left at its default (AWS): headers are untouched");
+        auto request = makeRequest();
+        const auto headers = request.GetRequestSpecificHeaders();
+        EXPECT_TRUE(headers.contains("x-amz-copy-source"));
+        EXPECT_TRUE(headers.contains("x-amz-metadata-directive"));
+        EXPECT_TRUE(headers.contains("x-amz-storage-class"));
+        EXPECT_TRUE(headers.contains("x-amz-meta-cas-envelope"));
+        EXPECT_FALSE(headers.contains("x-goog-copy-source"));
+    }
+
+    {
+        SCOPED_TRACE("api_mode explicitly set to GCS: every mapped header is renamed");
+        auto request = makeRequest();
+        request.setApiMode(DB::S3::ApiMode::GCS);
+        const auto headers = request.GetRequestSpecificHeaders();
+        EXPECT_TRUE(headers.contains("x-goog-copy-source"));
+        EXPECT_TRUE(headers.contains("x-goog-metadata-directive"));
+        EXPECT_TRUE(headers.contains("x-goog-storage-class"));
+        EXPECT_TRUE(headers.contains("x-goog-meta-cas-envelope"));
+        EXPECT_FALSE(headers.contains("x-amz-copy-source"));
+        EXPECT_FALSE(headers.contains("x-amz-metadata-directive"));
+        EXPECT_FALSE(headers.contains("x-amz-storage-class"));
+        EXPECT_FALSE(headers.contains("x-amz-meta-cas-envelope"));
     }
 }
 
