@@ -43,3 +43,34 @@ catch, exactly as `Pool/CasRefLedger.cpp:177` already pairs the two codes. Do th
 release that admits a mixed-generation pool (see B180 / format-freeze in
 `operability-and-introspection.md`), since after that the narrow catch turns a degradable fetch into
 a hard replication stall.
+
+## The `.tmp` + `replaceFile` write dance is unusable on a committed CA part (2031-triage CAS-057) {#tmp-replacefile-on-committed-part}
+
+`ContentAddressedTransaction::moveFile` services only sources STAGED in the same transaction; a
+source that is not staged throws `LOGICAL_ERROR` ("moveFile source not staged",
+`ContentAddressedTransaction.cpp:1529-1534`), and `replaceFile` delegates to it
+(`:1537-1552`). So the generic local-disk crash-safety pattern — write `<name>.tmp`, then
+`replaceFile` — cannot work against a published part when the two steps run in separate
+transactions: the `.tmp` write autocommits into the manifest as an ordinary inline entry (it is not
+blob-mandatory, `ContentAddressedTransaction.cpp:65-73`, so the autocommit gate at `:766-771` admits
+it), and the following `replaceFile` finds nothing staged and fails loudly. Fail-closed, not silent:
+no wrong bytes are ever published; the residue is a `<name>.tmp` entry in the committed manifest.
+
+The supported shape for such callers already exists and is generic, not CA-specific:
+`IDataPartStorage::supportsAtomicFileWrites` (`src/Storages/MergeTree/IDataPartStorage.h:198-200`,
+true for CA via `ContentAddressedMetadataStorage.h:261`), which
+`VersionMetadataOnDisk::storeInfoToDataPartStorage` consults to write `txn_version.txt` in one shot
+instead of the rename dance (`src/Interpreters/MergeTreeTransaction/VersionMetadataOnDisk.cpp:329`,
+landed in `45e43b37aaf`). The alternative is to run both steps inside ONE
+`disk->createTransaction()`, where the `.tmp` entry is staged and `moveFile` re-keys it in place
+(`ContentAddressedTransaction.cpp:1504-1527`).
+
+Latent, with no production caller today. The one named by the audit —
+`DeleteBitmapFileOps::writeBitmapToStorage` (`src/Storages/MergeTree/UniqueKey/DeleteBitmapFileOps.cpp:47-71`,
+`storage.writeFile(tmp)` + `storage.replaceFile`) — is reached only from
+`MergeTreeBitmapStore::installBitmap`, which has no caller outside its gtests (the store's own
+comment says "no production caller"); the UNIQUE KEY delete-bitmap path is unwired and gated behind
+`allow_experimental_unique_key` (`registerStorageMergeTree.cpp:740-748`). Owed when that path is
+wired: make `writeBitmapToStorage` take the `supportsAtomicFileWrites` short-circuit (or one
+transaction around both steps), and add a CA-disk test for it. Until then the guard's fail-loud throw
+is the correct behaviour.
