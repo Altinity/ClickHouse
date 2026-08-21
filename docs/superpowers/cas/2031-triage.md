@@ -91,8 +91,8 @@
 | CAS-073 | by-design | P3 | [{#cas-021-followups}](BACKLOG.md#cas-021-followups) | нет | Все три формы верны, но следствие изобретено: маркер по определению не является авторитетом удаления — удаляет exact-token delete по токену из retired-строки, а resurrect ротирует incarnation-tag, так что маркер «прошлой инкарнации» ничего удалить не разрешает. |
 | CAS-074 | ⏳ | — | — | — | — |
 | CAS-075 | ⏳ | — | — | — | — |
-| CAS-076 | ⏳ | — | — | — | — |
-| CAS-077 | ⏳ | — | — | — | — |
+| CAS-076 | not-a-bug | — | — | — | Форма кода верна (печать fold-seal идёт до единственного CAS `gc/state`), но следствие «ничего не убирает поколения, которые состояние не приняло» на HEAD ложно: оптовый префиксный prune `gc/gen/<g>/` — единственный и штатный сборщик ВСЕХ попыток, включая непринятые, и это закреплено тестами. |
+| CAS-077 | частично | P3 | [{#dead-member-frozen-build-floor} (новая секция в `BACKLOG/gc.md`)](BACKLOG.md#dead-member-frozen-build-floor} (новая секция в `BACKLOG/gc.md`) | нет | Удержание реально: право на удаление даёт только собственный mount-floor умершего узла, и у слота, который никто не переклеймил, `min_active`/`writer_epoch` больше не двигаются — но механизм в находке назван неверно (лиза не исчезает при потере узла), «навсегда» верно лишь для слота без перезапуска/сукцессора/декоммиссии, а сама консервативность — сознательный контроль #9. |
 | CAS-078 | подтверждено | P3 | [{#janitor-cursor-rewind-on-list-error}](BACKLOG.md#janitor-cursor-rewind-on-list-error) | нет | Сброс курсора уборщика namespace на любой ошибке LIST реален и запинен тестом, но это только задержка реклейма (громкая, посчитанная fsck), а не потеря данных. |
 | CAS-079 | подтверждено | P2 | [{#ref-cleanup-whole-catalog-token-stillness}](BACKLOG.md#ref-cleanup-whole-catalog-token-stillness) | нет | Ревалидация ref-cleanup в GC действительно требует неподвижности токена всего пул-глобального каталога и при отказе выходит из всей фазы — живой остаток того самого класса, который для ref-writer уже убран коммитом 684161dcc03. |
 | CAS-080 | ⏳ | — | — | — | — |
@@ -3256,3 +3256,144 @@ BACKLOG: пункта на это не было (грепы `catalog token`/`sti
 по СТРОКЕ, как в `684161dcc03` — строка по значению + переразрешение life + явный `throwIfAmbiguous` (именно он ловит aliasing-инкарнацию, которую
 раньше ловило сравнение токена); (б) отказ ограничить своим namespace (`continue`), а не всей фазой; (в) перецелить оба пинящих теста на
 per-row-контракт, добавив регресс на «чужая мутация каталога не должна останавливать подрезку».
+
+## CAS-076 — Форма кода верна (печать fold-seal идёт до единственного CAS `gc/state`), но следствие «ничего не убирает поколения, которые состояние не приняло» на HEAD ложно: оптовый префиксный prune `gc/gen/<g>/` — единственный и штатный сборщик ВСЕХ попыток, включая непринятые, и это закреплено тестами. (not-a-bug, —) {#cas-076}
+
+Анкеры находки — из снапшота `CA/...`; на HEAD файл —
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp` (перенос в подкаталоги —
+`592b9b83568`). Номера строк устарели: `putDeterministicArtifact(... foldSealKey(new_generation,
+attempt) ...)` не на `:2254`, а на `Gc/CasGc.cpp:3326`; «rebuild has the same shape» не на
+`:2980/:2987`, а на `Gc/CasGc.cpp:4366` (печать seal) и `:4375-4380` (`casPut(gcStateKey())`).
+
+ЧТО ПОДТВЕРЖДАЕТСЯ (как код-форма).
+1) Round — ОДНОПРОХОДНЫЙ: `fold` печатает fold seal под `(new_generation, attempt)`
+(`Gc/CasGc.cpp:3326`) и НЕ делает CAS `gc/state`; принятие происходит только в памяти
+(`:3333-3334`) и коммитится единственным `backend.casPut(layout.gcStateKey(), ...)` уже в
+`runRegularRound` (`:1076-1079`). То есть окно «seal напечатан — состояние не принято»
+существует, и падение в нём оставляет полноценный seal у поколения, на которое `gc/state` не
+ссылается. `new_generation = state.snap_generation + 1` (`:1915`), поэтому повторные падения
+складывают мусор ПОД ОДИН И ТОТ ЖЕ префикс `gc/gen/<G+1>/`, каждый раз под новой попыткой
+(`attempt` = `lease.seq`).
+2) У rebuild ровно та же последовательность: `putDeterministicArtifact(..., foldSealKey(generation,
+seal_attempt), ...)` (`:4366`), затем `casPut(gcStateKey())` (`:4375`), и на проигранном CAS —
+`rep.refusal` без отката печати (`:4376-4380`).
+
+ЧТО ФАКТИЧЕСКИ НЕВЕРНО — «nothing prunes generations the state never adopted».
+`Gc::pruneSupersededGenerations` (`Gc/CasGc.cpp:3585-3680`) на каждом успешном round-е делает не
+точечное удаление по принятой попытке, а ОПТОВОЕ удаление всего префикса поколения:
+`deletePrefixWholesale(backend, layout.gcGenPrefix(g), remaining, &fully_drained)` (`:3652-3653`) для
+каждого `g <= adopted_generation - keep`. Комментарий на месте прямо описывает именно этот класс
+мусора: «a deposed leader writes its fold_seal/runs/cleanup AND its attempt-scoped retired/outcomes
+sets under its OWN unadopted attempt before its CAS fails. The old per-key single-attempt prune ...
+therefore leaked every non-adopted attempt's debris. Instead, LIST the whole `gc/gen/<g>/` prefix and
+delete every listed object» (`:3605-3616`), и раздел (2) фиксирует, что оптовый prune — «the SOLE
+reclaimer of ALL attempt debris, including a deposed leader's» (`:3667-3676`). Итог: мусор непринятого
+поколения `G+1` ждёт не «вечно», а пока принятое поколение уйдёт на `keep` вперёд.
+
+История. Оптовая форма пришла коммитом `e9d435c6f8d` («CA GC prune: wholesale generation-retention
+(reclaims all attempts incl retired/outcomes) + bounded current-gen attempt sweep»), а per-round LIST
+текущего поколения был сознательно убран `3913f4dbf2b` («drop per-round current-gen attempt-sweep
+LIST; rely on wholesale retention (KISS)») — то есть ровно этот сценарий разбирался, и цена решения
+записана в коде: задержка возврата вместо постоянного LIST на редкую коллизию лидеров.
+
+ЗАКРЕПЛЕНО ТЕСТАМИ (то есть это не побочный эффект, а инвариант):
+- `src/Disks/tests/gtest_cas_gc_round.cpp:1390` `CASGCSnapRetention.
+  ReclaimsNonAdoptedCurrentGenAttemptViaRetention` — сажает seal+run под `orphan_gen =
+  snap_generation + 1` с НЕпринятой попыткой, проверяет, что свой round мусор переживает (`:1418-1420`,
+  «there is no per-round current-gen sweep»), а после старения поколения за `keep` оптовый prune
+  сносит весь подпрефикс (`:1430-1436`).
+- `:1247` `WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes` — тот же инвариант для
+  `retired/outcomes` наборов под чужими попытками.
+- `:1744-1755` — после проигранного round-CAS следующий успешный round обязан вернуть «the losing
+  round's own abandoned attempt debris», т.е. поколения, не упомянутые ни родительским, ни новым
+  seal-ом.
+- `:1760` `KeepZeroPrunesNothing` — единственный режим, где не собирается НИЧЕГО, это
+  `gc_snapshot_generations_to_keep == 0` (forensics/keep-all), и это документированный выбор
+  (`Gc/CasGc.cpp:3596-3597`).
+
+ОСТАТОК (не новый и не «leak»). Непринятый, но полностью записанный seal у `G+1` до момента prune
+виден пути аварийного восстановления: `newestFoldSealRef` шагает вниз по перечисленным поколениям и
+взял бы такой seal за базу (`Gc/CasGc.cpp:1463-1523`). Это (а) срабатывает только когда `gc/state`
+отсутствует/нечитаем, (б) консервативно (полный seal несёт не меньше hold-ов, чем принятый
+предшественник), и (в) уже отслежено как `BACKLOG/gc.md`{#rebuild-seal-point-read} (нужен
+point-readable `gc/gen/<G>/sealed`-алиас, чтобы discovery не зависел от перечисления). Ничего
+нового в BACKLOG не добавлено: заявленного в находке «нечем убрать» на HEAD нет, а компромисс по
+задержке возврата описан в самом коде и закреплён тестами. Класс отказа тоже мягкий: пропущенный
+CAS — это громкое `ABORTED` («gc/state moved during the round», `:1078`), при этом ничего
+разрушительного до CAS не делается, кроме печати детерминированного артефакта.
+
+## CAS-077 — Удержание реально: право на удаление даёт только собственный mount-floor умершего узла, и у слота, который никто не переклеймил, `min_active`/`writer_epoch` больше не двигаются — но механизм в находке назван неверно (лиза не исчезает при потере узла), «навсегда» верно лишь для слота без перезапуска/сукцессора/декоммиссии, а сама консервативность — сознательный контроль #9. (частично, P3) {#cas-077}
+
+Анкеры — из снапшота `CA/...`; на HEAD это
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.cpp` и
+`.../Pool/CasServerRoot.cpp` (перенос — `592b9b83568`). Строки почти совпали: `prefixEligible` не на
+`:373-387`, а на `Gc/CasOrphanManifestSweep.cpp:476-493`; «floor lookup :40-56» — это
+`floorForNamespace` на `:45-64`; «fence-out `CA/Pool/CasServerRoot.cpp:455`» — на HEAD ветка
+reclaim-по-сертификату-смерти на `Pool/CasServerRoot.cpp:425-446`.
+
+ЧТО ПОДТВЕРЖДАЕТСЯ.
+1) Право на удаление даётся ИСКЛЮЧИТЕЛЬНО durable mount-floor-ом жертвы:
+`prefixEligible` берёт `floorForNamespace` и при его отсутствии возвращает `false`
+(`Gc/CasOrphanManifestSweep.cpp:482-484`), далее: старший эпох ⇒ eligible, младший ⇒ нет,
+`min_active == UINT64_MAX` (farewell/retired sentinel) ⇒ eligible всё, иначе `min_active >
+build_sequence` (`:486-493`). `floorForNamespace` читает именно `layout.mountKey(server_root_id)`,
+подбирая `srid` префиксами namespace от длинного к короткому (`:45-64`).
+2) Ни fence-out, ни флаг `gc_fenced` не двигают ни `writer_epoch`, ни `min_active` — GC ставит только
+фенс (`Gc/CasGc.cpp:578-600`, `report.fence_outs`), а `prefixEligible` про `gc_fenced` вообще не
+знает. То есть у слота, который никто не переклеймил, floor заморожен на последнем heartbeat-е.
+3) Удержание шире, чем «манифесты»: не-eligible неотвладенный манифест трактуется как ЖИВОЕ ребро,
+т.е. пинит и свои блобы («Include edges of every manifest that is unowned AND not provably build-dead
+(the watermark fact) — over-protect», `Gc/CasGc.cpp:4274-4297`), а брошенные загрузки незакоммиченной
+транзакции прямо описаны как «min_active-spared debris»
+(`ContentAddressedTransaction.cpp:114-115`). Байты могут быть размером с part.
+4) «Единственный verb, который снимает лизу, сначала стирает данные» — верно и подтверждено:
+`decommissionPoolMember` сперва дропает каждый owned namespace (`Tools/CasDecommission.cpp:188,194`),
+затем дренирует manifest-debris/staging/mountpoint (`:219-242`), farewell (`min_active = UINT64_MAX`)
+и снятие слота — только после подтверждённых дренажей (`:305-310,:337`). Это тот же инвариант «данные
+раньше слота», который уже разобран в CAS-063 (`{#owner-only-slot-invisible-in-mounts}`), и он
+by-design, а не дефект.
+
+ЧТО НЕВЕРНО/НЕТОЧНО В ФОРМУЛИРОВКЕ НАХОДКИ.
+- «the sweep needs the owning mount lease to compute a watermark floor; once the node is gone its
+  debris is protected forever». Потеря узла НЕ удаляет объект `mount` — floor не отсутствует, он
+  заморожен. Отсюда следствие иное: ветка «нет лизы ⇒ не eligible» (`:483-484`) в этом сценарии не
+  срабатывает вовсе, работает `min_active > build_sequence` = false.
+- «forever» — только для случая, когда слот никто не переклеймил. Штатных путей возврата два, и оба
+  живые: (а) перезапуск того же `srid` или сукцессор берут слот по сертификату смерти
+  (`gc_fenced` / clean marker / `proven_dead_token`) и пишут тело с НОВЫМ `writer_epoch`
+  (`Pool/CasServerRoot.cpp:425-446`), после чего весь мусор прежнего эпоха становится eligible по
+  первой же ветке `prefixEligible` (`:487-488` — «old-epoch debris drains after a process restart even
+  when its build_sequence is above the current min_active»); (б) `SYSTEM CAS DROP POOL MEMBER` —
+  документированный verb именно для навсегда мёртвого участника, он и стамп farewell ставит, и
+  eligible-мусор дренирует.
+- Класс: это УДЕРЖАНИЕ (retention), а не потеря и не тихая порча; ничего не удаляется по неполному
+  доказательству — наоборот, отказ от удаления и есть fail-closed.
+
+ПОЧЕМУ ЭТО СОЗНАТЕЛЬНО. Комментарий на месте запрещает подмену: «Eligibility comes only from the
+durable mount-lease floor. A missing floor means NOT eligible; do not replace that authority check with
+a frozen-sequence or judged-dead guess» (`Gc/CasOrphanManifestSweep.cpp:478-481`), и это закреплено
+контролем #9 — `src/Disks/tests/gtest_cas_orphan_manifest_sweep.cpp:316`
+`CASOrphanManifestSweep.NoWatermarkIsNotAuthority` («frozen-seq is not authority»). Кажущийся дешёвый
+фикс — «считать `gc_fenced` за retired-всего-эпоха» — не однострочный: у зафенсенного предшественника
+in-flight PUT ещё может материализовать тело позже (`BACKLOG/ref-protocol.md` `[Late Predecessor
+PUT]`), поэтому такое повышение сертификата требует отдельного разбора приземления.
+ПОИСК ПО BACKLOG: совпадений по этому механизму нет. Смежное, но про другое: `BACKLOG.md`
+{#decommission-wrong-predicate} (что считать «мёртвым» для самой команды),
+{#nested-srid-decommission} (выбор жертвы по префиксу), `BACKLOG/mounts-and-lifecycle.md`
+{#life-epoch-monotone-per-server-root} (передача namespace другому server root — «pool-member
+decommission is where this would be introduced»), `BACKLOG/testing-and-ci.md` B200 (сценарная карта
+декоммиссии). Ни одна из записей не покрывает «floor мёртвого участника заморожен ⇒ его брошенные
+build-префиксы удерживаются».
+
+РЕАЛЬНЫЙ ОСТАТОК (записан новой секцией, оставлено незакоммиченным):
+`docs/superpowers/cas/BACKLOG/gc.md`{#dead-member-frozen-build-floor}. Две половины, дешёвая первая:
+(1) НАБЛЮДАЕМОСТЬ — удержание по неeligible-префиксу молчит: `sweepNamespace` возвращает 0 без
+retain-класса (`Gc/CasOrphanManifestSweep.cpp:499-500`, «not eligible by the durable watermark fact — delete nothing»), такие объекты попадают в
+недифференцированный `skipped` (см. `Gc::reportSweepRetention`, `Gc/CasGc.cpp:3338-3374`), а `ca-fsck`
+помечает их `in-flight-pre-precommit` (`Tools/CasFsck.cpp:1113-1116`) — для заведомо мёртвого
+участника это дезинформация; нужен отдельный класс с именем `srid`. (2) РЕШЕНИЕ ПО ВОЗВРАТУ — либо
+неразрушающий административный verb, который ставит только farewell-стамп на доказанно мёртвом слоте
+(не трогая namespace-ы), либо явная фиксация, что декоммиссия — единственный ответ; это
+protocol-adjacent (лицензирует удаления от имени мёртвого узла) и требует консультации.
+P3: удержание ограничено числом build-ов в полёте на момент потери, самоустраняется при перезапуске
+того же `srid` или сукцессоре, и для навсегда мёртвого участника уже есть штатный verb.
