@@ -272,3 +272,15 @@ Owed (small): either give the synthesized row a `state` word naming the cause (e
 `list_ok = false` versus `''` for a genuinely empty listing), or add a nullable
 `mount_list_error` column carrying `getCurrentExceptionMessage`. Related:
 {#owner-only-slot-invisible-in-mounts} (the other reason a slot has no row).
+
+## `~Pool`'s network teardown runs under `pointer_mutex` (umbrella review M8) {#pool-dtor-under-pointer-mutex}
+
+In `ContentAddressedMetadataStorage::shutdown()` both `part_access.reset()` and `cas_store.reset()`
+still execute while `pointer_mutex` is held. With GC disabled or a read-only mount — real
+configurations — `cas_store` is the last strong reference, so `~Pool`'s multi-second network teardown
+(ref-lane drain plus the farewell write) runs inside the lock and blocks every snapshot reader
+(`poolAccess()`, `store()`, `gcHealth()`, `system.cas_mounts`). The GC-enabled case is masked only by
+the scheduler holding a second reference — a refcount accident, not an invariant, and `pointer_mutex`
+is documented as a brief-snapshot lock. Fix: hoist both into locals, release the lock, reset them
+unlocked — exactly the handling `old_scheduler` already gets in the same function. P3: latency and
+lock-hold hygiene, no corruption.

@@ -569,3 +569,18 @@ stop allocating per record. Nothing outside `Formats/` calls `readLine`
 
 Related, already tracked: `{#writepath-cost-txn-final}` covers the WRITE-side allocation audit; this
 is the read/decode side, which that item does not mention.
+
+## Blob-upload pool: raw reference escapes its lock; `clickhouse-local` tears it down first (umbrella review M6) {#blob-upload-pool-teardown-order}
+
+`blobUploadPool()` returns a raw `ThreadPool &` after releasing `pool_mutex`, and the reference is
+held across the whole upload fan-out; `shutdownBlobUploadPool()` simply resets the instance. In
+`clickhouse-local` the shutdown call runs BEFORE `global_context->shutdown()` — the reverse of the
+order in `clickhouse-server` and `clickhouse-disks`. Since `MergeTreeData` starts real background
+merges even under `clickhouse-local`, a merge mid-fan-out at process exit can hold a reference to a
+pool that is already destroyed (use-after-free, or a null-pool throw in sanitizer builds). The
+header's own contract admits the reference is valid only while the pool stays initialized and relies
+on call-order discipline with no assertion.
+
+Fix: move the shutdown call after `global_context->shutdown()` in `LocalServer::cleanup()`; longer
+term hand out a `shared_ptr` (or a use-counter the shutdown drains) so the contract is enforced by
+code. P2. Not the same as the tracked pool-size/backpressure item (2031-triage CAS-047).
