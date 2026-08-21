@@ -49,6 +49,9 @@ PLAIN_BUCKET = "plainbucket"
 
 NUM_ROWS = 200
 
+# Where the fixture installs the disk configuration, so a test can rewrite it and reload.
+CONFIG_IN_CONTAINER = "/etc/clickhouse-server/config.d/cas_gcs.xml"
+
 cluster = ClickHouseCluster(__file__)
 
 
@@ -96,7 +99,7 @@ def start_cluster():
         node = cluster.instances["node"]
         node.copy_file_to_container(
             os.path.join(os.path.dirname(__file__), "configs", "config.xml"),
-            "/etc/clickhouse-server/config.d/cas_gcs.xml",
+            CONFIG_IN_CONTAINER,
         )
         node.restart_clickhouse()
 
@@ -864,6 +867,89 @@ def test_a_write_whose_response_carries_no_generation_is_refused():
 
 
 # ---------------------------------------------------------------------------------------------------
+def test_a_reload_that_would_flip_the_token_dialect_is_refused():
+    """A live CAS mount must keep the incarnation-token dialect it was opened with.
+
+    The pool derives persistent state from that dialect -- how a token value is normalised, whether a
+    listing may supply one at all, and which preconditions the mount had to satisfy -- so a reload that
+    swapped the client for one minting the other kind would leave persisted tokens uncomparable.
+
+    The refusal lives in the object storage rather than in the CAS metadata storage, and that placement
+    is the point of this test: only the object storage knows the EFFECTIVE `http_client`, which it merges
+    from its current settings, any endpoint-level block and the disk's own section. A check reading the
+    disk section alone would miss a flip arriving from an endpoint block, and would refuse a reload that
+    changes nothing whenever the effective value came from anywhere else.
+
+    Asserting the refusal is not enough on its own, because "the reload was refused" and "the reload was
+    refused AND the old client survived" are different claims and only the second is the guarantee. So
+    the test also shows the mount still speaks generation afterwards: a fresh conditional write still
+    carries a numeric precondition, which only a generation-dialect client sends.
+
+    Would fail if: the pin were not installed at startup, were compared against one config section
+    instead of the merged settings, or were checked after the client had already been replaced.
+    """
+    node = cluster.instances["node"]
+    table = "t_cas_gcs_oauth"
+    cas_bucket = CAS_DISKS["cas_gcs_oauth"]
+
+
+    try:
+        # An explicit non-GCS value, not a removed key. Settings merge through `updateIfChanged`, which
+        # applies only values the incoming config actually SET, so deleting `http_client` leaves the old
+        # one in force and flips nothing -- the first version of this test deleted it and the guard
+        # correctly stayed silent. No validation rejects an unrecognised value; it simply selects the
+        # ordinary client, which is an ETag store.
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "<http_client>gcp_oauth</http_client>",
+            "<http_client>none</http_client>",
+        )
+        try:
+            reload_error = node.query_and_get_error_with_retry(
+                "SYSTEM RELOAD CONFIG", retry_count=1, sleep_time=0
+            )
+        except Exception:
+            reload_error = ""
+
+        # Whether the refusal reaches the client or only the log depends on how config reload reports a
+        # failing disk, so accept either -- but require one of them, and require the specific reason rather
+        # than any failure.
+        logged = node.grep_in_log("cannot change its conditional-operation dialect on reload")
+        assert "conditional-operation dialect" in reload_error or logged, (
+            "the reload was neither refused to the client nor recorded as refused in the log; "
+            "error was {!r}".format(reload_error)
+        )
+
+        # The guarantee: the old client survived, so this mount still speaks the generation dialect. The
+        # evidence is a generation PRECONDITION on the wire, which only a generation-dialect client sends.
+        # Not the `numeric_if_match` counter -- that one counts `If-Match` (exact-token) requests, and an
+        # INSERT sends `x-goog-if-generation-match` for create-if-absent instead, so the counter would have
+        # stayed flat here for a reason that has nothing to do with the dialect.
+        after_reload_seq = _next_seq()
+        node.query(
+            "INSERT INTO {} SELECT number, toString(number) FROM numbers(30000, 20)".format(table)
+        )
+        post_reload = _captured_since(after_reload_seq, cas_bucket)
+        assert post_reload, "the INSERT after the refused reload reached the store not at all"
+        conditional = [r for r in post_reload if "x-goog-if-generation-match" in r["headers"]]
+        assert conditional, (
+            "no generation precondition was sent after the refused reload, so the mount is no longer "
+            "speaking the generation dialect it was opened with"
+        )
+    finally:
+        # Always restore, even on a failed assertion: leaving the disk configured for the other
+        # dialect would break every test that runs after this one.
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "<http_client>none</http_client>",
+            "<http_client>gcp_oauth</http_client>",
+        )
+        node.query("SYSTEM RELOAD CONFIG")
+        node.query(
+            "INSERT INTO {} SELECT number, toString(number) FROM numbers(31000, 20)".format(table)
+        )
+
+
 # MUST STAY LAST IN THIS FILE. The fake's counters are global and cumulative and nothing in this module
 # resets them, so a counter assertion covers exactly the traffic that precedes it. Placed anywhere but
 # last, the test below silently becomes a prefix check and stops seeing the traffic of whatever now

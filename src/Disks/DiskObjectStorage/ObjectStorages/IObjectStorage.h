@@ -393,6 +393,18 @@ public:
     /// through the single-PUT path (GCS enforces no preconditions on CompleteMultipartUpload).
     virtual bool conditionalOpsUseGenerationTokens() const { return false; }
 
+    /// Declare that this storage's answer to `conditionalOpsUseGenerationTokens` must not change for
+    /// the rest of its life, and what that answer is expected to be. A caller that has already derived
+    /// persistent state from the dialect pins it here; a later `applyNewSettings` that would flip it
+    /// must then be refused rather than silently swapping the client underneath that state.
+    ///
+    /// The check has to live at this layer because the effective value is only known here: it is merged
+    /// from the storage's current settings, any endpoint-level block and the disk's own section, and no
+    /// caller holding configuration text alone can reproduce that resolution.
+    ///
+    /// Unpinned by default, so an ordinary storage's settings and reload behaviour are unchanged.
+    virtual void pinConditionalOpsGenerationDialect(bool /*expect_generation_tokens*/) {}
+
     /// Whether the underlying bucket has object versioning enabled; nullopt when unknown or not
     /// applicable. Used by the CAS capability probe to fail closed on GCS: on a versioned bucket
     /// a token-exact DELETE archives a noncurrent generation instead of reclaiming storage.

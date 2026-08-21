@@ -97,14 +97,6 @@ private:
 
 bool isS3ExpressEndpoint(const std::string & endpoint);
 
-/// Whether an `http_client` value selects a Google client whose objects are versioned by generation
-/// rather than by ETag. Case-insensitive, since the value comes from user configuration.
-///
-/// One definition on purpose: the answer is needed both by a live client (`Client::
-/// supportsGcsNativeConditionalRequests`) and by callers that only hold configuration text and have no
-/// client yet. Two copies would agree today and diverge the day a third value is added to one of them.
-bool httpClientImpliesGcsGenerationDialect(const std::string & http_client);
-
 struct ClientSettings
 {
     bool use_virtual_addressing = false;

@@ -17,6 +17,7 @@
 #include <IO/WriteBufferFromS3.h>
 #include <IO/ReadBufferFromS3.h>
 #include <IO/S3/getObjectInfo.h>
+#include <IO/S3/Client.h>
 #include <IO/S3/Requests.h>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
@@ -78,6 +79,12 @@ namespace S3RequestSetting
     extern const S3RequestSettingsUInt64 min_upload_part_size;
     extern const S3RequestSettingsUInt64 max_unexpected_write_error_retries;
     extern const S3RequestSettingsUInt64 max_single_operation_copy_size;
+}
+
+
+namespace S3AuthSetting
+{
+    extern const S3AuthSettingsString http_client;
 }
 
 
@@ -537,6 +544,11 @@ bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
     return client.get()->supportsGcsNativeConditionalRequests();
 }
 
+void S3ObjectStorage::pinConditionalOpsGenerationDialect(bool expect_generation_tokens)
+{
+    pinned_generation_dialect.store(expect_generation_tokens ? 1 : 0);
+}
+
 std::optional<bool> S3ObjectStorage::isBucketVersioningEnabled() const
 {
     S3::GetBucketVersioningRequest request;
@@ -951,6 +963,31 @@ void S3ObjectStorage::applyNewSettings(
 
     modified_settings->request_settings.proxy_resolver = DB::ProxyConfigurationResolverProvider::getFromOldSettingsFormat(
         ProxyConfiguration::protocolFromString(uri.uri.getScheme()), config_prefix, config);
+
+    /// A caller that derived persistent state from the conditional-ops dialect pinned it (see
+    /// `IObjectStorage::pinConditionalOpsGenerationDialect`). Refuse before the client is replaced, so a
+    /// rejected reload leaves the working client and its dialect in place.
+    ///
+    /// This is the only point where the question can be answered: `modified_settings` above is the merge
+    /// of the current settings, any endpoint-level block and the disk's own section, and `http_client`
+    /// may be set by any of them. Checking a single config section instead would miss an endpoint-level
+    /// flip entirely, and would refuse a reload that changes nothing whenever the effective value comes
+    /// from somewhere other than that section.
+    if (const int8_t pinned = pinned_generation_dialect.load(); pinned >= 0)
+    {
+        const bool would_be_generation
+            = S3::httpClientImpliesGcsGenerationDialect(modified_settings->auth_settings[S3AuthSetting::http_client]);
+        if (would_be_generation != (pinned == 1))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Object storage {} cannot change its conditional-operation dialect on reload: it is in "
+                "use by a mount that has already recorded {} incarnation tokens, and the new settings "
+                "resolve `http_client` to '{}', which would mint {} ones. Persisted tokens would no "
+                "longer be comparable. Keep the previous `http_client`, or recreate the mount.",
+                getName(),
+                pinned == 1 ? "generation" : "ETag",
+                modified_settings->auth_settings[S3AuthSetting::http_client].value,
+                would_be_generation ? "generation" : "ETag");
+    }
 
     auto current_settings = s3_settings.get();
     if (options.allow_client_change
