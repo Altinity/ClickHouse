@@ -178,3 +178,34 @@ Owed (small): give the mounts view a row for a slot that has an `owner` (or an `
 `mount`, with a state naming it — `retiring`/`half-retired` — so the operator sees the resume anchor
 instead of a silence. Related: {#decommission-successor-mount-race} (the other end of the same
 retirement tail) and `BACKLOG.md`{#decommission-wrong-predicate}.
+
+## `remount_running` is latched before the recovery thread is spawned, so a failed spawn disables self-remount for the process lifetime (2031-triage CAS-070) {#remount-running-latched-before-spawn}
+
+`CasMountRuntime::scheduleRemount` stores `remount_running = true`
+(`Pool/CasMountRuntime.cpp:451`) and only THEN constructs the recovery thread
+(`:452`). `ThreadFromGlobalPool`'s constructor goes through
+`GlobalThreadPool::scheduleOrThrow`, which throws `CANNOT_SCHEDULE_TASK` on pool
+exhaustion and on injected faults (`Common/ThreadPool.cpp:330`,
+`CannotAllocateThreadFaultInjector` — enabled by
+`tests/config/config.d/cannot_allocate_thread_injection.xml` in the stress lanes). If it
+throws, the only store that clears the flag (`:470`, at the end of the thread body) never
+runs, no thread exists, and every later `scheduleRemount` returns at the
+`remount_running.load()` gate (`:444`/`:447`) forever: the mount stays fenced closed and
+the disk's writes fail loud until the server restarts.
+
+The throw itself is invisible: the arming call sites are the keeper's `on_lost` hook
+(`Pool/CasMountRuntime.cpp:249-254`, reached from
+`SingleWriterSlot::backgroundLoop`'s `onRenewFailed`, whose hook exceptions are swallowed
+by an empty catch at `Pool/CasServerRoot.cpp:1448-1456`) and
+`Pool::reportImpossibleInterference` (`Pool/CasPool.cpp:1472`). Nothing logs the failed
+arming, so the operator sees a permanently fenced disk with no explanation.
+
+Fail-loud, no data loss (the fence is closed, not open), so this is not a release blocker —
+but the fix is small and self-contained: set `remount_running` only after the thread object
+is constructed (or clear it in a catch around the spawn) and log loudly when arming fails.
+The two other legs the finding attached to this shape do NOT hold: the thread body's callback
+`Pool::tryRemountOnce` is contractually non-throwing (its whole body is wrapped, and the
+lifecycle probe classifies rather than throws — `Pool/CasPool.cpp:1011-1018`, `:1083`,
+`:1205-1219`), and `stopRemountThread`'s store-outside-`remount_cv_mutex`
+(`Pool/CasMountRuntime.cpp:496-497`) costs at most one backoff interval (the wait is a
+`wait_for`, `:466`), never a lost wakeup.
