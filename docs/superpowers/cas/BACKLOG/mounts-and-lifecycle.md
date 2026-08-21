@@ -253,3 +253,22 @@ end fail-closed or inert, and both are cheap to close.
    enforced elsewhere — the keeper's token-guarded CAS and the `liveWriterEpoch` comparison in
    `Pool/CasPartWriteTxn.cpp:158-161`. Either drop the two fields, or keep them and say in the
    comment that they are a diagnostic record only, never an admission input.
+
+## A failed `listMounts` is not distinguishable from "live pool with no slots" in `system.content_addressed_mounts` (2031-triage CAS-133) {#mounts-list-failure-indistinguishable}
+
+P3, observability only — nothing is corrupted and the failure is already logged.
+
+When `Cas::listMounts` throws, `StorageSystemContentAddressedMounts::read` logs it
+(`src/Storages/System/StorageSystemContentAddressedMounts.cpp:170-172`), sets `list_ok = false`, and
+falls through to the synthesized snapshot row (`:223-242`). That row still carries the truthful
+non-gated lifecycle (`appendLifecycle(snap)`, `:241`), so the disk does NOT look absent and does NOT
+look like a never-started disk: a healthy pool keeps `lifecycle = 'live'` while a never-started disk
+reports `constructing` and a torn-down one `shutdown`
+(`ContentAddressedMetadataStorage.cpp:468-474`). What the row cannot express is *why* the lease
+columns are blank: `state` is a non-nullable `String` and gets `insertDefault()` (`:236`), so a
+throttled LIST renders exactly like a `live` pool that legitimately listed zero slots.
+
+Owed (small): either give the synthesized row a `state` word naming the cause (e.g. `unknown` when
+`list_ok = false` versus `''` for a genuinely empty listing), or add a nullable
+`mount_list_error` column carrying `getCurrentExceptionMessage`. Related:
+{#owner-only-slot-invisible-in-mounts} (the other reason a slot has no row).

@@ -99,3 +99,24 @@ whose move accomplishes no physical relocation, so the realistic `MOVE`/TTL targ
 (different bucket/tier), where the bytes genuinely must travel and no relink is possible. Ordering:
 after `[VERIFY-ca-ca-same-pool-move]`'s S37 leg actually runs — it decides whether same-pool CA↔CA is
 even a supported shape before there is any point optimizing it.
+
+## With no target disk supplied, a fetch advertises only the FIRST CA pool of the policy, so a reservation on a second CA pool loses relink (2031-triage CAS-134) {#relink-advertises-only-first-ca-pool}
+
+P3, performance only — the fallback is a normal byte fetch onto a CA disk (content-addresses and
+dedups on arrival), and it is logged with both pool ids.
+
+`fetchSelectedPart` advertises the receiver's pool identity before it knows which disk the
+reservation will pick. When the caller supplied a CA `disk`, the advertise is exact
+(`src/Storages/MergeTree/DataPartsExchange.cpp:707-712`); when it did not, the code walks
+`data.getDisks()` and advertises the FIRST CA disk it meets (`:713-724`, `break`). Three of the four
+production callers pass no disk (`StorageReplicatedMergeTree.cpp:3483`, `:3611`, `:5823`); only
+`fetchExistsPart` (`:6009`) passes one. So in a policy holding two CA disks belonging to DIFFERENT
+pools, a reservation that lands on the second pool cannot use the offer: the post-reservation re-check
+(`DataPartsExchange.cpp:926-932`, added by `f3cd6e1ff1f`) sees
+`chosen_ca->getPoolUUID() != advertised_pool_uuid` and re-requests the bytes.
+
+Owed (small, only if the topology is supported at all): advertise the SET of CA pool ids reachable
+from the policy (comma-separated `cas_pool_uuid`) and let the sender pick the one matching the part's
+disk, or defer the advertise until after reservation. Whether the topology is even a supported shape
+is `BACKLOG/formats-and-storage.md`{#orphan-triage-2026-08-04} `[mixed-ca-tiered-topology]`, which
+this item should be ordered after.
