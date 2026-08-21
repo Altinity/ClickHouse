@@ -686,17 +686,37 @@ that UNFREEZE is a destructive, local-intent statement). Live parts are correctl
 `DROP TABLE` + GC the frozen blobs are gone. Data loss on the backup path; correct semantics = the
 local-disk baseline (shadow is strictly per-replica, the issue's P6).
 
-FIX (SCHEDULED: tomorrow, pre-release — see docs/superpowers/cas/final-checks-todo.md), small radius:
-- (1) `shadowNamespace` -> `server_root_id + "/" + canonicalDiskPath(shadow_table_dir)` (the DISK
-  path `shadow/...` stays; only the pool-namespace derivation changes);
-- (2) the two `"shadow/"` enumeration scopes -> `<server_root>/shadow/`
-  (`ContentAddressedMetadataStorage.cpp:1513`, `:1700`);
+FIX (SCHEDULED: pre-release — see docs/superpowers/cas/final-checks-todo.md):
+- (1) `shadowNamespace` -> `serverPrefix() + "/" + canonicalDiskPath(shadow_table_dir)`, mirroring
+  `liveNamespace` (the DISK path `shadow/...` stays; only the pool-namespace derivation changes). It
+  stops being `static`, because `serverPrefix()` is a member — which is what surfaces the call sites
+  in (2).
+- (2) SIX sites, not three. An earlier revision of this entry listed three and missed the most
+  dangerous one; the corrected enumeration, re-derived against the tree:
+  | site | role |
+  |---|---|
+  | `ContentAddressedMetadataStorage.cpp` `shadowNamespace` | the derivation itself |
+  | `ContentAddressedTransaction.cpp` UNFREEZE of one frozen part's ref | call site, breaks on the `static` drop |
+  | `ContentAddressedTransaction.cpp` UNFREEZE of a table-dir namespace | call site, breaks on the `static` drop |
+  | `ContentAddressedMetadataStorage.cpp` intermediate-shadow-dir existence probe | enumeration scope |
+  | `ContentAddressedMetadataStorage.cpp` its listing counterpart | enumeration scope |
+  | **`ContentAddressedTransaction.cpp` `UNFREEZE WITH NAME` bulk drop** | **enumeration scope — the one that was missed** |
+  Why the last one matters more than the others: prefix the derivation without prefixing that scope
+  and `UNFREEZE WITH NAME` enumerates `shadow/<backup>/`, finds nothing (namespaces now live under
+  `<server_root>/shadow/...`), and stops releasing its OWN freeze. It would fix the cross-replica
+  destruction and replace it with a permanent leak of every frozen ref, in the same statement.
 - (3) `PartPathParser`/`route()` untouched (they parse the unchanged disk path); GC/fsck have no
   shadow special-cases — prefixed shadow namespaces become ordinarily owned;
 - (4) pre-release no-compat policy: no migration;
-- (5) tests: stateless P3/P5-style (two `server_root_id` on one pool: foreign UNFREEZE must be a
-  no-op on the other replica's freeze; DROP+GC must leave the freeze intact); the reporter's
-  six-property suite lives in clickhouse-regression (`cas/tests/freeze_isolation.py`).
+- (5) tests. `05003_cas_freeze.sh` already asserts that `UNFREEZE WITH NAME` FINDS AND REMOVES its own
+  snapshot on a single server root, so the leak in (2) cannot ship silently — that test fails first.
+  The new coverage is the isolation dimension: a stateless test with two `server_root_id` on one pool
+  asserting (a) a foreign `UNFREEZE` is a no-op on the other root's freeze, (b) `DROP TABLE` + a GC
+  round leave that freeze intact, and (c) each root's own `UNFREEZE` still releases its own freeze —
+  (c) is not redundant with 05003: without it a two-root isolation test stays green under a total
+  leak. The reporter's six-property suite lives in clickhouse-regression
+  (`cas/tests/freeze_isolation.py`).
+- (6) no existing test asserts cross-replica shadow visibility, so losing it breaks nothing.
 Trade acknowledged: cross-replica readability of freezes goes away — that is the correct (local)
 FREEZE semantics; shared backup access belongs to the BACKUP machinery, not UNFREEZE.
 
