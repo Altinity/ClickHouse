@@ -143,3 +143,19 @@ These are real scale/budget findings; most are variants of "O(N) GC / per-op amp
 - **[hot-part-blob-trickle-warmer] optional age-based trickle warmer for hot-part blobs ahead of snapshot** — DESIRABLE — Speculative but well-motivated perf idea (young-merge-window reasoning); borderline vs. not-tracked but the driver is concrete.
 - **[ca-trycommit-retry-loses-staged-state] `tryCommit` retry can drop staged `writeFile`/`createHardLink` state (B82)** — DESIRABLE — A CA `tryCommit` retry can lose staged state because a reset `metadata_transaction` has no `operations_to_execute` entry to refill in-memory staging maps. Has a bug number already assigned; verify still reproducible against HEAD and file properly if so.
 - **[cache-get-head-token-mismatch] `readManifest`/`get`/`getStream` can cache bytes fetched at one incarnation token under an earlier `HEAD`'s token** — DESIRABLE (correctness) — Independently confirmed still open during the phase-2/3 verdict audit of the docs-consolidation effort itself.
+
+## Suffix allowlist buffers big index files whole in memory (2031-triage CAS-014) {#part-file-suffix-allowlist-memory}
+
+`partFileMustStayBlob` (`ContentAddressedTransaction.cpp:65-71`) is a closed suffix allowlist that
+decides streaming-blob vs whole-file-in-memory buffering. It does not know `primary.cidx` (the
+DEFAULT name — `compress_primary_key=true` makes the listed `primary.idx` branch dead code),
+`.cmrk4` (default `write_marks_for_substreams_in_compact_parts=true`), or any skip-index data file
+(`.idx`, `.pst.idx`, `minmax_*.idx`). Those go through `CaInlineWriteBuffer`, which accumulates the
+whole payload into a `std::string` and only at finalize applies `INLINE_CAP = 1 MiB` (`:98`, `:932`),
+spilling oversized bodies to a blob.
+
+So there is no correctness or manifest-bloat defect (the cap holds), but a vector/text index or a
+large primary key is buffered entirely in memory and then written twice. Fix: add the shipped
+default names to the allowlist, and — the structural half — emit a log/metric when an unknown
+extension takes the buffered path, so the next new MergeTree file name shows up instead of silently
+costing memory. Predicate unchanged since `c623713479f`.
