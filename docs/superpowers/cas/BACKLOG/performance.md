@@ -240,3 +240,46 @@ gate underneath it.
 Note for readers of the same finding: the claimed pending-count leak on a failed dispatch (which would
 hang the untimed waits at `Pool/CasRefLedger.cpp:1710-1713` and `:5106-5111`) does NOT exist — it was
 closed by `829ad698ef6`.
+
+## The ref-table cache budget is enforced only on cache admission, is not operator-tunable, and its running total can underflow (2031-triage CAS-053) {#ref-table-cache-budget-admission-only}
+
+`CasRefLedger::enforceRefTableCacheBudget` (`Pool/CasRefLedger.cpp:1611-1690`) has exactly one call
+site: the tail of `ensureRefTableRecovered` (`:1550`), which is reached only when a recovery actually
+ran — a warm touch returns early at `:1339`. So the whole-table cache budget
+(`ref_table_cache_bytes`, default 256 MiB, `Pool/CasPool.h:265`) is an admission-time check, like an
+LRU that only evicts on insert. It is never re-evaluated when the resident tables GROW in place:
+`tail_bytes_since_snapshot` is incremented by every applied txn (`:2470`, `:3791`) and
+`base_snapshot_bytes` is refreshed on each publish (`:1568`), yet a stable working set that is written
+forever and never re-recovers cold triggers no pass at all. A fixed set of hot tables can therefore sit
+above the configured ceiling indefinitely.
+
+Three separate residuals, all confirmed at HEAD:
+
+- No re-enforcement on in-place growth (above). Partly inherent: the `use_count() == 1` gate at `:1650`
+  and `:1659` is a correctness gate, not a policy choice — it is what makes append-lane split-brain
+  impossible, and a table being written is by construction not evictable. But the pass also never runs
+  for tables that HAVE gone idle, because nothing but a cold admission calls it.
+- `ref_table_cache_bytes` is the only cache budget in `PoolConfig` with no `ContentAddressedSettings`
+  entry: `deduplication_cache_bytes` (`ContentAddressedSettings.cpp:70`) and
+  `manifest_decode_cache_bytes` (`:90`) are declared settings and wired in
+  `ContentAddressedMetadataStorage.cpp:759` and `:761`, while `ref_table_cache_bytes` is set nowhere
+  outside gtests — the 256 MiB default is effectively hardcoded in production. There is also no
+  `CurrentMetrics` gauge for the ref-table cache (only `ProfileEvents::CASRefTableEvictions`,
+  `ProfileEvents.cpp:788`), so an operator can neither size it nor observe it.
+- `total -= c.weight` (`Pool/CasRefLedger.cpp:1667`) is an unclamped unsigned subtraction over values
+  read in two different passes of the same critical section: `total` sums `weightOf` for every table
+  (`:1634-1636`) including hot ones whose atomics are mutated under `state_mutex` only, while `c.weight`
+  is captured later (`:1657`). A table that was hot during the `total` loop and idle by the candidate
+  loop can contribute a larger weight than it did to `total`; if that increase exceeds every other
+  table's weight the subtraction underflows, `total <= budget` stays false and every idle `Ready` table
+  is evicted in one pass. `clampedCounterSub` (`:4191-4198`) already exists for exactly this class and
+  is used at `:4423-4424`; this site does not use it.
+
+Why P3 and not a gate: no correctness impact. Eviction is gated on idle + `Ready` + non-wedged
+(`:1650-1660`), an evicted table is re-recovered from the durable snapshot+log on next touch
+(`gtest_cas_ref_writer.cpp:2025` pins this), so the underflow's worst outcome is a burst of extra
+recovery I/O, and the missed enforcement only lets resident memory track the working set's real ref-map
+size rather than the nominal cap. Owed, in increasing cost: clamp the subtraction; expose the budget as
+a `ContentAddressedSettings` entry plus a `CurrentMetrics` gauge; and call the pass from a second,
+growth-driven trigger (for example after a snapshot publish updates `base_snapshot_bytes`) so the cap
+means something for a long-lived stable table set.
