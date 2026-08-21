@@ -109,10 +109,13 @@ public:
     /// conditional copy and is never selected for S3 staging, so it throws `NOT_IMPLEMENTED` there):
     /// WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
     /// `resurrect` (every mode): prepends `fresh_header` and UNCONDITIONALLY writes
-    /// `[fresh_header][payload]` to `blob_key` (fresh tag ⇒ distinct ETag from the condemned
-    /// incarnation, INV-NO-RETURN), then a fresh HEAD for the ETag. Native streams with plain
-    /// `WriteSettings` — no forced single part, no size ceiling on any dialect; EmulatedSingleProcess
-    /// materializes and SERIALIZES resurrections process-wide, bounding the peak to one body.
+    /// `[fresh_header][payload]` to `blob_key` (a fresh tag gives a token distinct from the condemned
+    /// incarnation, so its already-queued exact-token delete misses), then a fresh HEAD for the token.
+    /// The write carries no precondition but IS token-producing, so it goes through
+    /// `tokenProducingWriteSettings`: on a generation dialect that forces a single PUT and applies the
+    /// token-producing cap, exactly as a conditional write does; an ETag dialect is unconstrained.
+    /// EmulatedSingleProcess materializes and SERIALIZES resurrections process-wide, bounding the peak
+    /// to one body.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
     Token resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override;
 

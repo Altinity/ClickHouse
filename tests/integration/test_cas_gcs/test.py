@@ -718,9 +718,13 @@ def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_cli
     """Two statements over one interleaved workload on the OAuth clients.
 
     Mode isolation: the ordinary disk's requests must still carry `x-amz-api-version` (marking deletes
-    it) and the CAS disk's must still show both kinds, in a slice of the log where the two disks'
-    traffic is interleaved rather than separated by phase. Would fail if: the mode became a property
-    of the client rather than of the request.
+    it) and the CAS disk's traffic must still be marked, in a slice of the log where the two disks'
+    traffic is interleaved rather than separated by phase. The contribution here is the INTERLEAVING;
+    that a single OAuth client carries both marked and unmarked requests is established separately by
+    `test_marked_and_default_heads_coexist_on_one_oauth_client`, which asserts both halves non-empty in
+    one bucket. This test asserts only the marked half, deliberately -- duplicating the partition would
+    add a second place to keep in step and no new fencing power. Would fail if: the mode became a
+    property of the client rather than of the request.
 
     Client count: the metadata server hands out a token when a client's cache is first populated, and
     answers a 24-hour expiry, so within this slice a new token fetch means a new client with a new

@@ -100,14 +100,17 @@ storage, and GC would silently stop reclaiming.
 `runCapabilityProbe` (`Backend/CasProbe.cpp`) runs a throwaway-key battery against every writable
 mount, described in full on the [bucket requirements](/antalya/cas/bucket-requirements) page. It is
 fail-closed: any check that does not pass throws `NOT_IMPLEMENTED` naming the specific failure, and
-the mount refuses to become writable. Further mount-time gates sit alongside it:
+the mount refuses to become writable. Two further gates run as the battery's opening steps, and one
+sits genuinely alongside it. The distinction matters: because the versioning check runs *inside* the
+battery, skipping the battery used to skip it too, which is exactly why the third gate exists.
 
-- `checkPoolPreconditions` — on the `GCS`-dialect combination only, requires bucket versioning to be
+- `checkPoolPreconditions` — inside the battery. On the `GCS`-dialect combination only, requires bucket versioning to be
   *verifiably* off. A confirmed `Enabled` and an inconclusive probe both throw: `CAS` cannot assume
   the safe answer here, because what it would do on a versioned bucket is delete objects it believes
   it reclaimed. A probe is inconclusive when the credential may not read the bucket's versioning
   configuration, or when the backend cannot answer at all.
-- `checkSkipAccessCheckSupport` — asks whether the backend may serve a writable mount that skips the
+- `checkSkipAccessCheckSupport` — alongside the battery, in the skip branch of `Pool::open`, since it
+  is the gate that decides whether the battery may be skipped at all. It asks whether the backend may serve a writable mount that skips the
   battery at all. The `GCS`-dialect combination refuses, so `skip_access_check = true` cannot reach a
   writable generation-token mount; every other backend still skips only its permitted access-check
   I/O. This is what makes the exact-token delete check below unskippable on an *ordinary* writable
@@ -115,7 +118,7 @@ the mount refuses to become writable. Further mount-time gates sit alongside it:
   battery skipped, because the fail-closed tradeoff inverts there: refusing an ordinary mount costs
   availability and protects data, whereas refusing a decommission strands a pool with a dead replica
   in it and leaves the operator no way forward.
-- `checkConditionalWriteSingleAttemptSupport` — refuses to mount writable unless the underlying
+- `checkConditionalWriteSingleAttemptSupport` — inside the battery. Refuses to mount writable unless the underlying
   object storage supports a single-HTTP-attempt retry profile for conditional writes. A hidden SDK
   retry can outlive the writer's mount lease and obscure whether a conditional operation actually
   committed, so retries on the conditional path must be explicit CAS state-machine transitions, not

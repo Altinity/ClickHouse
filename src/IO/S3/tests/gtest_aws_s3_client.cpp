@@ -1436,13 +1436,16 @@ TEST(IOTestAwsS3Client, OrdinaryHmacRequestsKeepUpstreamHeadersAndAuth)
         EXPECT_FALSE(captured[0].headers.has("x-goog-meta-cas-envelope"));
         EXPECT_TRUE(captured[0].headers.get("authorization", "").starts_with("AWS4-HMAC-SHA256"));
         /// An earlier version of this assertion claimed the SDK's default checksum is always present;
-        /// a real run showed that is wrong. This narrower claim is what the test actually pins: a bare
-        /// `PutObjectRequest` with no `SetChecksumAlgorithm` call -- exactly what this test constructs --
-        /// has nothing for the SDK to compute a checksum from, so no checksum header reaches the wire.
-        /// That is a real fact about ordinary HMAC clients not implicitly injecting a checksum, but it is
-        /// NOT a test of `WriteBufferFromS3`'s S3Express-only checksum policy (`WriteBufferFromS3.cpp:526-530`):
-        /// this test never goes through `WriteBufferFromS3` at all, so widening that policy tomorrow would
-        /// not be caught here.
+        /// a real run showed that is wrong. The conclusion below is right, but the reason is NOT that an
+        /// unset algorithm leaves nothing to compute: a bare `PutObjectRequest` does report a default
+        /// algorithm name from `GetChecksumAlgorithmName()`. What actually suppresses the header is that
+        /// `PocoHTTPClientConfiguration` sets `requestChecksumCalculation` to `WHEN_REQUIRED`
+        /// unconditionally, which leaves the SDK's checksum interceptor gating purely on
+        /// `RequestChecksumRequired()` -- and this fork overrides that to `is_s3express_bucket`.
+        /// Independently, `setChecksumAlgorithm` is only ever reached from `setIsS3ExpressBucket`.
+        /// So the fact pinned here is that an ordinary HMAC client injects no checksum, and it is NOT a
+        /// test of `WriteBufferFromS3`'s S3Express-only checksum policy: this test never goes through
+        /// `WriteBufferFromS3` at all, so widening that policy tomorrow would not be caught here.
         EXPECT_FALSE(captured[0].headers.has("x-amz-checksum-crc32"));
         EXPECT_FALSE(captured[0].headers.has("x-amz-sdk-checksum-algorithm"));
     }

@@ -197,9 +197,11 @@ void prepareGcsRequestForGoog4Authentication(Aws::Http::HttpRequest & request)
         const auto disposition = goog4DispositionFor(toLower(name));
         if (!disposition)
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "GOOG4 authentication: header '{}' has no known GCS XML API counterpart. GCS rejects a "
-                "request mixing the x-amz- and x-goog- prefixes, so it can be neither translated nor "
-                "sent as-is. Remove it from the disk configuration, or use an AWS-compatible endpoint.",
+                "GOOG4 authentication: header '{}' has no known GCS XML API counterpart, so it cannot be "
+                "translated. Sending it unchanged would mix the x-amz- and x-goog- prefixes in one "
+                "GOOG4-signed request, and whether GCS accepts that has not been established -- so it is "
+                "refused rather than guessed at. Remove it from the disk configuration, or use an "
+                "AWS-compatible endpoint.",
                 name);
 
         switch (*disposition)

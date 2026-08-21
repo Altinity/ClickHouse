@@ -425,7 +425,8 @@ continuing the ID series, not renumbering anything above.
 resurrect is now an UNCONDITIONAL write (`Backend::resurrect`): on remote object storage it streams
 and takes multipart -- size-unlimited on GCS too; the local emulated mode materializes one body at a
 time (see the spill-to-disk debt below). What remains capped is the CONDITIONAL write-once
-CREATE (`If-None-Match`), still forced single-part under `gcs_max_conditional_put_bytes` -- so this
+CREATE (`If-None-Match`), still forced single-part under `gcs_max_token_producing_put_bytes` (renamed
+from `gcs_max_conditional_put_bytes` with no alias -- the old name is now rejected as unknown) -- so this
 item is now only about creating a blob larger than the cap on GCS, and everything below about the
 overwrite/resurrect shape is historical context.
 
@@ -433,7 +434,8 @@ GCS honours no preconditions on multipart completion — Google's own XML API do
 "Preconditions are not supported in the requests", and it was measured independently on 2026-07-03
 (`0a3bc2f1fc6`). A lost precondition there does not fail the write, it **silently overwrites**, which
 is the one outcome CAS's whole token protocol exists to prevent. Hence `s3_force_single_part_upload`
-for generation-token stores, and `gcs_max_conditional_put_bytes` (1 GiB) as its forced companion: with
+for generation-token stores, and `gcs_max_token_producing_put_bytes` (1 GiB, formerly
+`gcs_max_conditional_put_bytes`) as its forced companion: with
 multipart off, the body must go in ONE part, buffered whole in RAM.
 
 The consequences are larger than a settings row suggests, and they are worth re-deriving rather than

@@ -34,8 +34,9 @@ void prepareGcsRequestForOAuthAuthentication(Aws::Http::HttpRequest & request);
 /// `x-amz-*` header must have a decided fate before signing — dropped as an AWS signing artifact,
 /// renamed to its `x-goog-` counterpart, or consumed because GCS has no counterpart. An `x-amz-*`
 /// header with no rule raises BAD_ARGUMENTS rather than being guessed at or sent as-is. Whether GCS
-/// would in fact reject a mixed-prefix request has not been measured; no request shape ClickHouse
-/// constructs on a normal bucket produces one.
+/// would in fact reject a mixed-prefix request has not been measured, and the thrown message says so
+/// too: the refusal is fail-closed under that uncertainty, not a consequence of a known rejection. No
+/// request shape ClickHouse constructs on a normal bucket produces one.
 void prepareGcsRequestForGoog4Authentication(Aws::Http::HttpRequest & request);
 
 /// The adapter, response side, applied only for a `NativeConditional` request: copies the header
