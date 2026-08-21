@@ -434,3 +434,51 @@ the shared helper), which also makes the two "same hygiene as `checkNamespace`" 
 a gtest case next to the existing namespace-validation cases, since `validateNamespace`
 (`Formats/CasLayout.h:451`) is explicitly the re-validation hook for namespaces reconstructed from
 untrusted listed keys on the GC ref-intake path.
+
+## FREEZE reuses a backup name silently on CA: `isDirectoryEmpty`'s part-dir short-circuit disables the `DIRECTORY_ALREADY_EXISTS` guard (2031-triage CAS-086) {#freeze-name-reuse-merges-shadow-ref}
+
+P3, narrow but SILENT. `ContentAddressedMetadataStorage::isDirectoryEmpty` deliberately answers
+`true` for any part-shaped directory, including a SHADOW part dir (`route` keeps
+`ref = <part>`, `file = ""` for a `shadow/<name>/...` path,
+`ContentAddressedMetadataStorage.cpp:1292-1299`, `:1799-1817`) — the short-circuit exists so
+`DiskObjectStorage::removeDirectory` reaches the ref-unlink instead of throwing `CANNOT_RMDIR`
+(`DiskObjectStorage.cpp:441-443`), which is right for the removal path and test-pinned
+(`src/Disks/tests/gtest_ca_wiring.cpp:463`, `:580`).
+
+The side effect is on the FREEZE path: `Backup` refuses a destination that exists and is not empty
+(`src/Storages/MergeTree/Backup.cpp:146`), which upstream is what makes a second
+`ALTER TABLE ... FREEZE WITH NAME 'x'` fail loudly for an already-frozen part. On CA the guard never
+fires, so the second freeze stages into the SAME shadow ref and `publishStaging` takes the
+existing-view repoint arm, merging the old frozen manifest's untouched entries with the new ones
+(`ContentAddressedTransaction.cpp:338-392`). Re-freezing an unchanged part is idempotent and
+harmless; re-freezing a DIFFERENT part that carries the same part name (after `REPLACE PARTITION` /
+`ATTACH PARTITION FROM`, which can reuse `all_1_1_0`) silently produces one frozen ref mixing files
+from two snapshots, where upstream would have refused the operation.
+
+Fix options, both small: teach `isDirectoryEmpty` to keep the listing-based answer for shadow part
+dirs (the removal-path rationale only covers live/detached part dirs, and shadow removal goes through
+`removeRecursive`, not `removeDirectory`), or reject a shadow ref that already exists on the FREEZE
+staging path. A gtest next to the existing shadow-shape cases plus a stateless `FREEZE WITH NAME`
+twice case would pin whichever is chosen.
+
+## A non-Atomic database or table literally named `detached`/`moving` is folded as the reserved dir with no refusal (2031-triage CAS-087) {#nonatomic-reserved-name-fold-no-refusal}
+
+P3, accepted-limitation half already pinned, missing half is the fail-closed refusal.
+`findPartDirComponent` scans for a `detached`/`moving` component before the right-to-left part-dir
+grammar scan (`Parts/PartPathParser.cpp:205-212`); the ordering is load-bearing (without it the inner
+part name steals the anchor and the reserved dir becomes part of a table namespace `DROP TABLE` never
+cleans). The consequence — a non-Atomic `data/<db>/detached/...` path is indistinguishable from a
+table's reserved `detached/` subdir — is a deliberately accepted limitation, documented at the anchor
+site (`:214-221`) and pinned by
+`CASPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir`
+(`src/Disks/tests/gtest_ca_wiring.cpp:229-245`).
+
+What is NOT covered: nothing refuses such a table. Under a deprecated `Ordinary` database
+(`allow_deprecated_database_ordinary`, default `false`, `src/Core/Settings.cpp:6712`) a table named
+`detached` gets `ns = liveNamespace("data/<db>")` and every one of its parts folds onto
+`detached/<part>` refs (`ContentAddressedMetadataStorage.cpp:1300-1311`); with the DATABASE named
+`detached`, all tables in it collapse onto `detached/<table>` refs, so each table's parts share ONE
+ref and concurrent publishes fight over it. Failures there are loud (promote conflicts), but the
+config is silently accepted rather than refused. Fix: refuse at table-attach/mount time a non-Atomic
+relative data path whose db or table component equals `kDetachedDirName`/`kMovingDirName`, naming the
+reserved name in the message. Same class as the DiskEncrypted-over-CA refusal item.
