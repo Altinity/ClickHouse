@@ -10,6 +10,11 @@
 #include <limits>
 #include <memory>
 #include <optional>
+<<<<<<< HEAD
+=======
+#include <sstream>
+#include <base/arithmeticOverflow.h>
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSet.h>
 #include <Core/UUID.h>
@@ -410,6 +415,7 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
     std::optional<size_t> total_rows;
     std::optional<size_t> total_bytes;
     std::optional<size_t> total_position_deletes;
+    std::optional<size_t> total_equality_deletes;
 
     if (snapshot_object->has(f_summary))
     {
@@ -424,6 +430,9 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         {
             total_position_deletes = summary_object->getValue<Int64>(f_total_position_deletes);
         }
+
+        if (summary_object->has(f_total_equality_deletes))
+            total_equality_deletes = summary_object->getValue<Int64>(f_total_equality_deletes);
     }
 
     if (!snapshot_object->has(f_schema_id))
@@ -437,7 +446,8 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
         schema_id,
         total_rows,
         total_bytes,
-        total_position_deletes);
+        total_position_deletes,
+        total_equality_deletes);
 }
 
 IcebergDataSnapshotPtr
@@ -1230,7 +1240,14 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
         return 0;
     }
 
+    /// Equality deletes remove data rows by value match; summary `total-equality-deletes` counts
+    /// rows in delete files, not deleted data rows. Fail closed when the field is present and > 0.
+    /// If the field is absent, skip to manifests for EQUALITY_DELETE files.
+    if (actual_data_snapshot->total_equality_delete_rows.has_value()
+        && *actual_data_snapshot->total_equality_delete_rows > 0)
+        return {};
 
+<<<<<<< HEAD
     /// Row counts stored in the metadata layers above the manifest files are not used as
     /// data sources, because writers derive them instead of measuring them against the data:
     /// - the snapshot summary's `total-records` is maintained incrementally (parent total
@@ -1246,10 +1263,22 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
     /// required field in every format version, so summing it over the live data files is
     /// exact, at the cost of opening the manifest files (served from the Iceberg metadata
     /// cache on repeated queries).
+=======
+    /// Do not trust snapshot-summary `total-records` for the answer. Those totals are optional,
+    /// writer-maintained incrementally, and a single bad commit can poison every later snapshot.
+    /// Sum required per-data-file `record_count` from manifests when there are no live delete
+    /// files; otherwise fail closed to a real scan. Summary is compared only for a mismatch warning.
+    ///
+    /// Manifest-list `added_rows_count`/`existing_rows_count` are not used (some writers stamp them
+    /// from snapshot summary and can report 0 after compaction). Subtracting live position-delete /
+    /// deletion-vector `record_count` from data-file totals is also unsafe (duplicates, stale
+    /// references, DV supersession of parquet position deletes).
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     UInt64 result = 0;
     for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
     {
         auto manifest_file_ptr = getManifestFileEntriesHandle(
+<<<<<<< HEAD
             object_storage, persistent_components, local_context, log, manifest_list_entry, actual_table_state_snapshot.schema_id);
 
         /// Live delete files make an exact metadata-only count impossible:
@@ -1271,6 +1300,35 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
         if (!manifest_rows.has_value())
             return {};
         result += *manifest_rows;
+=======
+            object_storage, persistent_components, local_context, log, manifest_list_entry, actual_table_state_snapshot.schema_id, *secondary_storages);
+
+        if (!manifest_file_ptr.getFilesWithoutDeleted(FileContentType::EQUALITY_DELETE).empty()
+            || !manifest_file_ptr.getFilesWithoutDeleted(FileContentType::POSITION_DELETE).empty())
+            return {};
+        /// nullopt means a negative / overflowing per-file `record_count`: fail closed to a
+        /// real scan instead of returning a wrong count. Do not use optional column
+        /// `value_counts` here — nested fields can report element counts larger than rows.
+        auto manifest_rows = manifest_file_ptr.getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
+        if (!manifest_rows.has_value())
+            return {};
+        /// Per-manifest sums are capped at Int64::max; still guard the cross-manifest total.
+        if (common::addOverflow(result, static_cast<UInt64>(*manifest_rows), result))
+            return {};
+    }
+
+    if (auto summary_total_rows = actual_data_snapshot->getTotalRows();
+        summary_total_rows.has_value() && *summary_total_rows != result)
+    {
+        LOG_WARNING(
+            log,
+            "Iceberg snapshot summary of table {} claims {} total rows, but its manifest files describe {} rows. "
+            "The snapshot summary is inconsistent with the table data (possibly a corrupted commit in the table "
+            "history), using the row count from the manifest files",
+            persistent_components.table_location,
+            *summary_total_rows,
+            result);
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
     }
 
     const auto summary_total_rows = actual_data_snapshot->getTotalRows();
@@ -1285,7 +1343,7 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
             result);
 
     ProfileEvents::increment(ProfileEvents::IcebergTrivialCountOptimizationApplied);
-    return result;
+    return static_cast<size_t>(result);
 }
 
 std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) const
@@ -1300,7 +1358,9 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
     if (actual_data_snapshot->total_bytes.has_value())
         return actual_data_snapshot->total_bytes;
 
-    Int64 result = 0;
+    /// Per-manifest sums are capped at Int64::max; still guard the cross-manifest total
+    /// (same fail-closed contract as `totalRows`).
+    UInt64 result = 0;
     for (const auto & manifest_list_entry : actual_data_snapshot->manifest_list_entries)
     {
         auto manifest_file_ptr = getManifestFileEntriesHandle(
@@ -1309,10 +1369,11 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
         if (!count.has_value())
             return {};
 
-        result += count.value();
+        if (common::addOverflow(result, static_cast<UInt64>(*count), result))
+            return {};
     }
 
-    return result;
+    return static_cast<size_t>(result);
 }
 
 ObjectIterator IcebergMetadata::iterate(

@@ -222,6 +222,7 @@ static void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerP
 #endif
 }
 
+<<<<<<< HEAD
 /// Whether reading this object goes through row-level delete transformers (Iceberg
 /// position/equality deletes, Delta Lake deletion vectors). The count-from-files cache
 /// is keyed only by the file path and its modification time, but delete files change the
@@ -304,6 +305,21 @@ static std::optional<ActionsDAG> buildIdentityPartitionColumnsDag(
         outputs.push_back(&dag.materializeNode(constant));
     }
     return dag;
+=======
+/// Count-from-files cache key is data-file identity only. Skip when row filtering can change
+/// independently (DVs / selection vectors, Iceberg eq/pos deletes) or when the task is a bucket subset.
+/// Cache must stay fail-closed even when need_only_count is allowed for position deletes / DVs:
+/// the key is path + mtime only, and deletes change the contributed row count without touching the file.
+static bool canUseCountFromFilesCache(const ObjectInfoPtr & object_info)
+{
+    if (hasNonEmptyExcludedRows(object_info->data_lake_metadata) || object_info->file_bucket_info)
+        return false;
+#if USE_AVRO
+    if (hasIcebergEqualityDeletes(object_info) || hasIcebergPositionDeletes(object_info))
+        return false;
+#endif
+    return true;
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 }
 
 StorageObjectStorageSource::StorageObjectStorageSource(
@@ -879,12 +895,20 @@ Chunk StorageObjectStorageSource::generate()
             }
         }
 
+        /// Do not cache filtered cardinality: filter DAG, PREWHERE, and row policies all
+        /// reduce rows seen by generate(), while the cache key is file identity only.
         if (reader.getInputFormat() && read_context->getSettingsRef()[Setting::use_cache_for_count_from_files]
+<<<<<<< HEAD
             && !format_filter_info->filter_actions_dag
             && !hasAttachedDeletes(*reader.getObjectInfo())
             && !reader.getObjectInfo()->rows_to_read)
             addNumRowsToCache(*reader.getObjectInfo(), total_rows_in_file);
 
+=======
+            && format_filter_info && !format_filter_info->hasFilter()
+            && canUseCountFromFilesCache(reader.getObjectInfo()))
+            addNumRowsToCache(reader.getObjectInfo(), total_rows_in_file);
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         total_rows_in_file = 0;
 
         chassert(reader_future.valid());
@@ -1074,9 +1098,29 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     /// response. Skip the shortcut when `_headers` is requested so the real `GET` headers are used.
     const bool headers_requested = read_from_format_info.requested_virtual_columns.contains("_headers");
 
+<<<<<<< HEAD
     std::optional<size_t> num_rows_from_cache
         = need_only_count && !headers_requested && context_->getSettingsRef()[Setting::use_cache_for_count_from_files]
         ? try_get_num_rows_from_cache() : std::nullopt;
+=======
+    /// Equality-delete FilterTransform evaluates predicates against column values, but need_only_count
+    /// emits default-filled chunks — so disable the fast path for equality deletes only.
+    /// Position deletes and deletion vectors filter by row index (preserved on synthetic chunks);
+    /// DeletionVectorTransform adjusts const count chunks via roaring range cardinality, and Parquet
+    /// needOnlyCount reads footer/row-group metadata only (including bucketed reads). Count-from-files
+    /// cache stays separately fail-closed in canUseCountFromFilesCache.
+#if USE_AVRO
+    const bool effective_need_only_count = need_only_count && !hasIcebergEqualityDeletes(object_info);
+#else
+    const bool effective_need_only_count = need_only_count;
+#endif
+
+    const bool can_use_count_cache = effective_need_only_count
+        && context_->getSettingsRef()[Setting::use_cache_for_count_from_files]
+        && canUseCountFromFilesCache(object_info);
+
+    std::optional<size_t> num_rows_from_cache = can_use_count_cache ? try_get_num_rows_from_cache() : std::nullopt;
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
 
     if (num_rows_from_cache)
     {
@@ -1331,7 +1375,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 filter_info,
                 true /* is_remote_fs */,
                 compression_method,
-                need_only_count,
+                effective_need_only_count,
                 std::nullopt /*min_block_size_bytes*/,
                 std::nullopt /*min_block_size_rows*/,
                 std::nullopt /*max_block_size_bytes*/);
@@ -1349,17 +1393,18 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             filter_info,
             true /* is_remote_fs */,
             compression_method,
-            need_only_count);
+            effective_need_only_count);
         }
 
         input_format->setBucketsToRead(object_info->file_bucket_info);
         input_format->setSerializationHints(read_from_format_info.serialization_hints);
 
-        if (need_only_count)
+        if (effective_need_only_count)
             input_format->needOnlyCount();
 
         builder.init(Pipe(input_format));
 
+<<<<<<< HEAD
         if (!identity_partition_columns.empty())
         {
             if (auto dag = buildIdentityPartitionColumnsDag(builder.getHeader(), identity_partition_columns))
@@ -1377,12 +1422,21 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (object_info->data_lake_metadata
             && object_info->data_lake_metadata->excluded_rows
             && object_info->data_lake_metadata->excluded_rows->size() > 0)
+=======
+        /// Deletion vectors (and selection vectors) address absolute file row numbers via
+        /// `ChunkInfoRowNumbers`. Iceberg equality deletes use a plain `FilterTransform` that
+        /// shrinks the chunk without maintaining `applied_filter`, so DV must run first —
+        /// otherwise later DV filtering maps dense post-equality indices to the wrong file rows.
+        if (hasNonEmptyExcludedRows(object_info->data_lake_metadata))
+>>>>>>> 4b7cecaa3cf (Merge pull request #2183 from Altinity/feature/antalya-26.6/iceberg-puffin-deletion-vectors-read-2)
         {
             builder.addSimpleTransform([&](const SharedHeader & header)
             {
                 return std::make_shared<DeletionVectorTransform>(header, object_info->data_lake_metadata->excluded_rows);
             });
         }
+
+        configuration->addDeleteTransformers(object_info, builder, format_settings, parser_shared_resources, context_);
 
         std::optional<ActionsDAG> schema_transform;
         if (object_info->data_lake_metadata && object_info->data_lake_metadata->schema_transform)
