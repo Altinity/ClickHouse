@@ -116,6 +116,9 @@
 - name: test_storage_s3_queue/test_4.py::test_list_and_delete_race
   reason: 'KNOWN - Unstable upstream'
   message: AssertionError
+- name: test_storage_s3_queue/test_parallel_inserts.py::test_batch_set_processing_failure_does_not_crash
+  reason: 'KNOWN - Flaky: crash-repro batch not always scheduled within the retry window'
+  message: did not match expectations in 120 retries
 - name: test_storage_s3_queue/test_5.py::test_failed_startup
   reason: 'INVESTIGATE: Unstable on tsan'
   check_types:
