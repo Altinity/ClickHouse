@@ -77,8 +77,8 @@
 | CAS-059 | by-design | P3 | [{#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`)](BACKLOG.md#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`) | нет | Все описания кода на HEAD верны (`DiskEncrypted` берёт любой делегат, не переопределяет `isContentAddressed`/`supportsAtomicFileWrites`, `use_fake_transaction` по умолчанию true), но CAS+шифрование — settled out-of-scope позиция (Filimonov), а связка отваливается громким `NOT_IMPLEMENTED` на первой же записи части; остаток — только отсутствующий fail-fast гейт в конфиге, P3. |
 | CAS-060 | by-design | P3 | [{#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed}](BACKLOG.md#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed) | нет | Форма кода верна (случайный IV на каждую перезапись + CAS хеширует то, что ему дали → дедупа нет вовсе), но CAS×шифрование — принятая out-of-scope позиция; тихой порчи нет, а сама связка вообще не проведена (`DiskEncrypted` не пробрасывает `isContentAddressed`). |
 | CAS-061 | частично | P2 | BACKLOG.md {#damaged-object-repair} + BACKLOG/gc.md {#ckpt-damage-no-repair-path} + новая секция {#pool-meta-bootstrap-blocks-dr-tools} | нет | Ядро подтверждено (единственный rebuild-верб — `gc/state`; каталог/`_ckpt` падают fail-closed без пути восстановления; все CA-инструменты открываются через `_pool_meta`), но это уже затрекано как {#damaged-object-repair}/{#ckpt-damage-no-repair-path}, часть про mount lease неверна (есть `cas-drop-member`), а отсутствие migration-тулинга — сознательное pre-release решение. |
-| CAS-062 | ⏳ | — | — | — | — |
-| CAS-063 | ⏳ | — | — | — | — |
+| CAS-062 | частично | P3 | [{#fsck-meta-body-counters-unrendered} (новый); дубликат по таймауту/скоупу — {#lifecycle-verbs-wait-out-uncancellable-scans}](BACKLOG.md#fsck-meta-body-counters-unrendered} (новый); дубликат по таймауту/скоупу — {#lifecycle-verbs-wait-out-uncancellable-scans) | нет | SQL-путь FSCK действительно counts-only без дедлайна и скоупа, но это уже отслеживается как CAS-049; «нет пути ремонта нигде» неверно, а исключение meta/body-счётчиков из `clean()` — by-design; реальный остаток — эти два счётчика не рендерятся ни на одной поверхности. |
+| CAS-063 | частично | P3 | [{#owner-only-slot-invisible-in-mounts} (новый)](BACKLOG.md#owner-only-slot-invisible-in-mounts} (новый) | нет | Порядок «дропы namespace → снятие слота» и фильтр `/mount` в `listMounts` подтверждаются, но «повторный запуск не может починить» — фактически неверно: resume-путь есть в коде и закреплён тестами; остаётся только невидимость owner-only слота в `system.content_addressed_mounts`. |
 | CAS-064 | by-design | P3 | [{#format-battery-three-classes-unregistered}](BACKLOG.md#format-battery-three-classes-unregistered) | нет | Отсутствие фаззера и property-based тестов подтверждено фактически, но это settled-позиция (доверяем S3, декодеры fail-closed); реальный остаток — три живых формат-класса не зарегистрированы в общей battery (P3, дрейф-риск, а не дыра в покрытии). |
 | CAS-065 | частично | P2 | [review #14] в docs/superpowers/cas/BACKLOG/testing-and-ci.md#tests + [GATE #1: Azure] / [GCS production-grade follow-ups] в BACKLOG/formats-and-storage.md#backends | нет | Центральное утверждение ложно — нативный `If-None-Match`/`If-Match` путь гоняется в шести CI-полосах CAS-over-S3 (RustFS, `Mode::Native`) и на каждом writable-открытии пула проходит fail-closed capability-battery; реально не хватает только повторяемой полосы для GCS-generation-диалекта и native-строки в contract-suite, и это уже заведено. |
 | CAS-066 | ⏳ | — | — | — | — |
@@ -2743,3 +2743,149 @@ if (!snapshot.token)
 - `docs/superpowers/cas/BACKLOG/formats-and-storage.md:23` — `[GCS production-grade follow-ups]`, включая «`gcp_oauth` dialect probe validation against live GCS» — это и есть GCS-часть остатка.
 
 **История:** CAS-полосы в CI существуют и лишь переносились между конфигами (`9ad3e15b688` «cas: ci — move CAS ParamSets to AltinityJobConfigs»); generation-диалект и его тесты пришли с `5d7f26274cb` «Route CAS metadata and delete through GCS generations» и `9b887ac8886` «Bind GCS CAS writes to exact response generations». Именно эти коммиты и делают формулировку «ships unverified» устаревшей/неверной; закрыт не сам gap (полосы для GCS по-прежнему нет), а его сформулированное следствие.
+
+## CAS-062 — SQL-путь FSCK действительно counts-only без дедлайна и скоупа, но это уже отслеживается как CAS-049; «нет пути ремонта нигде» неверно, а исключение meta/body-счётчиков из `clean()` — by-design; реальный остаток — эти два счётчика не рендерятся ни на одной поверхности. (частично, P3) {#cas-062}
+
+Анкеры находки указывают на снапшот `CA/...`; на HEAD файлы лежат в
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/` (перенос — `592b9b83568`).
+Номера строк из находки устарели: `runFsckNow` не на `:739-745`, а на
+`ContentAddressed/ContentAddressedMetadataStorage.cpp:1051-1064`; `Tools/CasFsck.h:114` — не сигнатура
+`runFsck`, а середина `FsckReport` (сама сигнатура — `Tools/CasFsck.h:269-271`).
+
+ЧТО ПОДТВЕРЖДАЕТСЯ.
+1) SQL-путь действительно counts-only и без ограничителей:
+`src/Interpreters/InterpreterSystemQuery.cpp:2599` — `ca->runFsckNow(/* detail= */ false)`, и
+`ContentAddressedMetadataStorage.cpp:1063` — `Cas::runFsck(*store(), detail)`, т.е. не передаются ни
+`on_progress`, ни `deadline`, ни `partial_on_deadline`, ни `namespace_prefix`, хотя CLI их передаёт
+(`programs/disks/CommandFsck.cpp:27-40,67`: `--detail`, `--timeout` (по умолчанию 600 с),
+`--namespace`, `--partial`). Скан идёт под `lifecycle_mutex`, взятым на всё время
+(`ContentAddressedMetadataStorage.cpp:1055`), и не опрашивает отмену запроса, т.е. `KILL QUERY` и
+`max_execution_time` игнорируются.
+2) `clean()` действительно не включает `meta_without_body` / `body_without_meta`:
+`Tools/CasFsck.h:238-244` (`kFsckHardFindings` — 5 терминов, этих двух там нет).
+
+ЧТО УЖЕ ОТСЛЕЖИВАЕТСЯ (дубликат).
+Пункт 1 целиком покрыт анкером
+`docs/superpowers/cas/BACKLOG/operability-and-introspection.md`{#lifecycle-verbs-wait-out-uncancellable-scans}
+(запись «Lifecycle verbs wait out an uncancellable GC round or FSCK scan (2031-triage CAS-049)»,
+строки 128-160): там дословно зафиксировано, что SQL FSCK не передаёт ни один из bounding-параметров
+CLI, держит `lifecycle_mutex` и не проверяет отмену, и что owed — дедлайн из `max_execution_time` +
+`partial_on_deadline` + опрос отмены. Масштабная часть («fsck не доходит до конца на ~30 GiB») —
+`gc.md`{#fsck-scale-timeout} и {#fsck-large-pool-fixed} п.(c). Ничего нового CAS-062 здесь не
+добавляет.
+
+ЧТО ФАКТИЧЕСКИ НЕВЕРНО.
+a) «no repair path exists anywhere». Путь ремонта существует и вызывается из SQL: `SYSTEM CAS GC
+REBUILD` (`InterpreterSystemQuery.cpp:2545-2585`, `runGcRebuildNow`) — именно он лечит класс
+`stale_edge`/повреждённого in-degree-состояния, о чём сам `FsckClass::StaleEdge` и говорит
+(«Only a full rebuild of the in-degree state can», `Tools/CasFsck.h:47-52`); слотовые верб-ы —
+`SYSTEM CAS FORGET` и `DROP POOL MEMBER` (`Tools/CasDecommission.cpp`). Отсутствует именно
+`fsck --repair` для повреждённого `_ckpt`, и это отслеживается как
+`gc.md`{#ckpt-damage-no-repair-path} (п. (b): «there is NO repair path … candidate fixes = `fsck
+--repair` …»). Утверждение «в `Tools/` нет функции ремонта» верно буквально, но вывод «нигде» —
+нет.
+b) «pool with body-without-meta or meta-without-body residue reports clean» — верно как факт, но
+описано как дефект, тогда как это документированное by-design: `Tools/CasFsck.h` (поле
+`meta_without_body`) объясняет, что GC удаляет тело ПЕРВЫМ и `.meta` — позже, на bounded
+error-suppressed пуле, поэтому один LIST законно видит body-less `.meta`, и «no finite grace makes a
+persistent one hard evidence»; `body_without_meta` — «benign, NOT a dangle»
+(`Tools/CasFsck.cpp:1029-1033`). Позиция закреплена тестами:
+`src/Disks/tests/gtest_cas_fsck.cpp:1238,1244` («advisory — excluded from clean()») и `:1257-1259`.
+Это не «crash-residue counters», а advisory-класс; отказ считать их hard-findings — не тихая порча, а
+сознательный выбор.
+c) «the SQL path can tell an operator that the pool is corrupt but never which keys» — верно, но это
+явно документированный YAGNI: `InterpreterSystemQuery.cpp:2426-2429` («Named UInt64 columns only, no
+DETAIL keyword (YAGNI — the offline `clickhouse-disks cas-fsck --detail` applet already covers
+per-object listing)»). При этом SQL-строка НЕ является подмножеством находок: все 5 терминов `clean`
+там есть (`:2441-2470`, `:2489-2493`), плюс `unchecked`, janitor-* и byte-счётчики.
+
+РЕАЛЬНЫЙ ОСТАТОК (не отслеживался).
+`meta_without_body`/`body_without_meta` считаются (`Tools/CasFsck.cpp:1043,1046`), но не выводятся
+НИГДЕ: их нет в `formatFsckSummary` (`Tools/CasFsck.cpp:1155-1174`), нет в
+`contentAddressedFsckColumns`/`appendContentAddressedFsckRow`
+(`InterpreterSystemQuery.cpp:2433-2478,2482-2504`), нет в `programs/disks/CommandFsck.cpp`, и в
+`detail`-режиме на них не создаётся ни одной `FsckObject`-строки (парный цикл только инкрементирует).
+Единственный читатель вне gtest — отсутствует. Соответственно комментарий в `Tools/CasFsck.h`
+(«Counted and reported; excluded from `clean()`») ложен в половине «reported» — тот же класс, что
+{#fsck-rule-restated-in-unfenceable-prose}. Записано новой секцией
+`docs/superpowers/cas/BACKLOG/operability-and-introspection.md`{#fsck-meta-body-counters-unrendered}
+(оставлено незакоммиченным): либо рендерить оба счётчика (summary-строка + SQL-строка + detail-строка
+с хешем), либо удалить счётчики вместе с комментарием.
+
+История: SQL-верб появился в `b335f784581` («dormant-only SYSTEM CONTENT ADDRESSED FSCK …»),
+`--namespace`/`--partial` в CLI — `15436aa3e07`, парность meta/body — `dadac45da92`,
+`kFsckHardFindings` — `4e19cfe08e7`.
+
+ИТОГ: подтверждённая часть — дубликат CAS-049 (P2, уже отслежен); by-design часть переоценке не
+подлежит; новый остаток — невидимость двух advisory-счётчиков, P3, не блокер релиза (громкие findings
+рендерятся, тихой порчи нет).
+
+## CAS-063 — Порядок «дропы namespace → снятие слота» и фильтр `/mount` в `listMounts` подтверждаются, но «повторный запуск не может починить» — фактически неверно: resume-путь есть в коде и закреплён тестами; остаётся только невидимость owner-only слота в `system.content_addressed_mounts`. (частично, P3) {#cas-063}
+
+Анкеры находки — из снапшота `CA/...`; на HEAD это
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.cpp` и
+`.../Pool/CasServerRoot.cpp` (перенос — `592b9b83568`). Номера строк по декоммиссии почти совпали
+(дропы namespace — `:159-211`, хвост снятия слота — `:244-455`, удаление `mount`/`epoch` — `:372-373`,
+tombstone owner — `:408-435`); `listMounts` не на `:606-649`, а на `Pool/CasServerRoot.cpp:751-797`.
+
+ЧТО ПОДТВЕРЖДАЕТСЯ (как код-форма).
+1) Порядок именно такой: сначала `admin->dropNamespace(life)` по каждому owned namespace
+(`Tools/CasDecommission.cpp:188,194`), затем дренаж manifest-debris/staging/mountpoint (`:219-242`),
+и только потом снятие слота (`:267-447`).
+2) Удаление мутабельных контрольных объектов идёт до tombstone: `mount` затем `epoch`
+(`:372-373`), liveness-recheck (`:375-403`), и лишь потом CAS-перезапись `owner` с
+`retired_at_ms` (`:408-435`).
+3) `listMounts` перечисляет только ключи, кончающиеся на `/mount`
+(`Pool/CasServerRoot.cpp:754-763`), и `system.content_addressed_mounts` строится из него
+(`src/Storages/System/StorageSystemContentAddressedMounts.cpp:163`). Значит слот, у которого остался
+только `owner`, строки в представлении не имеет.
+
+ЧТО ФАКТИЧЕСКИ НЕВЕРНО — «a re-run cannot repair, because the capture precondition no longer holds».
+Resume-путь спроектирован ровно под это окно:
+- `Pool::openForDecommission` берёт uuid жертвы из `owner`-объекта, а при его отсутствии — из
+  mount-лизы («partial hand-cleanup: adopt from the lease»), и только при отсутствии обоих отказывает
+  с `BAD_ARGUMENTS`, указывая на `cas-fsck` (`Pool/CasPool.cpp:820-828`). В обсуждаемом окне `owner`
+  ЕЩЁ ЕСТЬ и не tombstoned, т.е. это самый благополучный вход.
+- Отсутствующий `epoch` при отсутствующем/терминальном `mount` — это выделенная политика
+  `EpochMintPolicy::DecommissionRecovery` (`Pool/CasPool.cpp:578-582`,
+  `Pool/CasServerRoot.cpp:221-247`): живая лиза — громкий отказ `ABORTED`, терминальная — минт
+  заведомо отличного эпоха; при `mount` отсутствующем (`ProbeOutcome::KeyAbsent`,
+  `CasServerRoot.cpp:217-218`) идёт обычный fresh-bootstrap. Поддеревo к этому моменту пусто (дренажи
+  прошли), поэтому guard `serverRootSubtreeEmpty` (`CasServerRoot.cpp:196-201`) не срабатывает.
+  Далее повторный прогон снова доходит до `:244-447`: victim не владеет ни одной catalog-строкой →
+  `warnings` пусты → слот снимается и `owner` tombstone-ится.
+- Закреплено тестами: `src/Disks/tests/gtest_cas_decommission.cpp:1325`
+  (`MidRetirementCrashResumesViaMountLeaseFallback` — вручную сносят `epoch`+`owner`, повторный
+  прогон доводит снятие слота до конца), `:1054`
+  (`SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor`), `:1231` (`FailedDrainKeepsSlotThenResumes`),
+  `:1267`, `:987` (`RemovesMutableSlotAndRefusesTombstonedRerun`).
+- BACKLOG прямо фиксирует, что «the general decommission two-phase-heal flow (verified separately)»
+  уже проверен (`BACKLOG/mounts-and-lifecycle.md`, запись
+  {#decommission-successor-mount-race}).
+Кроме того, любой незакрытый шаг хвоста не молчит: неудача tombstone даёт warning «rerun the command
+to retry» (`Tools/CasDecommission.cpp:431-434`), неполный дренаж — `LOG_WARNING` «mount slot kept
+(terminated) — re-run the command to finish» (`:451-453`). Это fail-closed громкий путь, не тихая
+порча.
+
+ЧТО BY-DESIGN — «the only way to clear a dead member's mount slot is a verb that first erases that
+member's data». Слот и есть якорь владения: снятие слота прямо запрещено, пока в каталоге остаётся
+хоть одна строка жертвы (`Tools/CasDecommission.cpp:250-265`: «upcoming GC rounds perform the final
+cleanup — re-run this command afterwards to retire the slot»), а `Removing`-namespace без своего
+`_ckpt` — `CORRUPTED_DATA` (`:177-183`). То есть «сначала данные, потом слот» — это инвариант, а не
+дефект последовательности; «неразрушающей» альтернативой было бы перенос владения namespace другому
+server root, и это отдельная, уже описанная тема с зафиксированным ограничением
+(`BACKLOG/mounts-and-lifecycle.md`{#life-epoch-monotone-per-server-root}: «Pool-member decommission is
+where this would be introduced»). Смежное уже отслеживается: трение вокруг определения «мёртв» —
+`BACKLOG.md`{#decommission-wrong-predicate}; гонка с успешным сукцессором в хвосте снятия —
+{#decommission-successor-mount-race} (и сознательно принятое окно описано в самом коде,
+`Tools/CasDecommission.cpp:362-370`); выбор жертвы по префиксу — `BACKLOG.md`{#nested-srid-decommission};
+сценарная карта «kill the command mid-run at each phase, then resume» — `BACKLOG/testing-and-ci.md`
+(B200 follow-up), т.е. resume-поведение стоит в очереди на soak-проверку, а не отсутствует.
+
+РЕАЛЬНЫЙ ОСТАТОК (не отслеживался): единственная невыдуманная и неотслеженная половина — п.3, т.е.
+owner-only слот не виден в `system.content_addressed_mounts` (поиск по BACKLOG по `cas_mounts` /
+`owner anchor` совпадений не дал). Записано новой секцией
+`docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md`{#owner-only-slot-invisible-in-mounts}
+(оставлено незакоммиченным): выдавать строку для слота с `owner`/`epoch` без `mount` со состоянием
+вида `retiring`/`half-retired`. P3 — чистая наблюдаемость, состояние самопочиняемое повторным
+запуском той же команды.
