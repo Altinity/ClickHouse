@@ -139,9 +139,9 @@
 | CAS-121 | частично | P3 | — | нет | Отказ BACKUP через временные хардлинки подтверждён, но это осознанный fail-closed гейт и достижим только для deprecated Ordinary-базы; вторая половина находки («каждый BACKUP перечитывает все байты из-за `areBlobPathsRandom()==false`») факт��чески неверна — у part-файлов есть precalculated checksum, и он проверяется РАНЬШЕ пути FromRemotePath. |
 | CAS-122 | дубликат CAS-042 | P3 | [{#operability} (B180 / format-freeze), {#manifest-digest-by-reencode}](BACKLOG.md#operability} (B180 / format-freeze), {#manifest-digest-by-reencode) | нет | Обе цитаты на HEAD верны, но следствие «additive-поле читается как CORRUPTED_DATA» недостижимо (гейт `checkCompatibility` по `v` срабатывает ДО тела и даёт `UNKNOWN_FORMAT_VERSION`), а «нет продюсера у `!`-ключа» — это осознанно дремлющая compat-плоскость pre-release-политики recreate-only; ровно эта земля уже адъюдицирована как CAS-042. |
 | CAS-123 | частично | P3 | [{#byte-accounting-blobs-only-and-preview-size-units} (новый), примыкает к {#mpu-and-probe-debris-unaccounted}](BACKLOG.md#byte-accounting-blobs-only-and-preview-size-units} (новый), примыкает к {#mpu-and-probe-debris-unaccounted) | нет | Учёт байт действительно ограничен телами блобов (плюс один непрофильный счётчик `namespace_janitor_pending_bytes`), и reclaim-forecast-поверхности нет; в `previewDeletes` подтвердилась конкретная смесь физического и логического размера в одной колонке, но «считает записи, которые не удалит» преувеличено — они помечены в колонке `reason`, а двойного счёта нет. |
-| CAS-124 | ⏳ | — | — | — | — |
-| CAS-125 | ⏳ | — | — | — | — |
-| CAS-126 | ⏳ | — | — | — | — |
+| CAS-124 | частично | P3 | [{#fsck-unparsable-blob-key-sentinel-collides-with-the-empty-blob}](BACKLOG.md#fsck-unparsable-blob-key-sentinel-collides-with-the-empty-blob) | нет | Форма кода реальна (пустой контент под cityhash128 даёт нулевой digest, совпадающий с `BlobRef{}`), но следствие ограничено одной строкой классификации в `fsck` и не влияет на данные. |
+| CAS-125 | not-a-bug | — | — | — | Ложное утверждение: `XXH3_128bits_reset` проверяет `NULL` и возвращает `XXH_ERROR`, разыменования нет, guard `valid()` живой и рабочий. |
+| CAS-126 | by-design | — | — | — | Асимметрия реальна, но это не «pre-check»: колбэк — гейт ДОЛГОВЕЧНОГО эффекта перед `sink->finalize()`, а у локального пути такого эффекта нет (только приватный scratch-файл), и его настоящая запись всё равно под fence. |
 | CAS-127 | ⏳ | — | — | — | — |
 | CAS-128 | ⏳ | — | — | — | — |
 | CAS-129 | ⏳ | — | — | — | — |
@@ -5477,3 +5477,58 @@ fail-closed-loud vs silent-corruption — низший грейд.
 (а) байты считаются только по телам блобов, и ни fsck, ни GC-лог не дают разбивку по классам объектов;
 (б) однострочная несогласованность единиц в `PreviewEntry::size`. «Reclaim-forecast» как фича
 корректно назван отсутствующим, но это не дефект, а неспецифицированная функция.
+
+## CAS-124 — Форма кода реальна (пустой контент под cityhash128 даёт нулевой digest, совпадающий с `BlobRef{}`), но следствие ограничено одной строкой классификации в `fsck` и не влияет на данные. (частично, P3) {#cas-124}
+
+1) «Пустой контент хэшируется в нулевой digest» — ПОДТВЕРЖДЕНО для алгоритма по умолчанию.
+   `src/IO/HashingWriteBuffer.h:20-22` инициализирует `state(0, 0)`, а `getHash` (`:24-29`) при `block_pos == 0` возвращает именно этот `state` без вызова `CityHash128WithSeed`. То же наследуется `HashingReadBuffer` (общая база `IHashingBuffer`). Значит `CityHash128BlobHashingWriteBuffer::getHashHex`
+   (`.../Primitives/CasBlobHashingWriteBuffer.cpp:64-68`) и `blobHashHexOneShot` для `CityHash128` (`:224-233`) на пустом входе дают `0…0`.
+   Для `xxh3-128` (`:235-241`) и `sha256` (`:242-250`) пустой вход даёт обычный ненулевой константный digest — то есть утверждение верно ТОЛЬКО для `cityhash128`, который является алгоритмом по умолчанию (`BlobHashAlgo::CityHash128 = 1`, `Primitives/CasBlobDigest.h:40`).
+
+2) «Тот же all-zero digest — sentinel fsck для неразобранного ключа» — ПОДТВЕРЖДЕНО, но это ЕДИНСТВЕННОЕ место в дереве.
+   `Tools/CasFsck.cpp:953`: `const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});`, а `BlobRef{}` — это `{CityHash128, digest all-zero}` (`Primitives/CasBlobDigest.h:207-214`). Грепом по всему CAS другого использования `BlobRef{}`/`BlobDigest{}` как «отсутствует» нет:
+   единственный хит — эта строка 953 (плюс объявление поля-дефолта в самом заголовке). То есть «sentinel» существует ровно в одном сравнении, а не в протоколе, манифестах, ledger-е или GC-состоянии.
+
+3) Следствие в аудите ЗАВЫШЕНО. Строка 953 работает только внутри цикла по НЕДОСТИЖИМЫМ блобам (`:943-953`), и результат влияет только на метку `FsckClass` в отчёте:
+   - ветка `PendingGc` (`:957-958`) дополнительно требует совпадения токена: `backend.head(bkey).token == rit->second.token`. У чужого/битого ключа токен принадлежит другому объекту, поэтому совпадение с записью реального пустого блоба практически недостижимо — эта ветка от коллизии не страдает.
+   - ветка `in_run_hashes.contains(hash)` (`:968`) токен не проверяет, поэтому мусорный (непарсящийся) ключ МОЖЕТ получить метку `AwaitingGc`/`StaleEdge` вместо `Unaccounted` — но только если в пуле одновременно есть (а) настоящий пустой блоб под `cityhash128`, попавший в GC-снапшот, и (б) объект с неразбираемым ключом.
+   Ни в одну сторону это не меняет ни удаление, ни чтение: `report.unreachable` инкрементируется до классификации (`:946`), объект в отчёте всё равно виден, а удаляет только GC по своим структурам, а не по этой метке. Обратная ошибка (настоящий пустой блоб принят за «мусор») невозможна: для него `parseBlobKey` успешен и даёт тот же самый `BlobRef`, то есть корректный.
+   Это не тихая порча, а неверная МЕТКА в диагностическом отчёте, причём в «мусорном» ведре.
+
+4) Пустые блобы в принципе создаваемы: файлы из `partFileMustStayBlob` идут по blob-пути независимо от размера (`ContentAddressedTransaction.cpp:860-917`), а `stageBlobPartFile` (`:701-720`) и `CasPartWriteTxn` не имеют отсечки по `size == 0`. Так что предпосылка «легитимный zero-length blob» не вымышлена.
+
+5) BACKLOG/история: по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` совпадений по «all-zero / zero digest / empty blob / value_or(BlobRef» нет — тема не отслеживается. Дублирования с другими CAS-### по этому месту не видно.
+
+Реальный остаток: заменить `value_or(BlobRef{})` на `std::optional<BlobRef>` и явно классифицировать непарсящийся ключ как `Unaccounted`, не заводя его в поиск по `retired_by_hash`/`in_run_hashes`. Косметика для отчёта fsck, не релиз-блокер. Добавлен пункт в `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` (не закоммичен), anchor выше.
+
+## CAS-125 — Ложное утверждение: `XXH3_128bits_reset` проверяет `NULL` и возвращает `XXH_ERROR`, разыменования нет, guard `valid()` живой и рабочий. (not-a-bug, —) {#cas-125}
+
+1) Утверждение «конструктор разыменовывает нулевой state» — ФАКТИЧЕСКИ НЕВЕРНО.
+   `Primitives/CasXxh3Streamer.h:44`: `Xxh3Streamer() : state(XXH3_createState()) { XXH3_128bits_reset(state); }`. Далее по цепочке:
+   - `contrib/xxHash/xxhash.h:6571-6575`: `XXH3_128bits_reset(statePtr)` — это ровно `return XXH3_64bits_reset(statePtr);`
+   - `contrib/xxHash/xxhash.h:5878-5883`: `XXH3_64bits_reset` начинается с `if (statePtr == NULL) return XXH_ERROR;` и только после этого зовёт `XXH3_reset_internal`.
+   То есть при `XXH3_createState() == NULL` (`:5821-5827`, возвращает `NULL` при неудаче `XXH_alignedMalloc`) вызов `reset` — безобидный no-op, а не разыменование. UB-атрибутов тоже нет: `XXH_NOESCAPE` разворачивается в `__attribute__((noescape))` (`:797`), это не `nonnull`.
+
+2) Деструктор на нулевом состоянии тоже корректен: `XXH3_freeState` (`:5837-5841`) вызывает `XXH_alignedFree`, а тот начинается с `if (p != NULL)` (`:5803-5806`).
+
+3) Значит guard ЖИВОЙ, а не мёртвый: `Primitives/CasBlobHashingWriteBuffer.cpp:103-104` —
+   `if (!state.valid()) throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, ...)` — исполняется в конструкторе `Xxh3128BlobHashingWriteBuffer`, единственном производителе xxh3-стримера (`makeBlobHashingWriteBuffer`, `:207-208`). `valid()` (`CasXxh3Streamer.h:53`) читает поле `state`, никакого предварительного разыменования нет. Заявленное «под нехваткой памяти процесс падает вместо `CANNOT_ALLOCATE_MEMORY`» неверно в обе стороны: падения нет, исключение поднимается.
+   (Замечу, что при `blob_hash=xxh3-128` в ClickHouse нехватка памяти обычно вообще перехватывается трекером памяти раньше, чем `malloc` вернёт `NULL`, так что ветка редка и без того — но она корректна.)
+
+4) Единственные пользователи `Xxh3Streamer` — сам `Xxh3128BlobHashingWriteBuffer` (поле, `:133`) и никто больше (грep по `Xxh3Streamer` в CAS даёт только объявление в заголовке и это поле). Других мест, где `update`/`digest` могли бы быть вызваны на невалидном стримере, нет.
+
+5) BACKLOG (`docs/superpowers/cas/BACKLOG.md`, `docs/superpowers/cas/BACKLOG/*.md`) этой темы не содержит, и заводить нечего: фиксить нечего. Классический для этого аудита паттерн — реальная форма кода (безусловный вызов после потенциально нулевой аллокации) с ИНВЕРТИРОВАННЫМ следствием, не проверенным по коду вызываемой функции.
+
+## CAS-126 — Асимметрия реальна, но это не «pre-check»: колбэк — гейт ДОЛГОВЕЧНОГО эффекта перед `sink->finalize()`, а у локального пути такого эффекта нет (только приватный scratch-файл), и его настоящая запись всё равно под fence. (by-design, —) {#cas-126}
+
+1) Форма кода подтверждается, строки в анкоре устарели. Актуальные места: S3-путь — `ContentAddressedTransaction.cpp:890` (`const uint64_t admitted_generation = pool->fenceGeneration();`) и `:904` (`[pool, admitted_generation] { pool->checkFenceOrThrow(admitted_generation); }`); локальный путь — `:907-917`, действительно передаёт только `on_finalized` без колбэка (у локального конструктора `CaContentWriteBuffer` такого параметра вообще нет, `ContentAddressedTransaction.h:311-318`).
+
+2) Ключевое: это НЕ предварительная проверка. Колбэк вызывается в `CaContentWriteBuffer::finalizeImpl` (`ContentAddressedTransaction.cpp:1869-1887`) — уже ПОСЛЕ `next()`, `count()` и `hashing->getHashHex()`, то есть после того как всё тело простримлено и захэшировано, ровно перед `sink->finalize()` (`:1887`). Значит заявленное следствие («на локальном бэкенде писатель зря стримит всё тело, а на S3 — нет») ложно: S3-путь тоже стримит всё тело целиком и лишь затем проверяет fence. Экономии работы этот колбэк не даёт ни там, ни там — он не для этого.
+
+3) Назначение колбэка задокументировано прямо на конструкторе и совпадает с кодом: `ContentAddressedTransaction.h:339-345` — «`check_fence_before_finalize_` is the rev.7 [C2] fence-generation admission for this durable write (the ONLY durable backend effect of the Local-mode constructor above is a private scratch file, so it takes none)». Контракт самой примитивы такой же: `Pool/CasMountRuntime.h:150-157` — «for every durable CAS/PUT/DELETE ... immediately before its durable backend call»; реализация `Pool/CasMountRuntime.cpp:97-113` бросает типизированный transient-отказ. То есть проверка требуется там, где запись становится видимой в РАЗДЕЛЯЕМОМ объектном хранилище (S3 staging-объект), и не требуется там, где эффект — файл в локальном `scratchPath` этого же процесса.
+
+4) Локальный путь не остаётся без fence: настоящая долговечная запись (загрузка блоба post-precommit) идёт через `streamIfAbsent`, который «rides the request controller's fence gate» (`Pool/CasPartWriteTxn.cpp:578`, `:692-693`), а два сырых backend-вызова смещения (`resurrect`/`putOverwrite`) явно закрыты `checkFenceOrThrow` против сгенерации, снятой на решении о смещении (`:700`, `:724`, `:754`). Так что «обнаруживает потерю только на коммите» — и есть корректное место: до коммита локальный писатель ничего разделяемого не тронул.
+
+5) Класс INTEGRITY неприменим: обе ветки fail-closed и громкие (`throwCasTransientUnavailable`), тихой порчи не возникает ни в одной. Разница — исключительно в том, где стоит гейт долговечности.
+
+6) BACKLOG: релевантный исторический анкер — `{#c2-resurrect-putoverwrite-fence-check}`, и он УЖЕ ЗАКРЫТ в коде: проверки стоят на месте (`Pool/CasPartWriteTxn.cpp:691-754`), а в `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md:136-145` он числится только как устаревшая ссылка в комментариях/тестах, с явной пометкой «Cosmetic only: the code and the fence checks themselves are correct». Нового отслеживаемого остатка по CAS-126 нет, новый пункт не заводился.

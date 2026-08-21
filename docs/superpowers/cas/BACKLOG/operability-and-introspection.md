@@ -643,3 +643,22 @@ Not defects in the same tool, for the record: rows the round will not delete are
 over-report is documented at the API (`Gc/CasGc.h:453-457`), and no blob is double-counted — the fold
 emits at most one sentinel row per blob (`Gc/CasBlobInDegree.cpp:573-589`) and `zeroInDegree` skips
 `kCondemned` rows (`:706-708`).
+
+## fsck substitutes the default `BlobRef{}` for an unparsable blob key, and that value is the identity of an empty blob under the default algo (2031-triage CAS-124) {#fsck-unparsable-blob-key-sentinel-collides-with-the-empty-blob}
+
+`Tools/CasFsck.cpp:953` classifies an unreachable listed object with
+`layout.parseBlobKey(bkey).value_or(BlobRef{})`, and `BlobRef{}` is `{CityHash128, all-zero digest}`
+(`Primitives/CasBlobDigest.h:207-214`). An empty blob hashes to exactly that: `IHashingBuffer` starts
+at `state(0, 0)` and `getHash` returns it unchanged when nothing was hashed
+(`src/IO/HashingWriteBuffer.h:20-29`), so `blobHashHexOneShot(CityHash128, "")` is `0…0`. Zero-length
+blobs are creatable — files matching `partFileMustStayBlob` take the blob path regardless of size
+(`ContentAddressedTransaction.cpp:860-917`) and neither `stageBlobPartFile` nor `CasPartWriteTxn`
+rejects `size == 0`.
+
+Consequence is one report label, not data: the `PendingGc` branch additionally requires a token match
+(`:957-958`), which a foreign key cannot satisfy, but `in_run_hashes.contains(hash)` (`:968`) does not,
+so a truly unparsable/foreign key can be labeled `AwaitingGc`/`StaleEdge` instead of `Unaccounted`
+whenever the pool also holds an empty `cityhash128` blob in the GC snapshot. `report.unreachable` is
+already incremented before the classification (`:946`), so nothing disappears from the report. Fix is
+one line: keep the `std::optional<BlobRef>` and classify a parse failure as `Unaccounted` directly
+instead of looking the sentinel up in `retired_by_hash`/`in_run_hashes`.
