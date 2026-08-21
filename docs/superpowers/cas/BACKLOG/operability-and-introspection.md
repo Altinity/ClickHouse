@@ -662,3 +662,35 @@ whenever the pool also holds an empty `cityhash128` blob in the GC snapshot. `re
 already incremented before the classification (`:946`), so nothing disappears from the report. Fix is
 one line: keep the `std::optional<BlobRef>` and classify a parse failure as `Unaccounted` directly
 instead of looking the sentinel up in `retired_by_hash`/`in_run_hashes`.
+
+## `system.content_addressed_log` stamps time, `thread_id` and `query_id` on the DRAINING thread, not the emitter (2031-triage CAS-131) {#cas-log-drain-thread-attribution}
+
+`CasEvent` is pure data with no time or caller identity fields (`Primitives/CasEvent.h:61-75`), and the
+three columns that answer "when, and who did this" are filled inside the sink, at delivery:
+`ContentAddressedMetadataStorage.cpp:580-581` (`event_time`/`event_time_microseconds` from
+`system_clock::now()`) and `:594-595` (`e.thread_id = getThreadId(); e.query_id =
+CurrentThread::getQueryId();`).
+
+Delivery is not guaranteed to run on the emitting thread. `EventDispatcher::emit` enqueues under the
+mutex and, if another thread is already draining, returns immediately — the queued event is delivered
+by that other thread's loop (`Pool/CasEventDispatcher.cpp:19-30`, and the drain loop at `:31-52`
+which releases the lock around the sink call). The same hand-off happens for an emission made from
+inside a sink callback (the documented reentrancy case, `Pool/CasEventDispatcher.h:20-23`). So under
+any concurrency — two queries writing, a query plus the GC/keeper background threads, the intra-part
+upload fan-out the dispatcher was introduced for — a row can carry the `thread_id` of an unrelated
+thread and the `query_id` of an unrelated query (or none), while its timestamp is the delivery
+instant rather than the decision instant.
+
+Nothing is corrupted and no path fails; the cost is that the audit table's own attribution columns
+cannot be trusted for exactly the correlate-with-`system.query_log` triage they exist for. Fix
+direction: stamp at emission — capture the three values in `EventDispatcher::emit` (or in the
+emission helpers) into new `CasEvent` fields, and have the sink copy them instead of sampling its own
+thread. Cheap, and it also makes `event_time` mean "when the decision happened", which is what every
+existing analysis assumes.
+
+Checked while triaging, NOT defects: the deliberate skip of the `RefResolve` row on a warm
+`CachedForLoad` view-cache hit (`Parts/PartFolderAccess.cpp:161-186`, contract stated in
+`Parts/PartFolderAccess.h:394` and `Pool/CasRefLedger.h:33`) — the hit is reported by
+`CASPartFolderViewHits`; and the part-folder cache counters, which are all plain counts with
+descriptions matching the code (`src/Common/ProfileEvents.cpp:919-924,943`), with the bytes/entries
+gauges kept as separate `CurrentMetrics` (`src/Common/CurrentMetrics.cpp:234-235`).

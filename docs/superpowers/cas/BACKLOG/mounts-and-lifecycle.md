@@ -229,3 +229,27 @@ The shim precedent already exists: `base/base/time.h` maps `CLOCK_MONOTONIC_COAR
 The owed treatment is the same shape — extend that header (or a CAS-local one) with a
 `CLOCK_BOOTTIME` mapping for Darwin, and state in the mapping comment that Darwin's substitute does
 not include sleep time, which weakens (does not break) the suspend argument the fence relies on.
+
+## `decodeServerEpoch` accepts `nwe = 0`, and `MountFence` carries two never-read identity fields (2031-triage CAS-130) {#server-epoch-zero-and-dead-fence-identity}
+
+Two small hardening/hygiene residuals around the writer-epoch fence. Neither is a live defect: both
+end fail-closed or inert, and both are cheap to close.
+
+1. `Formats/CasServerRootFormats.cpp:91-117` (`decodeServerEpoch`) validates only that the `nwe` key
+   is present — a body with `nwe = "0"` decodes to `ServerEpoch{next_writer_epoch = 0}`. On the
+   object-PRESENT path of `allocateWriterEpoch` (`Pool/CasServerRoot.cpp:265-272`) there is no
+   zero-clamp (the clamp exists only on the absent path, `Pool/CasServerRoot.cpp:263-264`), so that
+   decode would hand out `writer_epoch = 0`. No writer can produce such a body (the only encoder site
+   writes `next + 1`, `Pool/CasServerRoot.cpp:269-272`), so this needs a corrupted or hand-written
+   `cas_epoch` object; and the consequence is loud, not silent — the first ref transaction /
+   manifest ref encode of the incarnation throws `CORRUPTED_DATA` on the nonzero-epoch check
+   (`Formats/CasRefWireVocab.cpp:33-37`, `Formats/CasWireVocab.cpp:87-99`). `CasDecommission` already
+   treats `next_writer_epoch != 0` as a validity precondition (`Tools/CasDecommission.cpp:335`), so
+   the owed treatment is to reject zero at decode time, where the other epoch invariants live.
+2. `MountFence::server_uuid` / `MountFence::writer_epoch` (`Pool/CasMountRuntime.h:76-77`) are
+   assigned by `armMountFence` (`Pool/CasMountRuntime.cpp:136-137`) and read by nothing, in the whole
+   tree. The local fence is deliberately a latch + deadline + generation triple (`mayMutate`,
+   `Pool/CasMountRuntime.cpp:80-84`; `checkFenceOrThrow`, `:97-113`), and the durable identity is
+   enforced elsewhere — the keeper's token-guarded CAS and the `liveWriterEpoch` comparison in
+   `Pool/CasPartWriteTxn.cpp:158-161`. Either drop the two fields, or keep them and say in the
+   comment that they are a diagnostic record only, never an admission input.
