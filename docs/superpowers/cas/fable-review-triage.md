@@ -34,18 +34,17 @@ TXN-ONE-PIPELINE, ack-floor GC и прочее, поэтому часть выв
 
 | ID | Статус | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|--------|-----------|------------|-------------------|------|
-| m1 | ⏳ | — | — | — | — |
-| m2 | ⏳ | — | — | — | — |
-| m3 | ⏳ | — | — | — | — |
-| m4 | ⏳ | — | — | — | — |
-| m5 | ⏳ | — | — | — | — |
-| m6 | ⏳ | — | — | — | — |
-| m7 | ⏳ | — | — | — | — |
-| m8 | ⏳ | — | — | — | — |
-| m9 | ⏳ | — | — | — | — |
-| m10 | ⏳ | — | — | — | — |
-| m11 | ⏳ | — | — | — | — |
-| m12 | ⏳ | — | — | — | — |
+| m1 | подтверждено | P3 | нет | — (смежное: `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:114` {#fsck-… | `clickhouse-disks cas-fsck` по-прежнему бросает `BAD_ARGUMENTS` на четырёх находках целостности — тот же код, что и на кривом флаге. |
+| m2 | подтверждено (смежно с дубликат CAS-096) | P3 | нет | частично — `docs/superpowers/cas/2031-triage.md` CAS-096 {#refplan-dead-drop-counters},… | офлайновый `cas-gc-rebuild` печатает 9 полей отчёта, но не два «дисастер-специфичных» — `virgin_by_enumeration` и `adopted_seal_generation`. |
+| m3 | подтверждено | P3 | нет | — (нигде: в `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.md`, `2031-triage.md` про … | `SYSTEM CAS DROP POOL MEMBER` по-прежнему требует строковый литерал для диска, тогда как шесть соседних глаголов принимают bare identifier. |
+| m4 | подтверждено | P3 | нет | — (не отслеживается; `BACKLOG.md:723` {#issue-2211-gc-run-follower-noop} и `final-check… | `SYSTEM CAS GC RUN` без диска по-прежнему итерирует имена дисков без дедупа по нижележащему CA-указателю → двойной раунд на cache-over-CAS. |
+| m5 | дубликат CAS-033 | P2 | нет (пред-релизная половина висит на CAS-040) | `docs/superpowers/cas/2031-triage.md` CAS-033 {#ckpt-damage-no-repair-path} (by-design,… | порча тела манифеста по-прежнему валит весь раунд GC (нет try/catch), в отличие от per-namespace `HOLD` для ref-логов — но это уже покрыто CAS-033/CAS-040. |
+| m6 | подтверждено | P3 | нет | — (грепы по `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.md`, `2031-triage.md` на `… | `system.cas_gc_log` по-прежнему на руками пронумерованных `Enum8`, тогда как соседний `cas_log` использует `LowCardinality(String)`. |
+| m7 | подтверждено | P3 | нет | — (не отслеживается) | `Primitives/CasTypes.h` по-прежнему включает `Formats/CasFormat.h` и зовёт `storedSuffix`, нарушая собственное правило «Primitives — zero outward dependencies». |
+| m8 | подтверждено | P3 | нет | — (смежно `2031-triage.md` CAS-037 {#numeric-parse-and-window-wrap}, но там про заворот… | `ReadBufferFromFileView::resizeWorkingBuffer` по-прежнему усекает буфер, не трогая `pos`, — латентный выход за границы, недостижимый текущими вызывающими. |
+| m9 | дубликат CAS-038 | P3 | нет | `docs/superpowers/cas/2031-triage.md` CAS-038 {#decoder-optional-field-residuals} (внут… | асимметрия обязательных полей в `Formats/` жива в конкретном виде (`tv` не требуется в outcome-логе), но класс уже разобран и затрекан триажем CAS-038. |
+| m10 | подтверждено | P3 | нет | `docs/superpowers/cas/BACKLOG.md:190` {#disks-exit-code-upstream} | `clickhouse-disks --query` действительно теперь возвращает ненулевой код при ошибке команды — breaking change для `set -e`-скриптов, релиз-нота всё ещё не написана. |
+| m11 | подтверждено | P3 | нет | `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:67` {#lazy-load-tables-d… | одно-табличные `SYSTEM`-глаголы теперь разворачивают `StorageTableProxy` и материализуют ленивую таблицу — юзер-видимое изменение поведения, changelog-строки нет. |
 
 ## Nits {#nits}
 
@@ -451,3 +450,51 @@ P2 и не pre-release: это документация, ни одно из тр
 2. (P2, уже описано в CAS-098) Колонка `gc_running`/`gc_state` в `system.cas_mounts` из латча `stopping`, заодно закрыть `ever_succeeded`.
 3. (P3, разное) Тестовые пробелы: error-path на мисконфигурацию CA-диска; `KILL QUERY` посреди INSERT; хотя бы один интеграционный набор с конкурентными клиентами; функциональный тест на `GC STOP/START`; BACKUP на S3-бэкап-диск с CA-источника; `FORGET`-на-живом.
 Не pre-release: ни один пункт не меняет корректности, все — про диагностируемость и про то, какие классы риска сегодня некому поймать; но пункт 1 и 2 стоит взять первыми, потому что именно они превращают инцидент в «нет данных».
+
+## Minor issues — детали {#minor-details}
+
+### m1 (подтверждено, P3) {#m1}
+
+На HEAD все четыре integrity-находки бросают `ErrorCodes::BAD_ARGUMENTS`: `programs/disks/CommandFsck.cpp:146-147` («{} reachable object(s) MISSING (INV-NO-LOSS violation)»), `:153-154`, `:164-165`, `:175-176`. Ровно тот же код используется и для CLI-ошибок в том же файле (`:45`, `:49`, `:52-53`), так что exit-code-контракт не различает «плохой аргумент» и «пул повреждён». Правка тривиальна — `CORRUPTED_DATA` на четырёх сайтах; фиксов в истории нет.
+
+### m2 (подтверждено (смежно с дубликат CAS-096), P3) {#m2}
+
+`programs/disks/CommandCaGcRebuild.cpp:67-70` выводит `performed/round/generation/namespaces/shards/committed_refs/live_precommits/unowned_alive_manifests/edges/clamped_shards`; ни `virgin_by_enumeration`, ни `adopted_seal_generation` в потоке нет (в файле они не встречаются вовсе). Поля живы в структуре (`Gc/CasGc.h:112` и соседнее) и выводятся SQL-поверхностью — `src/Interpreters/InterpreterSystemQuery.cpp:2426`/`:2446` и лог-строка `:2591-2594`. Триаж CAS-096 (`2031-triage.md:114`) как раз опроверг тезис «REBUILD сообщает только performed=1», подтвердив 13 колонок в SQL, — то есть асимметрия ровно между SQL и CLI, и остаток именно в CLI.
+
+### m3 (подтверждено, P3) {#m3}
+
+`src/Parsers/ParserSystemQuery.cpp:504-524`: ветка `Type::CAS_DROP_POOL_MEMBER` парсит srid и диск двумя `ParserStringLiteral`, минуя `parseQueryWithOnClusterAndTarget`. Соседние `CAS_FSCK/FORGET/GC STOP/GC START` (`:495-503`) и `CAS_GC_REBUILD` идут через `SystemQueryTargetType::Disk` и принимают голый идентификатор. Комментарий в коде обосновывает строковый литерал для srid (opaque path с `/`), но на диск это обоснование не распространяется — грамматическая непоследовательность живая, фикса в истории нет.
+
+### m4 (подтверждено, P3) {#m4}
+
+`src/Interpreters/InterpreterSystemQuery.cpp:2533-2560` (`runContentAddressedGcRun`): ветка пустого `disk_name` идёт `for (const auto & [name, disk] : getContext()->getDisksMap())` и на каждом `tryFromDisk`-успехе вызывает `ca->runGarbageCollectionRoundNow()`, добавляя строку. Ни `server_root_id`, ни указатель `ContentAddressedMetadataStorage*` не используются как ключ дедупликации, так что cache-обёртка над CA-диском даёт две записи в map и два синхронных раунда (LIST/fold/delete дважды) плюс вводящий в заблуждение двухстрочный результат. Живой двойной раунд по-прежнему не прогонялся — подтверждена только форма кода.
+
+### m5 (дубликат CAS-033, P2) {#m5}
+
+На HEAD место переехало в `Gc/CasGc.cpp:1301-1324` (`Gc::foldManifestEdges`): `decodePartManifest(...)` на `:1319` и два `throw Exception(ErrorCodes::CORRUPTED_DATA, ...)` на `:1320-1324` (ref mismatch / namespace mismatch) не обёрнуты ничем — исключение поднимается из fold и рвёт раунд целиком. Контраст с ref-логом сохранился (`gtest_cas_gc_fold.cpp:165` `RefMismatchFailsClosed`). Триаж 2031 уже адъюдицировал обе половины: CAS-033 признал пул-широкий destructive gate осознанным fail-closed выбором с трекингом гранулярности в BACKLOG, а CAS-040 (P1, до релиза) фиксирует именно «один битый/осиротевший манифест навсегда заклинивает GC по всему пулу». Отдельного действия по m5 не нужно.
+
+### m6 (подтверждено, P3) {#m6}
+
+`src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:18`, `:21`, `:25` заводят три `DataTypeEnum8` (`type_enum`, `outcome_enum`, `trigger_enum`) с явными числовыми значениями, при том что в том же файле уже есть `lc_string = LowCardinality(String)` (`:27`) — то есть смешение стилей внутри одной таблицы. Риск ровно тот, что описан в обзоре: при форк-ребейзе перенумерация значений молча меняет смысл уже записанных данных. Ни правила append-only, ни перехода на `LowCardinality(String)` на HEAD нет.
+
+### m7 (подтверждено, P3) {#m7}
+
+Третья строка `Primitives/CasTypes.h` — `#include <.../ContentAddressed/Formats/CasFormat.h>`, а `:160` вызывает `storedSuffix(FormatId::PartManifest)` внутри `fmt::format("{:06}{}", manifest_ordinal, ...)`. Правило зафиксировано в `.../ContentAddressed/README.md:77` (слоёвка `Primitives → Formats → Backend → Pool → Gc → Tools`) и `:80` («**`Primitives/`** — the vocabulary, zero outward dependencies»). CI-проверки слоёв нет, так что нарушение держится с момента разбиения (`592b9b83568`); лечится либо переносом `storedSuffix`, либо переносом самого хелпера ключа в `Formats/`.
+
+### m8 (подтверждено, P3) {#m8}
+
+`src/IO/ReadBufferFromFileView.cpp:169-179`: при `file_offset_of_buffer_end > getRightBound()` делается `working_buffer.resize(max(size - extra, 0))` и `file_offset_of_buffer_end = getRightBound()`, при этом `pos` не переставляется — то есть `pos` может оказаться за новым `end()`, после чего `available()` завернётся. Все четыре вызывающих на HEAD (конструктор `:30`, `setReadUntilPosition` `:56`, `setReadUntilEnd` `:70` — с новой rebase-логикой `:45-55`/`:62-69`) по-прежнему сужают границу до/вместе с seek, так что гап остаётся сугубо латентным. Дешёвая страховка — `if (pos > working_buffer.end()) pos = working_buffer.end();` внутри самой функции.
+
+### m9 (дубликат CAS-038, P3) {#m9}
+
+`Formats/CasGcOutcomesFormat.cpp:100-113` заводит `have_ha/have_h/have_tt`, а `tv` читается без флага (`:108`) и проверка на `:113` требует только `ha/h/tt` — при этом `encodeOutcomeLog` всегда пишет `tt`+`tv` парой (`writeTokenFields(out, first, e.token)`), так что усечённая запись декодируется с пустым токеном. Триаж 2031 (CAS-038, `2031-triage.md:56`, тело `:1858+`) прошёл по семи подпретензиям того же класса, пять признал не соответствующими HEAD и оставил как реальные остатки необязательный `oc` в этом же декодере (`:113-114`) и отсутствие line-cap на записи `gc/state` — оба классифицированы как косметика, P3. Правильный ход — один required-field sweep, объединив `tv` с уже заведёнными остатками CAS-038, а не отдельный пункт.
+
+### m10 (подтверждено, P3) {#m10}
+
+Поведение на HEAD: `programs/disks/DisksApp.cpp:238` кладёт код ошибки в `last_command_exit_code`, а `:622-623` возвращает его из `main` только для неинтерактивного режима (`query.has_value()`). Коммит — `f85cb4330c8` «clickhouse-disks: non-interactive runs exit nonzero on a failed command». Пункт отслеживается в `BACKLOG.md:190` {#disks-exit-code-upstream} как carve-out-обязательство (вынести правку отдельным upstream-PR), но именно строки changelog/release-note там нет; ближайший прецедент оформления — `BACKLOG/docs-and-cleanup.md:76` {#CHANGELOG-unknown-config-key-rejection}.
+
+### m11 (подтверждено, P3) {#m11}
+
+Изменение живо: `src/Interpreters/InterpreterSystemQuery.cpp:278` несёт комментарий про таблицу в БД с `lazy_load_tables = 1`, остающуюся обёрнутой в `StorageTableProxy`; коммит — `2ba28ac4b6f` «SYSTEM SYNC REPLICA (and sibling per-table SYSTEM verbs) materialize lazy_load_tables proxies instead of failing "is not replicated"» (+ stateless-тест 05017). Тема широко отслежена в `BACKLOG/operability-and-introspection.md` — `:105` фиксирует и фикс, и открытый эмпирический хвост, `:106`/`:119` — оставшиеся proxy-forwarding-пробелы (`DROP REPLICA`, `RESTART REPLICAS`, `STOP/START <action>`), а `:80` держит USER DECISION по самой фиче. Отсутствует ровно то, о чём буллет: changelog-запись про смену поведения.
+
+Примечание: в исходном списке одиннадцать буллетов, а не двенадцать — строка `m12` из таблицы удалена.
