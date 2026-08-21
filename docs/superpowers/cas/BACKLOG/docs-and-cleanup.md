@@ -79,3 +79,19 @@ Ranked by value-per-risk, each backed by real defects it would have prevented.
 
 - **[partpathparser-duplicated-path-constants] `PartPathParser` duplicating canonical ClickHouse path constants instead of deriving them** — MINOR — Concrete maintainability/consistency risk: a drift between the duplicated constants and the canonical ones would silently misparse part paths.
 - **[behavior-preserving-refactor-sequence] behavior-preserving refactor sequence (remove `CasDbg*` instrumentation, centralize event emission/cursor keys, introduce `RefId`/`ObjectId`)** — DESIRABLE — A genuine but broad refactor-candidate list; low urgency, real value.
+
+## Bucket requirements: lifecycle / Object Lock / storage-class transitions undocumented; Glacier read unclassified (2031-triage CAS-012) {#bucket-requirements-lifecycle-worm-glacier}
+
+The settled position (a CAS pool requires a plain bucket: no lifecycle expiration, no versioning, no
+Object Lock/WORM, no storage-class transitions; CAS cannot detect any of them without admin access)
+is only half-delivered in the user docs. `docs/en/antalya/cas/.../bucket-requirements.md:26,29-31`
+documents versioning only; a grep across all of `docs/en/antalya/cas/` finds no requirement text for
+`lifecycle`, `Object Lock`, `WORM`, `storage class`, or `Glacier`. Add them there — the operator
+cannot infer a requirement that is nowhere written.
+
+Second half: a blob transitioned to Glacier surfaces as a raw `S3Exception` — no `InvalidObjectState`
+handling exists anywhere in CAS or `src/IO/S3/`. It fails closed (`isObjectNotFound`,
+`CasObjectStorageBackend.cpp:323-343`, does not swallow it), so this is diagnosability, not
+correctness: classify that status into a message naming the storage-class requirement instead of a
+bare S3 error. No restore-and-retry path is wanted (a CAS pool must not live on a restore-latency
+class).
