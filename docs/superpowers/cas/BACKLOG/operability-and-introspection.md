@@ -440,7 +440,7 @@ passes none of the CLI's bounding parameters).
 lambda (`src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:232-241`), i.e. only
 when the disk object is CREATED. On a config reload `DiskSelector::updateFromConfig` calls
 `disk->applyNewSettings(...)` for every disk that already exists
-(`src/Disks/DiskSelector.cpp:176`), `DiskObjectStorage::applyNewSettings` forwards to
+(`src/Disks/DiskSelector.cpp:180`), `DiskObjectStorage::applyNewSettings` forwards to
 `metadata_storage->applyNewSettings(...)`
 (`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:985`), and
 `ContentAddressedMetadataStorage` does not override that virtual — the base is an empty no-op
@@ -463,7 +463,7 @@ introduced by an edit-and-reload is not diagnosed until the next restart.
 
 Second half, lower severity and mostly generic: removing a CAS disk from `storage_configuration` and
 reloading only produces the upstream warning "disappeared from configuration, this change will be
-applied after restart of ClickHouse" (`src/Disks/DiskSelector.cpp:203-207`) — no `shutdown()` on the
+applied after restart of ClickHouse" (`src/Disks/DiskSelector.cpp:215-218`) — no `shutdown()` on the
 dropped disk. For a CAS disk this means the mount lease keeps being heartbeaten until the process
 exits, so the `server_root_id` slot cannot be taken over by another server before a restart. This is
 the same disk-registry-caches-forever class as the deferred disk-lifecycle leak
