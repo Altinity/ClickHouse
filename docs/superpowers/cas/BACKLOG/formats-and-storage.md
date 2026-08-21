@@ -19,7 +19,12 @@ backend validation, the local/emulated backend, and codec/format items.
 
 ## Backends — real-store validation, GCS, LIST consistency {#backends}
 
-- **[GATE #1: Azure] real-store GC validation on Azure** — GATE — AWS + GCS DONE (2026-07-03, live-validated). Azure not started — the last leg of the real-S3 reclaim release gate.
+- **[GATE #1: Azure] real-store GC validation on Azure** — GATE — AWS + GCS DONE (2026-07-03,
+  live-validated). Azure not started — the last leg of the real-S3 reclaim release gate. Before
+  implementing Azure CAS, decide whether to introduce the provider-neutral conditional-operations
+  layer described in the [draft proposal](/superpowers/specs/cas-object-storage-conditional-operations-proposal).
+  The refactor is justified primarily if Azure is the next concrete backend; it must follow completion
+  of the current GCS Task 9 gate.
 - **[GCS production-grade follow-ups]** — DESIRABLE — Compose-based conditional finalize for blobs above `gcs_max_conditional_put_bytes` (multipart silently ignores the precondition on GCS → currently throws `NOT_IMPLEMENTED`); `gcp_oauth` dialect probe validation against live GCS (ADC creds); generation-aware LIST discovery (GC re-reads every shard on GCS since list tokens are disabled — cost only); signed `x-goog-*` `extra_headers` on `gcs_hmac` (currently unsigned).
 - **[LIST consistency on real S3] token-diff discovery under eventual consistency** — {#list-consistency-real-s3} — TEST/GATE — S3's LIST may not reflect a just-PUT key; code handles it conservatively but needs real-S3 testing. Add a LIST-consistency probe in `Cas::Probe` before LIST-derived discovery is trusted on a given store. Also load-bearing for the (moot) registry-removal LIST premise.
 - **[B196] cap `s3_max_connections` to backend permits** — HARD (cheap) — CONFIRMED still open: no CA code caps `s3_max_connections`; prevents 503 + retry storm under high concurrency.
