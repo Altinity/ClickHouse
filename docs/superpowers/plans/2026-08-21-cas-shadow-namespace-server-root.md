@@ -1,191 +1,189 @@
-# FREEZE shadow namespace under `server_root_id` — Implementation Plan
+---
+description: 'Implementation plan for scoping a content-addressed FREEZE snapshot to the server root that created it'
+sidebar_label: 'CAS shadow namespace server root'
+sidebar_position: 1
+slug: /superpowers/plans/cas-shadow-namespace-server-root
+title: 'FREEZE shadow namespace under server_root_id — implementation plan'
+doc_type: 'guide'
+---
+
+# FREEZE shadow namespace under `server_root_id` — Implementation Plan {#cas-shadow-namespace-plan}
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make a `FREEZE` snapshot on a content-addressed disk private to the server root that created it, so `UNFREEZE` on one replica can no longer destroy another replica's backup.
 
-**Architecture:** `shadowNamespace` gains the `serverPrefix()` prefix, exactly as `liveNamespace` already does, so a frozen part's pool namespace becomes `<server_root_id>/shadow/<backup>/...`. The disk path stays `shadow/...`; only the pool-namespace derivation changes. Because mirrored object keys are built as `<pool>/roots/<namespace path>`, prefixing the namespace moves its mirrored files with it — so the write side needs no change and every *read* scope that enumerates the shadow subtree needs the same prefix.
+**Architecture:** `shadowNamespace` gains the `serverPrefix()` prefix, exactly as `liveNamespace` already does, so a frozen part's pool namespace becomes `<server_root_id>/shadow/<backup>/...`. The disk path stays `shadow/...`; only the pool-namespace derivation changes. Because a mirrored object key is built as `<pool>/roots/<namespace path>`, prefixing the namespace moves its mirrored files with it — the write side needs no change, and every *read* scope that enumerates the shadow subtree needs the same prefix.
 
-**Tech Stack:** C++ (ClickHouse fork), stateless `.sh` tests, `clickhouse-local` for output shaping.
+**Tech Stack:** C++ (ClickHouse fork), stateless `.sh` tests, `clickhouse-local` for output shaping, gtest.
 
-**Spec:** `docs/superpowers/cas/BACKLOG.md` `{#issue-2212-shadow-namespace}` (corrected in commit `6309169135f`). Read it first: it is the authority, it enumerates all six sites, and it explains why one of them is a silent-leak risk.
+**Spec:** `docs/superpowers/cas/BACKLOG.md` `{#issue-2212-shadow-namespace}` (corrected in commit `6309169135f`). Read it first: it is the authority, it enumerates the six production sites, and it explains why one of them is a silent-leak risk.
 
-## Global Constraints
+## Global Constraints {#global-constraints}
 
 - Branch `cas-gc-rebuild`. No rebase, no amend — add new commits.
 - **Pre-release no-compat policy: no migration, no alias, no fallback for the old namespace layout.** Existing shadow data under the unprefixed namespace is not read, not moved, not detected.
 - The disk path `shadow/...` does not change. `Cas::PartPathParser` and `ContentAddressedMetadataStorage::route` parse the disk path and must not be touched.
-- No `LOGICAL_ERROR` anywhere in this work. Nothing here is input-reachable failure territory; this change adds no new failure mode.
+- No `LOGICAL_ERROR` anywhere in this work. This change adds no new failure mode.
 - Allman braces (opening brace on its own line) — enforced by the style check.
 - Comments must not cite this plan, the BACKLOG, a task number, or an issue number. Keep the reason, drop the provenance.
-- **The controller owns builds, test runs and commits.** Do not run `ninja`, do not run `clickhouse-test`, do not run `python3 -m ci.praktika`, do not commit. Report when the tree is ready.
+- **The controller owns builds, test runs and commits.** Do not run `ninja`, `clickhouse-test`, or `python3 -m ci.praktika`; do not commit. Report when the tree is ready.
 - This checkout is shared and has foreign uncommitted files. Never `git add -A`, `git add .`, or `git commit -a`; do not stage anything.
 
 ---
 
-### Task 1: Pin the bug with a failing two-root isolation test
+## Task 1: Pin the cross-root destruction with a failing test {#task-1}
 
 **Files:**
-- Create: `tests/queries/0_stateless/05011_cas_freeze_two_roots.sh`
-- Create: `tests/queries/0_stateless/05011_cas_freeze_two_roots.reference`
+- Modify: `tests/queries/0_stateless/05024_cas_freeze_two_roots.sh` (already created by `add-test`, currently a stub)
+- Modify: `tests/queries/0_stateless/05024_cas_freeze_two_roots.reference` (created empty by `add-test`)
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: the test that Task 2 must turn green. Its name and path are fixed here so Task 2 can run it.
+- Produces: the test Task 2 must turn green. The number `05024` was assigned by `./tests/queries/0_stateless/add-test cas_freeze_two_roots.sh`; do not renumber it, and do not `chmod` — `add-test` already did both.
 
-The test expresses the issue on ONE server, which is what a stateless test gives us. `SYSTEM UNFREEZE WITH NAME` is server-wide and would legitimately release both roots' freezes, so it cannot express "a foreign unfreeze"; the table-scoped form can:
+### Why the obvious test does not work {#task-1-why-not-obvious}
 
-```sql
-ALTER TABLE tbl UNFREEZE PARTITION p WITH NAME 'backup'
-```
+Two ordinary tables on two disks do **not** collide. `FREEZE` builds the snapshot path as `shadow/<backup>/<relative_data_path>` (`MergeTreeData.cpp`, the freeze callback), and in an Atomic database `relative_data_path` embeds the table UUID. Two tables have two UUIDs, so their shadow namespaces differ *before* any fix and an unfreeze of one could never have touched the other. A test built that way passes on broken code and proves nothing.
 
-Two CAS disks share one pool (same `path`), differing only in `server_root_id`. That is the stateless stand-in for two replicas on one pool.
+The collision needs **one `relative_data_path` reachable from two server roots**. On a single server that means reusing one explicit table UUID sequentially: create on disk A, freeze, drop, then create with the *same* UUID on disk B. Both freezes then derive the identical shadow path, which is exactly the two-replicas-one-table shape from the issue.
 
-Three assertions, and the third is the one that looks redundant and is not:
+Explicit UUIDs are available in stateless tests — `02990_rmt_replica_path_uuid.sql` uses `CREATE TABLE x UUID '...'`.
 
-1. Root B's table unfreezing its own freeze must NOT release root A's freeze under the same backup name.
-2. `DROP TABLE` on B plus a GC round must leave A's freeze intact.
-3. Each root's own unfreeze still finds and removes its own freeze. Without this, the test stays green under a change that makes unfreeze find nothing at all.
+Two further traps this test avoids:
+
+- `ALTER … UNFREEZE` returns rows only under `alter_partition_verbose_result = 1`. The setting defaults to `false` and `MergeTreeData` returns an empty result without it, so any reference file expecting rows without the setting is unreachable.
+- The `PARTITION` clause is omitted deliberately. `UNFREEZE WITH NAME` alone removes the backup of all partitions, so the statement does not have to resolve a partition expression against a table whose live data was dropped.
 
 - [ ] **Step 1: Write the failing test**
 
-Create `tests/queries/0_stateless/05011_cas_freeze_two_roots.sh`:
+Replace the body of `tests/queries/0_stateless/05024_cas_freeze_two_roots.sh` (keep the `add-test` header lines it generated):
 
 ```bash
 #!/usr/bin/env bash
 # Tags: no-fasttest
 # ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# A FREEZE snapshot on a content-addressed disk belongs to the server root that made it. Two server
-# roots sharing one pool is how two replicas of one table look from the pool's side, and UNFREEZE is a
-# local, destructive statement: releasing one root's freeze must not touch the other's.
+# A FREEZE snapshot on a content-addressed disk belongs to the server root that made it. UNFREEZE is
+# local and destructive, so releasing one root's freeze must not touch another root's.
 #
-# Both freezes deliberately use the SAME backup name, because that is the case that collides: the
-# pool namespace used to be derived from the shadow path alone, so both roots wrote the same
-# namespace and either one's unfreeze released it for both.
+# Two server roots sharing one pool is how two replicas of one table look from the pool's side. The
+# collision needs ONE table path reachable from both roots, and the shadow path embeds the table UUID
+# in an Atomic database -- so the UUID is reused sequentially rather than creating two tables, which
+# would have two UUIDs, two namespaces, and no collision to test.
 
-CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
-. "$CURDIR"/../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
 
+TABLE_UUID='05024aaa-0000-4000-8000-000000000001'
+BACKUP='shared_05024'
 UNFREEZE_STRUCTURE='command_type String, partition_id String, part_name String, backup_name String, backup_path String, part_backup_path String'
 
-# Filter UNFREEZE output to the deterministic columns: backup_path and part_backup_path are absolute.
-unfreeze_rows() {
-    ${CLICKHOUSE_LOCAL} --structure "$UNFREEZE_STRUCTURE" \
-        --query "SELECT command_type, partition_id, backup_name FROM table ORDER BY partition_id FORMAT TSVWithNames"
+# `ALTER ... UNFREEZE` returns rows only under alter_partition_verbose_result=1; the default is off.
+# backup_path and part_backup_path are absolute, so only the stable columns are printed.
+unfreeze_and_print() {
+    ${CLICKHOUSE_CLIENT} --query "ALTER TABLE $1 UNFREEZE WITH NAME '${BACKUP}' SETTINGS alter_partition_verbose_result = 1;" \
+        | ${CLICKHOUSE_LOCAL} --structure "$UNFREEZE_STRUCTURE" \
+            --query "SELECT command_type, partition_id, backup_name FROM table ORDER BY partition_id FORMAT TSVWithNames"
 }
 
-${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_root_a;"
-${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_root_b;"
+create_on_root() {
+    # $1 = table name, $2 = server_root_id, $3 = disk name. One pool, two roots.
+    ${CLICKHOUSE_CLIENT} --query "
+    CREATE TABLE $1 UUID '${TABLE_UUID}' (k UInt32, v String)
+    ENGINE = MergeTree ORDER BY k PARTITION BY k
+    SETTINGS disk = disk(
+        type = object_storage,
+        object_storage_type = local,
+        metadata_type = cas,
+        server_root_id = '$2',
+        name = '$3',
+        path = '05024_cas_freeze_pool/');"
+}
 
-# Two disks, ONE pool (same path), two server roots.
-${CLICKHOUSE_CLIENT} --query "
-CREATE TABLE t_cas_freeze_root_a (k UInt32, v String)
-ENGINE = MergeTree ORDER BY k PARTITION BY k
-SETTINGS disk = disk(
-    type = object_storage,
-    object_storage_type = local,
-    metadata_type = cas,
-    server_root_id = '05011_root_a',
-    name = '05011_cas_freeze_a',
-    path = '05011_cas_freeze_pool/');"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_a;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_freeze_b;"
 
-${CLICKHOUSE_CLIENT} --query "
-CREATE TABLE t_cas_freeze_root_b (k UInt32, v String)
-ENGINE = MergeTree ORDER BY k PARTITION BY k
-SETTINGS disk = disk(
-    type = object_storage,
-    object_storage_type = local,
-    metadata_type = cas,
-    server_root_id = '05011_root_b',
-    name = '05011_cas_freeze_b',
-    path = '05011_cas_freeze_pool/');"
+# Root A freezes, then releases the UUID. Its freeze must outlive the table -- an independent GC root.
+create_on_root t_cas_freeze_a 05024_root_a 05024_cas_freeze_a
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_freeze_a VALUES (1, 'a');"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_a FREEZE PARTITION 1 WITH NAME '${BACKUP}';"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_a;"
 
-${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_freeze_root_a VALUES (1, 'a');"
-${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_freeze_root_b VALUES (1, 'b');"
+# Root B, SAME table UUID and SAME backup name: identical shadow path, so the pre-fix namespace
+# derivation gives both roots one pool namespace.
+create_on_root t_cas_freeze_b 05024_root_b 05024_cas_freeze_b
+${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_freeze_b VALUES (1, 'b');"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_b FREEZE PARTITION 1 WITH NAME '${BACKUP}';"
 
-# Same backup name from both roots: the colliding case.
-${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_root_a FREEZE PARTITION 1 WITH NAME 'shared_05011';"
-${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_root_b FREEZE PARTITION 1 WITH NAME 'shared_05011';"
-
-${CLICKHOUSE_CLIENT} --query "SELECT 'frozen_a', count() FROM system.parts
-WHERE database = currentDatabase() AND table = 't_cas_freeze_root_a' AND is_frozen AND active;"
-${CLICKHOUSE_CLIENT} --query "SELECT 'frozen_b', count() FROM system.parts
-WHERE database = currentDatabase() AND table = 't_cas_freeze_root_b' AND is_frozen AND active;"
-
-# (1) B releases its own freeze. A's must be untouched.
+# (1) B releases its OWN freeze. This must succeed -- it is also the self-release half: a change that
+# made unfreeze search the wrong subtree would print nothing here.
 echo 'unfreeze_b'
-${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_root_b UNFREEZE PARTITION 1 WITH NAME 'shared_05011';" | unfreeze_rows
+unfreeze_and_print t_cas_freeze_b
 
-# (2) Drop B's table and run a GC round: A's freeze must survive both.
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_root_b;"
-${CLICKHOUSE_CLIENT} --query "SYSTEM CAS COLLECT GARBAGE ON DISK '05011_cas_freeze_a';"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_b;"
+${CLICKHOUSE_CLIENT} --query "SYSTEM CAS COLLECT GARBAGE ON DISK '05024_cas_freeze_a';"
 
-# (3) A's own unfreeze still finds and removes A's freeze. This is the assertion that fails if the
-# fix makes unfreeze search the wrong subtree and find nothing: without it, a total leak reads as a
-# clean pass, because "A's freeze was not destroyed" is also true when nothing can ever release it.
+# (2) A's freeze must still be there. Recreate A's table on root A with the same UUID -- the freeze is
+# addressed by path, so the recreated table reaches its predecessor's snapshot -- and release it.
+# Pre-fix this prints nothing, because B's unfreeze above already dropped the shared namespace.
+create_on_root t_cas_freeze_a 05024_root_a 05024_cas_freeze_a
 echo 'unfreeze_a'
-${CLICKHOUSE_CLIENT} --query "ALTER TABLE t_cas_freeze_root_a UNFREEZE PARTITION 1 WITH NAME 'shared_05011';" | unfreeze_rows
+unfreeze_and_print t_cas_freeze_a
 
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_root_a;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_freeze_a;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
 ```
 
-Create `tests/queries/0_stateless/05011_cas_freeze_two_roots.reference`:
+Write `tests/queries/0_stateless/05024_cas_freeze_two_roots.reference`:
 
 ```
-frozen_a	1
-frozen_b	1
 unfreeze_b
 command_type	partition_id	backup_name
-UNFREEZE PARTITION	1	shared_05011
+UNFREEZE PARTITION	1	shared_05024
 unfreeze_a
 command_type	partition_id	backup_name
-UNFREEZE PARTITION	1	shared_05011
+UNFREEZE PARTITION	1	shared_05024
 dropped_ok
 ```
 
-- [ ] **Step 2: Make the test executable**
+- [ ] **Step 2: Report for a run and state the expected failure precisely**
+
+Expected on today's code: the `unfreeze_b` block prints its row, and the `unfreeze_a` block prints **only the header** — B's unfreeze already dropped the namespace A's freeze shared. The single production line responsible is `ContentAddressedMetadataStorage::shadowNamespace`, which derives the namespace from the shadow path alone with no server-root prefix.
+
+**Do not proceed to Task 2 until the controller confirms it fails that way.** Three failure modes mean a broken test rather than a pinned bug, and each needs fixing here rather than in production: `command_type` printing something other than `UNFREEZE PARTITION`; `SYSTEM CAS COLLECT GARBAGE ON DISK` rejecting that disk name; or the recreated table failing because the UUID or the inline disk is still held.
+
+- [ ] **Step 3: Commit (controller only, after the failing run is confirmed)**
 
 ```bash
-chmod +x tests/queries/0_stateless/05011_cas_freeze_two_roots.sh
-```
-
-- [ ] **Step 3: Report for a run, and state the expected failure precisely**
-
-Report to the controller. Expected on today's code: the `unfreeze_a` block comes back EMPTY (only the header, or nothing), because B's unfreeze already dropped the shared pool namespace that A's freeze also used. The single line of production code responsible is `ContentAddressedMetadataStorage::shadowNamespace`, which derives the namespace from the shadow path alone with no server-root prefix.
-
-**Do not proceed to Task 2 until the controller confirms the test fails for that reason.** A test that fails for a different reason — the disk name in `SYSTEM CAS COLLECT GARBAGE` being wrong, `ALTER … UNFREEZE` not accepting this spelling, the pool refusing two roots — is a broken test, not a pinned bug, and fixing production against it proves nothing.
-
-- [ ] **Step 4: Commit (controller only, after the failing run is confirmed)**
-
-```bash
-git add tests/queries/0_stateless/05011_cas_freeze_two_roots.sh \
-        tests/queries/0_stateless/05011_cas_freeze_two_roots.reference
+git add tests/queries/0_stateless/05024_cas_freeze_two_roots.sh \
+        tests/queries/0_stateless/05024_cas_freeze_two_roots.reference
 git commit -m 'Pin the cross-root FREEZE destruction on a content-addressed disk'
 ```
 
 ---
 
-### Task 2: Prefix the shadow namespace and every scope that enumerates it
+## Task 2: Prefix the shadow namespace, every scope, and every caller {#task-2}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h` (the `shadowNamespace` declaration; add the scope helper)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp` (the derivation; two enumeration scopes)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp` (two call sites; one enumeration scope)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp`
+- Modify: `src/Disks/tests/gtest_ca_wiring.cpp` (two static call sites)
+- Modify: `src/Disks/tests/gtest_cas_confirm_exact_ref.cpp` (an ownership expectation that changes meaning)
 
 **Interfaces:**
 - Consumes: the test from Task 1.
 - Produces:
   - `Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir) const` — no longer `static`.
-  - `std::string ContentAddressedMetadataStorage::shadowScope(const std::string & path) const` — the server-root-scoped enumeration prefix for a shadow directory, ending in `/`.
+  - `std::string ContentAddressedMetadataStorage::shadowScope(const std::string & path) const` — the server-root-scoped enumeration prefix for a shadow directory, always ending in `/`.
 
-All six sites change together. The `static` drop breaks compilation at the two call sites, which is deliberate: it makes the compiler enumerate them rather than trusting a grep.
+Everything here lands together. The `static` drop breaks compilation at four call sites — two in production, two in gtests — which is the point: the compiler enumerates them, where a grep scoped to the production tree missed the test ones.
 
 - [ ] **Step 1: Change the derivation and add the scope helper**
 
-In `ContentAddressedMetadataStorage.h`, replace the `shadowNamespace` declaration:
+In `ContentAddressedMetadataStorage.h`, replace the `shadowNamespace` declaration with:
 
 ```cpp
     /// Canonicalizes a literal shadow-table directory into the pool namespace used by freeze and
@@ -193,18 +191,18 @@ In `ContentAddressedMetadataStorage.h`, replace the `shadowNamespace` declaratio
     /// trailing slash is ignored.
     ///
     /// A freeze belongs to the server root that made it. UNFREEZE is local and destructive, so a
-    /// pool-global namespace let one replica's unfreeze release another's backup and the blobs then
-    /// went with the next collection round. Cross-replica READABILITY of a freeze goes away with it;
-    /// shared access to a backup belongs to the BACKUP machinery, not to UNFREEZE.
+    /// pool-global namespace let one replica's unfreeze release another's backup, and the blobs went
+    /// with the next collection round. Cross-replica READABILITY of a freeze goes away with it; shared
+    /// access to a backup belongs to the BACKUP machinery, not to UNFREEZE.
     Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir) const;
 
     /// The namespace-enumeration prefix for a shadow directory: the same server-root scoping
     /// `shadowNamespace` applies, for callers that enumerate a subtree instead of naming one
-    /// namespace. Always ends in '/'. `path` empty means the disk root's whole shadow subtree.
+    /// namespace. Always ends in '/'. An empty `path` means the disk root's whole shadow subtree.
     ///
-    /// One helper on purpose: three callers need this prefix, and a shadow namespace that is
-    /// enumerated with a differently-built prefix is invisible — which for the unfreeze path means it
-    /// silently stops releasing anything.
+    /// One helper on purpose: three callers need this prefix, and a shadow namespace enumerated with a
+    /// differently-built prefix is invisible — which on the unfreeze path means it silently stops
+    /// releasing anything.
     std::string shadowScope(const std::string & path) const;
 ```
 
@@ -214,8 +212,8 @@ In `ContentAddressedMetadataStorage.cpp`, replace the body:
 Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir) const
 {
     /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>) is
-    /// bijective with the disk path for both layouts; the disk path itself is unchanged by the server
-    /// root prefix. Canonicalize because the unfreezer can hand the directory a trailing slash.
+    /// bijective with the disk path for both layouts, and the disk path itself is unchanged by this
+    /// prefix. Canonicalize because the unfreezer can hand the directory a trailing slash.
     return Cas::RootNamespace{serverPrefix() + "/" + canonicalDiskPath(shadow_table_dir)};
 }
 
@@ -226,7 +224,7 @@ std::string ContentAddressedMetadataStorage::shadowScope(const std::string & pat
 }
 ```
 
-- [ ] **Step 2: Point the two enumeration scopes in the metadata storage at the helper**
+- [ ] **Step 2: Point both metadata-storage enumeration scopes at the helper**
 
 At the intermediate-shadow-dir existence probe, replace:
 
@@ -258,21 +256,19 @@ with:
             for (const auto & child : store()->listMirroredChildren(shadowScope(path)))
 ```
 
-This one needs the prefix for the same reason as the namespace scope even though it queries the mirrored tree rather than the catalog: a mirrored object key is built as `<pool>/roots/<namespace path>`, so moving the namespace moves its mirrored files with it.
+The second needs the prefix for the same reason as the first even though it queries the mirrored tree rather than the catalog: a mirrored object key is built as `<pool>/roots/<namespace path>`, so moving the namespace moves its mirrored files with it.
 
-- [ ] **Step 3: Fix the two call sites and the bulk-drop scope in the transaction**
+- [ ] **Step 3: Fix the two production call sites and the bulk-drop scope**
 
-The two calls become member calls through the storage reference the transaction already holds:
+In `ContentAddressedTransaction.cpp`, the two calls become member calls through the storage reference the transaction already holds — change only the namespace expression, not the surrounding statements:
 
 ```cpp
             const auto ns = metadata_storage.shadowNamespace(p->shadow_table_dir);
 ```
 
 ```cpp
-            metadata_storage.dropNamespace(metadata_storage.shadowNamespace(path));
+            metadata_storage.partAccess()->dropNamespace(metadata_storage.shadowNamespace(path));
 ```
-
-For the second, keep the existing call shape and change only the namespace expression — the surrounding statement is `metadata_storage.partAccess()->dropNamespace(...)`; do not restructure it.
 
 Then the bulk drop behind `UNFREEZE WITH NAME`. Replace:
 
@@ -287,79 +283,134 @@ with:
             = metadata_storage.store()->listNamespaces(metadata_storage.shadowScope(prefix));
 ```
 
-**This is the site the original adjudication missed, and the one worth checking twice.** Prefix the derivation without prefixing this, and `UNFREEZE WITH NAME` enumerates the unprefixed subtree, finds nothing, and stops releasing its own freeze — the cross-replica destruction is gone and every frozen ref leaks forever instead. The `prefix` local here is already stripped of trailing slashes, and `shadowScope` canonicalizes anyway, so passing it directly is correct; do not append a slash.
+**This is the site the original adjudication missed, and the one worth checking twice.** Prefix the derivation without prefixing this, and `UNFREEZE WITH NAME` enumerates the unprefixed subtree, finds nothing, and stops releasing its own freeze — cross-replica destruction traded for a permanent leak of every frozen ref. The `prefix` local is already stripped of trailing slashes and `shadowScope` canonicalizes anyway, so pass it directly; do not append a slash.
 
-- [ ] **Step 4: Report for a build and a run**
+- [ ] **Step 4: Fix the two gtest call sites**
 
-Report to the controller with the list of sites touched. Expected:
+`gtest_ca_wiring.cpp` calls the derivation statically in two tests. Both become member calls on the storage the test already has:
 
-- `tests/queries/0_stateless/05011_cas_freeze_two_roots.sh` — PASSES.
-- `tests/queries/0_stateless/05003_cas_freeze.sh` — STILL PASSES. This one is the leak guard: it asserts that `UNFREEZE WITH NAME` finds and removes its own snapshot on a single root, so if Step 3's bulk-drop scope were missed, 05003 fails.
-- The full `CAS*:Cas*:CA*` gate — unchanged.
+```cpp
+    publishWiredPart(*storage, storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+```
 
-State plainly which of these you verified by reading and which only the run can settle. You cannot run any of them.
+While there, assert the prefix rather than leaving it implied. In whichever of the two tests reads back the namespace, add:
 
-- [ ] **Step 5: Commit (controller only, after a green run)**
+```cpp
+    EXPECT_EQ(storage->shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111").value,
+              std::string(storage->serverRootIdForTest()) + "/shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
+```
+
+If no such accessor exists, use the literal `server_root_id` the fixture configures rather than adding a new seam; report which you did and why.
+
+- [ ] **Step 5: Update the ownership expectation that changes meaning**
+
+`gtest_cas_confirm_exact_ref.cpp` asserts that a shadow namespace is owned by nobody:
+
+```cpp
+        EXPECT_FALSE(storage->ownsNamespace("srv1", "shadow/backup/store/abc/abcdef")) << phase;
+```
+
+Keep it — an *unprefixed* shadow path is still owned by nobody, and after this change nothing writes one. Add the case that now exists, because "shadow is ordinarily owned" is the behavioural consequence of the fix and nothing else asserts it:
+
+```cpp
+        /// A prefixed shadow namespace is ordinary owned content: the freeze belongs to the root
+        /// that made it, so relink routing treats it exactly like a live namespace.
+        EXPECT_TRUE(storage->ownsNamespace("srv1", "srv1/shadow/backup/store/abc/abcdef")) << phase;
+        EXPECT_FALSE(storage->ownsNamespace("srv10", "srv1/shadow/backup/store/abc/abcdef")) << phase;
+```
+
+Update the comment above the kept assertion so it no longer calls the FREEZE tree pool-global.
+
+- [ ] **Step 6: Report for a build and a run**
+
+Report the sites touched, and say which claims you verified by reading versus which only a run can settle. Expected:
+
+- `05024_cas_freeze_two_roots.sh` — PASSES.
+- `05003_cas_freeze.sh` — STILL PASSES. It is the leak guard: it asserts `UNFREEZE WITH NAME` finds and removes its own snapshot on a single root, so a missed Step 3 fails it.
+- `CASWiringRead*`, `CASWiringOps*`, `CASConfirmExactRef*` — pass with the updated expectations.
+- The full `CAS*:Cas*:CA*` gate — otherwise unchanged.
+
+- [ ] **Step 7: Commit (controller only, after a green run)**
 
 ```bash
 git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h \
         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp \
+        src/Disks/tests/gtest_ca_wiring.cpp \
+        src/Disks/tests/gtest_cas_confirm_exact_ref.cpp
 git commit -m 'Scope a content-addressed FREEZE snapshot to the server root that made it'
 ```
 
 ---
 
-### Task 3: Retire the shadow-is-a-separate-root concept from the prose
+## Task 3: Retire the pool-global shadow model from the prose {#task-3}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp` (the lifecycle grouping comment listing `shadowNamespace` among pure computations)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h` (the namespace-mapping table; the `FREEZE shadow` row)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp` (the `ownsNamespace` contract clause; the lifecycle grouping list)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h` (the `listMirroredChildren` contract)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h` (the namespace example)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h` (the namespace example)
+- Modify: `src/Disks/tests/gtest_ca_wiring.cpp` (a comment calling the shadow publish pool-global)
 
 **Interfaces:**
 - Consumes: Task 2's landed change.
 - Produces: nothing later tasks depend on.
 
-Task 2 does not merely move a prefix; it removes a special case. Shadow used to be a second relative root alongside the server root, and now it is ordinary server-relative content. Two comments still describe the old model, and one of them is an API contract.
+Task 2 removes a special case rather than moving a prefix: shadow used to be a second relative root beside the server root, and becomes ordinary server-relative content. Six places still describe the old model, and two of them are contracts rather than asides.
 
-- [ ] **Step 1: Correct the `listMirroredChildren` contract**
+- [ ] **Step 1: Correct the two contracts**
 
-It currently says `prefix` is "a server-relative or shadow-relative path ending in '/'". Shadow is no longer a separate relative root, so replace that clause with: `prefix` is a server-relative path ending in `/`. Say nothing about shadow — that is the point: it needs no mention because it is no longer special.
+`CasPool.h`'s `listMirroredChildren` says `prefix` is "a server-relative or shadow-relative path ending in '/'". Shadow is no longer a separate relative root: say `prefix` is a server-relative path ending in `/`, and say nothing about shadow — needing no mention is the point.
 
-- [ ] **Step 2: Keep the lifecycle grouping comment true**
+`ownsNamespace`'s comment says the predicate "deliberately does not match a pool-global shadow" tree. That clause is now wrong in its reason: a shadow namespace IS matched, because it is rooted at a server root like everything else. Replace it with the current truth — ownership is exactly "rooted at MY server root", and the freeze tree is no exception.
 
-The grouping comment lists `serverPrefix/liveNamespace/shadowNamespace/route/classifyDirectory` as "pure path computation, no pool I/O". That stays TRUE after Task 2 — `serverPrefix()` returns a member set in the constructor and does no pool I/O — so the only change needed is to add `shadowScope` to the same list, beside `shadowNamespace`. Do not weaken the "no pool I/O" claim; verify it rather than assuming, by checking that `serverPrefix()` still just returns the member.
+- [ ] **Step 2: Correct the namespace map and the two examples**
 
-- [ ] **Step 3: Report for a build**
+The mapping table's `FREEZE shadow` row still reads "the LITERAL shadow table dir" and says the tree enumerates from `Pool::listNamespaces("shadow/...")`. Make it `SERVER_ID/shadow/BACKUP/...` with the same `ref = PART_DIR`, and say the enumeration is server-root-scoped.
 
-Comment-only changes cannot alter behaviour, but they are in a `.cpp` and a `.h`, so the controller rebuilds and re-runs the `CAS*:Cas*:CA*` gate to confirm the tree is still green. Say explicitly in your report that you changed no code.
+`CasTypes.h` and `CasLayout.h` each carry an example string of the form `"shadow/<backup>/<table_uuid>"` beside a `"srv1/<table_uuid>"` one. Update the shadow example to `"srv1/shadow/<backup>/<table_uuid>"` so the two examples stop implying two different rooting schemes.
 
-- [ ] **Step 4: Commit (controller only)**
+- [ ] **Step 3: Correct the remaining comments**
+
+Add `shadowScope` to the lifecycle grouping list beside `shadowNamespace`. That list claims "pure path computation, no pool I/O", which stays true — `serverPrefix()` returns a member set in the constructor — so verify that rather than weakening the claim.
+
+In `gtest_ca_wiring.cpp`, the comment "the staged shadow part publishes at commit (pool-global - any replica reads the backup)" is now false in both halves. State what is true: the staged shadow part publishes at commit under this server root.
+
+- [ ] **Step 4: Report for a build**
+
+These are comment-only changes, but they sit in `.cpp`/`.h` files, so the controller rebuilds and re-runs the `CAS*:Cas*:CA*` gate. Say explicitly in your report that you changed no code — and if you found yourself needing to change code to make a comment true, stop and say so instead.
+
+- [ ] **Step 5: Commit (controller only)**
 
 ```bash
-git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
-        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h \
+        src/Disks/tests/gtest_ca_wiring.cpp
 git commit -m 'Shadow content is ordinary server-relative content now'
 ```
 
 ---
 
-## Optional simplification, only if Task 2 landed clean {#optional-simplification}
+## Optional simplification, only after Task 2 lands clean {#optional-simplification}
 
-Not part of the fix. Offer it to the controller as a separate decision; do not fold it into Task 2.
+Not part of the fix. A separate decision for the controller; do not fold it into Task 2.
 
-After Task 2, `liveNamespace` and `shadowNamespace` have the same shape — `serverPrefix() + "/" + <a mirrored path>` — differing only in how the path is derived. A single `serverScoped(path)` helper used by both would make "everything this server owns is rooted at its own id" explicit in code instead of by convention repeated twice, and would give the next namespace kind one obvious place to hook into.
+After Task 2, `liveNamespace` and `shadowNamespace` have the same shape — `serverPrefix() + "/" + <a mirrored path>` — differing only in how the path is derived. A single `serverScoped(path)` helper used by both would make "everything this server owns is rooted at its own id" explicit in code instead of by convention repeated twice, and give the next namespace kind one obvious place to hook into.
 
-The argument against is equally real: two callers is a thin basis for an abstraction, and the two derivations are not otherwise related. Take it only if the controller judges the invariant worth naming.
+Against it: two callers is a thin basis for an abstraction, and the derivations are otherwise unrelated. Take it only if the invariant is judged worth naming.
 
----
+## Self-review {#self-review}
 
-## Self-review
+**Spec coverage.** The spec's six production sites map to Task 2 Steps 1-3. Spec items (3) parser/route untouched and (4) no migration are Global Constraints. Item (5) the test is Task 1, including the third assertion the spec calls non-redundant — here it is the `unfreeze_b` block, which is both the foreign-unfreeze setup and the self-release proof. Item (6) nothing asserts cross-replica visibility is why Task 3 deletes the concept instead of preserving it.
 
-**Spec coverage.** The spec's six sites map to Task 2 Steps 1-3: the derivation (Step 1), the two metadata-storage enumeration scopes (Step 2), the two transaction call sites and the bulk-drop scope (Step 3). Spec item (3) — parser and `route` untouched — is a Global Constraint. Item (4), no migration, is a Global Constraint. Item (5), the test, is Task 1, including the third assertion the spec calls out as non-redundant. Item (6), that nothing asserts cross-replica visibility, needs no task; it is why Task 3 can delete the concept rather than preserve it.
+**Beyond the spec.** The spec's site list covered production only. Task 2 Steps 4-5 add two test files the `static` drop breaks or invalidates, and Task 3 adds four prose sites the spec did not enumerate. The spec should be treated as complete for production and incomplete for tests and prose.
 
-**Placeholders.** None. Every code step carries the actual before/after text; the test and its reference file are given in full.
+**Placeholders.** None. Every code step carries actual before/after text; the test and its reference are given in full.
 
-**Type consistency.** `shadowNamespace` is declared and used as a const member returning `Cas::RootNamespace` in both files that call it. `shadowScope` is declared and used as a const member returning `std::string` at all three enumeration sites. The transaction reaches both through `metadata_storage`, which it holds as `ContentAddressedMetadataStorage &`.
+**Type consistency.** `shadowNamespace` is a const member returning `Cas::RootNamespace`, used that way in both production callers and both gtests. `shadowScope` is a const member returning `std::string`, used at all three enumeration sites. The transaction reaches both through `metadata_storage`, held as `ContentAddressedMetadataStorage &`.
 
-**One risk the plan cannot remove.** Task 1's reference file predicts the exact `UNFREEZE PARTITION` output shape. If the real `command_type` string differs from `UNFREEZE PARTITION`, the reference is wrong and the first run will say so — that is a reference fix, not a production finding, and it must not be treated as one.
+**Risks this plan cannot remove.** Task 1's reference predicts the exact `command_type` string and relies on an inline disk plus a table UUID being reusable after `DROP TABLE`. If any of those is wrong the first run says so, and each is a test fix rather than a production finding — Step 2 names all three so they are not mistaken for one. Task 2 Step 4's prefix assertion depends on an accessor for the configured `server_root_id` existing in that fixture; if it does not, the literal is the fallback and no new seam should be added for it.
