@@ -40,10 +40,10 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_)
+ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t token_producing_single_put_cap_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
-    , conditional_single_put_cap(conditional_single_put_cap_)
+    , token_producing_single_put_cap(token_producing_single_put_cap_)
     , emu_root(object_storage->getCommonKeyPrefix())
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
@@ -210,21 +210,11 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
     if (finalizeConditionalWriteInstrumented(*buf) == PutOutcome::PreconditionFailed)
         return {PutOutcome::PreconditionFailed, {}};
 
-    /// Record the token of the incarnation WE just wrote (model WCreate). The S3 write returns
-    /// its object ETag in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD
-    /// is needed — this is ~73% of the CA backend's HEADs. A backend with no write-time ETag
-    /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
-    Token token;
-    if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
-        token = tokenForHead(*etag);
-    else
-    {
-        /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
-        /// the pre-existing behavior, so an empty-ETag server is never worse than before.
-        auto hr = nativeHead(key);
-        token = hr ? hr->token : Token{};
-    }
-    return {PutOutcome::Done, token};
+    /// Attribute the token of the incarnation WE just wrote (model WCreate) -- see
+    /// tokenFromWriteResult for the exact generation-vs-ETag policy. The S3 write returns its object
+    /// ETag/generation in the PutObject/CompleteMultipartUpload response, so no follow-up HEAD is
+    /// needed for most backends — this is ~73% of the CA backend's HEADs.
+    return {PutOutcome::Done, tokenFromWriteResult(key, buf->getResultObjectETag())};
 }
 
 namespace
@@ -261,20 +251,9 @@ public:
             return {PutOutcome::PreconditionFailed, {}};
         }
 
-        /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
-        /// returns its object ETag in the response, so no follow-up HEAD is needed (the bulk of
-        /// the CA backend's HEADs). Backends with no write-time ETag (local) return nullopt and
-        /// we fall back to the HEAD (a cheap local stat there).
-        Token token;
-        if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
-            token = backend.tokenForHead(*etag);
-        else
-        {
-            /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
-            auto hr = backend.head(key);
-            token = hr.exists ? hr.token : Token{};
-        }
-        return {PutOutcome::Done, token};
+        /// Attribute the token of the incarnation we just wrote (model WCreate) -- see
+        /// tokenFromWriteResult for the exact generation-vs-ETag policy.
+        return {PutOutcome::Done, backend.tokenFromWriteResult(key, write_buf->getResultObjectETag())};
     }
 
     void cancel() noexcept override
@@ -813,26 +792,36 @@ SentinelProbeResult ObjectStorageBackend::probeSentinelRaw(const String & key)
     }
 }
 
-/// Base WriteSettings for every Native conditional write. CAS-mutable keys (shard manifests,
-/// gc/state, the registry) override check_objects_after_upload to `false` (see WriteSettings.h);
-/// this was observed live against RustFS: a publish's manifest CAS raced the GC fence and the
-/// mismatch terminated the server from the upload worker.
-///
-/// On a generation-token store (GCS), a conditional write must ALSO never take the multipart path:
-/// GCS enforces no preconditions on `CompleteMultipartUpload` (measured), so a lost
-/// precondition on a multipart write would silently overwrite instead of failing. Force single-PUT
-/// and raise the single-part cap to conditional_single_put_cap (RAM-buffered) to keep the fast path
-/// available for bodies up to that size; a bigger body throws NOT_IMPLEMENTED from
-/// WriteBufferFromS3::createMultipartUpload.
-WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
+/// Settings for EVERY write whose result token enters CAS protocol state ("Write-settings
+/// decomposition"): mark the write NativeConditional so its production request wrapper is eligible
+/// for the typed GCS dialect, and on a generation-token store (GCS) ALSO force a single PUT capped at
+/// token_producing_single_put_cap. GCS enforces no precondition on `CompleteMultipartUpload`
+/// (measured), so ANY token-producing write -- conditional or not -- would silently overwrite
+/// instead of failing if it were allowed to complete via multipart; raise the single-part cap to keep
+/// the fast (RAM-buffered) path available for bodies up to that size, and let a bigger body throw
+/// NOT_IMPLEMENTED from WriteBufferFromS3::createMultipartUpload before any multipart request is
+/// issued. ETag-dialect stores are unaffected (no forcing, no cap).
+WriteSettings ObjectStorageBackend::tokenProducingWriteSettings() const
 {
     WriteSettings ws;
-    ws.s3_check_objects_after_upload_override = false;
+    ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
     if (native_token_type == TokenType::Generation)
     {
         ws.s3_force_single_part_upload = true;
-        ws.s3_single_part_upload_max_bytes_override = conditional_single_put_cap;
+        ws.s3_single_part_upload_max_bytes_override = token_producing_single_put_cap;
     }
+    return ws;
+}
+
+/// Settings for a Native COMPARE/CREATE write (create-if-absent, compare-and-set): everything
+/// tokenProducingWriteSettings sets, plus the precondition-specific retry policy. CAS-mutable keys
+/// (shard manifests, gc/state, the registry) override check_objects_after_upload to `false` (see
+/// WriteSettings.h); this was observed live against RustFS: a publish's manifest CAS raced the GC
+/// fence and the mismatch terminated the server from the upload worker.
+WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
+{
+    WriteSettings ws = tokenProducingWriteSettings();
+    ws.s3_check_objects_after_upload_override = false;
     /// Exactly one attempt at the WriteBufferFromS3 layer too: makeSinglepartUpload/
     /// completeMultipartUpload run their OWN retry loop above the S3 client, reissuing the identical
     /// (conditional!) request on NO_SUCH_KEY — a client-level override alone does not bound it. Plain
@@ -840,9 +829,55 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
     ws.s3_max_unexpected_write_error_retries_override = 1;
     /// Exactly one HTTP attempt for every conditional write: the object storage resolves the
     /// profile to its own single-attempt client. A backend that cannot honor it is rejected for
-    /// writable Native mounts by checkConditionalWriteSingleAttemptSupport (fail closed).
+    /// writable Native mounts by checkConditionalWriteSingleAttemptSupport (fail closed). An
+    /// UNCONDITIONAL token-producing write (resurrection) must NOT inherit this retry policy, which
+    /// is why it uses tokenProducingWriteSettings directly instead of this method.
     ws.object_storage_retry_profile = ObjectStorageRetryProfile::SingleAttempt;
     return ws;
+}
+
+/// See the declaration in the header for the policy. Centralizes the generation-vs-ETag attribution
+/// decision that every Native write/copy result path (nativeConditionalPut, NativeStreamingSink,
+/// resurrect, promoteStaged) used to duplicate.
+///
+/// The strict Generation-dialect check below is gated on `etag.has_value()`, not merely on
+/// `native_token_type`: `WriteBufferFromS3` unconditionally assigns `object_etag = outcome.GetResult().GetETag()`
+/// on BOTH of its success paths -- `makeSinglepartUpload` (WriteBufferFromS3.cpp) and
+/// `completeMultipartUpload` (WriteBufferFromS3.cpp) -- so a successful S3 write always leaves
+/// `getResultObjectETag()` holding a value, empty string included; `has_value()` is exactly "this was
+/// a real S3-style write response", the only case Step 7's "a missing x-goog-generation is an
+/// exception" rule is ABOUT. `S3ObjectStorage::writeObject` returns that `WriteBufferFromS3` directly,
+/// undecorated, so this holds for the whole CAS-over-S3 write path with no wrapping in between. A
+/// backend with no write-time-token concept at all (local files, or a non-S3 `IObjectStorage`
+/// exercising Generation dialect purely for a unit test, see
+/// `CASBackendGeneration.StampedTokenTypeFollowsNativeKind`) reports `nullopt` structurally, not a
+/// broken response, and keeps falling back to a fresh HEAD exactly like the ETag dialect. A future
+/// change that wraps the returned write buffer in a decorator would need to re-derive or preserve this
+/// chain -- `WriteBufferFromFileDecorator::getResultObjectETag` returns `nullopt` for a wrapped impl
+/// that is not itself a `WriteBufferFromFileBase`, which would silently turn a hard failure back into
+/// a HEAD fallback.
+Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::optional<String> & etag)
+{
+    if (native_token_type == TokenType::Generation && etag.has_value())
+    {
+        const bool valid_generation = !etag->empty()
+            && std::all_of(etag->begin(), etag->end(), [](char c) { return c >= '0' && c <= '9'; });
+        if (!valid_generation)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS on GCS: a token-producing write to {} succeeded but its response carried no "
+                "valid generation ({}) -- there is no follow-up HEAD to patch this over, so the write "
+                "cannot be attributed to an incarnation",
+                key, *etag);
+        return tokenForHead(*etag);
+    }
+
+    /// ETag dialect (and any backend with no write-time token at all, e.g. local files): unchanged
+    /// pre-existing behavior -- an absent/empty value falls back to a fresh HEAD of `key`.
+    if (etag && !etag->empty())
+        return tokenForHead(*etag);
+
+    auto hr = nativeHead(key);
+    return hr ? hr->token : Token{};
 }
 
 PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
@@ -1030,7 +1065,7 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     try
     {
         res = object_storage->copyObjectConditional(
-            StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+            StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), conditionalWriteSettings());
     }
     catch (const std::exception & e)
     {
@@ -1040,7 +1075,10 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     recordConditionalWriteOutcome(res.created ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
     if (!res.created)
         return {PutOutcome::PreconditionFailed, {}};
-    return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};
+    /// Attribute the token of the incarnation this copy just created -- see tokenFromWriteResult for
+    /// the exact generation-vs-ETag policy (a missing/non-numeric generation is now an exception here
+    /// too, rather than being forwarded blindly as before).
+    return {PutOutcome::Done, tokenFromWriteResult(blob_key, res.dest_etag)};
 }
 
 Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key,
@@ -1082,12 +1120,17 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
     /// incarnation mismatches and misses (`INV-NO-RETURN`). An `If-Match` on the condemned token would
     /// only save a redundant re-upload on a lost race, never prevent data loss.
     ///
-    /// Plain `WriteSettings` also means no forced single part: a conditional write on a
-    /// generation-token store is capped because GCS drops preconditions on multipart completion, and
-    /// this write carries none, so it may take the multipart path on every backend. The payload is
-    /// streamed from `payload` and never materialized — blob bodies have no size cap.
+    /// This write carries no precondition, but it is still routed through tokenProducingWriteSettings
+    /// rather than plain WriteSettings: it is a token-producing write ("Unconditional token-producing
+    /// write"), so on a generation-token store (GCS) it is bound by the same single-PUT cap a
+    /// CONDITIONAL write is -- GCS drops preconditions on multipart completion regardless of whether
+    /// one was ever set, so an oversized unconditional resurrect could silently multipart-overwrite
+    /// too. ETag-dialect (AWS-compatible) stores are unaffected: tokenProducingWriteSettings only
+    /// forces single-part for the Generation dialect, so resurrect may still take the multipart path
+    /// there, and the payload keeps streaming from `payload` without ever being materialized whole.
     auto out = object_storage->writeObject(
-        StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, WriteSettings{});
+        StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE,
+        tokenProducingWriteSettings());
     out->write(fresh_header.data(), fresh_header.size());
     const size_t before = out->count();
     copyData(payload, *out);
@@ -1105,14 +1148,15 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
     }
     out->finalize();
 
-    /// The plain write does not reliably surface the destination ETag across dialects, so HEAD the
-    /// fresh incarnation to learn its token.
-    const auto hr = nativeHead(blob_key);
-    if (!hr)
+    /// Attribute the token of the incarnation WE just wrote -- see tokenFromWriteResult for the exact
+    /// generation-vs-ETag policy (no follow-up HEAD on a generation store; the pre-existing
+    /// fail-closed HEAD fallback below is unchanged for dialects with no write-time token at all).
+    const Token token = tokenFromWriteResult(blob_key, out->getResultObjectETag());
+    if (token.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ObjectStorageBackend::resurrect: blob {} is absent immediately after the resurrect "
             "re-upload — failing closed", blob_key);
-    return hr->token;
+    return token;
 }
 
 ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit)

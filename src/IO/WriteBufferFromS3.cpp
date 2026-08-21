@@ -656,6 +656,12 @@ bool WriteBufferFromS3::completeMultipartUpload()
     if (!write_settings.object_storage_write_if_match.empty())
         req.SetIfMatch(write_settings.object_storage_write_if_match);
 
+    /// Defense in depth only: a conditional write on a generation-token store never reaches this
+    /// request in the first place (WriteSettings forces a single PUT below the cap, so
+    /// createMultipartUpload throws first). Marking it anyway lets Task 4's native adapter reject a
+    /// conditional CompleteMultipartUpload outright if that invariant is ever violated.
+    req.setNativeConditional(write_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional);
+
     Aws::S3::Model::CompletedMultipartUpload multipart_upload;
     for (size_t i = 0; i < multipart_tags.size(); ++i)
     {
@@ -744,6 +750,10 @@ S3::PutObjectRequest WriteBufferFromS3::getPutRequest(PartData & data)
     req.SetContentType("binary/octet-stream");
 
     client_ptr->setKMSHeaders(req);
+
+    /// The actual PUT that produces a CAS incarnation token: eligible for the typed NativeConditional
+    /// HTTP mode when the caller marked this write as such (see WriteSettings::object_storage_request_mode).
+    req.setNativeConditional(write_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional);
 
     return req;
 }

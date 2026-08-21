@@ -64,7 +64,7 @@ public:
     /// tests and local development. The generation-token store limit applies only to Native mode:
     /// generation stores must use a single PUT because their multipart completion path does not enforce
     /// the precondition.
-    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_ = 1ULL << 30);
+    ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t token_producing_single_put_cap_ = 1ULL << 30);
 
     /// Read an object or return `nullopt` if it is absent. Native mode HEADs first so the returned
     /// token identifies the incarnation whose bytes are read; a not-found race is also reported as
@@ -165,11 +165,29 @@ public:
         return observed == expected;
     }
 
-    /// Build settings shared by every Native conditional write. They skip the racy post-upload
-    /// existence/size check, force single-part uploads for generation-token stores, and select the
-    /// SingleAttempt object-storage retry profile.
+    /// Settings for EVERY write whose result token enters CAS protocol state ("Write-settings
+    /// decomposition"): always NativeConditional request mode, plus -- on a generation-token store
+    /// (GCS) only -- a forced single PUT capped at token_producing_single_put_cap (GCS enforces no
+    /// precondition on CompleteMultipartUpload, so any token-producing write, conditional or not,
+    /// would silently overwrite instead of failing if it took the multipart path). Use this directly
+    /// for an UNCONDITIONAL token-producing write (resurrection); conditionalWriteSettings layers a
+    /// precondition-specific retry policy on top of it for compare/create operations.
+    WriteSettings tokenProducingWriteSettings() const;
+    WriteSettings tokenProducingWriteSettingsForTest() const { return tokenProducingWriteSettings(); }
+    /// Settings for a Native COMPARE/CREATE write (create-if-absent, compare-and-set): everything
+    /// tokenProducingWriteSettings sets, plus exactly one attempt at every retry layer (the
+    /// SingleAttempt object-storage retry profile and WriteBufferFromS3's own unexpected-error retry
+    /// loop) and skipping the racy post-upload existence/size check.
     WriteSettings conditionalWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
+    /// Convert a successful write/copy response's incarnation-identifying string into this backend's
+    /// token -- the ONE place that decides how strictly to trust it ("Exact successful-write token").
+    /// Generation dialect (GCS): the response MUST carry a non-empty, purely numeric generation; a
+    /// missing or non-numeric value is an exception -- there is no follow-up HEAD, so a broken or
+    /// lying response can never be silently patched over by a later, unrelated read. Every other
+    /// dialect (ETag, and any backend with no write-time token at all, e.g. local files) keeps the
+    /// pre-existing behavior: an absent value falls back to a fresh HEAD of `key`.
+    Token tokenFromWriteResult(const String & key, const std::optional<String> & etag);
     /// Override the emulated backend's wall clock for deterministic expiry tests.
     void setEmuNowNsForTest(uint64_t now_ns);
     /// Return the guarded per-key token-state size for expiry tests.
@@ -179,8 +197,9 @@ private:
     const ObjectStoragePtr object_storage;
     const Mode mode;
     TokenType native_token_type = TokenType::ETag;
-    /// GCS single-PUT budget for conditional writes (generation-token stores only); see ctor.
-    const uint64_t conditional_single_put_cap;
+    /// GCS single-PUT budget for every token-producing write (generation-token stores only --
+    /// unconditional writes, such as resurrection, included; see tokenProducingWriteSettings and ctor).
+    const uint64_t token_producing_single_put_cap;
 
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could

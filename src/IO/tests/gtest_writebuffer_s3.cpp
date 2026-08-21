@@ -62,6 +62,7 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int S3_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 }
@@ -226,12 +227,24 @@ struct InjectionModel
 
 struct Client : DB::S3::Client
 {
-    explicit Client(std::shared_ptr<S3MemStrore> mock_s3_store)
+    /// `simulate_gcs_native_conditional_` fakes a GCS-dialect client purely at the config-selection
+    /// level (`http_client`), which is ALL `Client::supportsGcsNativeConditionalRequests` /
+    /// `S3ObjectStorage::conditionalOpsUseGenerationTokens` consult -- it does not enable the actual
+    /// GCS wire dialect (that stays authoritative on the real HTTP path until a later task). Just
+    /// enough for a test to drive the generation-dialect BRANCH of code that only checks that
+    /// predicate (e.g. the copy single-operation cap in `S3ObjectStorage::copyObjectConditional`).
+    explicit Client(std::shared_ptr<S3MemStrore> mock_s3_store, bool simulate_gcs_native_conditional_ = false)
         : DB::S3::Client(
             100,
             DB::S3::ServerSideEncryptionKMSConfig(),
             std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>("", ""),
-            GetClientConfiguration(),
+            [simulate_gcs_native_conditional_]
+            {
+                auto cfg = GetClientConfiguration();
+                if (simulate_gcs_native_conditional_)
+                    cfg.http_client = "gcp_oauth";
+                return cfg;
+            }(),
             Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
             DB::S3::ClientSettings{
                 .use_virtual_addressing = true,
@@ -273,6 +286,9 @@ struct Client : DB::S3::Client
     Aws::S3::Model::PutObjectOutcome PutObject(const Aws::S3::Model::PutObjectRequest & request) const override
     {
         ++counters.putObject;
+
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_put_object_native_conditional = wrapper->isNativeConditional();
 
         if (injections)
         {
@@ -352,6 +368,9 @@ struct Client : DB::S3::Client
     {
         ++counters.multiUploadCreate;
 
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_create_multipart_native_conditional = wrapper->isNativeConditional();
+
         if (injections)
         {
             if (auto opt_val = injections->call(request))
@@ -371,6 +390,9 @@ struct Client : DB::S3::Client
     Aws::S3::Model::UploadPartOutcome UploadPart(const Aws::S3::Model::UploadPartRequest & request) const override
     {
         ++counters.uploadParts;
+
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_upload_part_native_conditional = wrapper->isNativeConditional();
 
         if (injections)
         {
@@ -395,6 +417,9 @@ struct Client : DB::S3::Client
     Aws::S3::Model::CompleteMultipartUploadOutcome CompleteMultipartUpload(const Aws::S3::Model::CompleteMultipartUploadRequest & request) const override
     {
         ++counters.multiUploadComplete;
+
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_complete_multipart_native_conditional = wrapper->isNativeConditional();
 
         if (injections)
         {
@@ -439,6 +464,9 @@ struct Client : DB::S3::Client
     Aws::S3::Model::CopyObjectOutcome CopyObject(const Aws::S3::Model::CopyObjectRequest & request) const override
     {
         ++counters.copyObject;
+
+        if (const auto * wrapper = dynamic_cast<const DB::S3::RequestWithNativeConditionalMode *>(&request))
+            last_copy_object_native_conditional = wrapper->isNativeConditional();
 
         if (injections)
         {
@@ -507,6 +535,11 @@ struct Client : DB::S3::Client
     mutable std::shared_ptr<InjectionModel> injections;
     mutable bool last_head_object_native_conditional = false;
     mutable bool last_delete_object_native_conditional = false;
+    mutable bool last_put_object_native_conditional = false;
+    mutable bool last_create_multipart_native_conditional = false;
+    mutable bool last_upload_part_native_conditional = false;
+    mutable bool last_complete_multipart_native_conditional = false;
+    mutable bool last_copy_object_native_conditional = false;
     void resetCounters() const { counters = {}; }
 };
 
@@ -678,7 +711,7 @@ public:
         return *async_policy;
     }
 
-    std::unique_ptr<WriteBufferFromS3> getWriteBuffer(String file_name = "file")
+    std::unique_ptr<WriteBufferFromS3> getWriteBuffer(String file_name = "file", const WriteSettings & write_settings = {})
     {
         S3::S3RequestSettings request_settings;
         request_settings.updateFromSettings(settings, /* if_changed */true, /* validate_settings */false);
@@ -695,7 +728,8 @@ public:
                     request_settings,
                     nullptr,
                     std::nullopt,
-                    getAsyncPolicy().getScheduler());
+                    getAsyncPolicy().getScheduler(),
+                    write_settings);
     }
 
     void setInjectionModel(std::shared_ptr<MockS3::InjectionModel> injections_)
@@ -1336,6 +1370,62 @@ TEST_P(SyncAsync, StrictUploadPartSize) {
     }
 }
 
+/// Task 3: the actual PutObject request a single-part upload issues must carry the typed
+/// NativeConditional mode exactly when the caller's WriteSettings asked for it -- the old blanket GCS
+/// dialect stays authoritative over the wire until a later task; this only proves the mark reaches
+/// the production request object (mirrors the HEAD/DELETE marking tests in
+/// S3ObjectStorageConditionalOpsTest below).
+TEST_F(WBS3Test, PutObjectNativeConditionalModePropagates)
+{
+    WriteSettings ws;
+    ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
+
+    auto buffer = getWriteBuffer("native_conditional_put", ws);
+    buffer->write('A');
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    EXPECT_EQ(client->counters.putObject, 1);
+    EXPECT_TRUE(client->last_put_object_native_conditional);
+}
+
+/// The control: an ordinary (Default-mode) single-part upload must NOT pick up the mark.
+TEST_F(WBS3Test, PutObjectOrdinaryWriteRemainsDefault)
+{
+    auto buffer = getWriteBuffer("ordinary_put");
+    buffer->write('A');
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    EXPECT_EQ(client->counters.putObject, 1);
+    EXPECT_FALSE(client->last_put_object_native_conditional);
+}
+
+/// A multipart upload's CompleteMultipartUpload request must carry the mode too (Task 4's native
+/// adapter consumes it as a defense-in-depth guard against a conditional multipart completion), while
+/// CreateMultipartUpload and UploadPart -- which no consumer needs marked -- must NOT.
+TEST_F(WBS3Test, CompleteMultipartUploadNativeConditionalModePropagatesButCreateAndUploadPartDoNot)
+{
+    getSettings()[Setting::s3_max_single_part_upload_size] = 0; // force multipart
+    getSettings()[Setting::s3_min_upload_part_size] = 1;
+
+    WriteSettings ws;
+    ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
+
+    auto buffer = getWriteBuffer("native_conditional_multipart", ws);
+    buffer->write('A');
+    buffer->next();
+    buffer->write('A');
+
+    getAsyncPolicy().setAutoExecute(true);
+    buffer->finalize();
+
+    EXPECT_EQ(client->counters.multiUploadComplete, 1);
+    EXPECT_TRUE(client->last_complete_multipart_native_conditional);
+    EXPECT_FALSE(client->last_create_multipart_native_conditional);
+    EXPECT_FALSE(client->last_upload_part_native_conditional);
+}
+
 /// Mock-S3 coverage for the content-addressed conditional-write primitives: `removeObjectIfTokenMatches`
 /// (`If-Match` `DeleteObject`) and `copyObjectConditional` (`If-None-Match: *` `CopyObject`), plus the
 /// fallback-disable guarantee in `copyS3File` when a conditional copy is requested.
@@ -1483,6 +1573,79 @@ TEST_F(S3ObjectStorageConditionalOpsTest, CopyObjectConditionalPreconditionFaile
     /// "Lost the race": not an error, just created == false and no destination etag.
     ASSERT_FALSE(result.created);
     ASSERT_TRUE(result.dest_etag.empty());
+}
+
+/// Task 3: the actual CopyObjectRequest a conditional (write-once) copy issues must carry the typed
+/// NativeConditional mode exactly when the caller's WriteSettings asked for it.
+TEST_F(S3ObjectStorageConditionalOpsTest, CopyObjectConditionalNativeConditionalModePropagates)
+{
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    WriteSettings ws;
+    ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
+    auto result = object_storage->copyObjectConditional(
+        StoredObject("src-key"), StoredObject("dst-key"), ReadSettings{}, ws, std::nullopt);
+
+    ASSERT_TRUE(result.created);
+    EXPECT_TRUE(mock_client->last_copy_object_native_conditional);
+}
+
+/// The control: an ordinary (Default-mode) conditional copy must NOT pick up the mark -- this is the
+/// exact shape `CopyObjectConditionalSuccess` above already exercises with `WriteSettings{}`.
+TEST_F(S3ObjectStorageConditionalOpsTest, CopyObjectConditionalOrdinaryModeRemainsDefault)
+{
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    auto result = object_storage->copyObjectConditional(
+        StoredObject("src-key"), StoredObject("dst-key"), ReadSettings{}, WriteSettings{}, std::nullopt);
+
+    ASSERT_TRUE(result.created);
+    EXPECT_FALSE(mock_client->last_copy_object_native_conditional);
+}
+
+/// A token-producing conditional copy on a GENERATION-dialect store must fail BEFORE issuing any
+/// request when the source exceeds the single-operation cap (see the "Unconditional token-producing
+/// write" / "Write-settings decomposition" design sections and
+/// S3ObjectStorage::copyObjectConditional): GCS drops preconditions on multipart completion, so a
+/// lost race on a multipart-completed conditional copy would silently overwrite instead of failing.
+TEST_F(S3ObjectStorageConditionalOpsTest, CopyObjectConditionalAboveSinglePutCapThrowsNotImplementedBeforeAnyRequest)
+{
+    /// Deliberately builds its OWN store/client/object_storage instead of the fixture's -- this test
+    /// needs a client that reports the generation dialect (conditionalOpsUseGenerationTokens()==true),
+    /// which the fixture's plain client does not.
+    auto cap_store = std::make_shared<MockS3::S3MemStrore>();
+    const String cap_bucket = "cap-cond-bucket";
+    cap_store->CreateBucket(cap_bucket);
+    /// simulate_gcs_native_conditional makes conditionalOpsUseGenerationTokens() report true, so the
+    /// cap-enforcement branch this test targets actually runs -- it does not enable the real wire
+    /// dialect (that stays gated on Task 4).
+    auto owned_client = std::make_unique<MockS3::Client>(cap_store, /*simulate_gcs_native_conditional_=*/true);
+    auto * cap_client = owned_client.get();
+    cap_store->GetBucketStore(cap_bucket).PutObject("src-key", String(65, 'a'));
+
+    S3::URI uri;
+    uri.bucket = cap_bucket;
+    S3Capabilities capabilities;
+    ObjectStorageKeyGeneratorPtr key_generator;
+    auto cap_object_storage = std::make_shared<S3ObjectStorage>(
+        std::move(owned_client), std::make_unique<S3Settings>(), std::move(uri), capabilities, key_generator, "cap-cond-disk");
+
+    WriteSettings ws;
+    ws.object_storage_request_mode = ObjectStorageRequestMode::NativeConditional;
+    ws.s3_single_part_upload_max_bytes_override = 64;   /// one byte below the 65-byte source
+
+    EXPECT_THROW({
+        try
+        {
+            cap_object_storage->copyObjectConditional(StoredObject("src-key"), StoredObject("dst-key"), ReadSettings{}, ws, std::nullopt);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::NOT_IMPLEMENTED);
+            throw;
+        }
+    }, DB::Exception);
+    EXPECT_EQ(cap_client->counters.copyObject, 0);
 }
 
 /// B166-adjacent: `copyS3File`'s `If-None-Match` conditional copy must not silently fall back to an

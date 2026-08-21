@@ -77,6 +77,7 @@ namespace S3RequestSetting
     extern const S3RequestSettingsUInt64 max_single_part_upload_size;
     extern const S3RequestSettingsUInt64 min_upload_part_size;
     extern const S3RequestSettingsUInt64 max_unexpected_write_error_retries;
+    extern const S3RequestSettingsUInt64 max_single_operation_copy_size;
 }
 
 
@@ -787,7 +788,7 @@ ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
     const StoredObject & object_from,
     const StoredObject & object_to,
     const ReadSettings & read_settings,
-    const WriteSettings &,
+    const WriteSettings & write_settings,
     std::optional<ObjectAttributes> object_to_attributes)
 {
     auto current_client = client.get();
@@ -807,6 +808,31 @@ ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
     auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
     const auto read_settings_to_use = patchSettings(read_settings);
 
+    /// A token-producing conditional copy on a generation-token store (GCS) must stay a SINGLE
+    /// CopyObject operation, for the same reason a token-producing PUT must stay a single PUT (see
+    /// WriteBufferFromS3::createMultipartUpload): GCS enforces no precondition on
+    /// CompleteMultipartUpload, so a lost race on a multipart-completed conditional copy would
+    /// silently overwrite instead of failing. Fail BEFORE issuing any request rather than falling
+    /// back to multipart or an unconditional read-write copy -- `write_settings.s3_single_part_upload_max_bytes_override`
+    /// carries the same cap a conditional PUT uses (see ObjectStorageBackend::tokenProducingWriteSettings);
+    /// it is 0 (no override) for a non-generation dialect or an ordinary, non-token-producing copy.
+    S3::S3RequestSettings request_settings = settings_ptr->request_settings;
+    if (write_settings.object_storage_request_mode == ObjectStorageRequestMode::NativeConditional
+        && conditionalOpsUseGenerationTokens()
+        && write_settings.s3_single_part_upload_max_bytes_override)
+    {
+        const uint64_t cap = write_settings.s3_single_part_upload_max_bytes_override;
+        if (size > cap)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "CAS on GCS: a token-producing conditional copy of {} bytes to {} exceeds the "
+                "single-operation cap of {} bytes -- refusing (a multipart-completed conditional copy "
+                "would silently overwrite instead of failing, since GCS enforces no precondition on "
+                "CompleteMultipartUpload)", size, object_to.remote_path, cap);
+        /// Raise the single-operation ceiling so a body up to the cap stays a single CopyObject
+        /// instead of taking the (forbidden, for this dialect) multipart-copy path.
+        request_settings[S3RequestSetting::max_single_operation_copy_size] = cap;
+    }
+
     String dest_etag;
     try
     {
@@ -819,14 +845,15 @@ ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
             /*dest_s3_client=*/current_client,
             /*dest_bucket=*/uri.bucket,
             /*dest_key=*/object_to.remote_path,
-            settings_ptr->request_settings,
+            request_settings,
             read_settings_to_use,
             BlobStorageLogWriter::create(disk_name),
             scheduler,
             [&, this]{ return readObject(object_from, read_settings_to_use);},
             object_to_attributes,
             /*if_none_match=*/"*",
-            /*out_dest_etag=*/&dest_etag);
+            /*out_dest_etag=*/&dest_etag,
+            write_settings.object_storage_request_mode);
     }
     catch (S3Exception & exc)
     {

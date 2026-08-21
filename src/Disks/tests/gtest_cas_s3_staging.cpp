@@ -2,6 +2,8 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
+#include <IO/WriteSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
@@ -81,6 +83,7 @@ public:
         std::optional<DB::ObjectAttributes> object_to_attributes) override
     {
         ++call_count;
+        last_request_mode = write_settings.object_storage_request_mode;
         if (mode == Mode::Enforcing && exists(object_to))
             return {.created = false, .dest_etag = {}};
 
@@ -89,6 +92,10 @@ public:
     }
 
     int callCount() const { return call_count; }
+
+    /// The `object_storage_request_mode` carried by the WriteSettings passed to the MOST RECENT call --
+    /// lets a test prove a caller marked (or didn't mark) its conditional copy NativeConditional.
+    DB::ObjectStorageRequestMode last_request_mode = DB::ObjectStorageRequestMode::Default;
 
 private:
     Mode mode;
@@ -288,6 +295,36 @@ TEST(CASS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
 
     EXPECT_EQ(storage->stagingBackend(), DB::Cas::StagingBackend::Local);
     EXPECT_FALSE(storage->conditionalCopySupported());
+}
+
+/// Task 3: `ObjectStorageBackend::promoteStaged` must pass its caller's request as NativeConditional
+/// -- staging promotion is a write-once conditional server-side copy whose destination token enters
+/// CAS protocol state, exactly the category "Mark every CAS token-producing write" targets. The mode
+/// is dialect-agnostic (it takes effect only when the underlying client also speaks the GCS wire
+/// dialect, gated on Task 4's Client::BuildHttpRequest predicate), so it is asserted here regardless
+/// of this fake's (ETag-like) dialect.
+TEST(CASS3Staging, PromoteStagedNativeConditionalModePropagates)
+{
+    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
+
+    /// Native mode passes staging_key/blob_key straight through to the object storage with no prefix
+    /// of its own (unlike EmulatedSingleProcess's emuPath), so they must already be valid raw storage
+    /// paths -- rooted under the fake's own common key prefix, exactly like `sweepOwnMountStaging`'s
+    /// test above does for the same `LocalObjectStorage`-backed fake.
+    const std::string root = storage->getCommonKeyPrefix();
+    const std::string staging_key = root + "/staging-key";
+    const std::string blob_key = root + "/blob-key";
+    {
+        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
+        const std::string body = "staged-bytes";
+        buf->write(body.data(), body.size());
+        buf->finalize();
+    }
+
+    const auto result = backend->promoteStaged(staging_key, blob_key);
+    ASSERT_EQ(result.outcome, DB::Cas::PutOutcome::Done);
+    EXPECT_EQ(storage->last_request_mode, DB::ObjectStorageRequestMode::NativeConditional);
 }
 
 /// Task 2 of the S3-native staging plan: `IObjectStorage::copyObjectConditional` (write-once

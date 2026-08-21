@@ -334,9 +334,12 @@ public:
     /// UNCONDITIONAL re-upload of the writer's OWN payload over `blob_key` under a FRESH-tagged
     /// envelope header — the sanctioned condemned-object resurrection overwrite. Writes
     /// `[fresh_header][payload]`, streaming `payload` from `reader`, and returns the fresh incarnation's
-    /// token. Blob bodies have no size cap, so a Native backend streams the payload and never
-    /// materializes it; the emulated backend materializes (its conditional ops are whole-`String` by
-    /// design) and serializes resurrections to bound the peak to one body at a time.
+    /// token. A Native backend streams the payload and never materializes it whole; on an ETag-dialect
+    /// store that means no size cap, while a generation-token store (GCS) enforces the same single-PUT
+    /// token-producing cap this write would face if it carried a precondition (GCS drops preconditions
+    /// on multipart completion regardless of whether one was set). The emulated backend materializes
+    /// (its conditional ops are whole-`String` by design) and serializes resurrections to bound the
+    /// peak to one body at a time.
     ///
     /// The reader is the caller's: it is ALWAYS the writer's own source (a staging object or a local
     /// staged file), NEVER a read of the condemned `blob_key`, and the caller has already skipped any
