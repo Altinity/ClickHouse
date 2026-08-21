@@ -73,7 +73,7 @@
 | CAS-055 | подтверждено | P2 | [{#hardlink-per-file-forcefresh-head}](BACKLOG.md#hardlink-per-file-forcefresh-head) | нет | Подтверждено: ветка carry-forward в `createHardLink` делает ForceFresh-resolve на каждый файл, а при дефолтном `part_folder_validate = always` это обязательный `HEAD` манифеста на файл; но «полная пересборка view» преувеличена (декод берётся из кэша), а фикс — мемоизация уровня транзакции, уже существующая в `unlinkFile`. |
 | CAS-056 | частично | P2 | [{#standalone-write-scratch-manifest-cost}](BACKLOG.md#standalone-write-scratch-manifest-cost) | нет | форма кода реальна — standalone-запись в закоммиченную часть действительно платит второй (черновой) manifest-PUT и по одному adopt-событию на перенесённый blob-лист, но «два ПОЛНЫХ manifest-энкода» и «внутри retry-замыкания CAS» — неточности; корректность не страдает. |
 | CAS-057 | not-a-bug | P3 | [{#tmp-replacefile-on-committed-part}](BACKLOG.md#tmp-replacefile-on-committed-part) | нет | бросок `LOGICAL_ERROR` на не-стейдженный `moveFile`/`replaceFile` подтверждён и сохраняет ранее принятую позицию (fail-loud-заглушка без живого вызывающего), а «свежая улика» ложная: `DeleteBitmapFileOps::writeBitmapToStorage` не имеет ни одного продакшн-вызова. |
-| CAS-058 | подтверждено | P1 | [{#issue-2173-freezeremote-gap}](BACKLOG.md#issue-2173-freezeremote-gap) | да | `freezeRemote` действительно единственный из трёх clone-путей без CAS-транзакции, кросс-дисковый `ATTACH PARTITION FROM` в CAS падает на первой же части — это уже подтверждённый и воспроизведённый на HEAD issue #2173 с запланированным пред-релизным фиксом; неверны только «REPLACE PARTITION FROM» в триггере и намёк на тихое «partial state» (отказ громкий, tmp-часть подчищается). |
+| CAS-058 | исправлено (`c5467b8989b`, `cfe9a6a3615`) | — | [план исправления](../plans/2026-08-21-cas-freezeremote-transaction.md) | закрыто | `freezeRemote` теперь публикует cross-disk CAS-клон одной транзакцией; local, same-pool CAS и replicated `ATTACH PARTITION FROM` закреплены RED/GREEN-тестом. |
 | CAS-059 | by-design | P3 | [{#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`)](BACKLOG.md#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`) | нет | Все описания кода на HEAD верны (`DiskEncrypted` берёт любой делегат, не переопределяет `isContentAddressed`/`supportsAtomicFileWrites`, `use_fake_transaction` по умолчанию true), но CAS+шифрование — settled out-of-scope позиция (Filimonov), а связка отваливается громким `NOT_IMPLEMENTED` на первой же записи части; остаток — только отсутствующий fail-fast гейт в конфиге, P3. |
 | CAS-060 | by-design | P3 | [{#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed}](BACKLOG.md#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed) | нет | Форма кода верна (случайный IV на каждую перезапись + CAS хеширует то, что ему дали → дедупа нет вовсе), но CAS×шифрование — принятая out-of-scope позиция; тихой порчи нет, а сама связка вообще не проведена (`DiskEncrypted` не пробрасывает `isContentAddressed`). |
 | CAS-061 | частично | P2 | BACKLOG.md {#damaged-object-repair} + BACKLOG/gc.md {#ckpt-damage-no-repair-path} + новая секция {#pool-meta-bootstrap-blocks-dr-tools} | нет | Ядро подтверждено (единственный rebuild-верб — `gc/state`; каталог/`_ckpt` падают fail-closed без пути восстановления; все CA-инструменты открываются через `_pool_meta`), но это уже затрекано как {#damaged-object-repair}/{#ckpt-damage-no-repair-path}, часть про mount lease неверна (есть `cas-drop-member`), а отсутствие migration-тулинга — сознательное pre-release решение. |
@@ -160,24 +160,24 @@
 |---|---|---|
 | частично | 87 | форма кода описана верно, но следствие завышено, недостижимо или инвертировано |
 | by-design | 21 | намеренное поведение, позиция зафиксирована (часть — с цитатами решений) |
-| подтверждено | 16 | реальная проблема на HEAD |
+| подтверждено | 15 | реальная проблема на HEAD |
 | not-a-bug | 8 | утверждение фактически неверно (галлюцинация) |
-| исправлено | 2 | было реально, теперь закрыто |
+| исправлено | 3 | было реально, теперь закрыто |
 | дубликат | 1 | та же земля, что у другого CAS-### |
 
-Приоритеты: **P1 — 3**, P2 — 38, P3 — 83, без действия — 11.
+Приоритеты: **P1 — 2**, P2 — 38, P3 — 83, без действия — 12.
 
 ### P1 — чинить до релиза {#p1-list}
 
 | ID | Суть | Где отслеживается |
 |---|---|---|
 | CAS-040 | перевод строки в пути файла парта → недекодируемый осиротевший манифест → каждый GC-раунд в пуле падает навсегда (ВОСПРОИЗВЕДЕНО) | `final-checks-todo.md` п.8 |
-| CAS-058 | `freezeRemote` без CAS-транзакции → кросс-дисковый `ATTACH PARTITION FROM` не работает | issue #2173, `final-checks-todo.md` п.1 |
 | CAS-106 | перечислительный `non_cas_keys` отвергает легальные S3-ключи диска → сервер падает на старте с `UNKNOWN_SETTING` | `final-checks-todo.md` п.4 (полевой отчёт) |
 
-Из четырёх исходных P1 CAS-001 закрыт коммитами `8e5ee61b6cc` и `11f5397a629`. Остальные не были
-найдены впервые этим триажем: CAS-058/106 пришли из независимого issue и полевого отчёта, CAS-040 —
-единственный, где триаж добавил воспроизведение и вскрыл настоящее следствие
+Из четырёх исходных P1 CAS-001 закрыт коммитами `8e5ee61b6cc` и `11f5397a629`, а CAS-058 —
+коммитами `c5467b8989b` и `cfe9a6a3615`. Оставшиеся два не были найдены впервые этим триажем:
+CAS-106 пришёл из полевого отчёта, а CAS-040 — единственный, где триаж добавил воспроизведение и
+вскрыл настоящее следствие
 (аудит утверждал «закоммиченная часть навсегда нечитаема», в реальности INSERT падает fail-closed, а
 ломается GC всего пула).
 
@@ -863,9 +863,9 @@ range» — ноль. Ближайшее по теме — `BACKLOG/replication.
 `[move-part-to-ca-architecturally-unimplemented]` (про MOVE В CA; его «architecturally
 unimplemented» шапка объявлена УСТАРЕВШЕЙ в `BACKLOG.md:665-670`, оба слоя приземлились), и там же
 явно сказано «unaffected: … off-CA moves (CA→local)» — что верно ровно для НЕравных
-`DataSourceDescription` (CA-s3 → local) и НЕ верно для CA-s3 → plain-s3 на том же эндпойнте. Родня
-того же семейства — `{#issue-2173-freezeremote-gap}` (`BACKLOG.md:635-670`): там пропущенная
-CA-ветка в `freezeRemote`, здесь — пропущенный CA-гард на стороне источника серверной копии.
+`DataSourceDescription` (CA-s3 → local) и НЕ верно для CA-s3 → plain-s3 на том же эндпойнте.
+Исправленный родственник того же семейства — CAS-058 `{#cas-058}`: там была пропущенная CA-ветка
+в `freezeRemote`, здесь — пропущенный CA-гард на стороне источника серверной копии.
 
 Минимальная структурная починка (напрашивается, дешёвая): либо включить `metadata_type` в
 `DataSourceDescription::operator==`/`sameKind` (`src/Disks/DiskType.cpp:35-52`), либо добавить
@@ -2637,28 +2637,28 @@ q.proj/checksums.txt il=259 <==', got '==> p'. (CORRUPTED_DATA)
 `docs/superpowers/cas/BACKLOG/formats-and-storage.md` — фиксирует оба остатка (мёртвая политика
 `Tolerant` + измеренная стоимость) со ссылкой на решение о CRC-границе в {#codecs-and-protocol}.
 
-## CAS-058 — `freezeRemote` действительно единственный из трёх clone-путей без CAS-транзакции, кросс-дисковый `ATTACH PARTITION FROM` в CAS падает на первой же части — это уже подтверждённый и воспроизведённый на HEAD issue #2173 с запланированным пред-релизным фиксом; неверны только «REPLACE PARTITION FROM» в триггере и намёк на тихое «partial state» (отказ громкий, tmp-часть подчищается). (подтверждено, P1) {#cas-058}
+## CAS-058 — `freezeRemote` был единственным из трёх clone-путей без CAS-транзакции (исправлено) {#cas-058}
 
-Анкор находки (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:593-621`) устарел по номерам строк (снапшот до 592b9b83568 + последующие правки): на HEAD `freezeRemote` — `DataPartStorageOnDiskBase.cpp:615-668`, «правильные» ветки с транзакцией — `freeze` (`:542-544`, комментарий про B21) и `clonePart` (`:735-757`, комментарий «L2 (MOVE-to-CA fix)»), стример — `copyDirectoryContentIntoTransaction` (`:686-712`). Файл сам не переезжал (он в generic `src/Storages/MergeTree/`), переехали только CA-файлы.
+**Вердикт: исправлено 2026-08-21 (`c5467b8989b`, `cfe9a6a3615`).**
 
-Что подтверждается на HEAD:
+На исходном HEAD дефект был независимо воспроизведён как issue #2173. Его исторический механизм:
 
-1. `freezeRemote` не имеет CA-ветки. `DataPartStorageOnDiskBase.cpp:625-628`: транзакция берётся ИСКЛЮЧИТЕЛЬНО из `params.external_transaction`, иначе `dst_disk->createDirectories(to)`; ни одного `dst_disk->isContentAddressed()` в теле функции нет (единственные два вхождения `isContentAddressed` в файле рядом — `:542` в `freeze` и `:735` в `clonePart`). Для сравнения, `freeze` (`:540-544`) и `clonePart` (`:735-745`) сами создают `owned_transaction`/`clone_transaction`, а восстановление из бэкапа — `MergeTreeData.cpp:7543-7545` (`restore_tx`). То есть «третий путь забыли» — верно буквально.
+1. `freezeRemote` не имел CA-ветки: без внешней транзакции он сразу создавал каталог назначения, тогда как `freeze` и `clonePart` сами создавали одну транзакцию для целого парта.
 
-2. Без транзакции копирование идёт по автокоммит-пути. `freezeRemote` вызывает `Backup(..., /*copy_instead_of_hardlinks=*/true, {}, params.external_transaction)` (`:630-643`); в `Backup` при пустой транзакции и `copy_instead_of_hardlinks=true` берётся ветка `src_disk->copyDirectoryContent(...)` (`src/Storages/MergeTree/Backup.cpp:180-185`), а это `IDisk::copyDirectoryContent` → `copyThroughBuffers` с пулом потоков (`src/Disks/IDisk.cpp:196-205`, `:174-193`) — каждый файл части становится отдельной автокоммит-транзакцией на CAS-диске.
+2. Без транзакции `Backup` выбирал `IDisk::copyDirectoryContent`, а `copyThroughBuffers` раскладывал файлы парта по пулу потоков; каждый файл становился отдельной автокоммит-транзакцией на CAS-диске.
 
-3. Итог на CAS — громкий отказ. Для blob-обязательных файлов (`.bin`, `.mrk*`, `primary.idx` — `ContentAddressedTransaction.cpp:65-73`) автокоммит запрещён: `ContentAddressedTransaction.cpp:766-771` бросает `NOT_IMPLEMENTED` «Autocommit writes are not supported for content part files». Параллельно две автокоммит-транзакции на один и тот же ref дают вторую подпись — отказ unique-ref инварианта `Pool/CasPartWriteTxn.cpp:1168-1174` («promote: ref ... already names a different committed manifest», retry-later). Какая из двух сработает — гонка пула; обе — fail-closed.
+3. Результатом был громкий fail-closed отказ: либо `NOT_IMPLEMENTED` для автокоммита blob-обязательного файла, либо unique-ref refusal, когда две однофайловые транзакции пытались опубликовать разные манифесты одного ref.
 
-4. Достижимость. `freezeRemote` вызывается только из `MergeTreeData::cloneAndLoadDataPart` (`MergeTreeData.cpp:9717`) в ветке `!on_same_disk`, а до неё стоит гейт `must_on_same_disk` (`MergeTreeData.cpp:9677-9681`, `BAD_ARGUMENTS` «disk does not belong to storage policy»). `must_on_same_disk=false` передают ровно ATTACH-ветки: `StorageMergeTree.cpp:3049-3057` и `StorageReplicatedMergeTree.cpp:9239-9248`; `external_transaction` там не задаётся (`ClonePartParams` — `StorageMergeTree.cpp:3029`, `StorageReplicatedMergeTree.cpp:9218-9222`). Значит триггер — именно `ALTER TABLE cas_tbl ATTACH PARTITION ... FROM src`.
+4. Достижимым триггером был именно cross-disk `ATTACH PARTITION FROM`: `freezeRemote` вызывается из `MergeTreeData::cloneAndLoadDataPart` при `!on_same_disk`, а local и replicated ATTACH-ветки передают `must_on_same_disk=false` без внешней транзакции.
 
 Что в находке неверно:
 
 - «`REPLACE PARTITION FROM`» и `MOVE PARTITION TO TABLE` этот путь НЕ достают. В Replicated `replace=true` жёстко передаёт `must_on_same_disk=true` (`StorageReplicatedMergeTree.cpp:9233`), как и `movePartitionToTable` (`:9521`). В `StorageMergeTree` `replace`/`movePartitionToTable` передают `!are_policies_partition_op_compatible` (`StorageMergeTree.cpp:3041`, `:3226`), а `StoragePolicy::isCompatibleForPartitionOps` требует, чтобы ВСЕ диски обеих политик были `isPlain()` (`src/Disks/StoragePolicy.cpp:420-435`); CAS-метаданные `isPlain()` не переопределяют, т.е. остаётся дефолтное `false` (`src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:310`, `src/Disks/IDisk.h:473`) — политика с CAS-диском несовместима, `must_on_same_disk=true`, и запрос отвергается ЗАРАНЕЕ громким `BAD_ARGUMENTS`. Единственное исключение — одна и та же политика по имени (`StoragePolicy.cpp:422-423`), но тогда `on_same_disk` истинно и путь `freezeRemote` вообще не берётся.
 - «leaving partial state rather than being rejected up front» — по факту не тихая порча. До броска успевают автокоммитом опубликоваться только inline-совместимые файлы части (`checksums.txt`/`columns.txt`/`count.txt`) в tmp-ref `tmp_replace_from_*`; ветка `Backup` с копированием обёрнута в `CleanupOnFail` → `dst_disk->removeRecursive(destination_path)` (`Backup.cpp:182-184`), плюс держится `getTemporaryPartDirectoryHolder(tmp_dst_part_name)` (`MergeTreeData.cpp:9687`). Целевая таблица не получает ни одной части (все `dst_parts` коммитятся только после успеха всех клонов). Так что реальный вред — падение запроса + возможный tmp-мусор в пуле, а не порча данных; «не отвергается заранее» — верно, но это UX/фича-гэп, а не корректность.
 
-Покрытие в BACKLOG: уже есть, дословно про этот же дефект — `docs/superpowers/cas/BACKLOG.md:638` `## Issue #2173 CONFIRMED: cross-disk ATTACH PARTITION FROM (local -> CAS) — freezeRemote lacks the CAS single-transaction branch (2026-08-20) {#issue-2173-freezeremote-gap}`. Там же (`BACKLOG.md:646-663`) зафиксирован тот же механизм (16-потоковый пул, две конкурирующие автокоммит-транзакции, unique-ref refusal `CasPartWriteTxn.cpp:1168` либо `NOT_IMPLEMENTED` `ContentAddressedTransaction.cpp:770`), репро на HEAD и запланированный фикс — зеркалить CA-ветку `clonePart` внутри `freezeRemote` (self-created `dst_disk->createTransaction()` + `copyDirectoryContentIntoTransaction` + один commit) плюс stateless-тест. Пункт помечен как SCHEDULED pre-release (`docs/superpowers/cas/final-checks-todo.md`). На HEAD (`c2cd4b62df1`) фикс НЕ внесён — ветки в `freezeRemote` нет, так что запись не устарела. Новых записей в BACKLOG не добавлял: находка — независимое переоткрытие уже затрекованного и запланированного к фиксу issue #2173.
+Исправление записано в `docs/superpowers/plans/2026-08-21-cas-freezeremote-transaction.md`. Коммит `cfe9a6a3615` перенёс существующий последовательный стример выше `freezeRemote`, добавил self-owned транзакцию для CAS-назначения и включил post-clone удаления в тот же commit. Коммит `c5467b8989b` закрепил три формы: local→CAS, same-pool CAS→CAS с доказанным переиспользованием blob и replicated local→CAS с `metadata_version.txt` repoint. Закрытый пункт удалён из live BACKLOG; пункт 1 в `final-checks-todo.md` отмечен выполненным.
 
-Итого: код-часть находки верна и это реальный пред-релизный дефект (первый же `ATTACH PARTITION FROM` в CAS-таблицу падает), но новизны нет; правки к формулировке — только ATTACH (не REPLACE/MOVE) и отказ громкий, без тихой порчи.
+Итого: код-часть находки была верна и описывала реальный пред-релизный дефект, теперь закрытый. Поправки к исходной формулировке остаются исторически важны: только ATTACH (не REPLACE/MOVE), а отказ был громким, без тихой порчи.
 
 ## CAS-059 — Все описания кода на HEAD верны (`DiskEncrypted` берёт любой делегат, не переопределяет `isContentAddressed`/`supportsAtomicFileWrites`, `use_fake_transaction` по умолчанию true), но CAS+шифрование — settled out-of-scope позиция (Filimonov), а связка отваливается громким `NOT_IMPLEMENTED` на первой же записи части; остаток — только отсутствующий fail-fast гейт в конфиге, P3. (by-design, P3) {#cas-059}
 
@@ -3888,7 +3888,7 @@ condemned-маркер без тела».
 ## История и покрытие в BACKLOG
 
 - В `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` пункта про `always_use_copy_instead_of_hardlinks` НЕТ (grep по `hardlink` даёт только `performance.md:144` {#ca-trycommit-retry-loses-staged-state} и `performance.md:287` {#hardlink-per-file-forcefresh-head} — оба про другое). В `docs/superpowers/cas/final-checks-todo.md` тоже нет.
-- Не дубликат CAS-058/{#issue-2173-freezeremote-gap}: там КРОСС-дисковый `ATTACH PARTITION FROM` через `freezeRemote` без CA-транзакции (и без участия этой настройки); здесь — однодисковый путь и мутации, ломающиеся именно настройкой.
+- Не дубликат исправленного CAS-058 `{#cas-058}`: там КРОСС-дисковый `ATTACH PARTITION FROM` шёл через `freezeRemote` без CA-транзакции и без участия этой настройки; здесь — однодисковый путь и мутации, ломающиеся именно настройкой.
 - Ничем не закрыто: `git log -S "generateObjectKeyForPath"` по CA-файлу показывает только перенос/рефакторинг, ветки `copyFile` для CA не появилось; grep по `copyFile|copyObject` внутри каталога `ContentAddressed/` — ноль реализаций.
 - Тестового покрытия нет: единственное упоминание настройки в `tests/` — снапшот списка настроек `tests/queries/0_stateless/02995_merge_tree_settings_settings_26_5_1.tsv`; CA-полосы её не включают, так что «missing coverage» здесь — правда, но и сама комбинация не поддержана.
 
@@ -5274,7 +5274,7 @@ P3: без порчи данных, все недоказанные исходы
 ## 4. Что в истории/бэклоге, и что устарело
 
 - Тема находки уже отслежена: `[VERIFY-ca-ca-same-pool-move]` (`docs/superpowers/cas/BACKLOG/replication.md:16`) — это её прямое покрытие.
-- Последовательность копирования и сам `copyDirectoryContentIntoTransaction` разобраны в `docs/superpowers/cas/BACKLOG.md:640-675` ({#issue-2173-freezeremote-gap}), где перечислены три clone-пути и указано, что `freeze()` (`:534`) и `clonePart()` (`:735`) уже завёрнуты в одну CAS-транзакцию, а незакрытый член семьи — `freezeRemote()`.
+- Последовательность копирования и три clone-пути разобраны в плане `docs/superpowers/plans/2026-08-21-cas-freezeremote-transaction.md`: `freeze`, `clonePart` и теперь `freezeRemote` заворачивают whole-part CAS-публикацию в одну транзакцию.
 - **Устарело:** заголовок `[move-part-to-ca-architecturally-unimplemented]` (`BACKLOG/replication.md:15`, «architecturally unimplemented — HARD») больше не описывает HEAD: оба слоя приземлились — L1 (routing `moving` через staging-префикс) коммитами `2f2a3b01aa6`, `4d73e198f6b`, `81eab8b6968`, L2 (одна транзакция в `clonePart`) — `4229a1477be` («cas: MOVE-to-CA fix L2 -- clonePart routes CA destinations through one transaction»), после чего прогонялись S36/S37 (`26590e4aa55`, `93bb65eb8e8`). Это уже зафиксировано текстом в `BACKLOG.md:671-675`, но сам заголовок пункта в `replication.md` до сих пор читается как «не реализовано» — стоит переписать при следующей правке файла.
 
 ## 5. Что реально осталось (новый уточняющий пункт)
