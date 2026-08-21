@@ -690,6 +690,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
     auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_token_producing_put_bytes);
+    const Cas::TokenType native_token_type = backend->nativeTokenType();
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
@@ -777,6 +778,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
+    view.native_token_type = native_token_type;
     view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }
@@ -816,16 +818,37 @@ void ContentAddressedMetadataStorage::startup()
     /// Fail-close, never fail-open: an unsupported or non-enforcing backend just falls back to local
     /// staging (`conditional_copy_supported` stays `false`) — this is NOT a mount failure, unlike the
     /// mandatory battery, because `local` staging remains fully functional.
+    ///
+    /// A generation-token backend (GCS) is unsupported for S3-native staging regardless of what the
+    /// probe would report, so it takes no probe at all: `probeConditionalCopy` issues its conditional
+    /// copies with a default `WriteSettings`, which never receives the GCS conditional-dialect header
+    /// mapping, so it would observe a raw `If-None-Match` that GCS ignores on `CopyObject` and report
+    /// enforcement where there is none. Even a corrected probe would not help — the generation that
+    /// `promoteStaged` needs comes back in a response HEADER, and the vendored `CopyObjectResult` the
+    /// copy call site reads only ever populates its `ETag` from the response BODY, so the token would
+    /// never reach the caller. Excluding generation stores here keeps that dead end unreachable instead
+    /// of surfacing it as a corrupted-token exception.
     bool copy_supported = false;
     if (staging_backend == Cas::StagingBackend::S3 && !read_only)
     {
-        const String probe_prefix = physicalKey(view.pool_prefix + "/staging/" + server_root_id + "/probe");
-        copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
-        if (!copy_supported)
+        if (view.native_token_type == Cas::TokenType::Generation)
+        {
             LOG_INFO(
                 getLogger("ContentAddressedMetadataStorage"),
-                "staging_backend=s3 requested but the object storage does not enforce conditional "
-                "copy; falling back to local staging");
+                "staging_backend=s3 requested but this object storage mints generation incarnation "
+                "tokens, which S3-native staging cannot carry through a server-side copy; falling "
+                "back to local staging");
+        }
+        else
+        {
+            const String probe_prefix = physicalKey(view.pool_prefix + "/staging/" + server_root_id + "/probe");
+            copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
+            if (!copy_supported)
+                LOG_INFO(
+                    getLogger("ContentAddressedMetadataStorage"),
+                    "staging_backend=s3 requested but the object storage does not enforce conditional "
+                    "copy; falling back to local staging");
+        }
 
         /// Reclaim this mount's own leaked `staging/<server_root_id>/` debris (a promote whose staging-delete never
         /// ran, or an aborted transaction's never-promoted staging object — see

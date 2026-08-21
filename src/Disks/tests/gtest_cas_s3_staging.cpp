@@ -11,6 +11,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskCommitTransactionOptions.h>
+#include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 
 #include <Poco/AutoPtr.h>
@@ -19,8 +20,16 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
+
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3Common.h>
+#include <aws/s3/S3Errors.h>
+#endif
 
 /// Task 0 of the S3-native staging plan: pure config plumbing, ZERO behavior change.
 /// `staging_backend` (default `local`) is parsed
@@ -910,3 +919,309 @@ TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
     EXPECT_FALSE(blobs_prefix.starts_with(staging_prefix));
     EXPECT_FALSE(staging_key.starts_with(blobs_prefix));
 }
+
+/// S3-native staging closes on a generation-token store: the converse of
+/// `GenerationDialectStorageSkipsConditionalCopyProbe` below -- an ETag/Emulated-dialect backend (every
+/// backend that is not a generation-token store) must still take the probe. This proves the guard
+/// discriminates on token type rather than skipping the probe unconditionally, which would satisfy the
+/// Generation-dialect test alone but leave S3-native staging permanently unusable everywhere.
+TEST(CASS3Staging, EtagDialectStorageStillProbesConditionalCopy)
+{
+    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountEtag");
+    metadata_storage->startup();
+
+    EXPECT_EQ(object_storage->callCount(), 2)
+        << "an ETag/Emulated-dialect backend must still take the S3-native staging probe";
+    EXPECT_TRUE(metadata_storage->conditionalCopySupported());
+}
+
+#if USE_AWS_S3
+
+namespace
+{
+
+/// A `LocalObjectStorage` that reports the GCS generation dialect
+/// (`conditionalOpsUseGenerationTokens() == true`) and a non-`Local` `getType()`, so
+/// `ContentAddressedMetadataStorage::openPoolView` builds its backend in `Mode::Native` with
+/// `native_token_type == TokenType::Generation` — exactly the combination the S3-staging guard
+/// (`ContentAddressedMetadataStorage.cpp`) must refuse to probe.
+///
+/// Holds every object entirely in memory, keyed by the BARE CAS key exactly as `Backend` hands it to
+/// `object_storage` (e.g. `"pool/_probe/<hex>/token"`). Native mode never asks `object_storage` to
+/// resolve that key against anything (`ContentAddressedMetadataStorage::physicalKey` is a documented
+/// no-op for Native, since a real S3 client resolves a bucket-relative key against its own bucket/prefix
+/// configuration internally) -- so this fake never needs a notion of "resolve a key to a location" at
+/// all, unlike a real filesystem-backed object storage would. That sidesteps the class of bug a
+/// resolve-then-strip round trip through the real `LocalObjectStorage` file/list implementation is prone
+/// to (a key is a key, with no round trip to get wrong), and it never touches the real filesystem, so it
+/// cannot leak files into the test process's working directory either.
+///
+/// A writable Native-mode mount always runs the mandatory capability battery (`CasProbe.cpp`), which
+/// requires REAL conditional-write enforcement: the precondition is evaluated when a write completes,
+/// signaled by an `S3Exception` carrying the canonical `PreconditionFailed` name (see
+/// `ObjectStorageBackend::finalizeConditionalWrite`). `writeObject` therefore buffers bytes in memory and
+/// defers both the precondition check and the commit to `finalize`, mirroring how a real object store
+/// only commits -- and only then can reject -- on PUT completion.
+class FakeGenerationObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    DB::ObjectStorageType getType() const override { return DB::ObjectStorageType::S3; }
+    bool conditionalOpsUseGenerationTokens() const override { return true; }
+    std::optional<bool> isBucketVersioningEnabled() const override { return false; }
+    bool supportsRetryProfile(DB::ObjectStorageRetryProfile) const override { return true; }
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> /*attributes*/,
+        size_t /*buf_size*/,
+        const DB::WriteSettings & write_settings) override
+    {
+        if (mode != DB::WriteMode::Rewrite)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "FakeGenerationObjectStorage only supports Rewrite");
+        return std::make_unique<ConditionalWriteBuffer>(
+            *this, object.remote_path, write_settings.object_storage_write_if_none_match,
+            write_settings.object_storage_write_if_match);
+    }
+
+    bool exists(const DB::StoredObject & object) const override
+    {
+        std::lock_guard lock(mutex);
+        return objects.contains(object.remote_path);
+    }
+
+    std::unique_ptr<DB::ReadBufferFromFileBase> readObject(
+        const DB::StoredObject & object,
+        const DB::ReadSettings & /*read_settings*/,
+        std::optional<size_t> /*read_hint*/,
+        bool /*use_external_buffer*/,
+        bool /*restrict_seek*/) const override
+    {
+        std::lock_guard lock(mutex);
+        auto it = objects.find(object.remote_path);
+        if (it == objects.end())
+            /// `RESOURCE_NOT_FOUND`, not a plain `DB::Exception`: `Backend::probeSentinelRaw`'s Native
+            /// path (`CasObjectStorageBackend.cpp`) classifies absence ONLY from a caught `S3Exception`
+            /// carrying `NO_SUCH_KEY`/`RESOURCE_NOT_FOUND` (or the matching exception name) -- anything
+            /// else, including an unrecognized exception TYPE, falls through to `ProbeOutcome::
+            /// Indeterminate` (fail-closed). A bodyless HEAD on a real absent S3 key throws exactly this
+            /// code, since the SDK cannot parse a `<Code>` from a body that was never sent.
+            throw DB::S3Exception("FakeGenerationObjectStorage: object does not exist",
+                                   Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+        /// Copies the bytes, matching a real remote read (no shared ownership with the stored entry, so
+        /// a later overwrite of this key cannot mutate bytes a caller is still reading).
+        return std::make_unique<DB::ReadBufferFromOwnMemoryFile>(object.remote_path, it->second.bytes);
+    }
+
+    DB::ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = tryGetObjectMetadata(path, with_tags);
+        if (!metadata)
+            throw DB::S3Exception("FakeGenerationObjectStorage: object does not exist",
+                                   Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
+        return *metadata;
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool /*with_tags*/) const override
+    {
+        std::lock_guard lock(mutex);
+        auto it = objects.find(path);
+        if (it == objects.end())
+            return std::nullopt;
+        DB::ObjectMetadata metadata;
+        metadata.size_bytes = it->second.bytes.size();
+        metadata.etag = std::to_string(it->second.generation);
+        return metadata;
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override
+    {
+        return tryGetObjectMetadata(path, with_tags);
+    }
+
+    void removeObjectIfExists(const DB::StoredObject & object) override
+    {
+        std::lock_guard lock(mutex);
+        objects.erase(object.remote_path);
+    }
+
+    void removeObjectsIfExist(const DB::StoredObjects & objects_to_remove) override
+    {
+        std::lock_guard lock(mutex);
+        for (const auto & object : objects_to_remove)
+            objects.erase(object.remote_path);
+    }
+
+    /// `path` is a bare CAS-relative prefix (e.g. `"pool/"` or `"pool/_probe/<hex>"`) -- exactly what
+    /// `Backend::list`'s Native-mode path passes through unchanged (it applies no prefix stripping of
+    /// its own there) and expects back on every listed key. A plain string-prefix scan over the
+    /// in-memory keys already IS that key space, so there is no separate "physical" representation to
+    /// resolve to or strip back off.
+    void listObjects(const std::string & path, DB::RelativePathsWithMetadata & children, size_t max_keys) const override
+    {
+        std::lock_guard lock(mutex);
+        for (const auto & [key, entry] : objects)
+        {
+            if (!key.starts_with(path))
+                continue;
+            DB::ObjectMetadata metadata;
+            metadata.size_bytes = entry.bytes.size();
+            metadata.etag = std::to_string(entry.generation);
+            children.push_back(std::make_shared<DB::RelativePathWithMetadata>(key, std::move(metadata)));
+            if (max_keys != 0 && children.size() >= max_keys)
+                break;
+        }
+    }
+
+    DB::ConditionalRemoveResult removeObjectIfTokenMatches(const DB::StoredObject & object, const std::string & etag) override
+    {
+        std::lock_guard lock(mutex);
+        DB::ConditionalRemoveResult result;
+        auto it = objects.find(object.remote_path);
+        if (it == objects.end())
+        {
+            result.outcome = DB::ConditionalRemoveOutcome::NotFound;
+            return result;
+        }
+        if (std::to_string(it->second.generation) != etag)
+        {
+            result.outcome = DB::ConditionalRemoveOutcome::TokenMismatch;
+            return result;
+        }
+        objects.erase(it);
+        result.outcome = DB::ConditionalRemoveOutcome::Removed;
+        return result;
+    }
+
+    /// Never expected to be called under the guard this test suite targets -- kept functional (not a
+    /// hard failure) so a regression surfaces as a wrong call count, the same signal every other
+    /// assertion here relies on, rather than a crash that could mask it.
+    DB::ConditionalCopyResult copyObjectConditional(
+        const DB::StoredObject & object_from,
+        const DB::StoredObject & object_to,
+        const DB::ReadSettings & read_settings,
+        const DB::WriteSettings & write_settings,
+        std::optional<DB::ObjectAttributes> object_to_attributes) override
+    {
+        ++copy_conditional_calls;
+        return DB::LocalObjectStorage::copyObjectConditional(object_from, object_to, read_settings, write_settings, object_to_attributes);
+    }
+
+    int copyConditionalCallCount() const { return copy_conditional_calls; }
+
+    /// Checks the write-once/exact-token precondition against the current generation and, on success,
+    /// stores `bytes` and mints the next generation. Throws an `S3Exception` naming `PreconditionFailed`
+    /// on a lost condition -- the one signal `finalizeConditionalWrite` classifies as
+    /// `PutOutcome::PreconditionFailed` rather than an ordinary failure.
+    void commitConditionalWrite(const std::string & key, const std::string & bytes,
+                                 const std::string & if_none_match, const std::string & if_match)
+    {
+        std::lock_guard lock(mutex);
+        auto it = objects.find(key);
+        const bool exists_now = it != objects.end();
+        if (!if_none_match.empty() && exists_now)
+            throw DB::S3Exception("FakeGenerationObjectStorage: if-none-match precondition failed",
+                                   Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
+        if (!if_match.empty() && (!exists_now || std::to_string(it->second.generation) != if_match))
+            throw DB::S3Exception("FakeGenerationObjectStorage: if-match precondition failed",
+                                   Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed");
+
+        objects[key] = Entry{bytes, next_generation++};
+    }
+
+private:
+    struct Entry
+    {
+        std::string bytes;
+        uint64_t generation;
+    };
+
+    /// Buffers the whole body in memory (like `FakeStagingSink` above) so the entry is committed exactly
+    /// once, at `finalize`, and only after the precondition has been checked.
+    class ConditionalWriteBuffer final : public DB::WriteBufferFromFileBase
+    {
+    public:
+        ConditionalWriteBuffer(FakeGenerationObjectStorage & storage_, std::string key_,
+                                std::string if_none_match_, std::string if_match_)
+            : DB::WriteBufferFromFileBase(/*buf_size=*/8192, nullptr, 0)
+            , storage(storage_), key(std::move(key_))
+            , if_none_match(std::move(if_none_match_)), if_match(std::move(if_match_))
+        {
+        }
+
+        void sync() override {}
+        std::string getFileName() const override { return key; }
+
+    protected:
+        void nextImpl() override
+        {
+            if (!offset())
+                return;
+            buffered.append(working_buffer.begin(), offset());
+        }
+
+        void finalizeImpl() override
+        {
+            next();
+            storage.commitConditionalWrite(key, buffered, if_none_match, if_match);
+        }
+
+    private:
+        FakeGenerationObjectStorage & storage;
+        std::string key;
+        std::string if_none_match;
+        std::string if_match;
+        std::string buffered;
+    };
+
+    mutable std::mutex mutex;
+    std::map<std::string, Entry> objects;
+    uint64_t next_generation = 1;
+    std::atomic<int> copy_conditional_calls{0};
+};
+
+std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_s3_staging_generation_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<FakeGenerationObjectStorage>(std::move(settings));
+}
+
+}
+
+/// S3-native staging closes on a generation-token store: the S3-staging capability probe
+/// (`Cas::probeConditionalCopy`) is meaningless on a GCS-dialect backend -- it issues its conditional
+/// copies with a default `WriteSettings`, which never receives the GCS conditional-dialect header
+/// mapping, so it would misreport enforcement where there is none. A generation-token backend must
+/// therefore take no probe at all and fall back to local staging.
+///
+/// Failing first: before the guard exists, `startup()` calls `Cas::probeConditionalCopy` unconditionally
+/// whenever `staging_backend == Cas::StagingBackend::S3 && !read_only`
+/// (`ContentAddressedMetadataStorage.cpp`, inside `startup()`), which drives exactly two
+/// `copyObjectConditional` calls against this fake -- `copyConditionalCallCount()` reads 2, failing the
+/// `EXPECT_EQ(..., 0)` below. The `if (view.native_token_type == Cas::TokenType::Generation)` guard is
+/// the single line that skips that call for this backend.
+TEST(CASS3Staging, GenerationDialectStorageSkipsConditionalCopyProbe)
+{
+    auto object_storage = makeFakeGenerationObjectStorageForTest();
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountGen");
+    metadata_storage->startup();
+
+    EXPECT_EQ(object_storage->copyConditionalCallCount(), 0)
+        << "a generation-token backend must never be probed for conditional-copy support -- the "
+           "probe's default WriteSettings never receive the GCS dialect mapping, so it would "
+           "misreport enforcement";
+    EXPECT_FALSE(metadata_storage->conditionalCopySupported());
+}
+
+#endif

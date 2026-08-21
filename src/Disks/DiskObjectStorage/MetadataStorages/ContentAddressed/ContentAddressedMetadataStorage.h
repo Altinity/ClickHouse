@@ -728,6 +728,12 @@ private:
         /// SAME resolved value to build its own probe key, so it is returned here rather than
         /// recomputed a second time.
         String pool_prefix;
+        /// The backend's native incarnation-token dialect (`Cas::ObjectStorageBackend::nativeTokenType`),
+        /// captured while the concrete backend is still in scope. `startup()`'s S3-staging capability
+        /// probe needs this same fact to decide whether the probe is meaningful at all, and reading it
+        /// back out through `pool` would mean unwrapping the instrumentation decorator `Pool::open`
+        /// wraps the backend in -- returned here instead so there is exactly one place that reads it.
+        Cas::TokenType native_token_type = Cas::TokenType::ETag;
     };
 
     /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does. A read-only
