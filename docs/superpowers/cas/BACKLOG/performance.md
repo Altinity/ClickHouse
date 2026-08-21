@@ -159,3 +159,35 @@ large primary key is buffered entirely in memory and then written twice. Fix: ad
 default names to the allowlist, and — the structural half — emit a log/metric when an unknown
 extension takes the buffered path, so the next new MergeTree file name shows up instead of silently
 costing memory. Predicate unchanged since `c623713479f`.
+
+## The part-folder view cache byte budget is inoperative (2031-triage CAS-045) {#part-folder-cache-weight-always-256}
+
+`PartFolderView::estimatedBytes` returns `256 + manifest_size` (`Parts/PartFolderAccess.cpp:136-140`)
+and `manifest_size` comes from `Cas::Resolved` (`Pool/CasRefProtocol.h:126`), which BOTH producers
+hardwire to zero: `CasRefLedger::resolveRef` (`Pool/CasRefLedger.cpp:341-345`) and
+`CasRefLedger::listRefs` (`:373-377`). The field has never been populated since it was introduced in
+`7a640e5ac69`, so every retained view weighs exactly 256 bytes.
+
+Two consequences, both confirmed at HEAD:
+
+- `part_folder_cache_bytes` (default 64 MiB, `ContentAddressedSettings.cpp:86`) is not a byte budget
+  at all — it degenerates to an entry cap of `cache_bytes / 256`, i.e. 262144, far above
+  `part_folder_cache_max_entries` (default 10000, `:87`). The only live bound is the entry count, and
+  what each entry actually pins is the fully decoded `PartManifest` including every `inline_bytes`
+  body (up to the 16 MiB aggregate inline cap per part, see
+  `formats-and-storage.md`{#manifest-inline-budget-no-spill}). 10000 wide-part views with
+  a few hundred KiB of inline `checksums.txt`/`serialization.json`/`primary.cidx` each is gigabytes of
+  memory an operator believes is capped at 64 MiB. `CurrentMetrics::CASPartFolderCacheBytes`
+  (`CurrentMetrics.cpp:233`) reports the same fiction.
+- the oversized-entry bypass at `Parts/PartFolderAccess.cpp:226` compares 256 against
+  `part_folder_cache_max_entry_bytes` (default 16 MiB, `ContentAddressedSettings.cpp:88`), so nothing
+  is ever excluded for being too large and `CASPartFolderViewOversizedBypasses` can only ever be zero.
+  The setting and the metric are both dead.
+
+No correctness impact — this is memory accounting only, and the entry cap keeps the cache finite —
+hence P2. Owed: weigh the view from the decoded body it actually owns (sum of entry path lengths plus
+`inline_bytes` sizes plus a fixed per-entry overhead) and delete `Resolved::manifest_size`, whose only
+consumer is this weight; a `manifest_size` sourced from the ref ledger cannot be made to work because
+the ledger never learns the body size. A gtest should assert a manifest with a large inline body
+weighs more than an empty one (today `gtest_cas_part_folder_view.cpp:50` passes `manifest_size=1000`
+by hand, which is why the unit tests never noticed).

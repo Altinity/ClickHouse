@@ -197,3 +197,48 @@ Owed: track the inline total during staging and demote the largest inline candid
 the cap (the machinery already exists on the per-entry path), so the cap becomes a placement decision
 instead of a write refusal. Fixing {#part-file-suffix-allowlist-memory} shrinks the exposure but does
 not close it (projection metadata and skip-index bodies stay inline-eligible by design).
+
+## Control-object bytes are materialized whole before the format cap is checked (2031-triage CAS-036) {#control-object-read-precap-materialization}
+
+Every control-object read is `Backend::get` → whole body into a `String` → `openObject`, which is
+where the per-format `object_cap` first fires (`Backend/CasObjectStorageBackend.cpp:356`
+`readStringUntilEOF`, `Formats/CasTextFormat.cpp:388-403`). `get` already HOLDS the authoritative
+size — it HEADs the key first and passes `hr->size` down (`:614`) — so nothing stops a pre-read gate
+except that `get` is format-agnostic and no caller passes its cap down. Consequence today is a
+transient allocation the size of whatever sits at the key before the cap can refuse it; under the
+memory tracker that surfaces as `MEMORY_LIMIT_EXCEEDED` on a GC/mount/recovery thread instead of the
+`CORRUPTED_DATA` the caps exist to produce. Fail-loud either way, and only a bucket-credential holder
+can plant such an object ({#pool-trust-boundary-undocumented} — that credential is the whole trust
+boundary), hence P3, not a security defect.
+
+Fix direction: give `get`/`getStream` an optional expected-cap argument (or a thin
+`getControlObject(FormatId, key)` wrapper) and refuse `hr->size > object_cap` before the read, so the
+cap is enforced at the same place for every format and the error is the pinned one.
+
+Second, independent residue in the same read: `JsonObjectReader::nextKey` de-duplicates keys with a
+linear `std::find` over a `std::vector<String>` (`Formats/CasTextFormat.cpp:173-175`), so one line
+with k distinct keys costs Θ(k²) comparisons. The line caps bound k, but the `RefLog`/`RefSnapshot`
+line cap is 64 MiB (`Formats/CasFormat.cpp:144`) — millions of keys, i.e. a single planted record
+that pins one thread for a long time. Cheap fix: a sorted/hashed seen-set, or a key-count cap per
+object.
+
+## The `std::stoull` key-number parses accept `-1` and the manifest read window can wrap (2031-triage CAS-037) {#numeric-parse-and-window-wrap}
+
+Three GC key-shape parses use `std::stoull` inside `catch (...)` (`Gc/CasGc.cpp:1488`, `:1619`,
+`:4094`). The catch handles junk, but `std::stoull("-1")` does not throw — it returns `UINT64_MAX`
+(verified) — so a key named `.../gc/gen/-1/...` parses as a legitimate generation. At `:4094` that
+value flows into `const uint64_t generation = max_gen + 1` (`:4102`), which wraps to 0 and hands the
+REBUILD path a generation number the very comment above it forbids ("must never collide with debris
+of the lost era"). The same lesson was already learned and fixed elsewhere in this tree with
+`std::from_chars` (`ContentAddressedMetadataStorage.cpp:332-340`, commit `fc89b827d74`); these three
+sites did not get it. Fix: `std::from_chars` at all three, plus a saturating/`checked` successor for
+`max_gen + 1`.
+
+Related in the same class: `readBlobPayload` forms the read window as
+`location.offset + location.length` twice (`ContentAddressedMetadataStorage.cpp:2004-2006`) where
+`length` is the manifest's `sz`, parsed with `readIntText`'s default
+`DO_NOT_CHECK_OVERFLOW` (`Formats/CasPartManifestFormat.cpp:222`, `src/IO/readIntText.h:246`). A `sz`
+near `UINT64_MAX` wraps the sum below `offset`, and `ReadBufferFromFileView` has no
+`left_bound <= right_bound` precondition — the window collapses to an immediate EOF (empty read,
+loud failure downstream), so this is robustness, not silent corruption. Fix on the CAS side (validate
+`sz` or use a saturating add) rather than in the generic upstream buffer.
