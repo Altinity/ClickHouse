@@ -99,8 +99,8 @@
 | CAS-081 | частично | P2 | [{#s3-staging-reclaim-only-at-mount-start}](BACKLOG.md#s3-staging-reclaim-only-at-mount-start) | нет | Форма кода описана верно и удержание staging-объекта на abort — сознательный дизайн (это источник resurrect для promote), но приписанные следствия частично ложны: мёртвого члена дренирует `SYSTEM CAS DROP POOL MEMBER`, а «два диска с одним srid» невозможны из-за fail-closed mount-claim; реальный остаток — отсутствие периодической уборки в течение работы монтирования и отсутствие интроспекции. |
 | CAS-082 | частично | P3 | [{#mpu-and-probe-debris-unaccounted}](BACKLOG.md#mpu-and-probe-debris-unaccounted) | нет | Форма кода описана верно (CAS не ведёт своего учёта multipart, `_probe/` исключён из bootstrap-скана), но последствия завышены: обычные пути аборт делают в апстримном буфере, а мусор пробы возникает только при hard-kill; остаётся косметический (cost-only) остаток — задокументирован новым пунктом BACKLOG. |
 | CAS-083 | by-design | — | — | — | Форма кода на HEAD подтверждается (hardlink/repoint переносят тот же `BlobRef`), но это и есть суть CAS-дедупликации и ровно то же поведение, что у обычного MergeTree при lightweight `DELETE`; позиция «не фиксим» в силе. |
-| CAS-084 | ⏳ | — | — | — | — |
-| CAS-085 | ⏳ | — | — | — | — |
+| CAS-084 | частично | P3 | [{#file-cache-stale-after-gc-reclaim}](BACKLOG.md#file-cache-stale-after-gc-reclaim) | нет | Механизм реален — CA-удаления идут в обход кэширующего object storage, так что записи файлового кэша для отобранных GC блобов не инвалидируются; но «ёмкость держится бесконечно» и «удалённый контент читается» — преувеличение: кэш обязательно ограничен и вытесняется по LRU, а ключи контент-адресные, поэтому устаревшая запись физически не может вернуть чужие/неверные байты. |
+| CAS-085 | частично | P2 | [{#always-copy-instead-of-hardlinks-no-gate}](BACKLOG.md#always-copy-instead-of-hardlinks-no-gate) | нет | Ядро находки верно и достижимо — при `always_use_copy_instead_of_hardlinks=1` мутации и однодисковые клоны разделов на CA-таблице падают громким `NOT_IMPLEMENTED`, и настройка ничем не отвергается; но `FREEZE`, BACKUP/RESTORE-клон и «неявный zero-copy» этот путь не достают, а отказ fail-closed, без порчи данных. |
 | CAS-086 | ⏳ | — | — | — | — |
 | CAS-087 | ⏳ | — | — | — | — |
 | CAS-088 | ⏳ | — | — | — | — |
@@ -3767,3 +3767,79 @@ condemned-маркер без тела».
 
 ИТОГ: форма кода подтверждена, следствие — известный и принятый by-design остаток (R4), видимый как
 `unaccounted`; блокером релиза не является, тихой порчи нет. P3.
+
+## CAS-084 — Механизм реален — CA-удаления идут в обход кэширующего object storage, так что записи файлового кэша для отобранных GC блобов не инвалидируются; но «ёмкость держится бесконечно» и «удалённый контент читается» — преувеличение: кэш обязательно ограничен и вытесняется по LRU, а ключи контент-адресные, поэтому устаревшая запись физически не может вернуть чужие/неверные байты. (частично, P3) {#cas-084}
+
+## Что подтверждается на HEAD
+
+Анкор находки (`src/Disks/DiskObjectStorage/DiskObjectStorageCache.cpp:21-23`) по смыслу верен, номера строк близки: на HEAD это `DiskObjectStorageCache.cpp:14-43` (`DiskObjectStorage::wrapWithCache`). Файл generic, не переезжал.
+
+1. Кэш-диск над CA действительно переиспользует то же самое CA-метахранилище, а оборачивает только object storage: `DiskObjectStorageCache.cpp:25` (`registry[local_location] = std::make_shared<CachedObjectStorage>(...)`) и `:35-37` — `MetadataStoragePtr cache_metadata_storage = metadata_storage->isContentAddressed() ? metadata_storage : std::make_shared<MetadataStorageFromCacheObjectStorage>(metadata_storage);`. Комментарий `:27-34` прямо фиксирует и мотив («generic passthrough скрывает `isContentAddressed` и конкретные CA-типы»), и следствие («control plane продолжает пользоваться собственным raw-указателем на object storage и обходит кэш»).
+
+2. Чтения блобов части ДЕЙСТВИТЕЛЬНО идут через кэшированный роутер, т.е. кэш реально наполняется CA-блобами: `DiskObjectStorage.cpp:825-834` строит `ca_blob_view`, `:842` берёт `object_storages->takePointingTo(cluster->getLocalLocation())` (это роутер, в котором локальная позиция подменена на `CachedObjectStorage`), `:861` вычисляет `file_cache_enabled = storage->supportsCache() && read_settings.enable_filesystem_cache`, `:882` — `storage->prepareRead(...)` («CachedObjectStorage::prepareRead adds needFilesystemCache automatically»).
+
+3. Удаления (и записи) CA идут в обход кэша. Бэкенд пула конструируется над raw-указателем метахранилища: `ContentAddressed/ContentAddressedMetadataStorage.cpp:692` — `std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_conditional_put_bytes)`, где `object_storage` — член `ContentAddressedMetadataStorage.h:571`, тот самый, что был передан фабрикой диска (не `CachedObjectStorage`). Реклейм GC — `Backend/CasObjectStorageBackend.cpp:999-1014` (`deleteExact` → `object_storage->removeObjectIfTokenMatches`), staging-уборка транзакции — `ContentAddressedTransaction.cpp:197` (`metadata_storage.objectStorage()->removeObjectIfExists`). Оба — по raw-указателю.
+
+4. Единственный хук инвалидации действительно недостижим для CA-путей: `ObjectStorages/Cached/CachedObjectStorage.cpp:150-158` (`removeCacheIfExists` → `cache->removeKeyIfExists`) вызывается только изнутри самого `CachedObjectStorage` — из `writeObject` (`:130`), `removeObjectIfExists` (`:162`) и `removeObjectsIfExist` (`:166-168`). Проверка «ничего в CA-дереве не зовёт `removeCacheIfExists`» верна: единственные упоминания в `src/` — объявление `IObjectStorage.h:382`, реализация и вызовы в `CachedObjectStorage.{h,cpp}`.
+
+Итог по механизму: после реклейма блоба GC его сегменты остаются в локальном файловом кэше без инвалидации. Это подтверждено.
+
+## Что в находке неверно / преувеличено
+
+- «capacity held indefinitely» — неверно. Кэш-диск обязан объявить бюджет: `src/Interpreters/FileCache/FileCacheSettings.cpp:230-231` бросает `BAD_ARGUMENTS`, если не задан ни `max_size`, ни `max_size_ratio_to_total_space`, и `:236-237` запрещает `max_size = 0`. То есть кэш конечен и устаревшие сегменты вытесняются штатным LRU/SLRU-механизмом при первом же давлении. Реальный урон — деградация полезной доли кэша, а не рост потребления диска без границ.
+- «deleted content still readable locally» — по факту без последствий. Ключ кэша — это ключ объекта (`getCacheKey(object.remote_path)`, `CachedObjectStorage.cpp:157`), а в CA ключ блоба производен от хеша содержимого, поэтому попадание в кэш может вернуть ровно те байты, которыми запись была заполнена. Прочитать устаревший сегмент можно только запросив тот же ключ, а после реклейма на него не ссылается ни один живой ref; при воскрешении (re-upload) ключ тот же ⇒ и байты те же. Ни неверных результатов, ни подмены содержимого этот дефект дать не может. Остаётся лишь нюанс остаточных данных на локальном диске (data remanence) до вытеснения — с ручкой `SYSTEM DROP FILESYSTEM CACHE` у оператора.
+- Класс `LEAK` натянут: это не утечка (бюджет конечен, ссылок на записи нет), а промах гигиены/эффективности кэша. Отказов нет вовсе — путь молчаливый, но и портить нечего.
+- Дополнительно (уточнение, не в пользу находки): наполнения кэша на записи не происходит вообще — cache-on-write в `CachedObjectStorage::writeObject` (`:120-146`) достижим только для записей через роутер, а CA грузит блобы бэкендом по raw-указателю (см. п. 3). Так что запись в кэш возникает исключительно на чтениях.
+
+## История и покрытие в BACKLOG
+
+- Кэш-над-CA — сознательно поддержанный, но ОПЦИОНАЛЬНЫЙ путь: включается только явной конфигурацией `<type>cache</type>` над CA-диском; появился в `3ed0e5f5030` «fix(cas): support file-cache disk over a content-addressed disk» (единственный CA-коммит в `git log -- src/Disks/DiskObjectStorage/DiskObjectStorageCache.cpp`). Есть soak-конфиг `utils/ca-soak/configs/storage_conf_s3cache_ch1.xml` (сценарий `s3cache`).
+- Существующего пункта именно про инвалидацию кэша при реклейме в `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` НЕТ (grep по `removeCacheIfExists`, `file cache`, `filesystem cache`, `ca_cache`): рядом только `BACKLOG/performance.md:26` ({#read-request-count} — «Companion to the (landed, opt-in) file-cache disk») и `BACKLOG.md:417` {#s3cache-config-comment-stale} (устаревший комментарий в soak-конфиге) — оба про другое.
+- Ничего из этого не закрыто более поздней работой: `removeCacheIfExists` не появился ни в одном CA-файле на HEAD.
+
+## Что реально осталось
+
+Два остатка, оба минорные: (a) устаревшие сегменты занимают бюджет кэша до вытеснения ⇒ падает hit rate на GC-активной нагрузке; (b) байты отобранного блоба лежат на локальном диске узла до вытеснения. Заведена новая (некоммиченная) секция `docs/superpowers/cas/BACKLOG/performance.md` {#file-cache-stale-after-gc-reclaim} с механизмом, границами (кэш конечен, ключи контент-адресные) и направлением фикса (нотификация локального кэша из пути реклейма; маршрутизировать CA-удаления через `CachedObjectStorage` НЕЛЬЗЯ — control plane обходит кэш намеренно).
+
+Приоритет P3: путь opt-in, корректность не затронута, отказов нет, у оператора есть `SYSTEM DROP FILESYSTEM CACHE`. Пред-релизным не является.
+
+## CAS-085 — Ядро находки верно и достижимо — при `always_use_copy_instead_of_hardlinks=1` мутации и однодисковые клоны разделов на CA-таблице падают громким `NOT_IMPLEMENTED`, и настройка ничем не отвергается; но `FREEZE`, BACKUP/RESTORE-клон и «неявный zero-copy» этот путь не достают, а отказ fail-closed, без порчи данных. (частично, P2) {#cas-085}
+
+## Анкоры
+
+Анкор находки `CA/ContentAddressedTransaction.cpp:363-366`, `:492-495` — из снапшота до `592b9b83568`. На HEAD: `generateObjectKeyForPath` → `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp:530-533` (`notYet("generateObjectKeyForPath")`), `createMetadataFile` → `:697-700` (`notYet("createMetadataFile")`), сам `notYet` — `:83-90`. Generic-анкоры `MutateTask.cpp:2490-2494`, `:2513-2517`, `:3306-3311` совпали почти точно: на HEAD `:2493-2496`, `:2516-2519`, `:3312`.
+
+## Что подтверждается на HEAD
+
+1. Настройка существует, дефолт `false`, ничем на CA не отвергается: `src/Storages/MergeTree/MergeTreeSettings.cpp:1902` (`DECLARE(Bool, always_use_copy_instead_of_hardlinks, false, ...)`). Grep по `always_use_copy_instead_of_hardlinks` в `src/` даёт только точки ЧТЕНИЯ (`StorageMergeTree.cpp:3215`, `StorageReplicatedMergeTree.cpp:3357`, `:5600`, `:9070`, `:9220`, `:9511`, `MutateTask.cpp:2493`, `:2516`, `:3312`, `BuzzHouse/Generator/TableSettings.cpp:78`) — ни одного гейта ни в `checkAlterIsPossible`, ни при `CREATE`. Утверждение «nothing rejects the setting» верно.
+
+2. Копирующая ветка на CA действительно упирается в `notYet`. `DiskObjectStorageTransaction::copyFileImpl` строит ключи назначения через `metadata_transaction->generateObjectKeyForPath(to_file_path)` (`src/Disks/DiskObjectStorage/DiskObjectStorageTransaction.cpp:522-524`), т.е. бросок происходит ДО каких-либо байтовых операций. Это зафиксировано в коде явным комментарием `:565-568`: «Unreachable on CA (Audit 6): `copyFileImpl` calls `generateObjectKeyForPath` above, which throws `NOT_IMPLEMENTED` on CA before this point». `createMetadataFile` при этом действительно недостижим на CA — так что вторая половина анкора («`createMetadataFile` → `notYet`») формально мертва: до неё не доходит.
+
+3. Достижимые триггеры (проверены по цепочкам):
+   - Мутации (`ALTER ... UPDATE/DELETE`, `MATERIALIZE INDEX`): `MutateTask.cpp:2493-2496` (файлы части) и `:2516-2519` (файлы проекции) при включённой настройке зовут `copyFileFrom` вместо `createHardLinkFrom`; `DataPartStorageOnDiskFull::copyFileFrom` (`src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp:372-388`) идёт напрямую в `disk->copyFile`, минуя транзакцию части; `DiskObjectStorage::copyFile` (`DiskObjectStorage.cpp:291-321`) при совпадающем `DataSourceDescription` создаёт object-storage-транзакцию и зовёт `transaction->copyFile` → `copyFileImpl` → `notYet`. Это самый частый путь: «перенести неизменённые файлы вперёд» — норма любой частичной мутации.
+   - Клон неизменённой части в мутации: `MutateTask.cpp:3312` кладёт `copy_instead_of_hardlink` в `ClonePartParams`; далее `MergeTreeData::cloneAndLoadDataPart` при `on_same_disk` (`MergeTreeData.cpp:9699-9706`) → `DataPartStorageOnDiskBase::freeze` (`:530-561`, где для CA создаётся `owned_transaction`, `:542-544`) → `Backup(..., params.copy_instead_of_hardlink, ...)` (`:552-561`) → `BackupImpl`, и его копирующая ветка при наличии транзакции — `transaction->copyFile(source, destination, ...)` (`src/Storages/MergeTree/Backup.cpp:61-65`). Тот же `notYet`.
+   - Однодисковые `ATTACH/REPLACE PARTITION FROM` и `MOVE PARTITION TO TABLE` на `StorageMergeTree`: `StorageMergeTree.cpp:3215` передаёт настройку в `ClonePartParams` того же `cloneAndLoadDataPart`.
+
+## Что в находке неверно
+
+- **`ALTER TABLE ... FREEZE` эту настройку не читает.** `MergeTreeData::freezePartitionsByMatcher` строит `ClonePartParams` ровно с одним полем — `MergeTreeData.cpp:9988-9991`: `IDataPartStorage::ClonePartParams params { .make_source_readonly = true };`. `copy_instead_of_hardlink` остаётся дефолтным `false` (`IDataPartStorage.h:271`), т.е. `FREEZE` идёт по hardlink-ветке `Backup` (`Backup.cpp:69-73`), которая на CA поддержана (`ContentAddressedTransaction::createHardLink`, `ContentAddressedTransaction.cpp:1144`).
+- **BACKUP/RESTORE-клон тоже не через эту настройку.** Единственные точки установки `copy_instead_of_hardlink` в `MergeTreeData.cpp` — `:9695`, `:9747`, `:9754`, `:9769` (все внутри `cloneAndLoadDataPart`); ни BACKUP (`DataPartStorageOnDiskBase::backup`, у которого свой CA-гейт `SUPPORT_IS_DISABLED` на `make_temporary_hard_links`, `:422-427`), ни путь восстановления её не читают.
+- **Неявная активация через zero-copy на CA мертва.** Термы `... || ((our_zero_copy_enabled || source_zero_copy_enabled) && src_part->isStoredOnRemoteDiskWithZeroCopySupport())` (`StorageReplicatedMergeTree.cpp:3357`, `:9220`, `:9511`) на CA не срабатывают: `DiskObjectStorage::supportZeroCopyReplication` возвращает `false` для `MetadataStorageType::CAS` (`src/Disks/DiskObjectStorage/DiskObjectStorage.h:53-58`, «zero-copy subsystem (B1) is explicitly out of scope for M1»). То есть дефект требует именно явного включения настройки — «silently accepted and then permanently breaks» верно только для оператора, который её сам выставил.
+- «permanently breaks» — с оговоркой: настройка обратима (`ALTER ... MODIFY SETTING ... = 0`), после чего застрявшая мутация проходит. Необратимого состояния нет.
+
+## Класс отказа
+
+Отказ громкий и fail-closed: бросок происходит до любой записи в пул, `notYet` — `NOT_IMPLEMENTED` (`ContentAddressedTransaction.cpp:83-90`), а клонирующая ветка вдобавок обёрнута откатом (`DiskObjectStorage.cpp:311-316` `transaction->undo()`, `Backup.cpp:180-184` `CleanupOnFail`). Тихой порчи/частичного состояния нет. Реальный вред — недоступность мутаций и однодисковых операций с разделами плюс бесконечный retry записи мутации в очереди, пока настройка не снята. Побочно: текст исключения («Hitting it usually means the disk is wrapped by a layer that bypasses the content-addressed write path») для этого триггера дезориентирует — обёртки тут нет, виновата настройка таблицы.
+
+## История и покрытие в BACKLOG
+
+- В `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` пункта про `always_use_copy_instead_of_hardlinks` НЕТ (grep по `hardlink` даёт только `performance.md:144` {#ca-trycommit-retry-loses-staged-state} и `performance.md:287` {#hardlink-per-file-forcefresh-head} — оба про другое). В `docs/superpowers/cas/final-checks-todo.md` тоже нет.
+- Не дубликат CAS-058/{#issue-2173-freezeremote-gap}: там КРОСС-дисковый `ATTACH PARTITION FROM` через `freezeRemote` без CA-транзакции (и без участия этой настройки); здесь — однодисковый путь и мутации, ломающиеся именно настройкой.
+- Ничем не закрыто: `git log -S "generateObjectKeyForPath"` по CA-файлу показывает только перенос/рефакторинг, ветки `copyFile` для CA не появилось; grep по `copyFile|copyObject` внутри каталога `ContentAddressed/` — ноль реализаций.
+- Тестового покрытия нет: единственное упоминание настройки в `tests/` — снапшот списка настроек `tests/queries/0_stateless/02995_merge_tree_settings_settings_26_5_1.tsv`; CA-полосы её не включают, так что «missing coverage» здесь — правда, но и сама комбинация не поддержана.
+
+## Что реально осталось
+
+Отсутствие fail-fast гейта: настройку следует отвергать на CA-политике в `CREATE`/`ALTER MODIFY SETTING` (шаблон — `SUPPORT_IS_DISABLED`-гейты в `MergeTreeData::checkAlterIsPossible`), либо научить CA-транзакцию обслуживать `copyFile` как манифестный carry-forward (что она уже умеет для `createHardLink`). Заведена новая (некоммиченная) секция `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` {#always-copy-instead-of-hardlinks-no-gate} с достижимыми путями, опровергнутыми претензиями (FREEZE / BACKUP / zero-copy) и направлением фикса.
+
+Приоритет P2: требуется явное включение неподдержанной настройки, отказ громкий и обратимый, порчи нет — но застревающая очередь мутаций достаточно неприятна, чтобы гейт заслуживал трекинга. Пред-релизным блокером не является.

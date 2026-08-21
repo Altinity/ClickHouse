@@ -380,7 +380,7 @@ pool meta rather than from the object: `CasManifestReader::locate` returns
 forensic fields, never a gate on a read; `runFsck` never GETs a body either, by design (GET budget).
 
 This is a deliberate design (constant-shift locate, no per-object header read, documented at
-`Formats/CasBlobEnvelopeFormat.h:79-93` and `Pool/CasManifestReader.cpp:147-153`), and divergence
+`Formats/CasBlobEnvelopeFormat.h:44-58, 76-93` and `Pool/CasManifestReader.cpp:147-153`), and divergence
 between an object's real envelope length and the pool's `blob_header_len` is unreachable today:
 `blob_header_len` is minted once at pool creation and the pool is authoritative on reopen
 (`Pool/CasPoolMeta.cpp:122`, `:150`), a mount whose expected value disagrees is rejected
@@ -392,8 +392,45 @@ Residual for the format-freeze pass (same gate as `[gc-snap-codec-tlv-review]` a
 `[codecs.md standardization]`): decide explicitly whether the envelope stays a write-only forensic
 record or gains a read-side use, and record the decision. Two cheap options if it stays write-only:
 drop `decodeEnvelopeHeader`'s unused `object_size` parameter
-(`Formats/CasBlobEnvelopeFormat.cpp:157` — the parameter is already unnamed) or give it a real
+(`Formats/CasBlobEnvelopeFormat.cpp:162` — the parameter is already unnamed) or give it a real
 consumer; and have fsck's `detail` mode optionally decode the envelope of a sampled blob so
 `header_len == blob_header_len` and `v` are proven somewhere outside `INSPECT`. No integrity item:
 a wrong offset would hand MergeTree shifted bytes, which its own compressed-block checksums reject
 loudly.
+
+## `Layout::checkNamespace` is the only CAS path validator that admits `.` and `..` segments (2031-triage CAS-091) {#checknamespace-admits-dot-segments}
+
+`Layout::checkNamespace` (`Formats/CasLayout.cpp:319-343`) rejects an empty namespace, an empty
+segment (leading/trailing/doubled `/`) and the reserved `_files`/`_manifests` segments — but NOT a
+`.` or `..` segment. Every sibling validator in the tree does reject them:
+
+- `validateServerRootId` (`Pool/CasServerRoot.h:199-225`) is otherwise the SAME function and has the
+  check at `:216-218` ("uses a relative segment ('.' or '..')");
+- `isCanonicalRefName` (`Primitives/CasCodecUtil.h:71-…`, doc `:65-70`);
+- `isCleanRelativeNamespaceFileName` (`Formats/CasLayout.h:25-31`);
+- the manifest entry-path check (`Formats/CasPartManifestFormat.cpp:197-210`), whose comment even
+  claims it enforces "the same path hygiene as `CasLayout::checkNamespace` … no empty/'.'/'..'
+  segments" — a parity claim that is false at HEAD. `Pool/CasServerRoot.h:192` carries the mirror
+  version of the same false claim.
+
+The mechanism the divergence would enable is real, not theoretical: for `ObjectStorageType::Local`
+the backend is auto-selected into `EmulatedSingleProcess`
+(`ContentAddressedMetadataStorage.cpp:688-690`) and keys are joined under the disk root via
+`getCommonKeyPrefix` (`:727-729`), i.e. they ARE filesystem paths, so a namespace segment `..` would
+escape the pool root.
+
+No production reachability today, which is why this is hygiene and not an incident:
+- every live namespace is `serverPrefix() + "/" + mirroredArchiveNamespace(table_uuid)`
+  (`ContentAddressedMetadataStorage.cpp:1267-1273`), and the prefix is the config value already run
+  through `validateServerRootId` (`ContentAddressedSettings.cpp:192`);
+- `mirroredArchiveNamespace` builds `store/<u3>/<uuid>@cas@` or `data/<db>/<tbl>@cas@`
+  (`Parts/PartPathParser.cpp:376-386`) from escaped identifiers / a hex UUID;
+- the one user-supplied string on the shadow path is the FREEZE backup name, and MergeTree escapes it
+  before it becomes a directory (`MergeTreeData.cpp:9947` `escapeForFileName(with_name)`, which turns
+  `..` into `%2E%2E`).
+
+Fix is one line plus prose: add the `.`/`..` segment rejection to `checkNamespace` (or have it call
+the shared helper), which also makes the two "same hygiene as `checkNamespace`" comments true. Worth
+a gtest case next to the existing namespace-validation cases, since `validateNamespace`
+(`Formats/CasLayout.h:451`) is explicitly the re-validation hook for namespaces reconstructed from
+untrusted listed keys on the GC ref-intake path.
