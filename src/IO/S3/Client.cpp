@@ -985,10 +985,15 @@ bool Client::supportsMultiPartCopy() const
     return provider_type != ProviderType::GCS;
 }
 
+bool httpClientImpliesGcsGenerationDialect(const String & http_client)
+{
+    const auto lowered = Poco::toLower(http_client);
+    return lowered == "gcp_oauth" || lowered == "gcs_hmac";
+}
+
 bool Client::supportsGcsNativeConditionalRequests() const
 {
-    const auto http_client = Poco::toLower(client_configuration.http_client);
-    return http_client == "gcp_oauth" || http_client == "gcs_hmac";
+    return httpClientImpliesGcsGenerationDialect(client_configuration.http_client);
 }
 
 void Client::BuildHttpRequest(const Aws::AmazonWebServiceRequest& request,

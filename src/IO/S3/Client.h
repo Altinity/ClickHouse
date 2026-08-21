@@ -97,6 +97,14 @@ private:
 
 bool isS3ExpressEndpoint(const std::string & endpoint);
 
+/// Whether an `http_client` value selects a Google client whose objects are versioned by generation
+/// rather than by ETag. Case-insensitive, since the value comes from user configuration.
+///
+/// One definition on purpose: the answer is needed both by a live client (`Client::
+/// supportsGcsNativeConditionalRequests`) and by callers that only hold configuration text and have no
+/// client yet. Two copies would agree today and diverge the day a third value is added to one of them.
+bool httpClientImpliesGcsGenerationDialect(const std::string & http_client);
+
 struct ClientSettings
 {
     bool use_virtual_addressing = false;
@@ -114,6 +122,13 @@ struct ClientSettings
     bool gcs_issue_compose_request = false;
     bool is_s3express_bucket = false;
 };
+
+/// True for the two `http_client` values (case-insensitive) that select a GCS-native HTTP layer:
+/// `gcp_oauth` and `gcs_hmac`. The single source of truth for what "GCS generation dialect" means
+/// from configuration alone -- `Client::supportsGcsNativeConditionalRequests` below is this applied to
+/// a constructed client's own configuration; a caller that needs the answer before a client exists
+/// (e.g. deciding whether a config change would flip the dialect) calls this directly instead.
+bool httpClientImpliesGcsGenerationDialect(const String & http_client);
 
 /// Client that improves the client from the AWS SDK
 /// - inject region and URI into requests so they are rerouted to the correct destination if needed

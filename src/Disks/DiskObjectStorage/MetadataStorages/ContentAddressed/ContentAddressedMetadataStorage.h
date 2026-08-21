@@ -234,6 +234,20 @@ public:
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
 
+    /// `SYSTEM RELOAD CONFIG` rebuilds this disk's object-storage client (`DiskObjectStorage::
+    /// applyNewSettings` runs this BEFORE that rebuild) but never recreates the pool, so the token
+    /// dialect pinned at `startup` (`native_token_type` below) would otherwise silently go stale the
+    /// moment the new client mints the other kind: every conditional write, `supportsListTokens`, and
+    /// the GC precondition battery all key off the dialect fixed at construction. Refuses a reload that
+    /// would flip ETag<->generation for this disk; a same-dialect reload (including one that changes
+    /// unrelated auth settings) is unaffected. A disk not yet started has nothing to pin against and
+    /// this is a no-op.
+    void applyNewSettings(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix, ContextPtr context) override;
+
+    /// Test-only: force the dialect `applyNewSettings` believes this disk was opened with, so its
+    /// reload guard can be exercised for the generation-token direction without a real GCS backend.
+    void setNativeTokenTypeForTest(Cas::TokenType t) { native_token_type = t; }
+
     /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
     /// pool-member decommission): an observe-only (`<readonly>`) disk must reject them all.
     void checkNotReadOnly(std::string_view what) const;
@@ -640,6 +654,10 @@ private:
     /// snapshot-safety reason as cas_store.
     std::shared_ptr<Cas::CachedPartFolderAccess> part_access TSA_GUARDED_BY(pointer_mutex);
     String pool_uuid;
+    /// The backend's incarnation-token dialect pinned at `startup` (see `openPoolView`'s `PoolView::
+    /// native_token_type`) -- immutable afterwards. `applyNewSettings` reads this to refuse a reload
+    /// that would flip the dialect under the live pool.
+    Cas::TokenType native_token_type = Cas::TokenType::ETag;
     /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
     /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
     /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never

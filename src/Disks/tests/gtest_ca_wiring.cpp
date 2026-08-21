@@ -328,6 +328,8 @@ TEST(CASPartPathParser, SplitCacheEvictionStaysCorrect)
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
+#include <Poco/AutoPtr.h>
+#include <Poco/Util/MapConfiguration.h>
 
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
@@ -335,6 +337,7 @@ using DB::Cas::tests::u128Of;
 namespace DB::ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace
@@ -433,6 +436,32 @@ TEST(CASWiringCapability, SupportsAtomicFileWrites)
     auto plain_storage = std::make_shared<DB::MetadataStorageFromPlainObjectStorage>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), "", /*object_metadata_cache_size=*/0);
     EXPECT_FALSE(plain_storage->supportsAtomicFileWrites());
+}
+
+/// `SYSTEM RELOAD CONFIG` rebuilds the disk's object-storage client but never recreates the pool, so
+/// the incarnation-token dialect pinned at `startup` must stay fixed for the pool's lifetime. Both
+/// flip directions are refused; a reload that does not change the dialect (including one that changes
+/// unrelated settings) must still succeed.
+TEST(CASWiringReload, RejectsTokenDialectFlipEitherDirectionButAllowsANoOpReload)
+{
+    auto storage = openWiringStorage();
+
+    Poco::AutoPtr<Poco::Util::MapConfiguration> etag_to_generation = new Poco::Util::MapConfiguration();
+    etag_to_generation->setString("disk.http_client", "gcs_hmac");
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
+        [&] { storage->applyNewSettings(*etag_to_generation, "disk", nullptr); });
+
+    storage->setNativeTokenTypeForTest(DB::Cas::TokenType::Generation);
+    Poco::AutoPtr<Poco::Util::MapConfiguration> generation_to_etag = new Poco::Util::MapConfiguration();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
+        [&] { storage->applyNewSettings(*generation_to_etag, "disk", nullptr); });
+
+    /// Same dialect (Generation, pinned above): an unrelated setting change must not be caught up in
+    /// the guard.
+    Poco::AutoPtr<Poco::Util::MapConfiguration> unrelated_change = new Poco::Util::MapConfiguration();
+    unrelated_change->setString("disk.http_client", "gcp_oauth");
+    unrelated_change->setString("disk.region", "some-other-region");
+    EXPECT_NO_THROW(storage->applyNewSettings(*unrelated_change, "disk", nullptr));
 }
 
 TEST(CASWiringRead, ResolvesPublishedPart)

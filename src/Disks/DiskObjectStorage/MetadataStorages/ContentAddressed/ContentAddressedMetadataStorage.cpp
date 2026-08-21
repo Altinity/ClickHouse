@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <IO/S3/Client.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasSentinelProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
@@ -24,6 +25,7 @@
 #include <Common/LoggingHelpers.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
+#include <Poco/String.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <base/sleep.h>
 #include <charconv>
@@ -690,7 +692,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
     auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_token_producing_put_bytes);
-    const Cas::TokenType native_token_type = backend->nativeTokenType();
+    const Cas::TokenType backend_token_type = backend->nativeTokenType();
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
@@ -778,7 +780,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     PoolView view;
     view.physical_key_prefix = physical_key_prefix_local;
     view.pool_prefix = pool_prefix;
-    view.native_token_type = native_token_type;
+    view.native_token_type = backend_token_type;
     view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
     return view;
 }
@@ -905,6 +907,7 @@ void ContentAddressedMetadataStorage::startup()
     }
     pool_uuid = std::move(uuid);
     conditional_copy_supported = copy_supported;
+    native_token_type = view.native_token_type;
 }
 
 void ContentAddressedMetadataStorage::shutdown()
@@ -929,6 +932,33 @@ void ContentAddressedMetadataStorage::shutdown()
     /// old_scheduler keeps the object alive regardless.
     if (old_scheduler)
         old_scheduler->stop();
+}
+
+void ContentAddressedMetadataStorage::applyNewSettings(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix, ContextPtr /*context*/)
+{
+    /// Nothing pinned yet -- before the first `startup` this disk has no dialect to protect.
+    if (pool_uuid.empty())
+        return;
+
+    /// Reads the INCOMING config directly rather than asking the object storage:
+    /// `DiskObjectStorage::applyNewSettings` runs this metadata storage's `applyNewSettings` BEFORE it
+    /// rebuilds the object storage's client, so the object storage would still report the OLD dialect
+    /// at this point. `http_client` is a direct child of the disk block, like every other
+    /// CAS-recognized key.
+    const bool would_be_generation = S3::httpClientImpliesGcsGenerationDialect(config.getString(config_prefix + ".http_client", ""));
+    const bool is_generation = native_token_type == Cas::TokenType::Generation;
+    if (would_be_generation == is_generation)
+        return;
+
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "CAS disk {}: SYSTEM RELOAD CONFIG would change the incarnation-token dialect from {} to {} "
+        "(the http_client setting moved between an S3-compatible ETag store and a GCS generation "
+        "store). The pool was opened with the OLD dialect and every conditional write, list-token "
+        "decision, and GC precondition depends on it staying fixed for the pool's lifetime -- flipping "
+        "it under a live pool would silently corrupt token semantics instead of failing loudly. "
+        "Restart the server to remount this disk under the new dialect.",
+        storage_path_full, is_generation ? "generation" : "ETag", would_be_generation ? "generation" : "ETag");
 }
 
 namespace
