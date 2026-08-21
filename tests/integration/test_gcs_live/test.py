@@ -50,20 +50,25 @@ generations rather than ETags.
 
 It does NOT assert the outbound header set — that `x-goog-if-generation-match` appears on the wire,
 that `x-amz-date` / `x-amz-content-sha256` / `x-amz-security-token` / `x-amz-api-version` are absent,
-or which headers the GOOG4 signature covers. That is not an omission to be fixed later; it is not
-observable from here, and the reason is worth writing down because the obvious fixes are all worse
-than the gap:
+or which headers the GOOG4 signature covers. That is a scope decision, not an impossibility, and the
+alternatives considered were each worse than the gap:
 
   - `PocoHTTPClient` logs RESPONSE headers under `enable_s3_requests_logging` and never logs the
     request headers, so the server log cannot supply them.
-  - Interposing a capturing proxy either requires spelling the endpoint as the proxy's own hostname,
-    which makes `deduceProviderType` report UNKNOWN and switches off the very `ApiMode` behaviour this
-    suite exists to exercise, or requires downgrading the connection to plain HTTP so the proxy can
-    read the headers, which sends live credentials in clear text.
+  - A plain forward proxy would have to be named as the endpoint, which makes `deduceProviderType`
+    report UNKNOWN and switches off the very `ApiMode` behaviour this suite exists to exercise.
+  - Downgrading to plain HTTP so a proxy can read the headers puts live credentials in clear text on
+    the wire.
+  - A TLS-TERMINATING proxy does work and is the honest option: `endpoint` stays
+    `storage.googleapis.com`, so `provider_type` is still GCS and `ApiMode::GCS` stays active, while
+    the proxy observes plaintext request headers inside a process the test operator already controls —
+    the same trust boundary as the container that already holds the plaintext HMAC secret in its
+    config. It is not built here because it needs a proxy container, a generated CA distributed into
+    the server's trust store, and per-disk proxy configuration: real infrastructure for a property the
+    unit tests already establish by inspecting the request object directly, with no network at all.
 
-The outbound header set is covered by the unit tests, which inspect the request object directly and
-need no network at all. What is left for this gate is acceptance — and acceptance is the part a unit
-test structurally cannot reach.
+So the outbound header set stays with the unit tests. What is left for this gate is acceptance — and
+acceptance is the part a unit test structurally cannot reach.
 """
 
 import os
@@ -114,12 +119,24 @@ pytestmark = pytest.mark.skipif(
 cluster = ClickHouseCluster(__file__)
 
 
-def _disk_xml(name, subprefix, cas, client, bucket=None):
+def _disk_xml(name, subprefix, cas, client, bucket=None, skip_access_check=False):
     lines = [
         "            <{}>".format(name),
         "                <type>object_storage</type>",
         "                <object_storage_type>s3</object_storage_type>",
     ]
+    if skip_access_check:
+        # Only for the deliberately-unreachable-bucket disk, and only because that disk is NOT a CAS
+        # mount. `IDisk::startup` calls `checkAccess` and rethrows, and `DiskSelector::initialize` is a
+        # function-try-block with a single `catch (...)` around the whole construction loop — there is
+        # no per-disk isolation, so one unreachable disk aborts the entire selector build and every
+        # other disk in this file dies with it. `Server.cpp` hardcodes
+        # `registerDisks(global_skip_access_check=false)`, so the per-disk key is the only way out.
+        #
+        # NEVER put this on a `cas=True` disk. A writable generation-token CAS mount must refuse it, so
+        # that `runCapabilityProbe` cannot be bypassed — that battery is the only thing proving a
+        # token-exact DELETE really carries its generation precondition.
+        lines.append("                <skip_access_check>true</skip_access_check>")
     if cas:
         lines += [
             "                <metadata_type>cas</metadata_type>",
@@ -162,6 +179,7 @@ def _write_config(path):
                 cas=False,
                 client="gcs_hmac",
                 bucket="clickhouse-gcs-live-gate-bucket-that-does-not-exist",
+                skip_access_check=True,
             ),
             _disk_xml(CAS_HMAC_DISK, "cas-hmac", cas=True, client="gcs_hmac"),
         ]
@@ -281,21 +299,36 @@ def test_default_gcs_hmac_accepts_the_ordinary_object_storage_operation_set():
     issued at least once, so a statement that quietly stopped reaching object storage — because a
     default changed, or because a part stayed in memory — cannot leave the assertion true.
 
-    The statement-to-operation mapping is deliberately NOT pinned. Which statement produces a listing
-    or a batch delete is a ClickHouse implementation detail that moves between versions; whether GCS
-    accepts a listing or a batch delete is what this gate is asking. Pinning the mapping would make
-    this test fail on refactors that say nothing about GCS.
+    The statement-to-operation mapping is deliberately NOT pinned. Which statement produces a batch
+    delete rather than singular ones is a ClickHouse implementation detail that moves between versions;
+    whether GCS accepts a batch delete is what this gate is asking. Pinning the mapping would make this
+    test fail on refactors that say nothing about GCS.
+
+    Object LISTING is not covered by this group at all — see the comment on `counters` below. It is the
+    one operation in the ordinary set that an ordinary MergeTree lifecycle on a local-metadata disk
+    never issues, so no statement here can drive it.
 
     Would fail if: GOOG4 signing produced a signature Google rejects for some operation, or the
     existing `access_key_id`/`secret_access_key` spelling stopped being accepted by the `gcs_hmac`
     selector (the disk would not resolve and no statement below would run).
     """
     node = cluster.instances["node"]
+    # `S3ListObjects` is deliberately NOT in this set, and must not be re-added. Both of its increment
+    # sites live in `S3IteratorAsync::getBatchAndCheckNext` and `S3ObjectStorage::listObjects`, which
+    # are reached through `IObjectStorage::iterate`/`listObjects` — called by the object-storage table
+    # engines, the data lakes, `ObjectStorageQueue`, the plain/plain_rewritable metadata storages and
+    # CAS, none of which is in play here. These disks set no `metadata_type`, so they use local
+    # metadata: MergeTree's own `iterate` calls go through `IDisk::iterateDirectory` over the LOCAL
+    # metadata directory and issue no S3 listing at all. An ordinary lifecycle on a local-metadata disk
+    # never lists.
+    #
+    # Worse than merely unsatisfiable, it would be unsound: `system.events` is process-wide, and the
+    # CAS disks in this same configuration DO list, so a background GC round landing inside the delta
+    # window could satisfy it for a reason that has nothing to do with this test's workload.
     counters = [
         "S3PutObject",
         "S3GetObject",
         "S3HeadObject",
-        "S3ListObjects",
         "S3CopyObject",
         "S3DeleteObjects",
         "S3CreateMultipartUpload",
@@ -329,7 +362,7 @@ def test_default_gcs_hmac_accepts_the_ordinary_object_storage_operation_set():
     node.query("ALTER TABLE {} MOVE PARTITION tuple() TO VOLUME 'cold'".format(table))
     assert int(node.query("SELECT count() FROM {}".format(table))) == 4500
 
-    # A merge (listing plus more writes), then the deletes.
+    # A merge (more reads and writes), then the deletes.
     node.query("OPTIMIZE TABLE {} FINAL".format(table))
     node.query("ALTER TABLE {} DROP PARTITION tuple()".format(table))
     assert int(node.query("SELECT count() FROM {}".format(table))) == 0
