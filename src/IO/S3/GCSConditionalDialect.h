@@ -13,7 +13,7 @@ namespace DB::S3
 /// same client keeps upstream AWS semantics. Translations:
 ///   - `If-None-Match: *` becomes `x-goog-if-generation-match: 0`;
 ///   - `If-Match: "<digits>"` (quotes optional) becomes `x-goog-if-generation-match: <digits>`;
-///   - `x-amz-meta-*` becomes `x-goog-meta-*` (GCS rejects a mixed-prefix request).
+///   - `x-amz-meta-*` becomes `x-goog-meta-*`, the prefix GCS documents for object metadata.
 /// Fail-close guards, the request never leaves the process:
 ///   - `If-None-Match` with any value other than `*` (LOGICAL_ERROR: CAS only ever sends `*`);
 ///   - a non-numeric `If-Match` (CORRUPTED_DATA: a persisted token, or a storage response the
@@ -30,10 +30,12 @@ void applyGcsConditionalDialectToRequest(Aws::Http::HttpRequest & request);
 void prepareGcsRequestForOAuthAuthentication(Aws::Http::HttpRequest & request);
 
 /// Authentication preparation for the GOOG4-HMAC path, run for EVERY request that client sends.
-/// GCS rejects a request mixing the `x-amz-` and `x-goog-` prefixes, so every `x-amz-*` header must
-/// have a decided fate before signing: dropped as an AWS signing artifact, renamed to its `x-goog-`
-/// counterpart, or consumed because GCS has no counterpart. An `x-amz-*` header with no rule raises
-/// BAD_ARGUMENTS rather than being guessed at or sent as-is.
+/// This path normalises prefixes deliberately: it signs with Google's native scheme, so every
+/// `x-amz-*` header must have a decided fate before signing — dropped as an AWS signing artifact,
+/// renamed to its `x-goog-` counterpart, or consumed because GCS has no counterpart. An `x-amz-*`
+/// header with no rule raises BAD_ARGUMENTS rather than being guessed at or sent as-is. Whether GCS
+/// would in fact reject a mixed-prefix request has not been measured; no request shape ClickHouse
+/// constructs on a normal bucket produces one.
 void prepareGcsRequestForGoog4Authentication(Aws::Http::HttpRequest & request);
 
 /// The adapter, response side, applied only for a `NativeConditional` request: copies the header
@@ -42,6 +44,9 @@ void prepareGcsRequestForGoog4Authentication(Aws::Http::HttpRequest & request);
 /// ETag/token plumbing unchanged; `x-goog-meta-*` is presented as `x-amz-meta-*`. The same metadata
 /// key arriving under both prefixes with different values raises CORRUPTED_DATA. A `Default`
 /// response is never passed here and so keeps its upstream ETag and headers byte-for-byte.
+/// Consequence: CAS object attributes are legible only through a marked read. The AWS SDK parses only
+/// `x-amz-meta-*` into its metadata map and this function holds the only reverse mapping, so a
+/// `Default` read of a CAS object's attributes yields a silently empty map rather than an error.
 void applyGcsConditionalDialectToResponse(const Poco::Net::HTTPResponse & poco_response, Aws::Http::HttpResponse & sdk_response);
 
 }

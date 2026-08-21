@@ -89,8 +89,9 @@ struct Goog4HeaderRule
 };
 
 /// Every `x-amz-*` header ClickHouse's S3 requests can carry, with the reason for its fate. A header
-/// absent from this table is rejected: GCS refuses a mixed-prefix request, so guessing a translation
-/// or passing one through are both worse than an error naming the header.
+/// absent from this table is rejected: this path deliberately signs a request whose prefixes are all
+/// `x-goog-`, so guessing a translation or passing one through are both worse than an error naming
+/// the header.
 constexpr std::array GOOG4_HEADER_RULES{
     /// GCS object metadata is `x-goog-meta-*`; the storage class, copy source and metadata directive
     /// are the same headers under the other prefix.
@@ -162,7 +163,7 @@ void applyGcsConditionalDialectToRequest(Aws::Http::HttpRequest & request)
         request.SetHeaderValue("x-goog-if-generation-match", *generation_match);
     }
 
-    /// --- Object metadata: x-amz-meta-* -> x-goog-meta-* (GCS rejects a mixed-prefix request) ---
+    /// --- Object metadata: x-amz-meta-* -> x-goog-meta-*, the prefix GCS documents ---
     std::vector<std::string> meta_headers;
     for (const auto & header : request.GetHeaders())
     {

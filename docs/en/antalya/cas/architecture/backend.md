@@ -59,21 +59,25 @@ gap, not a hypothetical one. `CAS`'s conditional writes therefore always take th
 on a generation-dialect backend.
 
 With `http_client = gcs_hmac`, requests are signed with Google's native `GOOG4-HMAC-SHA256` scheme,
-and GCS refuses a request that mixes the `x-amz-` and `x-goog-` header prefixes. Every `x-amz-*`
+and the request is deliberately normalised to `x-goog-` prefixes before signing. Every `x-amz-*`
 header must therefore have a known GCS counterpart before signing, and one that does not is refused
 with an error naming it. Two configurations reach that refusal: server-side encryption, whether
 KMS-based or with a customer-supplied key, because GCS expresses encryption through a different
 contract than `x-amz-server-side-encryption*`; and any custom `x-amz-*` header set on the disk with
 `<header>`. Both fail with a clear error rather than being sent under a guessed `x-goog-` name GCS
-would not honour or in a mixed-prefix request GCS would reject outright. Configure such a disk
-against an AWS-compatible endpoint instead.
+would not honour. Configure such a disk against an AWS-compatible endpoint instead.
 
 This bounds conditional writes only: the write-once create is therefore single-part and limited by
 `gcs_max_conditional_put_bytes` on a generation dialect, while the unconditional resurrect takes the
 ordinary multipart path and has no size limit on any backend.
 
-Every request carrying a rewritten header also has its AWS auth headers stripped and every
-remaining `x-amz-*` header renamed to `x-goog-*`, since GCS rejects a mixed header set.
+The two authentication paths clean up differently, and neither renames headers wholesale. On
+`gcs_hmac` every request the client sends — marked or not — goes through
+`prepareGcsRequestForGoog4Authentication`, which drops the stale AWS signing artifacts and then
+resolves each remaining `x-amz-*` header against an explicit per-header rule table, raising an error
+naming any header for which there is no rule. On `gcp_oauth` only a marked request is touched at all,
+by `prepareGcsRequestForOAuthAuthentication`: it removes the AWS signing artifacts so the Bearer
+token is the sole credential and passes every other `x-amz-*` header through unchanged.
 
 Azure Blob Storage's REST API documents equivalent conditional headers (`If-None-Match`,
 `If-Match`), but no third dialect exists in this backend yet — `IObjectStorage`'s Azure

@@ -406,6 +406,9 @@ TEST(GCSConditionalDialect, ResponseWithoutGenerationKeepsETag)
     EXPECT_EQ(f.sdk.GetHeader("etag"), "\"abc\"");
 }
 
+/// This one stays despite `IOTestAwsS3Client.ResponseGenerationAndMetadataAdaptedOnlyWhenMarked`
+/// covering the same mapping end to end: that test drives a whole client, so it can only report that
+/// the mapping is absent, while this one localises the absence to the response adapter itself.
 TEST(GCSConditionalDialect, ResponseMetadataPrefixIsMapped)
 {
     ResponseFixture f;
