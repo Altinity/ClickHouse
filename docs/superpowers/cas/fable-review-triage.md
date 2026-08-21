@@ -50,21 +50,17 @@ TXN-ONE-PIPELINE, ack-floor GC и прочее, поэтому часть выв
 
 | ID | Статус | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|--------|-----------|------------|-------------------|------|
-| n1 | ⏳ | — | — | — | — |
-| n2 | ⏳ | — | — | — | — |
-| n3 | ⏳ | — | — | — | — |
-| n4 | ⏳ | — | — | — | — |
-| n5 | ⏳ | — | — | — | — |
-| n6 | ⏳ | — | — | — | — |
-| n7 | ⏳ | — | — | — | — |
-| n8 | ⏳ | — | — | — | — |
-| n9 | ⏳ | — | — | — | — |
-| n10 | ⏳ | — | — | — | — |
-| n11 | ⏳ | — | — | — | — |
-| n12 | ⏳ | — | — | — | — |
-| n13 | ⏳ | — | — | — | — |
-| n14 | ⏳ | — | — | — | — |
-| n15 | ⏳ | — | — | — | — |
+| n1 | подтверждено | P3 | нет | — | Внутренние теги (`INV-NO-LOSS`, `B16/B34`, `B11`) по-прежнему протекают в пользовательские строки и комментарии колонок. |
+| n2 | подтверждено | P3 | нет | — | Дрейф «CA» вместо «CAS» в рантайм-строках сохраняется: 5 ошибок `clickhouse-disks` и комментарий колонки системной таблицы. |
+| n3 | подтверждено | P3 | нет | — | Все три документационных подпункта живы: в `grant.md` нет привилегий `SYSTEM CAS *`, в `mounts-and-leases.md` нет `#`-заголовка, комментарий в `ASTSystemQuery.h` искажает грамматику `REBUILD`. |
+| n4 | частично (подпункт про `holds`/`checkpoint_observations` — дубликат CAS-096) | P3 | нет | `docs/superpowers/cas/BACKLOG/gc.md:389` {#refplan-dead-drop-counters} (только `holds`/… | Весь мёртвый/рудиментарный код на месте; отслеживается лишь один из четырёх подпунктов. |
+| n5 | подтверждено | P3 | нет | — | `04283_cas_replicated_rejected.sql` до сих пор называется «rejected», хотя проверяет успешный путь. |
+| n6 | подтверждено | P3 | нет | — | `throwIfAmbiguous` по-прежнему стоит лишь у части mint-сайтов `NamespaceLifeId::fromCatalogEntry` в `CasRefLedger.cpp`. |
+| n7 | подтверждено | P3 | нет | — | Комментарий «off by default» в `ContentAddressedLog.h` устарел — логи включены в `config.xml`. |
+| n8 | подтверждено | P3 | нет | — | Тестовый UAF-порядок объявлений в `gtest_cas_part_folder_access.cpp` не исправлен. |
+| n9 | подтверждено | P3 | нет | подпункт про `emulated_resurrect_mutex` пересекается с `2031-triage.md:5793` CAS-135 (т… | Все три подпункта на месте: process-wide static-мьютекс, дублированная магическая 1000 и деструктор без try/catch. |
+| n10 | подтверждено | P3 | нет | — | Безусловный подъём `max_memory_usage` 150M→170M в `03829` не изменён и не сужен до CAS-полосы. |
+| n11 | подтверждено | P3 | нет | — | Отладочные остатки в `S3ObjectStorage::exists` и монолитная `Gc::fold` (~1660 строк) на месте. |
 
 ## Needs verification — что обзор оставил открытым {#needs-verification}
 
@@ -498,3 +494,51 @@ P2 и не pre-release: это документация, ни одно из тр
 Изменение живо: `src/Interpreters/InterpreterSystemQuery.cpp:278` несёт комментарий про таблицу в БД с `lazy_load_tables = 1`, остающуюся обёрнутой в `StorageTableProxy`; коммит — `2ba28ac4b6f` «SYSTEM SYNC REPLICA (and sibling per-table SYSTEM verbs) materialize lazy_load_tables proxies instead of failing "is not replicated"» (+ stateless-тест 05017). Тема широко отслежена в `BACKLOG/operability-and-introspection.md` — `:105` фиксирует и фикс, и открытый эмпирический хвост, `:106`/`:119` — оставшиеся proxy-forwarding-пробелы (`DROP REPLICA`, `RESTART REPLICAS`, `STOP/START <action>`), а `:80` держит USER DECISION по самой фиче. Отсутствует ровно то, о чём буллет: changelog-запись про смену поведения.
 
 Примечание: в исходном списке одиннадцать буллетов, а не двенадцать — строка `m12` из таблицы удалена.
+
+## Nits — детали {#nits-details}
+
+### n1 (подтверждено) {#n1}
+
+`programs/disks/CommandFsck.cpp:147` бросает `"cas-fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)"`; `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:427` — `"... not supported on a CAS disk yet (B16/B34); ..."`; `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:47` — комментарий колонки заканчивается `"... blob deletes, B11)."` и виден через `DESCRIBE`. Ни один из трёх не менялся с момента ревью.
+
+### n2 (подтверждено) {#n2}
+
+`programs/disks/CommandCaInspect.cpp:49`, `CommandCaGcRebuild.cpp:57`, `CommandCaGcDryRun.cpp:39`, `CommandCaDropMember.cpp:49`, `CommandFsck.cpp:54` — все говорят `"open the CA disk read-only"`. В системных таблицах: `src/Interpreters/ContentAddressedLog.cpp:24` — `"The CA decision/event (blob_put, ...)"`. Термин «CA» в docs/en нигде не определён.
+
+### n3 (подтверждено) {#n3}
+
+`grep -n "CAS" docs/en/sql-reference/statements/grant.md` не находит ни одной из 7 привилегий. `docs/en/antalya/cas/architecture/mounts-and-leases.md` — единственный из 13 файлов набора без строки `^# ` (у остальных 12 она есть); есть только frontmatter `title` и сразу `## server_root_id`. `src/Parsers/ASTSystemQuery.h:191` пишет `SYSTEM CAS GC REBUILD FORCE [<disk>]`, тогда как парсер (`src/Parsers/ParserSystemQuery.cpp:481-488`) реализует `REBUILD [FORCE] <disk>` — `FORCE` опционален, диск обязателен.
+
+### n4 (частично (подпункт про `holds`/`checkpoint_observations` — дубликат CAS-096)) {#n4}
+
+`src/Disks/tests/cas_test_helpers.h:414-421` — `registerNamespaceRaw` по-прежнему пустой no-op с ~8 вызовами (`gtest_cas_orphan_manifest_sweep.cpp`, `gtest_cas_gc_round.cpp:1807`); `cas_test_helpers.h:196` — `[[maybe_unused]] const DB::UInt128 & domain_id`. `RefScanSummary::holds` / `checkpoint_observations` (`Gc/CasGc.h:215-216`, циклы обогащения `Gc/CasGc.cpp:287`) — это ровно CAS-096, уже разобрано в `2031-triage.md:4457` и заведено в BACKLOG/gc.md; не передеривирую. `max_fence_round` — `Gc/CasGc.cpp:4159` объявлена `= 0` и читается в `std::max({max_fence_round, state.round, max_gen})` на `:4324`, присваиваний нет во всём дереве.
+
+### n5 (подтверждено) {#n5}
+
+`tests/queries/0_stateless/04283_cas_replicated_rejected.sql:5-15` прямо пишет «B33 (lifted): ReplicatedMergeTree on a cas disk is now SUPPORTED» и создаёт таблицу, ожидая успеха. Имя файла (и `.reference`) не переименовано.
+
+### n6 (подтверждено) {#n6}
+
+На HEAD `Pool/CasRefLedger.cpp` содержит 6 вызовов `fromCatalogEntry` (`:589, :1250, :4735, :4833, :4897, :4915`), из которых защищён гардом только первый (`:584`, плюс добавленный коммитом `684161dcc03` повторный гард `:607` в той же функции). Остальные пять — без гарда; сравнение с `056488b47a0` показывает, что расстановка не изменилась (сдвиг номеров строк на ~7-11).
+
+### n7 (подтверждено) {#n7}
+
+`src/Interpreters/ContentAddressedLog.h:12` — «Optional (off by default); enabled for soak/CI», при том что `cas_log`/`cas_gc_log` поставляются включёнными в `config.xml`. Текст не менялся с момента ревью.
+
+### n8 (подтверждено) {#n8}
+
+В `GetViewEmitsRefResolveOnlyOnRealResolveWork` `store` объявлен на `src/Disks/tests/gtest_cas_part_folder_access.cpp:985`, а захватываемый sink-ом `std::vector<Cas::CasEvent> seen` — только на `:992-993`, т.е. `seen` разрушается раньше `~Pool`. Тот же порядок в соседнем тесте на `:1239/1246`; поясняющего комментария о порядке в файле нет ни разу (grep по «outlive/destroyed» даёт только несвязанную строку `:403`).
+
+### n9 (подтверждено) {#n9}
+
+`Backend/CasObjectStorageBackend.cpp:1146` — `static std::mutex emulated_resurrect_mutex;` (CAS-135 разбирает именно его и признаёт сериализацию resurrect'ов сознательной). Магическая `1000` дублируется в 8 местах GC: `Gc/CasGc.cpp:1495, :1629, :3549 (kListPageLimit), :3783 (kListPageLimit), :4050, :4100, :4301` и `Gc/CasOrphanManifestSweep.cpp:597`. `PartWriteTxn::~PartWriteTxn` (`Pool/CasPartWriteTxn.cpp:124-141`) вызывает `store->enqueueWriterCleanupDuty(...)` и `store->retireBuildSeq(build_seq)` без try/catch, хотя деструктор неявно `noexcept`.
+
+### n10 (подтверждено) {#n10}
+
+`tests/queries/0_stateless/03829_insert_deduplication_info_memory.sql:17` — `SET max_memory_usage = '170M';` для всех движков; комментарий `:12-16` объясняет запас, но продолжает мотивировать его «~0.5 MB» накладных CAS. Побайтовое сравнение с `056488b47a0` показывает: файл в этой части не менялся.
+
+### n11 (подтверждено) {#n11}
+
+`src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.cpp:251-256` — `auto settings_ptr = s3_settings.get();` не используется, а `const bool e = ...; return e;` — лишняя переменная вместо однострочного `return S3::objectExists(...)`. `Gc::fold` начинается на `Gc/CasGc.cpp:1673` и заканчивается на `:3336` — 1664 строки (бага не утверждается, только риск ревью).
+
+Примечание: в разделе `## Nits` одиннадцать буллетов (часть склеивает по 2-4 подпункта), а не пятнадцать — лишние строки из таблицы удалены.
