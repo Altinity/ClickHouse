@@ -41,12 +41,13 @@
 #include <Disks/IStoragePolicy.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/sortBlock.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
 #if USE_AVRO
 
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <IO/ReadHelpers.h>
 #include <filesystem>
 #include <regex>
@@ -58,6 +59,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
 
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 using namespace DB;
 
@@ -89,12 +91,15 @@ extern const SettingsString iceberg_metadata_compression_method;
 namespace ProfileEvents
 {
     extern const Event IcebergVersionHintUsed;
+    extern const Event IcebergJsonFileParsing;
+    extern const Event IcebergJsonFileParsingMicroseconds;
 }
 
 namespace DB::Setting
 {
     extern const SettingsUInt64 iceberg_metadata_staleness_ms;
     extern const SettingsUInt64 output_format_compression_level;
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 /// Hard to imagine a hint file larger than 10 MB
@@ -105,7 +110,6 @@ static constexpr size_t MAX_LIST_RETRIES = 5;
 
 namespace DB::Iceberg
 {
-
 using namespace DB;
 
 /// Best-effort heuristic based on ClickHouse naming conventions.
@@ -163,7 +167,7 @@ static bool isTemporaryMetadataFile(const String & file_name)
     return Poco::UUID{}.tryParse(substring);
 }
 
-static MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
+Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
 {
     String file_name = std::filesystem::path(path).filename();
     if (isTemporaryMetadataFile(file_name))
@@ -381,27 +385,31 @@ bool writeMetadataFileAndVersionHint(
 }
 
 
-std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src)
+std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src, const String & time_zone)
 {
     std::string transform_name = Poco::toLower(transform_name_src);
 
+    std::optional<String> time_zone_opt;
+    if (!time_zone.empty())
+        time_zone_opt = time_zone;
+
     if (transform_name == "year" || transform_name == "years")
-        return TransformAndArgument{"toYearNumSinceEpoch", std::nullopt};
+        return TransformAndArgument{"toYearNumSinceEpoch", std::nullopt, time_zone_opt};
 
     if (transform_name == "month" || transform_name == "months")
-        return TransformAndArgument{"toMonthNumSinceEpoch", std::nullopt};
+        return TransformAndArgument{"toMonthNumSinceEpoch", std::nullopt, time_zone_opt};
 
     if (transform_name == "day" || transform_name == "date" || transform_name == "days" || transform_name == "dates")
-        return TransformAndArgument{"toRelativeDayNum", std::nullopt};
+        return TransformAndArgument{"toRelativeDayNum", std::nullopt, time_zone_opt};
 
     if (transform_name == "hour" || transform_name == "hours")
-        return TransformAndArgument{"toRelativeHourNum", std::nullopt};
+        return TransformAndArgument{"toRelativeHourNum", std::nullopt, time_zone_opt};
 
     if (transform_name == "identity")
-        return TransformAndArgument{"identity", std::nullopt};
+        return TransformAndArgument{"identity", std::nullopt, std::nullopt};
 
     if (transform_name == "void")
-        return TransformAndArgument{"tuple", std::nullopt};
+        return TransformAndArgument{"tuple", std::nullopt, std::nullopt};
 
     if (transform_name.starts_with("truncate") || transform_name.starts_with("bucket"))
     {
@@ -425,11 +433,11 @@ std::optional<TransformAndArgument> parseTransformAndArgument(const String & tra
 
         if (transform_name.starts_with("truncate"))
         {
-            return TransformAndArgument{"icebergTruncate", argument};
+            return TransformAndArgument{"icebergTruncate", argument, std::nullopt};
         }
         else if (transform_name.starts_with("bucket"))
         {
-            return TransformAndArgument{"icebergBucket", argument};
+            return TransformAndArgument{"icebergBucket", argument, std::nullopt};
         }
     }
     return std::nullopt;
@@ -493,6 +501,9 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
         return json_str;
     };
 
+    ProfileEvents::increment(ProfileEvents::IcebergJsonFileParsing);
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergJsonFileParsingMicroseconds);
+
     String metadata_json_str;
     if (metadata_cache && table_uuid.has_value())
         metadata_json_str = metadata_cache->getOrSetTableMetadata(
@@ -510,6 +521,15 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 {
     switch (type->getTypeId())
     {
+        case TypeIndex::UInt8:
+        {
+            if (isBool(type))
+                return {"boolean", true};
+            return {"int", true};
+        }
+        case TypeIndex::Int8:
+        case TypeIndex::UInt16:
+        case TypeIndex::Int16:
         case TypeIndex::UInt32:
         case TypeIndex::Int32:
             return {"int", true};
@@ -536,6 +556,17 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
             return {"string", true};
         case TypeIndex::UUID:
             return {"uuid", true};
+        case TypeIndex::Decimal32:
+        case TypeIndex::Decimal64:
+        case TypeIndex::Decimal128:
+        case TypeIndex::Decimal256:
+        {
+            auto precision = getDecimalPrecision(*type);
+            if (precision > 38)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Iceberg decimal type supports precision up to 38, got {}", precision);
+            return {"decimal(" + std::to_string(precision) + ", " + std::to_string(getDecimalScale(*type)) + ")", true};
+        }
         case TypeIndex::Tuple:
         {
             auto type_tuple = std::static_pointer_cast<const DataTypeTuple>(type);
@@ -776,7 +807,7 @@ static Poco::JSON::Object::Ptr getPartitionField(
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported function for iceberg partitioning {}", partition_function->name);
 }
 
-static std::pair<Poco::JSON::Object::Ptr, Int32> getPartitionSpec(
+std::pair<Poco::JSON::Object::Ptr, Int32> getPartitionSpec(
     ASTPtr partition_by,
     const std::unordered_map<String, Int32> & column_name_to_source_id)
 {
@@ -1359,6 +1390,11 @@ std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::J
 
 KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context)
 {
+    // sort-orders / default-sort-order-id are optional in Iceberg V1 metadata
+    // (required only from V2); an unsorted table uses the no-op order-id 0.
+    // Treat their absence as "no sort order" rather than dereferencing a missing field.
+    if (!metadata_object->has(f_default_sort_order_id) || !metadata_object->has(f_sort_orders))
+        return KeyDescription{};
     auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
     Poco::JSON::Array::Ptr sort_orders = metadata_object->getArray(f_sort_orders);
     std::unordered_map<Int64, String> source_id_to_column_name;
@@ -1390,7 +1426,8 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name);
+            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
+                local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
             /// Quote the column name so identifiers with special characters (e.g. `@timestamp`)
             /// produce a parseable ORDER BY clause.
             auto quoted_column_name = backQuoteIfNeed(column_name);
@@ -1402,7 +1439,10 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
                 {
                     full_argument += std::to_string(*clickhouse_transform_name->argument) +  ", ";
                 }
-                full_argument += quoted_column_name + ")";
+                full_argument += quoted_column_name;
+                if (clickhouse_transform_name->time_zone)
+                    full_argument += ", '" + *clickhouse_transform_name->time_zone + "'";
+                full_argument += ")";
             }
             else
             {
@@ -1419,6 +1459,124 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         return KeyDescription{};
     order_by_str.pop_back();
     return KeyDescription::parse(order_by_str, column_description, {}, local_context, true);
+}
+
+/// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
+static String formatPartitionFieldDisplay(const String & iceberg_transform_name, const String & column_name)
+{
+    std::string name = Poco::toLower(iceberg_transform_name);
+    if (name == "identity")
+        return column_name;
+    if (name == "year" || name == "years")
+        return "year(" + column_name + ")";
+    if (name == "month" || name == "months")
+        return "month(" + column_name + ")";
+    if (name == "day" || name == "date" || name == "days" || name == "dates")
+        return "day(" + column_name + ")";
+    if (name == "hour" || name == "hours")
+        return "hour(" + column_name + ")";
+    if (name.starts_with("truncate") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "truncate(" + name.substr(p + 1, name.size() - p - 2) + ", " + column_name + ")";
+    }
+    if (name.starts_with("bucket") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "bucket(" + name.substr(p + 1, name.size() - p - 2) + ", " + column_name + ")";
+    }
+    return column_name;
+}
+
+std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */, ContextPtr /* local_context */)
+{
+    if (!metadata_object->has(f_partition_specs) || !metadata_object->has(f_default_spec_id))
+        return std::nullopt;
+    auto partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+    Poco::JSON::Array::Ptr partition_specs = metadata_object->getArray(f_partition_specs);
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    Poco::JSON::Object::Ptr partition_spec;
+    for (size_t i = 0; i < partition_specs->size(); ++i)
+    {
+        auto spec = partition_specs->getObject(static_cast<UInt32>(i));
+        if (spec->getValue<Int64>(f_spec_id) == partition_spec_id)
+        {
+            partition_spec = spec;
+            break;
+        }
+    }
+    if (!partition_spec || !partition_spec->has(f_fields))
+        return std::nullopt;
+    auto fields = partition_spec->getArray(f_fields);
+    if (fields->size() == 0)
+        return std::nullopt;
+
+    std::vector<String> part_exprs;
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(i);
+        auto source_id = field->getValue<Int64>(f_source_id);
+        auto it = source_id_to_column_name.find(source_id);
+        if (it == source_id_to_column_name.end())
+            return std::nullopt;
+        String column_name = it->second;
+        auto iceberg_transform_name = field->getValue<String>(f_transform);
+        part_exprs.push_back(formatPartitionFieldDisplay(iceberg_transform_name, column_name));
+    }
+    String result;
+    for (size_t i = 0; i < part_exprs.size(); ++i)
+    {
+        if (i != 0)
+            result += ", ";
+        result += part_exprs[i];
+    }
+    return result;
+}
+
+std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */)
+{
+    if (!metadata_object->has(f_sort_orders) || !metadata_object->has(f_default_sort_order_id))
+        return std::nullopt;
+    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
+    Poco::JSON::Array::Ptr sort_orders = metadata_object->getArray(f_sort_orders);
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    for (UInt32 i = 0; i < sort_orders->size(); ++i)
+    {
+        auto sort_order = sort_orders->getObject(i);
+        if (sort_order->getValue<Int64>(f_order_id) != sort_order_id)
+            continue;
+        auto sort_fields = sort_order->getArray(f_fields);
+        String result;
+        for (UInt32 j = 0; j < sort_fields->size(); ++j)
+        {
+            auto field = sort_fields->getObject(j);
+            auto source_id = field->getValue<Int64>(f_source_id);
+            auto it = source_id_to_column_name.find(source_id);
+            if (it == source_id_to_column_name.end())
+                return std::nullopt;
+            String column_name = it->second;
+            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
+            auto iceberg_transform_name = field->getValue<String>(f_transform);
+            String expr = formatPartitionFieldDisplay(iceberg_transform_name, column_name);
+            if (!result.empty())
+                result += ", ";
+            result += expr + direction;
+        }
+        return result.empty() ? std::nullopt : std::optional<String>(result);
+    }
+    return std::nullopt;
 }
 
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type)
@@ -1488,3 +1646,29 @@ void forEachAvroEntry(
 }
 
 #endif
+
+namespace DB
+{
+
+ObjectStoragePtr getResolvedStorageFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info, const ObjectStoragePtr & default_storage)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+    {
+        if (auto resolved = iceberg_info->getResolvedStorage())
+            return resolved;
+    }
+#endif
+    return default_storage;
+}
+
+std::optional<String> getMetadataPathFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info)
+{
+#if USE_AVRO
+    if (auto iceberg_info = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+        return iceberg_info->getMetadataPath();
+#endif
+    return std::nullopt;
+}
+
+}
