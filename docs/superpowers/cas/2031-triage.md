@@ -45,8 +45,8 @@
 | CAS-027 | by-design | P3 | [{#pool-trust-boundary-undocumented}](BACKLOG/docs-and-cleanup.md#pool-trust-boundary-undocumented) | нет | Код на HEAD ровно соответствует урегулированной позиции (никакой intra-pool аутентификации нет, bucket-credential = вся граница доверия); единственный реальный остаток — эта граница доверия не описана нигде в `docs/en/antalya/cas/`. |
 | CAS-028 | ⏳ | — | — | — | — |
 | CAS-029 | ⏳ | — | — | — | — |
-| CAS-030 | ⏳ | — | — | — | — |
-| CAS-031 | ⏳ | — | — | — | — |
+| CAS-030 | частично | P3 | [{#skip-access-check-no-signal}](BACKLOG/formats-and-storage.md#skip-access-check-no-signal) | нет | Механика верна (probe целиком пропускается, decommission выставляет флаг жёстко), но «removes every bucket-configuration defense» преувеличено — single-attempt gate и residual-proof остаются, а реальный остаток — отсутствие ЛЮБОГО сигнала оператору о пропущенном probe и самопротиворечивое сообщение про versioning «has no override». |
+| CAS-031 | подтверждено | P2 | [{#write-once-probe-misses-multipart}](BACKLOG/formats-and-storage.md#write-once-probe-misses-multipart) | нет | Верно: обе write-once CREATE-примитивы (streaming `putIfAbsentStream` и server-side `promoteStaged`) для больших тел переносят `If-None-Match` на `CompleteMultipartUpload`, а обе probe-проверки экзерсайзят только маленький single-operation путь — т.е. батарея сертифицирует не тот путь, по которому идёт основной объём блобов; но эксплуатируемо только на сторонних S3-совместимых хранилищах (AWS требование поддерживает, GCS отказывается громко). |
 | CAS-032 | ⏳ | — | — | — | — |
 | CAS-033 | ⏳ | — | — | — | — |
 | CAS-034 | ⏳ | — | — | — | — |
@@ -1157,3 +1157,87 @@ DELETE в редкой гонке — лечение хуже болезни; б
 Под этот остаток заведён новый пункт: `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md` `{#pool-trust-boundary-undocumented}`.
 
 **Что реально осталось.** Только докстроки (P3, не pre-release-блокер): короткая секция про границу доверия в `index.md` или `bucket-requirements.md`. Кодовых изменений находка не требует.
+
+## CAS-030 — Механика верна (probe целиком пропускается, decommission выставляет флаг жёстко), но «removes every bucket-configuration defense» преувеличено — single-attempt gate и residual-proof остаются, а реальный остаток — отсутствие ЛЮБОГО сигнала оператору о пропущенном probe и самопротиворечивое сообщение про versioning «has no override». (частично, P3) {#cas-030}
+
+**Где сейчас лежит код (анкеры находки устарели).** `CA/Pool/CasPool.cpp:339-347` → `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:457-481`; `:528` (жёсткий skip) → тот же файл `:809`; `CA/ContentAddressedSettings.cpp:35` → `ContentAddressedSettings.cpp:69`; `CA/Backend/CasProbe.cpp:15-66` → `Backend/CasProbe.cpp:15-243` (батарея выросла до 9 шагов). Файлы переехали в подкаталоги коммитом `592b9b83568` (git mv), номера строк в находке не соответствуют HEAD ни в одном из четырёх анкеров.
+
+**(1) «`skip_access_check` пропускает probe» — ПОДТВЕРЖДЕНО, но split явный и запинен тестами.**
+
+`Pool/CasPool.cpp:457-481`:
+```
+if (!config.skip_access_check)
+{
+    const UInt128 probe_uid = ...;
+    runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+}
+else
+{
+    backend->checkConditionalWriteSingleAttemptSupport();
+}
+```
+Т.е. пропускается вся батарея `Backend/CasProbe.cpp:47-243` (шаг 0 `checkPoolPreconditions`, шаги 1-8: enforcement conditional-create/overwrite/`casPut`/`deleteExact`, list-after-write/delete, детект delete-marker'а), а `checkConditionalWriteSingleAttemptSupport` (`Backend/CasProbe.cpp:53`, дублирован в `else`-ветке) выполняется всегда на writable-монтировании. Это НЕ «wrap the whole probe»: split заведён специально (`fb25e8cd3f6`, 2026-07-13, «cas: skip the capability probe under skip_access_check») и запинен дискриминирующим тестом `CASPool.SkipAccessCheckStillEnforcesSingleAttemptGate` (`src/Disks/tests/gtest_cas_pool.cpp:255-269`, комментарий `:226-229` прямо называет регрессию, от которой он защищает) плюс `692cea3ab04` (2026-07-13, «pin the skip_access_check safety split with discriminating tests»).
+
+**(2) «removes EVERY bucket-configuration defense» — ПРЕУВЕЛИЧЕНО.**
+
+Что остаётся при `skip_access_check=true`:
+- single-attempt gate (`Backend/CasObjectStorageBackend.cpp:94-108`) — writable-монтирование на объектном хранилище, не поддерживающем профиль `SingleAttempt`, по-прежнему отказывается монтироваться (`NOT_IMPLEMENTED`);
+- zero-write residual-proof перед bootstrap'ом (`Pool/CasPool.cpp:392-455`) — `ResidualWithoutMeta`/`Indeterminate` по-прежнему fail-closed;
+- `PoolMeta::createOrValidate` (`Pool/CasPool.cpp:499-502`) — сверка `blob_header_len`/`gc_shards`/`algos_used` и запрет mint'а на read-only открытии.
+
+Что действительно теряется — только доказательство enforcement'а условных операций ЭТИМ путём и два versioning-детектора: GCS-специфичный `checkPoolPreconditions` (`Backend/CasObjectStorageBackend.cpp:56-84`; для ETag-хранилищ это no-op: `:58-59` `if (mode != Mode::Native || native_token_type != TokenType::Generation) return;`) и шаг 8 `created_delete_marker` (`Backend/CasProbe.cpp:196-206`) — последний работает и на AWS, и он единственный «bucket-configuration defense» общего вида. Комментарий в `Pool/CasPool.cpp:475-478` эту потерю признаёт и квалифицирует как «purely environmental (slower GC reclaim, not data loss)» — с этим согласен: versioned bucket даёт неубираемый рост, а не потерю данных.
+
+**(3) Реальный остаток №1: сообщение шага 8 противоречит существованию опции.** `Backend/CasProbe.cpp:203-205` утверждает: «This is NOT ignorable and **has no override**» — при том что `skip_access_check=true` ровно этот шаг и снимает. Это не «дыра», это ложное утверждение в user-facing тексте (P3, правится одной фразой: «…кроме случая, когда probe пропущен `skip_access_check`, тогда проверка отложена до следующего обычного монтирования»).
+
+**(4) Реальный остаток №2 (главный): opt-out нигде не наблюдаем — ПОДТВЕРЖДЕНО.**
+- в `else`-ветке (`Pool/CasPool.cpp:470-480`) нет ни одной строки лога: пропуск батареи проходит абсолютно молча;
+- в пуле не записывается: `_pool_meta` несёт только `pid`/`hln`/`gcs`/`mrg`/`alg` (`Formats/CasPoolMetaFormat.cpp:76-87`) — поля про probe нет;
+- в интроспекции не видно: `system.cas_mounts` (`src/Storages/System/StorageSystemContentAddressedMounts.cpp:40-59`) — 20 колонок, ни одной про capability-probe/skip.
+
+Итог: узел, поднятый с `skip_access_check=true`, внешне неотличим от проверенного, включая для второго writer'а того же shared-пула. Это тот же класс, что уже зафиксирован в BACKLOG под `{#consolidation-2026-08-findings}`: `[gc-enabled-false-silent]` («Disabling the background GC scheduler produces no ongoing signal…») и `[part-folder-validate-never-gating]` («accepts `never` … with no acknowledgment of the risk», помечено HARD (user settings-policy direction)). Минимальный фикс того же вида: `LOG_WARNING` при пропуске + строка в `system.cas_mounts`/`_pool_meta`-независимая метрика. Отдельного анкера именно про `skip_access_check` в `BACKLOG.md`/`BACKLOG/*.md` нет (единственные совпадения по «probe» — про LIST-passport `{#list-consistency-real-s3}` и GC-probe'ы, не про это).
+
+**(5) «the shipped description invites the setting» — формально да, по существу нет.** Строка `ContentAddressedSettings.cpp:69` — «Skip the boot-time capability probe (start now, fix later)»; «start now, fix later» — это цитата семантики upstream'ного `skip_access_check` (`src/Disks/IDisk.cpp:217-223`, `docs/en/operations/storing-data.md:552`), а не приглашение. Пользовательская документация при этом аккуратна и НЕ преувеличивает безопасность в обратную сторону: `docs/en/antalya/cas/configuration.md:92` — «Safer than the name suggests: only the preflight probe is skipped — the conditional-write correctness check still runs unconditionally on every writable mount». Т.е. документированная позиция совпадает с кодом (п. 1-2). Претензия «shipped description invites it» — стилистическая, P3 максимум.
+
+**(6) «every decommission remount takes it unconditionally» — ПОДТВЕРЖДЕНО как код, следствие мягче заявленного.**
+
+`Pool/CasPool.cpp:809`: `config.skip_access_check = true;   /// the pool exists (the calling disk validated it); no probe writes` (введено `03b3b95de44`, 2026-07-15). При этом `:834` — `backend->checkConditionalWriteSingleAttemptSupport();` вызывается явно, т.е. и здесь пропущена только батарея. Проверка обоснования по call site'ам:
+- `SYSTEM CAS DROP POOL MEMBER` (`src/Interpreters/InterpreterSystemQuery.cpp:1063-1077`) переиспользует `host_store->poolConfig()` живого CA-диска — этот диск монтировался writable и батарею уже прогнал (если только сам не поднят с `skip_access_check=true`). Здесь пропуск — законная дедупликация проверки, ровно как написано в комментарии.
+- `clickhouse-disks cas-drop-member` (`programs/disks/CommandCaDropMember.cpp:47-56`) — наоборот, ТРЕБУЕТ read-only открытия диска (`if (!ca->isReadOnly()) throw`), а read-only открытие probe не запускает вообще по построению (`Pool/CasPool.cpp:381` — вся секция под `if (!config.read_only)`, обоснование `:376-379`). Значит в этом пути enforcement условных операций не доказан НИ РАЗУ в процессе, а `openForDecommission` затем делает destructive-записи (удаление namespace'ов, staging, mount-слота, `Tools/CasDecommission.cpp:110-133+`). Формулировка комментария `:809` («the calling disk validated it») для этого пути верна буквально (диск подтвердил существование пула), но не покрывает capability.
+
+Насколько это опасно: удаления в decommission идут через `deleteExact` (exact-token), т.е. на хранилище, игнорирующем `If-Match`, они могли бы снести чужую инкарнацию — но точно тот же аргумент относится к любому GC-раунду на таком хранилище, и такое хранилище не прошло бы обычный writable-mount на любом узле. Т.е. это не отдельная дыра decommission'а, а тот же «неcертифицированный store» из п. 4, просто без единственного места, где сертификация вообще могла бы случиться в этом процессе. Разумный минимальный фикс — прогонять батарею в `openForDecommission`, когда вызывающий диск был открыт read-only (или требовать флаг), плюс лог из п. 4.
+
+**Чего в находке нет и что стоит зафиксировать отдельно:** ничего из перечисленного не является silent corruption — все сохранившиеся отказы громкие (`NOT_IMPLEMENTED`/`INVALID_STATE`), а всё пропущенное деградирует либо в отложенную проверку (следующее монтирование без флага), либо в стоимость (versioned bucket). Поэтому P3, не P1, и `PRE-RELEASE: нет`.
+
+## CAS-031 — Верно: обе write-once CREATE-примитивы (streaming `putIfAbsentStream` и server-side `promoteStaged`) для больших тел переносят `If-None-Match` на `CompleteMultipartUpload`, а обе probe-проверки экзерсайзят только маленький single-operation путь — т.е. батарея сертифицирует не тот путь, по которому идёт основной объём блобов; но эксплуатируемо только на сторонних S3-совместимых хранилищах (AWS требование поддерживает, GCS отказывается громко). (подтверждено, P2) {#cas-031}
+
+**Где сейчас лежит код (анкеры устарели).** `CA/Backend/CasObjectStorageBackend.cpp:632-636` → `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp:914-931` (`putIfAbsentStream`); `CA/Backend/CasProbe.cpp:42` → `Backend/CasProbe.cpp:59-66` (шаг 1, `putIfAbsent` fresh). Анкер `src/IO/WriteBufferFromS3.cpp:409-416` указывает на `createMultipartUpload`'s GCS-refusal (сейчас `:407-416`) — это как раз ЗАКРЫТАЯ половина проблемы, а не открытая.
+
+**(1) Probe проверяет только single-PUT — ПОДТВЕРЖДЕНО.**
+
+Батарея пишет строковые литералы: `Backend/CasProbe.cpp:59` `backend.putIfAbsent(key, "probe-v1")`, `:75` `"should-not-land"`, `:104` `"clobbered"`, `:118` `"probe-v2"`, `:131-166` `"cas-s1"`/`"cas-s2"` — 8-9 байт. `WriteBufferFromS3::preFinalize` (`src/IO/WriteBufferFromS3.cpp:176-193`) выбирает single-part, пока `multipart_upload_id.empty() && detached_part_data.size() <= 1 && data_size <= max_single_part_upload_size` — т.е. любой шаг батареи гарантированно уходит одним `PutObject`. Ни один шаг не пишет тело, превышающее буфер/порог, и в батарее нет отдельного multipart-шага. То же для опциональной проверки server-side copy: `probeConditionalCopy` (`Backend/CasProbe.cpp:250-263`) пишет строку `"cas-conditional-copy-probe"` (26 байт) и копирует её — заведомо single-operation `CopyObject`.
+
+При этом заявленный контракт батареи размер не оговаривает: `Backend/CasProbe.h:8-24` — «The probe validates the backend preconditions required by a writable content-addressed pool: … 2. Conditional-create and conditional-overwrite are enforced», и `:26-28` — «a backend that does not pass the battery MUST NOT be used to coordinate a content-addressed pool». Это и есть overclaim: сертифицируется один транспортный путь, а протокол ездит по двум.
+
+**(2) Условная запись реально уходит через multipart — ПОДТВЕРЖДЕНО, и путь горячий.**
+
+`Backend/CasObjectStorageBackend.cpp:914-931` (`putIfAbsentStream`): `WriteSettings ws = conditionalWriteSettings(); ws.object_storage_write_if_none_match = "*";` → `object_storage->writeObject(...)` → `WriteBufferFromS3`. Тела блобов пишутся именно этим синком: `Pool/CasPartWriteTxn.cpp:611-620` (`sink = store->backend().putIfAbsentStream(key)`, затем `writeString(buildHeader(), out)` + `copyData(*source.open(), out)`), т.е. КАЖДЫЙ файл части, не попавший в дедуп, — это conditional create произвольного размера. Тело > первого буфера/порога → `writeMultipartUpload` (`src/IO/WriteBufferFromS3.cpp:393-405`), и precondition переносится на завершение: `src/IO/WriteBufferFromS3.cpp:651-656`
+```
+if (!write_settings.object_storage_write_if_none_match.empty())
+    req.SetIfNoneMatch(write_settings.object_storage_write_if_none_match);
+if (!write_settings.object_storage_write_if_match.empty())
+    req.SetIfMatch(write_settings.object_storage_write_if_match);
+```
+Т.е. на ETag-диалекте multipart для условной записи не запрещён — запрет адресный и только для generation-диалекта: `Backend/CasObjectStorageBackend.cpp:804-814` (`tokenProducingWriteSettings`: `if (native_token_type == TokenType::Generation) { ws.s3_force_single_part_upload = true; ws.s3_single_part_upload_max_bytes_override = token_producing_single_put_cap; }`) → `src/IO/WriteBufferFromS3.cpp:407-416` бросает `NOT_IMPLEMENTED` ДО первого multipart-запроса. Комментарий на `src/IO/WriteBufferFromS3.cpp:657-661` это прямо фиксирует: «a conditional write on a generation-token store never reaches this request … Marking it anyway lets Task 4's native adapter reject a conditional CompleteMultipartUpload outright if that invariant is ever violated» — то есть для ETag-хранилищ conditional CMU ЯВЛЯЕТСЯ штатным путём, по построению.
+
+Второй такой же примитив — S3-native staging promote: `Backend/CasObjectStorageBackend.cpp:1083` (`copyObjectConditional(..., conditionalWriteSettings())`), вызывается из `Pool/CasPartWriteTxn.cpp:604-606`. Для больших объектов `copyS3File` тоже вешает precondition на `CompleteMultipartUpload` — см. контракт `src/IO/S3/copyS3File.h:35-40` («both the single-operation `CopyObject` request and, for large objects, the multipart `CompleteMultipartUpload` request») и `src/IO/S3/copyS3File.cpp:722-723`, `:770-774`, `:838-840`. Проверяет же его `probeConditionalCopy` только на 26-байтном объекте (п. 1). Т.о. пробел одинаков для ОБЕИХ write-once CREATE-примитив, а находка называет только одну.
+
+**(3) Достижимость и радиус — уточнение к находке.**
+
+- AWS S3 поддерживает `If-None-Match` на `CompleteMultipartUpload` (с ноября 2024), так что на референсном бэкенде поведение корректно.
+- GCS — единственное измеренное хранилище, игнорирующее preconditions на завершении multipart (`docs/superpowers/cas/BACKLOG.md:429-434`: «Google's own XML API documentation says "Preconditions are not supported in the requests", and it was measured independently on 2026-07-03 (`0a3bc2f1fc6`)»), и оно как раз fail-closed: forced single-PUT + cap, а тело выше cap даёт громкий `NOT_IMPLEMENTED`. Это ровно то, что предписывает правило «loud failure ≫ silent corruption».
+- Остаётся класс «сторонние S3-совместимые хранилища, честно исполняющие `If-None-Match` на `PutObject` и молча игнорирующие его на `CompleteMultipartUpload`». Такое хранилище пройдёт батарею и будет считаться сертифицированным. Ни одного такого хранилища на HEAD не измерено (в отличие от GCS), т.е. эксплуатируемость — гипотеза, а не наблюдение; поэтому не P1.
+- Радиус на таком хранилище неоднороден: для тел блобов ключ контент-адресный, и потерянный precondition даёт перезапись байт-идентичного тела с новым `incarnation_tag`/токеном — это ломает атрибуцию инкарнации (writer получит `Done` вместо `PreconditionFailed` и пойдёт по ветке «я создал», см. `Pool/CasPartWriteTxn.cpp:643-660` вместо adopt/resurrect на `:665-700`), но не подменяет содержимое; повреждение здесь — не байты, а состояние протокола (в частности displacement condemned-инкарнации минует reconcile-путь `:680-700`). Для write-once объектов управляющего плана (record'ы ref-лога, снапшоты, part-манифесты) потеря precondition — это уже clobber чужого объекта, и молчаливый; но эти тела пишутся строкой через `nativeConditionalPut` (`Backend/CasObjectStorageBackend.cpp:202-218`) и превышают `max_single_part_upload_size` (по умолчанию 32 MiB) только на экстремальных размерах (снапшот каталога в сотни тысяч записей), т.е. это узкий хвост, а не типовой случай.
+
+**(4) Что реально надо сделать (и это отсутствует на HEAD).** Батарею нужно расширить одним шагом, который экзерсайзит именно multipart-путь: conditional create тела размером выше `max_single_part_upload_size` (или с `s3_min_upload_part_size`, приведённым вниз, чтобы шаг оставался дешёвым), повторно на занятый ключ → ожидание `PreconditionFailed`; и то же для `probeConditionalCopy`. Альтернатива в духе уже принятого GCS-решения — не сертифицировать, а сузить: форсить single-part для условных записей на любом не сертифицированном store и падать громко выше cap. Ни того, ни другого в коде нет; `Pool/CasPool.cpp:457-481` вызывает батарею как есть.
+
+**BACKLOG/история.** Прямого анкера нет: по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` все совпадения по «multipart» — про GCS (`BACKLOG.md:419-457` `{#gcs-conditional-overwrite-rethink}`, `BACKLOG/formats-and-storage.md:23` «[GCS production-grade follow-ups]») и про emulated-resurrect в RAM (`{#emulated-resurrect-spill-to-disk}`); ETag-хранилища там не рассматриваются, что подтверждает: пробел не отслеживается. Ближайший по КЛАССУ отслеживаемый пункт — `BACKLOG/formats-and-storage.md:24` `{#list-consistency-real-s3}`: «Add a LIST-consistency probe in `Cas::Probe` before LIST-derived discovery is trusted on a given store», т.е. та же идея «passport'а для конкретного store» (и `BACKLOG/gc.md:22` про сертификацию LIST). Разумно оформить новый пункт того же вида: «conditional-write passport must cover the multipart finalize path». По истории: `git log -S "SetIfNoneMatch" -- src/IO/WriteBufferFromS3.cpp` даёт только `1f6b7ba9c5c` — строка на CMU не менялась после введения, ничего это не закрывало.

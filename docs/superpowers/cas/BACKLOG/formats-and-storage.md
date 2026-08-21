@@ -105,3 +105,28 @@ first step), or (2) make `DataSourceDescription` equality account for `metadata_
 generic disk code, so it needs the upstream-consult step
 ([[feedback_upstream_code_consult_first]], [[feedback_cas_upstream_coupling_minimization]]) before
 anyone touches it.
+
+## Write-once probes certify the single-operation path, not the multipart one (2031-triage CAS-031) {#write-once-probe-misses-multipart}
+
+Both write-once CREATE primitives — streaming `putIfAbsentStream` and the server-side
+`promoteStaged`/`probeConditionalCopy` copy — carry `If-None-Match` on
+`CompleteMultipartUpload` for large bodies, while both probe checks exercise only the small
+single-operation path. So the capability battery certifies a path that most blob bytes do not take.
+Exposure is limited to third-party S3-compatible stores: AWS honours the precondition on CMU and GCS
+refuses loudly, so a store that silently ignores it on CMU is the only failing case — hence P2.
+
+Fix: extend the probe to run one multipart-sized write-once attempt (and the conditional-copy
+equivalent) so the certification covers the path the data plane actually uses. Related:
+{#list-consistency-real-s3} (same "probe what is trusted" principle) and, in BACKLOG.md,
+{#gcs-conditional-overwrite-rethink}.
+
+## `skip_access_check` and the decommission open silently skip the whole probe (2031-triage CAS-030) {#skip-access-check-no-signal}
+
+`skip_access_check` skips the capability probe wholesale, and `clickhouse-disks cas-drop-member`
+opens read-only, which never probes at all — so `openForDecommission`'s comment ("the calling disk
+validated it") does not hold for capability in that path. Not the "removes every bucket
+defense" the audit claims: the single-attempt gate and the residual proof stay (deliberate split in
+`fb25e8cd3f6`, pinned by `CASPool.SkipAccessCheckStillEnforcesSingleAttemptGate`). The residue is
+observability: nothing tells the operator the probe was skipped, and the probe's own step-8 text
+claims the versioning check "has no override", which is false. Fix: log the skip at default level
+(with what is consequently unverified) and correct the message. P3.
