@@ -178,11 +178,23 @@ an exception instead of being guessed or sent in a mixed-prefix request. Custome
 encryption headers are not mechanically renamed because GCS uses a different contract. ACL headers
 are not included without an actual ClickHouse call site and a validated GCS mapping.
 
-A live GCS characterization test covers `Default` HEAD, GET, LIST, PUT with metadata, CopyObject,
-DELETE, batch `DeleteObjects`, multipart, and an upload that exercises any SDK checksum or chunked
-framing selected by the production configuration before the blanket adapter is removed. This is a
-release gate: unit tests can prove the allowlist, but cannot prove that GCS accepts the resulting
-authenticated wire requests.
+A live GCS characterization test covers `Default` HEAD, GET, LIST, CopyObject, DELETE, batch
+`DeleteObjects` and multipart before the blanket adapter is removed. This is a release gate: unit tests
+can prove the allowlist, but cannot prove that GCS accepts the resulting authenticated wire requests.
+
+Two shapes the allowlist covers are deliberately NOT in the live gate, because no configuration of this
+build can produce them and a test that cannot fire is worse than an absent one:
+
+- **SDK checksum and stream-framing headers.** The only producer is the S3 Express path, and whether a
+  client takes it is derived from the endpoint containing `s3express`. This gate requires an endpoint of
+  `storage.googleapis.com`, since that is what makes the client report GCS at all, and one endpoint
+  cannot contain both. The allowlist rules for `x-amz-checksum-*`, `x-amz-trailer` and
+  `x-amz-decoded-content-length` therefore guard a future SDK change rather than a reachable
+  configuration, and unit tests are the right and only place to pin them.
+- **User metadata on an ordinary write.** No production call site constructs object attributes: every
+  caller outside the object-storage layer passes an empty set, and no SQL surface writes custom object
+  metadata. There is consequently nothing to round-trip on a `Default` request. This says nothing about
+  CAS attributes on a marked request, which are produced, and whose round trip is required below.
 
 This characterization is separate from the compatibility test for the established ordinary-S3
 HMAC path. Neither path may require a configuration migration for non-CAS users.
@@ -264,11 +276,13 @@ fails:
 
 - `conditionalCreateControlled` classifies `CORRUPTED_DATA` as a deterministic local failure and
   propagates it unchanged, without resolving. The write fails. This is the blob-create path.
-- `putIfAbsentControlled` catches a raising attempt without filtering on the error code, treats it as
-  an unresolved attempt, and calls `resolveByExactGet`. That reads the stored object's body, compares
-  it against the bytes this attempt intended to write, and returns the observed token only on an exact
-  match; different bytes raise. So the omitted generation can be recovered and the operation can
-  succeed. This is the manifest and journal path.
+- `putIfAbsentControlled` classifies a raising attempt instead of propagating it. A whitelisted
+  synchronous rejection classifies as a definite failure and returns without resolving; anything the
+  classifier cannot prove was never applied — which includes the `CORRUPTED_DATA` a missing generation
+  raises — becomes an unresolved attempt and reaches `resolveByExactGet`. That reads the stored
+  object's body, compares it against the bytes this attempt intended to write, and returns the observed
+  token only on an exact match; different bytes raise. So the omitted generation can be recovered and
+  the operation can succeed. This is the manifest and journal path.
 
 The recovery is admissible for the reason the prohibition exists. A follow-up HEAD is forbidden because
 it *assumes* the attribution — it returns whatever incarnation happens to be current, which on a lost
@@ -657,9 +671,10 @@ path must retain `native_conditional=false` and must not require `http_client=gc
 ### Dedicated GOOG4 characterization {#dedicated-goog4-characterization}
 
 Add a separate live-GCS characterization for `gcs_hmac` `Default` requests that proves the explicit
-authentication allowlist supports HEAD, GET, LIST, PUT with metadata, CopyObject, DELETE, batch
-`DeleteObjects`, multipart, and production checksum/chunked upload behavior. It preserves response
-ETags and never applies generation preconditions. The existing `http_client=gcs_hmac`
+authentication allowlist supports HEAD, GET, LIST, CopyObject, DELETE, batch `DeleteObjects` and
+multipart. It preserves response ETags and never applies generation preconditions. Checksum/chunked
+upload behaviour and user metadata on an ordinary write are excluded for the reasons given above --
+neither is reachable from any configuration of this build. The existing `http_client=gcs_hmac`
 configuration spelling and credential fields remain accepted unchanged.
 
 Unit tests enumerate the disposition of every allowed SDK-generated `x-amz-*` header, including
@@ -671,8 +686,18 @@ For one object returned once through LIST metadata and once through ordinary HEA
 
 - `_etag` has the same ordinary ETag value;
 - filesystem-cache and page-cache key construction receives the same ETag;
-- Parquet metadata cache constructs the same `(path, etag)` key;
 - no numeric generation is exposed to these non-CAS consumers.
+
+All three consumers key off one value — the `etag` on the object metadata — and each applies its own
+formula to it: the filesystem cache hashes the path and updates with the ETag, the page cache builds a
+path key and an ETag key, and the Parquet metadata cache builds a `(path, etag)` pair. Since the value
+is shared, an assertion that the ETag reaching the first two is the ordinary one is also an assertion
+about the third; only the formulas differ, and each formula is pinned by a unit test.
+
+The Parquet consumer's end-to-end assertion belongs in the live-GCS Default group rather than the
+deterministic fixture. A cold Parquet metadata read needs a real ranged `GET`, which the fake service
+does not serve; teaching it ranged reads would buy an assertion that the live gate — already required
+before release — makes at no extra cost.
 
 ### Typed-mode isolation and retry derivation {#typed-mode-isolation-and-retry-derivation}
 

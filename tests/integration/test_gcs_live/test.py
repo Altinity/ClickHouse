@@ -496,6 +496,20 @@ def test_default_gcs_hmac_accepts_the_ordinary_object_storage_operation_set():
         "counter and the row counts cannot see this, which is why it is asserted here"
     )
 
+    # The singular shape needs its own evidence. `S3DeleteObjects` aggregates both, so the counter
+    # moving says nothing about which of the two GCS accepted, and the assertions above speak only for
+    # the batch one -- a build that never issued a singular DeleteObject at all would satisfy them.
+    # Same prefix filter and the same reason for it.
+    single_lines = [
+        line
+        for line in node.grep_in_log("Object with path ").splitlines()
+        if PREFIX in line
+    ]
+    assert single_lines, (
+        "no singular delete was logged for this run's own keys, so GCS acceptance of the singular "
+        "DeleteObject shape is unproven -- only the batch shape is"
+    )
+
 
 @requires_hmac
 def test_default_gcs_hmac_reports_a_typed_error_for_a_refused_request():
