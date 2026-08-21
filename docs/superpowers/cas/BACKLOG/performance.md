@@ -544,3 +544,28 @@ Neither is a correctness issue — the controller is bounded (16 attempts, 90 s 
 `Committed`. Related, already tracked: `{#issue-2244-lease-retry-asymmetry}` (the lease/remount ops
 have the OPPOSITE problem — no retries at all) and `[timeout-retry RFC residuals]` in
 `BACKLOG/ref-protocol.md`.
+
+## Every decoded text-format line is assembled one byte at a time into a fresh `String` (2031-triage CAS-127) {#readline-per-byte-per-record-string}
+
+`Cas::readLine` (`Formats/CasTextFormat.cpp:281-295`) builds each line by `line.push_back(c)` in a
+loop with an `in.eof()` check per character and no `reserve`, returning a freshly-constructed `String`
+by value. It is the single line reader for every v3 text format, and the record-oriented formats call
+it once per record inside their decode loop: `Formats/CasRefSnapshotFormat.cpp:159,194`,
+`Formats/CasRefLogFormat.cpp:324,370`, `Formats/CasPartManifestFormat.cpp:136,173,278`,
+`Formats/CasFoldSealFormat.cpp:335,350`, `Formats/CasRecordStreamFormat.cpp:123,238`,
+`Formats/CasRefCatalogFormat.cpp:174`, `Formats/CasGcOutcomesFormat.cpp:73`.
+
+So a GC round that streams a large ref snapshot, an in-degree run, a fold seal and a pool-global ref
+catalog pays, per record: one heap allocation (the JSON record lines are well past the SSO limit, so
+this is a real `malloc`/`free` pair) plus a per-byte loop where a `memchr` over the already-buffered
+range plus one `append` would do. Pure constant factor — no correctness dimension, no cap change
+(`line_cap` is still enforced, it just moves from per-byte to post-scan) — but it sits on the decode
+side of every GC round and every part-manifest open.
+
+Fix shape: scan the `ReadBuffer`'s pending range for `'\n'` and `append` whole chunks (the same shape
+as `readStringUntilNewlineInto`), and let the caller pass a reusable `String &` so the decode loops
+stop allocating per record. Nothing outside `Formats/` calls `readLine`
+(`Formats/CasTextFormat.h:221` plus `Pool/CasPool.cpp:1435-1436`), so the signature change is local.
+
+Related, already tracked: `{#writepath-cost-txn-final}` covers the WRITE-side allocation audit; this
+is the read/decode side, which that item does not mention.

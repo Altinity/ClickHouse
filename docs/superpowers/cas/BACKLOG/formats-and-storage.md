@@ -539,3 +539,36 @@ and before the PUT (`:880`), so it can never name a manifest in an owner transit
 Owed: the same additive pre-encode reservation the other control objects use (an entry-count ×
 worst-case-per-entry reservation plus the fixed frame, via `fitsObjectCap`), so this format follows
 the one discipline the tree already documents rather than being the exception.
+
+## The staged-Inline arms of `createHardLink` / `moveFile` never establish the destination `PartWriteTxn` (2031-triage CAS-128) {#staged-inline-hardlink-no-dst-buildtxn}
+
+`f7539af045c` ("inline-only part must create a Build") fixed exactly one of the three places that can
+push an `EntryPlacement::Inline` entry into a part staging: the inline WRITE callback, which now calls
+`buildFor(route, st)` (`ContentAddressedTransaction.cpp:943`). The two transfer paths were not fixed
+and still push an Inline entry into a possibly-fresh destination staging without a `PartWriteTxn`:
+
+- `createHardLink`, staged-source arm — the `Blob` case calls `adoptStagedBlob(..., buildFor(*dst, dst_st), ...)`
+  (`ContentAddressedTransaction.cpp:1178`), the `Inline` case falls through to the bare
+  `dst_st.entries.push_back(...)` at `:1181-1183` with no `buildFor`. (The committed-source arm below
+  is fine: `buildFor(*dst, dst_st).adoptEvidence(*src_entry)` at `:1188`.)
+- `moveFile`, staged-entry arm — `buildFor(*dst, dst_st)` is inside `if (&src_st != &dst_st && entry.placement == Cas::EntryPlacement::Blob)`
+  (`ContentAddressedTransaction.cpp:1508-1522`), so a CROSS-PART move of an Inline entry leaves the
+  destination staging with entries and no build (and the source's build stays with the source).
+
+`publishStaging` then throws `LOGICAL_ERROR` "staged entries or removal marks for {}/{} without a
+Build" (`ContentAddressedTransaction.cpp:395-397`) — unless the destination ref happens to be already
+committed, in which case the repoint branch at `:337-392` tolerates a null build. Fail-closed and
+loud: nothing is published, no silent corruption; but under `abort_on_logical_error` it is a server
+abort, which is how the write-path instance of this same shape was originally found.
+
+Not reachable from production today: every MergeTree `createHardLink` call site carries forward from a
+COMMITTED source part (`MutateTask.cpp:2280,2294,2538,2574,2599` all pass `ctx->source_part`'s
+storage; `DataPartStorageOnDiskBase.cpp:478` and `Backup.cpp:71` hardlink from a committed part), and
+the part-file `moveFile` caller renames within ONE part directory
+(`DataPartStorageOnDiskFull.cpp:335`), so `&src_st == &dst_st` and the build already exists from the
+inline write. So this is latent-shape hardening, not a live bug.
+
+Fix: add the idempotent `buildFor(*dst, dst_st)` to both Inline arms (it is idempotent, `:151-155`),
+and add the two gtest cases next to `CASWiringWrite.InlineOnlyPartPublishesWithoutBuildCrash`
+(`src/Disks/tests/gtest_ca_wiring.cpp:828`): stage an inline file into part A, then hardlink / move
+ONLY it into a fresh part B, and commit.
