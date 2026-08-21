@@ -318,12 +318,15 @@ def test_gcp_auth_etag_and_cache_isolation(started_cluster):
     # `_etag` numeric here; this assertion is fireable because the two formats cannot collide.
     assert not re.fullmatch(r"\d+", etag_head), etag_head
 
-    # --- Filesystem cache: the same `_etag` must produce the same cache key on repeated reads, so a
-    # second read of the unchanged object is served from cache with no further GetObject call. ---
+    # --- Filesystem cache: the first read is LIST-sourced (glob), the second is HEAD/GET-sourced (a
+    # direct key). The cache key is `SipHash(path, etag)`
+    # (`StorageObjectStorageSource.cpp`), so the second read can only be served from cache -- with no
+    # further `GetObject` call -- if the two read paths agree on `etag` for the identical object. A
+    # generation leaking into only one of the two response kinds would make this a cache miss.
     fs_settings = "filesystem_cache_name='gcp_oauth_cache1', enable_filesystem_cache=1, use_page_cache_for_object_storage=0"
     fs_query_id = f"fs-{object_name}-1"
     node.query(
-        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {fs_settings}",
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='cache_isolation*.parquet', format='Parquet') SETTINGS {fs_settings}",
         query_id=fs_query_id,
     )
     node.query("SYSTEM FLUSH LOGS")
@@ -349,14 +352,16 @@ def test_gcp_auth_etag_and_cache_isolation(started_cluster):
     assert int(read_bytes) == write_bytes
     assert int(gets) == 0
 
-    # --- Page cache: mutually exclusive with the filesystem cache in the read pipeline
-    # (`use_page_cache` in `StorageObjectStorageSource::createReadBuffer` requires
-    # `!use_filesystem_cache`), so this is its own query with the filesystem cache turned off. ---
+    # --- Page cache: same cross-path shape as the filesystem cache above (LIST-sourced warm read,
+    # then a HEAD/GET-sourced read that must hit), over the independent page-cache key
+    # `"etag:" + etag` (`StorageObjectStorageSource.cpp`). Mutually exclusive with the filesystem
+    # cache in the read pipeline (`use_page_cache` in `StorageObjectStorageSource::createReadBuffer`
+    # requires `!use_filesystem_cache`), so this is its own query with the filesystem cache off. ---
     node.query("SYSTEM CLEAR SCHEMA CACHE")
     pc_settings = "enable_filesystem_cache=0, use_page_cache_for_object_storage=1"
     pc_query_id = f"pc-{object_name}-1"
     node.query(
-        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {pc_settings}",
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='cache_isolation*.parquet', format='Parquet') SETTINGS {pc_settings}",
         query_id=pc_query_id,
     )
     node.query("SYSTEM FLUSH LOGS")
@@ -385,8 +390,9 @@ def test_gcp_auth_etag_and_cache_isolation(started_cluster):
     assert int(misses_2) == 0
     assert int(gets) == 0
 
-    # --- Parquet metadata cache: isolated from both body-caching mechanisms above, so a hit here can
-    # only come from the footer/metadata cache keyed on `(path, etag)`
+    # --- Parquet metadata cache: same cross-path shape again (LIST-sourced warm read, then a
+    # HEAD/GET-sourced read that must hit), isolated from both body-caching mechanisms above so a hit
+    # here can only come from the footer/metadata cache keyed on `(path, etag)`
     # (`ParquetMetadataCache::createKey`), not from a full-file cache serving the whole read. A hit
     # still requires an `S3GetObject` for the row-group body, so -- unlike the filesystem/page-cache
     # queries above -- this does not assert the absence of a further object-body fetch.
@@ -394,7 +400,7 @@ def test_gcp_auth_etag_and_cache_isolation(started_cluster):
     pq_settings = "enable_filesystem_cache=0, use_page_cache_for_object_storage=0, use_parquet_metadata_cache=1"
     pq_query_id = f"pq-{object_name}-1"
     node.query(
-        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {pq_settings}",
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='cache_isolation*.parquet', format='Parquet') SETTINGS {pq_settings}",
         query_id=pq_query_id,
     )
     node.query("SYSTEM FLUSH LOGS")
