@@ -95,3 +95,18 @@ handling exists anywhere in CAS or `src/IO/S3/`. It fails closed (`isObjectNotFo
 correctness: classify that status into a message naming the storage-class requirement instead of a
 bare S3 error. No restore-and-retry path is wanted (a CAS pool must not live on a restore-latency
 class).
+
+## The pool trust boundary is nowhere stated for operators (2031-triage CAS-027) {#pool-trust-boundary-undocumented}
+
+The settled position — the bucket credential IS the whole trust boundary, and every party holding it
+is trusted exactly as much as every other pool member — matches the code (nothing in the pool
+protocol authenticates the writer of a control object: `CasServerRoot.cpp`'s owner/mount writes are
+guarded by a conditional token, never by an identity), but it is stated nowhere an operator will
+read it. A grep across all of `docs/en/antalya/cas/` finds no security or trust-boundary text: no
+statement that a party with pool write credentials can retire a member (`owner` tombstone), fence
+its writes (`gc_fenced`), or claim its mount slot; no guidance that the pool prefix must not be
+shared with a role or tenant that is not trusted with every member's availability; and no note that
+backup/log-shipping/analytics roles pointed at the pool should be read-only. Add a short
+trust-boundary section (index or bucket-requirements) saying exactly that. Consequence of the gap is
+operational, not a code defect: an operator can hand out pool credentials believing them to be
+narrower than they are.
