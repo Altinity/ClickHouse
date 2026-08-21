@@ -345,11 +345,20 @@ def test_gcp_auth_etag_and_cache_isolation(started_cluster):
         query_id=fs_query_id_2,
     )
     node.query("SYSTEM FLUSH LOGS")
-    read_bytes, gets = node.query(
-        f"SELECT ProfileEvents['CachedReadBufferReadFromCacheBytes'], ProfileEvents['S3GetObject'] "
+    read_bytes, misses, gets = node.query(
+        f"SELECT ProfileEvents['CachedReadBufferReadFromCacheBytes'], "
+        f"ProfileEvents['CachedReadBufferReadFromCacheMisses'], ProfileEvents['S3GetObject'] "
         f"FROM system.query_log WHERE query_id='{fs_query_id_2}' AND type='QueryFinish'"
     ).split("\t")
-    assert int(read_bytes) == write_bytes
+    # Not `read_bytes == write_bytes`: `CachedReadBufferCacheWriteBytes` counts one physical
+    # population of the cache, while `CachedReadBufferReadFromCacheBytes` sums every buffer instance
+    # that reads through the cache in that query (schema resolution, prefetch, and the execution read
+    # each open their own `CachedOnDiskReadBufferFromFile` and each re-reads the small cached object in
+    # full) -- for this object that was observed to be exactly 3x on a clean second read, so the two
+    # counters are not comparable quantities even when nothing is wrong. What isolation actually
+    # requires is that every one of those reads is a hit: zero cache misses, and no `GetObject` at all.
+    assert int(read_bytes) > 0
+    assert int(misses) == 0
     assert int(gets) == 0
 
     # --- Page cache: same cross-path shape as the filesystem cache above (LIST-sourced warm read,
