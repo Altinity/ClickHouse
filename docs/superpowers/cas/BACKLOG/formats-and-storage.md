@@ -82,3 +82,26 @@ affects S3/GCS production pools.
 - **[runfile-block-crc-coverage-gap] run-file block CRC coverage gap (head fields not covered)** — MINOR — Concrete integrity-hardening item: the block CRC does not cover the head fields.
 - **[format-version-field-naming-standardization] `format_version`/`compatibility_version` field-naming standardization across `RunFile`/`PartManifest`** — MINOR — Real but purely cosmetic, low urgency.
 - **[sec4-decoder-size-bounds] decoders lack an explicit size bound for a valid-CRC oversized shard/manifest** — DESIRABLE (security-relevant, SEC-4) — A pool-write-capable party could place an enormous but validly-framed object; `decodeRootShard`/`decodePartManifest`-class decoders were not confirmed to validate size bounds.
+
+## Copy-object paths out of a CA disk copy envelope bytes (2031-triage CAS-020) {#move-out-copies-envelope-bytes}
+
+`getStorageObjects` cannot express a blob's payload offset — `StoredObject` has no offset field
+(`ContentAddressedMetadataStorage.cpp:1859-1865`; the envelope header is ≥225 bytes,
+`CasManifestReader.cpp:144-160`), so any consumer that server-side-copies those keys copies the
+envelope, not the file. `clonePart` branches on the DESTINATION only
+(`DataPartStorageOnDiskBase.cpp:735`), so a MOVE **out** of a CA disk falls into
+`DiskObjectStorage::copyFile` (`:300`), and `DataSourceDescription::operator==`
+(`DiskType.cpp:35-38`) ignores `metadata_type` — a CA s3 disk and a plain s3 disk on the same
+endpoint compare EQUAL, so `copyFileImpl` (`:522`) takes the raw server-side copy. The same class
+reaches `BackupWriterS3/Azure/Disk::copyFileFromDisk` through `getBlobPath`. No move-out refusal
+exists.
+
+Loudness correction to the audit: every real part has inline files (≤1 MiB) whose storage key is
+`""`, so the operation aborts loudly — garbage objects plus a confusing error, not silent
+corruption. Hence P2, not a release blocker.
+
+Fix options: (1) refuse move-out/copy-out on a CA source with a clear message (CA-local, preferred
+first step), or (2) make `DataSourceDescription` equality account for `metadata_type` — that is
+generic disk code, so it needs the upstream-consult step
+([[feedback_upstream_code_consult_first]], [[feedback_cas_upstream_coupling_minimization]]) before
+anyone touches it.

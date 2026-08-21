@@ -35,8 +35,8 @@
 | CAS-017 | ⏳ | — | — | — | — |
 | CAS-018 | частично | P3 | [{#noexcept-allocation-hardening}](BACKLOG/ref-protocol.md#noexcept-allocation-hardening) | нет | Головной механизм (утечка лидерства в ref-очереди) уже закрыт единой точкой выхода и тестами; из шести якорей подтверждаются только теоретические аллокации в `noexcept`/деструкторах под лимитом памяти, а «renewal фенсит маунт» — прямо неверно. |
 | CAS-019 | частично | P2 | [{#part-folder-single-flight-manifest-keying}](BACKLOG/ref-protocol.md#part-folder-single-flight-manifest-keying) | нет | Ключ single-flight действительно только `ns+ref` и post-wait проверки manifest id нет, но каждый выданный view внутренне консистентен (один манифест), сингл-флайт работает только на stale-терпимом `CachedForLoad`, так что последствие — сдвиг на один репойнт, а не смешение двух манифестов. |
-| CAS-020 | ⏳ | — | — | — | — |
-| CAS-021 | ⏳ | — | — | — | — |
+| CAS-020 | подтверждено | P2 | [{#move-out-copies-envelope-bytes}](BACKLOG/formats-and-storage.md#move-out-copies-envelope-bytes) | нет | Механизм подтверждён — `getStorageObjects` теряет смещение payload и не имеет CA-гарда на стороне ИСТОЧНИКА, поэтому серверный copy-object (MOVE из CA / BACKUP на s3 того же хоста) копирует байты конверта; но «без ошибки» преувеличено: inline-файлы отдают ПУСТОЙ ключ, и операция целиком падает громко. |
+| CAS-021 | частично | P3 | [{#cas-021-followups}](BACKLOG.md#cas-021-followups) | нет | Все шесть цитат про контроллер на HEAD текстуально верны, но каждое опасное следствие уже нейтрализовано; остаточный дефект — устаревшая in-process памятка condemn-маркера, чинить её пере-чтениями пользователь отказался (принятый остаток + переименование в наблюдаемости). |
 | CAS-022 | ⏳ | — | — | — | — |
 | CAS-023 | ⏳ | — | — | — | — |
 | CAS-024 | not-a-bug | P3 | — | нет | Конфигурация «два CAS-диска на одном пуле с одинаковым `server_root_id`» не доживает до записи: второй диск падает на mount-протоколе с `ABORTED` (live double-start), поэтому пути потери данных при `MOVE PARTITION TO DISK` нет. |
@@ -668,3 +668,244 @@ BACKLOG / история. Запись существует и совпадае�
 Коммит, которым это состояние введено осознанно: `0cc71cece03` «ca: gc — REBUILD condemns nothing; fsck walks arithmetic streams (chain-broken fatal)» (`git log -S"A REBUILD CONDEMNS NOTHING"`). То есть это не забытая регрессия, а сознательная замена вектора потери данных на ограниченное удержание.
 
 Итог: класс находки правильнее читать не как LEAK-баг, а как известный tracked-остаток. Понижаю до P3, pre-release не блокирует (утечка ёмкости после аварийного REBUILD, детектируемая fsck). Полезное, что можно взять из находки: (i) в BACKLOG-пункт стоит добавить персональный анкор; (ii) rebuild стоит явно логировать/эмитить оценку «сколько блобов осталось без строки» — сейчас оператор узнаёт об этом только запустив fsck (перекрывается с `gc.md:52`).
+
+## CAS-020 — Механизм подтверждён — `getStorageObjects` теряет смещение payload и не имеет CA-гарда на стороне ИСТОЧНИКА, поэтому серверный copy-object (MOVE из CA / BACKUP на s3 того же хоста) копирует байты конверта; но «без ошибки» преувеличено: inline-файлы отдают ПУСТОЙ ключ, и операция целиком падает громко. (подтверждено, P2) {#cas-020}
+
+## (a) Что реально возвращает `getStorageObjects` на HEAD
+
+`ContentAddressedMetadataStorage::getStorageObjects`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp:1820-1867`):
+
+- blob-файл: `const auto location = snap.pool->locate(*entry);` (`:1859`) и
+  `return {StoredObject(location.key, path, location.length)};` (`:1865`). Смещение payload
+  ОТБРОШЕНО осознанно, и это записано в комментарии `:1860-1864`: «StoredObject carries no range …
+  the header offset is applied by `getBlobViewPlan`'s view window, the only byte-reading path».
+- Смещение не нулевое и не выводимо из объекта: `Pool/CasManifestReader.cpp:144-160` —
+  `BlobLocation{ .key = layout.blobKey(entry.ref), .offset = meta.blob_header_len, .length =
+  entry.blob_size }`; `blob_header_len` — константа пула (для blob-пулов 256, валидируется в
+  `Formats/CasPoolMetaFormat.cpp:38-46`). То есть payload НИКОГДА не начинается с offset 0.
+- `StoredObject` вообще не имеет поля смещения (`Disks/DiskObjectStorage/ObjectStorages/StoredObject.h`),
+  так что смещение не «потерялось по недосмотру» — оно НЕПРЕДСТАВИМО в возвращаемом типе.
+- Inline-записи (мелкие файлы части, `INLINE_CAP == 1 MiB`, `ContentAddressedTransaction.cpp:98`,
+  `:932-951`) отдают ПУСТОЙ ключ-заглушку: `:1828-1829`
+  `if (auto bytes = tryGetInManifestBytes(path)) return {StoredObject("", path, bytes->size())};`
+  (и `:1899-1900` в `getStorageObjectsIfExist`). Замысел заявлен в
+  `ContentAddressedMetadataStorage.h:138-141`: «any consumer bypassing the prepareRead branch fails
+  loudly, never reads wrong bytes». Для копирующих потребителей это работает как громкий отказ
+  (пустой ключ → ошибка бэкенда), а НЕ как правильное копирование.
+- Дополнительно: ключ не прогнан через `physicalKey()` (сравни `getBlobViewPlan` `:1987` и
+  `readBlobPayload` `:2002`, где `physicalKey` применяется) — для emulated/local бэкенда ключ ещё и
+  не физический.
+
+Правильный путь чтения — единственный: `DiskObjectStorage::prepareRead` (`DiskObjectStorage.cpp:825-838`)
+сначала пробует `prepareInManifestRead`, затем `getBlobViewPlan`, и только не-CA диски идут в
+`metadata_storage->getStorageObjects(path)` (`:836-838`).
+
+## (b) Потребители: где серверная копия реально достижима
+
+`clonePart` (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:716-779`) ветвится ТОЛЬКО по
+приёмнику: `if (dst_disk->isContentAddressed())` (`:735`) — тогда весь клон идёт через ОДНУ
+CA-транзакцию побайтово (`copyDirectoryContentIntoTransaction`, `:685-713`, `readFile` →
+`writeFile` → `copyData`). Это и есть «MOVE-to-CA fix» (L2). Для MOVE ИЗ CA (приёмник не CA)
+ветки нет: `:760-775` вызывает `src_disk->copyDirectoryContent(...)`, `DiskObjectStorage`
+`copyDirectoryContent` не переопределяет, значит `IDisk::copyDirectoryContent` →
+`copyThroughBuffers` → `asyncCopy` → `from_disk.copyFile(...)` (`src/Disks/IDisk.cpp:157-205`) →
+`DiskObjectStorage::copyFile` (`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:291-323`).
+
+Развилка там одна: `if (getDataSourceDescription() == to_disk.getDataSourceDescription())` (`:300`) →
+серверная копия через `MultipleDisksObjectStorageTransaction::copyFile` →
+`DiskObjectStorageTransaction::copyFileImpl`
+(`src/Disks/DiskObjectStorage/DiskObjectStorageTransaction.cpp:506-575`), где
+`:522 const auto blobs_to_copy = src_metadata_storage->getStorageObjects(from_file_path);` и
+`:551-552 copyObjectToAnotherObjectStorage(src_blob, dst_blob, ...)`. Иначе — безопасное чтение
+через буферы (`IDisk::copyFile`, `src/Disks/IDisk.cpp:63-79`, то есть через CA-пайплайн чтения).
+
+И развилка НЕ различает CA: `DataSourceDescription::operator==` (`src/Disks/DiskType.cpp:35-38`)
+сравнивает `type, object_storage_type, description, is_encrypted, zookeeper_name` — и НЕ сравнивает
+`metadata_type`, хотя `MetadataStorageType::CAS` существует (`src/Disks/DiskType.h:34`, поле `:46`) и
+CA-хранилище его честно возвращает (`ContentAddressedMetadataStorage.h:230`). `description` для S3 —
+это `uri.endpoint` (`Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h:70`), то есть только
+схема+хост, без бакета и префикса. Итог: CA-диск на s3-эндпойнте E и обычный s3-диск на том же E
+СРАВНИВАЮТСЯ РАВНЫМИ (`sameKind`, `DiskType.cpp:40-52`, ещё слабее). Гардов на стороне ИСТОЧНИКА нет
+вовсе: grep по `copyFile|copyDirectoryContent|copyObject` в каталоге `ContentAddressed/` — ноль
+попаданий.
+
+Что при этом копируется физически: `S3ObjectStorage::copyObjectToAnotherObjectStorage`
+(`Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.cpp:692-720`) берёт
+`size = S3::getObjectSize(...)` ИСХОДНОГО объекта (`:705`) и делает `copyS3File(..., src_offset=0,
+src_size=size, ...)` (`:711-717`) — то есть ВЕСЬ объект вместе с конвертом, а метаданные приёмника
+записываются с размером payload (`copyFileImpl:523-525`, `from.bytes_size`). Прочитанные с приёмника
+первые `payload_len` байт = заголовок конверта + payload без хвоста. Это порча, и на уровне
+отдельного файла — молчаливая.
+
+Кто доходит до `clonePart` (значит наследует эту развилку): `ALTER … MOVE PART|PARTITION TO
+DISK|VOLUME` (`MergeTreeData.cpp:6947`, `:7030`, диспетчер `:7151-7155`) → `movePartsToSpace`
+(`:10253`) → `moveParts` (`:10334`) → `MergeTreePartsMover::clonePart` (`:10405`/`:10438`,
+`MergeTreePartsMover.cpp:275`/`:281`), TTL/фоновые перемещения через `scheduleDataMovingJob`
+(`:10224`) → `selectPartsForMove` (`MergeTreePartsMover.cpp:103`) → тот же `movePartsToSpace`, и
+`IMergeTreeDataPart::makeCloneOnDisk` (`IMergeTreeDataPart.cpp:2474`). `MOVE_PARTITION` явно
+разрешён CA-гардом `MergeTreeData.cpp:6729/6786` (комментарий `:6773-6776` прямо говорит, что
+кросс-дисковый `MOVE … TO DISK/VOLUME` идёт байтовым `clonePart`-путём — что верно только при
+НЕравных `DataSourceDescription`).
+
+BACKUP — тот же класс, и там развилка ещё слабее:
+- `BackupWriterS3::copyFileFromDisk` (`src/Backups/BackupIO_S3.cpp:382-423`): `sameKind` (`:387-388`),
+  затем `src_disk->getBlobPath(src_path)` (`:391-392`) — а это буквально
+  `getStorageObjects` (`DiskObjectStorage.cpp:948-959`) — и `copyS3File(..., start_pos, length, ...)`
+  (`:394-403`) без `blob_header_len`. ДОСТИЖИМО и портит.
+- `BackupWriterAzureBlobStorage::copyFileFromDisk` (`src/Backups/BackupIO_AzureBlobStorage.cpp:161-193`):
+  предикат вообще только по типу (`:167-168`) — слабее всех.
+- `BackupWriterDisk::copyFileFromDisk` (`src/Backups/BackupIO_Disk.cpp:129-152`) → `src_disk->copyFile`
+  (`:145`) → та же развилка `:300`.
+- `BackupWriterFile` (`BackupIO_File.cpp:140-172`) требует `getBlobPath(...).size() == 1` и
+  `length == fs::file_size(...)` (`:152`, `:158`) — на CA размеры не совпадают (payload vs
+  payload+заголовок) и ключ не физический → откат на буферный путь; не портит, но и не гард.
+- `BackupWriterDefault::copyFileFromDisk` (`BackupIO_Default.cpp:79-93`) — безопасен (чтение через диск).
+- Контрольные суммы по удалённому пути ОТКАЗАНЫ заранее: `canCalculateChecksumFromRemotePath` →
+  `areBlobPathsRandom()` (`BackupEntryWithChecksumCalculation.cpp:124-127`), а CA возвращает `false`
+  (`ContentAddressedMetadataStorage.h:263`), так что `calculateChecksumFromRemotePath` (`:272-334`,
+  `getStorageObjects` на `:298`) не вызывается.
+- RESTORE В CA отказан громко: `writeFileUsingBlobWritingFunction` →
+  `generateObjectKeyForPath` → `notYet` (`ContentAddressedTransaction.cpp:530-532` через
+  `DiskObjectStorageTransaction.cpp:394`); штатный путь — целочастная транзакция
+  `MergeTreeData.cpp:7543-7545`.
+
+## (c) Есть ли явный отказ для MOVE ИЗ CA
+
+Нет. Существующие CA-отказы закрывают другое: BACKUP через временные хардлинки
+(`DataPartStorageOnDiskBase.cpp:422-427`, `SUPPORT_IS_DISABLED`; и там же в комментарии `:420-421`
+прямо сказано, что второй путь «uses getStorageObjects and round-trips on a CAS disk, so it is left
+untouched» — именно это предположение и неверно при равном `DataSourceDescription`), CA как ПРИЁМНИК
+(`generateObjectKeyForPath`/`truncateFile`/автокоммит в `ContentAddressedTransaction.cpp:530-532`,
+`:757`, `:770-771`, `:1655-1656`), репликация (`DataPartsExchange.cpp:159-164`, `:404-405`).
+Комментарий `DiskObjectStorageTransaction.cpp:565-567` («Unreachable on CA») верен ТОЛЬКО для CA-приёмника:
+`getStorageObjects` источника читается на `:522`, ДО `generateObjectKeyForPath` приёмника.
+
+## (d) Громко или тихо
+
+Здесь заявление аудита («corrupt destination part with no error») преувеличено, и это существенно:
+
+- каждый blob-файл копируется молча неверно (см. выше);
+- НО в любой реальной части есть файлы <= `INLINE_CAP` (1 MiB): `count.txt`, `columns.txt`,
+  `checksums.txt`, `metadata_version.txt` и т.п. — они inline (`ContentAddressedTransaction.cpp:932-951`),
+  и `getStorageObjects` отдаёт для них ПУСТОЙ ключ (`:1828-1829`). `copyObjectToAnotherObjectStorage`
+  на пустом ключе сразу делает `S3::getObjectSize` (`S3ObjectStorage.cpp:705`) → ошибка бэкенда →
+  исключение;
+- в `clonePart` это исключение ловится и приёмник вычищается (`DataPartStorageOnDiskBase.cpp:766-772`,
+  `removeRecursive`), в BACKUP — падает вся операция.
+
+То есть на уровне ЧАСТИ/операции исход — громкий отказ с невнятным сообщением (про пустой/отсутствующий
+ключ), плюс мусорные объекты в приёмнике от уже успевших скопироваться blob-ов. Молчаливая порча
+достижима только для потребителя, копирующего исключительно blob-файлы; такого потребителя в дереве я
+не нашёл (в MOVE и BACKUP части всегда идут целиком). Поэтому класс — реальный незакрытый
+integrity-гард с гарантированным «спасательным» громким отказом, а не тихая порча данных: P2, не
+pre-release-блокер.
+
+## История / BACKLOG
+
+Отдельного пункта под это НЕТ. `git log -S "since fixed"` по CAS-коду ничего не даёт; grep по
+`BACKLOG.md` и `BACKLOG/*.md` на «envelope offset», «CAS-020», «CAS-047», «StoredObject carries no
+range» — ноль. Ближайшее по теме — `BACKLOG/replication.md`
+`[move-part-to-ca-architecturally-unimplemented]` (про MOVE В CA; его «architecturally
+unimplemented» шапка объявлена УСТАРЕВШЕЙ в `BACKLOG.md:665-670`, оба слоя приземлились), и там же
+явно сказано «unaffected: … off-CA moves (CA→local)» — что верно ровно для НЕравных
+`DataSourceDescription` (CA-s3 → local) и НЕ верно для CA-s3 → plain-s3 на том же эндпойнте. Родня
+того же семейства — `{#issue-2173-freezeremote-gap}` (`BACKLOG.md:635-670`): там пропущенная
+CA-ветка в `freezeRemote`, здесь — пропущенный CA-гард на стороне источника серверной копии.
+
+Минимальная структурная починка (напрашивается, дешёвая): либо включить `metadata_type` в
+`DataSourceDescription::operator==`/`sameKind` (`src/Disks/DiskType.cpp:35-52`), либо добавить
+CA-гард источника в `DiskObjectStorage::copyFile:300` и в `DiskObjectStorage::getBlobPath:948`
+(последнее закрывает и оба BACKUP-writer'а сразу).
+
+## CAS-021 — Все шесть цитат про контроллер на HEAD текстуально верны, но каждое опасное следствие уже нейтрализовано; остаточный дефект — устаревшая in-process памятка condemn-маркера, чинить её пере-чтениями пользователь отказался (принятый остаток + переименование в наблюдаемости). (частично, P3) {#cas-021}
+
+## Что уже адъюдицировано (не переоткрываем)
+
+Находка уже разобрана 2026-08-20 как issue https://github.com/Altinity/ClickHouse/issues/2207;
+вердикт записан в `docs/superpowers/cas/BACKLOG.md:502-540` (секция
+`## CAS-021 (issue #2207) adjudication follow-ups ... {#cas-021-followups}`). Вердикт тот же:
+поведение контроллера описано аудитом правильно, но ни одно из заявленных нарушений целостности
+на текущем дереве не достижимо. Ниже — перепроверка на HEAD (`684161dcc03` + docs-коммиты;
+`git log -S "since fixed"` по CAS-коду ничего не даёт).
+
+## Цитаты аудита на HEAD (все подтверждены текстуально)
+
+- Равенство байт трактуется как доказательство собственного авторства (create-путь):
+  `Backend/CasRequestControl.cpp:290-296` — `if (got->bytes == expected_bytes) ... return
+  CasWriteOutcome::Committed; /// identical deterministic bytes -> the earlier attempt DID commit`.
+  Разные байты по тому же ключу — не «неопределённость», а `CORRUPTED_DATA` (`:298-300`),
+  то есть fail-closed.
+- То же на overwrite-пути: `Backend/CasRequestControl.cpp:561-569` —
+  `else if (got && got->bytes == bytes_s) { ... return {CasOverwriteOutcome::Committed, got->token}; }`,
+  и рядом честный комментарий про природу неопределённости `:544-546` («PreconditionFailed alone
+  does NOT prove a real conflict — it may be our own earlier attempt's write landing»).
+- Неопределённость, отражённая как чужая занятость: `Backend/CasRequestControl.cpp:570-574`
+  (`else if (got) ... Conflict`), `:466`, `:495` (`Occupied`); метка `NotUnresolved`
+  (`:329`, `:707`) действительно вводит в заблуждение.
+- `NoSuchKey` → `PreconditionFailed`: `Backend/CasObjectStorageBackend.cpp:156-159`
+  (`e.isPreconditionFailed() || e.getExceptionName() == "NoSuchKey" || e.getS3ErrorCode() ==
+  Aws::S3::S3Errors::NO_SUCH_KEY` → `PutOutcome::PreconditionFailed`). Направление отображения
+  fail-safe и это заявлено в комментарии `:141-142`: «a misread error becomes a retryable
+  PreconditionFailed/Conflict, never a false success».
+
+## Почему опасные следствия не достигаются на HEAD
+
+- Удаление защищено нормативным пере-чтением in-degree на самом delete-сайте:
+  `Gc/CasBlobInDegree.cpp:423-432` («THE DELETE-SITE IN-DEGREE RE-READ IS NORMATIVE (spec §5, third
+  arm). It is not an optimization and not defense-in-depth»).
+- Удаление — строго exact-token, а воскрешение ротирует `incarnation_tag`, поэтому ETag
+  воскрешённого тела гарантированно отличается от осуждённого:
+  `Pool/CasPartWriteTxn.cpp:710-719` («`buildHeader` mints a FRESH `incarnation_tag` ... so the
+  resurrected body (and hence its ETag) differs from the condemned incarnation regardless of
+  edge-before-observe»), сама запись `:731` и `:761` (`backend().resurrect(...)`), плюс fence-чек
+  `store->checkFenceOrThrow(displace_admitted_generation)` (`:723`, `:753`).
+- Etag, «разрешённый по равенству», не потребляется никем: `Gc/CasGc.cpp:127-137`
+  `writeCondemnedMeta` возвращает только `bool` (`... .outcome == CasOverwriteOutcome::Committed`),
+  токен/etag из результата CAS не читается.
+- Авторство в ref-лейне решается побайтовым сравнением payload, который несёт идентичность
+  транзакции: `Pool/CasRefLedger.cpp:165` (`classifyRefLogOccupant`), вызовы `:909`, `:2244`, `:3597`.
+- Гейт GC — «существует durable-свидетельство Condemned», а GET на разрешении равенства именно это
+  и доказывает; чужой Condemned-маркер удовлетворяет предикат by design, ровно как уже-Condemned
+  ветка (`Gc/CasGc.cpp:137` `return true;` на уже осуждённой мете).
+
+## Что реально осталось (остаток стоит на HEAD)
+
+Устаревшая мемоизация condemn-маркера. In-process реестр —
+`Gc/CasGc.h:968` `std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;`, заполняется в
+`Gc/CasGc.cpp:442-446` (`noteCondemnMarkerDurable`), читается в `:449-452`
+(`condemnMarkerConfirmedInProcess`), забывается только в `:454-458` (`forgetCondemnMarker`) и вызовы
+этого забывания стоят ИСКЛЮЧИТЕЛЬНО на fold-путях, где запись покидает конвейер:
+`Gc/CasGc.cpp:870` (redelete-выход), `:914` (spared), `:963` (replaced/superseded).
+
+Единственный законный переход `Condemned -> Clean` делает ПИСАТЕЛЬ —
+`Pool/CasPartWriteTxn.cpp:537` `writeResurrectMetaClean`, вызовы `:567`, `:734`, `:762` — и он
+физически не может инвалидировать приватный in-process set у `Gc` (другой класс, другой объект,
+никаких вызовов `forgetCondemnMarker` вне `Gc`; проверено grep'ом по всему каталогу CAS). Поэтому
+гейт градуации `Gc/CasGc.cpp:1885-1889` (`if (condemnMarkerConfirmedInProcess(entry.ref,
+entry.token)) return true;`) может пропустить запись, чья durable-мета уже `Clean`, — без единого
+запроса, по памятке. Приоритет остаточной ветки на градуации: памятка проверяется ПЕРЕД
+`loadMeta`-пере-чтением (`:1890-1896`), так что пере-чтение её не спасает.
+
+Последствие, когда это срабатывает (сверх-редкая гонка «воскрешение без промежуточного fold»): ОДИН
+лишний `deleteExact` — то есть один S3 DELETE, бесплатный, и он самозалечивается: воскрешение
+ротировало токен, значит `deleteExact` (`Gc/CasGc.cpp:802`) даёт `TokenMismatch` (дизамбигуация
+412-на-отсутствующем — `:814-823`), исход классифицируется как `Replaced` (`:825-829`), мета НЕ
+трогается (условие `:864` только `Deleted`/`Absent`, и явный комментарий `:859-863`: удалять мету
+на `Replaced` нельзя, писатель сам вернул её в `Clean`), а памятка тут же сбрасывается
+(`:870` `forgetCondemnMarker`). Данные не теряются:
+удаляется старая инкарнация по её собственному токену, живого тела этот DELETE не касается.
+
+Починка пере-чтением ОТКЛОНЕНА пользователем 2026-08-20 (зафиксировано в
+`BACKLOG.md` {#cas-021-followups}, пункт (2)): она стоила бы +1 БИЛЛИНГОВЫЙ GET на каждую
+градуирующую осуждённую запись на ОБЩЕМ пути (класс бюджета GET из P9), чтобы сэкономить бесплатные
+DELETE в редкой гонке — лечение хуже болезни; бесплатной инвалидации не существует, окно по
+определению «никто не наблюдал воскрешение». Не переоткрываю.
+
+Санкционированные остатки работы (оба — не про поведение): (1) «honesty patch» над контроллером
+(вынести исход, разрешённый по равенству, из `Committed` — например `IntendedStateDurable`;
+перестать возвращать наблюдаемый токен занявшего на этой ветке — сегодня он всё равно никем не
+читается; переименовать метку `NotUnresolved`; добавить doc-блок про модель доверия и таблицу
+разрешимости владения по классу ключа) и (2) метка наблюдаемости на самозалечивающем сайте
+`Gc/CasGc.cpp:814-830` — считать/логировать это как «spared by token rotation», а не как аномалию.
+Оба — ноль дополнительных запросов и ноль изменений durable-операций, поэтому P3 и не pre-release.
