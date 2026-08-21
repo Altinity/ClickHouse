@@ -48,6 +48,27 @@ the test names was actually issued (read off `system.events`, so a statement tha
 reaching S3 cannot leave an assertion vacuously true), and that the tokens CAS recorded are
 generations rather than ETags.
 
+## OPEN QUESTION FOR WHOEVER FIRST RUNS THIS WITH CREDENTIALS
+
+`system.events` counters are PROCESS-WIDE, and this configuration also holds two CAS disks whose
+background collection issues object-storage requests of its own. So every counter delta asserted here
+is only as sound as the assumption that no CAS activity moved that counter inside the measured window.
+Where that assumption fails, the assertion still passes — for a reason that has nothing to do with the
+statement it names.
+
+This is an open question, not a known defect: which counters CAS can actually move during these
+windows is not determinable without a real run. It is written here rather than in a tracked item
+because the first run is when it matters and this docstring is what its reader will have in front of
+them. **On that run, check each counter individually instead of trusting a pass** — for any counter CAS
+can move, a green assertion is not evidence that the statement under test issued the operation.
+
+One instance is already settled and serves as the pattern. `S3ListObjects` was asserted here and has
+been removed: an ordinary MergeTree lifecycle on a local-metadata disk never lists, so it could not
+have been satisfied by this workload at all — but the CAS disks in this same configuration DO list, so
+a background collection round inside the window could have satisfied it anyway. That is exactly the
+failure mode above, and it is why "make something list somehow" would have produced a test passing for
+the wrong reason rather than a working one.
+
 It does NOT assert the outbound header set — that `x-goog-if-generation-match` appears on the wire,
 that `x-amz-date` / `x-amz-content-sha256` / `x-amz-security-token` / `x-amz-api-version` are absent,
 or which headers the GOOG4 signature covers. That is a scope decision, not an impossibility, and the
