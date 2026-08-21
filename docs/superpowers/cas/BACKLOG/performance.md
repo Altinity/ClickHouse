@@ -369,3 +369,30 @@ bytes of a reclaimed blob linger on the node's local disk until eviction, with
 path notify the local cache for the deleted key (a `removeCacheIfExists`-style hook reachable
 without routing CA deletes through the cached object storage, which must NOT happen — the control
 plane deliberately bypasses the cache).
+
+## Every committed ref chunk re-GETs and rescans the pool-global ref catalog (2031-triage CAS-112) {#ref-catalog-read-per-commit}
+
+`commitRefChunk` performs a fresh, unconditional whole-object read of `cas/ref_catalog` immediately
+before id allocation for every positive (state-growing) chunk
+(`Pool/CasRefLedger.cpp:3248-3262`, gate `positive_append` at `:3194-3198`).
+`CasRefCatalog::read` is a plain `backend.get` plus a full `decodeRefCatalog` plus a
+`CatalogLifeIndex` build with no caching whatsoever (`Pool/CasRefCatalog.cpp:26-49`), and the row
+lookup is a linear `std::find_if` over all entries (`Pool/CasRefLedger.cpp:3255-3261` at the caller,
+helper `findEntry` at `Pool/CasRefCatalog.cpp:166-172`). A single part publish issues two positive
+appends — the precommit (`Pool/CasPartWriteTxn.cpp:1338`) and the promote
+(`Pool/CasPartWriteTxn.cpp:955`/`:1070`) — so a lone `INSERT` pays at least two full catalog GETs
+whose body size and decode cost scale with the number of namespaces in the pool, entirely unrelated
+to the table being written. Flat combining amortizes this across concurrent appends (one GET per
+committed chunk, not per item), and the warm path does NOT re-read the catalog in
+`namespaceLife`/`acquireMutableRefTableRuntime` (cached runtime, `Pool/CasRefLedger.cpp:620-631`,
+`:4691-4718`) — so the cost is per chunk commit, not per API call.
+
+This is the READ counterpart of {#ref-catalog-write-hotspot} (which is about creation-time CAS
+contention on the same object) and the same shape as {#ckpt-read-policy} (a fresh control-object GET
+per commit): the fix should be considered together with that policy seam, since both are
+"exact-read-per-commit" of a singleton whose only mutators are lifecycle transitions under lease
+exclusivity. Correctness note for any caching design: this read is a deliberate fence — it closes
+the window in which another actor publishes `Removing` after the cached runtime's own admission — so
+a cache needs the same invalidation edges {#ckpt-read-policy} lists (fence-generation change, wedge,
+remount supersession, `catalog_life_invalidated`) plus the terminal-removal path staying always-exact
+(`Pool/CasRefLedger.cpp:3223-3235`). Not correctness-affecting today; pure request-count/scale cost.

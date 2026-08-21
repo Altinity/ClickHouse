@@ -126,8 +126,8 @@
 | CAS-108 | ⏳ | — | — | — | — |
 | CAS-109 | ⏳ | — | — | — | — |
 | CAS-110 | ⏳ | — | — | — | — |
-| CAS-111 | ⏳ | — | — | — | — |
-| CAS-112 | ⏳ | — | — | — | — |
+| CAS-111 | подтверждено | P2 | [{#ref-table-64mib-admission-ceiling}](BACKLOG.md#ref-table-64mib-admission-ceiling) | нет | Потолок 64 MiB на закодированный снапшот/removal-транзакцию действительно даёт жёсткий предел числа refs на таблицу (~0.6-0.9 M) с отказом растущих записей, но это громкий fail-closed отказ до создания любого объекта, и он уже отслежен в BACKLOG. |
+| CAS-112 | частично | P2 | [{#ref-catalog-read-per-commit}](BACKLOG.md#ref-catalog-read-per-commit) | нет | Каждый закоммиченный положительный ref-чанк действительно делает свежий безкешевый GET+полный декод пул-глобального `cas/ref_catalog` с линейным поиском (≥2 GET на публикацию парта), но «deep copy и re-encode на каждой мутации» относится к lifecycle-мутациям каталога, а не к ref-append. |
 | CAS-113 | ⏳ | — | — | — | — |
 | CAS-114 | ⏳ | — | — | — | — |
 | CAS-115 | ⏳ | — | — | — | — |
@@ -4824,3 +4824,54 @@ GC» — ровно то, что метрика должна была ловит
 **Что в BACKLOG было / что добавлено.** Прямого покрытия не было: `grep -rni "config reload|SYSTEM RELOAD CONFIG|reloadable|reloaded"` по `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` не даёт ни одного попадания. Добавлен новый раздел (незакоммичен) `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` → `{#cas-settings-not-reloadable-silently}`: он фиксирует обе половины, отделяет реально динамическое подмножество (GC-каденс и per-round бюджеты, кэш-бюджеты, `part_folder_validate`, `gc_enabled`) от creation-time идентичностей (`server_root_id`, `gc_shards`, `blob_hash`, `scratch_path`, `staging_backend`), требует WARNING с перечислением изменённых игнорируемых ключей вместо нынешней тишины, упоминает попутно закрываемую дыру с проверкой неизвестных ключей только на старте, и отдельным абзацем — удержанный lease при удалении диска из конфига со ссылкой на `{#disk-lifecycle-rev8-closure}`.
 
 **Оценка.** Тихое игнорирование правки конфига — операционный дефект (оператор видит успешный reload и делает неверный вывод), но не риск для данных и не блокер релиза: ничего не портится, все опасные настройки по конструкции creation-time, а самое востребованное (`gc_enabled`) имеет SQL-верб. Отсюда P2 / pre-release нет. Половина про удалённый диск — P3-по-себе и в основном generic upstream; отдельным элементом не выделяю, она включена в тот же новый раздел.
+
+## CAS-111 — Потолок 64 MiB на закодированный снапшот/removal-транзакцию действительно даёт жёсткий предел числа refs на таблицу (~0.6-0.9 M) с отказом растущих записей, но это громкий fail-closed отказ до создания любого объекта, и он уже отслежен в BACKLOG. (подтверждено, P2) {#cas-111}
+
+Форма кода в находке подтверждается полностью, только пути/номера строк устарели (снапшот `CA/...` из коммита 592b9b83568 переехал в подкаталоги).
+
+1. Лимиты существуют и оба равны 64 MiB:
+   - `src/.../ContentAddressed/Formats/CasRefLogFormat.h:100`: `inline constexpr size_t ref_removal_max_bytes = 64 * 1024 * 1024;`
+   - `src/.../Formats/CasRefSnapshotFormat.h:65`: `inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;`
+   (в находке был указан `CasRefLogFormat.h:50` и `CasRefSnapshotFormat.h:40` — номера устарели, символы те же).
+
+2. Бюджеты — на таблицу (namespace), считаются один раз при recovery с вычетом каркасного оверхеда:
+   `Pool/CasRefLedger.cpp:1205-1208` — `const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;` затем `result.snapshot_budget = ...`, `result.removal_budget = ...`. Один namespace = одна таблица (`srv1/<table_uuid>`, `Primitives/CasTypes.h:42-44`).
+
+3. Проверка допуска и отказ: `Pool/CasRefLedger.cpp:3021-3025`
+   `if (state_growing && !admits(item_scratch, op, rt->snapshot_budget, rt->removal_budget)) throw Exception(ErrorCodes::LIMIT_EXCEEDED, "ref mutation on namespace '{}' would exceed the table's admission budget ... — refusing before any object is created", ...)`.
+   `admits` — `Pool/CasRefProtocol.cpp:718-735`: применяет op к копии состояния и сравнивает `encodedSnapshotBudgetSize(scratch) > snapshot_budget` и `encodedRemovalBudgetSize(scratch) <= removal_budget`; сами размеры — O(1) от инкрементальных счётчиков (`Pool/CasRefProtocol.cpp:700-715`). То есть измеряется не текущий объект, а гипотетический ПОЛНЫЙ снапшот таблицы и гипотетическая ПОЛНАЯ removal-транзакция — значит потолок действительно на живое состояние таблицы, а не на одну транзакцию. Это ключевое утверждение находки, и оно верно.
+
+4. Оценка «~610k refs» — правдоподобна по порядку, но зависит от длины имён. Строка снапшота пишется как `{"k":"c","rn":…,"me":…,"mb":…,"mo":…,"ts":…}` (`Formats/CasRefSnapshotFormat.cpp:57-70`), одна committed-строка = одна папка парта; на реалистичных именах это ~75-95 байт, т.е. ceiling порядка 0.6-0.9 M refs. Так что цифра находки в диапазоне, но подавать её как точную нельзя.
+
+Что в находке переоценено:
+- «every write to that table fails» — отказывают только STATE-GROWING операции (`OwnerTransition` с новым binding и `SetPublishedAt`, см. комментарий и условие на `CasRefLedger.cpp:3013-3022`); удаления (`remove_namespace`, чистое снятие binding) бюджет не проверяют и работают, т.е. DROP PARTITION / удаление партов / DROP TABLE выводят таблицу из-под потолка. Формулировка one-liner'а «trimming cannot help» неверна: обрезка помогает, не помогает только merge (merge сначала растит, потом сжимает).
+- «retrying cannot help» — верно как факт (повтор той же вставки при том же состоянии снова упрётся), но отказ per-item изолированный: соседи в том же batch не падают (`complete_error({it}, ...)` в step 1/3), объект не создаётся, публикация не частичная. Это громкий fail-closed отказ, не порча данных — по нашей шкале это существенно снижает оценку.
+- Достижимость «ordinary part accumulation» преувеличена: собственный потолок MergeTree — `max_parts_in_total = 100000` (`src/Storages/MergeTree/MergeTreeSettings.cpp:976`, форсится в `src/Storages/MergeTree/MergeTreeData.cpp:6191`), это на порядок ниже. Чтобы дойти до 64 MiB, нужно поднять эту настройку в несколько раз плюс большое число outdated-партов/precommit'ов, всё ещё держащих refs. Отсюда P2, не блокер релиза.
+
+BACKLOG: пункт уже существует и покрывает ровно эту находку — `docs/superpowers/cas/BACKLOG/formats-and-storage.md:491` «The per-namespace 64 MiB ref-table budget is a hard per-table ref ceiling with no spill path (2031-triage CAS-111)» с анкором `{#ref-table-64mib-admission-ceiling}`, добавлен коммитом 2583e3427aa (предыдущий проход этой же триажной серии). Новый пункт не нужен. Там же зафиксировано, что остаётся: (a) отсутствует surface наблюдаемости потребления бюджета (`CurrentMetrics`/`system.`) и предупреждение задолго до стены — сейчас потолок узнаётся только по отказу записи; (b) нет дизайн-ответа для таблиц, которым легитимно нужно больше refs (chunked/multi-object snapshot или партиционированная ref-таблица). Родственный пункт — `{#manifest-inline-budget-no-spill}`.
+
+Итог: сама механика подтверждена на HEAD, ничего не закрыто последующей работой, но последствие в находке завышено (не «все записи навсегда», а рост при огромном числе refs, и обрезка выводит из состояния), достижимость требует изменённых настроек, класс отказа — fail-closed. Остаточная работа = уже отслеженные (a)+(b).
+
+## CAS-112 — Каждый закоммиченный положительный ref-чанк действительно делает свежий безкешевый GET+полный декод пул-глобального `cas/ref_catalog` с линейным поиском (≥2 GET на публикацию парта), но «deep copy и re-encode на каждой мутации» относится к lifecycle-мутациям каталога, а не к ref-append. (частично, P2) {#cas-112}
+
+Подтверждено на HEAD (пути из находки устарели после 592b9b83568, символы найдены):
+
+1. Чтение каталога на пути коммита чанка: `Pool/CasRefLedger.cpp:3248-3262` внутри `commitRefChunk` —
+   `const CasRefCatalog::Snapshot catalog = CasRefCatalog::read(backend, layout);` затем
+   `std::find_if(catalog.catalog.entries.begin(), ...)` и требование `state == NsState::Live`.
+   Условие входа — `positive_append` (`Pool/CasRefLedger.cpp:3194-3198`: любой `OwnerTransition` с новым binding либо `SetPublishedAt`). То есть на КАЖДЫЙ положительный коммит чанка — одно полное чтение каталога.
+2. Кеша нет: `CasRefCatalog::read` (`Pool/CasRefCatalog.cpp:41-49`) вызывает `readOptionalForBootstrap` (`:26-36`) = `backend.get(layout.refCatalogKey())` + `decodeRefCatalog(got->bytes)` + построение `CatalogLifeIndex(catalog)`. Ни ETag-кеша, ни условного GET, ни памяти между вызовами. Стоимость тела и декода растёт с числом namespace'ов (таблиц) в пуле — то есть с чем-то, не имеющим отношения к записываемой таблице. Это ядро находки, и оно верно.
+3. Линейный поиск: у вызывающего — `std::find_if` (`Pool/CasRefLedger.cpp:3255-3261`), общий помощник — `findEntry` (`Pool/CasRefCatalog.cpp:166-172`), тоже `std::find_if`. Утверждение находки про «vector kept sorted by lower_bound» неточно: порядок каноничен и проверяется кодеком, но поиск здесь именно линейный, `lower_bound` на этом пути не используется.
+4. «Как минимум два полных GET каталога на коммит парта» — подтверждается: публикация одного парта делает два положительных append'а — precommit (`Pool/CasPartWriteTxn.cpp:1338`) и promote (`Pool/CasPartWriteTxn.cpp:955`, ветка `:1070`), каждый доезжает до своего `commitRefChunk`. На removal-пути читается дополнительно (`Pool/CasRefLedger.cpp:3223-3235` — terminal removal, всегда exact).
+
+Что в находке неверно/переоценено:
+- «a whole-catalog deep copy and re-encode on every mutation» (`CasRefCatalog.cpp:163` в снапшоте) — это `casUpdateImpl` (`Pool/CasRefCatalog.cpp:107-137`: `RefCatalog candidate = mutate(snap.catalog); const String bytes = encode(candidate); backend.casPut(...)`). Он выполняется только на LIFECYCLE-мутациях каталога (создание/удаление namespace, смена состояния), а не на ref-append: путь `appendRefOps`→`commitRefChunk` каталог только ЧИТАЕТ, никакого `casPut` по `cas/ref_catalog` там нет. Значит «на каждую мутацию» — про мутации каталога, а не про каждый коммит парта; per-part-commit амплификации записи/контенции по этому объекту нет.
+- «Every ref append re-reads» — по числу API-вызовов это завышено в обе стороны: тёплый путь `appendRefOps`→`acquireMutableRefTableRuntime`→`namespaceLife` каталог НЕ читает при закешированном runtime (`Pool/CasRefLedger.cpp:620-631`, `:4691-4718`; чтение только на холодном первом обращении и при `removal_admission_closed`), зато flat-combining объединяет много конкурентных append'ов в один чанк — так что реальная гранулярность = один GET на закоммиченный чанк, а не на каждый append и не на каждый item.
+- Класс — чисто request-count/scale, никакой корректностной проблемы: это осознанный fence (закрывает окно, в котором другой актор публикует `Removing` после того, как закешированный runtime уже прошёл admission), и он же даёт громкий `throwCasWriteRetryLater` при не-`Live` строке (`:3260-3268`).
+
+BACKLOG: существующие пункты эту находку НЕ покрывают:
+- `{#ref-catalog-write-hotspot}` (`docs/superpowers/cas/BACKLOG/performance.md:113`) — про CAS-контенцию ЗАПИСИ того же объекта при массовом создании таблиц, не про чтение на пути коммита.
+- `{#ckpt-read-policy}` (`performance.md:7-21`) — тот же класс («свежий GET control-объекта на каждый коммит»), но про `_ckpt`, другой объект.
+Поэтому добавлен новый (незакоммиченный) пункт: `docs/superpowers/cas/BACKLOG/performance.md`, раздел «Every committed ref chunk re-GETs and rescans the pool-global ref catalog (2031-triage CAS-112)», анкор `{#ref-catalog-read-per-commit}` — с точными цитатами, поправкой на flat-combining, указанием, что фикс надо проектировать вместе с `{#ckpt-read-policy}` (те же edges инвалидации кеша), и с требованием оставить terminal-removal чтение всегда exact.
+
+Итог: механика подтверждена, следствие частично завышено (deep-copy/re-encode не на этом пути; гранулярность — чанк, не append), корректность не затронута, P2 как чисто масштабный/бюджетный по S3-операциям пункт.

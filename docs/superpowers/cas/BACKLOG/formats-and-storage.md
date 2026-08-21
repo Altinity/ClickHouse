@@ -515,3 +515,27 @@ before the wall, so the ceiling is observable instead of arriving as a write ref
 answer for tables that legitimately want more refs — a chunked/multi-object snapshot, or a
 partitioned ref table — since today the only way out is deleting parts. Same family as
 {#manifest-inline-budget-no-spill} (a fail-closed format cap with no re-placement path).
+
+## The manifest encoded-size cap is checked after the canonical text is materialized (2031-triage CAS-113) {#manifest-encoded-cap-checked-after-materialization}
+
+MINOR (consistency; the failure is loud and fail-closed, and unreachable under the caps that precede it).
+
+`stageManifest` encodes the whole canonical text and only then compares it against the cap
+(`Pool/CasPartWriteTxn.cpp:854-858`, `kMaxManifestEncodedBytes = 256 MiB` at `:54`). The ref lane
+answers the same question the other way round: `admits` (`Pool/CasRefProtocol.h:571`) decides whether
+one MORE row still fits *before* any encoding, off O(1) incremental body-byte counters, against
+per-table budgets computed once in recovery (`Pool/CasRefLedger.cpp:1206-1208`); and
+`Formats/CasByteBudget.h:12-22` states the rule explicitly ("a producer that must decide whether one
+MORE entry still fits cannot encode first and measure afterwards"), with `fitsObjectCap` already used
+by `Formats/CasRefCatalogFormat.cpp:283`, `:367-379` and `Formats/CasFoldSealFormat.cpp:166`.
+
+Not a release concern: the entry-count cap (`:816-818`, 1 048 576), the per-entry inline cap
+(`:822-827`, 1 MiB) and the total inline cap (`:830-832`, 16 MiB) are all checked before the body is
+built, so the 256 MiB text is unreachable for any realistic part folder, and the caller already holds
+the whole `entries` vector in memory — the transient text is a constant factor on top of memory that
+is already allocated, not a new order of magnitude. The cap also fires before `sealObject` (`:859`)
+and before the PUT (`:880`), so it can never name a manifest in an owner transition.
+
+Owed: the same additive pre-encode reservation the other control objects use (an entry-count ×
+worst-case-per-entry reservation plus the fixed frame, via `fitsObjectCap`), so this format follows
+the one discipline the tree already documents rather than being the exception.
