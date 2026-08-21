@@ -140,3 +140,23 @@ log archaeology.
 - **[gc-files-prefix-not-listed] verify `_files` debris is reclaimed without a GC LIST of `rootsPrefix()`** — DESIRABLE — `Cas::Gc`'s fold LISTs `casRefsPrefix()` but not `rootsPrefix()`, so `_files` keys may not reach a GC round even though the writer's `removeRecursive` handles both prefixes. Confirm the perpetual namespace janitor (not the fold) is the actual reclaimer for this class, and document it if so; if not, it's a leak.
 - **[decode-cache-ttl-vs-gc-graduation-assert] assert `shard_decode_cache_ttl_ms` stays below GC's condemn-to-graduate window** — DESIRABLE — No assertion enforces `shard_decode_cache_ttl_ms` (200 ms) staying below the condemn-to-graduate latency (minimum two full rounds), which is the actual safety margin this cache setting depends on. A future GC-latency tuning change could silently violate this margin with no test catching it.
 - **[gc-rebuild-lease-interlock] `cas-gc-rebuild`'s `rebuildBaseline` has no mount-lease interlock** — HARD — A live server's fresh mount lease does not stop the offline disaster-recovery rebuild from performing; the only live-server guard today is the caller's own read-only-open discipline. Real safety gap in a destructive tool.
+
+## Orphan sweep's no-catalog-row branch skips every gate; its premise is false (2031-triage CAS-022) {#orphan-sweep-absent-catalog-row-window}
+
+Two paths differ. The addressed path `sweepNamespace` correctly refuses without a catalog row
+(`Gc/CasOrphanManifestSweep.cpp:499-500,518-520`) — the audit's claim is false there. But the paged
+planner `planManifestCursorPage` conditions ALL of its gates on `catalog_entry` (`:700-711`
+watermark, `:740`, `:751`, `:817`, `:828-830`) and nominates directly at `:875-895`, so a manifest
+whose namespace has no row yet passes with no watermark, no coverage and no §6 premise.
+
+The comment at `:822-826` justifying this states that a catalog row is published before any object
+of the life — that is wrong at HEAD: `stageManifest` writes the manifest BODY
+(`Pool/CasPartWriteTxn.cpp:809-878`) while the `Creating` row appears only later inside
+`precommitAdd` → `appendRefOps` → `createNamespace` (`Pool/CasRefCatalog.cpp:579-590`). So a
+namespace's first write does have a window.
+
+Mitigations keep this out of data-loss class: `promote` is fail-closed on a missing body
+(`CasPartWriteTxn.cpp:1032-1039`) so the INSERT fails loudly rather than committing a hole, and
+`BlobSourceRetirement` is idempotent (`Gc/CasBlobInDegree.h:167-174`). Fix: make the paged planner
+require the same durable premise as `sweepNamespace` (no row ⇒ skip, not nominate), and correct the
+stale ordering comment. P2.
