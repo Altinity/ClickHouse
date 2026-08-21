@@ -21,7 +21,9 @@ doc_type: 'guide'
 
 ## Spec delta — what this plan adds to the spec, and why the spec was not edited {#spec-delta}
 
-`docs/superpowers/cas/BACKLOG.md` is being actively rewritten by another session as this plan is written. Editing a file another agent is mid-write on risks losing one of the two edits, so the corrections live here and Task 3 moves them once that file is free. Treat this section as authoritative where it disagrees with the spec.
+`docs/superpowers/cas/BACKLOG.md` is being actively rewritten by another session as this plan is written. Editing a file another agent is mid-write on risks losing one of the two edits, so the corrections live here and Task 3 acts on them once that file is free. Treat this section as authoritative where it disagrees with the spec.
+
+Note what Task 3 does with the entry, because it is not what a reader would guess. That file declares itself a live backlog of **open work only**, with history left to git. The issue #2212 entry was not flipped to `FIXED` when it was fixed — it was **deleted**, and its anchor is already gone from the file. So a fixed #2173 leaves the live backlog too, and the durable record of what was done lives in this plan, in the triage document, and in the commits.
 
 1. **The three post-clone `removeFileIfExists` calls must route through the self-created transaction.** The spec mentions only that the `metadata_version.txt` / `txn_version.txt` writes "become legal single repoints". It does not say that the removals, which today go straight to the disk, would autocommit — introducing one transaction and immediately breaking it with three separate publishes against the same ref.
 2. **`freezeRemote`'s `external_transaction` branches must NOT be removed.** Verified: the whole function is byte-identical to `$(git merge-base altinity/antalya-26.6 HEAD)` — untouched upstream code. Those branches are dead *in this fork only*, because the single tree-wide assignment to `ClonePartParams::external_transaction` reaches `freeze`, not `freezeRemote`. Removing them would change shared upstream behaviour for no benefit to this fix, and the next upstream merge would meet the removal. A simplification along those lines was proposed during design and withdrawn for this reason.
@@ -35,7 +37,7 @@ Two further facts the spec does not state, both verified, both load-bearing for 
 ## Global Constraints {#global-constraints}
 
 - Branch `cas-gc-rebuild`. No rebase, no amend — add new commits.
-- **THE WORKTREE IS SHARED AND BUSY.** Another session is executing a different plan in this same checkout: it holds uncommitted edits under `src/Disks/tests/` and is rewriting `docs/superpowers/cas/BACKLOG.md`. Before staging anything, re-run `git status --short <the exact paths>` and stage only paths whose diff is yours. Never `git add -A`, `git add .`, or `git commit -a`. **Never stage `docs/superpowers/cas/BACKLOG.md`.**
+- **THE WORKTREE IS SHARED AND BUSY.** Another session is executing a different plan in this same checkout: it holds uncommitted edits under `src/Disks/tests/` and is rewriting `docs/superpowers/cas/BACKLOG.md`. Before staging anything, re-run `git status --short <the exact paths>` and stage only paths whose diff is yours. Never `git add -A`, `git add .`, or `git commit -a`. Do not stage a file while someone else's diff sits in it — that is a condition to re-check before each commit, not a permanent ban on a particular file.
 - `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp` is upstream code. Change only what this fix needs; do not tidy, reorder, or delete anything else in it.
 - No `LOGICAL_ERROR`. This change adds no new failure mode; the CAS branch either commits or undoes and rethrows.
 - Allman braces (opening brace on its own line) — enforced by the style check.
@@ -54,7 +56,7 @@ Two further facts the spec does not state, both verified, both load-bearing for 
 - Consumes: nothing from other tasks.
 - Produces: the test Task 2 must turn green.
 
-Three legs. The second and third are not decoration: leg 2 covers the case that needs no code and would otherwise never be exercised, and its counter assertion is the only thing that distinguishes "it worked" from "it worked by re-uploading everything".
+Three legs, none of them decoration. Leg 1 is the issue's repro. Leg 2 covers the same-pool case that needs no production code and would otherwise never be exercised, and its counter assertion is the only thing separating "it worked" from "it worked by re-uploading everything". Leg 3 covers the replicated ATTACH, which reaches the same function through different parameters and then repoints an already-committed part -- a shape leg 1 does not produce, because a non-replicated attach leaves `metadata_version_to_write` unset.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -140,6 +142,7 @@ SETTINGS disk = disk(
     metadata_type = cas,
     server_root_id = '05025_shared_b',
     name = '05025_cas_shared_b',
+    deduplication_head_first_min_bytes = 1,
     path = '05025_cas_shared_pool/');"
 
 ${CLICKHOUSE_CLIENT} --query "INSERT INTO src_cas SELECT number % 2, toString(number) FROM numbers(64);"
@@ -151,7 +154,12 @@ ${CLICKHOUSE_CLIENT} --query_id "$ATTACH_QUERY_ID" \
 ${CLICKHOUSE_CLIENT} --query "SELECT 'leg2', count(), sum(k), uniqExact(v) FROM dst_cas_same_pool;"
 
 # The content is already in the pool, so the publish must have adopted the existing blobs rather
-# than uploading their bodies again.
+# than uploading their bodies again. `CASBlobBodyPutAvoided` is raised only on the HEAD-first branch,
+# and that branch is taken on a dedup-cache hit or above `deduplication_head_first_min_bytes` --
+# whose default is 1 MiB, far above these blobs, and the destination pool's presence cache starts
+# empty because it is a different `Cas::Pool` object. Hence the destination disk lowers that
+# threshold to 1: without it the publish takes the conditional-body-PUT branch, the counter stays 0,
+# and this assertion fails for a reason that has nothing to do with the fix.
 ${CLICKHOUSE_CLIENT} --query "SYSTEM FLUSH LOGS;"
 ${CLICKHOUSE_CLIENT} --query "
 SELECT 'leg2_reused_blobs', ProfileEvents['CASBlobBodyPutAvoided'] > 0
@@ -159,10 +167,48 @@ FROM system.query_log
 WHERE current_database = currentDatabase() AND query_id = '${ATTACH_QUERY_ID}' AND type = 'QueryFinish'
 ORDER BY event_time_microseconds DESC LIMIT 1;"
 
+# ------------------------------------------------ leg 3: replicated, local -> content-addressed
+
+# The replicated ATTACH is a DIFFERENT shape and reaches the same function: of the replicated clone
+# sites only the ATTACH branch passes `must_on_same_disk=false`, and its clone params set
+# `metadata_version_to_write`, so after the transaction commits the caller writes
+# `metadata_version.txt` separately -- a repoint of an already-published part rather than a file
+# inside the clone. REPLACE on a replicated table is same-disk only and cannot reach this path.
+
+${CLICKHOUSE_CLIENT} --query "
+CREATE TABLE src_plain_repl (k UInt32, v String)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/05025_src_repl', 'r1')
+ORDER BY k PARTITION BY k
+SETTINGS disk = disk(type = local, name = '05025_plain_repl', path = '05025_plain_repl/');"
+
+${CLICKHOUSE_CLIENT} --query "
+CREATE TABLE dst_cas_repl (k UInt32, v String)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/05025_dst_repl', 'r1')
+ORDER BY k PARTITION BY k
+SETTINGS disk = disk(
+    type = object_storage,
+    object_storage_type = local,
+    metadata_type = cas,
+    server_root_id = '05025_dst_repl',
+    name = '05025_cas_dst_repl',
+    path = '05025_cas_dst_repl_pool/');"
+
+${CLICKHOUSE_CLIENT} --query "INSERT INTO src_plain_repl SELECT number % 2, toString(number) FROM numbers(64);"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE dst_cas_repl ATTACH PARTITION 1 FROM src_plain_repl;"
+${CLICKHOUSE_CLIENT} --query "SELECT 'leg3', count(), sum(k), uniqExact(v) FROM dst_cas_repl;"
+
+# The metadata-version repoint lands on a committed part, so the part must still read after a
+# detach/attach round trip -- that is what proves the repoint did not corrupt the published ref.
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE dst_cas_repl DETACH PARTITION 1;"
+${CLICKHOUSE_CLIENT} --query "ALTER TABLE dst_cas_repl ATTACH PARTITION 1;"
+${CLICKHOUSE_CLIENT} --query "SELECT 'leg3_roundtrip', count(), sum(k) FROM dst_cas_repl;"
+
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE src_plain;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE dst_cas;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE src_cas;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE dst_cas_same_pool;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE src_plain_repl SYNC;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE dst_cas_repl SYNC;"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
 ```
 
@@ -173,6 +219,8 @@ leg1	32	32	32
 leg1_roundtrip	32	32
 leg2	32	32	32
 leg2_reused_blobs	1
+leg3	32	32	32
+leg3_roundtrip	32	32
 dropped_ok
 ```
 
@@ -186,6 +234,7 @@ Expected: leg 1's `ATTACH PARTITION 1 FROM src_plain` throws. The reported error
 
 - The attach *succeeds*. Then the two tables are not on different disks and the clone went through `freeze`. Check the disk names actually differ and that the destination policy reserves the CAS disk.
 - Leg 2's counter row is empty rather than `0`/`1`. Then the `query_id`, the `current_database` filter, or `SYSTEM FLUSH LOGS` placement is wrong, not the dedup claim.
+- Leg 2's counter row is `0`. Then check `deduplication_head_first_min_bytes = 1` really reached the destination disk, because that is what puts the publish on the HEAD-first branch the counter lives on.
 
 - [ ] **Step 3: Commit**
 
@@ -364,13 +413,20 @@ Keep the correctness half untouched (a content-addressed transaction batches eve
 
 - [ ] **Step 5: Build and run**
 
+Build BOTH binaries — the server for the stateless tests and the unit-test binary for the gate, since building only one leaves the other stale and a green gate on a stale binary is evidence about different code. Redirect every build and every run to its own uniquely named log under the build directory, and have a subagent summarise each log rather than reading them inline:
+
 ```bash
-ninja -C build clickhouse
-./tests/clickhouse-test 05025_cas_attach_partition_cross_disk
-./tests/clickhouse-test 05003_cas_freeze 05024_cas_freeze_two_roots
+ninja -C build clickhouse       > build/2173_clickhouse_build.log 2>&1; echo "NINJA_EXIT=$?" >> build/2173_clickhouse_build.log
+ninja -C build unit_tests_dbms  > build/2173_unit_build.log      2>&1; echo "NINJA_EXIT=$?" >> build/2173_unit_build.log
+
+./tests/clickhouse-test 05025_cas_attach_partition_cross_disk  > build/2173_new_test.log     2>&1
+./tests/clickhouse-test 05003_cas_freeze 05024_cas_freeze_two_roots > build/2173_freeze_tests.log 2>&1
+build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*'        > build/2173_cas_gate.log     2>&1
 ```
 
-Expected: the new test passes all three legs; the two freeze tests are unaffected — they exercise `freeze`, not `freezeRemote`, and this change touches neither `freeze` nor the helper's contents. Also run the `CAS*:Cas*:CA*` gtest gate: it should be unchanged, since no CAS-internal signature moved.
+Read the exit status out of the log marker, not from the shell: a backgrounded wrapper's exit code has lied before in this repository.
+
+Expected: the new test passes all three legs; the two freeze tests are unaffected — they exercise `freeze`, not `freezeRemote`, and this change touches neither `freeze` nor the helper's body; the gtest gate is unchanged, since no CAS-internal signature moved.
 
 - [ ] **Step 6: Commit**
 
@@ -382,44 +438,43 @@ git commit -m 'Clone a part into a content-addressed disk in one transaction on 
 
 ---
 
-## Task 3: Move the spec delta into the spec {#task-3}
+## Task 3: Retire the entry and update the triage record {#task-3}
 
 **Files:**
-- Modify: `docs/superpowers/cas/BACKLOG.md`, section `{#issue-2173-freezeremote-gap}` — **only if it is clean**
+- Modify: `docs/superpowers/cas/BACKLOG.md` — **delete** the `{#issue-2173-freezeremote-gap}` section, only if the file is clean
+- Modify: `docs/superpowers/cas/2031-triage.md` — four coordinated edits
 
 **Interfaces:**
 - Consumes: Tasks 1 and 2 landed.
 - Produces: nothing later tasks depend on.
 
-- [ ] **Step 1: Check whether the file is yours to touch**
+- [ ] **Step 1: Check whether the backlog is yours to touch**
+
+Run `git status --short docs/superpowers/cas/BACKLOG.md`.
+
+If it reports anything, another session is still working in it. **Stop and report that.** Do not edit it, do not stage it, and do not relocate the content elsewhere to get around it — the plan's spec-delta section stays the record until someone can land this properly. Go on to Step 3 meanwhile; the triage file is a different file and may be free.
+
+- [ ] **Step 2: If clean, delete the entry**
+
+Remove the whole `{#issue-2173-freezeremote-gap}` section. Do not flip its heading to `FIXED`, and do not leave a stub: the file's own header says it carries only open work, and the #2212 entry set the precedent by being deleted rather than annotated. Before removing it, grep `BACKLOG/` and `docs/superpowers/cas/` for links to that anchor; any link dies with it, in the same commit.
+
+- [ ] **Step 3: Update the triage record — four edits, and all four are needed**
+
+`docs/superpowers/cas/2031-triage.md` carries CAS-058 in four places, and fixing three of them leaves a document contradicting itself:
+
+1. The CAS-058 verdict row, currently `подтверждено | P1` with a link to the backlog anchor. Mark it fixed, name the commits, and repoint the link at this plan — the anchor dies in Step 2 and a dangling link is worse than none.
+2. The priority tally line reading `**P1 — 3**`. It becomes 2.
+3. The `{#p1-list}` table. Drop the CAS-058 row.
+4. The paragraph after that table, which reads "Из четырёх исходных P1 CAS-001 закрыт коммитами …". CAS-058 joins CAS-001 there, and the following sentence about which P1s this triage did not find first has to still parse with one fewer row above it.
+
+A stale P1 count is worse than a stale sentence: it is the number someone reads to decide whether the release is ready.
+
+- [ ] **Step 4: Commit**
+
+Re-check dirtiness, stage only paths whose diff is yours, then:
 
 ```bash
-git status --short docs/superpowers/cas/BACKLOG.md
-```
-
-If it reports anything, another session is still working in it. **Stop and report that**; do not edit it, do not stage it, and do not work around it by putting the content somewhere else. The plan's spec-delta section stays authoritative until someone can land it properly.
-
-- [ ] **Step 2: If clean, flip the entry to FIXED and fold in the corrections**
-
-The `{#issue-2212-shadow-namespace}` entry shows the house format for a fixed issue: the heading changes from `CONFIRMED` to `FIXED`, the mechanism paragraph moves to the past tense, and `FIX (SCHEDULED: …)` becomes `FIX (IMPLEMENTED <date>: <commit hashes>)`. Do the same here. The current heading — "`freezeRemote` lacks the CAS single-transaction branch" — is itself the stalest sentence in the entry once Task 2 lands.
-
-Fold in the four corrections, in the entry's own words rather than copied from this plan:
-
-1. the three post-clone `removeFileIfExists` calls go through the self-created transaction — with the reason, that sending them to the disk would autocommit and reintroduce the very defect;
-2. `freezeRemote`'s `external_transaction` branches are untouched upstream code, dead in this fork only, and deliberately left alone;
-3. the helper had to move above `freezeRemote` because an anonymous namespace declared it after the caller;
-4. the clone path is selected by `on_same_disk`, so a test whose tables share a disk exercises `freeze` instead.
-
-Two more edits inside the same entry:
-
-- Record that CAS→CAS same-pool needed no production code, and that the test now asserts the blobs were reused rather than assuming it.
-- The entry's closing sentence reads "The unfixed member of the family is exactly this `freezeRemote` gap." That family now has no unfixed member; say so, because the sentence is the one a reader would trust to know what is left.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add docs/superpowers/cas/BACKLOG.md
-git commit -m 'Record what the freezeRemote fix needed beyond the adjudicated shape'
+git commit -m 'Retire the cross-disk clone gap from the live backlog'
 ```
 
 ---
@@ -435,7 +490,7 @@ git commit -m 'Record what the freezeRemote fix needed beyond the adjudicated sh
 - Consumes: Tasks 1 and 2 landed.
 - Produces: nothing later tasks depend on.
 
-Documentation-only; no build. Each file gets its own dirtiness check before staging, for the reason in the Global Constraints.
+Mostly documentation, plus two source comments that need a build. Each file gets its own dirtiness check before staging, for the reason in the Global Constraints.
 
 - [ ] **Step 1: Close the scheduling entry**
 
@@ -453,17 +508,37 @@ Documentation-only; no build. Each file gets its own dirtiness check before stag
 
 This is the kind of consequence a fix does not usually announce about itself: nothing in the fix is wrong, and another item got more reachable because of it.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Correct two source comments the fix falsifies**
+
+Both sit outside the file Task 2 touches, so they need their own build. Both are load-bearing prose about what is and is not supported.
+
+`src/Storages/MergeTree/MergeTreeData.cpp`, in the `MetadataStorageType::CAS` case that discusses partition-clone support, says the clone path "is now transactional — `DataPartStorageOnDiskBase::freeze` runs the whole clone through ONE CA transaction". After Task 2 that is one of two such paths, and the neighbouring claim that cloning is "publishing a ref (no byte copy)" holds for a same-pool clone and not for a cross-disk clone from a local disk, which streams bytes. Name both paths and say which one copies.
+
+`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp`, in the comment explaining why advertising a capability does not open the per-file clone hazard, lists "the corrupting whole-part clone paths (partition clone, BACKUP hard-link, replication)" as "gated by their own independent checks". The partition clone is no longer gated — it works. Remove it from that list rather than rewording around it, and leave the other two entries alone.
+
+- [ ] **Step 5: Build and run after the comment edits**
+
+Comment-only, but they are in `.cpp` files, so both binaries get rebuilt and each run gets its own log:
+
+```
+ninja -C build clickhouse      > build/2173_docs_clickhouse_build.log 2>&1
+ninja -C build unit_tests_dbms > build/2173_docs_unit_build.log 2>&1
+build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/2173_docs_cas_gate.log 2>&1
+```
+
+Append an exit marker to each log and read the status from the marker, not from the shell. Say explicitly in the report that you changed no code; if making a comment true required changing code, stop and say so instead.
+
+- [ ] **Step 6: Commit**
+
+Re-check dirtiness across all five paths — three documents and two sources — stage only what is yours, then:
 
 ```bash
-git status --short docs/superpowers/cas/final-checks-todo.md                    docs/superpowers/cas/BACKLOG/replication.md                    docs/superpowers/cas/BACKLOG/formats-and-storage.md
-git add <only the paths whose diff is yours>
-git commit -m 'Record the cross-disk clone fix across the tracking documents'
+git commit -m 'Record the cross-disk clone fix across the tracking documents and comments'
 ```
 
 ## Documentation checked and deliberately NOT changed {#docs-not-changed}
 
-Recorded so the executing agent does not re-derive it, and so a later reader knows the sweep happened:
+Recorded so the executing agent does not re-derive it, and so a later reader knows the sweep happened. The triage document is NOT in this list — it is changed, in Task 3 Step 3.
 
 - **`docs/en/antalya/cas/`** — nothing stale. The user-facing roadmap's `{#known-limitations}` list never mentioned cross-disk `ATTACH PARTITION FROM`, so there is no limitation to retract; and this was a bug rather than an unshipped feature, so there is nothing to announce either. Checked every page for `ATTACH PARTITION`, "not supported" and "limitation".
 - **`BACKLOG/operability-and-introspection.md`** — its list of paths reaching `freeze` includes "Same-disk `ATTACH/REPLACE PARTITION FROM`". That stays true: same-disk still routes to `freeze`, and this plan changes only the cross-disk path. Left alone on purpose.
@@ -479,4 +554,4 @@ Recorded so the executing agent does not re-derive it, and so a later reader kno
 
 **Type consistency.** `owned_transaction` is a `DiskTransactionPtr`, matching the name and type `freeze` already uses for the same role in this file. `copyDirectoryContentIntoTransaction` is called with the signature verified from its definition, including the trailing cancellation hook. No declaration in `DataPartStorageOnDiskBase.h` changes.
 
-**Risks this plan cannot remove.** Leg 2's counter name `CASBlobBodyPutAvoided` was read from the event registry, not from a run, so the first execution settles whether that is the counter the dedup path actually increments; if it is not, Task 1 Step 2's second failure mode covers it and the fix is in the test. And the whole plan assumes the busy worktree — if the other session has finished by execution time, the dirtiness checks simply pass and Task 3 proceeds.
+**A risk that was removed rather than deferred.** An earlier revision left leg 2's counter to "the first run will settle it". That was derivable without a run and wrong: `CASBlobBodyPutAvoided` is raised only on the HEAD-first branch, whose threshold defaults to 1 MiB, and these blobs are far smaller — so the assertion would have failed for a reason unrelated to the fix. The destination disk now lowers that threshold explicitly. What genuinely remains unverifiable by reading is only whether the counter is emitted once per blob or once per part, which changes nothing about the assertion being `> 0`. And the whole plan assumes the busy worktree — if the other session has finished by execution time, the dirtiness checks simply pass and Task 3 proceeds.
