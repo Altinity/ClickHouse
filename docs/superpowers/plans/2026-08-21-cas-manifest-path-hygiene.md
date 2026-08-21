@@ -1,41 +1,42 @@
 ---
-description: 'Implementation plan for rejecting undecodable manifest paths at encode time and stopping one poison object from wedging garbage collection pool-wide'
+description: 'Implementation plan for carrying a part-file path through one escaper everywhere the manifest writes it, and stopping one poison object from wedging garbage collection pool-wide'
 sidebar_label: 'CAS manifest path hygiene'
 sidebar_position: 1
 slug: /superpowers/plans/cas-manifest-path-hygiene
-title: 'Manifest entry-path hygiene and a non-wedging orphan sweep — implementation plan'
+title: 'Manifest entry-path escaping and a non-wedging orphan sweep — implementation plan'
 doc_type: 'guide'
 ---
 
-# Manifest entry-path hygiene and a non-wedging orphan sweep — Implementation Plan {#cas-manifest-path-hygiene-plan}
+# Manifest entry-path escaping and a non-wedging orphan sweep — Implementation Plan {#cas-manifest-path-hygiene-plan}
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Stop a single unlucky `CREATE TABLE` from permanently disabling reclamation for a whole content-addressed pool.
+**Goal:** Make a content-addressed disk accept every part-file path an ordinary `MergeTree` disk accepts, and stop one undecodable manifest from disabling reclamation for a whole pool.
 
-**Architecture:** Two independent halves, both needed. The encoder gains a control-character check, so a manifest that nothing can decode is never written — and the decoder's rule set is left exactly as it is, which is what keeps every manifest already in a pool readable. And the orphan sweep treats an undecodable manifest as a recorded anomaly it walks past, instead of letting the exception escape and abort every round forever.
+**Architecture:** Two independent halves. The manifest format carries the entry path through **one** escaper everywhere it writes it — today the entry-record line escapes it and the payload-zone banner does not, and that asymmetry is the whole bug. And the orphan sweep treats an undecodable manifest as a recorded anomaly it walks past, instead of letting the exception escape and abort every round forever.
 
 **Tech Stack:** C++ (ClickHouse fork), gtest, one stateless `.sh` test, `SYSTEM CAS FSCK` for the "nothing was left behind" assertion.
 
+**Spec:** `docs/superpowers/cas/BACKLOG/formats-and-storage.md` `{#manifest-entry-path-newline-banner}`, with the adjudication at `docs/superpowers/cas/2031-triage.md` `{#cas-040}`. CONFIRMED and reproduced live on HEAD. **The spec's fix shape is superseded — read the spec-delta section below before starting.**
+
 **Spec anchor note:** this plan cites `{#manifest-entry-path-newline-banner}` in five places (the Spec line above, Task 3's file list, and Task 3 Steps 2, 3 and 4 — this note is not one of them). Task 3 deletes that anchor. The citations here are provenance for a plan that is itself history once executed, so they stay as they are — but do not add new ones, and do not "fix" them into links that will dangle.
 
-**Spec:** `docs/superpowers/cas/BACKLOG/formats-and-storage.md` `{#manifest-entry-path-newline-banner}`, with the adjudication at `docs/superpowers/cas/2031-triage.md` `{#cas-040}`. CONFIRMED and reproduced live on HEAD. **Read the spec-delta section below before starting.**
+## Spec delta — this plan does NOT reject the path {#spec-delta}
 
-## Spec delta — what this plan adds {#spec-delta}
+The spec diagnoses the mechanism correctly and then proposes the wrong remedy: validate the path and refuse it. **Do not implement that.** `MergeTree` accepts a projection whose name contains a newline, so refusing it in the CAS metadata layer would mean the same `CREATE TABLE` works on one disk type and fails on another, permanently and by design. That divergence is worse than the bug it prevents. Six things, all verified against the tree:
 
-The spec's mechanism and fix shape are correct. Four things it does not say, all verified against the tree, and the first is a deliberate narrowing of the spec's own wording:
-
-1. **The check goes on the encoder ONLY, and covers control characters ONLY.** The spec reads as though one shared validator should serve both sides. It must not, for a reason that is invisible until you read how lines are parsed: `decodePartManifest` reads records with `readLine`, which splits on `\n` alone, and compares the payload-zone banner byte-wise. So a path containing `\t`, `\r`, or any other non-LF control byte **round-trips correctly today**, and such a path is reachable by the same ordinary DDL that produced the reported bug. Tightening the decoder would make manifests that are readable now unreadable after an upgrade, for no gain: an embedded `\n` can never reach the decoder as part of a path — it splits the line, and the decoder already refuses the result as malformed. Fixing the writer fixes the defect; touching the reader only breaks readers. **Do not extend the decode-side hygiene check, and do not lift it into a shared function.**
-2. **Because of (1), no existing test changes.** `gtest_cas_part_manifest_format.cpp`'s `DecodeRejectsMalformedEntryPaths` encodes `"../evil"`, `"/abs"`, `""`, `"a//b"`, `"a/./b"` and then expects decode to throw; none of those is a control character, so the encoder still accepts them and the test still reaches its assertion. Its comment — that `encodePartManifest` does not itself reject *these* — stays true. `grep -P '\\[nrt0]|\\x0'` over that file returns nothing, so no other case in it is affected either. If any test in the format file does start failing, that is a finding: something about the character class is wider than intended.
-3. **The error code comes from the sibling check in the same function, not from first principles.** `encodePartManifest` already rejects duplicate paths with `CORRUPTED_DATA`. Use `CORRUPTED_DATA` for the new check too. It is also in the deterministic-local-failure set the write controller propagates instantly without retry, so the failure stays fast and loud.
-4. **The sweep cannot delete the poison object, only walk past it.** Deciding an orphan manifest is safe to delete requires reading its body to derive the source edges — exactly what fails. So half two retains the object, records it, and advances the cursor: one visibly-leaked object instead of a pool-wide wedge. `SYSTEM CAS FSCK` counts such a body as **`unreachable`** — `CasFsck.cpp`'s manifest-debris scan increments `report.unreachable` for any `cas/manifests/` body no committed ref owns, with no eligibility precondition on the increment. It is *not* `unaccounted`: that counter is produced only inside blob-object classification and would stay `0` here, which is exactly why an earlier revision of this plan had a stateless assertion that would have passed on the broken tree.
-5. **Part (3) of the spec's fix list is out of scope here.** Escaping the projection directory name lives in generic MergeTree code (`ProjectionsDescription::getDirectoryName`) and the spec itself routes it through the upstream-consult step. Do not touch it. This plan makes the CAS layer refuse the input; it does not change what MergeTree names a directory.
+1. **The defect is asymmetric escaping inside one format, and it only bites Inline entries.** The entry-record line escapes the path: `writeEntryRecord` writes it through `writeStringValue` → `CasJsonWriter::stringValue`, a quoted JSON string with full escaping, and `r.readString` restores the real bytes on the way back. That line survives the round trip intact. The break is in the **payload zone**, where `bannerFor` (`CasPartManifestFormat.cpp:68`) concatenates the path **raw** into `==> <path> il=<n> <==`; an LF splits that banner across two physical lines, and the reader's `readLine` comparison then mismatches. A **Blob** entry has no banner at all, so a path with an LF decodes end to end without complaint today. So "a newline cannot reach a decoded path" is false — do not write that into a comment.
+2. **One function fixes both sides, and that is why this is the right fix rather than the cheap one.** `bannerFor` is called from exactly two places: the encoder at `:116` writes its result, and the decoder at `:279` computes the expected banner and compares byte-wise. Route the path through `stringValue` inside `bannerFor` and both sides move together — the writer emits `==> "p\nq.proj/columns.txt" il=12 <==` and the reader expects exactly that, on one physical line. There is no decode-side rule to add, no validator, and no rejection branch. Reuse `stringValue`; a second hand-rolled escaper would recreate the asymmetry this fix exists to remove.
+3. **Every banner's bytes change, and pre-release that is free.** Adding quotes changes the banner for *all* paths, not only exotic ones, so a manifest written by the new code is not readable by the old and vice versa. CAS has no persisted data in the field, so this needs no format generation, no migration, and no compatibility shim — and the symmetric fix is preferred over an LF-only escape precisely because a special case is one more surface for the next drift. The quotes also remove a latent ambiguity for paths containing spaces.
+4. **Two goldens and one comment move with it.** `src/Disks/tests/gtest_cas_part_manifest_format.cpp:71` carries the literal banner `"==> c/small.txt il=12 <==\n"` inside a golden encoding; and the format's own documentation at `CasPartManifestFormat.h:25` states the banner shape as `==> <path> il=<n> <==\n`. The negative assertion at `:109` (`EXPECT_FALSE(encodePartManifest(m).contains("==>"))`) is about a manifest with no Inline entry and is unaffected. `grep -n '==>' ` over that file returns exactly those two lines; no other test or document in the tree spells the banner out.
+5. **The sweep cannot delete an undecodable object, only walk past it.** Deciding an orphan manifest is safe to delete requires reading its body to derive the source edges — exactly what fails. So half two retains the object, records it, and advances the cursor: one visibly-leaked object instead of a pool-wide wedge. `SYSTEM CAS FSCK` counts such a body as **`unreachable`** — `CasFsck.cpp`'s manifest-debris scan increments `report.unreachable` for any `cas/manifests/` body no committed ref owns, with no eligibility precondition on the increment. It is *not* `unaccounted`: that counter is produced only inside blob-object classification and would stay `0` here.
+6. **Part (3) of the spec's fix list becomes unnecessary rather than out of scope.** It asked for the projection directory name to be escaped in generic `MergeTree` code (`ProjectionsDescription::getDirectoryName`). Once the manifest carries any path faithfully, the CAS layer needs nothing from upstream. Do not touch that code, and do not open an upstream consult for it as part of this work.
 
 ## Global Constraints {#global-constraints}
 
 - Branch `cas-gc-rebuild`. No rebase, no amend — add new commits.
 - **The worktree is shared.** Other sessions hold uncommitted work in this checkout. Before every commit, re-run `git status --short <the exact paths>` and stage only paths whose diff is yours. Never `git add -A`, `git add .`, or `git commit -a`.
-- **No `LOGICAL_ERROR` anywhere in this work.** Both new failure paths are reachable from ordinary user DDL, so they are `CORRUPTED_DATA`. Before writing any `EXPECT_THROW`, check the error code at the site; if a site you touch throws `LOGICAL_ERROR` on an input-reachable condition, stop and report it rather than testing it.
+- **No `LOGICAL_ERROR` anywhere in this work.** Task 1 adds no failure path at all — it makes a previously unrepresentable path representable. Task 2's path is reachable from an object already in the pool, so it is `CORRUPTED_DATA` and is caught rather than thrown. Before writing any `EXPECT_THROW`, check the error code at the site; if a site you touch throws `LOGICAL_ERROR` on an input-reachable condition, stop and report it rather than testing it.
 - Allman braces (opening brace on its own line) — enforced by the style check.
 - Comments must not cite this plan, the BACKLOG, a task number, or an issue number. Keep the reason, drop the provenance.
 - Every build and every test run goes to its own uniquely named log under `build/`, with an exit marker appended, and the status is read from the marker rather than from the shell.
@@ -43,152 +44,126 @@ The spec's mechanism and fix shape are correct. Four things it does not say, all
 
 ---
 
-## Task 1: Reject an undecodable path at encode time {#task-1}
+## Task 1: Carry the entry path through one escaper everywhere it is written {#task-1}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp` — `encodePartManifest` only; **do not touch the decode-side hygiene block**
-- Modify: `src/Disks/tests/gtest_cas_part_manifest_format.cpp` — add tests; no existing test needs repair
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp` — `bannerFor` only
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h:25` — the documented banner shape
+- Modify: `src/Disks/tests/gtest_cas_part_manifest_format.cpp` — the golden banner at `:71`, plus new round-trip tests
 - Modify: `tests/queries/0_stateless/05026_cas_manifest_path_newline.sh`
 - Modify: `tests/queries/0_stateless/05026_cas_manifest_path_newline.reference`
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: a file-local `rejectControlCharacters(std::string_view)` in the format translation unit, called from `encodePartManifest` only. No public signature changes, and no change to what the decoder accepts.
+- Produces: no signature changes at all. `bannerFor` keeps `(std::string_view, uint64_t) -> String`; only the bytes it returns change.
+
+**Ordering is load-bearing.** Both tests are written and run RED before the production change, so the
+pre-fix evidence comes from the tree as it stands. Do not reach for `git stash` to manufacture a pre-fix
+state: other sessions are writing in this worktree and a bare `pop` can take their entry, `ninja` only
+builds a binary while `tests/clickhouse-test` talks to an already-running server, and two runs sharing one
+pool directory let the red run's leftover object be counted by the green one.
 
 - [ ] **Step 1: Write the failing gtest**
 
-Add beside the existing path tests. Both fail today because the encoder accepts the path and the round trip only breaks at decode.
-
-The case vector must be `std::vector<String>`, not a `const char *` initialiser list. Two independent
-reasons, and both silently produce a test that passes while checking nothing: `std::string(...).c_str()`
-in a braced list hands out a pointer to a temporary that dies at the end of the full expression, and a
-`const char *` converted to a `std::string_view` truncates at the first NUL — so the NUL case would
-test the path `"nul"`, which contains no control character at all and would make the loop fail for the
-wrong reason.
+The entry must be **Inline**: a Blob entry has no payload-zone banner, so a Blob-only manifest round-trips
+an LF path cleanly today and would prove nothing. `manifestWithSinglePath` builds a Blob entry, so it is the
+wrong helper here — build the manifest the way `sample()` builds its Inline entry.
 
 ```cpp
-/// A path is not just a name: `bannerFor` writes it verbatim into the payload-zone banner line, so a
-/// control character inside it breaks the banner's own line framing and nothing can decode the result.
-/// Rejecting at encode is what keeps such an object from ever being written.
-TEST(CASPartManifestFormat, EncodeRejectsControlCharactersInEntryPath)
+/// The path is written twice: escaped into the entry-record line, and -- before this fix -- raw into the
+/// payload-zone banner. Any byte that the escaper spells differently therefore has to survive BOTH, or
+/// the writer produces an object it cannot read back one transaction later.
+TEST(CASPartManifestFormat, InlineEntryPathSurvivesEveryEscapableByte)
 {
     const std::vector<String> paths{
-        String("p\nq.proj/columns.txt"),
+        String("p\nq.proj/columns.txt"),   /// the reported reproducer: LF splits the banner line
         String("a\rb.txt"),
         String("tab\there.txt"),
-        String("nul\0byte.txt", 12),   /// length-explicit: a NUL must survive into the String
+        String("quote\"and\\slash.txt"),
+        String("nul\0byte.txt", 12),       /// length-explicit, or the NUL is lost to the terminator
     };
     for (const String & path : paths)
     {
         SCOPED_TRACE(path);
-        ASSERT_EQ(path.find('\0') != String::npos, path.starts_with("nul"))
-            << "the NUL case must actually carry a NUL, or this loop checks a path with no control "
-               "character in it and passes for the wrong reason";
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodePartManifest(manifestWithSinglePath(path)); });
+        PartManifest m;
+        m.ref = ManifestRef{17, 66, 7};
+        m.root_namespace_id = RootNamespace("00/ff@cas@");
+        ManifestEntry e;
+        e.path = path;
+        e.placement = EntryPlacement::Inline;
+        e.inline_bytes = "hello world!";
+        m.entries = {e};
+        m.payload_digest = computePayloadDigest(m);
+
+        const PartManifest got = decodePartManifest(encodePartManifest(m));
+        ASSERT_EQ(got.entries.size(), 1u);
+        EXPECT_EQ(got.entries[0].path, path);
+        EXPECT_EQ(got.entries[0].inline_bytes, "hello world!");
     }
 }
 
-/// The banner is `==> <path> il=<n> <==`; a newline in the path used to split it across lines. Pin the
-/// specific case the reproducer used, so a future relaxation of the character set cannot let it back.
-TEST(CASPartManifestFormat, EncodeRejectsTheProjectionNewlineReproducer)
+/// The banner quotes and escapes the path with the SAME writer the entry-record line uses. Pin the byte
+/// shape, so a future hand-rolled escaper here cannot silently diverge from the record line again.
+TEST(CASPartManifestFormat, InlineBannerCarriesTheEscapedPath)
 {
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-                     [&] { encodePartManifest(manifestWithSinglePath("p\nq.proj/columns.txt")); });
+    PartManifest m;
+    m.ref = ManifestRef{17, 66, 7};
+    m.root_namespace_id = RootNamespace("00/ff@cas@");
+    ManifestEntry e;
+    e.path = "p\nq.proj/c.txt";
+    e.placement = EntryPlacement::Inline;
+    e.inline_bytes = "x";
+    m.entries = {e};
+    m.payload_digest = computePayloadDigest(m);
+
+    EXPECT_NE(encodePartManifest(m).find("==> \"p\\nq.proj/c.txt\" il=1 <=="), String::npos);
 }
 ```
 
-`manifestWithSinglePath` takes the path by a type that must preserve a NUL — check its signature before
-writing the loop, and if it takes `const char *`, add a `String` overload rather than dropping the case.
+Check `ManifestEntry`'s field names for an Inline entry against `sample()` before writing this — the entry
+carries `inline_bytes` and no `ref`/`blob_size`, and getting that wrong makes the test fail for a reason
+that has nothing to do with the banner.
 
-- [ ] **Step 2: Run it and confirm it fails for the right reason**
+- [ ] **Step 2: Write the stateless test, before touching any production file**
 
-```bash
-ninja -C build unit_tests_dbms > build/040_unit_build_1.log 2>&1; echo "EXIT=$?" >> build/040_unit_build_1.log
-build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_red.log 2>&1; echo "EXIT=$?" >> build/040_fmt_red.log
-```
+The gtests prove the format is symmetric. This proves the thing a user asked for: a projection whose name
+contains a newline works on a content-addressed disk, exactly as it does on an ordinary one. That is a
+stronger oracle than the previous revision's "the INSERT fails with the right message", and it is the
+oracle that matches what this fix is for.
 
-Expected: both new tests FAIL because `encodePartManifest` returns normally — no throw at all. A failure reporting a *different* thrown code means the encoder already rejects something and the case needs re-picking, not the fix.
+Two idioms are copied rather than invented, both from tests that already do this:
 
-- [ ] **Step 3: Add the encode-side check**
-
-Add one file-local function to `CasPartManifestFormat.cpp` and call it from `encodePartManifest`. Do
-**not** move, extend, or refactor the decode-side hygiene block — see spec-delta item 1 for why
-touching the reader is the one change that would make this fix harmful.
-
-```cpp
-/// A path reaches the payload-zone banner verbatim, so a control character inside one breaks the
-/// banner's line framing and produces an object nothing can ever decode -- including the writer
-/// itself, one transaction later. Refusing it here means such an object is never written.
-///
-/// Encode side only. The decoder splits records on '\n' and compares the banner byte-wise, so every
-/// other control byte round-trips correctly; rejecting them on read would make manifests that are
-/// readable today unreadable after an upgrade, and would buy nothing -- an embedded '\n' cannot reach
-/// a decoded path at all, because it splits the line and the record fails as malformed.
-void rejectControlCharacters(std::string_view path)
-{
-    for (const char c : path)
-    {
-        const auto b = static_cast<unsigned char>(c);
-        if (b < 0x20 || b == 0x7f)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS part manifest: entry path contains a control character, which cannot be carried "
-                "in the payload-zone banner: '{}'", path);
-    }
-}
-```
-
-Call it in `encodePartManifest` beside the existing duplicate-path rejection, over every entry, before
-any byte is written — the manifest is refused whole rather than half-emitted. Both checks run off the
-same sorted entry vector, so put the new loop next to the duplicate scan rather than in a third pass.
-
-- [ ] **Step 4: Confirm the new tests pass and nothing else moved**
-
-```bash
-ninja -C build unit_tests_dbms > build/040_unit_build_2.log 2>&1; echo "EXIT=$?" >> build/040_unit_build_2.log
-build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_green.log 2>&1; echo "EXIT=$?" >> build/040_fmt_green.log
-```
-
-Expected: the two new tests pass and **every pre-existing test in that filter still passes unchanged** —
-in particular `DecodeRejectsMalformedEntryPaths`, which reaches the decoder by encoding traversal paths
-that are not control characters. If it now fails, the character class is wider than intended: report it,
-do not adapt the test.
-
-- [ ] **Step 5: Write the stateless test — the user-visible half**
-
-The gtests prove the format refuses the path. This proves the improvement a user can see: the failure is
-loud, and **nothing is left behind**. That second half is the whole point of fixing the encode side, and
-it is what a message-matching test would miss.
-
-The fsck read is not invented here — copy the idiom from `tests/queries/0_stateless/04290_cas_no_leftovers.sh`,
-which already asserts exactly this pair of counters. Two details in it are load-bearing: the statement is
-`SYSTEM CAS FSCK '<disk>'` (there is no `ON DISK` in the grammar — `ParserSystemQuery` parses the disk as a
-plain target), and the `awk` indexes columns **by name** out of the `TSVWithNames` header, so a column added
-to the summary later cannot silently move the one being read.
+- the fsck read, from `tests/queries/0_stateless/04290_cas_no_leftovers.sh`. The statement is
+  `SYSTEM CAS FSCK '<disk>'` — there is no `ON DISK` in the grammar, `ParserSystemQuery` parses the disk as
+  a plain target — and the `awk` indexes columns **by name** out of the `TSVWithNames` header, so a column
+  added to the summary later cannot silently move the one being read.
+- the naming, from `tests/queries/0_stateless/05020_cas_fsck.sh`. Unique per-run disk and pool names are not
+  cosmetic here: a fixed pool path would let Step 3's pre-fix run and Step 5's post-fix run share one pool,
+  and the pre-fix run deliberately leaves an orphan manifest behind.
 
 ```bash
 #!/usr/bin/env bash
 # Tags: no-fasttest
 # ^ cas is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# A projection name is used verbatim as a part-relative directory, and a part-relative path is written
-# verbatim into the manifest's payload-zone banner. A control character in one therefore produced an
-# object that nothing could decode -- not even the writer, one transaction later.
-#
-# The INSERT failed before this fix too, so a test that only checks "the INSERT fails" would have
-# passed on the broken tree. What changed is WHEN it fails: before any object is written, so the pool
-# is left clean. That is what the fsck counters assert here.
+# A projection name is used verbatim as a part-relative directory, so a projection named with a newline
+# puts a newline in a part-file path. MergeTree allows that, and a content-addressed disk has to carry it:
+# the manifest writes each path twice -- escaped in its record line, and in an Inline entry's payload-zone
+# banner -- and both spellings have to agree or the writer cannot read back what it just wrote.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
-DISK_NAME="05026_cas_newline"
+DISK_NAME="ca_05026_${CLICKHOUSE_TEST_UNIQUE_NAME}_${RANDOM}"
+POOL_DIR="${CLICKHOUSE_USER_FILES_UNIQUE}_05026_${RANDOM}"
+TABLE="t_05026_${CLICKHOUSE_TEST_UNIQUE_NAME}"
 
-${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS t_cas_newline_proj;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS ${TABLE};"
 
 ${CLICKHOUSE_CLIENT} --query "
-CREATE TABLE t_cas_newline_proj (k UInt32, v String, PROJECTION \`p
-q\` (SELECT k ORDER BY k))
+CREATE TABLE ${TABLE} (k UInt32, v String, PROJECTION \`p
+q\` (SELECT v, count() GROUP BY v))
 ENGINE = MergeTree ORDER BY k
 SETTINGS disk = disk(
     type = object_storage,
@@ -196,76 +171,143 @@ SETTINGS disk = disk(
     metadata_type = cas,
     server_root_id = '05026',
     name = '${DISK_NAME}',
-    path = '05026_cas_newline_pool/');"
+    path = '${POOL_DIR}/');"
 
-# The INSERT must fail, and it must name the control character rather than a banner mismatch --
-# a banner mismatch would mean the object was written and read back, which is the old behaviour.
-echo 'insert_error'
-${CLICKHOUSE_CLIENT} --query "INSERT INTO t_cas_newline_proj VALUES (1, 'a');" 2>&1 \
-    | grep -c 'control character'
+echo 'insert_ok'
+${CLICKHOUSE_CLIENT} --query "INSERT INTO ${TABLE} SELECT number, 'v' || (number % 3) FROM numbers(30);" \
+    && echo 1
 
-# Nothing was written, so the pool holds no manifest body without a committed owner. On the broken tree
-# the failed INSERT left one behind, and that object wedged every later collection round.
+# The part is read back through the same manifest that was just written -- on the broken tree the INSERT
+# never got this far, because the manifest it wrote could not be decoded.
+echo 'rows'
+${CLICKHOUSE_CLIENT} --query "SELECT count() FROM ${TABLE};"
+
+# And the projection itself is usable, which is what a newline in its name must not prevent.
+echo 'projection_result'
+${CLICKHOUSE_CLIENT} --query "SELECT v, count() FROM ${TABLE} GROUP BY v ORDER BY v;"
+
+# No manifest body without a committed owner: the successful INSERT left nothing orphaned, and on the
+# broken tree the failed one did -- that object wedged every later collection round.
 ${CLICKHOUSE_CLIENT} --query "SYSTEM CAS FSCK '${DISK_NAME}'" --format TSVWithNames \
     | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
                   { print "unreachable", $col["unreachable"]; print "dangling", $col["dangling"] }'
 
-${CLICKHOUSE_CLIENT} --query "DROP TABLE t_cas_newline_proj;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE ${TABLE};"
 ${CLICKHOUSE_CLIENT} --query "SELECT 'dropped_ok';"
 ```
 
 Reference file:
 
 ```
-insert_error
+insert_ok
 1
-unreachable	0
-dangling	0
+rows
+30
+projection_result
+v0	10
+v1	10
+v2	10
+unreachable 0
+dangling 0
 dropped_ok
 ```
 
-Match the reference to what the `awk` above actually prints — one line per counter, name and value
-separated by a space or a tab depending on how you print it. Generate it by running the test and reading
-the output, then check the values are the ones written here rather than whatever the run produced.
+Generate the reference from a green run and then read it: check that `rows` is 30 and the three groups are
+10 each, rather than pasting whatever the run produced. Confirm the projection is actually used for that
+`GROUP BY` — `EXPLAIN indexes = 1` on it during development, not in the committed test, whose job is the
+result rather than the plan.
 
-- [ ] **Step 6: Prove the stateless test fails on the pre-fix binary**
+- [ ] **Step 3: Run both tests RED, against the unmodified tree**
 
-This step is mandatory and it is not a formality: the previous revision of this plan asserted a counter
-(`unaccounted`) that stays `0` on the broken tree, so its stateless test would have passed against the
-defect it was written for. A gtest failing-first run does not cover this — the gtest and the stateless
-test have different oracles.
-
-```bash
-git stash push src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp
-ninja -C build clickhouse > build/040_prefix_build.log 2>&1; echo "EXIT=$?" >> build/040_prefix_build.log
-./tests/clickhouse-test 05026_cas_manifest_path_newline > build/040_stateless_red.log 2>&1; echo "EXIT=$?" >> build/040_stateless_red.log
-git stash pop
-```
-
-Expected: FAIL, and the diff must show a **non-zero `unreachable`** — that is the leftover object, and it
-is the only part of this test that distinguishes fixed from broken. If `unreachable` is `0` on the pre-fix
-binary, the oracle does not discriminate: stop, report it, and do not proceed by weakening the assertion.
-The `insert_error` line failing to match instead means only that the message changed, which proves nothing.
-
-- [ ] **Step 7: Build the fixed binary, run the whole gate, read each marker**
+No production file has been touched yet, so the binary under test IS the pre-fix binary and no stashing is
+involved. What matters is that the server serving the stateless test was started from this binary: a bare
+`ninja` leaves whatever server is already running in place, and a red/green pair that shares one server
+proves nothing about either. Use the isolated job, which starts its own server from the build:
 
 ```bash
-ninja -C build clickhouse > build/040_clickhouse_build.log 2>&1; echo "EXIT=$?" >> build/040_clickhouse_build.log
-build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/040_gate_1.log 2>&1;   echo "EXIT=$?" >> build/040_gate_1.log
-./tests/clickhouse-test 05026_cas_manifest_path_newline > build/040_stateless.log 2>&1; echo "EXIT=$?" >> build/040_stateless.log
+ninja -C build clickhouse unit_tests_dbms > build/040_red_build.log 2>&1; echo "EXIT=$?" >> build/040_red_build.log
+build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_red.log 2>&1; echo "EXIT=$?" >> build/040_fmt_red.log
+python3 -m ci.praktika run "Stateless tests" --test 05026_cas_manifest_path_newline > build/040_stateless_red.log 2>&1; echo "EXIT=$?" >> build/040_stateless_red.log
 ```
 
-Expected: the stateless test passes all four assertions; the full gate is unchanged from before the task. **Any `CAS*` test that fails here is a finding, not noise** — the encoder just became stricter for every caller, and a test that was relying on a permissive encoder is exactly what this step is for.
+Expected, and all three parts are required:
 
-- [ ] **Step 8: Commit**
+- `InlineEntryPathSurvivesEveryEscapableByte` FAILS on the LF, CR and tab cases with a payload-zone banner
+  mismatch. It should PASS on the quote/backslash case even now — those bytes are escaped in the record
+  line and pass through the raw banner unchanged on both sides — so a failure there means the test builds
+  its manifest wrongly, not that the format is worse than described.
+- `InlineBannerCarriesTheEscapedPath` FAILS because the banner is unquoted today.
+- the stateless test FAILS at `insert_ok`, and the fsck read reports a **non-zero `unreachable`**. That
+  leftover object is what distinguishes fixed from broken here; an earlier revision of this plan asserted
+  a counter (`unaccounted`) that stays `0` on both trees. If `unreachable` is `0`, the oracle does not
+  discriminate: stop and report it, and do not proceed by weakening the assertion.
+
+State in your report which binary served this run, and how you know.
+
+- [ ] **Step 4: Route the banner's path through the record line's escaper**
+
+One function. Do not add a validator, a rejection branch, or a second escaper.
+
+```cpp
+/// The path is written into the banner through the SAME escaper the entry-record line uses. It has to be
+/// the same one: the decoder rebuilds this banner from the path it read out of the record line and
+/// compares byte-wise, so any spelling difference between the two writers is an object the writer cannot
+/// read back. Concatenating the path raw here is what made a part-file path containing a newline
+/// undecodable -- the LF split this line, and no reader could match it again.
+String bannerFor(std::string_view path, uint64_t n)
+{
+    CasJsonWriter w(path.size() + 32);
+    w.append("==> ");
+    w.stringValue(path);
+    w.append(" il=");
+    w.u64Number(n);
+    w.append(" <==");
+    return std::move(w).take();
+}
+```
+
+`take` is `String take() &&`, so the `std::move` is required. Check that `CasJsonWriter`'s header is
+already included in this translation unit — it is, since `encodePartManifest` builds one — and that
+`u64Number` renders the same digits the old `std::to_string(n)` did for every `uint64_t`.
+
+- [ ] **Step 5: Move the two goldens the byte change invalidates**
+
+Both are named in spec-delta item 4, and both must change in this commit or the suite is red for a reason
+unrelated to the next task:
+
+- `gtest_cas_part_manifest_format.cpp:71` — the golden banner line inside a full expected encoding becomes
+  `"==> \"c/small.txt\" il=12 <==\n"`. Do not regenerate the whole golden from output; change that one
+  line, so the diff shows exactly what moved.
+- `CasPartManifestFormat.h:25` — the documented shape becomes the quoted-and-escaped form, with a clause
+  saying the path is escaped by the same writer as the record line and why.
+
+- [ ] **Step 6: Green run, then the whole CAS gate**
+
+```bash
+ninja -C build clickhouse unit_tests_dbms > build/040_green_build.log 2>&1; echo "EXIT=$?" >> build/040_green_build.log
+build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_green.log 2>&1; echo "EXIT=$?" >> build/040_fmt_green.log
+python3 -m ci.praktika run "Stateless tests" --test 05026_cas_manifest_path_newline > build/040_stateless_green.log 2>&1; echo "EXIT=$?" >> build/040_stateless_green.log
+build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/040_gate_1.log 2>&1; echo "EXIT=$?" >> build/040_gate_1.log
+```
+
+Expected: the new tests pass, the stateless test passes every assertion, and the gate is otherwise
+unchanged. The pool directory differs from Step 3's run by construction, so a clean `unreachable` here is
+about this run's pool — say in your report that you checked that.
+
+**A `CAS*` failure here is a finding, not noise.** Every Inline entry's banner bytes just changed, so a
+test carrying a manifest fixture as literal bytes, or a checksum over one, will notice. Report each one
+with the fixture it came from; do not adapt an expectation you cannot explain.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git status --short src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp \
+                   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h \
                    src/Disks/tests/gtest_cas_part_manifest_format.cpp \
                    tests/queries/0_stateless/05026_cas_manifest_path_newline.sh \
                    tests/queries/0_stateless/05026_cas_manifest_path_newline.reference
 git add <only the paths whose diff is yours>
-git commit -m 'Refuse a manifest entry path that cannot survive the payload-zone banner'
+git commit -m 'Carry a manifest entry path through one escaper in the record line and the banner'
 ```
 
 ---
@@ -280,7 +322,7 @@ git commit -m 'Refuse a manifest entry path that cannot survive the payload-zone
 - Read first: that file's `OrphanFixture` (line 47). **Not** `src/Disks/tests/cas_sweep_test_support.h`: that header holds only the `sweepManifestCursorPageForTest` wrapper and builds no pool, no catalog, and no watermark
 
 **Interfaces:**
-- Consumes: nothing from Task 1. **This half must work on a pool that already contains a poison object**, which is precisely the case Task 1 can no longer create — so it is tested by planting bytes at the pool level, not through DDL.
+- Consumes: nothing from Task 1, and it is not made redundant by it. Task 1 removes ONE cause of an undecodable manifest — the format could not represent the path. This half is about an undecodable body whatever its cause: bit rot, a future format bug, a peer's manifest over the relink channel, or a pool that was already wedged before Task 1 landed. The encoder never produces such bytes, so the test plants them at the pool level rather than going through DDL.
 - Produces: `ManifestSweepResult::undecodable`, a `uint64_t` beside `listed`/`deleted`/`skipped`.
 
 **Why not a `retained_*` counter.** The `retained_*` family is documented in the header as "the §6
@@ -292,7 +334,7 @@ already reads "counts malformed, protected, ineligible, budget-exhausted, or rac
 increment **both** `skipped` (the contract requires it) and the new `undecodable` (the reason), add **no**
 `SweepRetainClass` member, and leave `topRetainReason` and `reportSweepRetention` untouched.
 
-Task 1 stops new occurrences; this unwedges a pool that already has one. Neither substitutes for the other: a pool wedged today stays wedged after Task 1 alone, because the object is already there.
+Neither half substitutes for the other. A pool wedged today stays wedged after Task 1 alone, because the object is already in it and nothing re-reads a manifest to repair it.
 
 - [ ] **Step 1: Write the failing gtest**
 
@@ -318,7 +360,8 @@ first and corrupting after would fail the seal check, which is a different code 
 
 ```cpp
     /// A payload-zone banner that no longer matches its entry path: the exact shape the reproducer
-    /// produced, reached without the encoder, which refuses to make one after Task 1.
+    /// produced -- built by hand, because a correct encoder never emits a banner that disagrees with
+    /// its own entry record.
     PartManifest good;
     good.ref = f.orphan;
     good.root_namespace_id = f.ns;
@@ -329,14 +372,14 @@ first and corrupting after would fail the seal check, which is a different code 
     ASSERT_NE(at, String::npos) << "no banner line to corrupt -- the entry must be Inline, not Blob";
     bytes[at + 4] = 'X';   /// same length, so no other offset shifts
     const PutResult put = f.backend->putIfAbsent(f.orphanKey(), sealObject(FormatId::PartManifest, bytes));
-    /// `putIfAbsent` over an existing key is a no-op, and a silently-legal body would make every
-    /// assertion below pass against the wrong object.
-    ASSERT_EQ(classifyPutOutcome(put), PutClass::Created) << "the poison body was not the one planted";
+    /// `putIfAbsent` over an existing key writes nothing and reports PreconditionFailed, so a
+    /// silently-legal body would make every assertion below pass against the wrong object.
+    ASSERT_EQ(put.outcome, PutOutcome::Done) << "the poison body was not the one planted";
 ```
 
-Check the name of the outcome classifier beside `classifyDeleteOutcome` before writing that assertion — what
-matters is that the plant is *verified*, not which helper verifies it. A bare `head(...).exists` is not
-enough: the fixture's own body would satisfy it.
+`PutResult` is `WriteResultT<PutOutcome>` with a plain `outcome` field, and `EXPECT_EQ(....outcome, PutOutcome::Done)`
+is the idiom `gtest_cas_backend.cpp` already uses. A bare `head(...).exists` would not do: the fixture's own
+body satisfies it.
 
 Plant a **second, legal, deletable** orphan at a key that sorts *after* the poison key, and give the page
 a list budget large enough for both. This is what turns "did not throw" into "walked past":
@@ -508,20 +551,25 @@ git commit -m 'Retire the manifest path-hygiene gap from the live backlog'
 Recorded so it is not re-derived, and so a later reader knows the sweep happened:
 
 - **`docs/en/antalya/cas/`** — nothing to change. This was a bug reachable only through a pathological identifier; no user-facing page promised or forbade it, and the roadmap's limitations list never mentioned it.
-- **`ProjectionsDescription::getDirectoryName`** — the upstream half of the spec's fix list. Left alone deliberately; it is generic MergeTree code and the spec routes it through the upstream-consult step. Note in the Task 3 commit that the CAS layer now refuses the input while the upstream naming is unchanged, so a future consult starts from the right state.
+- **`ProjectionsDescription::getDirectoryName`** — the upstream half of the spec's fix list, and it is now moot rather than deferred. The manifest carries any path faithfully, so the CAS layer needs nothing from upstream and no consult should be opened. Say that in the Task 3 commit, so a later reader does not reopen it: the spec asked for upstream escaping only because the CAS format could not represent the path.
 
 ## Self-review {#self-review}
 
-**Spec coverage.** The spec's fix (1), encode-side validation, is Task 1 — narrowed to the control-character class on the writer only, with the reason in spec-delta item 1. Its fix (2), the non-wedging sweep, is Task 2. Its fix (3), upstream projection escaping, is explicitly out of scope and recorded as such. The test gap the spec names — that the format tests pin `\n` in inline BYTES but never in the entry PATH — is closed by Task 1 Step 1.
+**Spec coverage.** The spec's fix (1) is deliberately NOT implemented: it asked for encode-side rejection, and rejecting a path `MergeTree` accepts would make the CAS disk refuse a working table. Task 1 fixes the cause the spec correctly diagnosed instead — one escaper for every place the format writes a path — which is what makes fix (3), upstream escaping of the projection directory name, unnecessary rather than deferred. Its fix (2), the non-wedging sweep, is Task 2. The test gap the spec names — that the format tests pin `\n` in inline BYTES but never in the entry PATH — is closed by Task 1 Step 1.
 
-**Placeholders.** Three remain, all narrow and each flagged in place: the Inline entry's construction in Task 2 Step 1 (the helper is in `cas_test_helpers.h` beside `blobEntryFor`, and naming the wrong one here would be worse than a one-line look), the put-outcome classifier in the same step, and the reference file's exact whitespace in Task 1 Step 5, which is generated from a run and then checked. Every other step carries its actual content.
+**Placeholders.** Three remain, all narrow and each flagged in place: the Inline entry's field names in Task 1 Step 1 and Task 2 Step 1 (check them against `sample()` / `blobEntryFor` rather than trusting this plan), and the reference file's exact whitespace in Task 1 Step 2, which is generated from a run and then read. Every other step carries its actual content.
 
-**Type consistency.** `rejectControlCharacters(std::string_view)` is file-local, void, throwing, called from `encodePartManifest` only. `undecodable` is a `uint64_t` on `ManifestSweepResult`, beside `skipped`, and is deliberately not a `SweepRetainClass`. The decode result becomes `std::optional<PartManifest>` at one call site, with three deref sites named.
+**Type consistency.** `bannerFor` keeps its signature; only its bytes change. `undecodable` is a `uint64_t` on `ManifestSweepResult`, beside `skipped`, deliberately not a `SweepRetainClass`. The decode result becomes `std::optional<PartManifest>` at one call site, with three deref sites named.
 
-**What an earlier revision got wrong, so it is not reintroduced.** Two defects, both of the same kind — an oracle that does not discriminate:
+**What earlier revisions got wrong, so none of it is reintroduced.** Six defects. The design one is first because it invalidated a whole task:
 
-- the stateless test asserted `unaccounted = 0`. That counter is produced only by blob classification; an orphan manifest lands in `unreachable`. The assertion would have passed on the broken tree. Task 1 Step 6 now makes a pre-fix stateless run mandatory, because reading the counter's definition is what caught this and running the test is what would have caught it sooner.
-- the poison plant went on top of the fixture's own legal body. `putIfAbsent` over an existing key changes nothing, so every assertion in that test would have run against a manifest that decodes fine. The plant now replaces the fixture's write and its outcome is asserted, because "the object exists" is satisfied by the wrong object.
-- the sweep test asserted the cursor had moved via `EXPECT_NE(next_cursor, …)`. `InMemoryBackend` returns an empty `next_cursor` at the end of the keyspace, so on a single-object page that assertion fails *after* a correct fix. It is now `EXPECT_TRUE(wrapped)` plus a second object planted beyond the poison key — the second is the assertion that actually distinguishes walking past from stopping.
+- the fix was encode-side **rejection** of a control character in a path. `MergeTree` accepts such a projection name, so that would have left the CAS disk permanently refusing a table that works on every other disk type — a functional divergence between metadata types, adopted deliberately, to avoid a two-call-site format fix. Task 1 is now the format fix.
+- the stateless test asserted `unaccounted = 0`. That counter is produced only by blob classification; an orphan manifest lands in `unreachable`. The assertion would have passed on the broken tree.
+- the pre-fix run was placed after the fix, reached for `git stash` in a worktree other sessions are writing to, rebuilt a binary without restarting the server that would serve the test, and reused one pool directory across both runs. It is now Step 3, before any production edit, on unique per-run names, through the isolated job that starts its own server.
+- the sweep test asserted the cursor had moved via `EXPECT_NE(next_cursor, …)`. `InMemoryBackend` returns an empty `next_cursor` at the end of the keyspace, so on a single-object page that assertion fails *after* a correct fix. It is now `EXPECT_TRUE(wrapped)` plus a second object planted beyond the poison key.
+- the poison plant went on top of the fixture's own legal body. `putIfAbsent` over an existing key writes nothing, so every assertion would have run against a manifest that decodes fine. The plant now replaces the fixture's write, and `put.outcome` is asserted.
+- the reason given for keeping the decoder unchanged was that an embedded LF "cannot reach a decoded path". It can: the record line escapes the path and restores it, and only an Inline entry's raw banner is sensitive. Under the new design the decoder changes anyway, through the same function as the encoder.
 
-**The risk this plan cannot remove.** Task 1 makes the encoder stricter for every caller in the tree. `grep -P '\\[nrt0]|\\x0'` over the format test file returns nothing and no other test constructs a control-character path, but only a full gate run covers the callers that build paths from data rather than from literals. Task 1 Step 7 says such a failure is a finding rather than noise, because the tempting response — relaxing the new check until the suite goes quiet — would undo the fix.
+Five of the six were caught by reading the code that decides — the parser, the counter's increment site, the backend's write contract, the escaper — and the sixth by a reviewer asking why we would reject input the database accepts. None was caught by re-reading the plan's own reasoning.
+
+**The risk this plan cannot remove.** Every Inline entry's banner bytes change, so any test or fixture carrying manifest bytes as literals will move. Two are named from `grep -n '==>'`; a fixture that stores a *checksum* over manifest bytes rather than the bytes would not appear in that grep, and only the gate run finds it. Task 1 Step 6 says such a failure is a finding rather than noise, because the tempting response — regenerating a golden until the suite goes quiet — hides whatever else moved with it.
