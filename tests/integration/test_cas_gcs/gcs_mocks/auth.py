@@ -7,6 +7,16 @@ GCS problem rather than a missing fixture, which is why this lives in its own mo
 container: the disk config points `metadata_service` at this host instead.
 
 It answers a long expiry so that the token is fetched once and no test depends on refresh timing.
+That long expiry is what makes the token-fetch count meaningful: within one test module a token is
+fetched when a client's cache is first populated and never again, so the count of fetches is the count
+of token caches that came into existence — one per OAuth HTTP client. A test that resets the counter,
+drives a workload and then finds no new fetch has evidence that the workload built no new client.
+
+Control surface:
+
+  - ``GET  /_control/tokens`` — ``{"fetches": <int>}``, the number of token endpoint requests served
+    since the last reset;
+  - ``GET  /_control/tokens/reset`` — set that counter back to zero.
 
 Usage: ``python3 auth.py <port>``. Started by ``helpers.mock_servers.start_mock_servers``, which
 probes ``GET /`` and expects the body ``OK``.
@@ -15,8 +25,12 @@ probes ``GET /`` and expects the body ``OK``.
 import http.server
 import json
 import sys
+import threading
 
 ACCESS_TOKEN = "fake-gce-metadata-bearer-token"
+
+_LOCK = threading.Lock()
+_TOKEN_FETCHES = [0]
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -28,7 +42,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _reply(self):
         if self.path == "/":
             return 200, b"OK", "text/plain"
+        if self.path == "/_control/tokens":
+            with _LOCK:
+                payload = json.dumps({"fetches": _TOKEN_FETCHES[0]}).encode()
+            return 200, payload, "application/json"
+        if self.path == "/_control/tokens/reset":
+            with _LOCK:
+                _TOKEN_FETCHES[0] = 0
+            return 200, b"OK", "text/plain"
         if self.path.rstrip("/").endswith("/token"):
+            with _LOCK:
+                _TOKEN_FETCHES[0] += 1
             payload = json.dumps(
                 {
                     "access_token": ACCESS_TOKEN,

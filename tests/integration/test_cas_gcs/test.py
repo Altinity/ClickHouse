@@ -15,6 +15,12 @@ request deletes `x-amz-api-version`, so a `Default` request still carries it. Th
 suite assert per-request marking on a single client rather than only per disk. It does not hold on
 `gcs_hmac`, where the header is stripped from every request regardless of mode.
 
+The second half of this file is adversarial. Those tests drive the fake into modes no correct client
+provokes — a service that silently ignores a generation placed in the ETag domain, a successful write
+whose response carries no generation — and one of them remounts the whole node against the permissive
+service. They run after the observational tests because they add rows to the capture log the tests
+above read, and because two of them restart the server.
+
 Not covered here, deliberately: CAS object attributes. The attribute parameter is plumbed through the
 CAS write paths but no production caller fills it — every call site uses the `Backend` overloads that
 forward an empty `ObjectMeta` — so an attribute round trip driven from SQL would be asserting the
@@ -130,6 +136,64 @@ def _control(path):
     return json.loads(raw)
 
 
+def _control_post(path):
+    container = cluster.get_container_id(GCS_HOST)
+    raw = cluster.exec_in_container(
+        container,
+        ["curl", "-sS", "-X", "POST", "http://localhost:{}{}".format(GCS_PORT, path)],
+    )
+    return json.loads(raw) if raw.strip().startswith(("{", "[")) else raw
+
+
+def _counters():
+    return _control("/_control/counters")
+
+
+def _set_if_match_mode(mode):
+    return _control_post("/_control/mode?if_match=" + mode)
+
+
+def _set_omit_generation(enabled):
+    return _control_post("/_control/mode?omit_generation=" + ("1" if enabled else "0"))
+
+
+def _raw(method, path, headers=()):
+    """Issue one request to the fake from inside its own container and return its status code.
+
+    Used only to drive request shapes production never sends, so that the fake's own discriminating
+    power can be asserted rather than assumed.
+
+    HEAD goes through `--head` rather than `-X HEAD`: with `-X HEAD` curl sends the request but still
+    waits for a response body, and a HEAD reply never has one, so it blocks until something kills it.
+    `--max-time` is here for the same class of mistake — a fixture hang should cost seconds, not the
+    module's whole budget.
+    """
+    container = cluster.get_container_id(GCS_HOST)
+    command = ["curl", "-sS", "--max-time", "30", "-o", "/dev/null", "-w", "%{http_code}"]
+    command += ["--head"] if method == "HEAD" else ["-X", method]
+    for name, value in headers:
+        command += ["-H", "{}: {}".format(name, value)]
+    command.append("http://localhost:{}{}".format(GCS_PORT, path))
+    return int(cluster.exec_in_container(container, command).strip())
+
+
+def _token_fetches():
+    container = cluster.get_container_id(METADATA_HOST)
+    raw = cluster.exec_in_container(
+        container,
+        ["curl", "-sS", "http://localhost:{}/_control/tokens".format(METADATA_PORT)],
+    )
+    return json.loads(raw)["fetches"]
+
+
+def _reset_token_fetches():
+    container = cluster.get_container_id(METADATA_HOST)
+    cluster.exec_in_container(
+        container,
+        ["curl", "-sS", "http://localhost:{}/_control/tokens/reset".format(METADATA_PORT)],
+    )
+
+
 def _captured(bucket=None):
     records = _control("/_control/requests")
     if bucket is None:
@@ -139,6 +203,15 @@ def _captured(bucket=None):
 
 def _minted():
     return _control("/_control/minted")
+
+
+def _next_seq():
+    """The `seq` the fake's next captured request will carry, so a later slice can start here."""
+    return len(_control("/_control/requests"))
+
+
+def _captured_since(seq, bucket=None):
+    return [r for r in _captured(bucket) if r["seq"] >= seq]
 
 
 def _unquote(value):
@@ -469,3 +542,318 @@ def test_the_fake_refused_nothing_it_had_to_serve(disk):
     assert not refused, "the fake refused operations it was asked for: {}".format(
         [(r["method"], r["key"], r["query"]) for r in refused]
     )
+
+
+# ---------------------------------------------------------------------------------------------------
+# Adversarial coverage. Everything below runs after the tests above on purpose: some of these restart
+# the server or drive the fake into a mode no correct client provokes, and the assertions above read
+# the whole capture log.
+# ---------------------------------------------------------------------------------------------------
+
+# A bucket no disk is configured against, so requests this file issues by hand are invisible to every
+# per-bucket assertion above.
+PROBE_BUCKET = "probebucket"
+
+
+def test_the_fake_refuses_a_keyless_write_and_a_bucket_level_object_subresource():
+    """Two request shapes that must not be served half-way.
+
+    A keyless `PUT /bucket` is `CreateBucket`, which this fake does not model; served as a generic
+    object write it would mint a phantom object at the empty key that then appears in every later
+    listing of the bucket. `GET /bucket?tagging` is a bucket-level address for an object-level
+    subresource; answered by the bare-listing shortcut it would return a full object listing to a
+    caller that asked for a tag set.
+
+    Negative control on the fixture, named as such: no production change flips this. It is asserted
+    because both shapes would corrupt the capture log the tests above read, silently and in a way that
+    reads as a ClickHouse bug.
+    """
+    assert _raw("PUT", "/{}".format(PROBE_BUCKET)) == 501
+    assert _raw("GET", "/{}?tagging".format(PROBE_BUCKET)) == 501
+    assert _raw("DELETE", "/{}".format(PROBE_BUCKET)) == 501
+
+    listing = [
+        r
+        for r in _captured(PROBE_BUCKET)
+        if r["method"] == "GET" and not r["key"] and r["status"] == 200
+    ]
+    assert not listing, "a bucket-level subresource was served as a listing"
+
+
+def test_a_generation_in_the_etag_domain_is_caught_by_the_fake_but_only_in_its_strict_mode():
+    """What each kind of real service would do with the request shape the design calls unsafe.
+
+    The design refuses to assume whether GCS rejects, compares or ignores a numeric generation placed
+    in an ETag-valued `If-Match`. This drives that shape by hand, under both of the fake's modes, and
+    reads the two answers off the wire:
+
+      - `reject` (the default): `400`, and the object survives. The mistake is loud.
+      - `ignore`: `204`, and the object is GONE. The caller is told its exact delete succeeded when
+        nothing was ever compared, which is data loss with no error anywhere.
+
+    The conclusion is what makes this worth having, so state it rather than leave it implied: because
+    a permissive service answers the unsafe shape with success, the fixture's safety CANNOT rest on
+    the service's answer. `test_no_cas_request_sends_a_generation_as_an_etag` — which inspects the
+    header CAS actually sent, whatever the service did with it — is the load-bearing fence, and this
+    test is why.
+
+    Negative control on the fixture: nothing in ClickHouse flips it. Production never sends this
+    shape, which is exactly why it has to be driven by hand to be observed at all.
+    """
+    key = "cas-token-in-etag-domain"
+    path = "/{}/{}".format(PROBE_BUCKET, key)
+
+    try:
+        for mode, expected_status, expected_after in (
+            ("reject", 400, 200),
+            ("ignore", 204, 404),
+        ):
+            assert _set_if_match_mode(mode)["if_match"] == mode
+            assert _raw("PUT", path) == 200
+            generation = _captured(PROBE_BUCKET)[-1]["response_generation"]
+            assert generation and generation.isdigit(), generation
+
+            assert (
+                _raw("DELETE", path, [("If-Match", generation)]) == expected_status
+            ), "mode {} answered the unsafe shape unexpectedly".format(mode)
+            assert _raw("HEAD", path) == expected_after, (
+                "mode {}: the object's survival does not match the delete's answer".format(mode)
+            )
+    finally:
+        assert _set_if_match_mode("reject")["if_match"] == "reject"
+
+
+def test_a_permissive_service_does_not_change_what_cas_puts_on_the_wire():
+    """Remount the whole node against the permissive service and re-read every disk.
+
+    The point is that correctness here is a property of the client, not of the store: under `ignore`
+    the fake compares nothing when a generation arrives in the ETag domain, so a client that had lost
+    its native mark would sail through the capability battery and mount successfully. The mount below
+    still passes for the opposite reason — CAS never sends that shape at all — and the delta assertion
+    is what says so.
+
+    Would fail if: any CAS conditional operation lost its request mode. The precondition would move
+    to `If-Match`, the permissive fake would swallow it, and `numeric_if_match` would be non-zero for
+    a run in which every table still read back correctly. That is precisely the regression a strict
+    fake would have masked as a loud mount failure and this one catches as a silent one.
+    """
+    node = cluster.instances["node"]
+    tables = ["t_" + disk for disk in list(CAS_DISKS) + [PLAIN_DISK]]
+    # Read the counts before the remount rather than comparing against NUM_ROWS: later tests in this
+    # file insert more rows, and a constant here would make this test's correctness depend on where it
+    # sits in the file.
+    before_counts = {t: int(node.query("SELECT count() FROM {}".format(t))) for t in tables}
+    before_sums = {t: int(node.query("SELECT sum(id) FROM {}".format(t))) for t in tables}
+    assert all(count > 0 for count in before_counts.values()), before_counts
+
+    before_numeric = _counters().get("numeric_if_match", 0)
+    first_new_seq = _next_seq()
+    try:
+        assert _set_if_match_mode("ignore")["if_match"] == "ignore"
+        node.restart_clickhouse()
+
+        for table in tables:
+            assert int(node.query("SELECT count() FROM {}".format(table))) == before_counts[table]
+            assert int(node.query("SELECT sum(id) FROM {}".format(table))) == before_sums[table]
+    finally:
+        assert _set_if_match_mode("reject")["if_match"] == "reject"
+        node.restart_clickhouse()
+
+    # The remount must actually have reached the store, or every assertion below is vacuous. A fresh
+    # mount runs the capability battery, so its generation preconditions are the strongest available
+    # evidence that this is a new mount's traffic and not a replay of the log read above.
+    remounted = _captured_since(first_new_seq)
+    assert remounted, "the restart produced no request at all"
+    for bucket in CAS_DISKS.values():
+        fresh = _captured_since(first_new_seq, bucket)
+        assert _generation_preconditions(fresh), (
+            "no generation precondition after the remount of {}, so the capability battery did not "
+            "run and this test proves nothing".format(bucket)
+        )
+
+    assert _counters().get("numeric_if_match", 0) == before_numeric, (
+        "a request put a numeric value in the ETag domain while the fake was permissive enough to "
+        "accept it"
+    )
+
+
+def test_a_token_producing_write_never_fragments_into_a_multipart_upload():
+    """No `CreateMultipartUpload`, `UploadPart` or `CompleteMultipartUpload` anywhere in the run.
+
+    GCS enforces no precondition on `CompleteMultipartUpload`, so a token-producing write that
+    fragmented would lose its write-once guarantee at the moment of completion.
+    `tokenProducingWriteSettings` therefore forces a single part for the Generation dialect.
+
+    Would fail if: `s3_force_single_part_upload` stopped being set for the Generation dialect and a
+    blob crossed the ordinary multipart threshold.
+
+    What this does NOT cover, and cannot from here: the ABOVE-THE-CAP arm, where a token-producing
+    body larger than `token_producing_single_put_cap` must be refused before any request is issued.
+    That cap is a 1 GiB constructor default with no configuration key, so an integration test cannot
+    reach it. `CopyObjectConditionalAboveSinglePutCapThrowsNotImplementedBeforeAnyRequest` covers it
+    at unit level.
+
+    It also overlaps `test_the_fake_refused_nothing_it_had_to_serve`, which would catch a multipart
+    attempt as a `501` — but only in the two CAS buckets, and only once it happened. The counters
+    below are global and distinguish "never attempted" from "attempted and refused".
+    """
+    counters = _counters()
+    assert counters.get("method_PUT", 0) > 0, (
+        "no PUT was ever sent, so the absence of multipart operations proves nothing"
+    )
+    for name in ("CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"):
+        assert counters.get(name, 0) == 0, "{} was issued {} time(s)".format(
+            name, counters[name]
+        )
+
+
+def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_client():
+    """Two statements over one interleaved workload on the OAuth clients.
+
+    Mode isolation: the ordinary disk's requests must still carry `x-amz-api-version` (marking deletes
+    it) and the CAS disk's must still show both kinds, in a slice of the log where the two disks'
+    traffic is interleaved rather than separated by phase. Would fail if: the mode became a property
+    of the client rather than of the request.
+
+    Client count: the metadata server hands out a token when a client's cache is first populated, and
+    answers a 24-hour expiry, so within this slice a new token fetch means a new client with a new
+    token cache. Zero new fetches says the request mode built neither. Would fail if: selecting the
+    request mode constructed a third client — the base and single-attempt clients already exist by
+    this point, having been built during the mount and the first conditional write.
+
+    The `> 0` preconditions matter three times here. Without the store-traffic check the mode
+    assertions would hold over an empty slice; without the per-method check they would hold over a
+    slice containing only writes; and without the lifetime-total token check the `== 0` would hold on
+    a fixture whose metadata server was never reached at all.
+
+    The read has to be one that MUST reach object storage, and the first version of this test got that
+    wrong: it used `SELECT count()`, which is answered from part metadata and never fetched a column,
+    so the ordinary disk's slice held nothing but PUTs and the per-method precondition below caught it.
+    A column read of the rows just inserted, with the mark and uncompressed caches dropped first, is
+    what actually issues a GET.
+    """
+    node = cluster.instances["node"]
+    assert _token_fetches() > 0, (
+        "the metadata server was never asked for a token, so counting new fetches proves nothing"
+    )
+
+    first_new_seq = _next_seq()
+    _reset_token_fetches()
+
+    for round_index in range(3):
+        base = 10000 + round_index * 100
+        for disk in (PLAIN_DISK, "cas_gcs_oauth"):
+            table = "t_" + disk
+            node.query(
+                "INSERT INTO {} SELECT number, toString(number) FROM numbers({}, 10)".format(
+                    table, base
+                )
+            )
+            # Drop the caches that would otherwise answer the read from memory, then read a COLUMN of
+            # the rows just written rather than a count.
+            node.query("SYSTEM DROP MARK CACHE")
+            node.query("SYSTEM DROP UNCOMPRESSED CACHE")
+            assert (
+                int(node.query("SELECT sum(id) FROM {} WHERE id >= {}".format(table, base)))
+                >= base
+            )
+
+    cas_bucket = CAS_DISKS["cas_gcs_oauth"]
+    plain = _captured_since(first_new_seq, PLAIN_BUCKET)
+    cas = _captured_since(first_new_seq, cas_bucket)
+    assert plain, "the ordinary disk sent nothing in this slice"
+    assert cas, "the CAS disk sent nothing in this slice"
+
+    # Named explicitly rather than folded into the `observable_plain` check, so that a workload which
+    # stops reaching the store says WHICH method vanished instead of just going quiet. Only GET is
+    # required: marking is a per-request property, so one observable request is enough to fence it, and
+    # forcing a DELETE would mean waiting on part-removal timing.
+    assert [r for r in plain if r["method"] == "GET" and r["key"]], (
+        "the ordinary disk issued no object GET in this slice, so the read never reached the store"
+    )
+
+    observable_plain = [r for r in plain if r["method"] in _MARKING_OBSERVABLE_METHODS]
+    assert observable_plain, "no GET/HEAD/DELETE on the ordinary disk in this slice"
+    for record in observable_plain:
+        assert _looks_default_on_oauth(record), (
+            "an interleaved ordinary {} on {} was marked".format(
+                record["method"], record["key"] or "(list)"
+            )
+        )
+
+    observable_cas = [r for r in cas if r["method"] in _MARKING_OBSERVABLE_METHODS]
+    assert [r for r in observable_cas if not _looks_default_on_oauth(r)], (
+        "no CAS request in this slice was marked"
+    )
+
+    new_fetches = _token_fetches()
+    assert new_fetches == 0, (
+        "an interleaved workload fetched {} new metadata token(s), so it built a client with a new "
+        "token cache".format(new_fetches)
+    )
+
+
+def test_a_write_whose_response_carries_no_generation_is_refused():
+    """The one input that can reach the "no valid generation" refusal.
+
+    A real GCS always answers a successful object write with `x-goog-generation`, and the response
+    adapter turns that into the SDK's `ETag`. When it is absent the SDK sees the store's real ETag
+    instead, which is not a generation, so `tokenFromWriteResult` must refuse to attribute the write to
+    an incarnation rather than patching the missing token over with a fresh HEAD — a HEAD returns
+    whatever incarnation happens to be current, which on a lost race is somebody else's.
+
+    The error text is the whole discriminator, and it is tight: had the code HEADed and adopted the
+    current incarnation instead of refusing, the INSERT would have SUCCEEDED. It failed, naming the
+    missing generation. So a regression that replaced the strict branch with a HEAD-and-adopt fallback
+    turns the error assertion red on its own.
+
+    Do NOT add an assertion here about which requests follow that write. Two forms were tried and both
+    had to be removed, for a reason no assertion on this seam can escape: what follows depends on WHICH
+    controlled lane the refused write happened to be on, and which object gets refused first varies
+    between runs. `putIfAbsentControlled` treats any raising attempt as unresolved and then runs
+    `resolveByExactGet`, so a HEAD and a GET of the key follow; `conditionalCreateControlled` filters
+    the attempt through `isDeterministicLocalFailure`, which lists `CORRUPTED_DATA`, and propagates
+    without resolving, so nothing follows at all. A manifest write takes the first lane and a blob write
+    the second, and nothing on the wire distinguishes a manifest put from a blob create — so the test
+    cannot know whether a resolve is expected, and `omit_generation` is global, so which object draws the
+    short straw varies between runs.
+
+    What fences the behaviour is the error text above, and nothing else here needs to.
+
+    Would fail if: the strict Generation branch in `tokenFromWriteResult` were replaced by, or fell
+    back to, the ETag dialect's HEAD path.
+
+    The mode is global while it is on, so a background CAS operation on the other disk can fail during
+    the window too. That is logged, not fatal, and the restored-mode INSERT at the end is what says
+    the disk is healthy again.
+    """
+    node = cluster.instances["node"]
+    table = "t_cas_gcs_oauth"
+    cas_bucket = CAS_DISKS["cas_gcs_oauth"]
+
+    first_new_seq = _next_seq()
+    try:
+        assert _set_omit_generation(True)["omit_generation"] is True
+        error = node.query_and_get_error(
+            "INSERT INTO {} SELECT number, toString(number) FROM numbers(20000, 50)".format(table)
+        )
+    finally:
+        assert _set_omit_generation(False)["omit_generation"] is False
+
+    assert "carried no valid generation" in error, error
+
+    # Positive proof that the fake actually produced the condition under test: a successful object
+    # write really did answer without a generation. Without this the error assertion above could be
+    # satisfied by an INSERT that failed for some entirely unrelated reason, and a mode switch that
+    # silently stopped working would look like a pass.
+    ungenerated = [
+        r
+        for r in _captured_since(first_new_seq, cas_bucket)
+        if r["method"] == "PUT" and r["status"] == 200 and r["response_generation"] is None
+    ]
+    assert ungenerated, "the mode was on but no successful PUT answered without a generation"
+
+    # Restoring the mode must restore the disk, or the failure above was something other than the
+    # missing generation.
+    node.query("INSERT INTO {} SELECT number, toString(number) FROM numbers(30000, 50)".format(table))
+    assert int(node.query("SELECT count() FROM {} WHERE id >= 30000".format(table))) == 50

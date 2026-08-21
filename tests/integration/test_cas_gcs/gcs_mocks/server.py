@@ -23,7 +23,23 @@ Control surface, reserved under the bucket name ``_control``:
   - ``GET  /_control/requests`` — the capture log as JSON: every request's method, bucket, key, query,
     headers, response status and the generation/ETag the response carried;
   - ``GET  /_control/minted`` — every generation and every ETag the fake has ever minted;
-  - ``POST /_control/reset`` — drop the capture log (objects are kept).
+  - ``GET  /_control/counters`` — per-method request counts plus the counts of the two operations a
+    token-producing write must never issue, ``CreateMultipartUpload`` and ``UploadPart``;
+  - ``POST /_control/reset`` — drop the capture log and the counters (objects are kept);
+  - ``POST /_control/mode?if_match=reject|ignore&omit_generation=0|1`` — select the adversarial
+    behaviours below. Global, not per bucket: the client reuses connections across buckets and a
+    per-bucket switch would invite a test to believe it had isolated something it had not.
+
+Adversarial behaviours, each off by default:
+
+  - ``if_match=ignore`` — a raw numeric ``If-Match`` is ignored instead of refused. The default
+    ``reject`` answers ``400``. Neither mode is reachable by correct production code, which never puts
+    a generation in the ETag domain; the pair exists to show what each kind of real service would do
+    if it did, and therefore how much of the fixture's safety depends on the service being strict.
+  - ``omit_generation=1`` — a successful object-write ``PUT`` answers without ``x-goog-generation``.
+    A real GCS always sends one; this models the response a proxy or a future API version might
+    return, which is the only input that can reach the "write succeeded but carried no valid
+    generation" refusal in the CAS write path.
 
 Usage: ``python3 server.py <port>``. Started by ``helpers.mock_servers.start_mock_servers``, which
 probes ``GET /`` and expects the body ``OK``.
@@ -44,11 +60,18 @@ _GENERATION_STRIDE = 7919
 
 _XMLNS = "http://s3.amazonaws.com/doc/2006-03-01/"
 
-# Query parameters this service actually models. Anything else — `?acl`, `?lifecycle`,
-# `?encryption`, `?requestPayment`, an unmodelled subresource of any kind — is refused rather than
-# silently treated as a listing or as an object write. An ALLOWLIST rather than a denylist on purpose:
-# a denylist grows stale the moment the SDK learns a new subresource, and the failure mode of a stale
-# denylist here is a half-served request that looks like a ClickHouse bug.
+# Query parameters this service actually models. An unmodelled query key — `?acl`, `?lifecycle`,
+# `?encryption`, `?requestPayment`, a subresource of any kind this fake has never heard of — is
+# refused rather than silently treated as a listing or as an object write. An ALLOWLIST rather than a
+# denylist on purpose: a denylist grows stale the moment the SDK learns a new subresource, and the
+# failure mode of a stale denylist here is a half-served request that looks like a ClickHouse bug.
+#
+# The allowlist governs the query shape only. Two other shapes reach the same half-served failure
+# without ever naming an unmodelled key, so each handler guards them separately: a MODELLED
+# subresource addressed at the wrong level (`?tagging` on a bucket rather than an object), and a
+# request carrying no object key at all where one is structurally required (`PUT /bucket`). Both are
+# refused by the `_MODELLED_SUBRESOURCES`-remainder check and the keyless-write check in the handlers
+# below.
 _MODELLED_LIST_PARAMS = frozenset(
     {
         "list-type",
@@ -72,6 +95,17 @@ def _unmodelled_params(query):
     return sorted(set(query) - _MODELLED_LIST_PARAMS - _MODELLED_SUBRESOURCES)
 
 
+def _unclaimed_subresources(query):
+    """Modelled subresources still present after every branch that owns one has declined it.
+
+    Each handler runs its explicit subresource branches first, each guarded to the level (bucket or
+    object) the subresource exists at, then calls this. A non-empty result means the request named a
+    subresource at a level no branch serves, which must be refused rather than falling through to the
+    generic listing or object path below it.
+    """
+    return sorted(set(query) & _MODELLED_SUBRESOURCES)
+
+
 _LOCK = threading.Lock()
 
 
@@ -83,8 +117,15 @@ class Store:
         self.requests = []  # the capture log
         self.minted_generations = []
         self.minted_etags = []
+        self.counters = {}
+        # Adversarial behaviour, off by default — see the module docstring.
+        self.if_match_mode = "reject"
+        self.omit_generation = False
         self._next_generation = _GENERATION_SEED
         self._next_etag_ordinal = 1
+
+    def count(self, name):
+        self.counters[name] = self.counters.get(name, 0) + 1
 
     def mint_generation(self):
         value = str(self._next_generation)
@@ -236,6 +277,12 @@ def _check_preconditions(entry, headers):
 
     if if_match is not None:
         if re.fullmatch(r'"?[0-9]+"?', if_match.strip()):
+            STORE.count("numeric_if_match")
+            if STORE.if_match_mode == "ignore":
+                # A permissive service: the precondition is dropped, so the request proceeds as if it
+                # had carried none at all. This is the dangerous direction — the caller is told its
+                # conditional operation succeeded conditionally when nothing was ever compared.
+                return None
             return _bad_request(
                 "If-Match is a generation, not an ETag: {!r}. A generation reached the ETag "
                 "domain.".format(if_match)
@@ -280,8 +327,10 @@ def handle_put(bucket, key, query, headers, body):
     if unmodelled:
         return _unsupported("PUT with the subresource/parameter " + ", ".join(unmodelled))
     if "uploadId" in query or "uploads" in query or "partNumber" in query:
+        if "partNumber" in query:
+            STORE.count("UploadPart")
         return _unsupported("multipart upload")
-    if "tagging" in query:
+    if "tagging" in query and key:
         entry = STORE.objects.get((bucket, key))
         if entry is None:
             return _no_such_key(key)
@@ -289,6 +338,14 @@ def handle_put(bucket, key, query, headers, body):
         return Reply(200)
     if "versioning" in query:
         return _unsupported("changing the bucket versioning configuration")
+    unclaimed = _unclaimed_subresources(query)
+    if unclaimed:
+        return _unsupported("PUT with the subresource " + ", ".join(unclaimed))
+    if not key:
+        # A keyless PUT is CreateBucket, which this fake does not model — its buckets are implicit.
+        # Refused explicitly: falling through would mint an object at the empty key, and that phantom
+        # would then appear in every later listing of the bucket.
+        return _unsupported("creating a bucket")
 
     existing = STORE.objects.get((bucket, key))
     rejection = _check_preconditions(existing, headers)
@@ -346,14 +403,22 @@ def handle_put(bucket, key, query, headers, body):
         "content_type": headers.get("content-type", "application/octet-stream"),
     }
     STORE.objects[(bucket, key)] = entry
-    return Reply(
-        200, b"", {"ETag": entry["etag"], "x-goog-generation": entry["generation"]}
-    )
+    headers = {"ETag": entry["etag"]}
+    if not STORE.omit_generation:
+        headers["x-goog-generation"] = entry["generation"]
+    return Reply(200, b"", headers)
 
 
 def handle_delete(bucket, key, query, headers):
     if "uploadId" in query:
         return _unsupported("aborting a multipart upload")
+    unclaimed = _unclaimed_subresources(query)
+    if unclaimed:
+        return _unsupported("DELETE with the subresource " + ", ".join(unclaimed))
+    if not key:
+        # DeleteBucket, which this fake does not model. Refused rather than answered `NoSuchKey` for
+        # the empty key, which would read as an object-level result for a bucket-level operation.
+        return _unsupported("deleting a bucket")
 
     existing = STORE.objects.get((bucket, key))
     rejection = _check_preconditions(existing, headers)
@@ -482,9 +547,7 @@ def handle_get_or_head(bucket, key, query, headers):
             '<LocationConstraint xmlns="{}">us-east-1</LocationConstraint>'.format(_XMLNS)
         ).encode()
         return Reply(200, payload, {"Content-Type": "application/xml"})
-    if not key:
-        return handle_list(bucket, query)
-    if "tagging" in query:
+    if "tagging" in query and key:
         entry = STORE.objects.get((bucket, key))
         if entry is None:
             return _no_such_key(key)
@@ -493,6 +556,18 @@ def handle_get_or_head(bucket, key, query, headers):
             '<Tagging xmlns="{}"><TagSet/></Tagging>'.format(_XMLNS)
         ).encode()
         return Reply(200, payload, {"Content-Type": "application/xml"})
+    # Before the bare-listing shortcut, not after it: `versioning` and `location` are bucket-level and
+    # `tagging` is object-level, so a subresource that reached here named a level nothing serves. The
+    # listing shortcut would answer `GET /bucket?tagging` with a full object listing.
+    unclaimed = _unclaimed_subresources(query)
+    if unclaimed:
+        return _unsupported(
+            "GET/HEAD of {} with the subresource {}".format(
+                "an object" if key else "a bucket", ", ".join(unclaimed)
+            )
+        )
+    if not key:
+        return handle_list(bucket, query)
 
     entry = STORE.objects.get((bucket, key))
     rejection = _check_preconditions(entry, headers)
@@ -527,7 +602,26 @@ def handle_get_or_head(bucket, key, query, headers):
     return Reply(status, body, out_headers)
 
 
-def handle_control(path, method):
+def handle_control(path, method, query):
+    if path == "/_control/counters":
+        return Reply(
+            200, json.dumps(STORE.counters).encode(), {"Content-Type": "application/json"}
+        )
+    if path == "/_control/mode" and method == "POST":
+        if "if_match" in query:
+            value = query["if_match"][0]
+            if value not in ("reject", "ignore"):
+                return _bad_request("unknown if_match mode " + value)
+            STORE.if_match_mode = value
+        if "omit_generation" in query:
+            STORE.omit_generation = query["omit_generation"][0] == "1"
+        return Reply(
+            200,
+            json.dumps(
+                {"if_match": STORE.if_match_mode, "omit_generation": STORE.omit_generation}
+            ).encode(),
+            {"Content-Type": "application/json"},
+        )
     if path == "/_control/requests":
         return Reply(
             200,
@@ -547,6 +641,7 @@ def handle_control(path, method):
         )
     if path == "/_control/reset" and method == "POST":
         STORE.requests = []
+        STORE.counters = {}
         return Reply(200, b"OK")
     return Reply(404, _error_xml("NoSuchControl", "unknown control path " + path))
 
@@ -587,7 +682,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path.startswith("/_control/"):
             with _LOCK:
-                reply = handle_control(path, method)
+                reply = handle_control(path, method, query)
             self._send(reply, want_body=True)
             return
 
@@ -595,14 +690,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         bucket, _, key = stripped.partition("/")
 
         with _LOCK:
+            STORE.count("method_" + method)
             if method == "PUT":
                 reply = handle_put(bucket, key, query, headers, body)
             elif method == "DELETE":
                 reply = handle_delete(bucket, key, query, headers)
             elif method == "POST":
                 if "delete" in query:
+                    STORE.count("DeleteObjects")
                     reply = handle_batch_delete(bucket, body)
                 else:
+                    # Counted even though refused: a test asserting that a token-producing write
+                    # issued no CreateMultipartUpload needs the count to be recorded whatever the
+                    # answer is, or the refusal itself would make the count zero and the assertion
+                    # would pass for the wrong reason.
+                    if "uploads" in query:
+                        STORE.count("CreateMultipartUpload")
+                    if "uploadId" in query:
+                        STORE.count("CompleteMultipartUpload")
                     reply = _unsupported("POST " + parsed.query)
             elif method in ("GET", "HEAD"):
                 reply = handle_get_or_head(bucket, key, query, headers)
