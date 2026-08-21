@@ -70,11 +70,10 @@ def start_cluster():
         tag="latest",
         stay_alive=True,
     )
-    # The fake GCE metadata server takes the real default hostname rather than being pointed at by a
-    # `metadata_service` override, because a CAS disk rejects `metadata_service` as an unknown setting
-    # (`non_cas_keys` in ContentAddressedSettings.cpp lists `http_client` but not `metadata_service`,
-    # `request_token_path` or `service_account`). Using the default keeps the disk configuration to
-    # keys a CAS disk accepts, and exercises the production token-fetch path unchanged.
+    # The fake GCE metadata server takes the real default hostname `metadata.google.internal` on the
+    # test's docker network, so no `metadata_service` override is needed. A CAS disk would ACCEPT one —
+    # `non_cas_keys` in ContentAddressedSettings.cpp lists `metadata_service`, `request_token_path`,
+    # `service_account` and the ADC triple — so this is a fixture simplification, not a constraint.
     cluster.add_instance(
         METADATA_HOST,
         hostname=METADATA_HOST,

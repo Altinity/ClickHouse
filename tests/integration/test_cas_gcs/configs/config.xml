@@ -5,10 +5,10 @@
                  contains no `storage.googleapis.com`: generation capability must come from the
                  explicit `http_client` value, never from endpoint text.
 
-                 No `metadata_service` override appears here even though the OAuth client supports
-                 one, because a CAS disk rejects that key as an unknown setting — see the note in
-                 test.py. The fake metadata server therefore takes the default hostname
-                 `metadata.google.internal` on the test's docker network instead. -->
+                 No `metadata_service` override appears here because the fake metadata server claims
+                 the default hostname `metadata.google.internal` on the test's docker network, so the
+                 default already points at it. A CAS disk would accept the key — see the note in
+                 test.py. -->
             <cas_gcs_oauth>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>

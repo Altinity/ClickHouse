@@ -4,7 +4,8 @@
 cached token has expired, so a `gcp_oauth` disk cannot perform a single real request without one.
 Without this server the disk fails to resolve `metadata.google.internal` and the failure looks like a
 GCS problem rather than a missing fixture, which is why this lives in its own module and its own
-container: the disk config points `metadata_service` at this host instead.
+container: it claims the default hostname `metadata.google.internal` on the test network, so the disk
+config needs no `metadata_service` override to find it.
 
 It answers a long expiry so that the token is fetched once and no test depends on refresh timing.
 That long expiry is what makes the token-fetch count meaningful: within one test module a token is
