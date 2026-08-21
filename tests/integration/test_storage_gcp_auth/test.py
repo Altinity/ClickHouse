@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 
 import pytest
@@ -17,7 +18,10 @@ def started_cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "node",
-            main_configs=["configs/named_collections.xml"],
+            main_configs=[
+                "configs/named_collections.xml",
+                "configs/filesystem_caches.xml",
+            ],
             user_configs=["configs/users.xml"],
             with_minio=True,
         )
@@ -265,3 +269,153 @@ def test_gcp_auth_ordinary_contract(started_cluster):
 
     node.query("DROP TABLE s3_ordinary_write")
     node.query("DROP TABLE s3_multipart_write")
+
+
+def test_gcp_auth_etag_and_cache_isolation(started_cluster):
+    """Regression fence for the user-visible half of the isolation plan: a `Default`-mode `gcp_oauth`
+    response must expose the mock's stable ETag as `_etag`, never `x-goog-generation` (which the mock
+    also sets, as an unrelated large counter, on every HEAD/GET/PUT/CompleteMultipartUpload response),
+    regardless of whether the metadata reached ClickHouse through a LIST (the XML body's `<ETag>`) or a
+    HEAD/GET (the `ETag` header). Because `_etag` feeds the filesystem-cache key, the page-cache key
+    and the Parquet metadata-cache key (`StorageObjectStorageSource.cpp`), a blanket generation
+    substitution on only some response kinds would split those caches by read path for the identical
+    object. This is exercised end to end rather than at the unit level, because the failure mode is in
+    which responses the substitution reaches, not in the cache-key hashing itself (deterministic
+    regardless of its input, so it cannot by itself catch a wrong-but-consistent input).
+    """
+    node = started_cluster.instances["node"]
+    resolver_id = started_cluster.get_container_id("resolver")
+
+    def reset():
+        for port in [80, 22234]:
+            started_cluster.exec_in_container(
+                resolver_id, ["curl", "-s", f"http://localhost:{port}/reset"], nothrow=True
+            )
+
+    reset()
+
+    object_name = "cache_isolation.parquet"
+    node.query(
+        f"INSERT INTO FUNCTION s3(gcs_conn, filename='{object_name}', format='Parquet') "
+        f"SELECT number FROM numbers(2000) SETTINGS s3_truncate_on_insert=1"
+    )
+
+    # HEAD/GET path: a direct key, no glob.
+    etag_head = node.query(
+        f"SELECT _etag FROM s3(gcs_conn, filename='{object_name}', format='Parquet') LIMIT 1"
+    ).strip()
+
+    # LIST path: a glob forces ListObjectsV2, whose XML body carries its own <ETag>, independent of
+    # the HEAD/GET header path above.
+    etag_list = node.query(
+        f"SELECT _etag FROM s3(gcs_conn, filename='cache_isolation*.parquet', format='Parquet') LIMIT 1"
+    ).strip()
+
+    assert etag_head == etag_list, (etag_head, etag_list)
+    # The mock's generation counter is a large, purely-numeric string (see `_next_generation` /
+    # `bump_generation` in `gcs_mocks/echo.py`); its ETag never is (`stable_etag` prefixes with
+    # "etag-"). A blanket generation-for-ETag substitution -- the bug this plan fixes -- would make
+    # `_etag` numeric here; this assertion is fireable because the two formats cannot collide.
+    assert not re.fullmatch(r"\d+", etag_head), etag_head
+
+    # --- Filesystem cache: the same `_etag` must produce the same cache key on repeated reads, so a
+    # second read of the unchanged object is served from cache with no further GetObject call. ---
+    fs_settings = "filesystem_cache_name='gcp_oauth_cache1', enable_filesystem_cache=1, use_page_cache_for_object_storage=0"
+    fs_query_id = f"fs-{object_name}-1"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {fs_settings}",
+        query_id=fs_query_id,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    write_bytes = int(
+        node.query(
+            f"SELECT ProfileEvents['CachedReadBufferCacheWriteBytes'] FROM system.query_log "
+            f"WHERE query_id='{fs_query_id}' AND type='QueryFinish'"
+        )
+    )
+    assert write_bytes > 0
+
+    node.query("SYSTEM CLEAR SCHEMA CACHE")
+    fs_query_id_2 = f"fs-{object_name}-2"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {fs_settings}",
+        query_id=fs_query_id_2,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    read_bytes, gets = node.query(
+        f"SELECT ProfileEvents['CachedReadBufferReadFromCacheBytes'], ProfileEvents['S3GetObject'] "
+        f"FROM system.query_log WHERE query_id='{fs_query_id_2}' AND type='QueryFinish'"
+    ).split("\t")
+    assert int(read_bytes) == write_bytes
+    assert int(gets) == 0
+
+    # --- Page cache: mutually exclusive with the filesystem cache in the read pipeline
+    # (`use_page_cache` in `StorageObjectStorageSource::createReadBuffer` requires
+    # `!use_filesystem_cache`), so this is its own query with the filesystem cache turned off. ---
+    node.query("SYSTEM CLEAR SCHEMA CACHE")
+    pc_settings = "enable_filesystem_cache=0, use_page_cache_for_object_storage=1"
+    pc_query_id = f"pc-{object_name}-1"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {pc_settings}",
+        query_id=pc_query_id,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    misses = int(
+        node.query(
+            f"SELECT ProfileEvents['PageCacheMisses'] FROM system.query_log "
+            f"WHERE query_id='{pc_query_id}' AND type='QueryFinish'"
+        )
+    )
+    assert misses > 0
+
+    node.query("SYSTEM CLEAR SCHEMA CACHE")
+    pc_query_id_2 = f"pc-{object_name}-2"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') "
+        f"SETTINGS {pc_settings}, read_from_page_cache_if_exists_otherwise_bypass_cache=1",
+        query_id=pc_query_id_2,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    hits, misses_2, gets = node.query(
+        f"SELECT ProfileEvents['PageCacheHits'], ProfileEvents['PageCacheMisses'], "
+        f"ProfileEvents['S3GetObject'] FROM system.query_log "
+        f"WHERE query_id='{pc_query_id_2}' AND type='QueryFinish'"
+    ).split("\t")
+    assert int(hits) > 0
+    assert int(misses_2) == 0
+    assert int(gets) == 0
+
+    # --- Parquet metadata cache: isolated from both body-caching mechanisms above, so a hit here can
+    # only come from the footer/metadata cache keyed on `(path, etag)`
+    # (`ParquetMetadataCache::createKey`), not from a full-file cache serving the whole read. A hit
+    # still requires an `S3GetObject` for the row-group body, so -- unlike the filesystem/page-cache
+    # queries above -- this does not assert the absence of a further object-body fetch.
+    node.query("SYSTEM CLEAR SCHEMA CACHE")
+    pq_settings = "enable_filesystem_cache=0, use_page_cache_for_object_storage=0, use_parquet_metadata_cache=1"
+    pq_query_id = f"pq-{object_name}-1"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {pq_settings}",
+        query_id=pq_query_id,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    pq_misses = int(
+        node.query(
+            f"SELECT ProfileEvents['ParquetMetadataCacheMisses'] FROM system.query_log "
+            f"WHERE query_id='{pq_query_id}' AND type='QueryFinish'"
+        )
+    )
+    assert pq_misses > 0
+
+    node.query("SYSTEM CLEAR SCHEMA CACHE")
+    pq_query_id_2 = f"pq-{object_name}-2"
+    node.query(
+        f"SELECT sum(ignore(*)) FROM s3(gcs_conn, filename='{object_name}', format='Parquet') SETTINGS {pq_settings}",
+        query_id=pq_query_id_2,
+    )
+    node.query("SYSTEM FLUSH LOGS")
+    pq_hits, pq_misses_2 = node.query(
+        f"SELECT ProfileEvents['ParquetMetadataCacheHits'], ProfileEvents['ParquetMetadataCacheMisses'] "
+        f"FROM system.query_log WHERE query_id='{pq_query_id_2}' AND type='QueryFinish'"
+    ).split("\t")
+    assert int(pq_hits) > 0
+    assert int(pq_misses_2) == 0
