@@ -162,3 +162,28 @@ one comment that still describes a semantics that no longer exists —
 `Freshness` itself stays load-bearing: `ForceFresh`/`StrictValidate` still change `getView`'s
 manifest-body proof and single-flight participation (`Parts/PartFolderAccess.cpp:266-270`), only the
 resolve half of the distinction is gone. P3.
+
+## Public docs: unshipped artifacts, missing settings, wrong CLI names (umbrella review M12) {#public-docs-accuracy-m12}
+
+Three sub-claims, all reproduced verbatim at HEAD and none fixed:
+
+- **12a** — `correctness.md`, the official "how CAS safety was verified" page, cites a TLA+ model
+  corpus and a chaos harness under paths that do not exist in the shipped tree (`docs/superpowers/`
+  is a development-branch-only directory). Source files carry five such pointers, two of them broken
+  even on the development branch. Rewrite the page to cite only what ships, or ship a public subset.
+- **12b** — `configuration.md` claims to list every disk setting generated from
+  `ContentAddressedSettings`, and omits ten of twenty-nine — precisely the GC pacing budgets an
+  operator needs during a mass-`DROP` incident. Add them plus a count check.
+- **12c** — the wrong `ca-*` prefix instead of the registered `cas-*` for `clickhouse-disks`
+  commands. WIDER than the review said: nine occurrences across six public pages, so its
+  "every other page is correct" is wrong.
+
+P2, and cheap: one docs pass. Nothing here is tracked elsewhere (`deferred-docs-fixes.md` is empty).
+
+## Retry-later class has no ProfileEvent (umbrella review M13) {#retry-later-no-profile-event}
+
+`throwCasWriteRetryLater` is reached from 63 call sites (the review said "40+") and emits only a
+rate-limited WARNING, so write-contention cannot be trended or alerted on, and the single printed
+line need not name the active cause. Add an aggregate ProfileEvent at the throw. The sibling gap —
+no signal distinguishing "GC administratively stopped" from "not GC leader" — is already tracked as
+{#gc-health-zero-is-ambiguous} (2031-triage CAS-098). P2.

@@ -25,10 +25,10 @@ TXN-ONE-PIPELINE, ack-floor GC и прочее, поэтому часть выв
 | M7 | Инлайновые CAS-диски не сносятся на `DROP TABLE` (утечка lease + потоков) | частично | P2 | нет | `docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md:25` {#disk-lifecycle-rev8-closure} — раздел «CAS disk lifecycle… |
 | M8 | Сетевой деструктор `Pool` может выполняться под `pointer_mutex` | подтверждено | P3 | нет | — (нигде: `grep -ni pointer_mutex` по `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.md`, `2031-triage.md` даёт тол… |
 | M9 | GCS `gcp_oauth` переписывает ВСЕ запросы/ответы, не только условные записи | исправлено | P3 | нет | остаток (живая валидация) — `docs/superpowers/cas/BACKLOG/formats-and-storage.md:22-28` {#backends}: «GATE #1: Azure … |
-| M10 | Disk-transaction contract трогает 16 общих файлов MergeTree — нужен динамический non-CAS прогон | ⏳ | — | — | — |
-| M11 | Кросс-дисковый `MOVE PARTITION` (CAS ↔ non-CAS) достижим, но помечен непроверенным | ⏳ | — | — | — |
-| M12 | Публичные доки ссылаются на несуществующие артефакты и недоописывают настройки | ⏳ | — | — | — |
-| M13 | Пробелы наблюдаемости и покрытия под собственные классы риска | ⏳ | — | — | — |
+| M10 | Disk-transaction contract трогает 16 общих файлов MergeTree — нужен динамический non-CAS прогон | частично | P2 | нет | нигде — по существу не отслеживается. Греп по `docs/superpowers/cas/BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.m… |
+| M11 | Кросс-дисковый `MOVE PARTITION` (CAS ↔ non-CAS) достижим, но помечен непроверенным | частично | P2 | нет | направление В CA — `docs/superpowers/cas/BACKLOG/replication.md:15` **[move-part-to-ca-architecturally-unimplemented]… |
+| M12 | Публичные доки ссылаются на несуществующие артефакты и недоописывают настройки | подтверждено | P2 | нет | нигде. Ни в `docs/superpowers/cas/BACKLOG.md` (включая `## Inbox`), ни в `BACKLOG/docs-and-cleanup.md`, ни в `final-c… |
+| M13 | Пробелы наблюдаемости и покрытия под собственные классы риска | подтверждено | P2 | нет | отслеживается ЧАСТИЧНО и по кускам. `gc_scheduler_running` — да: `docs/superpowers/cas/BACKLOG/operability-and-intros… |
 
 ## Minor issues {#minor}
 
@@ -301,3 +301,153 @@ P3, не выше: путь достижим только на самом шат
 1. Живой прогон. План `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` содержит 9 задач; в коде видны 1-6, а задачи 7-9 (изоляция `ETag`/ключа кеша, валидация обоих нативных клиентов на живом GCS, финальная верификация и аудит форк-поверхности) как отдельные коммиты не прослеживаются, чекбоксы в плане не проставлены (85 незакрытых, 0 закрытых). BACKLOG подтверждает, что гейт ещё считается открытым: `formats-and-storage.md:26-27` — «must follow completion of the current GCS Task 9 gate», и там же `[GCS production-grade follow-ups]` держит «`gcp_oauth` dialect probe validation against live GCS (ADC creds)».
 2. Новая пользовательская строгость, которую всё ещё стоит релиз-нотить (ровно в духе исходного «at minimum release-note it»): на `gcs_hmac` подпись GOOG4 идёт для КАЖДОГО запроса и теперь требует явной диспозиции для любого `x-amz-*` (`GCSConditionalDialect.h:32-40`), поэтому server-side encryption и пользовательские `x-amz-*`-заголовки диска отклоняются с `BAD_ARGUMENTS` вместо молчаливого переименования — это описано в `docs/en/antalya/cas/architecture/backend.md`, но в changelog-формулировке ещё нуждается.
 3. Побочное следствие, зафиксированное в комментарии (`GCSConditionalDialect.h:48-51`): атрибуты CAS-объекта читаются только помеченным запросом — `Default`-чтение метаданных CAS-объекта отдаёт пустую карту, а не ошибку. Осознанно и задокументировано.
+
+## M10 — Disk-transaction contract трогает 16 общих файлов MergeTree — нужен динамический non-CAS прогон (частично, P2) {#m10}
+
+**Статическая половина на HEAD держится (все ветки по-прежнему дефолтно выключены для не-CAS), частичная централизация правила была уже в обозреваемом дереве и с тех пор не расширялась (~10 мест по-прежнему выводят правило заново, `PartTransactionScope`/debug-ассерта нет), а запрошенное динамическое доказательство «нет дельты против базы» на не-CAS так нигде и не зафиксировано — хотя апстримные (не-CAS) полосы CI на ветке сохранены и планируются каждым workflow.**
+
+Заявлено (обзор, п.10): коммит `93d545b7446` «Disk-transaction contract: one logical part = one transaction» переписывает 16 общих (не-CAS) файлов MergeTree; статически каждая точка ветвления корректно дефолтится для не-CAS, но это самый высокий blast radius для существующих пользователей, и чтение кода не заменяет прогон. Плюс архитектурная претензия: правило «одна логическая часть = одна транзакция» — конвенция, переизобретаемая примерно в 10 независимых местах. Предложено: (а) подтвердить полное не-CAS покрытие stateless/stress (проекции+мутации, MOVE/REPLACE/ATTACH PARTITION, FREEZE, BACKUP/RESTORE на plain local и plain S3) без дельты против базы; (б) рассмотреть централизацию через один хелпер `PartTransactionScope` + debug-ассерт.
+
+Коммит на месте: `git show 93d545b7446` (Aug 5 2026, «Projection sub-parts ride the parent whole-part transaction … read-your-writes … becomes part of the IDiskTransaction contract»), 16 файлов, из них общие MergeTree/Disks.
+
+### (1) Статическая половина — на HEAD держится
+
+Дефолты не тронуты:
+- `src/Storages/MergeTree/IDataPartStorage.h:196` — `virtual bool isContentAddressed() const { return false; }`;
+- `src/Disks/IDiskTransaction.h:145` — `virtual std::optional<StoredObjects> tryGetInFlightStorageObjects(...) const { return {}; }`, `:148` — `tryGetInFlightFileSize(...) { return {}; }`;
+- `src/Disks/DiskObjectStorage/DiskObjectStorageTransaction.h:135` — ветка `if (metadata_storage->transactionIsStagingOverlay())` (для не-CAS метахранилищ ложь, дальше прежний путь).
+
+Ключевые «безусловные» добавления по-прежнему за `hasActiveTransaction()`, т.е. no-op там, где транзакция не открыта:
+- `src/Storages/MergeTree/MergeTreeData.cpp:9372` (renameParts-путь `Transaction`) и `:9394` (`Transaction::commit`) — `if (part->getDataPartStorage().hasActiveTransaction()) part->getDataPartStorage().commitTransaction();`;
+- `:8737` — тот же гейт в OPTIMIZE DRY RUN;
+- `:5967-5969` — «пустое покрытие» дополнительно сужено конъюнкцией `isContentAddressed() && hasActiveTransaction()`, с комментарием, привязывающим это к TXN-ONE-PIPELINE.
+
+CA-специфичные ветки в общих файлах явно помечены и гейтятся по диску: `DataPartStorageOnDiskBase.cpp:424` (BACKUP через временные hardlink'и на CA — `SUPPORT_IS_DISABLED`), `:544` (`!params.external_transaction && disk->isContentAddressed()` — клон целиком в одной транзакции), `:745` (CA-приёмник в `clonePart`, ветка L2 MOVE-to-CA), `IMergeTreeDataPart.cpp:1435` (`use_parent_transaction = !is_temp_projection || isContentAddressed()`), `MergeTreeDeduplicationLog.cpp:114` (`type != Plain && type != CAS`). Ни одной незагейченной ветки при перепроверке не найдено — вывод обзора подтверждается на HEAD.
+
+### (2) Централизация правила — частично, и НЕ после обзора
+
+Централизация одна и она уже была в обозреваемом дереве: `73b03c9a1e4` «cas: encapsulate whole-part-transaction rule on borrowed projection storage» — «removing the 6 duplicated `if (!isContentAddressed()) begin/commitTransaction()` guards across MergeTask, MutateTask, MergeProjectionPartsTask and MergeTreeDataWriter», плюс `src/Storages/MergeTree/tests/gtest_projection_borrowed_transaction.cpp`. На HEAD это `DataPartStorageOnDiskFull.cpp:398-420` (`beginTransaction`/`commitTransaction` — `if (has_shared_transaction) return;`, комментарий `:401-404` прямо говорит «This centralizes the rule the 6 merge/mutate call sites used to duplicate»). Проверено, что то же самое есть и в дереве обзора: `git grep -c has_shared_transaction 056488b47a0 -- src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp` → 2. То есть обзор считал ~10 оставшихся мест УЖЕ после этой централизации.
+
+С 2026-08-05 в этой части не изменилось ничего: `git log 056488b47a0..HEAD -- src/Storages/MergeTree/ src/Disks/DiskObjectStorage/` содержит только GCS-изоляцию, shadow-namespace `FREEZE` и merge апстрима — ни одного коммита про транзакционный контракт. `PartTransactionScope` в дереве отсутствует (`grep -rn PartTransactionScope src/` → пусто), debug-ассерта на правило нет. Правило по-прежнему выводится заново примерно в десятке мест: `MergeTreeData.cpp` (7 совпадений `isContentAddressed()/MetadataStorageType::CAS/hasActiveTransaction`), `DataPartStorageOnDiskBase.cpp` (6), по одному в `MergeTask.cpp`, `IMergeTreeDataPart.cpp`, `MergeTreeDeduplicationLog.cpp`, `MergeTreeDataWriter.cpp`, `MutatePlainMergeTreeTask.cpp`, `MutateFromLogEntryTask.cpp`, `DataPartStorageOnDiskFull.cpp`, два в `DataPartsExchange.cpp`. Риск ровно тот, что описан: новый путь записи файлов, забывший правило, для shared-transaction случая падает молча.
+
+### (3) Динамическое доказательство на не-CAS — не найдено
+
+Что ЕСТЬ:
+- Апстримные полосы в CI на ветке сохранены и планируются: `ci/defs/altinity_jobs.py:126-131` — `functional_tests_jobs = [*JobConfigs.functional_tests_jobs, *cas_functional_tests_jobs]`, т.е. CAS-полосы ДОБАВЛЕНЫ к апстримным, а не заменяют их; CAS-полосы отдельны и параметризованы `cas storage` / `cas s3 storage` (`:74-121`). Значит механизм для не-CAS-прогона существует и работает на каждом PR ветки (есть и след разбора такого прогона — RCA CI PR #2073, ссылки в `docs/superpowers/cas/BACKLOG/gc.md:58`).
+- Гейтинг тестов по CA-дефолту жив: `tests/clickhouse-test:1355` (`CAS_STORAGE = "cas-storage"`), `:2883` (тег `no-cas-storage`); заметим, тег переименован — старого `no-content-addressed-storage` в `tests/` больше нет ни одного (`git grep -l` → 0), тогда как `BACKLOG/testing-and-ci.md:25` всё ещё говорит про «remaining `no-content-addressed-storage` tests».
+
+Чего НЕТ: ни одной записи с вердиктом «не-CAS прогон, дельты против базы нет». Единственные зафиксированные полные прогоны stateless — это ПРОТИВОПОЛОЖНОЕ направление (не-CA тесты под CA-дефолтным диском) и оба сами открыты: `BACKLOG/testing-and-ci.md:44` **[non-ca-stateless-fast-fails]** («TODO: re-run the CA-default stateless on a QUIET box (or real CI)») и `:45` **[full-ca-default-stateless-quiet-box]** («40 non-CA fails, dominated by CONTENTION TIMEOUTS … TODO: run the full CA-default stateless on real CI»). Ни один из них не отвечает на вопрос п.10, потому что там дефолтный диск — CAS. Прогонов по конкретному op-mix из «Fix» (проекции+мутации, MOVE/REPLACE/ATTACH PARTITION, FREEZE, BACKUP/RESTORE на plain local и plain S3) со сравнением против базы в `docs/superpowers/cas/` нет вообще.
+
+### Что осталось
+1. (главное) Зафиксировать не-CAS доказательство: прогон апстримных stateless+stress+integration полос ветки против базы `antalya-26.6` с явной записью «дельты нет», отдельно выделив BACKUP/RESTORE, FREEZE и партишен-операции на plain local и plain S3. Дёшево (полосы уже планируются), но результат нигде не записан — а именно записи и требовал п.10.
+2. (желательно) Централизация: `PartTransactionScope` + debug-ассерт «файл части пишется под транзакцией части». Сейчас закрыт только projection-borrowed кусок.
+3. (гигиена) Устаревшее имя тега в `BACKLOG/testing-and-ci.md:25` (`no-content-addressed-storage` → `no-cas-storage`).
+
+P2, не до релиза: доказательство ценно, но статическая перепроверка на HEAD снова не нашла ни одной незагейченной ветки, а апстримные полосы CI на ветке не отключены — то есть регрессия, если бы она была, попадала бы в обычный отчёт CI, а не оставалась бы невидимой.
+
+## M11 — Кросс-дисковый `MOVE PARTITION` (CAS ↔ non-CAS) достижим, но помечен непроверенным (частично, P2) {#m11}
+
+**Самопризнание «cross-disk не проверено» на HEAD стоит дословно и `MOVE_PARTITION` из CA-allowlist не убран, но ландшафт с 05.08 изменился асимметрично: направление В CA реализовано (L1+L2), закрыто в бэклоге и прогнано сценариями S36/S37, а направление ИЗ CA осталось без гарда — и именно там 2031-триаж нашёл реальный дефект CAS-020 (серверная копия копирует байты конверта, спасает только громкий отказ на inline-файлах).**
+
+Заявлено (обзор, п.11): в `MergeTreeData.cpp` `checkAlterPartitionIsPossible`, ветка `MetadataStorageType::CAS`, allowlist пропускает `MOVE_PARTITION`, а комментарий рядом сам говорит, что проверен только одно-дисковый `MOVE … TO TABLE`, а кросс-дисковый `MOVE … TO DISK/VOLUME` — «a follow-up to verify». Предложено: либо покрыть оба направления, либо отбивать кросс-дисковый случай `SUPPORT_IS_DISABLED`, как сделано для прочих загейченных партишен-операций.
+
+### Что на HEAD дословно
+
+`src/Storages/MergeTree/MergeTreeData.cpp:6816` — `case MetadataStorageType::CAS:`; `:6839-6843` — комментарий: «NOTE: `MOVE_PARTITION` also admits cross-disk `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only same-disk `MOVE ... TO TABLE` is verified here — cross-disk is a follow-up to verify.» `:6849` — `PartitionCommand::MOVE_PARTITION` по-прежнему в `supported_commands`. То есть буквальное утверждение обзора не устарело: ни покрытие не заявлено, ни отказ не добавлен, ни комментарий не переписан.
+
+### Что фактически разрешено/запрещено сегодня — по направлениям
+
+**(1) В CA (`MOVE PART|PARTITION TO DISK|VOLUME <ca disk>`): работает, это сделано специально.**
+`DataPartStorageOnDiskBase::clonePart` (`:744-768`) имеет ветку `if (dst_disk->isContentAddressed())`, которая гоняет весь клон через ОДНУ транзакцию приёмника (`clone_transaction = dst_disk->createTransaction()`, `copyDirectoryContentIntoTransaction`, `commit()`, откат `undo()`), с комментарием «L2 (MOVE-to-CA fix): a content-addressed disk models a part as ONE atomic unit». Бэклог-пункт `BACKLOG/replication.md:15` **[move-part-to-ca-architecturally-unimplemented]** помечен «✅ CLOSED at HEAD by L1 (`2f2a3b01aa6`, `4d73e198f6b`, `81eab8b6968`) + L2 (`4229a1477be`) — verified 2031-triage CAS-120». Динамическое подтверждение есть и оно именно кросс-дисковое: сценарии S36 (`ALTER TABLE s36_move MOVE PART … TO DISK 'ca'`) и S37 (TTL-move в CA-volume) — `utils/ca-soak/scenarios/RUN_HISTORY.md:424-425` и `:466-467`, оба `pass` 2026-07-18 (до фикса, `:415-416`, оба `fail`). После 07-18 прогонов S36/S37 в истории нет.
+Живые остатки этого направления: `BACKLOG/replication.md:16` **[VERIFY-ca-ca-same-pool-move]** — CA↔CA внутри ОДНОГО пула не прогонялся, открыт вопрос о доброкачественности коллизии ref-а `<part>` у источника и приёмника; `:17` **[killed-mid-move-partition-duplicate]** — kill посреди `MOVE PARTITION` оставляет задублированную партицию, атрибутировано как PRE-EXISTING и вероятно generic, не CA-специфика.
+
+**(2) Из CA (`MOVE … TO DISK|VOLUME <не-CA диск>`): достижимо, гарда нет, и здесь реальный дефект.**
+`clonePart`'s `else`-ветка (`:769-782`) уходит в `src_disk->copyDirectoryContent(...)`, то есть в `DiskObjectStorage::copyFile` (`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:291`), которая на `:300` сравнивает `getDataSourceDescription() == to_disk.getDataSourceDescription()` и при равенстве делает СЕРВЕРНУЮ копию (`transaction->copyFile`, `:307`), иначе — буферный `IDisk::copyFile` (`:321`). Ключевой факт: `metadata_type` в это сравнение НЕ входит — `DataSourceDescription::operator==` (`src/Disks/DiskType.cpp:35-38`) сравнивает `type, object_storage_type, description, is_encrypted, zookeeper_name`, а `metadata_type` объявлен отдельным полем (`src/Disks/DiskType.h:33`, `:49`) и в кортеж не попал. Поэтому CAS-s3 и plain-s3 на одном эндпойнте считаются одним источником данных, и берётся серверная копия, которая читает ключи через `getStorageObjects`, теряющий смещение payload (`ContentAddressedMetadataStorage.cpp:1859-1865`, комментарий `:1860-1864` — «StoredObject carries no range»), то есть копирует байты КОНВЕРТА.
+Это ровно 2031-триаж **CAS-020** (`docs/superpowers/cas/2031-triage.md:726-870`, статус подтверждено, P2, бэклог {#move-out-copies-envelope-bytes}). Существенное смягчение оттуда же (`(d) Громко или тихо`): в любой реальной части есть файлы <= `INLINE_CAP` 1 MiB (`count.txt`, `columns.txt`, `checksums.txt`), для них `getStorageObjects` отдаёт ПУСТОЙ ключ (`:1828-1829`), бэкенд падает, `clonePart` ловит и вычищает приёмник (`DataPartStorageOnDiskBase.cpp:766-772`). Итог операции — громкий отказ с невнятным сообщением плюс мусорные объекты в приёмнике, а не тихая порча. Когда `DataSourceDescription` РАЗЛИЧАЮТСЯ (типичный CA-s3 → local), берётся буферный путь через `prepareRead`, и копия корректна — именно поэтому `BACKLOG/replication.md:15` пишет «unaffected: … off-CA moves (CA→local)»; триаж CAS-020 уточняет, что это верно только при неравных описаниях.
+
+**(3) `MOVE PARTITION … TO TABLE` / `REPLACE PARTITION` между разными политиками: отбиваются заранее.**
+`StoragePolicy::isCompatibleForPartitionOps` (`src/Disks/StoragePolicy.cpp:420-435`) требует, чтобы ВСЕ диски обеих политик были `isPlain()`; CAS-метахранилище `isPlain()` не переопределяет (дефолт `false`), поэтому `must_on_same_disk=true` и запрос падает `BAD_ARGUMENTS` до всякого копирования (разбор — `2031-triage.md:2656`). То есть «кросс-дисковость» реально достижима только через `TO DISK/VOLUME` и TTL-перемещения, что и описано в (1)/(2).
+
+### Покрытие
+Stateless-тест на CA-партишен-операции есть, но он про TO TABLE: `tests/queries/0_stateless/04280_cas_clone_partition_works.sql:38` (`ALTER TABLE t_cas_clone_src MOVE PARTITION 3 TO TABLE t_cas_clone_dst`). Ни одного stateless-теста с `MOVE … TO DISK|VOLUME` на CA-диск (в любую сторону) нет — единственное динамическое покрытие кросс-дискового MOVE живёт в soak-сценариях S36/S37, и только для направления В CA.
+
+### Что осталось
+1. (P2, главное) Гард на стороне ИСТОЧНИКА для серверной копии из CA — структурно это либо включить `metadata_type` в `DataSourceDescription::operator==`/`sameKind`, либо явный CA-чек перед `transaction->copyFile`. Отслежено как CAS-020; правка затрагивает общий (апстримный) файл, значит по стоячему правилу требует согласования.
+2. (P2) Привести комментарий `MergeTreeData.cpp:6839-6843` в соответствие с фактом: направление В CA теперь реализовано и прогнано (L1+L2, S36/S37), направление ИЗ CA — незакрытый гард. Сейчас комментарий одинаково «не проверено» про обе стороны и потому дезинформирует.
+3. (P3) Прогнать `[VERIFY-ca-ca-same-pool-move]` (S37 CA↔CA leg) и добавить stateless-тест на `MOVE PART … TO DISK '<cas>'`, чтобы кросс-дисковое направление не держалось на одном soak-прогоне месячной давности.
+Отбивать `MOVE_PARTITION` через `SUPPORT_IS_DISABLED`, как предлагал обзор, уже неверно: это сломает реализованную и проверенную MOVE-to-CA функциональность.
+
+## M12 — Публичные доки ссылаются на несуществующие артефакты и недоописывают настройки (подтверждено, P2) {#m12}
+
+**Все три подпункта на HEAD воспроизводятся дословно и ни один не исправлен; 12c при перепроверке ОКАЗАЛСЯ ШИРЕ заявленного — неверный префикс `ca-` вместо `cas-` встречается не только в `roadmap.md`, а в шести файлах публичной документации (9 мест), так что фраза обзора «every other page is correct» неверна.**
+
+Заявлено (обзор, п.12): (12a) `correctness.md` — официальная страница «как проверялась безопасность CAS» — ссылается на корпус TLA+ по пути `docs/superpowers/models/` и на chaos-харнесс `utils/ca-soak/`, которых в поставляемом дереве нет (ноль `.tla`-файлов); плюс семь исходников и `programs/disks/CommandCaGcRebuild.cpp` ссылаются на `docs/superpowers/cas/BACKLOG.md`/`AGENTS.md`. (12b) `configuration.md` заявляет, что перечисляет ВСЕ настройки, сгенерированные из `ContentAddressedSettings` на HEAD, но пропускает 10 из 29 — ровно GC-бюджеты, нужные оператору при массовом `DROP`. (12c) `roadmap.md` даёт неверные имена команд `clickhouse-disks` (`ca-fsck` … вместо зарегистрированных `cas-fsck` …).
+
+### 12a — подтверждено, и различие «ветка разработки vs поставляемая» здесь ключевое
+
+Текст на месте: `docs/en/antalya/cas/architecture/correctness.md:20-21` — «The full model index (source `.tla` files and proof-run records) lives at `docs/superpowers/models/`; this page is the reader-facing summary»; `:25` — заголовок таблицы «Model (`docs/superpowers/models/`)» с 12 строками, каждая называет конкретный `.tla`; `:42` — «the soak/chaos harness (`utils/ca-soak/`)»; `:52` — «(`utils/ca-soak` scenario S30 …)».
+
+На ЭТОЙ ветке (`cas-gc-rebuild`) оба пути существуют и версионированы: `git ls-files docs/superpowers` → 644 файла, из них 148 `*.tla`; `git ls-files utils/ca-soak` непуст. На дереве, которое обозревали (`056488b47a0`), их нет: `git ls-tree -r --name-only 056488b47a0 -- docs/superpowers` → 0 записей, то же для `utils/ca-soak`. То есть претензия обзора верна именно для поставляемого артефакта, и суть её не «пути не существуют», а «публичная страница адресует читателя в дерево разработки, которого он не получит». Это не самоисправится: `docs/superpowers/` — рабочая зона и в релизную ветку не едет по построению.
+
+Ссылки из кода: их стало МЕНЬШЕ (было заявлено 8, на HEAD 5, `git grep -n "docs/superpowers" -- src programs`):
+- `programs/disks/CommandCaGcRebuild.cpp:20` — «see docs/superpowers/cas/04-gc-protocol.md#gc-rebuild»; этого файла НЕТ уже и на ветке разработки (консолидация 2026-08), т.е. ссылка битая дважды;
+- `src/.../Gc/CasGc.cpp:1569` и `src/Storages/StorageTableProxy.h:62` — на `docs/superpowers/cas/BACKLOG.md`;
+- `src/.../Tools/CasFsck.h:239` — на `docs/superpowers/cas/AGENTS.md`;
+- `src/Disks/tests/gtest_cas_parallel_commit.cpp:11` — на `docs/superpowers/sdd`, каталог удалён (`e8ecc2c5bdc`).
+Все пять — ещё и нарушение стоячего правила «комментарий не цитирует планы/BACKLOG/ревью»: причину надо оставить, происхождение убрать.
+
+### 12b — подтверждено ровно в заявленном объёме, без изменений
+
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp` содержит ровно 29 `DECLARE(...)`. Сверка каждого имени с `docs/en/antalya/cas/configuration.md` даёт 10 отсутствующих, и это именно бюджеты темпа GC:
+`gc_round_graduation_budget`, `gc_round_handoff_prefix_wholesale_budget`, `gc_round_outcome_entry_budget`, `gc_round_prefix_wholesale_budget`, `gc_round_redelete_budget`, `gc_round_ref_cleanup_budget`, `gc_round_sweep_namespace_budget`, `gc_round_sweep_recovery_op_budget`, `manifest_sweep_delete_budget_keys`, `manifest_sweep_list_budget_keys`.
+Заявление о полноте живёт прямо во frontmatter страницы: `docs/en/antalya/cas/configuration.md:2` — «Every disk-level and server-level setting content-addressed storage exposes, generated from ContentAddressedSettings and ServerSettings at HEAD». Слово «generated» тут вводит в заблуждение вдвойне: генерации нет, есть ручной список, и проверки счётчика (тест/CI-гейт «число задокументированных == число `DECLARE`») тоже нет.
+
+### 12c — подтверждено И ШИРЕ, чем в обзоре
+
+Зарегистрированные имена — `programs/disks/DisksApp.cpp:345-349`: `cas-fsck`, `cas-gc-dryrun`, `cas-gc-rebuild`, `cas-inspect`, `cas-drop-member` (и сами команды печатают себя так же: `CommandFsck.cpp:24` `command_name = "cas-fsck"`, `CommandCaGcRebuild.cpp:34`).
+Неверный префикс `ca-` в `docs/en/antalya/cas/` — 9 мест в 6 файлах, а не только в `roadmap.md`:
+- `roadmap.md:49` — «`clickhouse-disks` commands `ca-fsck`, `ca-inspect`, `ca-gc-dryrun`, and `ca-gc-rebuild`» (4 имени в одной строке);
+- `architecture/correctness.md:50` — «`clickhouse-disks ca-fsck` plus `ca-gc-dryrun`»;
+- `architecture/garbage-collection.md:246`, `:256` («`clickhouse-disks ca-gc-rebuild`»), `:257` («`clickhouse-disks ca-gc-dryrun`»);
+- `architecture/read-path.md:78` — «(`ca-fsck`, `ca-gc-dryrun`, and similar tools)»;
+- `architecture/blob-protocol.md:174`, `architecture/replication.md:89`, `architecture/manifests-and-refs.md:244` — `ca-fsck` в прозе.
+Уточнение обзора «every other page is correct» на HEAD не соответствует действительности; правка — не 4 имени в одном файле, а сплошной проход по шести файлам.
+
+### Что осталось (весь пункт открыт)
+1. Переписать `correctness.md` так, чтобы публичная страница не адресовала читателя в дерево разработки: либо описать корпус моделей и soak без путей (утверждение о том, ЧТО доказано, ценно и без ссылки), либо отгрузить публичное подмножество. Заодно — снять пять ссылок `docs/superpowers/*` из `src/`/`programs/` (одна из них уже битая и на самой ветке разработки).
+2. Дописать 10 GC-бюджетов в `configuration.md` и добавить проверку счётчика, иначе список разъедется снова.
+3. Сплошная замена `ca-` → `cas-` в именах команд по шести файлам `docs/en/antalya/cas/` (9 мест).
+P2 и не pre-release: это документация, ни одно из трёх не влияет на поведение сервера, но 12b — операционный риск в инциденте (оператор не найдёт ручки темпа GC), а 12c — команды, которые буквально не запускаются в том виде, в каком напечатаны; починка целиком механическая.
+
+## M13 — Пробелы наблюдаемости и покрытия под собственные классы риска (подтверждено, P2) {#m13}
+
+**Все три названные наблюдаемости/покрытия дыры на HEAD воспроизводятся: у `throwCasWriteRetryLater` по-прежнему только rate-limited WARNING и ни одного `ProfileEvent` при 63 call-site'ах, в `GcHealth`/`cas_mounts` нет сигнала «GC остановлен администратором» (есть только `is_leader`), а перечисленные тестовые пробелы подтверждаются пересчётом; поправка обзора про `gtest_cas_gc_stop_start.cpp` тоже верна — 10 gtest'ов есть, SQL-уровня нет.**
+
+Заявлено (обзор, п.13): (а) у класса retry-later нет счётчика — 40+ call-site'ов в 6 файлах сходятся в один логгер с 30-секундным rate limit и без `ProfileEvent`, оператор не может строить тренд/алерт по write-contention; добавить агрегатный `ProfileEvent` в `throwCasWriteRetryLater`. (б) Нет сигнала, отличающего «GC остановлен администратором» от «не лидер» — `GcHealth`/`cas_mounts` отдают только `is_leader`; добавить `gc_scheduler_running`. (в) Не покрыто: мисконфигурация диска (ноль `serverError`/`clientError` в ~34 не-access CAS stateless-тестах), настоящая crash-consistency (failpoint только в момент коммита, реальный SIGKILL только МЕЖДУ запросами, ноль `KILL QUERY` посреди INSERT), межпроцессные/многоклиентские гонки (все 10 интеграционных наборов гоняют серверы последовательно, ни одного `threading`), ни одна perf/stress/fuzzer/upgrade полоса не идёт на CAS-дефолтном хранилище, cross-disk-type `MOVE`/backup, `FORGET`-на-живом. Плюс собственная поправка обзора: `SYSTEM CAS GC STOP/START` хорошо покрыт на уровне gtest.
+
+### (а) ProfileEvent на retry-later — подтверждено, без изменений
+
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.cpp:183-188` — `logCasWriteRetryLater` содержит ровно `LogSeriesLimiter log(getLogger("CasWriteRetryLater"), 1, 30); LOG_WARNING(...)` и ничего больше; `:190-194` (`throwCasWriteRetryLater`) и `:196-201` (`makeCasWriteRetryLaterExceptionPtr`) вызывают только его. `ProfileEvents` в этом файле есть и активно используются (`:66`, `:74`, `:77`, `:80` — `CASConditionalWrite*`; `:412`, `:472`, `:538`, `:566` — `CASConditionalWriteFenceLostPostWrite`), то есть отсутствие счётчика именно здесь — пропуск, а не отсутствие механизма.
+Масштаб даже больше заявленного: `git grep -o "throwCasWriteRetryLater(" -- src` → 63 вхождения; по файлам — `Pool/CasRefLedger.cpp` 55, `Pool/CasPartWriteTxn.cpp` 11, `Pool/CasRefCatalog.cpp` 4, `Gc/CasGc.cpp` 2, `Pool/CasRefCkpt.cpp` 2, `Gc/CatalogLifecycleReconciler.cpp` 1 (плюс 2 в самом `CasRequestControl.cpp` и 3 в тесте).
+Важное уточнение к формулировке обзора «the one printed line may not even name the active cause»: комментарий на месте (`:177-181`) сам это признаёт — «`LogSeriesLimiter` keys on the LOGGER NAME only, so under a sustained outage where `why` keeps changing slightly, only the first message in each window prints; this is the intended throttle». То есть при сохранении текущего троттлинга агрегатный счётчик — единственный способ увидеть класс целиком, и именно его нет.
+
+### (б) `gc_scheduler_running` — подтверждено, и уже заведено в бэклог другим триажем
+
+`Gc/CasGcScheduler.h:123-130` — `struct GcHealth { bool is_leader; bool ever_succeeded; Int64 pending_reclaim; UInt64 last_success_age_seconds; UInt64 wedged_namespace_count; }` — поля про остановку нет. `src/Storages/System/StorageSystemContentAddressedMounts.cpp:52` объявляет `is_leader` («1 if this server's GC scheduler holds this disk's leadership lease»), заполняется на `:199`; больше ничего про состояние планировщика таблица не отдаёт. `SYSTEM CAS GC STOP` — stop-in-place (`src/Interpreters/InterpreterSystemQuery.cpp:2666-2682`, `ca->gcStop()`), единственный след — одноразовый `LOG_INFO` на `:2682`. Грепа `gc_scheduler_running`/`scheduler_running` по `src` нет вовсе.
+Пункт уже описан независимо: `BACKLOG/operability-and-introspection.md:491-498` (2031-триаж CAS-098, пункт 2) — «`is_leader = 0` conflates "follower", "operator stopped GC here" and "scheduler self-exited" … A `gc_running` (or `gc_state`) column, sampled from the scheduler's `stopping` latch, closes it». Там же соседний, того же семейства и НЕ упомянутый обзором дефект: `ever_succeeded` вычисляется, но не отдаётся ни колонкой, ни метрикой, из-за чего алерт `CASGCLastSuccessAgeSeconds_<disk> > threshold` не может сработать для диска, чей GC не преуспел ни разу.
+
+### (в) Перечисленные тестовые пробелы — пересчитаны на HEAD
+
+- **Мисконфигурация диска.** CAS stateless-тестов (семейства `04xxx_cas_/04xxx_content_addressed*` и `05xxx_cas*`) — 38 файлов. `serverError`/`clientError` встречается в 5, из которых 4 — access-тесты (`05011_cas_gc_rebuild_access.sh`, `05016_cas_drop_pool_member_access.sh`, `05019_cas_fsck_access.sh`, `05022_cas_verb_access.sh`), а пятый — одна строка `05007_cas_gc_introspection.sh:105` (`SYSTEM CAS GC RUN 'default'; -- { serverError BAD_ARGUMENTS }`, т.е. не-CA диск). Заявление обзора («ноль в не-access тестах») на HEAD верно с точностью до этой одной ассерции: путей ошибок конфигурации CA-диска не проверяет ни один тест.
+- **Crash-consistency.** Failpoint-покрытие ровно в момент коммита: `tests/integration/test_cas_insert_fault_recovery/test.py:64` — `disk_object_storage_fail_commit_metadata_transaction`. Реальный SIGKILL один и он МЕЖДУ запросами: `tests/integration/test_cas_shared_pool/test.py:265` — `node1.stop_clickhouse(kill=True)` вызывается после того, как INSERT уже вернулся (`:255-261`). `KILL QUERY` не встречается ни в одном CAS-тесте (`git grep -ln "KILL QUERY" -- tests/integration/test_cas* tests/queries/0_stateless/05*` → пусто).
+- **Многоклиентские гонки.** Интеграционных наборов теперь 11 (`test_cas_drop_pool_member`, `test_cas_file_cache`, `test_cas_gcs`, `test_cas_gc_s3`, `test_cas_gc_sharded`, `test_cas_insert_fault_recovery`, `test_cas_lazy_load_recovery`, `test_cas_ref_snaplog`, `test_cas_replicated_relink`, `test_cas_s3`, `test_cas_shared_pool`). `threading`/`ThreadPoolExecutor` встречается только в `test_cas_gcs/gcs_mocks/{auth,server}.py` — это mock-сервер GCS, то есть инфраструктура, а не драйвер теста: ни один набор не запускает конкурентных клиентов. Пробел подтверждается; он же зафиксирован под другим углом в `BACKLOG/testing-and-ci.md:19` **[review #14]** («concurrency invariants validated only by sequential-logic tests»).
+- **Полосы CI.** CAS-параметризация есть ТОЛЬКО у функциональных тестов: `ci/defs/altinity_jobs.py:74-121` (`cas storage` / `cas s3 storage`, включая asan/tsan/msan шарды) и `:126-131`, где эти джобы добавляются к `JobConfigs.functional_tests_jobs`. Ни perf, ни stress, ни fuzzer, ни upgrade-полосы CAS-варианта не имеют. Подтверждено.
+- **Cross-disk-type MOVE/backup.** BACKUP на CA покрыт одним тестом и только на локальный бэкап-диск: `tests/queries/0_stateless/05005_cas_backup_restore.sh:16` — `backup_name="Disk('backups', ...)"`; ни `S3(...)`, ни бэкапа между разнотипными дисками нет. По MOVE — см. отдельный разбор в M11: stateless-теста на `MOVE … TO DISK/VOLUME` с CA-диском нет вообще, единственное покрытие — soak-сценарии S36/S37 и только в направлении В CA.
+- **`FORGET`-на-живом.** `SYSTEM CAS FORGET` встречается в `05019`, `05020`, `05022`, `05023`, но везде как teardown после дропа всех таблиц: `05023_cas_dropns_leaked_namespace.sh:185-196` — «(7) fail-closed teardown … FORGET the disk (all tables already dropped above)». Сценария «FORGET при живых таблицах/запросах» нет. Подтверждено.
+- **Поправка обзора про GC STOP/START — верна.** `src/Disks/tests/gtest_cas_gc_stop_start.cpp` существует и содержит 10 `TEST`; на SQL-уровне же покрытие только привилегиями — `SYSTEM CAS GC STOP|START` в `tests/` встречается лишь в `01271_show_privileges.reference` и `05022_cas_verb_access.sh`, то есть функционального SQL/интеграционного теста действительно нет.
+
+### Что осталось (весь пункт открыт, разными кусками)
+1. (P2, дёшево) Агрегатный `ProfileEvent` в `logCasWriteRetryLater` — одна строка в единственной общей точке, покрывающая все 63 call-site'а; желательно с разбиением writer/GC, раз оба класса туда сходятся.
+2. (P2, уже описано в CAS-098) Колонка `gc_running`/`gc_state` в `system.cas_mounts` из латча `stopping`, заодно закрыть `ever_succeeded`.
+3. (P3, разное) Тестовые пробелы: error-path на мисконфигурацию CA-диска; `KILL QUERY` посреди INSERT; хотя бы один интеграционный набор с конкурентными клиентами; функциональный тест на `GC STOP/START`; BACKUP на S3-бэкап-диск с CA-источника; `FORGET`-на-живом.
+Не pre-release: ни один пункт не меняет корректности, все — про диагностируемость и про то, какие классы риска сегодня некому поймать; но пункт 1 и 2 стоит взять первыми, потому что именно они превращают инцидент в «нет данных».
