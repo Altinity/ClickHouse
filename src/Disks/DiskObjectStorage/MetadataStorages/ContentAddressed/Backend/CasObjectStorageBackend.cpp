@@ -131,6 +131,11 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 /// Native helpers
 /// =========================================================================================
 
+bool ObjectStorageBackend::isValidGenerationTokenValue(const String & value)
+{
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
 std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 {
     auto metadata = object_storage->tryGetObjectMetadataWithNativeToken(key, /*with_tags=*/false);
@@ -141,6 +146,15 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     hr.exists = true;
     hr.size = metadata->size_bytes;
     hr.token = tokenForHead(metadata->etag);
+    /// A generation-token store guarantees a numeric x-goog-generation on every successful HEAD;
+    /// a missing or non-numeric value (a proxy dropping the header, a service regression) means the
+    /// ordinary ETag fell through unmapped. There is no follow-up HEAD to patch this over, so surface
+    /// the failure here rather than minting a token that would poison the first conditional operation
+    /// that trusts it -- exactly the contract tokenFromWriteResult already enforces on the write path.
+    if (native_token_type == TokenType::Generation && !isValidGenerationTokenValue(hr.token.value))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS on GCS: a HEAD of {} succeeded but its response carried no valid generation ({})",
+            key, metadata->etag);
     hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     return hr;
 }
@@ -898,9 +912,7 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
         /// that transport syntax. Validating before the strip would reject every real GCS write.
         /// The message still reports the raw arrival, since that is what needs diagnosing.
         const Token token = tokenForHead(*etag);
-        const bool valid_generation = !token.value.empty()
-            && std::all_of(token.value.begin(), token.value.end(), [](char c) { return c >= '0' && c <= '9'; });
-        if (!valid_generation)
+        if (!isValidGenerationTokenValue(token.value))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS on GCS: a token-producing write to {} succeeded but its response carried no "
                 "valid generation ({}) -- there is no follow-up HEAD to patch this over, so the write "

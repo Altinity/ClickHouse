@@ -597,4 +597,30 @@ TEST_F(CASBackendGenerationS3, EtagDialectKeepsTransportQuotingVerbatim)
     EXPECT_EQ(hr.token, (Token{"\"d41d8cd98f00b204e9800998ecf8427e\"", TokenType::ETag}));
 }
 
+/// The HEAD-side twin of ResurrectMissingGenerationOnSuccessThrows: a successful HEAD on a
+/// generation-dialect backend whose response carries no ETag/generation at all must not mint a token
+/// from it -- there is no follow-up HEAD to patch this over, so nativeHead must refuse it directly.
+TEST_F(CASBackendGenerationS3, HeadMissingGenerationThrows)
+{
+    backend = makeBackend(/*cap=*/1024);
+    client->objects["p/gen/no-generation-head"] = "body";
+    /// next_head_etag stays empty: SetETag is never called, so the response carries no ETag field.
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { backend->head("p/gen/no-generation-head"); });
+}
+
+/// The HEAD-side twin of ResurrectNonNumericGenerationOnSuccessThrows: an ordinary AWS-style ETag
+/// reaching a generation-dialect backend through a successful HEAD (a proxy dropping
+/// x-goog-generation, a service regression) must not be minted as a generation token either.
+TEST_F(CASBackendGenerationS3, HeadNonNumericGenerationThrows)
+{
+    backend = makeBackend(/*cap=*/1024);
+    client->objects["p/gen/bad-etag-head"] = "body";
+    client->next_head_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { backend->head("p/gen/bad-etag-head"); });
+}
+
 #endif
