@@ -678,7 +678,12 @@ def test_a_permissive_service_does_not_change_what_cas_puts_on_the_wire():
 
 
 def test_a_token_producing_write_never_fragments_into_a_multipart_upload():
-    """No `CreateMultipartUpload`, `UploadPart` or `CompleteMultipartUpload` anywhere in the run.
+    """No multipart operation in the traffic the fake has seen UP TO THIS POINT in the module.
+
+    The counters are global and cumulative and this test is not last in the file, so its reach is a
+    PREFIX of the run — it covers the mount, the initial fills and every test above it, and nothing
+    below. `test_no_multipart_operation_was_issued_anywhere_in_the_whole_run` at the end of the file is
+    what makes the run-wide claim; this one localises a failure to the first half.
 
     GCS enforces no precondition on `CompleteMultipartUpload`, so a token-producing write that
     fragmented would lose its write-once guarantee at the moment of completion.
@@ -695,7 +700,7 @@ def test_a_token_producing_write_never_fragments_into_a_multipart_upload():
 
     It also overlaps `test_the_fake_refused_nothing_it_had_to_serve`, which would catch a multipart
     attempt as a `501` — but only in the two CAS buckets, and only once it happened. The counters
-    below are global and distinguish "never attempted" from "attempted and refused".
+    below distinguish "never attempted" from "attempted and refused".
     """
     counters = _counters()
     assert counters.get("method_PUT", 0) > 0, (
@@ -857,3 +862,37 @@ def test_a_write_whose_response_carries_no_generation_is_refused():
     # missing generation.
     node.query("INSERT INTO {} SELECT number, toString(number) FROM numbers(30000, 50)".format(table))
     assert int(node.query("SELECT count() FROM {} WHERE id >= 30000".format(table))) == 50
+
+
+# ---------------------------------------------------------------------------------------------------
+# MUST STAY LAST IN THIS FILE. The fake's counters are global and cumulative and nothing in this module
+# resets them, so a counter assertion covers exactly the traffic that precedes it. Placed anywhere but
+# last, the test below silently becomes a prefix check and stops seeing the traffic of whatever now
+# follows it — which is how it read before, and the reason the run-wide claim was not being made.
+# Add new tests ABOVE this line.
+# ---------------------------------------------------------------------------------------------------
+
+
+def test_no_multipart_operation_was_issued_anywhere_in_the_whole_run():
+    """The run-wide form of the single-part invariant, over every request the fake ever saw.
+
+    On a generation-token store a token-producing write must stay one PUT: GCS enforces no
+    precondition on `CompleteMultipartUpload`, so a fragmented write would lose its write-once
+    guarantee at the moment of completion, which is why the single-part cap exists at all. The claim
+    worth making is therefore the unqualified one — nothing in this module, at any point, fragmented.
+
+    Would fail if: `s3_force_single_part_upload` stopped being set for the Generation dialect, or any
+    later-added scenario drove a write over the ordinary multipart threshold. Unlike the
+    partway-through check above, a regression introduced by the last test in the file is caught here.
+
+    `method_PUT > 0` keeps it from passing vacuously: on a module where nothing ever wrote, three
+    absent counters would prove nothing at all.
+    """
+    counters = _counters()
+    assert counters.get("method_PUT", 0) > 0, (
+        "no PUT was ever sent in the entire run, so the absence of multipart operations proves nothing"
+    )
+    for name in ("CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"):
+        assert counters.get(name, 0) == 0, "{} was issued {} time(s) during the run".format(
+            name, counters[name]
+        )
