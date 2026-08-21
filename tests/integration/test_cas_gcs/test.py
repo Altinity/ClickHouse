@@ -874,19 +874,25 @@ def test_a_reload_that_would_flip_the_token_dialect_is_refused():
     listing may supply one at all, and which preconditions the mount had to satisfy -- so a reload that
     swapped the client for one minting the other kind would leave persisted tokens uncomparable.
 
-    The refusal lives in the object storage rather than in the CAS metadata storage, and that placement
-    is the point of this test: only the object storage knows the EFFECTIVE `http_client`, which it merges
-    from its current settings, any endpoint-level block and the disk's own section. A check reading the
-    disk section alone would miss a flip arriving from an endpoint block, and would refuse a reload that
-    changes nothing whenever the effective value came from anywhere else.
+    WHAT THIS TEST DOES NOT PROVE, stated because the obvious reading is wrong. It flips the DISK-LEVEL
+    `http_client`, which a guard reading only the disk section would also have refused. So it does not
+    discriminate where the check lives; it only shows that a flip is refused and that the old client
+    survives. The placement is what actually matters -- the effective value is merged from the storage's
+    current settings, any endpoint-level block and the disk section, so a disk-section-only check misses
+    a flip arriving from an endpoint block and falsely refuses a no-op reload whenever the effective
+    value comes from elsewhere -- and that property is covered by reading the code, not by this test.
+    Writing the discriminating version needs a CAS mount pinned to ETag, which this fixture cannot host:
+    the fake mints numeric ETags, so an ETag-dialect mount sends a numeric `If-Match` and the fake's own
+    domain check rejects it as a generation reaching the ETag domain. Teaching it a second ETag shape is
+    the prerequisite, and is deliberately not done here.
 
     Asserting the refusal is not enough on its own, because "the reload was refused" and "the reload was
     refused AND the old client survived" are different claims and only the second is the guarantee. So
     the test also shows the mount still speaks generation afterwards: a fresh conditional write still
     carries a numeric precondition, which only a generation-dialect client sends.
 
-    Would fail if: the pin were not installed at startup, were compared against one config section
-    instead of the merged settings, or were checked after the client had already been replaced.
+    Would fail if: the pin were not installed at startup, or were checked after the client had already
+    been replaced. It would NOT fail if the pin read a single config section, which is the gap above.
     """
     node = cluster.instances["node"]
     table = "t_cas_gcs_oauth"

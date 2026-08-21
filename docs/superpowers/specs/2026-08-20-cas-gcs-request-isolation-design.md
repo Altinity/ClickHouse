@@ -194,7 +194,9 @@ build can produce them and a test that cannot fire is worse than an absent one:
 - **User metadata on an ordinary write.** No production call site constructs object attributes: every
   caller outside the object-storage layer passes an empty set, and no SQL surface writes custom object
   metadata. There is consequently nothing to round-trip on a `Default` request. This says nothing about
-  CAS attributes on a marked request, which are produced, and whose round trip is required below.
+  CAS attributes on a marked request: the backend API carries them and the prefix mapping is covered by
+  the deterministic tests. No production caller passes a non-empty set there either today, so the
+  requirement below is about the mapping being correct, not about a live workload exercising it.
 
 This characterization is separate from the compatibility test for the established ordinary-S3
 HMAC path. Neither path may require a configuration migration for non-CAS users.
