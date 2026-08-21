@@ -433,3 +433,40 @@ was found" and "0 because nothing was checked" stop being the same output — th
 `partial` already makes for the deadline. Related: {#fsck-meta-body-counters-unrendered} (counters
 computed and rendered nowhere) and {#lifecycle-verbs-wait-out-uncancellable-scans} (the SQL FSCK
 passes none of the CLI's bounding parameters).
+
+## No CAS disk setting is applied by `SYSTEM RELOAD CONFIG`, and the no-op is silent (2031-triage CAS-107) {#cas-settings-not-reloadable-silently}
+
+`ContentAddressedSettings::loadFromConfig` runs exactly once, from the `cas` metadata-storage factory
+lambda (`src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:232-241`), i.e. only
+when the disk object is CREATED. On a config reload `DiskSelector::updateFromConfig` calls
+`disk->applyNewSettings(...)` for every disk that already exists
+(`src/Disks/DiskSelector.cpp:176`), `DiskObjectStorage::applyNewSettings` forwards to
+`metadata_storage->applyNewSettings(...)`
+(`src/Disks/DiskObjectStorage/DiskObjectStorage.cpp:985`), and
+`ContentAddressedMetadataStorage` does not override that virtual — the base is an empty no-op
+(`src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:365-368`; only
+`MetadataStorageFromCacheObjectStorage` overrides it, to forward to the underlying storage). So an
+operator who edits `gc_interval_sec`, `deduplication_cache_bytes`, `part_folder_cache_bytes`,
+`part_folder_validate`, `manifest_decode_cache_bytes`, any `gc_round_*` budget, ... and reloads gets a
+successful reload, no log line, and no behaviour change. The S3 half of the same disk block DOES
+reload (`DiskObjectStorage.cpp:988-989`), which makes the split especially surprising.
+
+Not every setting is reloadable in principle — `server_root_id`, `gc_shards`, `blob_hash`,
+`scratch_path`, `staging_backend` are pool-/mount-creation identities and must stay creation-time
+only. Owed shape: an `applyNewSettings` override that (a) re-parses the block, (b) applies the
+genuinely dynamic subset (GC cadence and the per-round budgets, the cache byte/entry budgets,
+`part_folder_validate`, `gc_enabled` — the last already has runtime verbs, `SYSTEM CAS GC
+STOP`/`START`), and (c) LOGS a warning naming any changed creation-time key as ignored-until-restart,
+instead of today's silence. Fixing this also removes a second silent surface: the unknown-key gate
+({#cas-disk-s3-key-whitelist-gap} in `BACKLOG.md`) is only ever evaluated at disk creation, so a typo
+introduced by an edit-and-reload is not diagnosed until the next restart.
+
+Second half, lower severity and mostly generic: removing a CAS disk from `storage_configuration` and
+reloading only produces the upstream warning "disappeared from configuration, this change will be
+applied after restart of ClickHouse" (`src/Disks/DiskSelector.cpp:203-207`) — no `shutdown()` on the
+dropped disk. For a CAS disk this means the mount lease keeps being heartbeaten until the process
+exits, so the `server_root_id` slot cannot be taken over by another server before a restart. This is
+the same disk-registry-caches-forever class as the deferred disk-lifecycle leak
+(`BACKLOG/mounts-and-lifecycle.md`{#disk-lifecycle-rev8-closure}) and is bounded by the restart, but
+the warning does not say that a lease is still held; the honest short-term fix is a CAS-specific line
+in that path (or in the mount log) naming the retained lease and the `FORGET` verb.
