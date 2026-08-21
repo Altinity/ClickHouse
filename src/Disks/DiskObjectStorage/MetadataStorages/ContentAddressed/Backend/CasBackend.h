@@ -276,10 +276,16 @@ public:
 
     /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
     /// probe BEFORE the op battery. Default: nothing to check. The S3 backend fails closed here
-    /// when a generation-dialect (GCS) bucket has object versioning enabled: every token-exact
-    /// DELETE would archive a noncurrent generation instead of reclaiming storage, so GC
-    /// "reclaim" would silently stop reclaiming.
+    /// unless a generation-dialect (GCS) bucket is VERIFIABLY free of object versioning: a
+    /// token-exact DELETE against a versioned bucket archives a noncurrent generation instead of
+    /// reclaiming storage, so GC "reclaim" would silently stop reclaiming.
     virtual void checkPoolPreconditions() {}
+
+    /// Fail-closed precondition: may this backend serve a WRITABLE mount that skips the access-check
+    /// battery? `PoolConfig::skip_access_check` is a preflight convenience, so it is available only to
+    /// backends whose correctness does not depend on the battery having run. Default: available.
+    /// See ObjectStorageBackend's override for the one combination that refuses it.
+    virtual void checkSkipAccessCheckSupport() {}
 
     /// Fail-closed precondition: a Native-mode backend MUST have a
     /// working single-attempt conditional-write path before it coordinates a WRITABLE pool — silently

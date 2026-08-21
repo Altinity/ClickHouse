@@ -26,6 +26,11 @@
 
 using namespace DB::Cas;
 
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+
 namespace
 {
 /// A `LocalObjectStorage` that records which of the two metadata-read virtuals a caller reached, so a
@@ -67,6 +72,56 @@ std::shared_ptr<RecordingObjectStorage> makeRecordingObjectStorageForTest()
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
     return std::make_shared<RecordingObjectStorage>(std::move(settings));
 }
+
+/// A `LocalObjectStorage` that answers the bucket-versioning probe with a value the test chooses, so
+/// the three outcomes `checkPoolPreconditions` distinguishes — verified disabled, verified enabled,
+/// and unverifiable — can each be driven exactly. The base `IObjectStorage` default answers only the
+/// third.
+class VersioningObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    VersioningObjectStorage(DB::LocalObjectStorageSettings settings_, std::optional<bool> versioned_)
+        : DB::LocalObjectStorage(std::move(settings_)), versioned(versioned_)
+    {
+    }
+
+    std::optional<bool> isBucketVersioningEnabled() const override { return versioned; }
+
+private:
+    const std::optional<bool> versioned;
+};
+
+std::shared_ptr<VersioningObjectStorage> makeVersioningObjectStorageForTest(std::optional<bool> versioned)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_unit_versioning_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<VersioningObjectStorage>(std::move(settings), versioned);
+}
+
+/// Every refusal reached from these mount gates is `NOT_IMPLEMENTED`, so the code alone cannot tell
+/// which one fired. Match a phrase unique to the intended message as well, or a test asserting the
+/// unverifiable-versioning refusal would pass on the enabled-bucket refusal and vice versa.
+template <typename F>
+void expectThrowsNotImplementedSaying(const std::string & needle, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception saying '" << needle << "'";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
+        EXPECT_NE(e.message().find(needle), std::string::npos) << "actual message: " << e.message();
+    }
+}
 }
 
 /// `ObjectStorageBackend::nativeHead` must route through `tryGetObjectMetadataWithNativeToken` (the
@@ -107,28 +162,74 @@ TEST(CASBackendGeneration, StampedTokenTypeFollowsNativeKind)
     EXPECT_EQ(hr.token.type, TokenType::Generation);
 }
 
-/// checkPoolPreconditions on a Native, generation-dialect (GCS) backend consults
-/// isBucketVersioningEnabled. LocalObjectStorage does not override that method, so it inherits the
-/// IObjectStorage base default, which returns nullopt (the check is inconclusive). Per the hook's
-/// documented behaviour, an inconclusive check must NOT fail closed — only a CONFIRMED `true` throws.
-TEST(CASBackendGeneration, CheckPoolPreconditionsProceedsOnUnknownVersioning)
+/// A generation-dialect (GCS) mount needs bucket versioning to be VERIFIABLY off: a token-exact
+/// DELETE against a versioned bucket archives a noncurrent generation, so GC would delete objects it
+/// believes it reclaimed. A probe that cannot answer therefore refuses the mount rather than
+/// assuming the safe answer.
+TEST(CASBackendGeneration, CheckPoolPreconditionsFailsClosedOnUnverifiableVersioning)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+        makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    expectThrowsNotImplementedSaying("could not VERIFY", [&] { b->checkPoolPreconditions(); });
+}
+
+TEST(CASBackendGeneration, CheckPoolPreconditionsRejectsEnabledVersioning)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        makeVersioningObjectStorageForTest(true), ObjectStorageBackend::Mode::Native);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    expectThrowsNotImplementedSaying("VERSIONING enabled", [&] { b->checkPoolPreconditions(); });
+}
+
+/// The one accepting case: a probe that answered, and answered "disabled".
+TEST(CASBackendGeneration, CheckPoolPreconditionsAcceptsVerifiedDisabledVersioning)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        makeVersioningObjectStorageForTest(false), ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
     EXPECT_NO_THROW(b->checkPoolPreconditions());
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
-/// a silent no-op for any backend that is not Native + TokenType::Generation.
+/// a silent no-op for any backend that is not Native + TokenType::Generation. Driven over a storage
+/// whose probe is unverifiable, which is what a generation-dialect backend now refuses: dropping the
+/// dialect guard from checkPoolPreconditions would fail this test.
 TEST(CASBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+        makeVersioningObjectStorageForTest(std::nullopt), ObjectStorageBackend::Mode::Native);
     ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
 
     EXPECT_NO_THROW(b->checkPoolPreconditions());
+}
+
+/// A writable generation-dialect (GCS) mount may not skip the mutating capability battery: that
+/// battery is the only proof that a token-exact DELETE actually carries its generation precondition.
+TEST(CASBackendGeneration, CheckSkipAccessCheckSupportRejectsGenerationDialect)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+
+    expectThrowsNotImplementedSaying("skip_access_check=true is not supported", [&] { b->checkSkipAccessCheckSupport(); });
+}
+
+/// Scoped to the generation dialect: an ETag-dialect Native backend and the emulated backend keep the
+/// pre-existing skip_access_check behaviour, so widening the refusal would fail this test.
+TEST(CASBackendGeneration, CheckSkipAccessCheckSupportAllowsEtagAndEmulatedBackends)
+{
+    auto etag = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    ASSERT_EQ(etag->nativeTokenType(), TokenType::ETag);
+    EXPECT_NO_THROW(etag->checkSkipAccessCheckSupport());
+
+    auto emulated = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    EXPECT_NO_THROW(emulated->checkSkipAccessCheckSupport());
 }
 
 /// GCS enforces NO preconditions on CompleteMultipartUpload (measured 2026-07-03), so a conditional

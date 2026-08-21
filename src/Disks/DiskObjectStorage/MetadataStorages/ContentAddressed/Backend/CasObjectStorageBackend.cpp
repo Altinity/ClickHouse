@@ -14,7 +14,6 @@
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
-#include <Common/logger_useful.h>
 
 #include <base/defines.h>
 
@@ -52,7 +51,8 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 
 /// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
 /// anything to check: a token-exact DELETE on a versioned bucket archives a noncurrent generation
-/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming.
+/// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming. Both an enabled
+/// bucket and an unverifiable probe refuse the mount.
 void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != TokenType::Generation)
@@ -61,19 +61,20 @@ void ObjectStorageBackend::checkPoolPreconditions()
     const auto versioned = object_storage->isBucketVersioningEnabled();
     if (!versioned.has_value())
     {
-        /// The check itself could not be verified — either the GetBucketVersioning-equivalent call
-        /// failed (e.g. permissions) or the storage does not support answering it. We proceed on the
-        /// ASSUMPTION that versioning is off rather than fail-closing the mount on an unknown: a
-        /// confirmed Enabled below is what actually breaks reclaim, and an outright refusal to mount
-        /// whenever the check is inconclusive would be too aggressive. This is intentionally logged
-        /// (not silent) so an operator can confirm the bucket's real state.
-        LOG_WARNING(getLogger("CasObjectStorageBackend"),
+        /// An unverifiable probe fails the mount, exactly like a confirmed Enabled below. Proceeding
+        /// on the ASSUMPTION that versioning is off was the earlier behaviour and it is not
+        /// defensible: what GC does on a versioned bucket is delete objects it believes it reclaimed,
+        /// so the assumption is silently wrong in precisely the case that matters, and it is wrong
+        /// without bound (a warning at mount does not stop the next round). The operator can prove
+        /// the bucket's state with one call and grant the permission the probe needs.
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "CAS on GCS: could not VERIFY the bucket-versioning precondition (the versioning check "
-            "request failed or is not supported by this backend) — proceeding on the assumption that "
-            "bucket versioning is OFF. If versioning is actually enabled, token-exact DELETEs will "
-            "archive noncurrent generations instead of reclaiming storage and GC will silently stop "
-            "reclaiming space. Please verify the bucket's versioning setting manually.");
-        return;
+            "request failed — e.g. the credential lacks permission to read it — or this backend "
+            "cannot answer it) — refusing to mount writable. CAS cannot assume versioning is off: if "
+            "it is actually enabled, token-exact DELETEs archive noncurrent generations instead of "
+            "reclaiming storage and GC silently stops reclaiming space. Grant the credential "
+            "permission to read the bucket's versioning configuration, confirm versioning is "
+            "disabled, and retry the mount.");
     }
 
     if (*versioned)
@@ -82,6 +83,23 @@ void ObjectStorageBackend::checkPoolPreconditions()
             "versioned bucket archives a noncurrent generation instead of reclaiming storage — GC "
             "would silently stop reclaiming space. Disable versioning on the bucket (and prefer "
             "soft-delete duration 0 for CAS pools) and retry the mount.");
+}
+
+/// See Backend::checkSkipAccessCheckSupport. A writable generation-dialect (GCS) mount is the one
+/// combination whose correctness depends on the MUTATING capability battery having run: the battery
+/// is what proves a numeric generation actually reaches GCS as x-goog-if-generation-match on a
+/// DELETE, and nothing else in the mount path proves it.
+void ObjectStorageBackend::checkSkipAccessCheckSupport()
+{
+    if (mode != Mode::Native || native_token_type != TokenType::Generation)
+        return;
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "CAS on GCS: skip_access_check=true is not supported on a WRITABLE generation-token mount. "
+        "The capability battery this setting skips is what verifies that a token-exact DELETE "
+        "actually honours the generation precondition; without it GC could delete an incarnation it "
+        "did not condemn, and the bucket-versioning precondition would go unchecked too. Remove "
+        "skip_access_check from this disk, or mount it read-only.");
 }
 
 /// See Backend::checkConditionalWriteSingleAttemptSupport. This is a MOUNT-TIME gate, deliberately

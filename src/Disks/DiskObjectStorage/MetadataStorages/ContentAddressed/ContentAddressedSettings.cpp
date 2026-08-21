@@ -90,7 +90,7 @@ static const std::set<std::string> non_cas_keys = {
     DECLARE(UInt64, gc_round_handoff_prefix_wholesale_budget, 5000, "Post-CAS hand-off generation-prefix reclaim object cap per round, reserved separately from gc_round_prefix_wholesale_budget so a prune-heavy round cannot starve the one-shot hand-off (0 = unbounded)", 0) \
     DECLARE(UInt64, gc_round_outcome_entry_budget, 5000, "GcOutcomes per-round entry cap across the redelete/spared audit log (0 = unbounded)", 0) \
     DECLARE(String, server_root_id, "", "REQUIRED explicit layout subtree identity; macros expand as in the s3 endpoint", 0) \
-    DECLARE(UInt64, gcs_max_conditional_put_bytes, 1ULL << 30, "GCS single-PUT budget for conditional writes (generation-token stores only)", 0) \
+    DECLARE(UInt64, gcs_max_token_producing_put_bytes, 1ULL << 30, "GCS single-PUT budget for every token-producing write, conditional or not (generation-token stores only)", 0) \
     DECLARE(UInt64, part_folder_cache_bytes, 64ULL << 20, "Part-folder view cache byte budget (0 disables retention)", 0) \
     DECLARE(UInt64, part_folder_cache_max_entries, 10000, "Part-folder view cache entry cap", 0) \
     DECLARE(UInt64, part_folder_cache_max_entry_bytes, 16ULL << 20, "Oversized part-folder views bypass retention above this size", 0) \

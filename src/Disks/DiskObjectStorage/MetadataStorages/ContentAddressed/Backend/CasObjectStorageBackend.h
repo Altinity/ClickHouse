@@ -116,9 +116,13 @@ public:
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
     Token resurrect(ReadBuffer & payload, uint64_t payload_size, const String & blob_key, const String & fresh_header) override;
 
-    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool if the
-    /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.
+    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool unless
+    /// object versioning is VERIFIABLY disabled — see Backend::checkPoolPreconditions.
     void checkPoolPreconditions() override;
+
+    /// Fail-closed precondition: a Native, generation-dialect (GCS) backend refuses a writable mount
+    /// that asked to skip the access check — see Backend::checkSkipAccessCheckSupport.
+    void checkSkipAccessCheckSupport() override;
 
     /// Fail-closed precondition for writable Native mode: require that the object storage supports the
     /// SingleAttempt retry profile (ObjectStorageRetryProfile), which disables transparent

@@ -67,9 +67,10 @@ contract than `x-amz-server-side-encryption*`; and any custom `x-amz-*` header s
 `<header>`. Both fail with a clear error rather than being sent under a guessed `x-goog-` name GCS
 would not honour. Configure such a disk against an AWS-compatible endpoint instead.
 
-This bounds conditional writes only: the write-once create is therefore single-part and limited by
-`gcs_max_conditional_put_bytes` on a generation dialect, while the unconditional resurrect takes the
-ordinary multipart path and has no size limit on any backend.
+This bounds every write whose resulting token enters `CAS` protocol state, not only the ones carrying
+a precondition: on a generation dialect the write-once create *and* the unconditional resurrect are
+single-part and limited by `gcs_max_token_producing_put_bytes`. On an `ETag` dialect neither is
+forced single-part and neither is size-limited.
 
 The two authentication paths clean up differently, and neither renames headers wholesale. On
 `gcs_hmac` every request the client sends — marked or not — goes through
@@ -99,11 +100,21 @@ storage, and GC would silently stop reclaiming.
 `runCapabilityProbe` (`Backend/CasProbe.cpp`) runs a throwaway-key battery against every writable
 mount, described in full on the [bucket requirements](/antalya/cas/bucket-requirements) page. It is
 fail-closed: any check that does not pass throws `NOT_IMPLEMENTED` naming the specific failure, and
-the mount refuses to become writable. Two mount-time gates sit alongside it:
+the mount refuses to become writable. Further mount-time gates sit alongside it:
 
-- `checkPoolPreconditions` — on the `GCS`-dialect combination only, verifies bucket versioning is
-  off (a confirmed `Enabled` throws; an inconclusive check proceeds under an assumption, logged at
-  `WARNING`, that versioning is off).
+- `checkPoolPreconditions` — on the `GCS`-dialect combination only, requires bucket versioning to be
+  *verifiably* off. A confirmed `Enabled` and an inconclusive probe both throw: `CAS` cannot assume
+  the safe answer here, because what it would do on a versioned bucket is delete objects it believes
+  it reclaimed. A probe is inconclusive when the credential may not read the bucket's versioning
+  configuration, or when the backend cannot answer at all.
+- `checkSkipAccessCheckSupport` — asks whether the backend may serve a writable mount that skips the
+  battery at all. The `GCS`-dialect combination refuses, so `skip_access_check = true` cannot reach a
+  writable generation-token mount; every other backend still skips only its permitted access-check
+  I/O. This is what makes the exact-token delete check below unskippable on an *ordinary* writable
+  mount. Decommissioning a pool member is the deliberate exception — it opens writable with the
+  battery skipped, because the fail-closed tradeoff inverts there: refusing an ordinary mount costs
+  availability and protects data, whereas refusing a decommission strands a pool with a dead replica
+  in it and leaves the operator no way forward.
 - `checkConditionalWriteSingleAttemptSupport` — refuses to mount writable unless the underlying
   object storage supports a single-HTTP-attempt retry profile for conditional writes. A hidden SDK
   retry can outlive the writer's mount lease and obscure whether a conditional operation actually
