@@ -470,3 +470,62 @@ the same disk-registry-caches-forever class as the deferred disk-lifecycle leak
 (`BACKLOG/mounts-and-lifecycle.md`{#disk-lifecycle-rev8-closure}) and is bounded by the restart, but
 the warning does not say that a lease is still held; the honest short-term fix is a CAS-specific line
 in that path (or in the mount log) naming the retained lease and the `FORGET` verb.
+
+## The GC-health surface cannot express "never led", "GC stopped" or "backlog shed" (2031-triage CAS-098) {#gc-health-zero-is-ambiguous}
+
+Four separate readings of the same per-disk GC-health snapshot
+(`Gc/CasGcScheduler.cpp:392-407`, rendered by `StorageSystemContentAddressedMounts.cpp:52-56`,
+`:196-209` and by the per-disk asynchronous metrics at
+`src/Interpreters/ServerAsynchronousMetrics.cpp:378-392`):
+
+1. **`last_success_age_seconds = 0` means BOTH "never led a round" and "succeeded within the last
+   second."** `gcHealth` computes the discriminator — `ever_succeeded = last_ms != 0`
+   (`Gc/CasGcScheduler.cpp:398`, field at `Gc/CasGcScheduler.h:126`) — and then neither surface
+   exposes it: there is no `ever_succeeded` column and no `CASGCEverSucceeded_<disk>` metric. The
+   operational bite is on the alerting side: an alert of the shape
+   `CASGCLastSuccessAgeSeconds_<disk> > threshold` can NEVER fire for a disk whose GC never
+   succeeded even once — precisely the silent failure the metric exists to catch. Cheapest honest
+   fix: render `NULL` (and skip the metric) when `!ever_succeeded`, so "no data" is distinguishable
+   from "fresh"; the alternative is to expose `ever_succeeded` alongside.
+2. **`is_leader = 0` conflates "follower", "operator stopped GC here" and "scheduler self-exited".**
+   `SYSTEM CAS GC STOP` is STOP-IN-PLACE — the scheduler object is retained deliberately so
+   `gcHealth` keeps answering (`ContentAddressedMetadataStorage.cpp:971-1001`) — so a stopped GC
+   presents exactly as a follower: `is_leader = 0`, health present. Nothing in `system.cas_mounts`,
+   the metrics, or `system.cas_gc_log` says "this node's reclaimer is administratively off"; the only
+   trace is the one-shot `LOG_INFO` at `src/Interpreters/InterpreterSystemQuery.cpp:2656-2661`. A
+   `gc_running` (or `gc_state`) column, sampled from the scheduler's `stopping` latch, closes it.
+   Not a defect: `GC STOP` being node-local and non-durable across restart matches the
+   `SYSTEM STOP MERGES` precedent and is documented as such at the same site — the gap is
+   observability, not persistence.
+3. **`pending_reclaim` sheds nothing but executed deletes, so it drifts upward permanently.** The
+   accumulator is `condemned - redeleted` (`Gc/CasGcScheduler.cpp:202-205`); an entry that leaves the
+   retired list as `spared` or `replaced` (`Gc/CasGc.h:136-137`, counted at `Gc/CasGc.cpp:995-996`)
+   is never subtracted. So the metric's own documented reading — "a persistently growing value
+   indicates GC is not keeping up with reclaim"
+   (`src/Interpreters/ServerAsynchronousMetrics.cpp:387-388`) — is satisfied by a perfectly healthy
+   pool that spares a lot. The authoritative gauge already exists and is computed every round:
+   `RoundReport::pending_condemned` / `pending_candidates` / `pending_retired`
+   (`Gc/CasGc.h:152-155`), but it is rendered ONLY in the `SYSTEM CAS GC RUN` result set
+   (`src/Interpreters/InterpreterSystemQuery.cpp:2356-2358`, `:2380-2382`) — neither
+   `system.cas_mounts` nor `system.cas_gc_log` nor the metrics carry it. Owed: render
+   `pending_condemned` where an operator watches (and either drop `pending_reclaim` or restate its
+   description as "cumulative condemn-vs-delete flow", not a backlog).
+4. **Our own docs read these columns as something they are not.** `operations/migration.md:200-203`
+   tells the operator to check the victim's `state` and `last_success_age_seconds` before
+   `SYSTEM CAS DROP POOL MEMBER` — but GC-health columns are `NULL` on every peer row by design
+   (stated correctly in `architecture/mounts-and-leases.md:219` and
+   `operations/monitoring.md:98-101`), so the victim's row never carries it; the liveness signals
+   there are `state`/`expires_at`. `operations/troubleshooting.md:20` likewise offers
+   "`last_success_age_seconds` not climbing" as evidence that the MOUNT LEASE is still renewing —
+   two unrelated clocks. Both lines are wrong as written and both are cheap prose fixes.
+
+NOT a defect, checked while triaging (the audit's fifth claim): `CASGCClampSuppressedPasses` no
+longer "fires every round by construction". The destructive gate is conditional at HEAD —
+`suppress_destructive = anomalies || carried_holds || frontier_incomplete`
+(`Gc/CasGc.cpp:3065-3071`) with `UniversePolicy::kDefault = Authoritative`
+(`Gc/CasGc.h:42-63`), flipped by `58fd482a800`. What IS stale is the counter's operator-facing
+description (`src/Common/ProfileEvents.cpp:803`), still asserting "In the current stage this is EVERY
+folding round by construction ... the round's destructive gate is shut unconditionally" — written
+before the flip (`e337bb2c87d`) and never revisited. Same class as
+`{#fsck-rule-restated-in-unfenceable-prose}`: a rule restated in prose no build can check. Fix the
+sentence; the pointer to the fold seal's hold set and `tables_held` stays useful.

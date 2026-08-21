@@ -446,3 +446,34 @@ the column comment is imprecise: `ContentAddressedGarbageCollectionLog.cpp:40` s
 should say "0 on Start and Phase rows; join on `round_id`". Likewise the constant phase metrics
 (`walk_plan_builds=1`, `fold_seal_reads=2`, `Gc/CasGc.cpp:658`, `:670`) are recorded facts about how
 many times the round reads one key, explained at `:667-670`, not measurements that broke.
+
+## A clean stop keeps the durable `gc/state` lease, so a rolling restart pauses reclamation for ~2 GC intervals (2031-triage CAS-099) {#gc-lease-not-released-on-clean-stop}
+
+`CasGcScheduler::stop` joins the worker + heartbeat threads and clears the in-process `i_am_leader`
+hint while leaving the durable lease alone — "the durable `gc/state` lease is untouched"
+(`Gc/CasGcScheduler.h:105-109`); `ContentAddressedMetadataStorage::shutdown` does the same on the
+server-shutdown path (`ContentAddressedMetadataStorage.cpp:887-908`). A peer therefore cannot take
+GC over on the departing node's word: it must observe the frozen `(owner, seq)` across two of its own
+paced ticks and steal (`Gc/CasGcScheduler.cpp:300-307`), bounded at roughly `2 * gc_interval_sec`
+(default 60 s, `ContentAddressedSettings.cpp:66`). Cost of a rolling restart is thus a couple of
+minutes of pool-wide non-reclamation per node — self-healing, no correctness or liveness risk, which
+is why this is minor rather than a gap.
+
+Worth weighing (NOT decided here): the mount side already has the precedent — a certified-quiescent
+unmount writes a terminal farewell so a successor reclaims the slot instantly instead of waiting out
+the observation window (`Pool/CasPool.cpp:861-889`,
+`docs/en/antalya/cas/architecture/mounts-and-leases.md:190-194`). The GC lease has no equivalent
+"resign" write. On a clean `stop()` every round is already joined, so nothing of this incarnation can
+act after the resign, and the owner token is exact — but the observation-window protocol is the
+safety argument for the whole steal path, so touching it needs the protocol consult, not a drive-by
+patch. Do not confuse this with the DESIRED refusal to hand off on a crash: there, waiting the window
+out is the point.
+
+Checked and NOT confirmed while triaging (the audit's headline for this item): "the only shutdown is
+stop and join" is false. `~Pool` drains the ref lanes and writes the certified farewell
+(`Pool/CasPool.cpp:861-889`), the same drain runs under `SYSTEM CAS FORGET`
+(`Pool/CasPool.cpp:891-968`) which IS the ordered in-service→out-of-service step before the
+destructive `SYSTEM CAS DROP POOL MEMBER`, and the disk-side `shutdown()` is wired into ordinary
+server shutdown (`src/Disks/DiskSelector.cpp:254-259` → `DiskObjectStorage.cpp:504-513`). The
+decommission verb's immediate refusal on a live member is the certificate-of-death rule
+(`BACKLOG.md`{#decommission-wrong-predicate}), not a missing drain.

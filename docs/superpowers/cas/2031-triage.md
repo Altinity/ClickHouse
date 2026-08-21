@@ -115,8 +115,8 @@
 | CAS-097 | частично | P3 | [{#cas-inspect-format-coverage-and-hold} (новая секция; зонтик — {#operability} `[B15/B99/B169/B159]`)](BACKLOG.md#cas-inspect-format-coverage-and-hold} (новая секция; зонтик — {#operability} `[B15/B99/B169/B159]`) | нет | Покрытие форматов и потеря `hold` в дампе fold seal подтверждены (10 из 17 живых форматов), но «сырые ключи никем не перечисляются» и «wedge неназываем» — неверно, а mis-decode `_files/` даёт громкую ошибку, не подмену данных. |
 | CAS-098 | ⏳ | — | — | — | — |
 | CAS-099 | ⏳ | — | — | — | — |
-| CAS-100 | ⏳ | — | — | — | — |
-| CAS-101 | ⏳ | — | — | — | — |
+| CAS-100 | частично | P3 | [{#fsck-clean-verdict-has-no-coverage-flag}](BACKLOG.md#fsck-clean-verdict-has-no-coverage-flag) | нет | Все четыре формы кода на HEAD подтверждаются, но следствия завышены: пропуск семейств проверок — заявленные cost-решения с компенсирующими механизмами (GC сам fail-closed проверяет чек-сумму run'ов, у `stale_edge` есть soak-гейт, `--namespace` предупреждает в справке), а единственный реальный остаток — у отчёта нет машиночитаемого признака покрытия («0, потому что не проверяли» неотличим от «0, потому что чисто»); пара meta/body-счётчиков уже отслежена. |
+| CAS-101 | частично | P3 | [{#gc-outcome-budget-skews-round-report-counters}](BACKLOG.md#gc-outcome-budget-skews-round-report-counters) | нет | Подтверждено, что счётчики раунда (`objects_deleted`/`absent`/`replaced`/`spared`) считаются по обрезанному бюджетом outcome-логу и что события `GcFoldBegin`/`GcFoldEnd` несут номер ПРЕДЫДУЩЕГО раунда, — но сами удаления при этом посчитаны точно (`entries_redeleted`), а `round = 0` на Phase-строках — задокументированный дизайн (корреляция по `round_id`), не дефект. |
 | CAS-102 | частично | P3 | [{#profileevents-surface-residuals}](BACKLOG.md#profileevents-surface-residuals) | нет | Оба факта верны (строка `CasNs::Server` недостижима, server-root-ключи классифицируются как `Gc`), но это осознанное состояние, задокументированное и закреплённое тестом; вывод «объём mount/lease нельзя измерить» неверен — остаётся косметический остаток: 11 всегда-нулевых счётчиков в `system.events`. |
 | CAS-103 | частично | P3 | [{#profileevents-surface-residuals}](BACKLOG.md#profileevents-surface-residuals) | нет | Форма кода верна — `CASBlobBodyPutAvoided`/`CASBlobDeduplicationCacheHit` инкрементируются до `observeAndAdmit`, и на condemned-ветке тело всё-таки грузится, так что счётчик запросов завышается на редкой гонке; но «байты» никто не считает, а сама ветка fail-closed по всем кодам кроме `ABORTED`. |
 | CAS-104 | ⏳ | — | — | — | — |
@@ -4481,3 +4481,164 @@ Catch-all — `parseTableFilePath`, `PartPathParser.cpp:370-372` (`r.table_uuid 
 **BACKLOG / история.** Покрытия не нашлось: `grep -rn "BodyPutAvoided\|DeduplicationCacheHit\|HeadFirst" docs/superpowers/cas/` даёт только рабочий файл текущего раунда `docs/superpowers/cas/2031-triage.md` (`:324`, `:1497`), в самом бэклоге (`BACKLOG.md`, `BACKLOG/*.md`) — ноль. Ранее закрытых коммитов по этому месту нет: порядок инкрементов такой же, как был при введении HEAD-first-ветки. Добавил незакоммиченный раздел `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` → `## ProfileEvents surface residuals {#profileevents-surface-residuals}`, пункт (b), включая заметку про устаревший комментарий в `CasPool.cpp`.
 
 **Что реально осталось (P3).** Перенести инкременты `CASBlobBodyPutAvoided` и `CASBlobDeduplicationCacheHit` внутрь успешной ветки — после возврата `observeAndAdmit`, рядом с `store->dedupCacheAdd(logical_ref)` на `:218` — и поправить комментарий `CasPool.cpp:250-253`. Изменение локальное, без влияния на протокол; релиз не блокирует.
+
+## CAS-100 — Все четыре формы кода на HEAD подтверждаются, но следствия завышены: пропуск семейств проверок — заявленные cost-решения с компенсирующими механизмами (GC сам fail-closed проверяет чек-сумму run'ов, у `stale_edge` есть soak-гейт, `--namespace` предупреждает в справке), а единственный реальный остаток — у отчёта нет машиночитаемого признака покрытия («0, потому что не проверяли» неотличим от «0, потому что чисто»); пара meta/body-счётчиков уже отслежена. (частично, P3) {#cas-100}
+
+ФАЙЛ НА HEAD: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.cpp`
+(старый анкор `CA/Tools/CasFsck.cpp` — снапшот до переноса в подкаталоги, `592b9b83568`; номера строк
+в находке устарели, ниже все ссылки — HEAD).
+
+1) «`if (!unref_hashes.empty())` гейтит проверку чек-суммы run'ов» — ПОДТВЕРЖДАЕТСЯ буквально.
+Гейт: `Tools/CasFsck.cpp:815`; чтение run'ов внутри (`:842-870`); сравнение
+`reader.accumulatedChecksum() != run.checksum` → `++report.corrupted_runs` — `:877-882`. Т.е. на пуле,
+где НЕТ ни одного present-but-unreferenced блоба, ни один run не читается и `corrupted_runs` читается
+как 0, не будучи проверенным.
+СЛЕДСТВИЕ ЗАВЫШЕНО. (а) При пустом `unref_hashes` строки run'ов ни на что не влияют — ни одна
+классификация не искажается (они нужны только для метки unreferenced-блоба, `:957-999`).
+(б) Настоящий детектор порчи run'а — сам GC, и он fail-closed: `SourceEdgeRunReader::verifyAgainst`
+бросает `CORRUPTED_DATA` («refusing to act on this run», `Formats/CasRecordStreamFormat.cpp:316-322`)
+и вызывается из потребителей удаления — `Gc/CasBlobInDegree.cpp:130` (посегментно), `:718`,
+`Gc/CasGc.cpp:4478`. Так что порченый run останавливает GC громко независимо от fsck — это
+fail-closed loud failure, а не тихая порча. Именно это и написано в комментарии `:873-876`.
+
+2) «stale-edge гейтится на `detail`, а SQL-путь его никогда не ставит» — ПОДТВЕРЖДАЕТСЯ.
+`stale_edge_check_available = detail && !unref_edge_sources.empty()` — `:905`; SQL зовёт
+`runFsckNow(/* detail= */ false)` — `src/Interpreters/InterpreterSystemQuery.cpp:2599` («summary only
+(no DETAIL keyword yet)»). Значит колонка `stale_edge` в `SYSTEM CAS FSCK` структурно всегда 0
+(`InterpreterSystemQuery.cpp:2459`, вставка `:2492`).
+Но это ЗАЯВЛЕННАЯ позиция, а не забытая: `Tools/CasFsck.h:103-107` («Populated only in `detail` mode:
+naming the live sources costs one GET per manifest body»), `:177-179` («a clean summary report says
+nothing about stale edges»), `:2456-2458` в SQL-файле, и главное — `Tools/CasFsck.h:220-226`:
+`stale_edge` — единственная строка `kFsckHardFindings`, намеренно исключённая из nonzero-exit, «WITH
+both halves»: письменное обоснование + компенсирующий гейт `stale_edge_verdict` в
+`utils/ca-soak/soak/fsck.py`, проверяемый soak-чекпоинтом. Стоимость реальна (LIST на namespace + GET
+на тело манифеста, `:908-941`). Что действительно остаётся — оператору, у которого есть только SQL,
+этот класс не виден и никакой признак «не проверялось» в строку не попадает.
+
+3) «namespace-scoped прогон пропускает семейства и рапортует то же самое `clean`» — форма
+ПОДТВЕРЖДАЕТСЯ: `if (namespace_prefix.empty())` — `:719` (внутри — physical LIST, GC-pipeline
+классификация, meta/body-парность, `:721-1047`), scoped-ветка — `:1048-1087` (только HEAD по
+блобам scoped-рефов). Причина заявлена в коде (`:717-718`) и в справке CLI:
+`programs/disks/CommandFsck.cpp:29-31` («skips the pool-wide physical/pipeline classification»), т.е.
+оператор сам просил такой прогон. Но ни `formatFsckSummary` (`:1155-1174`), ни `FsckReport`
+(`Tools/CasFsck.h:93-186`), ни `clean()` (`:252-258`) не несут маркера скоупа — строка scoped-прогона
+байт-в-байт такой же формы, как полного. Из SQL scoped-режим недостижим вовсе (`runFsckNow` →
+`Cas::runFsck(*store(), detail)`, `ContentAddressedMetadataStorage.cpp:1063`, префикс по умолчанию
+пустой), так что «cas-fsck --namespace» — единственный триггер этой части.
+
+4) «два счётчика crash-residue вычисляются и выбрасываются» — ПОДТВЕРЖДАЕТСЯ и УЖЕ ОТСЛЕЖЕНО.
+Это `meta_without_body` / `body_without_meta`: инкременты `:1043`, `:1046`; в `formatFsckSummary`
+их нет (`:1155-1174`), в SQL-строке нет (`InterpreterSystemQuery.cpp:2433-2479`, `:2482-2504`), в
+`programs/disks/CommandFsck.cpp` не упоминаются, per-object строк под `detail` пара не даёт. Вне
+gtest (`src/Disks/tests/gtest_cas_fsck.cpp:1238,1257`) читателей нет — проверено grep'ом по
+`src utils docs tests programs`. Существующий пункт: `BACKLOG/operability-and-introspection.md`
+{#fsck-meta-body-counters-unrendered} (2031-triage CAS-062, P3) — включая наблюдение, что проза поля
+`Tools/CasFsck.h:114` («Counted and reported») неверна в половине «reported». Ничего нового здесь нет,
+и «crash-residue» — неточное название: `body_without_meta` документирован как benign
+(`Tools/CasFsck.h:116-117`), `meta_without_body` — advisory с обоснованием (`:109-114`).
+
+ЧТО НЕ ПОДТВЕРЖДАЕТСЯ КАК ДЕФЕКТ. Формулировка одностроечника «вердикт не просто не исправлен, он
+несостоятелен» верна лишь в узком смысле: `clean()` считается по `kFsckHardFindings`
+(`Tools/CasFsck.h:205-211`, определение `:252-258`) и действительно может выдать «чисто», когда
+семейство не запускалось — но ровно та же проблема для дедлайна УЖЕ решена явным полем
+(`FsckReport::partial`, `:164-167`, выставляется в `runFsck`, `:1136-1142`, печатается `:1175-1176`),
+т.е. механизм честности в отчёте есть, он просто не распространён на три условных семейства.
+Тихой порчи ни в одном из четырёх пунктов нет; ни один объект не классифицируется неверно.
+
+ИСТОРИЯ. `git log -S`: pipeline-классификация unreferenced-блобов с гейтом `unref_hashes` —
+`a626a12021e`; stale-edge проверка и её `detail`-гейт — `34f6d8967ec`; `--namespace` scoping +
+`--partial` — `15436aa3e07` (позже переработано под opaque life ids, `6a3dd6a9245`). Ничего из
+заявленного позже не закрывалось — все четыре формы живы на HEAD.
+
+РЕАЛЬНЫЙ ОСТАТОК (новый пункт, оставлен незакоммиченным):
+`docs/superpowers/cas/BACKLOG/operability-and-introspection.md`{#fsck-clean-verdict-has-no-coverage-flag}
+— один бит покрытия на семейство (или `checked_families`), отрендеренный на summary-строке и в SQL-строке
+рядом с квалифицируемыми счётчиками, чтобы «0, потому что не нашли» и «0, потому что не смотрели»
+перестали выглядеть одинаково. P3: наблюдаемость и честность вердикта, не блокер релиза.
+
+## CAS-101 — Подтверждено, что счётчики раунда (`objects_deleted`/`absent`/`replaced`/`spared`) считаются по обрезанному бюджетом outcome-логу и что события `GcFoldBegin`/`GcFoldEnd` несут номер ПРЕДЫДУЩЕГО раунда, — но сами удаления при этом посчитаны точно (`entries_redeleted`), а `round = 0` на Phase-строках — задокументированный дизайн (корреляция по `round_id`), не дефект. (частично, P3) {#cas-101}
+
+ФАЙЛЫ НА HEAD: `.../ContentAddressed/Gc/CasGc.cpp`, `.../Gc/CasGcScheduler.cpp` (+ `.h`),
+`src/Interpreters/ContentAddressedGarbageCollectionLog.cpp`. Старые анкоры `CA/Gc/...` — снапшот до
+`592b9b83568`, номера строк устарели; ниже — HEAD.
+
+1) «Счётчики раунда выводятся из обрезанного бюджетом outcome-лога» — ПОДТВЕРЖДАЕТСЯ.
+Тэлли: `for (const OutcomeEntry & o : log.entries) switch (o.outcome) { ... ++report.deleted; ... }`
+— `Gc/CasGc.cpp:989-998`, причём комментарий `:967-968` прямо говорит «Tally the report from the FINAL
+durable logs». А запись строк в лог гейтится бюджетом: удаления —
+`if (round_work_budget.outcomeEntryAvailable()) { outcomes[shard].entries.push_back(...) }`
+(`:852-856`), spared — `:897-902`; бюджет заполняется из настройки
+`round_work_budget.max_outcome_entries = ...gc_round_outcome_entry_budget` (`:548`), дефолт 5000
+(`ContentAddressedSettings.cpp:83`). Дальше `report.deleted/absent/replaced/spared` попадают в
+`system.content_addressed_garbage_collection_log` как `objects_deleted/objects_absent/
+objects_replaced/objects_spared` (`Gc/CasGcScheduler.cpp:215-218`). Значит на раунде, чья когорта
+превышает 5000, эти колонки недосчитывают реально выполненные удаления — то есть ровно на большом
+DROP, как и заявлено триггером находки.
+ЧЕГО НАХОДКА НЕ ГОВОРИТ (и что снижает вес): само удаление и его счёт НЕ обрезаются. `deleteExact`
+выполняется до всякого бюджета (`:802`), `++report.redeleted` — безусловно (`:857`), плюс
+`ProfileEvents::CASGCRetiredRedeleted` (`:858`) и per-row событие `BlobDelete` (`:833-848`). В
+SQL-строке это `entries_redeleted` (`CasGcScheduler.cpp:221`, описание колонки
+`ContentAddressedGarbageCollectionLog.cpp:50`). Т.е. точный счётчик выполненных удалений в той же
+строке ЕСТЬ; ломается только разбивка по исходу (Deleted/Absent/Replaced) и равенство
+`objects_deleted+absent+replaced == entries_redeleted`. Комментарии на месте гейта это и заявляют:
+«The audit row is observability only -- the delete above already executed regardless of this cap»
+(`:849-851`), и для spared — «`settleEntry` already unconditionally spared this entry (INV_NO_LOSS:
+recovery wins past any budget)» (`:894-896`). Тихой порчи и потери работы нет.
+УЖЕ ОТСЛЕЖЕНО (класс): `docs/superpowers/cas/BACKLOG.md`{#gc-round-budgets-not-backpressure}, пункт
+**D. Audit loss** — `gc_round_outcome_entry_budget`, «the only casualty is the audit row explaining it
+— and it is dropped precisely on the busiest rounds». Смежное:
+`BACKLOG/formats-and-storage.md`{#outcome-log-oc-not-required} — «the sole consumer is the round
+report's tally (`Gc/CasGc.cpp:989-996`) ... the impact is a skewed counter, not a safety hole».
+НЕ отслежено ровно то, что пункт D недоговаривает: перекос доходит до операторской строки
+`system.content_addressed_garbage_collection_log`, а не остаётся в S3-объекте аудита.
+
+2) «Фазовая наблюдаемость печатает константы и пре-бюджетные метрики» — форма ПОДТВЕРЖДАЕТСЯ,
+дефектом не является. Константы: `t.metric("walk_plan_builds", 1)` (`Gc/CasGc.cpp:658`) и
+`t.metric("fold_seal_reads", 2)` (`:670`) — второе объяснено на месте (`:667-670`: «`graduationDue` and
+`listRefPrefix` each GET the adopted fold seal at the SAME (generation, attempt). Recorded, not
+fixed»), это записанный факт о числе чтений одного ключа, а не измерение, которое «сломалось».
+Метрики фазы `pending_deletes` разделены честно: `redeleted`/`graduated` — точные дельты раунда
+(`:1000-1001`, через `redeleted_before`/`graduated_before`, `:777-778`), а `deleted`/`absent`/
+`replaced`/`spared` (`:1002-1005`) — те самые обрезанные тэлли из п.1, т.е. это не отдельный дефект, а
+то же следствие. Претензия про «wrong round» в фазовых строках — это п.4.
+
+3) «Pre-increment round + post-fold generation: события fold несут другой номер раунда, чем события
+удаления того же раунда» — ПОДТВЕРЖДАЕТСЯ, и это единственная claim'а, где действительно похоже на
+недосмотр. `new_round = state.round + 1` (`Gc/CasGc.cpp:531`). Перечисление всех `e.round =` в файле:
+`new_round` — `:594` (GcFenceOut), `:607` (GcFence floor), `:839` (BlobDelete), `:889`
+(GcRecheckVerdict spared), `:927` (graduated), `:949` (BlobRetireReplaced), `:1204`, `:1252`;
+`state.round` — `:690` (ветка DEFER) и `:719`/`:756` (`GcFoldBegin`/`GcFoldEnd`). Использование
+`state.round` в DEFER — намеренное и подробно обоснованное (`:676-685`: раунд-CAS не выполнялся,
+`new_round` был бы «fabricated round number»). А `:719`/`:756` — на СКЛАДЫВАЮЩЕМ раунде, где CAS
+`next.round = new_round` будет выполнен позже (`:1051` и далее), т.е. `state.round` там — предыдущий,
+уже закоммиченный раунд: строки fold в `system.content_addressed_log` (колонка `round`,
+`src/Interpreters/ContentAddressedLog.cpp:31`) оказываются на раунд ниже строк удаления того же
+раунда. Дополнительно `GcFoldEnd` (`:756-757`) сочетает этот устаревший `round` с ПОСТ-fold
+генерацией: `state.snap_generation` меняется в памяти внутри `fold` (см. `:764` «set in-memory by
+fold; committed below»), поэтому `gen` там уже новый, а `round` — старый. Никакого обоснования на
+месте нет. Последствие — только корреляция в логе; ни одно решение GC не читает это поле.
+
+4) «Phase-строки копируют Start-запись, поэтому `round = 0`, и `system.cas_gc_log` нельзя
+фильтровать по раунду» — форма ПОДТВЕРЖДАЕТСЯ, но это BY DESIGN. Копия: `Rec row = start;` в
+phase-sink (`Gc/CasGcScheduler.cpp:167`), а `round` заполняется только на Finish
+(`fin.round = rep.round`, `:213`); `Rec start` его не ставит (`:152-159`), дефолт `UInt64 round = 0`
+(`CasGcScheduler.h:39`). Позиция записана прямо у поля-коррелятора: `round_id` — «DELIBERATELY NOT
+`round`. `round` is 0 on `Start`, is only known after the round's single `gc/state` CAS on a folding
+round, and does not exist AT ALL on a `NotALeader` round -- and the rounds a reader most needs to
+reconstruct are exactly the ones that never got that far» (`CasGcScheduler.h:57-63`), то же в
+`Gc/CasGc.cpp:500-501` («the phase rows are correlated by `round_id` and not by the round number a
+follower never learns») и в описании колонки (`ContentAddressedGarbageCollectionLog.cpp:57-58`:
+«Group by this column to reconstruct one round»). Т.е. правильный запрос — join/группировка по
+`round_id`, а не `WHERE round = N`. Единственный остаток — неточная проза колонки: `round` описан как
+«GC round number (0 on Start)» (`:40`), про Phase-строки не сказано.
+
+ИТОГ. Из четырёх claim'ов: п.1 — реален, но это перекос наблюдаемости при точном `entries_redeleted`,
+класс уже отслежен пунктом D в {#gc-round-budgets-not-backpressure}; п.2 — задокументированный дизайн
+плюс следствие п.1; п.3 — реальный, не задокументированный off-by-one в двух событиях (косметика
+лога); п.4 — by-design с задокументированным коррелятором, плюс неточность описания колонки.
+Порчи, потери данных и потери работы нет ни в одном пункте — все удаления выполняются и считаются.
+
+НОВЫЙ ПУНКТ (оставлен незакоммиченным): `docs/superpowers/cas/BACKLOG/gc.md`
+{#gc-outcome-budget-skews-round-report-counters} — уточнение к пункту D (перекос доходит до
+операторской строки; `entries_redeleted` — точный счётчик), off-by-one в `GcFoldBegin`/`GcFoldEnd`, и
+две проз-неточности описаний колонок. P3.
