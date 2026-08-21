@@ -412,6 +412,14 @@ def handle_put(bucket, key, query, headers, body):
 def handle_delete(bucket, key, query, headers):
     if "uploadId" in query:
         return _unsupported("aborting a multipart upload")
+    # DELETE was the last handler without this check, so `?acl` and friends used to delete the object
+    # while the allowlist above promised refusal. Nothing CAS sends today carries an unmodelled
+    # parameter on a DELETE, so this refuses nothing that currently happens — it is here so that a
+    # future delete shape acquiring one is refused rather than silently served, which is the whole
+    # point of the allowlist being an allowlist.
+    unmodelled = _unmodelled_params(query)
+    if unmodelled:
+        return _unsupported("DELETE with the subresource/parameter " + ", ".join(unmodelled))
     unclaimed = _unclaimed_subresources(query)
     if unclaimed:
         return _unsupported("DELETE with the subresource " + ", ".join(unclaimed))

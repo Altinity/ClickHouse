@@ -62,8 +62,14 @@ because the first run is when it matters and this docstring is what its reader w
 them. **On that run, check each counter individually instead of trusting a pass** — for any counter CAS
 can move, a green assertion is not evidence that the statement under test issued the operation.
 
-One instance is already settled and serves as the pattern. `S3ListObjects` was asserted here and has
-been removed: an ordinary MergeTree lifecycle on a local-metadata disk never lists, so it could not
+One test is EXEMPT, and the reason is the template for clearing the others:
+`test_default_gcs_hmac_parquet_metadata_cache_keys_on_the_ordinary_etag` uses
+`ParquetMetadataCacheMisses` and `ParquetMetadataCacheHits`, which only a Parquet read moves. No CAS
+disk can touch either, so those two deltas mean exactly what they say. Clearing a counter means showing
+that same thing about it — not observing it pass.
+
+One instance is already settled and serves as the pattern for the other direction. `S3ListObjects` was
+asserted here and has been removed: an ordinary MergeTree lifecycle on a local-metadata disk never lists, so it could not
 have been satisfied by this workload at all — but the CAS disks in this same configuration DO list, so
 a background collection round inside the window could have satisfied it anyway. That is exactly the
 failure mode above, and it is why "make something list somehow" would have produced a test passing for
@@ -125,10 +131,18 @@ HMAC_PLAIN_DISK = "live_hmac_plain"
 HMAC_PLAIN_DISK_2 = "live_hmac_plain_cold"
 HMAC_TWO_VOLUME_POLICY = "live_hmac_two_volume"
 # An ordinary `gcs_hmac` disk pointed at a bucket that does not exist, so a refused request can be
-# observed ON THE GOOG4 PATH. The `s3` table function cannot stand in for this: `http_client` is a
-# disk setting with no table-function spelling, so a bad-credential `s3(...)` read would exercise
-# ordinary AWS SigV4 against GCS and pass while saying nothing about GOOG4.
+# observed ON THE GOOG4 PATH. A disk rather than `s3(...)` because it reuses the configuration surface
+# the rest of this group already exercises — NOT because the table function cannot select the client:
+# `StorageS3Configuration::fromNamedCollection` does read `http_client`, which is what
+# `PARQUET_NAMED_COLLECTION` below relies on. What has no spelling for it is the POSITIONAL argument
+# form (`fromAST` sets `http_client` only through the BigLake ADC path, which forces `gcp_oauth`), so a
+# bare `s3('url', 'key', 'secret')` would sign with ordinary AWS SigV4 and say nothing about GOOG4.
 HMAC_ABSENT_BUCKET_DISK = "live_hmac_absent_bucket"
+# Carries `http_client=gcs_hmac` into the object-storage TABLE ENGINE path, which is the only way to
+# reach the Parquet metadata cache: that cache is consumed in `StorageObjectStorageSource` and
+# `ParquetV3BlockInputFormat`, never by a MergeTree disk, so no statement on the disks above can touch
+# it.
+PARQUET_NAMED_COLLECTION = "live_gcs_hmac_parquet"
 CAS_OAUTH_DISK = "live_cas_oauth"
 CAS_HMAC_DISK = "live_cas_hmac"
 
@@ -220,12 +234,34 @@ def _write_config(path):
         disks.append(_disk_xml(CAS_OAUTH_DISK, "cas-oauth", cas=True, client="gcp_oauth"))
         policies.append(_policy_xml(CAS_OAUTH_DISK))
 
+    named_collections = ""
+    if HMAC_AVAILABLE:
+        named_collections = (
+            "    <named_collections>\n"
+            "        <{name}>\n"
+            "            <url>{endpoint}/{bucket}/{prefix}/parquet/</url>\n"
+            "            <access_key_id>{key}</access_key_id>\n"
+            "            <secret_access_key>{secret}</secret_access_key>\n"
+            "            <http_client>gcs_hmac</http_client>\n"
+            "        </{name}>\n"
+            "    </named_collections>\n".format(
+                name=PARQUET_NAMED_COLLECTION,
+                endpoint=GCS_ENDPOINT,
+                bucket=BUCKET,
+                prefix=PREFIX,
+                key=HMAC_KEY_ID,
+                secret=HMAC_SECRET,
+            )
+        )
+
     with open(path, "w", encoding="utf-8") as out:
         out.write("<clickhouse>\n    <storage_configuration>\n        <disks>\n")
         out.write("\n".join(disks))
         out.write("\n        </disks>\n        <policies>\n")
         out.write("\n".join(policies))
-        out.write("\n        </policies>\n    </storage_configuration>\n</clickhouse>\n")
+        out.write("\n        </policies>\n    </storage_configuration>\n")
+        out.write(named_collections)
+        out.write("</clickhouse>\n")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -240,10 +276,14 @@ def start_cluster():
         cluster.start()
         yield cluster
     finally:
-        # Every disk this run created lives under `PREFIX`, which carries a per-run random suffix, so
-        # dropping the tables is enough to leave the bucket as it was found. A CAS pool additionally
-        # holds its own metadata under that prefix; the DROPs below let it retire that itself rather
-        # than deleting a live pool's keys from underneath it.
+        # Everything this run wrote lives under `PREFIX`, which carries a per-run random suffix, so no
+        # two runs and nothing pre-existing can collide. The DROPs below let each CAS pool retire its
+        # own metadata rather than deleting a live pool's keys from underneath it.
+        #
+        # They do NOT leave the bucket exactly as found: the Parquet test writes a plain object through
+        # a table function, and there is no SQL verb that deletes an object. `PREFIX/parquet/` therefore
+        # survives the run. Delete the whole `PREFIX` afterwards, or give the bucket a lifecycle rule —
+        # this suite runs against a real, billable bucket and cannot clean that one key itself.
         node = cluster.instances.get("node")
         if node is not None:
             for disk in (HMAC_PLAIN_DISK, CAS_HMAC_DISK, CAS_OAUTH_DISK):
@@ -411,9 +451,10 @@ def test_default_gcs_hmac_reports_a_typed_error_for_a_refused_request():
     response the error parser cannot read, which would surface as a generic transport failure with the
     real cause only in the body.
 
-    The refusal has to come from a disk rather than from `s3(...)`, because the table function has no
-    spelling for `http_client` and would therefore sign with ordinary AWS SigV4 — passing, or failing,
-    for a reason that has nothing to do with GOOG4.
+    A disk rather than a positional `s3('url', 'key', 'secret')`: that argument form has no spelling
+    for `http_client` and would sign with ordinary AWS SigV4, passing or failing for a reason unrelated
+    to GOOG4. A NAMED COLLECTION would work — see the Parquet test below — but the disk is what the
+    rest of this group already exercises.
     """
     node = cluster.instances["node"]
     table = _create(node, HMAC_ABSENT_BUCKET_DISK)
@@ -423,6 +464,73 @@ def test_default_gcs_hmac_reports_a_typed_error_for_a_refused_request():
     # A parsed S3 error names the bucket problem. An unparsed one surfaces as a bare transport or
     # timeout failure, which is what must not appear.
     assert ("NoSuchBucket" in error) or ("S3_ERROR" in error) or ("ACCESS_DENIED" in error), error
+
+
+@requires_hmac
+def test_default_gcs_hmac_parquet_metadata_cache_keys_on_the_ordinary_etag():
+    """The Parquet metadata cache keys off the object's ordinary ETag, never a generation.
+
+    Three cache consumers — the filesystem cache, the page cache and this one — key off ONE value, the
+    `etag` on the object metadata; only their formulas differ, and each formula is pinned by a unit
+    test. So this is the end-to-end arm for the shared VALUE, and what it has to establish on a live
+    endpoint is that the value arriving here is an ordinary ETag and not a numeric generation. A
+    generation reaching a cache key is the concrete bug the request-mode isolation exists to prevent:
+    the same object would acquire different keys depending on whether its metadata came from LIST or
+    from HEAD.
+
+    It needs the object-storage TABLE ENGINE, not a disk — `ParquetV3BlockInputFormat` builds the key
+    and only `StorageObjectStorageSource` reaches it, so no MergeTree statement can. Selecting
+    `gcs_hmac` there requires a NAMED COLLECTION: `StorageS3Configuration::fromNamedCollection` reads
+    `http_client`, while the positional argument form does not.
+
+    Would fail if: a generation reached the ETag field on this path — the digit check breaks; or the
+    key stopped being stable across two reads of one unchanged object — the hit count stays zero.
+
+    NOT subject to the counter hazard in the module docstring, and that is deliberate rather than
+    lucky. Its reachability preconditions are `ParquetMetadataCacheMisses` and
+    `ParquetMetadataCacheHits`, which only a Parquet read moves. The CAS disks in this configuration
+    cannot touch either, so unlike the S3 counters in the group above these two mean what they say.
+    """
+    node = cluster.instances["node"]
+    events = ["ParquetMetadataCacheMisses", "ParquetMetadataCacheHits"]
+    table_function = "s3({}, filename='cache-key-probe.parquet', format='Parquet')".format(
+        PARQUET_NAMED_COLLECTION
+    )
+
+    node.query(
+        "INSERT INTO FUNCTION {} SELECT number AS id, toString(number) AS data "
+        "FROM numbers(1000)".format(table_function),
+        settings={"s3_truncate_on_insert": 1},
+    )
+
+    before = _events(node, events)
+    # First read: cold, so the metadata is fetched from the object and the key is minted.
+    assert int(node.query("SELECT count() FROM {}".format(table_function))) == 1000
+    after_cold = _events(node, events)
+    assert after_cold["ParquetMetadataCacheMisses"] > before["ParquetMetadataCacheMisses"], (
+        "no Parquet metadata cache miss, so the read never reached the object and nothing below is "
+        "meaningful"
+    )
+
+    # Second read of the same unchanged object: the key must be rebuilt identically and hit.
+    assert int(node.query("SELECT count() FROM {}".format(table_function))) == 1000
+    after_warm = _events(node, events)
+    assert after_warm["ParquetMetadataCacheHits"] > after_cold["ParquetMetadataCacheHits"], (
+        "the second read of an unchanged object missed the cache, so the key is not stable"
+    )
+
+    # The key's own ETag component, read off the cache's log line: `cache miss <path> | <etag>`.
+    lines = node.grep_in_log("cache-key-probe.parquet |")
+    assert lines, "the cache logged no key for this object, so the value below cannot be checked"
+    etags = {line.rsplit("|", 1)[1].strip() for line in lines.splitlines() if "|" in line}
+    assert etags, lines
+    for etag in etags:
+        value = etag.strip('"')
+        assert value, "the Parquet cache key carried an EMPTY etag: {!r}".format(etag)
+        assert not value.isdigit(), (
+            "a numeric generation reached the Parquet metadata cache key: {!r}. On this path the "
+            "value must be the ordinary ETag".format(etag)
+        )
 
 
 # ---------------------------------------------------------------------------------------------------

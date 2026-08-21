@@ -784,6 +784,27 @@ void S3ObjectStorage::copyObject( // NOLINT
         object_to_attributes);
 }
 
+/// Consumes exactly two fields of `write_settings`: `object_storage_request_mode` and
+/// `s3_single_part_upload_max_bytes_override`. It deliberately IGNORES the rest of what a conditional
+/// write asks for, and a caller passing `ObjectStorageBackend::conditionalWriteSettings` gets less than
+/// that method's name promises:
+///   - `object_storage_retry_profile = SingleAttempt` is inert here. Only `writeObject` resolves the
+///     profile to `getSingleAttemptClient`; this path always uses `client.get()`, so the SDK may retry
+///     a CopyObject transparently.
+///   - `s3_max_unexpected_write_error_retries_override` and `s3_check_objects_after_upload_override`
+///     are applied inside `writeObject` only, and no copy passes through it.
+///
+/// Why that is safe rather than merely tolerated. The only caller supplying those settings is the
+/// content-addressed staging promote, and a retried CopyObject whose first attempt already landed
+/// answers `412` on the second, which becomes `created=false` — indistinguishable from losing the
+/// race. The caller's precondition-failed arm HEADs the key and either adopts a live incarnation or
+/// displaces a condemned one; the key is a content hash, so every incarnation under it carries a
+/// byte-identical payload and the created-versus-existed verdict is recoverable without the token from
+/// the response that was lost. Generation-token stores never reach here at all: S3-native staging is
+/// refused for them at mount.
+///
+/// Re-derive that argument before routing this copy through the single-attempt client. Doing so is a
+/// protocol-adjacent change, and correctness on this path does not need it.
 ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
     const StoredObject & object_from,
     const StoredObject & object_to,
