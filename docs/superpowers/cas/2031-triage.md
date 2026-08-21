@@ -55,8 +55,8 @@
 | CAS-037 | частично | P3 | [{#numeric-parse-and-window-wrap}](BACKLOG.md#numeric-parse-and-window-wrap) | нет | Обёртка `readIntText` без проверки переполнения — реальный код-шейп, и два настоящих остатка есть (`std::stoull` принимает `-1` в трёх разборах GC-ключей, из которых один даёт `max_gen + 1 == 0`; `location.offset + location.length` может завернуться и схлопнуть окно чтения в EOF), но центральный тезис «wrapping defeats every decoder range gate» логически несостоятелен, а `-1` в телах, underflow `blob_header_len - 1`, аллокация по length-полю и «Poco multiplication» — неверны либо недостижимы. |
 | CAS-038 | частично | P3 | [{#decoder-optional-field-residuals} (новая секция; внутри {#outcome-log-oc-not-required} и {#gc-state-encode-no-line-cap}); ранее существующий {#seal-decode-remaining-fields} — устарел (закрыт)](BACKLOG.md#decoder-optional-field-residuals} (новая секция; внутри {#outcome-log-oc-not-required} и {#gc-state-encode-no-line-cap}); ранее существующий {#seal-decode-remaining-fields} — устарел (закрыт) | нет | Из семи подпретензий пять факту на HEAD не соответствуют или имеют безопасное значение по умолчанию; реально остались только необязательный `oc` в журнале исходов GC и отсутствие проверки line cap на стороне записи `gc/state` — и то и другое косметика. |
 | CAS-039 | частично | P3 | [{#gc-shards-no-upper-bound} (новая секция; внутри {#gc-shards-config-override-silent}); родственный существующий {#sec4-decoder-size-bounds}](BACKLOG.md#gc-shards-no-upper-bound} (новая секция; внутри {#gc-shards-config-override-silent}); родственный существующий {#sec4-decoder-size-bounds) | нет | Форма описана верно (верхней границы у `gc_shards` нет нигде, а локальное значение из XML молча замещается пуловым), но последствия — громкий fail-closed отказ аллокации и отсутствие warning'а, а не порча данных; отдельно неверно утверждение об отсутствии сравнения — расхождение durable-пары ловится и бросает. |
-| CAS-040 | ⏳ | — | — | — | — |
-| CAS-041 | ⏳ | — | — | — | — |
+| CAS-040 | подтверждено | P1 | [{#manifest-entry-path-newline-banner}](BACKLOG.md#manifest-entry-path-newline-banner) | да | Механика находки реальна и достижима обычным DDL (проекция с `\n` в имени), но следствие описано неверно: коммита нечитаемой части нет (INSERT падает fail-closed, данные не теряются) — зато осиротевший манифест навсегда заклинивает каждый раунд GC во всём пуле. |
+| CAS-041 | частично | P2 | [{#manifest-digest-by-reencode}](BACKLOG.md#manifest-digest-by-reencode) | нет | Механика (digest = канонический re-encode) на HEAD ровно как описано, но заявленное следствие `CORRUPTED_DATA` на чужом поле сегодня недостижимо (версионный гейт срабатывает раньше и громче); реальный остаток — политика `Tolerant` для этого формата мертва плюс измеренные 27-63% времени декода и две лишние копии payload. |
 | CAS-042 | by-design | P2 | [{#operability} (B180 / format-freeze), {#cas-format-version-floor}](BACKLOG.md#operability} (B180 / format-freeze), {#cas-format-version-floor) | нет | Форма кода описана верно (одна глобальная генерация как min-reader, `changePoints` не читается на декоде), но это осознанная pre-release политика recreate-only; следствия про «тихое стирание полей» и про `Roster` недостижимы. |
 | CAS-043 | частично | P3 | [{#relink-fallback-unknown-format-version}](BACKLOG.md#relink-fallback-unknown-format-version) | нет | Узость catch подтверждена (`CORRUPTED_DATA` only, а гейт версии и критический ключ дают `UNKNOWN_FORMAT_VERSION`), но перекос генераций в одном пуле сегодня невозможен: relink предлагается только внутри одного смонтированного пула, а mount держит точный гейт генерации — остаётся однострочное упрочнение. |
 | CAS-044 | подтверждено | P2 | [{#manifest-inline-budget-no-spill}](BACKLOG.md#manifest-inline-budget-no-spill) | нет | Агрегатный лимит 16 MiB inline-данных на манифест действительно проверяется только в stageManifest и не имеет пути переклассификации в blob — INSERT/мерж падает громко и воспроизводимо; достижимость шире, чем описано в находке. |
@@ -73,10 +73,10 @@
 | CAS-055 | подтверждено | P2 | [{#hardlink-per-file-forcefresh-head}](BACKLOG.md#hardlink-per-file-forcefresh-head) | нет | Подтверждено: ветка carry-forward в `createHardLink` делает ForceFresh-resolve на каждый файл, а при дефолтном `part_folder_validate = always` это обязательный `HEAD` манифеста на файл; но «полная пересборка view» преувеличена (декод берётся из кэша), а фикс — мемоизация уровня транзакции, уже существующая в `unlinkFile`. |
 | CAS-056 | частично | P2 | [{#standalone-write-scratch-manifest-cost}](BACKLOG.md#standalone-write-scratch-manifest-cost) | нет | форма кода реальна — standalone-запись в закоммиченную часть действительно платит второй (черновой) manifest-PUT и по одному adopt-событию на перенесённый blob-лист, но «два ПОЛНЫХ manifest-энкода» и «внутри retry-замыкания CAS» — неточности; корректность не страдает. |
 | CAS-057 | not-a-bug | P3 | [{#tmp-replacefile-on-committed-part}](BACKLOG.md#tmp-replacefile-on-committed-part) | нет | бросок `LOGICAL_ERROR` на не-стейдженный `moveFile`/`replaceFile` подтверждён и сохраняет ранее принятую позицию (fail-loud-заглушка без живого вызывающего), а «свежая улика» ложная: `DeleteBitmapFileOps::writeBitmapToStorage` не имеет ни одного продакшн-вызова. |
-| CAS-058 | ⏳ | — | — | — | — |
-| CAS-059 | ⏳ | — | — | — | — |
-| CAS-060 | ⏳ | — | — | — | — |
-| CAS-061 | ⏳ | — | — | — | — |
+| CAS-058 | подтверждено | P1 | [{#issue-2173-freezeremote-gap}](BACKLOG.md#issue-2173-freezeremote-gap) | да | `freezeRemote` действительно единственный из трёх clone-путей без CAS-транзакции, кросс-дисковый `ATTACH PARTITION FROM` в CAS падает на первой же части — это уже подтверждённый и воспроизведённый на HEAD issue #2173 с запланированным пред-релизным фиксом; неверны только «REPLACE PARTITION FROM» в триггере и намёк на тихое «partial state» (отказ громкий, tmp-часть подчищается). |
+| CAS-059 | by-design | P3 | [{#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`)](BACKLOG.md#encrypted-over-cas-missing-gate} (новая запись; фича-часть — {#operability} `[B17]`) | нет | Все описания кода на HEAD верны (`DiskEncrypted` берёт любой делегат, не переопределяет `isContentAddressed`/`supportsAtomicFileWrites`, `use_fake_transaction` по умолчанию true), но CAS+шифрование — settled out-of-scope позиция (Filimonov), а связка отваливается громким `NOT_IMPLEMENTED` на первой же записи части; остаток — только отсутствующий fail-fast гейт в конфиге, P3. |
+| CAS-060 | by-design | P3 | [{#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed}](BACKLOG.md#operability} ([B17]) + новая секция {#encrypted-wrapper-hides-content-addressed) | нет | Форма кода верна (случайный IV на каждую перезапись + CAS хеширует то, что ему дали → дедупа нет вовсе), но CAS×шифрование — принятая out-of-scope позиция; тихой порчи нет, а сама связка вообще не проведена (`DiskEncrypted` не пробрасывает `isContentAddressed`). |
+| CAS-061 | частично | P2 | BACKLOG.md {#damaged-object-repair} + BACKLOG/gc.md {#ckpt-damage-no-repair-path} + новая секция {#pool-meta-bootstrap-blocks-dr-tools} | нет | Ядро подтверждено (единственный rebuild-верб — `gc/state`; каталог/`_ckpt` падают fail-closed без пути восстановления; все CA-инструменты открываются через `_pool_meta`), но это уже затрекано как {#damaged-object-repair}/{#ckpt-damage-no-repair-path}, часть про mount lease неверна (есть `cas-drop-member`), а отсутствие migration-тулинга — сознательное pre-release решение. |
 | CAS-062 | ⏳ | — | — | — | — |
 | CAS-063 | ⏳ | — | — | — | — |
 | CAS-064 | ⏳ | — | — | — | — |
@@ -2403,3 +2403,293 @@ BACKLOG/история: класс «репойнт стоит дорого» ч
 Пересечения с CAS-035 нет: CAS-035 — про полное перечисление `cas/ns/stream/` в GC-раунде и двойную материализацию edge-run'а (`Gc/CasBlobInDegree.cpp`, `Gc/CasGc.cpp`); CAS-057 — про интерфейс дисковой транзакции на пути MergeTree. Дубликатом не является.
 
 BACKLOG: покрытия не нашлось — grep по `docs/superpowers/cas/BACKLOG.md` и `BACKLOG/*.md` по `unique key|bitmap|replaceFile|moveFile|supportsAtomicFileWrites` даёт только неродственный `[codex-26]` (`BACKLOG/performance.md:31`). Поэтому добавил (не закоммичено) новую секцию `{#tmp-replacefile-on-committed-part}` в `docs/superpowers/cas/BACKLOG/replication.md` (топик — MergeTree-интеграция) как latent-долг: когда путь UNIQUE KEY будут подключать, `writeBitmapToStorage` обязан либо взять короткое замыкание `supportsAtomicFileWrites`, либо обернуть оба шага в одну транзакцию, плюс тест на CA-диске. До тех пор поведение корректно (fail-closed), исправлять в коде CAS нечего — отсюда P3 и PRE-RELEASE: нет.
+
+## CAS-040 — Механика находки реальна и достижима обычным DDL (проекция с `\n` в имени), но следствие описано неверно: коммита нечитаемой части нет (INSERT падает fail-closed, данные не теряются) — зато осиротевший манифест навсегда заклинивает каждый раунд GC во всём пуле. (подтверждено, P1) {#cas-040}
+
+## Что подтверждается в коде на HEAD
+
+Якоря находки указывают на старые пути `CA/Formats/...`; файл переехал в
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp`
+(перенос подкаталогов — `592b9b83568`). Номера строк в находке устарели, актуальные:
+
+- `bannerFor` строит баннер из СЫРОГО пути: `Formats/CasPartManifestFormat.cpp:68-71`
+  (`return "==> " + String(path) + " il=" + std::to_string(n) + " <==";`) — в находке `:64-67`.
+- Баннер добавляется в зону payload как есть, без экранирования: `:116-120` — в находке `:106-110`.
+- Строка записи entry при этом путь ЭКРАНИРУЕТ (`writeStringValue` → `CasJsonWriter::stringValue`,
+  «Quoted JSON string with full escaping», `Formats/CasTextFormat.h:75`): `:47`.
+- На декоде баннер сравнивается с одной прочитанной строкой: `:278-282` — в находке `:248-252`.
+- Валидация пути (относительный, без пустых/`.`/`..` сегментов) существует ТОЛЬКО на стороне декода:
+  `:198-210` — в находке `:184-193`. Контрольные символы она не отвергает; на стороне encode
+  проверки пути нет вообще (единственные проверки encode — сортировка и запрет дублей, `:77-87`).
+  Grep по всему CA-дереву: единственные места с «invalid entry path» — `:201-208`, то есть
+  асимметрия encode/decode подтверждается исчерпывающе.
+
+Прямая проверка round-trip (сборка через `.claude/tools/cppexpr.sh` со связкой `dbms`, лог
+`tmp/cas040_probe.log`):
+
+```
+probe("plain.txt")                 -> ROUNDTRIP_OK
+probe("p\nq.proj/columns.txt")     -> DECODE_THREW: PartManifest: payload-zone banner mismatch, expected '==> p
+probe("a/../b")                    -> DECODE_THREW: CAS part manifest: invalid entry path 'a/../b'
+probe("weird il=3 <==")            -> ROUNDTRIP_OK
+```
+
+То есть «encode проходит, decode не может никогда» — верно, а вот баннер-подобный текст в имени
+(`... il=3 <==`) безопасен, потому что баннер сверяется целиком.
+
+## Достижимость: подтверждена, причём обычным пользовательским DDL
+
+Путь entry берётся из `Route::file` (`ContentAddressedMetadataStorage.h:459-470`) — то есть буквально
+из имени файла внутри каталога части; никакой гигиены имён на write-path нет. Имена столбцов и
+индексов проходят через `escapeForFileName`, но имя каталога проекции — нет:
+`src/Storages/ProjectionsDescription.h:156` — `String getDirectoryName() const { return name + ".proj"; }`.
+Проверено на обычном локальном диске: `create table t (a UInt64, projection `p\nq` (select a order by a))`
+создаёт каталог части `p<LF>q.proj` (вывод `cat -A`: `p$` / `q.proj$`).
+
+Живая проверка на CA-диске (`clickhouse-local`, конфиг с `metadata_type=cas`, локальный бэкенд,
+каталог `tmp/castest`):
+
+```
+Code: 246. DB::Exception: PartManifest: payload-zone banner mismatch, expected '==> p
+q.proj/checksums.txt il=259 <==', got '==> p'. (CORRUPTED_DATA)
+```
+
+## Где находка ошибается (в свою пользу и себе во вред)
+
+1. НЕВЕРНО: «a committed part permanently unreadable, with the corruption created by the writer».
+   Манифест перечитывается внутри той же транзакции INSERT, поэтому INSERT падает fail-closed:
+   `select count() from t` → `0`, `select count() from system.parts where table='t'` → `0`. Никакой
+   закоммиченной нечитаемой части и потери данных нет; таблица просто становится непригодной для
+   вставки (каждый следующий INSERT падает так же). Это громкий отказ, а не тихая порча.
+2. НАЙДЕНО ХУЖЕ, чем в находке: неудавшаяся попытка оставляет в пуле недекодируемый объект манифеста
+   (в `tmp/castest/cas_pool/ca/cas/manifests/...`), а sweep осиротевших манифестов декодирует каждый
+   кандидат без защиты — `Gc/CasOrphanManifestSweep.cpp:878`
+   (`const PartManifest body = decodePartManifest(...)`), и на месте вызова
+   `Gc/CasGc.cpp:3124` (`result.orphan_sweep = planManifestCursorPage(...)`) нет никакого `try`.
+   Исключение выходит из fold, курсор не двигается. Наблюдаемо в живом логе (`tmp/castest/ch.log`,
+   `gc_interval_sec=3`), каждый тик:
+
+   ```
+   <Error> cas_pool/::ContentAddressedGC: CA GC round failed (will retry next tick):
+   Code: 246. DB::Exception: PartManifest: payload-zone banner mismatch, expected '==> p
+   q.proj/checksums.txt il=259 <==' ... (CORRUPTED_DATA)
+   ```
+
+   То есть одно странное имя проекции навсегда останавливает освобождение места во ВСЁМ пуле, пока
+   оператор не удалит объект руками. Это и определяет приоритет: не потеря данных, а бессрочная
+   остановка reclaim, инициируемая любым, кто может создать таблицу с проекцией.
+
+## Что нашлось в BACKLOG и истории
+
+- Прямого покрытия нет: grep по `docs/superpowers/cas/BACKLOG.md` и `BACKLOG/*.md` по
+  `banner`/`bannerFor` — пусто.
+- Ближайшие родственники (не покрывают этот случай):
+  `BACKLOG/gc.md` {#ckpt-damage-no-repair-path} — недекодируемый `_ckpt` закрывает раунд-широкий
+  destructive gate и не имеет пути ремонта; `BACKLOG.md` {#damaged-object-repair} — «present and
+  undecodable» как класс для fsck. Оба явно про ПОВРЕЖДЕНИЕ извне (вне модели отказов доверенного
+  стора), тогда как здесь недекодируемый объект пишет сам продукт из легального DDL.
+  `BACKLOG/formats-and-storage.md` {#gc-state-encode-no-line-cap} — тот же класс асимметрии
+  encode/decode, но для `gc/state` и с недостижимым следствием.
+- `git log -S "bannerFor" -- src` → единственный коммит `3cae1327cbc` (формат v3, фаза 6): баннер
+  такой с рождения, ничем позже не закрывался. Находка НЕ устаревшая.
+- Пробел в тестах: `src/Disks/tests/gtest_cas_part_manifest_format.cpp:130`
+  (`InlineBytesWithEmbeddedSpecialCharsRoundTripByteFaithfully`) намеренно фиксирует, что `\n` в
+  ТЕЛЕ inline-файла безопасен, но тот же вопрос про ПУТЬ не задан ни разу;
+  `DecodeRejectsMalformedEntryPaths` (`:218`) закрывает только traversal.
+
+## Что реально осталось (внесено в BACKLOG некоммиченным)
+
+Новая секция {#manifest-entry-path-newline-banner} в
+`docs/superpowers/cas/BACKLOG/formats-and-storage.md`. Направление фикса:
+(1) валидация пути на стороне ENCODE тем же правилом, что на декоде, плюс запрет управляющих
+символов (минимум `\n`) — тогда громкий отказ случается ДО публикации объекта;
+(2) sweep осиротевших манифестов не должен ронять раунд: недекодируемый манифест — записанная
+аномалия + continue (форма как у `BodyUndecodable` для `_ckpt`), иначе один poison-объект
+останавливает reclaim во всём пуле;
+(3) экранирование имени каталога проекции — это generic MergeTree-код, требует upstream-консультации.
+
+## CAS-041 — Механика (digest = канонический re-encode) на HEAD ровно как описано, но заявленное следствие `CORRUPTED_DATA` на чужом поле сегодня недостижимо (версионный гейт срабатывает раньше и громче); реальный остаток — политика `Tolerant` для этого формата мертва плюс измеренные 27-63% времени декода и две лишние копии payload. (частично, P2) {#cas-041}
+
+## Что подтверждается в коде на HEAD
+
+Якоря находки — старые пути `CA/Formats/...`; файл на HEAD:
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.cpp`
+(переезд подкаталогов — `592b9b83568`). Номера строк устарели, актуальные:
+
+- Пересчёт и сравнение digest: `:297-301` (в находке `:263-267`):
+  `const UInt128 expected_digest = computePayloadDigest(m); if (expected_digest != m.payload_digest) throw ... CORRUPTED_DATA`.
+- `computePayloadDigest` делает глубокую копию модели и заново кодирует её: `:306-317`
+  (в находке `:272-279`) — `PartManifest probe = m; probe.payload_digest = UInt128{}; const String bytes = encodePartManifest(probe);` + CityHash128.
+- Декод действительно терпим к неизвестным ключам: `JsonObjectReader(..., KeyStrictness::Tolerant, ...)`
+  на всех трёх уровнях (`:138` дескриптор, `:175` записи) и `r.skipUnknown(key)` (`:152`, `:184`, `:224`),
+  а сам формат зарегистрирован как `Tolerant`: `Formats/CasFormat.cpp:165`.
+
+То есть описание формы кода верно на 100%: терпимость к неизвестным ключам и digest-по-re-encode
+взаимно несовместимы — пропущенный ключ не переживёт повторную сериализацию из локальной структуры.
+
+## Где находка ошибается: следствие недостижимо
+
+«Trigger: read a manifest written by a build with any additional field» не является достижимой
+конфигурацией на HEAD:
+
+- Писатель всегда штампует `G_BUILD`: `Formats/CasFormat.h:132-138` — «Until the roster and
+  write-down-to-floor policy exist, this is always `G_BUILD`». Политики write-down нет (числится как
+  B180, `BACKLOG/operability-and-introspection.md`).
+- Значит объект из более новой генерации отвергается РАНЬШЕ digest'а — в заголовке:
+  `Formats/CasTextFormat.cpp:320-328` (`expectHeaderLine` → `checkCompatibility(h.v, ...)`) →
+  `UNKNOWN_FORMAT_VERSION`. Это происходит на `CasPartManifestFormat.cpp:129`, за ~170 строк до
+  проверки digest на `:297`.
+- Все реальные бампы генераций 4-9 — recreate-only (`Formats/CasFormat.h:24-59`), персистентных
+  данных до релиза нет, compat-обязательств нет ([[feedback_ca_no_compat_scaffolding_predev]]).
+- Даже в гипотетическом будущем это отказ fail-closed (громкий `CORRUPTED_DATA`), а не тихая порча.
+  Формулировка сводки находки («silent additive-field loss became a hard fail») подаёт это как
+  ухудшение, хотя жёсткий отказ строго лучше тихой потери поля; настоящая претензия не в этом, а в
+  том, что аффорданс `Tolerant` для данного формата не работает никогда.
+
+## Что реально осталось
+
+1. Противоречие дизайна (не баг во времени исполнения): формат объявлен `Tolerant`
+   (`Formats/CasFormat.cpp:165`), а фреймворк форматов прямо предусматривает аддитивные изменения,
+   сохраняющие прежний reader floor (`Formats/CasFormat.h`, док к `FormatChangePoint`: «Additive
+   changes retain the previous reader floor»). Для `cas_part_manifest` этим воспользоваться нельзя,
+   пока digest — канонический re-encode. Решать это надо вместе с уже числящимся решением о
+   CRC-границе `PartManifest.payload_digest` перед format-freeze:
+   `BACKLOG/formats-and-storage.md` {#codecs-and-protocol} («decide the `RunRef.checksum` /
+   `PartManifest.payload_digest` CRC-boundary before release»). Два выхода: считать digest по
+   байтам провода (тогда терпимость становится настоящей и re-encode исчезает) либо перевести
+   формат в `Strict` и честно записать, что аддитивная эволюция этого объекта требует бампа генерации.
+2. Стоимость — реальна, но в находке преувеличена. Измерено на этой сборке
+   (`tmp/cas041_bench.log`, `.claude/tools/cppexpr.sh`, 20 итераций на точку): доля
+   `computePayloadDigest` в полном `decodePartManifest` — 27-63%:
+   `60 × 100 B` → 45 µs, из них 12 µs (27%); `500 × 2 KiB` (1.06 MB) → 510 µs, из них 200 µs (39%);
+   `200 × 64 KiB` (13.1 MB) → 4.6 ms, из них 2.9 ms (63%). То есть «2x work» — верхняя граница
+   (~1.4x-2.7x суммарно), а не константа. Заявленные «~3x transient memory» держатся: одновременно
+   живут декодированная модель, её глубокая копия (`probe`) и закодированные байты; при
+   `object_cap` = 256 MiB для этого формата (`Formats/CasFormat.cpp:165`) пик стоит ограничить.
+   Смежное: {#sec4-decoder-size-bounds} в том же файле (границы размера у декодеров).
+
+## Дубликат/история
+
+Не дубликат: OLD-CAS-027 (по `tmp/2031/gist/RECONCILIATION-2031.md:329`) — про тихую потерю
+аддитивных полей; исправление OLD-CAS-025 (пересчёт digest) заменило её на жёсткий отказ. На HEAD
+жёсткий отказ по чужому полю недостижим (см. выше), так что «эволюция» находки — про будущее, а не
+про текущее поведение. Новая (2031-triage) секция CAS-027 в
+`BACKLOG/docs-and-cleanup.md` {#pool-trust-boundary-undocumented} — про другое (граница доверия
+пула), пересечения нет.
+
+## Внесено в BACKLOG (некоммиченно)
+
+Новая секция {#manifest-digest-by-reencode} в
+`docs/superpowers/cas/BACKLOG/formats-and-storage.md` — фиксирует оба остатка (мёртвая политика
+`Tolerant` + измеренная стоимость) со ссылкой на решение о CRC-границе в {#codecs-and-protocol}.
+
+## CAS-058 — `freezeRemote` действительно единственный из трёх clone-путей без CAS-транзакции, кросс-дисковый `ATTACH PARTITION FROM` в CAS падает на первой же части — это уже подтверждённый и воспроизведённый на HEAD issue #2173 с запланированным пред-релизным фиксом; неверны только «REPLACE PARTITION FROM» в триггере и намёк на тихое «partial state» (отказ громкий, tmp-часть подчищается). (подтверждено, P1) {#cas-058}
+
+Анкор находки (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:593-621`) устарел по номерам строк (снапшот до 592b9b83568 + последующие правки): на HEAD `freezeRemote` — `DataPartStorageOnDiskBase.cpp:615-668`, «правильные» ветки с транзакцией — `freeze` (`:542-544`, комментарий про B21) и `clonePart` (`:735-757`, комментарий «L2 (MOVE-to-CA fix)»), стример — `copyDirectoryContentIntoTransaction` (`:686-712`). Файл сам не переезжал (он в generic `src/Storages/MergeTree/`), переехали только CA-файлы.
+
+Что подтверждается на HEAD:
+
+1. `freezeRemote` не имеет CA-ветки. `DataPartStorageOnDiskBase.cpp:625-628`: транзакция берётся ИСКЛЮЧИТЕЛЬНО из `params.external_transaction`, иначе `dst_disk->createDirectories(to)`; ни одного `dst_disk->isContentAddressed()` в теле функции нет (единственные два вхождения `isContentAddressed` в файле рядом — `:542` в `freeze` и `:735` в `clonePart`). Для сравнения, `freeze` (`:540-544`) и `clonePart` (`:735-745`) сами создают `owned_transaction`/`clone_transaction`, а восстановление из бэкапа — `MergeTreeData.cpp:7543-7545` (`restore_tx`). То есть «третий путь забыли» — верно буквально.
+
+2. Без транзакции копирование идёт по автокоммит-пути. `freezeRemote` вызывает `Backup(..., /*copy_instead_of_hardlinks=*/true, {}, params.external_transaction)` (`:630-643`); в `Backup` при пустой транзакции и `copy_instead_of_hardlinks=true` берётся ветка `src_disk->copyDirectoryContent(...)` (`src/Storages/MergeTree/Backup.cpp:180-185`), а это `IDisk::copyDirectoryContent` → `copyThroughBuffers` с пулом потоков (`src/Disks/IDisk.cpp:196-205`, `:174-193`) — каждый файл части становится отдельной автокоммит-транзакцией на CAS-диске.
+
+3. Итог на CAS — громкий отказ. Для blob-обязательных файлов (`.bin`, `.mrk*`, `primary.idx` — `ContentAddressedTransaction.cpp:65-73`) автокоммит запрещён: `ContentAddressedTransaction.cpp:766-771` бросает `NOT_IMPLEMENTED` «Autocommit writes are not supported for content part files». Параллельно две автокоммит-транзакции на один и тот же ref дают вторую подпись — отказ unique-ref инварианта `Pool/CasPartWriteTxn.cpp:1168-1174` («promote: ref ... already names a different committed manifest», retry-later). Какая из двух сработает — гонка пула; обе — fail-closed.
+
+4. Достижимость. `freezeRemote` вызывается только из `MergeTreeData::cloneAndLoadDataPart` (`MergeTreeData.cpp:9717`) в ветке `!on_same_disk`, а до неё стоит гейт `must_on_same_disk` (`MergeTreeData.cpp:9677-9681`, `BAD_ARGUMENTS` «disk does not belong to storage policy»). `must_on_same_disk=false` передают ровно ATTACH-ветки: `StorageMergeTree.cpp:3049-3057` и `StorageReplicatedMergeTree.cpp:9239-9248`; `external_transaction` там не задаётся (`ClonePartParams` — `StorageMergeTree.cpp:3029`, `StorageReplicatedMergeTree.cpp:9218-9222`). Значит триггер — именно `ALTER TABLE cas_tbl ATTACH PARTITION ... FROM src`.
+
+Что в находке неверно:
+
+- «`REPLACE PARTITION FROM`» и `MOVE PARTITION TO TABLE` этот путь НЕ достают. В Replicated `replace=true` жёстко передаёт `must_on_same_disk=true` (`StorageReplicatedMergeTree.cpp:9233`), как и `movePartitionToTable` (`:9521`). В `StorageMergeTree` `replace`/`movePartitionToTable` передают `!are_policies_partition_op_compatible` (`StorageMergeTree.cpp:3041`, `:3226`), а `StoragePolicy::isCompatibleForPartitionOps` требует, чтобы ВСЕ диски обеих политик были `isPlain()` (`src/Disks/StoragePolicy.cpp:420-435`); CAS-метаданные `isPlain()` не переопределяют, т.е. остаётся дефолтное `false` (`src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:310`, `src/Disks/IDisk.h:473`) — политика с CAS-диском несовместима, `must_on_same_disk=true`, и запрос отвергается ЗАРАНЕЕ громким `BAD_ARGUMENTS`. Единственное исключение — одна и та же политика по имени (`StoragePolicy.cpp:422-423`), но тогда `on_same_disk` истинно и путь `freezeRemote` вообще не берётся.
+- «leaving partial state rather than being rejected up front» — по факту не тихая порча. До броска успевают автокоммитом опубликоваться только inline-совместимые файлы части (`checksums.txt`/`columns.txt`/`count.txt`) в tmp-ref `tmp_replace_from_*`; ветка `Backup` с копированием обёрнута в `CleanupOnFail` → `dst_disk->removeRecursive(destination_path)` (`Backup.cpp:182-184`), плюс держится `getTemporaryPartDirectoryHolder(tmp_dst_part_name)` (`MergeTreeData.cpp:9687`). Целевая таблица не получает ни одной части (все `dst_parts` коммитятся только после успеха всех клонов). Так что реальный вред — падение запроса + возможный tmp-мусор в пуле, а не порча данных; «не отвергается заранее» — верно, но это UX/фича-гэп, а не корректность.
+
+Покрытие в BACKLOG: уже есть, дословно про этот же дефект — `docs/superpowers/cas/BACKLOG.md:638` `## Issue #2173 CONFIRMED: cross-disk ATTACH PARTITION FROM (local -> CAS) — freezeRemote lacks the CAS single-transaction branch (2026-08-20) {#issue-2173-freezeremote-gap}`. Там же (`BACKLOG.md:646-663`) зафиксирован тот же механизм (16-потоковый пул, две конкурирующие автокоммит-транзакции, unique-ref refusal `CasPartWriteTxn.cpp:1168` либо `NOT_IMPLEMENTED` `ContentAddressedTransaction.cpp:770`), репро на HEAD и запланированный фикс — зеркалить CA-ветку `clonePart` внутри `freezeRemote` (self-created `dst_disk->createTransaction()` + `copyDirectoryContentIntoTransaction` + один commit) плюс stateless-тест. Пункт помечен как SCHEDULED pre-release (`docs/superpowers/cas/final-checks-todo.md`). На HEAD (`c2cd4b62df1`) фикс НЕ внесён — ветки в `freezeRemote` нет, так что запись не устарела. Новых записей в BACKLOG не добавлял: находка — независимое переоткрытие уже затрекованного и запланированного к фиксу issue #2173.
+
+Итого: код-часть находки верна и это реальный пред-релизный дефект (первый же `ATTACH PARTITION FROM` в CAS-таблицу падает), но новизны нет; правки к формулировке — только ATTACH (не REPLACE/MOVE) и отказ громкий, без тихой порчи.
+
+## CAS-059 — Все описания кода на HEAD верны (`DiskEncrypted` берёт любой делегат, не переопределяет `isContentAddressed`/`supportsAtomicFileWrites`, `use_fake_transaction` по умолчанию true), но CAS+шифрование — settled out-of-scope позиция (Filimonov), а связка отваливается громким `NOT_IMPLEMENTED` на первой же записи части; остаток — только отсутствующий fail-fast гейт в конфиге, P3. (by-design, P3) {#cas-059}
+
+Предзаполненный вердикт one-liner'а (out-of-scope, «CAS+encryption needs design/dev/testing; should be workable later — not now») на HEAD по-прежнему соответствует коду: никакой поддержки шифрования в CAS нет, ни одного упоминания encryption/IV/key в `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`, и позиция не переоткрывается. Проверял только, что позиция всё ещё описывает код, и что именно из «impact» реально достижимо.
+
+Подтверждается на HEAD (анкоры находки по номерам строк совпали, файл `src/Disks/DiskEncrypted.*` не переезжал):
+
+1. Нет проверки capability при создании. `src/Disks/DiskEncrypted.cpp:190-208` (`getDiskAndPathFromConfig`) берёт делегат из `DisksMap` по имени и валидирует ровно две вещи — непустое имя и завершающий `/` у `path`; фабрика `registerDiskEncrypted` (`src/Disks/DiskEncrypted.cpp:517-531`) конструирует `DiskEncrypted` и вызывает `startup(skip_access_check)`, без единого вопроса о типе делегата. То есть `<disk><type>encrypted</type><disk>cas_disk</disk></disk>` принимается.
+
+2. Обёртка отвечает «не content-addressed». `src/Disks/DiskEncrypted.h` делегирует десятки предикатов, включая `isPlain` (`:332`), но `isContentAddressed`/`supportsAtomicFileWrites` в файле отсутствуют вовсе (grep по `DiskEncrypted.h`), значит работают дефолты `IDisk` — `false` (`src/Disks/IDisk.h:473-480`), тогда как CA-метахранилище отвечает `true` (`.../ContentAddressed/ContentAddressedMetadataStorage.h:261`, через `DiskObjectStorage::supportsAtomicFileWrites`, `DiskObjectStorage.cpp:779-782`). Следствие «все CA-хуки в MergeTree выключены» — верно: их условия читают именно `isContentAddressed()` (`DataPartStorageOnDiskBase.cpp:422`, `:542`, `:735`, `MergeTreeData.cpp:5937`, `:7544`, `IMergeTreeDataPart.cpp:1364`, `MergeTask.cpp:567`, `DataPartsExchange.cpp:161`, `:405`).
+
+3. `use_fake_transaction` по умолчанию `true`: `src/Disks/DiskEncrypted.cpp:329` (`config.getBool(config_prefix + ".use_fake_transaction", true)`) и безусловно `true` во втором конструкторе (`:341`); `createTransaction` при этом возвращает `FakeDiskTransaction` (`src/Disks/DiskEncrypted.h:344-349`), т.е. каждая операция уходит в делегат как самостоятельный автокоммит.
+
+4. Префикс пути существует: `DiskEncryptedTransaction::wrappedPath` (`src/Disks/DiskEncryptedTransaction.h:36-42`) приклеивает `disk_path` спереди; метахранилище тоже оборачивается `MetadataStorageWithPathWrapper` (`DiskEncrypted.h:376-384`).
+
+Что в «impact» неверно или недостижимо:
+
+- «fails only at the first part write» — верно, и это ГРОМКИЙ fail-closed, не тихая порча. Поскольку транзакции фиктивные, каждый файл части приходит в CA как автокоммит-запись, а для blob-обязательных файлов (`.bin`, `.mrk*`, `primary.idx` — `ContentAddressedTransaction.cpp:65-73`) автокоммит запрещён броском `NOT_IMPLEMENTED` (`ContentAddressedTransaction.cpp:766-771`). Любая реальная часть (и Wide, и Compact) содержит такой файл, так что INSERT падает всегда; конфигурации, в которой запись «тихо» проходит, нет. Стартовый write-probe (`IDisk::startup`/`checkAccess`) — это не part-файл, он ложится как обычный mountpoint-объект (`ContentAddressedTransaction.cpp:808-830`), поэтому сервер и правда поднимается — то есть «принимается на старте» подтверждается.
+- «the wrapper's `path` prefix silently reshapes CAS path classification (shadow detection, atomic-shard detection, table-file parsing)» — верно лишь на треть, и только при непустом `<path>` (он может быть пустым: `DiskEncrypted.cpp:205-207` просто требует завершающий `/`, если строка непуста). Классификация part-путей к префиксу УСТОЙЧИВА: `findTableUuidComponent` ищет пару `<3 hex>/<uuid>` по форме в любом месте пути (`Parts/PartPathParser.cpp:114-128`, комментарий «robust to a missing store/»), а для не-Atomic раскладки есть форменный fallback по part-dir грамматике (`:136+`). Ломается только shadow-детекция, которая требует буквального первого компонента `shadow` (`Parts/PartPathParser.cpp:277-282`) — но FREEZE до этого всё равно не доживёт, потому что дойти до shadow-части можно лишь имея записанную часть, а запись падает (п. выше). Так что «silently reshapes» как отдельный вред — недостижимое следствие верно описанной формы кода (типичная ошибка этого аудита).
+- Про «no capability check» как таковое — верно, и это единственный живой остаток.
+
+История/покрытие: в `docs/superpowers/cas/BACKLOG.md` и `docs/superpowers/cas/BACKLOG/*.md` про шифрование была ровно одна строка — `BACKLOG/operability-and-introspection.md:25` `[B17] encryption-at-rest × content-addressing — DESIRABLE — Dedup scope per-encryption-key` (секция {#operability}); она покрывает ФИЧУ (и заодно per-key дедуп/крипто-шред, ср. вердикт CAS-028), но не отсутствующий гейт. Отсылка one-liner'а «the missing gate itself stays open under prev CAS-113» указывает на security-находку прошлого раунда, которая в этом раунде идёт как CAS-090 (`tmp/2031/issue-body.md:142`, SSE-C/manifest-plaintext/re-keying) — там про гейт тоже нет записи в BACKLOG. Признал остаток нетрекнутым и добавил (uncommitted) новую секцию `docs/superpowers/cas/BACKLOG/mounts-and-lifecycle.md:129` — `{#encrypted-over-cas-missing-gate}`: отказывать при конструировании/валидации конфига, если делегат (транзитивно) отвечает `isContentAddressed()`, с сообщением про неподдерживаемую связку; опционально — прокинуть `isContentAddressed`/`supportsAtomicFileWrites` через `DiskEncrypted`, когда связку начнут проектировать.
+
+Итого: описание кода верное, вердикт out-of-scope на HEAD по-прежнему корректен, релизного блокера нет (отказ громкий и немедленный), остаток — дешёвый fail-fast гейт, P3.
+
+## CAS-060 — Форма кода верна (случайный IV на каждую перезапись + CAS хеширует то, что ему дали → дедупа нет вовсе), но CAS×шифрование — принятая out-of-scope позиция; тихой порчи нет, а сама связка вообще не проведена (`DiskEncrypted` не пробрасывает `isContentAddressed`). (by-design, P3) {#cas-060}
+
+**Что подтверждается на HEAD (обе технические половины находки — верны).**
+
+1. Случайный IV на каждую rewrite-запись: `src/Disks/DiskEncryptedTransaction.cpp:105-112` (анкер находки точен и не устарел):
+   ```
+   if (!old_file_size)
+   {
+       /// Rewrite mode: we generate a new header.
+       ...
+       header.init_vector = FileEncryption::InitVector::random();
+   }
+   ```
+   Заголовок с IV — часть тела файла (`src/IO/FileEncryptionCommon.h:136` — `InitVector init_vector;` внутри `Header`, `kSize = 64` — `:139`), т.е. байты файла различаются даже при идентичном plaintext. Append-режим (`:98-103`) переиспользует существующий header — но для CAS это неважно, в CAS каждая часть пишется как новый файл.
+
+2. CAS хеширует ровно те байты, которые ему передали. Анкер находки `CA/ContentAddressedTransaction.cpp:600-642` **устарел** (снапшот до реорганизации `592b9b83568`); на HEAD хеширующий буфер ставится в `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.cpp:1814` и `:1848` (`hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);`), а имя блоба берётся из `:1876` (`const std::string hash_hex = hashing->getHashHex();`). Хеш — потоковый passthrough над уже зашифрованным потоком (`Primitives/CasBlobHashingWriteBuffer.h:17-28`), никакой нормализации/plaintext-хеша нет.
+
+Следствие «дедуп исчезает» верно и даже сильнее, чем в находке: не только два реплики или ATTACH, а **любая** повторная запись байт-идентичного plaintext (даже тем же сервером, тем же ключом) даёт другой блоб. Счётчика/предупреждения об этом действительно нет — но и не может быть: CAS видит просто разные байты, для него это нормальный miss.
+
+**Чего в находке нет и что снижает её вес.**
+
+- Это не порча и не потеря данных, а регрессия по месту/стоимости. Дедуп — оптимизация; корректность чтения/записи не затрагивается. По принятой градации «fail-closed loud vs silent corruption» это даже не отказ, а отсутствие выигрыша.
+- Связка «шифрование над CAS» на HEAD вообще не проведена, и это важнее самого IV: `DiskEncrypted` не переопределяет `isContentAddressed` (база возвращает `false` — `src/Disks/IDisk.h:477`; проброс есть только у `src/Disks/ReadOnlyDiskWrapper.h:92`). Поэтому под обёрткой все CA-ветки MergeTree видят НЕ-CA диск: `DataPartStorageOnDiskBase.cpp:422`, `:542`, `:735`, relink-путь `DataPartsExchange.cpp:161`, правило родительской транзакции для проекций `IMergeTreeDataPart.cpp:1364` и `MergeTask.cpp:567`, whole-part транзакция при BACKUP-restore `MergeTreeData.cpp:7544`. При этом сам `DiskObjectStorage` под обёрткой остаётся content-addressed (`DiskObjectStorage.cpp:774-776`), т.е. per-file autocommit-отказы CAS никуда не деваются — конфигурация упадёт громко, а не тихо испортит данные. Ни в фабрике дисков, ни в валидации маунта комбинация при этом не запрещена — тоже часть того же пробела.
+- Тестов на «encrypted over CA» в дереве нет (в `tests/integration/test_disk_configuration/test.py:573` есть только encrypted-диск сам по себе), что подтверждает статус «не поддержано».
+
+**История/BACKLOG.** Позиция settled и зафиксирована в one-liner'е (Filimonov: «CAS+encryption needs design/dev/testing; should be workable later — not now»), не пересматриваю. Уже затрекано как `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:25` — «**[B17] encryption-at-rest × content-addressing** — DESIRABLE — Dedup scope per-encryption-key; local to key/hash derivation» (анкер секции `{#operability}`). Прошлый раунд триажа тот же вывод уже делал по соседней находке: `docs/superpowers/cas/2031-triage.md:1513` («B17 … Это ровно “half” находки про соль/шред … Отслежено, не сделано»).
+
+**Реальный остаток (untracked → добавлен).** Сам per-key дедуп-скоуп затрекан, но два конкретных факта, которые обязана учесть будущая работа по шифрованию, нигде не записаны: (а) при случайном IV дедуп исчезает ПОЛНОСТЬЮ, а не сужается до per-key (значит per-key scope без детерминированного IV/plaintext-хеша ничего не даёт), и (б) `DiskEncrypted` не CA-прозрачен, поэтому обёртка обходит все CA-ветки и CA-отказы. Добавил секцию (не закоммичено): `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` {#encrypted-wrapper-hides-content-addressed}.
+
+**Итог.** Описание кода верно, следствие «дедуп молча теряется» верно, но приоритет низкий: это не дефект существующей функциональности, а свойство пока не поддержанной комбинации, закрытой принятым решением об out-of-scope. Ничего не надо чинить до релиза; P3 — только за счёт добавленной записи в BACKLOG.
+
+## CAS-061 — Ядро подтверждено (единственный rebuild-верб — `gc/state`; каталог/`_ckpt` падают fail-closed без пути восстановления; все CA-инструменты открываются через `_pool_meta`), но это уже затрекано как {#damaged-object-repair}/{#ckpt-damage-no-repair-path}, часть про mount lease неверна (есть `cas-drop-member`), а отсутствие migration-тулинга — сознательное pre-release решение. (частично, P2) {#cas-061}
+
+**1. «Только `gc/state` имеет rebuild-путь» — подтверждено.**
+`programs/disks/CommandCaGcRebuild.cpp:29-60` — единственный верб пересборки (`cas-gc-rebuild`, `rebuildBaseline`), плюс его SQL-двойник `SYSTEM CAS GC REBUILD` (`src/Interpreters/InterpreterSystemQuery.cpp:1033-1035`, `src/Parsers/ParserSystemQuery.cpp:477-479`). Остальные CA-вербы — `cas-fsck` (`programs/disks/CommandFsck.cpp:24`), `cas-inspect` (`CommandCaInspect.cpp:28`), `cas-gc-dryrun` (`CommandCaGcDryRun.cpp:22`) — только читают; `cas-drop-member` (`CommandCaDropMember.cpp:26`) удаляет объекты мёртвого участника, но ничего не пересобирает. Никакого repair для каталога/`_ckpt`/fold seal нет.
+
+**2. Каталог рефов: fail-closed без пути восстановления — подтверждено.** Анкер `CasRefCatalog.cpp:44-49` на HEAD соответствует `Pool/CasRefCatalog.cpp:41-49`:
+```
+if (!snapshot.token)
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "Mandatory CAS ref catalog '{}' is absent -- refusing to interpret opaque life "
+        "objects as an empty ownership universe", ...);
+```
+`initializeEmptyForNewPool` (`:52-73`) — только bootstrap нового пула (`putIfAbsent` + требование канонически пустого тела), не DR. Отказ громкий, тихой порчи нет.
+
+**3. Формат-floor и «no in-place migration» — подтверждено дословно.** `Formats/CasPoolMetaFormat.cpp:111-117`: при `header.v < kCommittedRefFrontierGeneration` — `UNKNOWN_FORMAT_VERSION` с текстом «…recreate the pool. … CAS is pre-release: there is no in-place migration.» Анкер `:89-95` устарел (реорганизация `592b9b83568`), сообщение живёт на `:112-117`. Но «migration tooling не существует» — это **by design** для pre-release (в BACKLOG это отдельный запланированный GATE: `BACKLOG/operability-and-introspection.md:19` «[B180 / format-freeze] … freeze the format on the first persisted-data release» и `:22` «[B13] migration path for existing tables»). То есть эта часть находки — не дефект, а известный незакрытый GATE.
+
+**4. Chicken-and-egg через `_pool_meta` — подтверждено, и это самая ценная часть находки.** Все пять инструментов достают пул только через `ca->store()`, т.е. через `Cas::Pool::open`, которая заканчивается на `PoolMeta::createOrValidate(..., allow_mint=!config.read_only)` (`Pool/CasPool.cpp:494-496`). Все инструменты ОБЯЗАНЫ открывать диск read-only (`CommandFsck.cpp:51-54`, `CommandCaInspect.cpp:48`, `CommandCaGcRebuild.cpp:54`, `CommandCaGcDryRun.cpp:38`, `CommandCaDropMember.cpp:47`), а read-only-открытие минтить не имеет права — отсутствующий `_pool_meta` даёт `INVALID_STATE` (`Pool/CasPoolMeta.cpp:143-146`), недекодируемый — исключение из `decodePoolMeta`. Особенно показателен `cas-inspect`: пул ему нужен ровно для `backend().get(key)` и `layout()` (`CommandCaInspect.cpp:52-56`), т.е. метаданные пула для его работы не нужны вовсе, но без них он не запускается. Анкер находки `CA/Pool/CasPool.cpp:293-368` устарел — на HEAD это `Pool::open` на `Pool/CasPool.cpp:367-525`, а указанный «:351-353» соответствует нынешнему блоку минта/валидации `:488-496`.
+
+**5. Что в находке неверно или преувеличено.**
+- «damage to … a mount lease … has no recovery verb» — неверно: верб есть, это `cas-drop-member` — он «erase its namespaces, debris, staging, roots objects and **mount slot**» (`CommandCaDropMember.cpp:26-31`, `Tools/CasDecommission.h`). Недекодируемый lease при этом обрабатывается адресно и громко, а не «молча»: `Pool/CasServerRoot.cpp:725-729` («An undecodable lease is the WORST case for a recreation, not an ignorable one»), `:836-840` («undecodable -- fail closed, never wave through»).
+- «Trigger: any corruption or **partial write** of a control object» — частично мимо: на S3-бэкенде PUT контрольного объекта атомарен, частичной записи нет; риск частичного файла ранее был локализован только для Emulated/local-бэкенда (см. `BACKLOG/operability-and-introspection.md`{#disk-error-audit-followups-2026-07-21}). Байтовая порча durable-объекта прямо объявлена вне доверительной модели (`BACKLOG.md`{#damaged-object-repair}: «outside the trusted-store fault model this design assumes, so this is not a correctness defect; it is an OPERABILITY hole»).
+- Класс отказа — **fail-closed loud** во всех проверенных точках: `_pool_meta` present-but-undecodable на remount даёт `StayTransient` + `CASRemountHeldTransient` + WARNING с прямым текстом «the pool metadata is unreadable to this build» (`Pool/CasPool.cpp:1064-1078`), lifecycle-гейт классифицирует это отдельно (`Pool/CasPool.cpp:105-143`). Тихой порчи нет ни в одной из ветвей.
+
+**6. Что уже затрекано (не новая находка).**
+- `docs/superpowers/cas/BACKLOG.md:104` — **`[damaged-object-diagnose-and-repair]` {#damaged-object-repair}**: ровно эта тема, с разбивкой на 4 пункта — fsck должен различать *present-and-undecodable / absent / decodable-but-inconsistent* «per affected object kind (`_ckpt`, fold seal, `gc/state`, catalog), naming the exact key»; `ca-fsck --repair` должен пересобирать выводимое и громко отказывать для невыводимого; выход из `NeedsRecovery`; операторский runbook «a CAS object is damaged».
+- `docs/superpowers/cas/BACKLOG/gc.md:65` — **{#ckpt-damage-no-repair-path}**: «a damaged `_ckpt` has no repair path and still shuts the round-wide destructive gate», с явным «there is NO repair path … the operator action for a damaged `_ckpt` is manual object surgery».
+- `BACKLOG/gc.md:52` (`[gc-rebuild follow-ups]`) и `:142` (`[gc-rebuild-lease-interlock]`) — остатки по единственному существующему rebuild-вербу.
+- Ни один из этих пунктов на HEAD не закрыт (repair-верба в `programs/disks/` нет; `CommandFsck.cpp` строк про present-and-undecodable не содержит).
+
+**7. Реальный незатрекованный остаток (добавлен).** Список объектов в {#damaged-object-repair} не включает `_pool_meta` и не фиксирует само bootstrap-зацепление «инструменты открываются через повреждённый объект». Это ровно то, что в находке ново. Добавил секцию (не закоммичено): `docs/superpowers/cas/BACKLOG/operability-and-introspection.md` {#pool-meta-bootstrap-blocks-dr-tools} — с тремя пунктами долга: (а) pool-meta-less «raw backend + layout» открытие для `cas-inspect`/diagnose-only fsck; (б) fsck-строка present-and-undecodable для `_pool_meta`; (в) решение «`_pool_meta` восстанавливается или только реставрируется» — `pool_id` это случайный u128, минтящийся при создании, т.е. невыводим, значит честный ответ «restore, not repair», и он должен попасть в runbook.
+
+**Итог.** `частично`: технические утверждения по коду верны (с поправкой на устаревшие анкеры), но следствие — операбилити-дыра с громкими отказами, а не риск данных; основная масса уже затрекана двумя существующими пунктами; часть про mount lease фактически неверна; migration — сознательный pre-release GATE. P2: чинить до релиза не требуется, но остаток (`_pool_meta` как единая точка отказа всех DR-инструментов) заслуживает трекинга.

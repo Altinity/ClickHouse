@@ -64,7 +64,24 @@ short-lived TODO, not the record.
   to `ABORTED` (already in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace).
   Zero upstream-code changes (user constraint).
 
-## 8. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 8. Fix CAS-040 — a newline in a part-file path wedges GC pool-wide {#fix-cas-040}
+
+- Source: issue #2031 finding CAS-040, adjudicated + REPRODUCED live on HEAD (2031-triage, 2026-08-21)
+- Full record: `docs/superpowers/cas/2031-triage.md` `{#cas-040}` + BACKLOG
+  `{#manifest-entry-path-newline-banner}`
+- Mechanism: plain DDL (a projection whose name contains `\n`) makes `bannerFor` write the raw path
+  into the manifest banner while path hygiene exists only on the DECODE side. The INSERT itself fails
+  fail-closed (no committed part, no data loss), but the attempt leaves an undecodable ORPHAN
+  manifest, and `planManifestCursorPage` decodes it unguarded (`Gc/CasOrphanManifestSweep.cpp:878`,
+  no `try` at `Gc/CasGc.cpp:3124`) — so EVERY GC round in the pool fails forever, cursor never
+  advances, nothing is ever reclaimed again.
+- Fix: validate path hygiene on the ENCODE side (reject/escape at `bannerFor`) so such a manifest
+  cannot be written, and make the sweep's decode of a foreign/undecodable manifest non-fatal to the
+  round (record + continue, per [[feedback_ca_gc_never_throw_on_404]]'s principle). Both halves are
+  needed: the first stops new occurrences, the second unwedges an existing pool.
+- Pre-release: yes. A single unlucky DDL permanently disables reclamation for the whole pool.
+
+## 9. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).

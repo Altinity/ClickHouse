@@ -242,3 +242,67 @@ near `UINT64_MAX` wraps the sum below `offset`, and `ReadBufferFromFileView` has
 `left_bound <= right_bound` precondition — the window collapses to an immediate EOF (empty read,
 loud failure downstream), so this is robustness, not silent corruption. Fix on the CAS side (validate
 `sz` or use a saturating add) rather than in the generic upstream buffer.
+
+## A part-relative file name containing `\n` produces a manifest nothing can decode — and it wedges GC pool-wide (2031-triage CAS-040) {#manifest-entry-path-newline-banner}
+
+`encodePartManifest` writes the payload-zone banner from the raw entry path
+(`Formats/CasPartManifestFormat.cpp:68-71`, appended at `:116-120`), while the entry-record line
+JSON-escapes the same path (`:47`) and the only path-hygiene check lives on the DECODE side
+(`:198-210`). So a path holding a newline encodes cleanly, and decode fails forever at the banner
+comparison (`:278-282`). Verified by direct round-trip probe: `plain.txt` round-trips,
+`p\nq.proj/columns.txt` throws `PartManifest: payload-zone banner mismatch, expected '==> p`.
+
+It is reachable from ordinary user DDL, not just operator tooling:
+`ProjectionsDescription::getDirectoryName` is `name + ".proj"` with no `escapeForFileName`
+(`src/Storages/ProjectionsDescription.h:156`), so a projection named with a backquoted newline
+creates a part-relative directory containing that newline (confirmed on a plain MergeTree part dir).
+
+Live behaviour on a local CA disk (`clickhouse-local`, cas default policy) — the audit's stated
+impact ("a committed part permanently unreadable") is WRONG, and what actually happens is worse in a
+different direction:
+
+- the INSERT fails fail-closed with `CORRUPTED_DATA` (the manifest is read back inside the same
+  transaction), `count()` stays 0, `system.parts` stays empty — no committed part, no data loss, and
+  every later INSERT into that table fails the same way;
+- but the failed attempt leaves the undecodable manifest object in the pool, and
+  `planManifestCursorPage` decodes each orphan candidate unguarded
+  (`Gc/CasOrphanManifestSweep.cpp:878`) with no `try` at the call site (`Gc/CasGc.cpp:3124`), so the
+  exception escapes the fold: `CA GC round failed (will retry next tick): … payload-zone banner
+  mismatch` on EVERY tick, forever, with the cursor never advancing. One weird projection name
+  therefore stops all reclamation for the whole pool until an operator deletes the object by hand.
+
+Fix, in priority order: (1) validate the entry path on the ENCODE side with the same rule the decoder
+applies, extended to reject control characters (at minimum `\n`), so a manifest that cannot be decoded
+is never published — the loud failure then happens before any object is written; (2) make the orphan
+sweep treat an undecodable manifest as a recorded anomaly and continue, per the never-wedge-the-round
+rule (same shape as the `_ckpt` `BodyUndecodable` hold, `gc.md` {#ckpt-damage-no-repair-path}), so no
+single poison object can stop reclamation pool-wide; (3) consider escaping the projection directory
+name upstream — that is generic MergeTree code and needs the upstream-consult step. Test gap worth
+closing with (1): `gtest_cas_part_manifest_format.cpp` deliberately pins that inline BYTES may hold
+`\n` (`InlineBytesWithEmbeddedSpecialCharsRoundTripByteFaithfully`) but never asks the same question
+of the entry PATH; `DecodeRejectsMalformedEntryPaths` covers traversal only.
+
+## The manifest payload digest is a canonical re-encode, which makes the format's `Tolerant` key policy inert (2031-triage CAS-041) {#manifest-digest-by-reencode}
+
+`decodePartManifest` verifies `payload_digest` by re-encoding the decoded model
+(`Formats/CasPartManifestFormat.cpp:297-301`, `computePayloadDigest` at `:306-317` deep-copies the
+manifest and calls `encodePartManifest`). Two residuals, neither of them a live bug:
+
+- **Design contradiction, not a reachable failure.** `cas_part_manifest` is registered
+  `KeyStrictness::Tolerant` (`Formats/CasFormat.cpp:165`) and the format framework explicitly plans
+  for additive changes that keep the old reader floor (`Formats/CasFormat.h`, `FormatChangePoint`
+  doc) — but a tolerated unknown key cannot survive a digest computed from what the local struct can
+  re-emit, so for this one format the tolerance affordance can never be used. The audit's stated
+  consequence ("a manifest written by any other generation reads as `CORRUPTED_DATA`") is NOT
+  reachable today: `currentCompatibilityVersion()` always stamps `G_BUILD` and there is no
+  write-down-to-floor policy (tracked as B180), so a newer object is refused earlier and louder by
+  `checkCompatibility` (`Formats/CasTextFormat.cpp:327`, `UNKNOWN_FORMAT_VERSION`), and every
+  generation bump so far is recreate-only. This has to be settled as part of the format-freeze /
+  `PartManifest.payload_digest` CRC-boundary decision above ({#codecs-and-protocol}): either digest
+  the wire bytes (which makes tolerance real and removes the re-encode) or drop the format to
+  `Strict` and say plainly that additive evolution of this object requires a generation bump.
+- **Cost, measured.** The recompute is 27–63% of total decode time on this build (60×100 B entries:
+  45 µs of which 12 µs; 500×2 KiB: 510 µs of which 200 µs; 200×64 KiB (13 MB): 4.6 ms of which
+  2.9 ms), i.e. roughly 1.4×–2.7× the decode work, plus two extra transient copies of the payload
+  (the probe manifest and its encoded bytes) on top of the decoded model — with a 256 MiB
+  `object_cap` for this format, that peak is worth bounding. Digesting the wire bytes removes both.

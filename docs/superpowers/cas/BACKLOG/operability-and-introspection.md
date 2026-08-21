@@ -160,3 +160,77 @@ Corrected while triaging: `shutdown` does NOT serialize behind an in-flight FSCK
 `gc_scheduler_mutex` and `pointer_mutex` only (`:891`), never `lifecycle_mutex`, and the pool stays
 alive through the `shared_ptr` the scan holds. Its only wait is on a GC round, which is the documented
 priority choice at `:889-890` ("clean GC completion over fast shutdown").
+
+## `DiskEncrypted` over a CA disk hides `isContentAddressed` from every CA-aware branch {#encrypted-wrapper-hides-content-addressed}
+
+Prerequisite detail for [B17] whenever encryption-at-rest × content-addressing is actually designed
+(2031 triage, CAS-060). Two independent facts at HEAD:
+
+1. `DiskEncryptedTransaction::writeFile` mints a fresh random IV for every rewrite-mode write
+   (`src/Disks/DiskEncryptedTransaction.cpp:106-112`), and CAS hashes the bytes handed to it
+   (`ContentAddressedTransaction.cpp:1814`, `:1876`). So every write through an encrypted wrapper
+   is a unique blob: dedup does not merely narrow to per-key scope, it disappears entirely — even
+   for the same server rewriting byte-identical plaintext.
+2. `DiskEncrypted` does not forward `isContentAddressed` (only `ReadOnlyDiskWrapper` does —
+   `src/Disks/ReadOnlyDiskWrapper.h:92`; the base returns false at `src/Disks/IDisk.h:477`). Every
+   CA-aware branch therefore sees a non-CA disk: the whole-part transaction choices
+   (`DataPartStorageOnDiskBase.cpp:422`, `:542`, `:735`), the relink fetch path
+   (`DataPartsExchange.cpp:161`), the projection parent-transaction rule
+   (`IMergeTreeDataPart.cpp:1364`, `MergeTask.cpp:567`) and the BACKUP-restore whole-part transaction
+   (`MergeTreeData.cpp:7544`) all take the plain-object-storage path over a pool that is in fact
+   content-addressed.
+
+Neither is silent corruption — (1) is a space/cost regression and (2) lands on CAS's own per-file
+autocommit rejections, i.e. loud failures — but any encryption work must start by deciding the
+dedup-scope/key-derivation question and by making the wrapper CA-transparent (or refusing the
+combination at config validation, which nothing does today).
+
+## Every CA CLI/DR verb opens the pool through `_pool_meta`, so damage to that one object disables the instruments {#pool-meta-bootstrap-blocks-dr-tools}
+
+Sub-item of `BACKLOG.md`{#damaged-object-repair} (2031 triage, CAS-061), naming the one object kind
+that item's list (`_ckpt`, fold seal, `gc/state`, catalog) does not: `_pool_meta`. All five CA tools
+(`cas-fsck`, `cas-inspect`, `cas-gc-dryrun`, `cas-gc-rebuild`, `cas-drop-member`) reach the pool only
+via `ca->store()`, i.e. via `Cas::Pool::open`, which ends at
+`PoolMeta::createOrValidate(..., allow_mint=!read_only)` (`Pool/CasPool.cpp:494-496`). A read-only
+open — which every tool is required to use (`programs/disks/CommandFsck.cpp:54`,
+`CommandCaInspect.cpp:48`, `CommandCaGcRebuild.cpp:54`, `CommandCaGcDryRun.cpp:38`, `CommandCaDropMember.cpp:47`) — must never
+mint, so an absent `_pool_meta` fails closed (`Pool/CasPoolMeta.cpp:143-146`) and an undecodable one
+throws out of `decodePoolMeta` (`Formats/CasPoolMetaFormat.cpp:105-117`). Consequence: the single
+damaged object locks out even `cas-inspect`, whose only use of the pool is a raw-key `GET` plus
+`Layout` (`CommandCaInspect.cpp:52-56`) and which therefore does not need pool metadata at all.
+
+Owed, in increasing cost: (a) let `cas-inspect` (and fsck's diagnose-only mode) work off a
+pool-meta-less "raw backend + layout" open so the operator can read the damaged bytes; (b) an fsck
+row that distinguishes `_pool_meta` present-and-undecodable from absent; (c) decide whether
+`_pool_meta` is repairable at all — `pool_id` is a random u128 minted at creation, so it is
+restorable from a backup copy of the object but not derivable, which makes the honest answer for
+(c) "restore, not repair" and belongs in the runbook item 4 of {#damaged-object-repair}.
+
+## The fsck meta/body pairing counters are computed and rendered nowhere (2031-triage CAS-062) {#fsck-meta-body-counters-unrendered}
+
+P3, observability only — the two counters are ADVISORY by design and correctly excluded from
+`FsckReport::clean` (pinned by `src/Disks/tests/gtest_cas_fsck.cpp:1224-1259`), so nothing here is a
+missed hard finding.
+
+`runFsck` counts `meta_without_body` and `body_without_meta`
+(`ContentAddressed/Tools/CasFsck.cpp:1043,1046`), but no surface prints either one:
+`formatFsckSummary` omits both (`Tools/CasFsck.cpp:1155-1174`), `contentAddressedFsckColumns` /
+`appendContentAddressedFsckRow` omit both
+(`src/Interpreters/InterpreterSystemQuery.cpp:2433-2478,2482-2504`), `programs/disks/CommandFsck.cpp`
+never mentions them, and `detail` mode emits no per-object row for them either (the pairing loop only
+increments). Outside the gtest, the only reader of these fields is nobody.
+
+That makes the field comment in `Tools/CasFsck.h` (`meta_without_body`: "Counted and reported;
+excluded from `clean()`") wrong on its "reported" half, which is exactly the shape
+{#fsck-rule-restated-in-unfenceable-prose} is about: prose asserting a rendering that no surface
+performs. Owed: either render both counters on the summary line (and, if rendered there, on the SQL
+row for the same reason the other non-`clean` counters are on it) plus a `detail` row naming the
+offending hash, or delete the counters and the comment together. Decide which — a counter no consumer
+can read is not an audit signal.
+
+The rest of CAS-062 is not new: the SQL FSCK's missing deadline / scoping / cancellation is
+{#lifecycle-verbs-wait-out-uncancellable-scans}, per-object keys from SQL is the documented YAGNI at
+`InterpreterSystemQuery.cpp:2426-2429` (the `clickhouse-disks cas-fsck --detail` applet is the
+per-object surface), and "no repair path" is `gc.md`{#ckpt-damage-no-repair-path} for `_ckpt` — while
+`SYSTEM CAS GC REBUILD` (`InterpreterSystemQuery.cpp:2545`) already is the repair path for the
+in-degree/`stale_edge` class.

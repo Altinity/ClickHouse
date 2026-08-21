@@ -125,3 +125,56 @@ as running" — is not a defect: self-exit fires only on `isVanished()` /`vanish
 `IdentityLost` (`CasGcScheduler.cpp:281-282`, `:369-370`), `gcStart` refuses loudly on exactly those
 states via `checkOpAdmitted(Admin)`, and `i_am_leader` is cleared before the return so `gcHealth` stays
 honest.
+
+## `type=encrypted` over a CAS disk is accepted at startup with no capability gate (2031-triage CAS-059) {#encrypted-over-cas-missing-gate}
+
+CAS + encryption is deliberately out of scope for this release (BACKLOG/operability-and-introspection.md
+`[B17]` covers the real feature: a per-encryption-key dedup scope). The residual is only the MISSING
+FAIL-FAST: `<disk><type>encrypted</type><disk>cas_disk</disk></disk>` is accepted without any check.
+`registerDiskEncrypted`'s creator takes any `DiskPtr` out of the disk map
+(`src/Disks/DiskEncrypted.cpp:517-531`, `getDiskAndPathFromConfig` `:190-208`) and `DiskEncrypted` does
+not delegate the two CAS capability answers — it forwards `isPlain` (`src/Disks/DiskEncrypted.h:332`)
+but neither `isContentAddressed` nor `supportsAtomicFileWrites`, so both fall back to the `IDisk`
+defaults `false` (`src/Disks/IDisk.h:473-480`) while the delegate answers `true`
+(`.../ContentAddressed/ContentAddressedMetadataStorage.h:261`). Consequences: (a) every CAS-aware
+MergeTree branch is switched off (`DataPartStorageOnDiskBase.cpp:542`, `:735`,
+`MergeTreeData.cpp:7544`, `DataPartsExchange.cpp:161`, `:405`), (b) `createTransaction` returns a
+`FakeDiskTransaction` by default (`DiskEncrypted.h:344-349`, `use_fake_transaction` defaults to true —
+`DiskEncrypted.cpp:329`), so every part file reaches the CAS layer as a standalone autocommit write and
+the first blob-mandatory file throws `NOT_IMPLEMENTED`
+(`ContentAddressedTransaction.cpp:766-771`), (c) with a non-empty `<path>` prefix
+(`DiskEncryptedTransaction::wrappedPath`, `src/Disks/DiskEncryptedTransaction.h:36-42`) FREEZE shadow
+classification stops matching, because it requires the LITERAL first component `shadow`
+(`Parts/PartPathParser.cpp:277-282`) — part-file classification itself is prefix-robust (shape-based
+uuid anchor, `Parts/PartPathParser.cpp:114-128`).
+
+So the failure is loud and immediate at the first INSERT, never silent corruption — hence a P3 hygiene
+item, not a release blocker. Fix (small): refuse at disk construction/config validation when the
+delegate (transitively) answers `isContentAddressed()`, with a message naming CAS+encryption as
+unsupported; optionally also forward `isContentAddressed`/`supportsAtomicFileWrites` in `DiskEncrypted`
+once the combination is actually designed.
+
+## An owner-only slot (mount and epoch already deleted) has no row in `system.content_addressed_mounts` (2031-triage CAS-063) {#owner-only-slot-invisible-in-mounts}
+
+P3, observability only — the state is repairable, and the repair is re-running the same command.
+
+`Cas::listMounts` enumerates `roots/` and keeps only keys ending in `/mount`
+(`ContentAddressed/Pool/CasServerRoot.cpp:754-763`), and `system.content_addressed_mounts` is built
+from it (`src/Storages/System/StorageSystemContentAddressedMounts.cpp:163`). So the window a
+decommission crash can leave — `mount` and `epoch` deleted
+(`Tools/CasDecommission.cpp:372-373`), the owner anchor not yet tombstoned (`:408-435`) — produces a
+member with objects in the pool and no row in the mounts view. An operator surveying the pool cannot
+see that the slot is half-retired.
+
+It is NOT unrepairable, contrary to how the finding this came from stated it: the owner anchor is
+itself the resume anchor (`Pool::openForDecommission` reads it, and falls back to the mount lease when
+it is gone, `Pool/CasPool.cpp:820-828`), and an absent `epoch` under an absent/terminal mount is the
+`EpochMintPolicy::DecommissionRecovery` path (`Pool/CasServerRoot.cpp:221-247`), which mints a fresh
+distinct epoch and lets the re-run reach the retirement tail. Pinned by
+`gtest_cas_decommission.cpp:1054` (`SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor`), `:1231`,
+`:1267` and `:1325` (`MidRetirementCrashResumesViaMountLeaseFallback`).
+
+Owed (small): give the mounts view a row for a slot that has an `owner` (or an `epoch`) but no
+`mount`, with a state naming it — `retiring`/`half-retired` — so the operator sees the resume anchor
+instead of a silence. Related: {#decommission-successor-mount-race} (the other end of the same
+retirement tail) and `BACKLOG.md`{#decommission-wrong-predicate}.
