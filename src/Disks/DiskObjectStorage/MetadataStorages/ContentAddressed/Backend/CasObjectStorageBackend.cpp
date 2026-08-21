@@ -875,15 +875,20 @@ Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::
 {
     if (native_token_type == TokenType::Generation && etag.has_value())
     {
-        const bool valid_generation = !etag->empty()
-            && std::all_of(etag->begin(), etag->end(), [](char c) { return c >= '0' && c <= '9'; });
+        /// Validate the MINTED value, not the raw one: the HTTP boundary presents the generation
+        /// through the SDK's ETag field and therefore quotes it, and `tokenForHead` is what strips
+        /// that transport syntax. Validating before the strip would reject every real GCS write.
+        /// The message still reports the raw arrival, since that is what needs diagnosing.
+        const Token token = tokenForHead(*etag);
+        const bool valid_generation = !token.value.empty()
+            && std::all_of(token.value.begin(), token.value.end(), [](char c) { return c >= '0' && c <= '9'; });
         if (!valid_generation)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "CAS on GCS: a token-producing write to {} succeeded but its response carried no "
                 "valid generation ({}) -- there is no follow-up HEAD to patch this over, so the write "
                 "cannot be attributed to an incarnation",
                 key, *etag);
-        return tokenForHead(*etag);
+        return token;
     }
 
     /// ETag dialect (and any backend with no write-time token at all, e.g. local files): unchanged

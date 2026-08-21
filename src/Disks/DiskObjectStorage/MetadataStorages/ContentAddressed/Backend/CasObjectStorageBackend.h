@@ -141,11 +141,33 @@ public:
     void setNativeTokenTypeForTest(TokenType t) { native_token_type = t; }
 
     /// ---- Token policy (single source of truth; see the .cpp) ----
+    /// A GCS generation reaches this layer through the AWS SDK's ETag field, which the HTTP boundary
+    /// fills with an ETag-shaped — that is, quoted — value. A generation is a number, and quotes are
+    /// transport syntax that must not enter CAS protocol state, where token values are compared for
+    /// equality and written into persisted manifests. Strip them here, where the meaning changes from
+    /// "an ETag field" to "an incarnation token".
+    ///
+    /// Generation-scoped on purpose: an ETag-dialect token IS the quoted ETag, and those quotes are
+    /// required syntax when the value goes back out as `If-Match`. Stripping unconditionally would
+    /// corrupt the AWS-compatible path.
+    String normalizeTokenValue(const String & etag) const
+    {
+        if (native_token_type != TokenType::Generation)
+            return etag;
+        if (etag.size() >= 2 && etag.front() == '"' && etag.back() == '"')
+            return etag.substr(1, etag.size() - 2);
+        return etag;
+    }
+
     /// Mint the incarnation token for a key we just HEAD'd or wrote: the object ETag/generation
     /// string carried under this backend's native dialect (native_token_type).
+    ///
+    /// This is the ONLY site that mints a Generation token: `tokenForList` is the sole other
+    /// `native_token_type` mint, and `supportsListTokens` above returns false for Generation, so it
+    /// cannot produce one.
     Token tokenForHead(const String & etag) const
     {
-        return Token{etag, native_token_type};
+        return Token{normalizeTokenValue(etag), native_token_type};
     }
 
     /// The token to surface for a LISTED key: present iff this backend surfaces per-key list tokens

@@ -302,6 +302,10 @@ public:
         return result;
     }
 
+    /// The ETag field a HeadObject response carries; empty means SetETag is never called, which is
+    /// what every test written before the quoting seam was understood relied on.
+    std::string next_head_etag;
+
     Aws::S3::Model::HeadObjectOutcome HeadObject(const Aws::S3::Model::HeadObjectRequest & request) const override
     {
         ++head_object_calls;
@@ -309,6 +313,8 @@ public:
         Aws::S3::Model::HeadObjectResult result(outcome.GetResultWithOwnership());
         auto it = objects.find(request.GetKey());
         result.SetContentLength(it == objects.end() ? 0 : it->second.size());
+        if (!next_head_etag.empty())
+            result.SetETag(next_head_etag);
         return result;
     }
 
@@ -346,12 +352,13 @@ protected:
         (void)getContext();   /// see S3ObjectStorageConditionalOpsTest::SetUp in gtest_writebuffer_s3.cpp
     }
 
-    /// A fresh backend with the given cap, native token type forced to Generation.
-    std::shared_ptr<ObjectStorageBackend> makeBackend(uint64_t cap)
+    /// A fresh backend with the given cap, native token type forced to Generation unless overridden
+    /// (the ETag dialect is needed to prove the generation-only quote handling does not touch it).
+    std::shared_ptr<ObjectStorageBackend> makeBackend(uint64_t cap, TokenType token_type = TokenType::Generation)
     {
         auto storage = makeGenerationS3ObjectStorageForTest(client);
         auto b = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::Native, cap);
-        b->setNativeTokenTypeForTest(TokenType::Generation);
+        b->setNativeTokenTypeForTest(token_type);
         return b;
     }
 };
@@ -434,6 +441,59 @@ TEST_F(CASBackendGenerationS3, ResurrectNonNumericGenerationOnSuccessThrows)
     DB::ReadBufferFromOwnString in{payload};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { backend->resurrect(in, payload.size(), "p/gen/bad-etag", String("H")); });
+}
+
+/// ---- The transport-quoting seam ----
+///
+/// A GCS generation reaches this layer through the SDK's ETag field, and the HTTP boundary fills that
+/// field with an ETag-shaped, QUOTED value. Every test above this point feeds the write path an
+/// UNQUOTED generation (`next_put_etag = "778899"`), and the HTTP-layer tests assert the field is
+/// quoted -- each half self-consistent, neither crossing the seam between them. Nothing checked what
+/// the CAS layer receives in the shape production actually produces, which is why a mount that could
+/// never succeed passed every unit test. These three tests are that crossing.
+
+/// A token-producing write whose response generation arrives quoted -- exactly what
+/// `applyGcsConditionalDialectToResponse` produces -- must yield an UNQUOTED, all-digits token.
+/// Before the fix this threw CORRUPTED_DATA, so every GCS CAS write failed and no pool could mount.
+TEST_F(CASBackendGenerationS3, WriteGenerationTokenStripsTransportQuoting)
+{
+    const String header = "HDR";
+    const String payload(61, 'x');
+    backend = makeBackend(/*cap=*/header.size() + payload.size());
+    client->objects["p/gen/quoted-write"] = "original";
+    client->next_put_etag = "\"1783078552147137\"";
+
+    DB::ReadBufferFromOwnString in{payload};
+    const Token tok = backend->resurrect(in, payload.size(), "p/gen/quoted-write", header);
+    EXPECT_EQ(tok, (Token{"1783078552147137", TokenType::Generation}));
+}
+
+/// The same crossing on the read side: a marked HEAD whose ETag field carries a quoted generation
+/// must mint the same unquoted token, so a token observed by HEAD compares equal to one returned by
+/// the write that created it.
+TEST_F(CASBackendGenerationS3, HeadGenerationTokenStripsTransportQuoting)
+{
+    backend = makeBackend(/*cap=*/1024);
+    client->objects["p/gen/quoted-head"] = "body";
+    client->next_head_etag = "\"1783078552147137\"";
+
+    const auto hr = backend->head("p/gen/quoted-head");
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, (Token{"1783078552147137", TokenType::Generation}));
+}
+
+/// The bound on that stripping. An ETag-dialect token IS the quoted ETag, and the quotes are required
+/// syntax when it goes back out as `If-Match`, so the AWS-compatible path must keep them verbatim.
+/// This is the test that fails if the quote handling is ever made unconditional.
+TEST_F(CASBackendGenerationS3, EtagDialectKeepsTransportQuotingVerbatim)
+{
+    backend = makeBackend(/*cap=*/1024, TokenType::ETag);
+    client->objects["p/etag/quoted-head"] = "body";
+    client->next_head_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+
+    const auto hr = backend->head("p/etag/quoted-head");
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, (Token{"\"d41d8cd98f00b204e9800998ecf8427e\"", TokenType::ETag}));
 }
 
 #endif

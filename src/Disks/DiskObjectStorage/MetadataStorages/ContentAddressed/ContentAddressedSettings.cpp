@@ -55,6 +55,11 @@ static const std::set<std::string> non_cas_keys = {
     "type", "object_storage_type", "metadata_type", "path", "name", "use_fake_transaction",
     "endpoint", "access_key_id", "secret_access_key", "region", "use_environment_credentials",
     "readonly", "expect_continue_min_bytes", "http_client", "key_compatibility_prefix",
+    /// The GCP OAuth token-source keys that accompany `http_client = gcp_oauth`, consumed by
+    /// `diskSettings.cpp` into the client configuration. Without them a CAS pool could not be
+    /// configured against a non-default metadata endpoint or a non-`default` service account.
+    "metadata_service", "request_token_path", "service_account",
+    "max_single_part_upload_size",
 };
 
 /// Config-key convention: the disk block already scopes every key to this disk, so no
