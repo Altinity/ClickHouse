@@ -253,10 +253,23 @@ TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
     EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 2u);
 }
 
+struct ConditionalPutWireObservation
+{
+    bool negotiated_expect_continue = false;
+    bool has_if_none_match = false;
+    bool has_generation_match = false;
+    std::string generation_match;
+};
+
 /// Drive a single-part conditional PUT (`If-None-Match: *`) with `body_size` bytes through a real
 /// S3 client whose `expect_continue_min_bytes` gate is `threshold`, against the mock HTTP server, and
-/// report whether the request that reached the wire carried an `Expect: 100-continue` header.
-static bool conditionalPutNegotiatesExpectContinue(uint64_t threshold, size_t body_size)
+/// report what the request that reached the wire carried. `http_client` selects the GCS-mode client
+/// to exercise; `request_mode` decides whether that client sees the write as native-conditional.
+static ConditionalPutWireObservation observeConditionalPut(
+    uint64_t threshold,
+    size_t body_size,
+    const std::string & http_client = "",
+    DB::ObjectStorageRequestMode request_mode = DB::ObjectStorageRequestMode::Default)
 {
     TestPocoHTTPServer http;
 
@@ -278,6 +291,7 @@ static bool conditionalPutNegotiatesExpectContinue(uint64_t threshold, size_t bo
 
     client_configuration.endpointOverride = uri.endpoint;
     client_configuration.expect_continue_min_bytes = threshold;
+    client_configuration.http_client = http_client;
 
     DB::S3::ClientSettings client_settings{
         .use_virtual_addressing = uri.is_virtual_hosted_style,
@@ -304,6 +318,7 @@ static bool conditionalPutNegotiatesExpectContinue(uint64_t threshold, size_t bo
 
     DB::WriteSettings write_settings;
     write_settings.object_storage_write_if_none_match = "*";
+    write_settings.object_storage_request_mode = request_mode;
 
     DB::WriteBufferFromS3 write_buffer(
         client,
@@ -320,7 +335,19 @@ static bool conditionalPutNegotiatesExpectContinue(uint64_t threshold, size_t bo
     write_buffer.write(body.data(), body.size());
     write_buffer.finalize();
 
-    return http.getLastRequestHeader().has("Expect");
+    const auto & header = http.getLastRequestHeader();
+    ConditionalPutWireObservation observed;
+    observed.negotiated_expect_continue = header.has("Expect");
+    observed.has_if_none_match = header.has("if-none-match");
+    observed.has_generation_match = header.has("x-goog-if-generation-match");
+    if (observed.has_generation_match)
+        observed.generation_match = header.get("x-goog-if-generation-match");
+    return observed;
+}
+
+static bool conditionalPutNegotiatesExpectContinue(uint64_t threshold, size_t body_size)
+{
+    return observeConditionalPut(threshold, body_size).negotiated_expect_continue;
 }
 
 TEST(IOTestAwsS3Client, ExpectContinueOnlyWhenThresholdPositive)
@@ -334,6 +361,46 @@ TEST(IOTestAwsS3Client, ExpectContinueOnlyWhenThresholdPositive)
     EXPECT_TRUE(conditionalPutNegotiatesExpectContinue(/*threshold=*/8, /*body_size=*/64));
     /// A positive threshold still excludes a body below it (only large bodies warrant the round-trip).
     EXPECT_FALSE(conditionalPutNegotiatesExpectContinue(/*threshold=*/128, /*body_size=*/64));
+}
+
+/// The GCS-mode clients translate conditions before delegating to the common HTTP boundary, so the
+/// `Expect: 100-continue` gate — which lives at that boundary and recognises
+/// `x-goog-if-generation-match` alongside the standard headers — still sees the condition either way.
+/// Both requests below use the same endpoint, a mock server with no `storage.googleapis.com` in its
+/// hostname, so nothing here is endpoint-sniffed.
+TEST(IOTestAwsS3Client, GcsHmacTranslatesConditionsOnlyWhenMarkedAndKeepsExpectGate)
+{
+    const auto native = observeConditionalPut(
+        /*threshold=*/8, /*body_size=*/64, "gcs_hmac", DB::ObjectStorageRequestMode::NativeConditional);
+    EXPECT_TRUE(native.has_generation_match);
+    EXPECT_EQ(native.generation_match, "0");
+    EXPECT_FALSE(native.has_if_none_match);
+    EXPECT_TRUE(native.negotiated_expect_continue);
+
+    /// A Default request through the very same client keeps the standard ETag precondition, and the
+    /// threshold semantics are unchanged by which form the condition took.
+    const auto standard = observeConditionalPut(
+        /*threshold=*/8, /*body_size=*/64, "gcs_hmac", DB::ObjectStorageRequestMode::Default);
+    EXPECT_TRUE(standard.has_if_none_match);
+    EXPECT_FALSE(standard.has_generation_match);
+    EXPECT_TRUE(standard.negotiated_expect_continue);
+
+    /// The pre-existing body-size gate still applies to both forms.
+    EXPECT_FALSE(observeConditionalPut(
+        /*threshold=*/128, /*body_size=*/64, "gcs_hmac", DB::ObjectStorageRequestMode::NativeConditional)
+            .negotiated_expect_continue);
+    EXPECT_FALSE(observeConditionalPut(
+        /*threshold=*/128, /*body_size=*/64, "gcs_hmac", DB::ObjectStorageRequestMode::Default)
+            .negotiated_expect_continue);
+}
+
+/// A `Default` PUT through the GOOG4 client must survive the authentication allowlist: whatever
+/// `x-amz-*` headers the SDK puts on an ordinary write have to be translated or consumed, never
+/// rejected. This is the ordinary-traffic regression the allowlist could break.
+TEST(IOTestAwsS3Client, GcsHmacDefaultPutPassesTheAuthenticationAllowlist)
+{
+    EXPECT_NO_THROW(observeConditionalPut(
+        /*threshold=*/0, /*body_size=*/64, "gcs_hmac", DB::ObjectStorageRequestMode::Default));
 }
 
 TEST(IOTestAwsS3Client, AppendExtraSSECHeadersRead)
@@ -1226,6 +1293,48 @@ TEST(IOTestAwsS3Client, NativeConditionalModeIsRederivedOnEverySdkAttempt)
         const auto observed = runOnce(server.getUrl(), /*native_conditional=*/false);
         ASSERT_EQ(observed.size(), 1u);
         EXPECT_FALSE(observed[0]);
+    }
+}
+
+/// Response adaptation is gated on the same typed bit as the request side. Both HEADs below get an
+/// identical response — a GCS-style one carrying both an ETag and a generation — so the only thing
+/// that can produce different results is the mode.
+TEST(IOTestAwsS3Client, ResponseGenerationAndMetadataAdaptedOnlyWhenMarked)
+{
+    const std::vector<ScriptedResponse> script{{Poco::Net::HTTPResponse::HTTP_OK, {
+        {"ETag", "\"6654c734ccab8f440ff0825eb443dc7f\""},
+        {"x-goog-generation", "1783078552147137"},
+        {"x-goog-meta-cas-envelope", "v1"},
+    }}};
+
+    auto headOnce = [&script](bool native_conditional)
+    {
+        ScriptedResponseServer server(script);
+        auto client = makeRecordingClient(server.getUrl(), /*max_retries=*/0, /*max_redirects=*/0);
+
+        DB::S3::HeadObjectRequest request;
+        request.SetBucket("bucket");
+        request.SetKey("key");
+        request.setNativeConditional(native_conditional);
+        return client->HeadObject(request);
+    };
+
+    {
+        SCOPED_TRACE("marked: the generation becomes the SDK-visible ETag and the metadata crosses over");
+        auto outcome = headOnce(/*native_conditional=*/true);
+        ASSERT_TRUE(outcome.IsSuccess());
+        EXPECT_EQ(outcome.GetResult().GetETag(), "\"1783078552147137\"");
+        const auto & metadata = outcome.GetResult().GetMetadata();
+        ASSERT_TRUE(metadata.contains("cas-envelope"));
+        EXPECT_EQ(metadata.at("cas-envelope"), "v1");
+    }
+
+    {
+        SCOPED_TRACE("Default: the upstream ETag survives even though a generation is present");
+        auto outcome = headOnce(/*native_conditional=*/false);
+        ASSERT_TRUE(outcome.IsSuccess());
+        EXPECT_EQ(outcome.GetResult().GetETag(), "\"6654c734ccab8f440ff0825eb443dc7f\"");
+        EXPECT_FALSE(outcome.GetResult().GetMetadata().contains("cas-envelope"));
     }
 }
 

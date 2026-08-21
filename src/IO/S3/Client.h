@@ -253,10 +253,6 @@ public:
 
     const PocoHTTPClientConfiguration & getClientConfiguration() const { return client_configuration; }
 
-    /// True when this client's HTTP layer runs the GCS conditional dialect (http_client =
-    /// gcs_hmac or gcp_oauth): conditional tokens are GCS generations riding the ETag plumbing.
-    bool usesGcsConditionalDialect() const { return client_configuration.gcs_conditional_dialect; }
-
     /// True when this client's HTTP layer can honor the typed `NativeConditional` request mode
     /// (http_client = gcs_hmac or gcp_oauth), independent of whether any given request opts in.
     bool supportsGcsNativeConditionalRequests() const;

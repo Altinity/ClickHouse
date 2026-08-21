@@ -77,8 +77,8 @@ public:
     HeadResult head(const String & key) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
     /// and EmulatedSingleProcess modes. FALSE on a generation-token store (GCS): the XML LIST
-    /// surfaces MD5-style ETags in the response BODY, which the conditional dialect's header-level
-    /// rewrite cannot map to generations. A list-derived token would therefore be an invalid
+    /// surfaces MD5-style ETags in the response BODY, which the header-level response adaptation
+    /// cannot map to generations. A list-derived token would therefore be an invalid
     /// `If-Match` token; generation stores deliberately omit it and make GC re-read each shard.
     /// Consumers already treat absent list tokens as Read/fail-closed (GC discover re-reads every
     /// shard — a cost, not a correctness change).
@@ -135,7 +135,7 @@ public:
     SentinelProbeResult probeSentinelRaw(const String & key) override;
 
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
-    /// stores, TokenType::Generation when the storage runs the GCS conditional dialect (the
+    /// stores, TokenType::Generation when the storage mints GCS generations (the
     /// generation rides the ETag plumbing; the VALUE stays opaque either way).
     TokenType nativeTokenType() const { return native_token_type; }
     void setNativeTokenTypeForTest(TokenType t) { native_token_type = t; }

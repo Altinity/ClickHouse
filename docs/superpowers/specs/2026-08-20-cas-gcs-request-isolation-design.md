@@ -403,9 +403,14 @@ virtual std::optional<ObjectMetadata> tryGetObjectMetadataWithNativeToken(
 
 The default implementation avoids changes to unrelated object-storage implementations.
 `S3ObjectStorage` overrides the method and builds a `HeadObjectRequest` with
-`NativeConditional`. `CasObjectStorageBackend::nativeHead` and the raw CAS sentinel probe use this
-method. A missing object remains the normal `nullopt` outcome; unrelated authentication, container,
-network, and service errors continue to propagate.
+`NativeConditional`. `CasObjectStorageBackend::nativeHead` uses this method. A missing object remains
+the normal `nullopt` outcome; unrelated authentication, container, network, and service errors
+continue to propagate.
+
+`probeSentinelRaw` keeps calling the throwing `getObjectMetadata`: it must tell no-such-key from
+no-such-bucket from resource-not-found from a transient failure, and an optional return collapses all
+of them into one `nullopt`. It also discards the metadata, so it consumes no token and gains nothing
+from the mark.
 
 The S3 implementation extends `getObjectInfoIfExists` or its immediate request-building helper with
 an explicit request mode so the field is set on the actual `HeadObjectRequest`. It must not emulate

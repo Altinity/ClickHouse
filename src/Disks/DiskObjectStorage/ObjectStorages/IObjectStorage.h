@@ -388,7 +388,7 @@ public:
     virtual bool supportParallelWrite() const { return false; }
 
     /// True when the incarnation tokens this storage returns from writes/HEADs are GCS generation
-    /// numbers riding the ETag plumbing (http_client = gcs_hmac / gcp_oauth conditional dialect).
+    /// numbers riding the ETag plumbing (http_client = gcs_hmac or gcp_oauth).
     /// Consumers (the CAS backend) stamp TokenType::Generation and route conditional writes
     /// through the single-PUT path (GCS enforces no preconditions on CompleteMultipartUpload).
     virtual bool conditionalOpsUseGenerationTokens() const { return false; }

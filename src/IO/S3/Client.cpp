@@ -1321,12 +1321,7 @@ std::unique_ptr<S3::Client> ClientFactory::create( // NOLINT
     auto credentials_provider = getCredentialsProvider(client_configuration, credentials, credentials_configuration);
 
     if (Poco::toLower(client_configuration.http_client) == "gcs_hmac")
-    {
-        client_configuration.gcs_conditional_dialect = true;
         client_configuration.gcs_hmac_credentials_provider = credentials_provider;
-    }
-    else if (Poco::toLower(client_configuration.http_client) == "gcp_oauth")
-        client_configuration.gcs_conditional_dialect = true;
 
     /// Disable per-thread retry loops if global retry coordination is in use.
     if (client_configuration.s3_slow_all_threads_after_retryable_error)

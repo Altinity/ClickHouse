@@ -51,10 +51,22 @@ its token dialect from `IObjectStorage::conditionalOpsUseGenerationTokens()`:
 | `GCS` | `Generation` | The backend rewrites conditional headers before the request goes out: `If-None-Match: *` becomes `x-goog-if-generation-match: 0`, and `If-Match: <etag>` becomes `x-goog-if-generation-match: <generation>` (`applyGcsConditionalDialectToRequest`, `IO/S3/GCSConditionalDialect.cpp`) |
 
 The GCS dialect is opted into by client configuration (`http_client = gcs_hmac` or `gcp_oauth`), not
-auto-detected from the endpoint host. It also rejects one shape outright: a **conditional
-`CompleteMultipartUpload`** throws rather than silently dropping the precondition, because GCS
-ignores preconditions on that call — a measured, documented gap, not a hypothetical one. `CAS`'s
-conditional writes therefore always take the single-`PUT` path on a generation-dialect backend.
+auto-detected from the endpoint host. Within such a disk it applies only to `CAS`'s own requests;
+ordinary reads, writes, and copies through the same disk keep standard `ETag` semantics. It also
+rejects one shape outright: a **conditional `CompleteMultipartUpload`** throws rather than silently
+dropping the precondition, because GCS ignores preconditions on that call — a measured, documented
+gap, not a hypothetical one. `CAS`'s conditional writes therefore always take the single-`PUT` path
+on a generation-dialect backend.
+
+With `http_client = gcs_hmac`, requests are signed with Google's native `GOOG4-HMAC-SHA256` scheme,
+and GCS refuses a request that mixes the `x-amz-` and `x-goog-` header prefixes. Every `x-amz-*`
+header must therefore have a known GCS counterpart before signing, and one that does not is refused
+with an error naming it. Two configurations reach that refusal: server-side encryption, whether
+KMS-based or with a customer-supplied key, because GCS expresses encryption through a different
+contract than `x-amz-server-side-encryption*`; and any custom `x-amz-*` header set on the disk with
+`<header>`. Both fail with a clear error rather than being sent under a guessed `x-goog-` name GCS
+would not honour or in a mixed-prefix request GCS would reject outright. Configure such a disk
+against an AWS-compatible endpoint instead.
 
 This bounds conditional writes only: the write-once create is therefore single-part and limited by
 `gcs_max_conditional_put_bytes` on a generation dialect, while the unconditional resurrect takes the

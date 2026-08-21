@@ -1502,9 +1502,9 @@ TEST_F(S3ObjectStorageConditionalOpsTest, RemoveObjectIfTokenMatchesNotFoundIsNo
 }
 
 /// `tryGetObjectMetadataWithNativeToken` must mark its HEAD wrapper eligible for the typed
-/// NativeConditional mode (the old blanket GCS dialect stays authoritative over the wire until a
-/// later task; this only proves the mark reaches the production request object), and it must keep
-/// tryGetObjectMetadata's existing missing-object contract of returning nullopt.
+/// NativeConditional mode — the mark is what makes a GCS-mode client apply generation semantics to
+/// this HEAD — and it must keep tryGetObjectMetadata's existing missing-object contract of returning
+/// nullopt.
 TEST_F(S3ObjectStorageConditionalOpsTest, NativeTokenHeadIsMarkedAndMissingIsNullopt)
 {
     store->GetBucketStore(bucket).PutObject("existing-key", "some-body");
