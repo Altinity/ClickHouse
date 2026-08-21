@@ -284,3 +284,31 @@ the scheduler holding a second reference — a refcount accident, not an invaria
 is documented as a brief-snapshot lock. Fix: hoist both into locals, release the lock, reset them
 unlocked — exactly the handling `old_scheduler` already gets in the same function. P3: latency and
 lock-hold hygiene, no corruption.
+
+## `createNamespaceStep1` is the one writer-plane durable write without a fence check (umbrella review V1) {#create-namespace-step1-unfenced}
+
+Result of the exhaustive sweep the 2026-08-05 review asked for and could not finish: every mutating
+`Cas::Backend` method plus the one non-backend `writeObject` staging path was enumerated and
+classified (writer plane / GC plane / administrative / bootstrap). Exactly one writer-plane site
+lacks the fence: `createNamespaceStep1` (`Pool/CasRefCatalog.cpp:200-230`) is the only caller of
+`casUpdateImpl` that skips the fence obligation its own header documents
+(`Pool/CasRefCatalog.h:84-95`), while the parent `createNamespace` passes
+`admitted_generation`/`check_fence_or_throw` to step 3.
+
+Consequence: a fenced-out mount can durably insert a `Creating` row carrying a freshly minted
+namespace incarnation under an already-dead `CreatorFence`. It self-heals — step 3 refuses and the
+next opener reconciles — so this is durable garbage in the pool-global `cas/ref_catalog`, not data
+loss, hence P3. The fix is one line, symmetric with the four sibling callers, and there is no test
+for it today (`gtest_cas_fence_generation.cpp` covers the plain-object, S3-staging and condemned
+paths only). Lower-confidence secondary: the abort-path `deleteExact` at
+`Pool/CasPartWriteTxn.cpp:1433` is unfenced and sits inside a swallowing `catch(...)`.
+
+## Decommission liveness recheck vs owner-anchor CAS: a live successor can be stamped retired (umbrella review V4) {#decommission-toctou-stamps-successor}
+
+The review's framing — "the sweep deletes what the successor needs" — does not hold: the destructive
+phases run under the victim's own mount lease, released only at `admin.reset()` afterwards. The
+window is real but produces a different defect: a cross-key TOCTOU between the liveness recheck (the
+`mount`/`epoch` GETs) and the owner-anchor CAS lets a LIVE same-UUID successor be stamped
+`retired_at_ms`, so its next restart is wrongly refused with `CORRUPTED_DATA`. Availability, not
+loss; reproducing it needs a chaos test that restarts the victim between the recheck and the CAS.
+P2. Loosely adjacent: 2031-triage CAS-063 and CAS-007.

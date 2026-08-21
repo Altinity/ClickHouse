@@ -460,6 +460,10 @@ harmless; re-freezing a DIFFERENT part that carries the same part name (after `R
 `ATTACH PARTITION FROM`, which can reuse `all_1_1_0`) silently produces one frozen ref mixing files
 from two snapshots, where upstream would have refused the operation.
 
+Cross-disk `ATTACH PARTITION FROM` into a content-addressed disk now works after `cfe9a6a3615`, so
+the local→CAS route to this state is reachable instead of failing earlier in `freezeRemote`.
+Reconsider this item's priority against that wider reachability rather than inheriting its old rank.
+
 Fix options, both small: teach `isDirectoryEmpty` to keep the listing-based answer for shadow part
 dirs (the removal-path rationale only covers live/detached part dirs, and shadow removal goes through
 `removeRecursive`, not `removeDirectory`), or reject a shadow ref that already exists on the FREEZE
