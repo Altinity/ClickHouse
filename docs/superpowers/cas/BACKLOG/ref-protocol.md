@@ -73,3 +73,29 @@ the read path) into the waits that run on a query thread — read/single-flight 
 after. Related, already listed here: `[timeout-retry RFC residuals]` item (c) —
 `PartFolderAccess` single flight rides the disk's default S3 retry profile instead of the CA
 controller.
+
+## Part-folder single flight keyed by ref only, no post-wait manifest check (2031-triage CAS-019) {#part-folder-single-flight-manifest-keying}
+
+`PartFolderAccess`'s single-flight key is `ns+ref` (`Parts/PartFolderAccess.h:34`, `:383-384`) and a
+waiter never re-checks that the view it receives is for the manifest id it resolved
+(`.cpp:277,283,286-287`). Not the mixed-manifest hazard the audit claims: single flight covers only
+the stale-tolerant `CachedForLoad` mode (`.cpp:267-270`), every view is an internally consistent
+single-manifest snapshot, and all read-after-write paths use `ForceFresh`. The real consequence is a
+one-repoint skew — a follower straddling a repoint can get the neighbouring manifest's view and
+surface a spurious `FILE_DOESNT_EXIST`.
+
+Fix: either key the single flight by `ns+ref+manifest_id`, or add the cheap post-wait check (compare
+the served view's manifest id against the resolved one and re-resolve on mismatch). The second is
+smaller and keeps the sharing benefit. P2.
+
+## Allocation in `noexcept`/destructor paths under a memory limit (2031-triage CAS-018) {#noexcept-allocation-hardening}
+
+The audit's headline (leadership leaked out of the ref queue on a throw) is closed: release is a
+single unconditional authority (`Pool/CasRefLedger.cpp:2019,2022-2029,2039,2099`) and the historic
+stranded-item bug was fixed in `79c07d6cc3d` with regression tests in
+`gtest_cas_ref_lane_exception_safety.cpp`; its "renewal fences the mount" sub-claim is simply false
+(the hook is wrapped, `Pool/CasServerRoot.cpp:1474-1483`). What remains is hardening nits: string
+formatting / container work inside `noexcept` functions and destructors that can throw under a
+memory limit — `Gc/CasGcPhaseTimer.h:52-75`, the `Backend/CasProbe.cpp` cleanup lambdas,
+`Pool/CasMountRuntime.cpp:529-532`, and the fail-closed branch at `CasRefLedger.cpp:2085-2090`.
+P3: wrap or pre-size those, no behaviour change intended.
