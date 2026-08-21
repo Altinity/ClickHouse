@@ -489,3 +489,58 @@ is a protocol-step change and therefore under the standing `HEAD`-before-`PUT` v
 explicit user decision with a risk analysis, not an opportunistic optimization. Cheap and unblocked in
 the meantime: quantify it, i.e. report the body/`.meta` object split in `SYSTEM CAS FSCK` output so the
 2x LIST cost is visible rather than inferred.
+
+## Opening one part file repeats the whole path-parse + route + view lookup two or three times (2031-triage CAS-118) {#read-path-repeated-view-lookup-per-open}
+
+Every read-side entry point re-derives the same `(ref, file)` from scratch: `parsePartFilePath` →
+`route` → `partAccess()`/`poolAccess()` → `getView` → `findFile`. One `DiskObjectStorage::readFile` on
+a blob-backed part file walks that chain twice — `prepareRead` first calls `prepareInManifestRead` →
+`tryGetInManifestBytes` (`ContentAddressedMetadataStorage.cpp:1962-1971`) and, on the normal
+non-inline outcome, then calls `getBlobViewPlan`, which parses and routes the identical path again
+(`:1999-2010`) — and a third time whenever the caller sized the file first through `getFileSize`
+(`:1656-1664`). Each pass takes the pool pointer lock plus the ref table's `state_mutex`
+(`Pool/CasRefLedger.cpp:311-312`) and the view cache's own lock, so a wide part multiplies the count
+by its file count.
+
+This is CPU and lock traffic only, not requests: `resolveRef` is a pure in-memory lookup on the
+mounted writer's cached `RefTableState` (`Pool/CasRefLedger.cpp:275-289`) and a warm `CachedForLoad`
+view hit returns without touching `readManifestShared` (`Parts/PartFolderAccess.cpp:176-191`), so
+none of the repeats reaches object storage. Fix direction: let `prepareRead` obtain one view (or one
+resolved `Route` + view pair) and pass it to both the in-manifest probe and the blob-window
+computation instead of each callee re-deriving it; the `PoolAccessSnapshot` plumbing that already
+shares one mount generation between `getView` and `locate` is the natural place to hang it. Ordering:
+strictly after the request-count items above, which dominate wall time.
+
+## The conditional-write lane retries on a deterministic backoff grid and sits outside the disk's cross-thread retry pacing (2031-triage CAS-119) {#conditional-write-retry-pacing-and-jitter}
+
+Two small, real residuals of the single-attempt conditional-write design (the design itself is settled —
+RFC `cas-s3-timeout-retry-control`, mount-time fail-closed gate at
+`Backend/CasObjectStorageBackend.cpp:112-127`, profile set at `:867`):
+
+1. **No jitter.** `CasRequestController::backoffBeforeAttempt` is a purely deterministic capped
+   exponential — `initial · 2^(attempt-2)` clamped to the cap, no random factor
+   (`Backend/CasRequestControl.cpp:231-244`), defaults 200 ms → 5 s
+   (`Backend/CasRequestControl.h:187-188`). Every thread that hits the same disruption at the same
+   moment therefore reissues on the same 200/400/800 ms grid. This matters here specifically because
+   the write path deliberately fans a part's blob uploads across 16-33 threads
+   (`fanOutBlobUploads`), so a store-wide 503/`SlowDown` episode produces synchronized reissue waves
+   from one part commit. Cheap fix: multiply the computed sleep by a `[1, 1+f)` factor, the same shape
+   the S3 client already has (`IO/S3/Client.cpp:144-149`).
+
+2. **The lane is excluded from the disk's cross-thread pacing.** `getSingleAttemptClient` clones the
+   disk client with `retry_strategy.max_retries = 0`
+   (`ObjectStorages/S3/S3ObjectStorage.cpp:1032-1051`); the clone is a distinct `Client` object, and
+   `next_time_to_retry_after_retryable_error` is a per-object atomic that the copy constructor does
+   not carry over (`IO/S3/Client.h:355`, `IO/S3/Client.cpp:340-363`). On top of that, the client's own
+   `updateNextTimeToRetryAfterRetryableError` fires only from `attempt_no > 1`
+   (`IO/S3/Client.cpp:836-843`) and `max_attempts` is `max_retries + 1 == 1` here (`:806`), so a
+   throttled conditional write neither observes nor contributes to the shared slowdown window that the
+   rest of the disk's traffic honors before every attempt (`:852`). Direction: seed/share the
+   slowdown state with the parent client for the single-attempt clone, or let the CAS controller
+   consult it.
+
+Neither is a correctness issue — the controller is bounded (16 attempts, 90 s operation deadline,
+`Backend/CasRequestControl.h:168-173`) and every unproven outcome is `Unresolved`, never a false
+`Committed`. Related, already tracked: `{#issue-2244-lease-retry-asymmetry}` (the lease/remount ops
+have the OPPOSITE problem — no retries at all) and `[timeout-retry RFC residuals]` in
+`BACKLOG/ref-protocol.md`.
