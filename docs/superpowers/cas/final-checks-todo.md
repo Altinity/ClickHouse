@@ -110,7 +110,20 @@ and none of the three was tracked anywhere until now.
   `use_fake_transaction` rejection one file over. Decide: reject `custom_disk` for pool-joining
   metadata types, or require a dedicated grant.
 
-## 10. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 10. Fix the shutdown-path null dereference: detached CAS work outliving `Context` {#fix-detached-pool-context}
+
+- Source: the second 2026-08-05 umbrella review (opus), items B3 + B4, re-verified at HEAD
+  2026-08-22; full record in `docs/superpowers/cas/opus-review-triage.md` `{#b3}`/`{#b4}` and BACKLOG
+  `{#detached-pool-outlives-context}`. Untracked until now.
+- One coupled chain: `shutdown()` does not drain the detached CAS dispatches, which hold a strong
+  `Pool` reference, so `~Pool`'s durable farewell write and mount-event emit can run arbitrarily late
+  — and CAS logs through a strong `ContextPtr` whose `shared` is already nulled by
+  `resetSharedContext()`. The snapshot publisher is a routine path, so this is not an exotic race.
+- Fix both halves: a tracked drain `shutdown()` waits on (so `~Pool` runs while the world exists),
+  and an event-emit path that tolerates an absent log/context instead of dereferencing it.
+- Pre-release: yes. It is a crash at shutdown on any server that ever mounted a CAS disk.
+
+## 11. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
