@@ -341,3 +341,31 @@ exists, so the repoint path could stage the MERGED manifest once, precommit it, 
 blobs under that edge, then promote — one body instead of two, with no weakening of
 EDGE-BEFORE-OBSERVE. The audit-row volume can be addressed independently (aggregate one
 `BlobReuseAdopt`-class row per publish with a count, keeping the per-leaf `ProfileEvent`).
+
+## A file-cache disk over a CA disk never invalidates entries for GC-reclaimed blobs (2031-triage CAS-084) {#file-cache-stale-after-gc-reclaim}
+
+With the opt-in `<type>cache</type>` disk in front of a content-addressed disk
+(`DiskObjectStorage::wrapWithCache`, `src/Disks/DiskObjectStorage/DiskObjectStorageCache.cpp:14-43`),
+only the object storage is wrapped: the CA metadata storage is reused as-is, and every CA control
+and reclamation call goes through `Cas::ObjectStorageBackend`, which is built over the metadata
+storage's own raw `object_storage`
+(`ContentAddressed/ContentAddressedMetadataStorage.cpp:692`, member at
+`ContentAddressed/ContentAddressedMetadataStorage.h:571`). Blob reads, in contrast, DO ride the
+cached router (`DiskObjectStorage.cpp:842-884`, `storage->prepareRead` adds the filesystem-cache
+stage). Consequence: a blob cached on a read and later reclaimed by GC (`deleteExact` →
+`removeObjectIfTokenMatches`, `Backend/CasObjectStorageBackend.cpp:999-1014`) never reaches
+`CachedObjectStorage::removeCacheIfExists`
+(`ObjectStorages/Cached/CachedObjectStorage.cpp:150-158`), which is the only invalidation hook and
+is called exclusively from that class's own `writeObject`/`removeObject*`.
+
+Not a correctness problem: cache keys are the content-addressed blob keys, so a stale entry can
+only ever return the exact bytes it was admitted with, and no live ref names a reclaimed blob. Not
+an unbounded leak either: a cache disk must declare `max_size` or
+`max_size_ratio_to_total_space` (`src/Interpreters/FileCache/FileCacheSettings.cpp:230-237`), so the
+stale entries are LRU-evicted under pressure. The real residuals are (a) stale entries consume the
+cache budget until evicted, so effective hit rate degrades on a GC-heavy workload, and (b) the
+bytes of a reclaimed blob linger on the node's local disk until eviction, with
+`SYSTEM DROP FILESYSTEM CACHE` as the only operator handle. Fix direction: have the CA reclamation
+path notify the local cache for the deleted key (a `removeCacheIfExists`-style hook reachable
+without routing CA deletes through the cached object storage, which must NOT happen — the control
+plane deliberately bypasses the cache).

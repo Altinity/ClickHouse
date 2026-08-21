@@ -89,8 +89,8 @@
 | CAS-071 | by-design | P3 | — | нет | Позиция прежнего вердикта (CAS-090: by-design, latent) на HEAD в силе — `mount_keeper` меняется только под `Pool::remount_mutex` и его единственный «конкурент» отсечён конфиг-гейтом в коде; заявленный разрыв fence/deadline против `mayMutate()` фактически неверен, остаётся один косметический остаток (`pool_uuid` публикуется вне `pointer_mutex`). |
 | CAS-072 | частично | P3 | [{#precommit-add-single-slot-guard}](BACKLOG.md#precommit-add-single-slot-guard) | нет | Форма кода реальна (один слот precommit, перезаписывается без проверки), но второй `precommitAdd` на одном `PartWriteTxn` не достижим ни на одном рабочем пути — остаётся латентный инвариант без исполняемой защиты. |
 | CAS-073 | by-design | P3 | [{#cas-021-followups}](BACKLOG.md#cas-021-followups) | нет | Все три формы верны, но следствие изобретено: маркер по определению не является авторитетом удаления — удаляет exact-token delete по токену из retired-строки, а resurrect ротирует incarnation-tag, так что маркер «прошлой инкарнации» ничего удалить не разрешает. |
-| CAS-074 | ⏳ | — | — | — | — |
-| CAS-075 | ⏳ | — | — | — | — |
+| CAS-074 | частично | P2 | [{#stranded-generation-prefix-invisible-to-fsck} (новая секция; существующее покрытие — {#suppressed-handoff-consumption}, [gc-handoff-single-crash-leak], BACKLOG.md{#gc-round-budgets-not-backpressure} класс C)](BACKLOG.md#stranded-generation-prefix-invisible-to-fsck} (новая секция; существующее покрытие — {#suppressed-handoff-consumption}, [gc-handoff-single-crash-leak], BACKLOG.md{#gc-round-budgets-not-backpressure} класс C) | нет | Форма кода верна и давно задокументирована самим кодом (курсор монотонный, hand-off одноразовый), утечка отслеживается тремя пунктами BACKLOG; но подтвердился НЕ отслеженный остаток: обещанный «backstop = fsck» не существует — `runFsck` вообще не перечисляет `gc/`, так что осиротевший префикс генерации не только не реклеймится, но и невидим. |
+| CAS-075 | частично | P3 | `gc.md`{#gc-followups} → пункт `[REBUILD R4 residual — manifest-less blobs unreclaimable]`; видимость счётчика — `operability-and-introspection.md`{#fsck-meta-body-counters-unrendered} | нет | Порядок «тело durable → потом `.meta`» и отсутствие LIST-а `blobs/` где-либо кроме fsck подтверждаются, но вывод «reclaimed by no sweep at all и не виден» — половинчатый: класс уже отслежен как by-design-остаток R4, а осиротевшее тело ВИДНО как `unaccounted` на всех трёх поверхностях fsck. |
 | CAS-076 | not-a-bug | — | — | — | Форма кода верна (печать fold-seal идёт до единственного CAS `gc/state`), но следствие «ничего не убирает поколения, которые состояние не приняло» на HEAD ложно: оптовый префиксный prune `gc/gen/<g>/` — единственный и штатный сборщик ВСЕХ попыток, включая непринятые, и это закреплено тестами. |
 | CAS-077 | частично | P3 | [{#dead-member-frozen-build-floor} (новая секция в `BACKLOG/gc.md`)](BACKLOG.md#dead-member-frozen-build-floor} (новая секция в `BACKLOG/gc.md`) | нет | Удержание реально: право на удаление даёт только собственный mount-floor умершего узла, и у слота, который никто не переклеймил, `min_active`/`writer_epoch` больше не двигаются — но механизм в находке назван неверно (лиза не исчезает при потере узла), «навсегда» верно лишь для слота без перезапуска/сукцессора/декоммиссии, а сама консервативность — сознательный контроль #9. |
 | CAS-078 | подтверждено | P3 | [{#janitor-cursor-rewind-on-list-error}](BACKLOG.md#janitor-cursor-rewind-on-list-error) | нет | Сброс курсора уборщика namespace на любой ошибке LIST реален и запинен тестом, но это только задержка реклейма (громкая, посчитанная fsck), а не потеря данных. |
@@ -3575,3 +3575,195 @@ graduation при удалении уже нессылаемого блоба, �
 5. Реальный остаток (его я и оставил в backlog). `sweepOwnMountStaging` вызывается ровно один раз, на старте монтирования, и никакой периодической уборки внутри живого монтирования нет (единственный call-site — `ContentAddressedMetadataStorage.cpp:844`). Значит при включённом (opt-in) `staging_backend=s3` staged-байты каждого убитого/отменённого INSERT, упавшей мутации и оборванного MOVE копятся всё время работы монтирования и вычищаются только следующим рестартом; при этом ни GC, ни `runFsck` их не перечисляют (см. п.1), так что оператор живого члена не видит объём мусора. В существующем backlog это НЕ покрыто: `BACKLOG/operability-and-introspection.md:42-43` упоминает staging только чтобы сказать «the S3 staging prefix has a sweeper; local scratch does not» — то есть трактует S3-часть как решённую, что верно лишь для момента монтирования. Поэтому добавлена новая (незакоммиченная) секция `docs/superpowers/cas/BACKLOG/formats-and-storage.md` — `{#s3-staging-reclaim-only-at-mount-start}`: периодический свип того же fenced-префикса с возрастным фильтром, который не может дотянуться до in-flight объекта, плюс вывод счётчика/байт staging в интроспекцию.
 
 6. Классификация. Молчаливой порчи данных нет: если staging-объект исчез, `promoteStaged`/resurrect не находит источник и попытка падает громко; удержание же лишь стоит места в бакете. Приоритет P2 (отслеживать после релиза, не блокер): путь opt-in и по умолчанию ВЫКЛЮЧЕН (`staging_backend=local` по умолчанию), любой рестарт вычищает остаток, а для мёртвого члена дренаж уже есть. Не «дубликат»: `CAS-060` этого раунда — про per-file IV и дедуп, ссылка «carried from prev CAS-060» в one-liner'е — артефакт нумерации предыдущего раунда, к этому ID отношения не имеет.
+
+## CAS-074 — Форма кода верна и давно задокументирована самим кодом (курсор монотонный, hand-off одноразовый), утечка отслеживается тремя пунктами BACKLOG; но подтвердился НЕ отслеженный остаток: обещанный «backstop = fsck» не существует — `runFsck` вообще не перечисляет `gc/`, так что осиротевший префикс генерации не только не реклеймится, но и невидим. (частично, P2) {#cas-074}
+
+Анкеры находки (`CA/Gc/CasGc.cpp:2456-2500`, `:829-856`) — из снапшота, которого в репозитории нет;
+на HEAD это `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp` (перенос —
+`592b9b83568`), а номера строк устарели примерно вдвое: `pruneSupersededGenerations` — `:3586-3691`,
+post-CAS hand-off (`PHASE 14/18 handoff_reclaim`) — `:1096-1166`.
+
+ЧТО ПОДТВЕРЖДАЕТСЯ НА HEAD.
+
+1) Курсор действительно перешагивает ЕЩЁ ССЫЛАЕМЫЕ генерации. В цикле prune генерация, которую
+удерживает живой adopted seal, пропускается через `continue` (`Gc/CasGc.cpp:3640-3646`), а после цикла
+курсор ставится в `g - 1` (`:3662`), т.е. включает пропущенную генерацию. Это не побочный эффект, а
+явно описанный контракт: `:3634-3639` («ref-retained (skipped) generations count as fully processed»)
+и `:3646-3657` («the wholesale prune NEVER revisits it once it is behind the cursor»).
+
+2) Hand-off действительно ОДНОРАЗОВЫЙ и это единственный компенсатор. `:1096-1110` — «the round that
+finally moves the ref OFF this generation … wholesale-deletes this whole prefix right after its CAS»;
+`:1144-1149` — «a generation this call reclaims only PARTIALLY is left … to `fsck`, never revisited by a
+later round's hand-off (the parent-seal difference that triggers it does not recur once the ref has
+moved)». Три способа потерять эту работу навсегда:
+   • подавление раунда — `handoff_candidates = suppress_destructive ? kNoRuns : parent_seal_runs`
+     (`:1134-1136`), с собственным капслоком в комментарии `:1119-1132` («UNLIKE EVERY OTHER GATED SITE,
+     SUPPRESSION HERE LOSES THE WORK RATHER THAN POSTPONING IT»);
+   • исчерпание бюджета — `remaining == 0 → break` (`:1150-1152`), бюджет
+     `gc_round_handoff_prefix_wholesale_budget` = 5000 объектов/раунд по умолчанию
+     (`ContentAddressedSettings.cpp:82`), отдельный резерв введён `08e215fbe8b`;
+   • крэш между round-CAS и фазой — `:1105-1107`.
+
+3) Ничто не пересматривает `snap_pruned_through` вниз. Prune стартует строго с
+`next.snap_pruned_through + 1` (`:3621`), в `rebuildBaseline` курсор переносится как есть (в
+`Gc::rebuildBaseline`, `:3849+`, перезаписываются только `snap_generation`/`snap_attempt`), других
+записей поля в продакшн-коде нет (`grep snap_pruned_through` даёт только формат
+`Formats/CasGcStateFormat.cpp:29,55`, инспектор `Tools/CasInspect.cpp:310`, prune и метрики
+`:1070-1074`).
+
+ЧТО В НАХОДКЕ НЕТОЧНО / НЕВЕРНО.
+
+a) «returns on `suppress_destructive`; cursor advances even when skipping» склеены в одно следствие,
+хотя это два разных механизма и подавляющий из них курсор НЕ двигает: `if (suppress_destructive)
+return;` стоит ДО любого изменения `next.snap_pruned_through` (`:3591-3592`), и это специально
+обосновано (`:3588-3591`: «advancing it over a generation this round declined to delete would strand
+that generation's whole prefix»). Пинится тестом `CASGCFrontierGate.TheHandOffReclaimIsInertUnderSuppression`
+(`gtest_cas_gc_frontier_gate.cpp:1380`, проверка неизменности курсора — `:1358-1367`). Т.е. подавление
+теряет только hand-off-часть; «курсор уезжает из-за подавления» — неверно.
+
+b) «budget-exhausted hand-off» как отдельное новое наблюдение — верно по коду, но у prune-половины
+такого дефекта нет: недодренированная генерация НЕ пускает курсор вперёд (`fully_drained` → `break`,
+`:3654-3661`), и это закреплено
+`CASGCSnapRetention.PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration`
+(`gtest_cas_gc_round.cpp:1318`).
+
+c) «leaks its objects permanently» — по последствиям это утечка МЕСТА, fail-safe, без потери данных и
+без тихой порчи: пропуск сделан именно чтобы не удалить живой run (`:3640-3646`), а обратная ошибка
+(prune съел ссылаемый run) — отдельный, наблюдавшийся однажды класс, уже записанный как
+`gc.md`{#adopted-seal-pruned-run-2026-07-25}. Правильные покрытия leak-класса существуют:
+   • `gc.md`{#suppressed-handoff-consumption} — «MINOR (bounded leak, fsck-visible) … under Stage A's
+     blanket suppression this DROPS rather than defers, and nothing revisits it»; пинится тем же
+     frontier-gate-тестом;
+   • `gc.md`:131 `[gc-handoff-single-crash-leak]` — ровно крэш-окно этой фазы, «distinct from the
+     suppressed-handoff-consumption item above»;
+   • `BACKLOG.md`{#gc-round-budgets-not-backpressure}, класс **C** — дословно про
+     `gc_round_handoff_prefix_wholesale_budget`: «A cap on one-shot work, i.e. a leak».
+   Т.е. все три механизма из п.2 уже отслежены; нового в этой части находка не даёт.
+
+d) «Trigger: a cold gc-shard carrying a generation by reference, plus one suppressed or
+budget-limited round» — триггер реален, но систематическая его половина уже закрыта: пункт
+{#suppressed-handoff-consumption} прямо оговаривает «Stops being systematic the moment
+{#stage-b-7b-sequencing} flips `kDefault`», а флип состоялся (`58fd482a800`, `Gc/CasGc.h:63`
+`kDefault = Authoritative`) — подавление теперь событийное (`suppress_destructive = !anomalies.empty()
+|| !carried_holds.empty() || frontier_incomplete`, `:3066-3067`), а не безусловное. Так что частота
+осталась «редкий раунд с аномалией/холдом/недоказанным frontier», а не «каждый раунд».
+
+РЕАЛЬНЫЙ ОСТАТОК (не отслеживался) — обещанного backstop не существует.
+Все три места в коде и сам пункт BACKLOG обещают, что осиротевший префикс достанется `fsck`
+(`Gc/CasGc.cpp:1105-1107` «fsck is the backstop», `:1126-1128` «The prefix is left to `fsck`»,
+`:1144-1149`; {#suppressed-handoff-consumption} «fsck-visible»). `runFsck` не перечисляет `gc/` ни в
+каком виде: его единственные LIST-ы — `layout.blobsPrefix()` (`Tools/CasFsck.cpp:728`) и манифестные
+префиксы (`:914`, `:1099`), а из `gc/` он читает ТОЛЬКО текущий `gc/state` (`:817`) и текущий fold seal
+по точному ключу (`:833`). Следствие: застрявший `gc/gen/<g>/` не попадает ни в один счётчик
+`FsckReport`, ни в `detail`-строки, ни в soak-метрику residual-settling — и одновременно нереклеймим
+(п.3). Плюс масштаб занижен: в префиксе лежат snapshot-run-объекты генерации, а они `O(edges)` в
+горячем пуле ({#gc-snapshot-log-structured-runs}), а не «one small run per shard». Записано новой
+секцией `docs/superpowers/cas/BACKLOG/gc.md`{#stranded-generation-prefix-invisible-to-fsck} (оставлено
+незакоммиченным): (a) поправить ложное «fsck-visible»/«fsck is the backstop»; (b) дать fsck
+ограниченный обход `gc/gen/` ниже курсора как advisory-счётчик; (c) только потом обсуждать реклеймер.
+Туда же вписан однотипный дефект прозы, найденный попутно: `Pool/CasServerRoot.h:768-771` и
+`gtest_cas_s3_staging.cpp:895-897` утверждают, что «GC blob discovery LISTs `Layout::blobsPrefix()`»,
+хотя на HEAD GC не LIST-ит `blobs/` вовсе (только HEAD/delete по ключам из рёбер: `Gc/CasGc.cpp:802`,
+`:817`, `:1820`, `:4437`; per-round LIST удалён — `:3665-3680`) — вывод про изоляцию `staging/` при
+этом остаётся верным по более сильной причине.
+
+ИСТОРИЯ. Hand-off и ref-aware retention пришли одним коммитом `3e21c9ec7fa` («CAS gc: ref-aware
+retention + post-CAS hand-off delete for superseded parent refs»); отдельный резерв бюджета —
+`08e215fbe8b`; фазовые строки/таймеры (`handoff_reclaim`) — `d412f85f749`; флип универсума —
+`58fd482a800`. Покрытие тестами: `CASGCRetention.PruneRetainsLiveReferencedRun`
+(`gtest_cas_gc_round.cpp:1449`), `CASGCRetention.HandOffDeletesSupersededRef` (`:1509`),
+`CASGCRetention.HandoffOwnBudgetSurvivesAPruneHeavyRound` (`:1572`),
+`CASGCSnapRetention.PruneRespectsPrefixWholesaleBudgetAndNeverStrandsAPartialGeneration` (`:1318`),
+`CASGCFrontierGate.TheHandOffReclaimIsInertUnderSuppression` (`gtest_cas_gc_frontier_gate.cpp:1380`) —
+т.е. заявленной «отсутствующей проверяемости» здесь нет.
+
+ИТОГ: подтверждённая часть — дубликат трёх уже отслеженных пунктов, P3-класс, не блокер релиза (утечка
+места, fail-safe, ограничена одной генерацией на событие); новый и не отслеженный остаток — ложное
+обещание fsck-backstop и вытекающая полная невидимость класса, P2, пост-релизный трек.
+
+## CAS-075 — Порядок «тело durable → потом `.meta`» и отсутствие LIST-а `blobs/` где-либо кроме fsck подтверждаются, но вывод «reclaimed by no sweep at all и не виден» — половинчатый: класс уже отслежен как by-design-остаток R4, а осиротевшее тело ВИДНО как `unaccounted` на всех трёх поверхностях fsck. (частично, P3) {#cas-075}
+
+Анкеры находки (`CA/Pool/CasPartWriteTxn.cpp:423-429`, `:463-465`, `:471-474`) — из снапшота; на HEAD
+это `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp` (перенос —
+`592b9b83568`), номера сместились примерно на +180: `streamIfAbsent` — `:594-641`, оба вызова
+`writeFreshMetaClean` после `PutOutcome::Done` — `:646-651` и `:666-671`, сам `writeFreshMetaClean` —
+`:564-570` (делегирует в `writeResurrectMetaClean`, `:536-561`).
+
+ЧТО ПОДТВЕРЖДАЕТСЯ НА HEAD.
+
+1) Окно реально и именно такой формы. `streamIfAbsent` возвращает `Done` только на
+`CasCreateOutcome::Committed` (`:626-628`), т.е. тело уже durable; `.meta` пишется СЛЕДУЮЩИМ вызовом —
+`writeFreshMetaClean()` на `:650` (обычный путь) и `:670` (путь «объект исчез между 412 и HEAD»).
+Между ними нет ни одной атомарной привязки. Причём это не только крэш: при исчерпании 8 попыток
+`writeResurrectMetaClean` бросает `throwCasWriteRetryLater` («the body incarnation is durable, but the
+meta marker is stuck», `:556-560`) — тоже тело без маркера, но громко и с retry-later, не тихо.
+
+2) Тело действительно попадает в «слепую зону» GC, и не из-за `.meta`, а из-за отсутствия РЕБРА.
+Загрузка тел идёт ДО staging манифеста и `precommitAdd` (`uploadBlobDetached` → `uploadFromSource`,
+`:241`; ребро-защита появляется только на precommit: «protection is the precommit edge — reachability,
+not `cas_owner`», `:607`; `stageManifest` — `:809+`, `precommitAdd` — `:910+`). Крэш в окне п.1 значит,
+что ни манифеста, ни precommit-ребра нет.
+
+3) «Никто, кроме fsck, не LIST-ит `blobs/`» — верно буквально. Единственный LIST этого префикса в
+дереве — `Tools/CasFsck.cpp:728`; в `Gc/CasGc.cpp` нет ни одного `list()` по `blobs/` — только
+HEAD/deleteExact по ключам, выведенным из рёбер (`:802`, `:817`, `:1820`, `:4437`), а
+per-round-LIST-дискавери удалён сознательно (`:3665-3680`). Так что тело, на которое не указывает ни
+одно ребро, для инкрементального GC не существует. Побочно: комментарии
+`Pool/CasServerRoot.h:768-771` и тест `CASS3Staging.GcBlobDiscoveryPrefixExcludesStagingObjects`
+(`gtest_cas_s3_staging.cpp:895-897`) утверждают обратное («GC blob discovery LISTs
+`Layout::blobsPrefix()`») — это устаревшая проза, зафиксирована во второй половине новой секции
+`gc.md`{#stranded-generation-prefix-invisible-to-fsck} (оставлено незакоммиченным).
+
+4) `clean()` действительно не включает `body_without_meta`: `kFsckHardFindings` — 5 терминов
+(`Tools/CasFsck.h:205-212`), этого среди них нет; поле прямо помечено «benign, NOT a dangle»
+(`Tools/CasFsck.h:116-117`, реализация — `Tools/CasFsck.cpp:1029-1033`, `:1046`).
+
+ЧТО В НАХОДКЕ НЕВЕРНО ИЛИ ПЕРЕОЦЕНЕНО.
+
+a) «reclaimed by no sweep at all» — верно для инкрементального GC, но класс уже назван и принят
+by-design: `gc.md` (секция {#gc-followups}, пункт `[REBUILD R4 residual — manifest-less blobs
+unreclaimable]`, стр. 54) — «a blob whose manifest no longer exists anywhere in the pool has no row in
+the rebuilt baseline and the incremental pipeline can never reach it. Such blobs are RETAINED and show
+as fsck `unaccounted` … This is the NAMED staging-contract residual of register R4 … NOT a bug and
+explicitly NOT to be closed with a substitute reclamation: any rule that reclaims from an enumeration
+reintroduces the same vector» (тот самый r5-finding-4 data-loss-вектор). Т.е. «подметать по
+перечислению» здесь запрещено осознанно, а не забыто.
+
+b) «excluded from the `clean()` verdict» подано как скрытость, хотя тело классифицируется ОБЫЧНЫМ
+конвейером present-but-unreferenced и попадает в `unaccounted` (`Tools/CasFsck.cpp:1016`, комментарий
+`:1029-1033`: «it still classifies through the ordinary present-but-unreferenced pipeline above»), а
+`unaccounted` рендерится на всех трёх поверхностях: summary-строка (`Tools/CasFsck.cpp:1160`), CLI-note
+(`programs/disks/CommandFsck.cpp:98-99`, плюс класс `Unaccounted` в `--detail`, `:130`) и SQL-строка
+(`InterpreterSystemQuery.cpp:2440`, `:2491`). Вдобавок оно входит в монотонный `unreachable`, который и
+watch-ит soak. Так что «reported by nothing» — неверно; not-hard-finding — сознательный выбор (та же
+позиция, что уже вынесена в CAS-062: by-design, и единственный реальный остаток там — что именно
+`body_without_meta`/`meta_without_body` не рендерятся нигде,
+`operability-and-introspection.md`{#fsck-meta-body-counters-unrendered}).
+
+c) Односторонне описан и сам ремонт по контенту: поскольку хранилище контент-адресуемое, любой
+последующий писатель того же содержимого адоптирует осиротевшее тело — `streamIfAbsent` → 412 → HEAD
+есть → `loadMeta` == nullopt ⇒ `condemned == false` ⇒ `observeAndAdmit` (`:660-680`), после чего
+появляется ребро и блоб становится нормально реклеймимым. Утечка «навсегда» — только для контента,
+который больше никогда не записывается.
+
+d) Класс последствия: это утечка МЕСТА, без потери данных и без тихой порчи. Осиротевшее тело
+неотличимо от валидного содержимого (ключ = хеш), никакой читатель на него не смотрит (нет ребра),
+никакой писатель им не «отравляется» (при адопции содержимое ровно то, что нужно). Провал записи
+`.meta` при этом громкий (`throwCasWriteRetryLater`, `:556-560`), т.е. INSERT не подтверждается.
+
+РЕАЛЬНЫЙ ОСТАТОК. Нового не нашлось: механизм (in-flight upload без ребра) — ровно тот, который
+закрывает регистр R4 («the build/upload registry, which is what can enumerate in-flight uploads
+safely»), и до R4 это TRACKED by design; невидимость именно парного счётчика уже записана как
+{#fsck-meta-body-counters-unrendered}; устаревшая проза про «GC LIST-ит blobs/» вписана в
+{#stranded-generation-prefix-invisible-to-fsck}. Отдельного нового пункта находка не заслуживает.
+
+ИСТОРИЯ. Точечный per-hash `.meta` вместо retire-view пришёл с `affc0938231`; примирение
+Conflict/exhaustion вместо тихого пропуска — `8068d8c5fe0` (именно оно сделало провал `.meta` громким);
+парность meta↔body в fsck — `dadac45da92`; учёт durable-полос (manifest/body/meta) —
+`64135f52a60`; `kFsckHardFindings` — `4e19cfe08e7`. Тестовое покрытие окна:
+`gtest_cas_fsck.cpp:1249-1261` (`CASFsck.BodyWithoutMetaIsBenign`: `body_without_meta >= 1`,
+`dangling == 0`, `clean()` true) и `:1239-1245` («meta_without_body is advisory — excluded from clean()»), плюс `CasPartWriteTxn.PutBlobResurrectVanishedReUploadsHeldBody` для случая «стал
+condemned-маркер без тела».
+
+ИТОГ: форма кода подтверждена, следствие — известный и принятый by-design остаток (R4), видимый как
+`unaccounted`; блокером релиза не является, тихой порчи нет. P3.

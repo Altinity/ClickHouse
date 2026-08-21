@@ -283,3 +283,38 @@ healthy open — and fsck's unaccounted pipeline classifies only keys under the 
 keys are neither reported nor reclaimed. Owed (cheap): have `Pool::open` best-effort delete stale
 `_probe/*` entries older than a threshold, or have fsck count them under a `probe_debris` line so the
 class is at least visible. Not urgent — the bytes are negligible and cannot mask real data.
+
+## `always_use_copy_instead_of_hardlinks=1` is accepted on a CA table and then breaks every mutation and same-disk partition clone (2031-triage CAS-085) {#always-copy-instead-of-hardlinks-no-gate}
+
+Nothing rejects the MergeTree setting `always_use_copy_instead_of_hardlinks`
+(`src/Storages/MergeTree/MergeTreeSettings.cpp:1902`, default `false`) on a content-addressed table
+— neither at `CREATE`, nor at `ALTER ... MODIFY SETTING`. Once it is on, the copy variant of every
+clone/hardlink site is taken and lands on `ContentAddressedTransaction::generateObjectKeyForPath`,
+which is a `notYet` throw (`ContentAddressed/ContentAddressedTransaction.cpp:530-533`, message at
+`:83-90`), because `DiskObjectStorageTransaction::copyFileImpl` derives destination keys from it
+(`src/Disks/DiskObjectStorage/DiskObjectStorageTransaction.cpp:522-524`).
+
+Reachable paths at HEAD:
+- Mutations (`ALTER ... UPDATE/DELETE`, `MATERIALIZE INDEX`, lightweight delete materialization):
+  `MutateTask.cpp:2493-2496` and `:2516-2519` call
+  `DataPartStorageOnDiskFull::copyFileFrom` → `disk->copyFile`
+  (`DataPartStorageOnDiskFull.cpp:372-388` → `DiskObjectStorage.cpp:291-321`).
+- The unchanged-part mutation clone: `MutateTask.cpp:3312` sets `copy_instead_of_hardlink`, reaching
+  `DataPartStorageOnDiskBase::freeze` → `Backup` → `BackupImpl`, whose copy branch calls
+  `transaction->copyFile` (`src/Storages/MergeTree/Backup.cpp:61-65`).
+- Same-disk `ATTACH/REPLACE PARTITION FROM` and `MOVE PARTITION TO TABLE` on `StorageMergeTree`
+  (`StorageMergeTree.cpp:3215`) reach the same `freeze` path.
+
+Fail-closed, loud `NOT_IMPLEMENTED`, no silent corruption — but a mutation entry then retries
+forever until the setting is reverted, and the thrown message ("the disk is wrapped by a layer that
+bypasses the content-addressed write path") misdescribes this trigger. Fix direction: reject the
+setting for a CA storage policy at `CREATE`/`ALTER MODIFY SETTING` (the same shape as the
+`SUPPORT_IS_DISABLED` gates in `MergeTreeData::checkAlterIsPossible`), or teach the CA transaction
+to serve `copyFile` as a manifest-level carry-forward like `createHardLink` already does.
+
+Two claims from the source finding do NOT hold: `ALTER TABLE ... FREEZE` does not consult this
+setting (`MergeTreeData.cpp:9988-9991` builds `ClonePartParams` with `make_source_readonly` only),
+and neither does BACKUP/RESTORE cloning; the zero-copy implicit `copy_instead_of_hardlink` term
+(`StorageReplicatedMergeTree.cpp:3357`, `:9220`) is dead on CA because
+`DiskObjectStorage::supportZeroCopyReplication` returns false for `MetadataStorageType::CAS`
+(`src/Disks/DiskObjectStorage/DiskObjectStorage.h:53-58`).

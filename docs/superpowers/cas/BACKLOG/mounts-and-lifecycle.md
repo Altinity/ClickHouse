@@ -209,3 +209,23 @@ lifecycle probe classifies rather than throws — `Pool/CasPool.cpp:1011-1018`, 
 `:1205-1219`), and `stopRemountThread`'s store-outside-`remount_cv_mutex`
 (`Pool/CasMountRuntime.cpp:496-497`) costs at most one backoff interval (the wait is a
 `wait_for`, `:466`), never a lost wakeup.
+
+## The mount-fence clock uses `CLOCK_BOOTTIME` with no portability shim, so the CAS sources do not compile on Darwin (2031-triage CAS-092) {#boottime-not-portable}
+
+Two unconditional `clock_gettime(CLOCK_BOOTTIME, ...)` reads sit in code that is compiled on every
+platform: `Pool/CasMountRuntime.cpp:63` (`CasMountRuntime::bootMs`, the write-fence clock) and
+`Pool/CasServerRoot.cpp:58` (`defaultBootMs`, the keeper's boot anchor). Both files are added to
+`dbms` unconditionally (`src/CMakeLists.txt:139`) with no `OS_LINUX` guard and no include of a
+compatibility header.
+
+`CLOCK_BOOTTIME` is a Linux name. Darwin's `<time.h>` does not define it (its boot-domain clock is
+`CLOCK_UPTIME_RAW`, which unlike `CLOCK_BOOTTIME` *excludes* sleep, so it is not a drop-in for the
+fence's stated requirement in `Pool/CasMountRuntime.h:68-72`); FreeBSD defines it as an alias of
+`CLOCK_UPTIME` under `__BSD_VISIBLE`, so only the Darwin builds are expected to break. The failure
+is a compile error, maximally loud, with zero runtime or correctness exposure — but the darwin build
+jobs will be red the first time the branch runs them.
+
+The shim precedent already exists: `base/base/time.h` maps `CLOCK_MONOTONIC_COARSE` per platform.
+The owed treatment is the same shape — extend that header (or a CAS-local one) with a
+`CLOCK_BOOTTIME` mapping for Darwin, and state in the mapping comment that Darwin's substitute does
+not include sleep time, which weakens (does not break) the suspend argument the fence relies on.

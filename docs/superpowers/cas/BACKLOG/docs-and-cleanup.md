@@ -126,3 +126,20 @@ That premise is nowhere in the user docs: `docs/en/antalya/cas/.../bucket-requir
 may target it". Add it (same pass as {#bucket-requirements-lifecycle-worm-glacier}). Optional
 belt-and-braces: record the endpoint advisorily in the mount lease so a mismatch can be reported —
 advisory only, identity stays pool_id-based.
+
+## Condemned-displacement comments name a `putOverwrite` branch that no longer exists, and cite a pruned BACKLOG anchor (2031-triage CAS-088) {#c2-displacement-comment-stale}
+
+`PartWriteTxn::uploadFromSource`'s displacement block says "the two displacement calls below
+(`resurrect` / `putOverwrite`)" (`Pool/CasPartWriteTxn.cpp:691-693`), but both arms now call
+`Backend::resurrect` (`Pool/CasPartWriteTxn.cpp:732` staged, `:759` local) — `putOverwrite` survives
+only as a controller helper (`Backend/CasRequestControl.cpp:504-521`) that this path never reaches.
+The pinning tests carry the same stale vocabulary (`gtest_cas_fence_generation.cpp:376,394,417`
+speak of a "`putOverwrite` displacement branch").
+
+Same block cites the BACKLOG anchor `{#c2-resurrect-putoverwrite-fence-check}`
+(`Pool/CasPartWriteTxn.cpp:691`, `:719`, and `gtest_cas_fence_generation.cpp:376`), which no longer
+exists — it was pruned by `f95458a1b79`. Per the comment policy (no internal refs), the fix is to
+keep the REASON (a raw backend write with no controller/fence coupling, hence the explicit
+capture-at-decision + check-before-write) and drop the anchor and the `rev.7 [C2]` provenance.
+
+Cosmetic only: the code and the fence checks themselves are correct.

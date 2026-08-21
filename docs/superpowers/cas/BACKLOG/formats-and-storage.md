@@ -368,3 +368,32 @@ still fenced to THIS mount's `staging/<server_root_id>/` prefix) with an age fil
 an in-flight staging object, and surface the staging-object count/bytes in an introspection surface
 (fsck report row or `system.content_addressed_mounts`). Low urgency: the whole path is opt-in and OFF
 by default, and every restart clears the residue.
+
+## The blob envelope is stamped but never decoded on any production path (2031-triage CAS-089) {#blob-envelope-never-read-back}
+
+Every blob body is `[fixed-length envelope][payload]`, and the read path takes the payload offset from
+pool meta rather than from the object: `CasManifestReader::locate` returns
+`.offset = meta.blob_header_len` (`Pool/CasManifestReader.cpp:155-159`), consumed by
+`getBlobViewPlan`/`readBlobPayload` (`ContentAddressedMetadataStorage.cpp:1987-1989`, `:2002-2004`).
+`decodeEnvelopeHeader` has exactly one non-test caller — `SYSTEM CAS INSPECT`
+(`Tools/CasInspect.cpp:630`) — so the envelope's `v` (compatibility version) and `tag`/`bld` are
+forensic fields, never a gate on a read; `runFsck` never GETs a body either, by design (GET budget).
+
+This is a deliberate design (constant-shift locate, no per-object header read, documented at
+`Formats/CasBlobEnvelopeFormat.h:79-93` and `Pool/CasManifestReader.cpp:147-153`), and divergence
+between an object's real envelope length and the pool's `blob_header_len` is unreachable today:
+`blob_header_len` is minted once at pool creation and the pool is authoritative on reopen
+(`Pool/CasPoolMeta.cpp:122`, `:150`), a mount whose expected value disagrees is rejected
+(`Pool/CasPool.cpp:124-128`), the value is range/multiple-validated on every decode
+(`Formats/CasPoolMetaFormat.cpp:36-46`, called `:171`), and cross-generation format change is gated
+pool-wide by `min_reader_generation` (`Formats/CasPoolMetaFormat.cpp:174-177`) rather than per blob.
+
+Residual for the format-freeze pass (same gate as `[gc-snap-codec-tlv-review]` and
+`[codecs.md standardization]`): decide explicitly whether the envelope stays a write-only forensic
+record or gains a read-side use, and record the decision. Two cheap options if it stays write-only:
+drop `decodeEnvelopeHeader`'s unused `object_size` parameter
+(`Formats/CasBlobEnvelopeFormat.cpp:157` — the parameter is already unnamed) or give it a real
+consumer; and have fsck's `detail` mode optionally decode the envelope of a sampled blob so
+`header_len == blob_header_len` and `v` are proven somewhere outside `INSPECT`. No integrity item:
+a wrong offset would hand MergeTree shifted bytes, which its own compressed-block checksums reject
+loudly.
