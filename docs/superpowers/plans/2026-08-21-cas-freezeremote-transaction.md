@@ -50,7 +50,7 @@ Two further facts the spec does not state, both verified, both load-bearing for 
 
 **Files:**
 - Modify: `tests/queries/0_stateless/05025_cas_attach_partition_cross_disk.sh` (stub from `add-test`)
-- Modify: `tests/queries/0_stateless/05025_cas_attach_partition_cross_disk.reference` (empty from `add-test`)
+- Modify: `tests/queries/0_stateless/05025_cas_attach_partition_cross_disk.reference` (emptied back to the `add-test` state; an earlier draft of this plan left a stale five-line version in it, so REPLACE its contents rather than appending)
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
@@ -84,10 +84,13 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CUR_DIR"/../shell_config.sh
 
+# Every table this test creates, including leg 3's, so a run interrupted mid-script can be repeated.
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS src_plain;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS dst_cas;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS src_cas;"
 ${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS dst_cas_same_pool;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS src_plain_repl SYNC;"
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS dst_cas_repl SYNC;"
 
 # ---------------------------------------------------------------- leg 1: local -> content-addressed
 
@@ -230,7 +233,9 @@ Run: `./tests/clickhouse-test 05025_cas_attach_partition_cross_disk`
 
 Expected: leg 1's `ATTACH PARTITION 1 FROM src_plain` throws. The reported error is one of two, and which one depends on which file the pool reaches first — both are the same defect: a unique-ref refusal from the promote, or `NOT_IMPLEMENTED` about autocommit writes not being supported for content part files. The single production fact responsible is that `freezeRemote` has no content-addressed branch, so `Backup` fans the part's files onto a thread pool and each becomes its own autocommit transaction against one ref.
 
-**Do not proceed to Task 2 until you have seen that.** Two other outcomes mean the test is wrong rather than the bug pinned, and each is fixed here:
+The script deliberately does not `set -e`. Only about an eighth of the stateless shell tests do, and here it would abort the run at leg 1 on the pre-fix tree — which is the expected state — leaving a truncated diff instead of showing which legs are missing. The instruction below is addressed to you, not to the script: the script runs to the end and the reference diff tells you what failed.
+
+**Do not proceed to Task 2 until you have seen that.** Three other outcomes mean the test is wrong rather than the bug pinned, and each is fixed here:
 
 - The attach *succeeds*. Then the two tables are not on different disks and the clone went through `freeze`. Check the disk names actually differ and that the destination policy reserves the CAS disk.
 - Leg 2's counter row is empty rather than `0`/`1`. Then the `query_id`, the `current_database` filter, or `SYSTEM FLUSH LOGS` placement is wrong, not the dedup claim.
@@ -403,7 +408,7 @@ with this:
 
 The external-transaction case keeps its exact previous behaviour: the removals go onto the caller's transaction and this function does not commit it. Only the self-created one is committed here, because only this function owns it.
 
-Leave `save_metadata_callback` and the `create(...)` tail exactly as they are. The callback is empty at the only call site and is upstream signature shape.
+Leave `save_metadata_callback` and the the `create` tail exactly as they are. The callback is empty at the only call site and is upstream signature shape.
 
 - [ ] **Step 4: Correct the helper's own justification, which this change outgrows**
 
@@ -416,15 +421,15 @@ Keep the correctness half untouched (a content-addressed transaction batches eve
 Build BOTH binaries — the server for the stateless tests and the unit-test binary for the gate, since building only one leaves the other stale and a green gate on a stale binary is evidence about different code. Redirect every build and every run to its own uniquely named log under the build directory, and have a subagent summarise each log rather than reading them inline:
 
 ```bash
-ninja -C build clickhouse       > build/2173_clickhouse_build.log 2>&1; echo "NINJA_EXIT=$?" >> build/2173_clickhouse_build.log
-ninja -C build unit_tests_dbms  > build/2173_unit_build.log      2>&1; echo "NINJA_EXIT=$?" >> build/2173_unit_build.log
+ninja -C build clickhouse      > build/2173_clickhouse_build.log 2>&1; echo "EXIT=$?" >> build/2173_clickhouse_build.log
+ninja -C build unit_tests_dbms > build/2173_unit_build.log 2>&1;       echo "EXIT=$?" >> build/2173_unit_build.log
 
-./tests/clickhouse-test 05025_cas_attach_partition_cross_disk  > build/2173_new_test.log     2>&1
-./tests/clickhouse-test 05003_cas_freeze 05024_cas_freeze_two_roots > build/2173_freeze_tests.log 2>&1
-build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*'        > build/2173_cas_gate.log     2>&1
+./tests/clickhouse-test 05025_cas_attach_partition_cross_disk > build/2173_new_test.log 2>&1;        echo "EXIT=$?" >> build/2173_new_test.log
+./tests/clickhouse-test 05003_cas_freeze 05024_cas_freeze_two_roots > build/2173_freeze_tests.log 2>&1; echo "EXIT=$?" >> build/2173_freeze_tests.log
+build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/2173_cas_gate.log 2>&1;             echo "EXIT=$?" >> build/2173_cas_gate.log
 ```
 
-Read the exit status out of the log marker, not from the shell: a backgrounded wrapper's exit code has lied before in this repository.
+Every command carries its own marker, and the status is read from the marker rather than from the shell: a wrapper's exit code has lied in this repository before.
 
 Expected: the new test passes all three legs; the two freeze tests are unaffected — they exercise `freeze`, not `freezeRemote`, and this change touches neither `freeze` nor the helper's body; the gtest gate is unchanged, since no CAS-internal signature moved.
 
@@ -442,7 +447,8 @@ git commit -m 'Clone a part into a content-addressed disk in one transaction on 
 
 **Files:**
 - Modify: `docs/superpowers/cas/BACKLOG.md` — **delete** the `{#issue-2173-freezeremote-gap}` section, only if the file is clean
-- Modify: `docs/superpowers/cas/2031-triage.md` — four coordinated edits
+- Modify: `docs/superpowers/cas/2031-triage.md` — five CAS-058 sites and four more references to the dying anchor
+- Modify: `docs/superpowers/cas/final-checks-todo.md` — item 1, which also holds a link to that anchor
 
 **Interfaces:**
 - Consumes: Tasks 1 and 2 landed.
@@ -458,20 +464,31 @@ If it reports anything, another session is still working in it. **Stop and repor
 
 Remove the whole `{#issue-2173-freezeremote-gap}` section. Do not flip its heading to `FIXED`, and do not leave a stub: the file's own header says it carries only open work, and the #2212 entry set the precedent by being deleted rather than annotated. Before removing it, grep `BACKLOG/` and `docs/superpowers/cas/` for links to that anchor; any link dies with it, in the same commit.
 
-- [ ] **Step 3: Update the triage record — four edits, and all four are needed**
+- [ ] **Step 3: Update the triage record — five CAS-058 sites, and every one is needed**
 
-`docs/superpowers/cas/2031-triage.md` carries CAS-058 in four places, and fixing three of them leaves a document contradicting itself:
+`grep -n "CAS-058" docs/superpowers/cas/2031-triage.md` returns five lines. Read the whole output; an earlier revision of this plan claimed four because the grep behind it had been piped through `head`, and the site it missed is the largest one.
 
-1. The CAS-058 verdict row, currently `подтверждено | P1` with a link to the backlog anchor. Mark it fixed, name the commits, and repoint the link at this plan — the anchor dies in Step 2 and a dangling link is worse than none.
-2. The priority tally line reading `**P1 — 3**`. It becomes 2.
-3. The `{#p1-list}` table. Drop the CAS-058 row.
-4. The paragraph after that table, which reads "Из четырёх исходных P1 CAS-001 закрыт коммитами …". CAS-058 joins CAS-001 there, and the following sentence about which P1s this triage did not find first has to still parse with one fewer row above it.
+1. The verdict row, currently `подтверждено | P1` with a link to the backlog anchor. Mark it fixed, name the commits, and repoint the link at this plan — the anchor dies in Step 2 and a dangling link is worse than none.
+2. The `{#p1-list}` table. Drop the CAS-058 row.
+3. The paragraph after that table, "Из четырёх исходных P1 CAS-001 закрыт коммитами …". CAS-058 joins CAS-001 there, and the sentence about which P1s the triage did not find first has to still parse with one fewer row above it.
+4. The priority tally line reading `**P1 — 3**`. It becomes 2. A stale P1 count is worse than a stale sentence: it is the number someone reads to decide whether the release is ready.
+5. **The full `{#cas-058}` section.** Its heading still ends `(подтверждено, P1)` and its body says the fix is only scheduled. Historicise it the way this document already historicises a closed verdict elsewhere — do not delete it: unlike the live backlog, the triage IS the history, and its own header says so.
 
-A stale P1 count is worse than a stale sentence: it is the number someone reads to decide whether the release is ready.
+- [ ] **Step 4: Correct the four other references to the dying anchor in the same file**
 
-- [ ] **Step 4: Commit**
+`grep -n "issue-2173-freezeremote-gap" docs/superpowers/cas/2031-triage.md` returns four more lines beyond the verdict row. Two of them assert things that stop being true, and they matter more than the links:
 
-Re-check dirtiness, stage only paths whose diff is yours, then:
+- one states outright that on HEAD the fix is NOT applied and the branch is absent in `freezeRemote` — after Task 2 that is false;
+- another calls `freezeRemote` "незакрытый член семьи" of the three clone paths — the family has no unclosed member now;
+- the remaining two are cross-references (a not-a-duplicate note and a family reference) whose links die with the anchor.
+
+- [ ] **Step 5: Close the scheduling item, which also holds a link to the anchor**
+
+`docs/superpowers/cas/final-checks-todo.md` item 1 is the pre-release schedule line for this fix and points at the anchor Step 2 removes. That is why it lives in this task rather than in Task 4: the anchor and every link to it have to go in one commit, and a link left behind in another task's file would dangle in between. Item 2 in the same file was closed by another session for issue #2212 and shows the format — the heading gains `DONE —` and the body names the commits.
+
+- [ ] **Step 6: Commit**
+
+Re-check dirtiness across all three files, stage only paths whose diff is yours, then:
 
 ```bash
 git commit -m 'Retire the cross-disk clone gap from the live backlog'
@@ -482,9 +499,12 @@ git commit -m 'Retire the cross-disk clone gap from the live backlog'
 ## Task 4: The rest of the documentation {#task-4}
 
 **Files:**
-- Modify: `docs/superpowers/cas/final-checks-todo.md` (item 1)
 - Modify: `docs/superpowers/cas/BACKLOG/replication.md` (`[VERIFY-ca-ca-same-pool-move]`)
 - Modify: `docs/superpowers/cas/BACKLOG/formats-and-storage.md` (the re-freeze-same-part-name item)
+- Modify: `src/Storages/MergeTree/MergeTreeData.cpp` (the partition-clone support comment)
+- Modify: `src/Disks/DiskObjectStorage/DiskObjectStorage.cpp` (the gated-clone-paths comment)
+
+`final-checks-todo.md` is NOT here — it moved to Task 3, because it links the backlog anchor Task 3 deletes and the two have to travel in one commit.
 
 **Interfaces:**
 - Consumes: Tasks 1 and 2 landed.
@@ -492,23 +512,19 @@ git commit -m 'Retire the cross-disk clone gap from the live backlog'
 
 Mostly documentation, plus two source comments that need a build. Each file gets its own dirtiness check before staging, for the reason in the Global Constraints.
 
-- [ ] **Step 1: Close the scheduling entry**
-
-`final-checks-todo.md` item 1 is the pre-release schedule line for this fix and still reads as pending. Item 2 in the same file was closed by another session for issue #2212 and shows the format: the heading gains `DONE —` and the body names the commits. Do the same for item 1.
-
-- [ ] **Step 2: Record what the new test does and does NOT answer for the same-pool question**
+- [ ] **Step 1: Record what the new test does and does NOT answer for the same-pool question**
 
 `BACKLOG/replication.md`'s `[VERIFY-ca-ca-same-pool-move]` asks whether a same-pool CA↔CA clone works and whether the target's ref `<part>` collides with the source's. The new test's second leg answers the first half for `ATTACH`: the publish dedup-resolves the blobs and the clone is a ref repoint, now asserted by a counter.
 
 **Do not close the item.** Its collision question is about `MOVE`, where source and target are the SAME table — one namespace, one ref name `<part>`. `ATTACH` writes into the destination table's namespace under a temporary part name, so it cannot collide and therefore proves nothing about the case the item is actually asking about. Add that distinction to the item so the next reader does not close it on the strength of this test.
 
-- [ ] **Step 3: Record that this fix widens another item's reachability**
+- [ ] **Step 2: Record that this fix widens another item's reachability**
 
 `BACKLOG/formats-and-storage.md`'s re-freeze item says that re-freezing a DIFFERENT part carrying the same part name — "after `REPLACE PARTITION` / `ATTACH PARTITION FROM`, which can reuse `all_1_1_0`" — silently produces one frozen ref mixing two snapshots. Until now the cross-disk route to that state was closed by the very bug this plan fixes. Note on the item that cross-disk `ATTACH PARTITION FROM` into a content-addressed disk now works, so that route is open and the item's priority should be reconsidered rather than inherited.
 
 This is the kind of consequence a fix does not usually announce about itself: nothing in the fix is wrong, and another item got more reachable because of it.
 
-- [ ] **Step 4: Correct two source comments the fix falsifies**
+- [ ] **Step 3: Correct two source comments the fix falsifies**
 
 Both sit outside the file Task 2 touches, so they need their own build. Both are load-bearing prose about what is and is not supported.
 
@@ -516,21 +532,21 @@ Both sit outside the file Task 2 touches, so they need their own build. Both are
 
 `src/Disks/DiskObjectStorage/DiskObjectStorage.cpp`, in the comment explaining why advertising a capability does not open the per-file clone hazard, lists "the corrupting whole-part clone paths (partition clone, BACKUP hard-link, replication)" as "gated by their own independent checks". The partition clone is no longer gated — it works. Remove it from that list rather than rewording around it, and leave the other two entries alone.
 
-- [ ] **Step 5: Build and run after the comment edits**
+- [ ] **Step 4: Build and run after the comment edits**
 
 Comment-only, but they are in `.cpp` files, so both binaries get rebuilt and each run gets its own log:
 
+```bash
+ninja -C build clickhouse      > build/2173_docs_clickhouse_build.log 2>&1; echo "EXIT=$?" >> build/2173_docs_clickhouse_build.log
+ninja -C build unit_tests_dbms > build/2173_docs_unit_build.log 2>&1;      echo "EXIT=$?" >> build/2173_docs_unit_build.log
+build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/2173_docs_cas_gate.log 2>&1; echo "EXIT=$?" >> build/2173_docs_cas_gate.log
 ```
-ninja -C build clickhouse      > build/2173_docs_clickhouse_build.log 2>&1
-ninja -C build unit_tests_dbms > build/2173_docs_unit_build.log 2>&1
-build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/2173_docs_cas_gate.log 2>&1
-```
 
-Append an exit marker to each log and read the status from the marker, not from the shell. Say explicitly in the report that you changed no code; if making a comment true required changing code, stop and say so instead.
+Read each status from its marker, not from the shell. Say explicitly in the report that you changed no code; if making a comment true required changing code, stop and say so instead.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
-Re-check dirtiness across all five paths — three documents and two sources — stage only what is yours, then:
+Re-check dirtiness across all four paths — two documents and two sources — stage only what is yours, then:
 
 ```bash
 git commit -m 'Record the cross-disk clone fix across the tracking documents and comments'
@@ -553,5 +569,7 @@ Recorded so the executing agent does not re-derive it, and so a later reader kno
 **Placeholders.** None. Every code step gives the exact before and after text; the test and reference are complete.
 
 **Type consistency.** `owned_transaction` is a `DiskTransactionPtr`, matching the name and type `freeze` already uses for the same role in this file. `copyDirectoryContentIntoTransaction` is called with the signature verified from its definition, including the trailing cancellation hook. No declaration in `DataPartStorageOnDiskBase.h` changes.
+
+**Two misses this plan corrected, both worth naming.** The CAS-058 site list said four and the real count is five, because the grep behind it was piped through `head` — the missing site being the largest one, a full section whose heading still called the issue open. Any claim in this plan of the form "N places" should be re-derived with an untruncated grep before it is trusted. And an earlier revision put the scheduling item in a different task from the anchor it links, which would have left a dangling link between two commits.
 
 **A risk that was removed rather than deferred.** An earlier revision left leg 2's counter to "the first run will settle it". That was derivable without a run and wrong: `CASBlobBodyPutAvoided` is raised only on the HEAD-first branch, whose threshold defaults to 1 MiB, and these blobs are far smaller — so the assertion would have failed for a reason unrelated to the fix. The destination disk now lowers that threshold explicitly. What genuinely remains unverifiable by reading is only whether the counter is emitted once per blob or once per part, which changes nothing about the assertion being `> 0`. And the whole plan assumes the busy worktree — if the other session has finished by execution time, the dirtiness checks simply pass and Task 3 proceeds.
