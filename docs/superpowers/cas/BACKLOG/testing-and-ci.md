@@ -74,3 +74,31 @@ infrastructure, the soak/chaos harness, and testing-methodology rules.
 - **[no-step-injecting-crash-harness] no deterministic crash-at-step harness; crash-window coverage is bespoke per window** — {#no-step-injecting-crash-harness} — DESIRABLE (TEST/HARNESS) — Found 2026-08-21 verifying an audit finding. Crash-consistency coverage today comes in two shapes, and neither selects a step: (a) integration/chaos SIGKILL at a wall-clock moment (`tests/integration/test_cas_shared_pool/test.py:265`, `test_cas_drop_pool_member/test.py:146`, `test_cas_gc_sharded/test.py:255`, plus the ca-soak chaos legs) — which window it lands in is luck; (b) gtests that hand-build the post-crash state for ONE chosen window (`CASGCAckFloor.ResumeAfterCrashBetweenRetiredPutAndStateCas`, `CASDecommission.MidRetirementCrashResumesViaMountLeaseFallback`, `CASGCHoldGrammar.RebuildStepsDownPastACrashedNewestGenerationToTheSealBelowIt`, the `CASFenceGeneration` abort-between-admission-and-durable-call family). Every new window therefore costs a hand-built fixture, and windows nobody thought of are silently uncovered. The mechanism to build a generic driver already exists — `InMemoryBackend`'s fault seams (`failNextCasPut`, `setHoldDeletes`, `injectAmbiguousPutIfAbsent`) plus the per-storage promote seams — what is missing is an "abort at the Nth durable write of this protocol run, then re-drive and assert the invariant" wrapper that enumerates N. Worth building the day a crash window is found by an incident rather than by a test.
 
 - **[gcs-live-header-observability-tls-proxy] the live-GCS gate cannot see outbound headers; a TLS-terminating proxy is the option not taken** — {#gcs-live-header-observability-tls-proxy} — DESIRABLE (TEST/HARNESS) — Recorded 2026-08-21 so the decision is recoverable. `tests/integration/test_gcs_live/test.py` asserts only client-observable facts, so three claims the design cares about go unchecked against a real endpoint: that `x-goog-if-generation-match` appears on the wire, that `x-amz-date` / `x-amz-content-sha256` / `x-amz-security-token` / `x-amz-api-version` are absent, and which headers the GOOG4 signature covers. Three routes were rejected outright — `PocoHTTPClient` logs response headers only and never the request headers; a plain forward proxy must be named as the `endpoint`, which makes `deduceProviderType` report UNKNOWN and switches off the `ApiMode::GCS` behaviour the gate exists to exercise; and downgrading to plain HTTP puts live credentials in clear text. The fourth route WORKS and is the reason this entry exists: a **TLS-terminating** proxy keeps `endpoint` spelled `storage.googleapis.com`, so `provider_type` stays GCS and the api-mode transformations stay active, while the proxy reads plaintext request headers inside a process the test operator already controls — the same trust boundary as the container that already holds the plaintext HMAC secret in its own config. Cost, and the reason it was not built: a proxy container, a generated CA distributed into the server's trust store, and per-disk proxy configuration — real infrastructure for a property the unit tests already establish by inspecting the request object directly with no network at all. Build it if a GOOG4 signing or header-stripping defect ever escapes the unit tests to a live endpoint, since that is the failure this and only this would have caught.
+
+## [GCS request isolation] Endpoint-level reload regression for the token-dialect pin {#gcs-endpoint-level-reload-regression}
+
+**What is missing.** The reload dialect pin is checked against the fully merged settings in
+`S3ObjectStorage::applyNewSettings`, which is the only place the effective `http_client` exists (it is
+merged from the storage's current settings, any endpoint-level block, and the disk's own section). The
+integration test that exists flips the **disk-level** key, which a disk-section-only guard would also
+have refused — so it does not discriminate the correct placement from the wrong one. The test says so
+itself now; this item is the missing coverage, not a misdescribed test.
+
+**The regression to write:**
+
+1. a CAS disk mounts with NO disk-level `http_client` and pins the ETag dialect;
+2. an endpoint-level `<s3>` block, added at reload, sets `http_client=gcp_oauth` for that endpoint;
+3. the reload is refused;
+4. a subsequent write proves the ETag client survived — an `If-None-Match` on the wire and no
+   `x-goog-if-generation-match` anywhere.
+
+**Prerequisite, and why this is not just "write the test".** `tests/integration/test_cas_gcs` cannot host
+an ETag-dialect CAS mount today. The fake mints numeric ETags, so such a mount sends a numeric `If-Match`
+and the fake's own domain check rejects it — `If-Match is a generation, not an ETag` — and the server
+fails to start. Attempted and reverted for exactly this reason. The prerequisite is a second ETag shape
+in the fake (non-numeric ETags for a designated bucket), kept separate from the generation domain so the
+existing domain-separation assertions stay meaningful.
+
+**Also worth noting:** an absent key is not a flip. Settings merge through `updateIfChanged`, which
+applies only values the incoming configuration sets, so deleting `http_client` leaves the previous value
+in force. Only an explicitly different value flips the dialect.
