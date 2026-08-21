@@ -57,8 +57,8 @@
 | CAS-039 | ⏳ | — | — | — | — |
 | CAS-040 | ⏳ | — | — | — | — |
 | CAS-041 | ⏳ | — | — | — | — |
-| CAS-042 | ⏳ | — | — | — | — |
-| CAS-043 | ⏳ | — | — | — | — |
+| CAS-042 | by-design | P2 | [{#operability} (B180 / format-freeze), {#cas-format-version-floor}](BACKLOG.md#operability} (B180 / format-freeze), {#cas-format-version-floor) | нет | Форма кода описана верно (одна глобальная генерация как min-reader, `changePoints` не читается на декоде), но это осознанная pre-release политика recreate-only; следствия про «тихое стирание полей» и про `Roster` недостижимы. |
+| CAS-043 | частично | P3 | [{#relink-fallback-unknown-format-version}](BACKLOG.md#relink-fallback-unknown-format-version) | нет | Узость catch подтверждена (`CORRUPTED_DATA` only, а гейт версии и критический ключ дают `UNKNOWN_FORMAT_VERSION`), но перекос генераций в одном пуле сегодня невозможен: relink предлагается только внутри одного смонтированного пула, а mount держит точный гейт генерации — остаётся однострочное упрочнение. |
 | CAS-044 | ⏳ | — | — | — | — |
 | CAS-045 | ⏳ | — | — | — | — |
 | CAS-046 | ⏳ | — | — | — | — |
@@ -1641,3 +1641,162 @@ P3 и не pre-release: заявленной дыры (незащищённый 
 7. Классификация серьёзности. Это деградация производительности/памяти, а не потеря или порча данных: свёртка fail-closed на каждом сомнительном шаге (кламп на отсутствующем теле манифеста — `Gc/CasGc.cpp:2520-2540`; проверка чек-суммы run'а перед решением об удалении — `Gc/CasBlobInDegree.cpp:715-717`; переучёт in-degree на месте удаления — `Gc/CasBlobInDegree.cpp:422-437`). Реальные риски: (а) раунд, переросший TTL лизы, отфенсивается (класс, который уже лечили в P3.1 — см. `BACKLOG.md:393-399`), (б) пик памяти edge-run'а на большом пуле при `gc_shards=1`. Ни то, ни другое не блокирует релиз при заявленном масштабе, но и то, и другое обязано быть в capacity-модели.
 
 8. Итог: подтверждено полностью (с более точными анкорами, чем в финдинге), уже отслежено тремя пунктами `{#gc-scalability}` и `{#gc-budgets-need-a-deadline}`; новой информации по сравнению с BACKLOG финдинг не даёт, кроме указания на настоящее место пика памяти (`out.str()` в `foldDeltasIntoGeneration`), которое стоит дописать в `[gc-snapshot-log-structured-runs]`.
+
+## CAS-042 — Форма кода описана верно (одна глобальная генерация как min-reader, `changePoints` не читается на декоде), но это осознанная pre-release политика recreate-only; следствия про «тихое стирание полей» и про `Roster` недостижимы. (by-design, P2) {#cas-042}
+
+Устаревшие якоря. Финдинг ссылается на снапшот `CA/Formats/CasFormat.*`; на HEAD файлы лежат в
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/` (переезд коммитом
+592b9b83568). Номера строк устарели: `G_BUILD` не `CasFormat.h:10`, а `CasFormat.h:60`;
+`currentWriterVersion`/`currentCompatibilityVersion`/`checkCompatibility` не `CasFormat.cpp:82-93`, а
+`CasFormat.cpp:98-116`; «противоречащая таблица :19-75» — это на HEAD два разных объекта:
+change-points `CasFormat.cpp:22-62` и таблица трейтов `CasFormat.cpp:139-174`.
+
+Что ПОДТВЕРЖДАЕТСЯ на HEAD (форма кода).
+
+1. Одна глобальная генерация штампуется как min-reader любого объекта.
+   `CasFormat.cpp:103-108`: `currentCompatibilityVersion` возвращает `G_BUILD` безусловно, с
+   комментарием «Until roster-based write-down is implemented, every object carries the current build
+   as its compatibility floor». `CasFormat.cpp:98-101`: `currentWriterVersion` — то же.
+   `CasFormat.h:60`: `constexpr uint32_t G_BUILD = 9`. То есть бамп генерации действительно поднимает
+   пол чтения у ВСЕХ классов, включая не менявшиеся. Утверждение верное.
+
+2. `changePoints` заполняется и не читается на пути декода.
+   Единственные не-тестовые вхождения — определение `CasFormat.cpp:66-96` и объявление
+   `CasFormat.h:161`; все прочие — тесты (`src/Disks/tests/gtest_cas_format.cpp:23,41,56`,
+   `gtest_cas_text_format.cpp:47`, `gtest_cas_gc_maintenance_state_format.cpp:30`). Гейт на декоде —
+   только `v > G_BUILD` (`CasFormat.cpp:110-116`, вызывается из `CasTextFormat.cpp:328` внутри
+   `expectHeaderLine`). Это прямо задокументировано и в самом дереве:
+   `src/Disks/tests/gtest_cas_format.cpp:36` — «nothing consults `changePoints` at decode time yet»,
+   и `gtest_cas_text_format.cpp:245-247`. То есть реестр — задел под будущий per-class пол.
+
+3. «Ничто не связывает изменение формата с бампом `G_BUILD`» — верно: связь только дисциплинарная
+   (комментарий-политика `CasFormat.h:13-16` и `Formats/README.md:52-53`), никакой машинной проверки
+   нет. Тесты фиксируют лишь согласованность уже записанных change-points, а не факт бампа.
+
+Что НЕ подтверждается (реальная форма кода + недостижимое следствие — типовая ошибка этого аудита).
+
+4. «Толерантные декодеры выбрасывают неизвестные ключи, а read-modify-write циклы их затирают,
+   тихо стирая поля более новой ноды». Форма RMW есть: `Pool/CasPoolMeta.cpp:87-101` —
+   `decodePoolMeta` → копия структуры → `encodePoolMeta(next)` → `casPut`, а `PoolMeta` толерантен
+   (`CasFormat.cpp:143`, `KeyStrictness::Tolerant`, `CasPoolMetaFormat.cpp:160` `r.skipUnknown(key)`).
+   Но объект более НОВОЙ генерации до толерантного тела не доходит: `expectHeaderLine`
+   (`CasTextFormat.cpp:320-329`) вызывает `checkCompatibility` ДО чтения тела, и `v > G_BUILD` даёт
+   `UNKNOWN_FORMAT_VERSION`. Плюс критические ключи `!...` отвергаются даже толерантными форматами
+   (`CasTextFormat.cpp:249-251`). Значит «тихое стирание» требует, чтобы новая сборка добавила поле
+   БЕЗ бампа генерации и без `!`-префикса, т.е. нарушения той самой политики из п.3. Это риск
+   дисциплины, а не дефект HEAD, и он fail-closed, а не silent, ровно там, где политика соблюдена.
+
+5. «`FormatId::Roster` зарегистрирован в `changePoints` без строки трейтов, поэтому обращение к нему
+   бросает `LOGICAL_ERROR`». Факт верен: `CasFormat.cpp:83` (ветка `Roster` → `BASELINE`), а
+   `traitsFor` (`CasFormat.cpp:177-183`) действительно бросает `LOGICAL_ERROR`, что и задокументировано
+   в `CasFormat.h:192-193` как «reserved and has no codec or traits row yet». Но следствие
+   недостижимо: `Roster` не пишется, не читается и не мапится ни на один `type` — во всём `src/`
+   `FormatId::Roster` встречается ровно в `CasFormat.cpp:83`, `CasFormat.h:107` и в ТЕСТАХ
+   (`gtest_cas_text_format.cpp:74,97` — там намеренный `EXPECT_THROW`/`EXPECT_DEATH`, т.е. поведение
+   зафиксировано как ожидаемое). Динамический путь `traitsForType` (`CasFormat.cpp:185-191`) вернуть
+   `Roster` не может: для незарегистрированного `type` он отдаёт `nullptr`. Итого — зарезервированное
+   значение enum с громким assert, а не баг.
+
+6. Trigger «прочитать объект более старой сборкой; или смешанные генерации в одном пуле» на HEAD
+   fail-closed на МОНТИРОВАНИИ, а не в бизнес-логике: любой mount декодирует `_pool_meta`
+   (`Pool/CasPoolMeta.cpp:126`, `Pool/CasPool.cpp:118,234`), а `decodePoolMeta` держит гейт в ОБЕ
+   стороны — назад `CasPoolMetaFormat.cpp:111-117` (`header.v < kCommittedRefFrontierGeneration` →
+   `UNKNOWN_FORMAT_VERSION`, «recreate the pool; CAS is pre-release: there is no in-place migration») и
+   вперёд через `expectHeaderLine`/`checkCompatibility`, плюс отдельный пол
+   `CasPoolMetaFormat.cpp:174-177` по `min_reader_generation`. Так как оба пола равны `G_BUILD = 9`,
+   сборка с другим `G_BUILD` пул просто не смонтирует. Смешанная генерация в одном пуле сегодня
+   невозможна по конструкции.
+
+BACKLOG и история. Остаток покрыт двумя якорями:
+`docs/superpowers/cas/BACKLOG/formats-and-storage.md:74` {#cas-format-version-floor} — ровно про то,
+что `checkCompatibility` не применяет per-class пол из `changePoints`, с предложенной формой фикса
+(`changePoints(id).front().generation` как backward-пол);
+`docs/superpowers/cas/BACKLOG/operability-and-introspection.md:19` (секция {#operability}, пункт
+«B180 / format-freeze») — GATE: «durable roster + `max_content_addressable_pool_format`
+setting/rollout machinery not built (Part IV)», т.е. отсутствующий write-down-to-floor, который и
+делает бамп генерации точечным, а не всеобщим. Дополнительно `BACKLOG/formats-and-storage.md:83`
+(наименование `format_version`/`compatibility_version`) — косметика. Позиция пользователя
+(«needs attention later; not a blocker; model may be wrong») коду соответствует: pre-release формат
+несёт нулевые persisted-обязательства, все бампы 4-9 объявлены recreate-only (`CasFormat.h:25-59`),
+и никакая часть находки не даёт тихой порчи данных — все отказы громкие
+(`UNKNOWN_FORMAT_VERSION`/`LOGICAL_ERROR`).
+
+Что реально осталось: (а) per-class пол на декоде (уже трекается {#cas-format-version-floor});
+(б) roster + write-down-to-floor, чтобы бамп не аннулировал неизменившиеся классы (уже трекается
+B180 под {#operability}); (в) отсутствие машинной привязки «изменил кодек → обнови change-points и
+`G_BUILD`» — это часть того же B180-гейта, отдельного пункта не заводил. Новых нетрекаемых остатков
+нет; часть про `Roster` фикса не требует.
+
+## CAS-043 — Узость catch подтверждена (`CORRUPTED_DATA` only, а гейт версии и критический ключ дают `UNKNOWN_FORMAT_VERSION`), но перекос генераций в одном пуле сегодня невозможен: relink предлагается только внутри одного смонтированного пула, а mount держит точный гейт генерации — остаётся однострочное упрочнение. (частично, P3) {#cas-043}
+
+Устаревшие якоря. `CA/ContentAddressedMetadataStorage.cpp:1610-1619` на HEAD — это
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp:2259-2272`
+(переезд каталогов коммитом 592b9b83568, сам guard родом из `784c698bb40` «CA GC B7 (1/3)»).
+`CasFormat.cpp:90` → `CasFormat.cpp:110-116`. `DataPartsExchange.cpp:1182-1184` → вызов
+`relinkPartToDisk` теперь `DataPartsExchange.cpp:944`; «:793-799» → ветка relink на приёмнике
+`DataPartsExchange.cpp:889-950`.
+
+ПОДТВЕРЖДАЕТСЯ (форма кода).
+
+1. Фильтр catch действительно только по `CORRUPTED_DATA`:
+   `ContentAddressedMetadataStorage.cpp:2259-2272` — `decodePartManifest` в `try`, затем
+   `if (e.code() != ErrorCodes::CORRUPTED_DATA) throw;` и лишь иначе
+   `return CaRelinkPrepare::MechanismFallbackAllowed`.
+
+2. Ошибка генерации — это НЕ `CORRUPTED_DATA`: `decodePartManifest`
+   (`Formats/CasPartManifestFormat.cpp:129`) начинается с `expectHeaderLine(in, FormatId::PartManifest)`,
+   тот вызывает `checkCompatibility` (`Formats/CasTextFormat.cpp:328`), который при `v > G_BUILD` бросает
+   `UNKNOWN_FORMAT_VERSION` (`Formats/CasFormat.cpp:110-116`). Второй источник того же кода —
+   критический ключ `!...`: `Formats/CasTextFormat.cpp:249-251` (`skipUnknown`). Оба — ровно те сигналы
+   «эта сборка не умеет читать манифест отправителя», которые формат задуман эмитировать, и оба
+   пролетают мимо fallback: исключение уходит из `prepareRelink` наверх через `relinkPartToDisk`
+   (`DataPartsExchange.cpp:944`) и валит fetch целиком, вместо перезапроса байтами
+   (`fall_back_to_byte_fetch`, `DataPartsExchange.cpp:907-914`).
+
+3. Верно и то, что версия репликационного протокола ничего не говорит о генерации CAS:
+   `DataPartsExchange.cpp:103,108` — `REPLICATION_PROTOCOL_VERSION_WITH_CA_RELINK = 10`,
+   `..._WITH_CA_CONFIRM = 11`; это чисто wire-возможности.
+
+НЕ ПОДТВЕРЖДАЕТСЯ (следствие недостижимо на HEAD) — заявленный trigger «fetch между двумя нодами с
+разным `G_BUILD`».
+
+4. Relink предлагается ТОЛЬКО при совпадении пула: `DataPartsExchange.cpp:926-932` — если
+   `!chosen_ca || chosen_ca->getPoolUUID() != advertised_pool_uuid`, идёт байтовый fetch. То есть обе
+   стороны обязаны иметь смонтированным ОДИН И ТОТ ЖЕ пул.
+
+5. Смонтировать один пул двумя сборками с разным `G_BUILD` нельзя: mount всегда декодирует
+   `_pool_meta` (`Pool/CasPoolMeta.cpp:126`, `Pool/CasPool.cpp:118,234`), а `decodePoolMeta` держит
+   точный гейт — назад `Formats/CasPoolMetaFormat.cpp:111-117` (`header.v < kCommittedRefFrontierGeneration`
+   → `UNKNOWN_FORMAT_VERSION`, «recreate the pool»), вперёд `checkCompatibility` в `expectHeaderLine`,
+   плюс `Formats/CasPoolMetaFormat.cpp:174-177` по `min_reader_generation` (который админ-путь поднимает
+   до `G_BUILD`, `Pool/CasPoolMeta.cpp:90,152`). Так как backward-пол `kCommittedRefFrontierGeneration`
+   и `G_BUILD` оба равны 9 (`Formats/CasFormat.h:60,91`), допускается ровно генерация 9. Перекос
+   генераций внутри пула — конфигурация, которую валидация монтирования не принимает.
+
+6. Wire-перекос отдельно уже обработан и НЕ через это исключение: неизвестное значение cookie
+   `cas_relink` (`DataPartsExchange.cpp:916-923`) явным образом деградирует в байтовый fetch с
+   комментарием про rolling upgrade. Так что «мешанина сборок» покрыта, просто в другом месте.
+
+7. Формулировка однострочника «was-fixed / still-present» некорректна: предыдущая адъюдикация
+   (CAS-209, «fail-closed publish-nothing → byte-fetch fallback; format bumps caught by the manifest's
+   own compatibility check») коду не противоречит — проверка совместимости действительно ловит бамп,
+   просто громко (fail-closed), а не деградацией. Никакой регрессии/откатанного фикса в истории этого
+   guard нет: с `784c698bb40` он всегда был `CORRUPTED_DATA`-only.
+
+Единственный живой путь и его цена. Приёмник читает `sender_manifest_bytes` из сети
+(`DataPartsExchange.cpp:936-938`) без предварительного контроля целостности заголовка (payload_digest
+проверяется позже и внутри тела), поэтому искажение поля `v` в проводе даст `UNKNOWN_FORMAT_VERSION`
+и жёсткое падение fetch вместо деградации. Это громкий fail-closed отказ, который самолечится
+повторной попыткой очереди репликации, — не порча данных и не потеря части. Отсюда P3.
+
+Что осталось и чем не покрыто. В `BACKLOG.md`/`BACKLOG/*.md` ни `UNKNOWN_FORMAT_VERSION`, ни узость
+этого catch не трекались (проверено grep по обоим); ближайший смежный якорь —
+`BACKLOG/formats-and-storage.md:74` {#cas-format-version-floor}, но он про другой конец гейта
+(отсутствие backward-пола), и `BACKLOG/operability-and-introspection.md:19` (B180 / format-freeze) —
+про будущую rolling-upgrade машинерию. Поэтому добавил новую секцию (не коммичена) в
+`docs/superpowers/cas/BACKLOG/replication.md` с якорем
+{#relink-fallback-unknown-format-version}: принять `UNKNOWN_FORMAT_VERSION` наравне с
+`CORRUPTED_DATA` в этом catch — ровно как уже сделано в `Pool/CasRefLedger.cpp:177` (там оба кода
+означают «чужой объект») — и сделать это до первого релиза, который допустит пул со смешанными
+генерациями, потому что после этого узкий catch превратит деградируемый fetch в жёсткий стопор
+репликации.

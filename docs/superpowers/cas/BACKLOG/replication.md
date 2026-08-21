@@ -19,3 +19,27 @@ onto CA disks, merge/insert retry interactions with the mount-lease fence, and c
 - **[r3-acked-lost-dataloss] acked-then-lost INSERT data loss on cross-request retry — FIXED** — Root cause: on CA, `renameParts` is a pure overlay re-key with no publish, so the Keeper block_id/part-znode multi commits durably BEFORE the CAS manifest — a genuine split-commit window. A part lost in that window left its dedup token behind, so a byte-identical client retry deduped against it and acked with zero rows written. Fixed by `77484196b0d`: closes every part disk-storage transaction in `MergeTreeData::Transaction::renameParts`, so the part is durable before the Keeper block_id registration. Gates all green post-fix (S40 10/10 acked=3796 lost=0; `dl_probe` LOST=0, was ~198/1314; the original R4 chaos recipe that lost 1118 rows now PHASE3 OK with zero deficit). R3 ship-readiness restored. Residual: a narrower hazard (block_id outliving a durably-committed part lost later) stays out of scope — verify-on-dedup is the candidate if it ever matters. Open thread: an upstream submission draft exists (`tmp/upstream_issue_dedup_durability.md`), pending a user decision on whether to send it.
 - **[RPL-5 slice] `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` queue-clone relink, untested on CA** — TEST — A `REPLACE_RANGE` log entry cloned to a second replica reduces to fetch (relink or byte) + drop, individually working, but no integration test proves the cloned fetch specifically relinks rather than byte-refetches (RPL-4 disables `to_detached` relink explicitly, so the branch taken isn't obvious a priori). Needs `test_cas_replicated_relink`'s 2-replica rustfs fixture extended with a `REPLACE PARTITION`/`ATTACH ... FROM` scenario plus a blob-count relink proof. Pulled into the publish-confirm fetch-handoff iteration's test package, which touches the same relink-eligibility branch. (An orphaned 2026-08-04-triage finding, C-0098, describes this identical test gap — folded in here rather than inserted as a separate item, since it duplicated this one exactly.)
 - **[B66b] relink-into-detached (zero-byte `to_detached` fetch for same-pool parts)** — IN PROGRESS (2026-07-23) — folded into the publish-confirm fetch-handoff iteration: relink already publishes under `tmp-fetch_<part>` and re-keys via `renameTempPartAndReplace`, so detached needs only lifting the `!to_detached` advertise gate (`DataPartsExchange.cpp:540-545`) + the detached temporary name + the same confirm step; collision semantics inherited from the byte path by construction. (RPL-4 perf cliff.)
+
+## The relink manifest-decode fallback catches `CORRUPTED_DATA` only, not `UNKNOWN_FORMAT_VERSION` (2031-triage CAS-043) {#relink-fallback-unknown-format-version}
+
+`ContentAddressedMetadataStorage::prepareRelink`'s decode guard degrades to a byte fetch for
+`CORRUPTED_DATA` and rethrows everything else
+(`ContentAddressedMetadataStorage.cpp:2264-2272`), while `decodePartManifest`'s header gate
+(`Formats/CasPartManifestFormat.cpp:129` → `expectHeaderLine` → `checkCompatibility`) and the
+critical-key rule (`Formats/CasTextFormat.cpp:249-251`, a `!`-prefixed key) both raise
+`UNKNOWN_FORMAT_VERSION`. So the two "this build cannot read the sender's manifest" signals the
+format layer was designed to emit are the two the mechanism-unavailable fallback does not accept: the
+whole fetch fails loudly instead of re-requesting the bytes.
+
+Not reachable today, and that is why this is hardening rather than a defect: relink is offered only
+when both sides carry the same pool UUID (`DataPartsExchange.cpp:925-932`), mounting a pool decodes
+`_pool_meta` through an EXACT-generation gate (`Formats/CasPoolMetaFormat.cpp:111-117` backward,
+`checkCompatibility` forward, both at `G_BUILD`), and no `!`-prefixed key exists in any codec — so a
+generation-skewed pair cannot share a mounted pool in the first place. Wire garbling of the header's
+`v` field is the only live path, and it fails loudly and self-heals on the queue's next fetch attempt.
+
+Fix shape (one line plus a test): accept `UNKNOWN_FORMAT_VERSION` alongside `CORRUPTED_DATA` in that
+catch, exactly as `Pool/CasRefLedger.cpp:177` already pairs the two codes. Do this before the first
+release that admits a mixed-generation pool (see B180 / format-freeze in
+`operability-and-introspection.md`), since after that the narrow catch turns a degradable fetch into
+a hard replication stall.
