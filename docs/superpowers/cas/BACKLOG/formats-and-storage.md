@@ -342,3 +342,29 @@ The existing unit coverage
 (`gtest_cas_backend.cpp:847-919`, `DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfortablyOld` /
 `EmuTokenStateEventuallyPrunesDistinctShortLivedKeys`) already has the injectable clock/etag doubles
 needed for a failing-first test.
+
+## S3 staging debris is reclaimed only at mount start and is invisible to fsck (2031-triage CAS-081) {#s3-staging-reclaim-only-at-mount-start}
+
+An aborted/exception-unwound transaction deliberately leaves its S3 staging objects in place
+(`ContentAddressedTransaction.cpp:174-207` — the local temp file is removed unconditionally, the S3
+object only `else if (committed)`), because a staging object is the sanctioned resurrect source for the
+promote gate and must outlive one failed attempt. That part of the design is settled. What is NOT
+covered is the reclaim side:
+
+- `sweepOwnMountStaging` (`Pool/CasServerRoot.cpp:1473`) has exactly ONE call site, at mount start
+  (`ContentAddressedMetadataStorage.cpp:844`, gated on `staging_backend=s3` + `!read_only` +
+  `conditional_copy_supported`). There is no periodic in-mount reclaim, so under an opt-in
+  `staging_backend=s3` disk the staged bytes of every killed/cancelled INSERT, failed mutation and
+  aborted MOVE accumulate for the WHOLE uptime of the mount and are reclaimed only by the next restart.
+- GC never lists `staging/` (a top-level prefix disjoint from `blobs/`, pinned by
+  `gtest_cas_s3_staging.cpp:900-910`), and `runFsck` inherits the same blob-discovery prefix, so the
+  debris does not appear as `unaccounted` — an operator has no shipped way to see how much staging
+  residue a LIVE member is holding. (For a DEAD member the drain does exist:
+  `SYSTEM CAS DROP POOL MEMBER` removes `staging/<victim_srid>/` and reports
+  `staging_objects_removed` — `Tools/CasDecommission.cpp:232-236`.)
+
+Fix direction: run the same prefix sweep periodically (e.g. from the GC scheduler's own pacing loop,
+still fenced to THIS mount's `staging/<server_root_id>/` prefix) with an age filter that cannot reach
+an in-flight staging object, and surface the staging-object count/bytes in an introspection surface
+(fsck report row or `system.content_addressed_mounts`). Low urgency: the whole path is opt-in and OFF
+by default, and every restart clears the residue.
