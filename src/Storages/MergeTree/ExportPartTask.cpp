@@ -65,7 +65,8 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool allow_experimental_analyzer;
     extern const SettingsString export_merge_tree_part_filename_pattern;
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool ignore_extra_source_columns;
 }
 
 namespace
@@ -122,15 +123,16 @@ namespace
             = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
 
-        const auto schema_mismatch_mode =
-            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
-        const bool ignore_extra_source_columns_by_position =
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+        const auto schema_match_mode =
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+        const bool ignore_extra_source_columns =
+            local_context->getSettingsRef()[Setting::ignore_extra_source_columns];
+        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        if (ignore_extra_source_columns_by_position && src_has_extra_columns)
+        if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartTask"),
                 "Source has {} columns while destination has {} columns, "
@@ -159,14 +161,10 @@ namespace
             source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         }
 
-        const bool ignore_extra_source_columns_by_name =
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
-            && src_has_extra_columns;
-
         auto dag = ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            ignore_extra_source_columns_by_name
+            match_by_name
                 ? ActionsDAG::MatchColumnsMode::Name
                 : ActionsDAG::MatchColumnsMode::Position,
             local_context);

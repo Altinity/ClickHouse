@@ -92,24 +92,14 @@ namespace ExportPartitionUtils
     void verifyExportColumnCastsAreSafe(
         const ColumnsWithTypeAndName & source_columns,
         const ColumnsWithTypeAndName & destination_columns,
-        MergeTreePartExportSchemaMismatchMode schema_mismatch_mode,
+        MergeTreePartExportSchemaMatchMode schema_match_mode,
+        bool ignore_extra_source_columns,
         const StorageID & destination_storage_id);
 
-    /// Validates that source columns can be exported into the destination with the
-    /// configured positional or name-based CAST matching. Lossy casts are rejected
-    /// unless `export_merge_tree_part_allow_lossy_cast` is set.
-    ///
-    /// By default the source and destination must have the same number of columns.
-    /// If `export_merge_tree_part_schema_mismatch_mode = 'ignore_extra_source_columns_by_position'`, a
-    /// source with more columns than the destination is allowed: the extra trailing
-    /// source columns (by position) are excluded from the comparison here, matching
-    /// what `ExportPartTask::addExportConvertingActions` drops from the actual data.
-    /// If the mode is `ignore_extra_source_columns_by_name` and the source has more columns
-    /// than the destination, destination columns are matched to source columns by their exact
-    /// names and may appear in a different order. With an equal (or smaller) column count this
-    /// mode has no extra source columns to ignore and behaves exactly like `strict`.
-    ///
-    /// Throws BAD_ARGUMENTS on any violation.
+    /// Validates that source columns can be exported into the destination with the configured
+    /// positional or name-based CAST matching (`export_merge_tree_part_schema_match_mode`) and
+    /// unmatched-column policy (`ignore_extra_source_columns`). Lossy casts are rejected unless
+    /// `export_merge_tree_part_allow_lossy_cast` is set. Throws BAD_ARGUMENTS on any violation.
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,

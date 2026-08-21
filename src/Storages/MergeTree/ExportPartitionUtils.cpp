@@ -97,7 +97,8 @@ namespace Setting
 #if USE_AVRO
     extern const SettingsTimezone iceberg_partition_timezone;
 #endif
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool ignore_extra_source_columns;
 }
 
 namespace FailPoints
@@ -217,12 +218,16 @@ namespace ExportPartitionUtils
             context_copy->setSetting("output_format_parquet_row_group_size", *manifest.parquet_row_group_size);
         if (manifest.parquet_row_group_size_bytes)
             context_copy->setSetting("output_format_parquet_row_group_size_bytes", *manifest.parquet_row_group_size_bytes);
-        /// Manifests written before this setting existed have no value here; such tasks were always
-        /// scheduled under the old, strict column-count check, so an absent value must resolve to
-        /// `strict` regardless of the ambient context's setting (which may have since been changed).
+        /// Manifests written before these settings existed have no value here; such tasks were always
+        /// scheduled under the old, strict column-matching check, so an absent value must resolve to
+        /// `match_by_position` / `false` regardless of the ambient context's settings (which may have
+        /// since been changed).
         context_copy->setSetting(
-            "export_merge_tree_part_schema_mismatch_mode",
-            String(magic_enum::enum_name(manifest.schema_mismatch_mode.value_or(MergeTreePartExportSchemaMismatchMode::strict))));
+            "export_merge_tree_part_schema_match_mode",
+            String(magic_enum::enum_name(manifest.schema_match_mode.value_or(MergeTreePartExportSchemaMatchMode::match_by_position))));
+        context_copy->setSetting(
+            "ignore_extra_source_columns",
+            manifest.ignore_extra_source_columns.value_or(false));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
@@ -969,14 +974,23 @@ namespace
     void verifyExportColumnCastsAreSafe(
         const ColumnsWithTypeAndName & source_columns,
         const ColumnsWithTypeAndName & destination_columns,
-        MergeTreePartExportSchemaMismatchMode schema_mismatch_mode,
+        MergeTreePartExportSchemaMatchMode schema_match_mode,
+        bool ignore_extra_source_columns,
         const StorageID & destination_storage_id)
     {
-        const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
-
-        if (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
-            && src_has_extra_columns)
+        if (schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name)
         {
+            /// `ignore_extra_source_columns` only excuses the source having MORE columns than the
+            /// destination; a source with fewer columns is always a mismatch.
+            const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
+            if (source_columns.size() != destination_columns.size()
+                && !(ignore_extra_source_columns && src_has_extra_columns))
+                throw Exception(
+                    ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                    "Number of columns doesn't match (source: {} and result: {})",
+                    source_columns.size(),
+                    destination_columns.size());
+
             std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
             source_columns_by_name.reserve(source_columns.size());
             for (const auto & source_column : source_columns)
@@ -997,8 +1011,7 @@ namespace
         }
 
         if (source_columns.size() < destination_columns.size()
-            || (schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::strict
-                && source_columns.size() != destination_columns.size()))
+            || (!ignore_extra_source_columns && source_columns.size() != destination_columns.size()))
             throw Exception(
                 ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
                 "Number of columns doesn't match (source: {} and result: {})",
@@ -1026,18 +1039,14 @@ namespace
         auto source_columns = source_sample_block.getColumnsWithTypeAndName();
         const auto & destination_columns = destination_sample_block.getColumnsWithTypeAndName();
 
-        /// In `ignore_extra_source_columns_by_position` mode a source with more columns than the destination
-        /// is allowed: the extra trailing source columns (by position) are dropped, mirroring
-        /// the trimming `ExportPartTask::addExportConvertingActions` applies to the real data.
-        /// The reverse (destination has more columns than source) is always rejected below by
-        /// `makeConvertingActions`, in both modes.
-        const auto schema_mismatch_mode =
-            context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
+        const auto schema_match_mode =
+            context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
+        const bool ignore_extra_source_columns =
+            context->getSettingsRef()[Setting::ignore_extra_source_columns];
+        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
-        const bool ignore_extra_source_columns_by_position =
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
 
-        if (ignore_extra_source_columns_by_position && src_has_extra_columns)
+        if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartitionUtils"),
                 "Source has {} columns while destination has {} columns, "
@@ -1048,14 +1057,21 @@ namespace
             source_columns.resize(destination_columns.size());
         }
 
-        const bool ignore_extra_source_columns_by_name =
-            schema_mismatch_mode == MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name
-            && src_has_extra_columns;
+        /// `makeConvertingActions` in `Name` mode silently ignores an unreferenced source column, so it must be rejected here explicitly.
+        /// `ignore_extra_source_columns` only excuses the source having MORE columns than the destination;
+        /// a source with fewer columns is always a mismatch.
+        if (match_by_name && source_columns.size() != destination_columns.size()
+            && !(ignore_extra_source_columns && src_has_extra_columns))
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {})",
+                source_columns.size(),
+                destination_columns.size());
 
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            ignore_extra_source_columns_by_name
+            match_by_name
                 ? ActionsDAG::MatchColumnsMode::Name
                 : ActionsDAG::MatchColumnsMode::Position,
             context);
@@ -1074,7 +1090,7 @@ namespace
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        if (ignore_extra_source_columns_by_name)
+        if (match_by_name)
         {
             std::unordered_map<String, size_t> source_positions_by_name;
             source_positions_by_name.reserve(source_columns.size());
@@ -1111,7 +1127,8 @@ namespace
         verifyExportColumnCastsAreSafe(
             source_columns,
             destination_columns,
-            schema_mismatch_mode,
+            schema_match_mode,
+            ignore_extra_source_columns,
             destination_storage_id);
     }
 }

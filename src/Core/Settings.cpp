@@ -7627,12 +7627,20 @@ Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) cas
 
 When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
 )", 0) \
-    DECLARE(MergeTreePartExportSchemaMismatchMode, export_merge_tree_part_schema_mismatch_mode, MergeTreePartExportSchemaMismatchMode::strict, R"(
-Controls whether `EXPORT PART`/`EXPORT PARTITION` allows the source `MergeTree` table to have more columns than the destination table and how destination columns are matched.
+    DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::match_by_position, R"(
+Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns.
 Possible values:
-- `strict` (default) - columns are matched positionally and the source and destination must have the same number of columns. A mismatch in either direction throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
-- `ignore_extra_source_columns_by_position` - the source may have more columns than the destination. The extra trailing source columns (by position) are dropped and not exported. The destination having more columns than the source is still rejected in this mode.
-- `ignore_extra_source_columns_by_name` - the source may have more columns than the destination. If it does, every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be reordered and the extra source columns may occur in any position; a destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback. When the source does not have more columns than the destination, this mode behaves exactly like `strict`: columns are matched positionally, and a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- `match_by_position` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+- `match_by_name` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback.
+
+See also `ignore_extra_source_columns`, which controls whether a source column without a corresponding destination column is dropped or rejected.
+)", 0) \
+    DECLARE(Bool, ignore_extra_source_columns, false, R"(
+Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` columns that have no corresponding destination column.
+- `false` (default) - such a source column is rejected: the source and destination must match exactly (in `export_merge_tree_part_schema_match_mode = 'match_by_position'`, this means the same number of columns; in `'match_by_name'`, the same set of column names). A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `match_by_position` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `match_by_name` mode, this allows source columns whose name has no destination counterpart.
+
+Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 )", 0) \
     \
     /* ####################################################### */ \

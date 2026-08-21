@@ -18,11 +18,13 @@ namespace ErrorCodes
 {
     extern const int INCOMPATIBLE_COLUMNS;
     extern const int THERE_IS_NO_COLUMN;
+    extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
 }
 
 namespace Setting
 {
-    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+    extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
+    extern const SettingsBool ignore_extra_source_columns;
 }
 
 namespace
@@ -144,60 +146,109 @@ TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
 }
 
 
-TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMismatchModeParsesAsNullopt)
+TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchModeParsesAsNullopt)
 {
     auto manifest = makeValidManifest();
-    manifest.schema_mismatch_mode = MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position;
+    manifest.schema_match_mode = MergeTreePartExportSchemaMatchMode::match_by_name;
 
     Poco::JSON::Parser parser;
     auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
-    json->remove("schema_mismatch_mode");
+    json->remove("schema_match_mode");
     std::ostringstream oss;
     oss.exceptions(std::ios::failbit);
     Poco::JSON::Stringifier::stringify(json, oss);
 
     auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
-    EXPECT_FALSE(parsed.schema_mismatch_mode.has_value());
+    EXPECT_FALSE(parsed.schema_match_mode.has_value());
 }
 
-TEST_F(ExportPartitionManifestBackCompatTest, SchemaMismatchModeRoundTripsForEveryValue)
+TEST_F(ExportPartitionManifestBackCompatTest, SchemaMatchModeRoundTripsForEveryValue)
 {
-    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMismatchMode>())
+    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMatchMode>())
     {
         auto manifest = makeValidManifest();
-        manifest.schema_mismatch_mode = value;
+        manifest.schema_match_mode = value;
 
         auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(manifest.toJsonString());
 
-        ASSERT_TRUE(parsed.schema_mismatch_mode.has_value()) << "value=" << magic_enum::enum_name(value);
-        EXPECT_EQ(*parsed.schema_mismatch_mode, value) << "value=" << magic_enum::enum_name(value);
+        ASSERT_TRUE(parsed.schema_match_mode.has_value()) << "value=" << magic_enum::enum_name(value);
+        EXPECT_EQ(*parsed.schema_match_mode, value) << "value=" << magic_enum::enum_name(value);
     }
 }
 
-TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMismatchModeFallsBackToStrictInWorkerContext)
+TEST_F(ExportPartitionManifestBackCompatTest, MissingIgnoreExtraSourceColumnsParsesAsNullopt)
 {
     auto manifest = makeValidManifest();
-    ASSERT_FALSE(manifest.schema_mismatch_mode.has_value());
+    manifest.ignore_extra_source_columns = true;
+
+    Poco::JSON::Parser parser;
+    auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
+    json->remove("ignore_extra_source_columns");
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+
+    auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(oss.str());
+    EXPECT_FALSE(parsed.ignore_extra_source_columns.has_value());
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsRoundTripsForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.ignore_extra_source_columns = value;
+
+        auto parsed = ExportReplicatedMergeTreePartitionManifest::fromJsonString(manifest.toJsonString());
+
+        ASSERT_TRUE(parsed.ignore_extra_source_columns.has_value()) << "value=" << value;
+        EXPECT_EQ(*parsed.ignore_extra_source_columns, value) << "value=" << value;
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchSettingsFallBackToDefaultsInWorkerContext)
+{
+    auto manifest = makeValidManifest();
+    ASSERT_FALSE(manifest.schema_match_mode.has_value());
+    ASSERT_FALSE(manifest.ignore_extra_source_columns.has_value());
 
     auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
 
     EXPECT_EQ(
-        worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value,
-        MergeTreePartExportSchemaMismatchMode::strict);
+        worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
+        MergeTreePartExportSchemaMatchMode::match_by_position);
+    EXPECT_EQ(
+        worker_context->getSettingsRef()[Setting::ignore_extra_source_columns].value,
+        false);
 }
 
-TEST_F(ExportPartitionManifestBackCompatTest, SchemaMismatchModeAppliedToWorkerContextForEveryValue)
+TEST_F(ExportPartitionManifestBackCompatTest, SchemaMatchModeAppliedToWorkerContextForEveryValue)
 {
-    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMismatchMode>())
+    for (const auto value : magic_enum::enum_values<MergeTreePartExportSchemaMatchMode>())
     {
         auto manifest = makeValidManifest();
-        manifest.schema_mismatch_mode = value;
+        manifest.schema_match_mode = value;
 
         auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
 
         EXPECT_EQ(
-            worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value,
+            worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
             value) << "value=" << magic_enum::enum_name(value);
+    }
+}
+
+TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToWorkerContextForEveryValue)
+{
+    for (const bool value : {false, true})
+    {
+        auto manifest = makeValidManifest();
+        manifest.ignore_extra_source_columns = value;
+
+        auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
+
+        EXPECT_EQ(
+            worker_context->getSettingsRef()[Setting::ignore_extra_source_columns].value,
+            value) << "value=" << value;
     }
 }
 
@@ -222,7 +273,8 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position,
+                MergeTreePartExportSchemaMatchMode::match_by_position,
+                /*ignore_extra_source_columns=*/ true,
                 destination_storage_id);
         },
         ErrorCodes::INCOMPATIBLE_COLUMNS);
@@ -230,11 +282,12 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
     EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
         source_columns,
         destination_columns,
-        MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name,
+        MergeTreePartExportSchemaMatchMode::match_by_name,
+        /*ignore_extra_source_columns=*/ true,
         destination_storage_id));
 }
 
-TEST(ExportColumnCastsTest, MatchingByNameNoOpWithoutExtraSourceColumns)
+TEST(ExportColumnCastsTest, MatchByNameAcceptsReorderedColumnsWithEqualColumnCount)
 {
     const ColumnsWithTypeAndName source_columns = {
         makeColumn<DataTypeInt32>("id"),
@@ -248,18 +301,26 @@ TEST(ExportColumnCastsTest, MatchingByNameNoOpWithoutExtraSourceColumns)
     };
     const StorageID destination_storage_id{"test", "destination"};
 
-    for (const auto mode :
-        {MergeTreePartExportSchemaMismatchMode::strict,
-         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position,
-         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name})
+    for (const bool ignore_extra_source_columns : {false, true})
     {
         expectExceptionCode(
             [&]
             {
                 ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-                    source_columns, reordered_destination_columns, mode, destination_storage_id);
+                    source_columns,
+                    reordered_destination_columns,
+                    MergeTreePartExportSchemaMatchMode::match_by_position,
+                    ignore_extra_source_columns,
+                    destination_storage_id);
             },
             ErrorCodes::INCOMPATIBLE_COLUMNS);
+
+        EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+            source_columns,
+            reordered_destination_columns,
+            MergeTreePartExportSchemaMatchMode::match_by_name,
+            ignore_extra_source_columns,
+            destination_storage_id));
     }
 
     const ColumnsWithTypeAndName same_order_destination_columns = {
@@ -268,14 +329,43 @@ TEST(ExportColumnCastsTest, MatchingByNameNoOpWithoutExtraSourceColumns)
         makeColumn<DataTypeString>("payload"),
     };
 
-    for (const auto mode :
-        {MergeTreePartExportSchemaMismatchMode::strict,
-         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_position,
-         MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name})
-    {
-        EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-            source_columns, same_order_destination_columns, mode, destination_storage_id));
-    }
+    for (const auto mode : {MergeTreePartExportSchemaMatchMode::match_by_position, MergeTreePartExportSchemaMatchMode::match_by_name})
+        for (const bool ignore_extra_source_columns : {false, true})
+            EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+                source_columns, same_order_destination_columns, mode, ignore_extra_source_columns, destination_storage_id));
+}
+
+TEST(ExportColumnCastsTest, MatchByNameRejectsUnmatchedSourceColumnUnlessIgnored)
+{
+    const ColumnsWithTypeAndName source_columns = {
+        makeColumn<DataTypeInt32>("id"),
+        makeColumn<DataTypeInt32>("year"),
+        makeColumn<DataTypeString>("extra"),
+    };
+    const ColumnsWithTypeAndName destination_columns = {
+        makeColumn<DataTypeInt32>("id"),
+        makeColumn<DataTypeInt32>("year"),
+    };
+    const StorageID destination_storage_id{"test", "destination"};
+
+    expectExceptionCode(
+        [&]
+        {
+            ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+                source_columns,
+                destination_columns,
+                MergeTreePartExportSchemaMatchMode::match_by_name,
+                /*ignore_extra_source_columns=*/ false,
+                destination_storage_id);
+        },
+        ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH);
+
+    EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
+        source_columns,
+        destination_columns,
+        MergeTreePartExportSchemaMatchMode::match_by_name,
+        /*ignore_extra_source_columns=*/ true,
+        destination_storage_id));
 }
 
 TEST(ExportColumnCastsTest, RejectsLossyCastAfterMatchingByName)
@@ -296,7 +386,8 @@ TEST(ExportColumnCastsTest, RejectsLossyCastAfterMatchingByName)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name,
+                MergeTreePartExportSchemaMatchMode::match_by_name,
+                /*ignore_extra_source_columns=*/ true,
                 StorageID{"test", "destination"});
         },
         ErrorCodes::INCOMPATIBLE_COLUMNS);
@@ -320,7 +411,8 @@ TEST(ExportColumnCastsTest, RejectsMissingDestinationColumnAfterMatchingByName)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMismatchMode::ignore_extra_source_columns_by_name,
+                MergeTreePartExportSchemaMatchMode::match_by_name,
+                /*ignore_extra_source_columns=*/ true,
                 StorageID{"test", "destination"});
         },
         ErrorCodes::THERE_IS_NO_COLUMN);
