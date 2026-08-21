@@ -422,6 +422,10 @@ continuing the ID series, not renumbering anything above.
 ## `[gcs-conditional-overwrite-rethink]` GCS conditional overwrite needs re-thinking from the premise, not a bigger cap {#gcs-conditional-overwrite-rethink}
 
 **SCOPE NARROWED (2026-08-04): the resurrect path no longer has this problem.** The condemned-blob
+  > **Correction (opus-review triage, 2026-08-22):** stale — `resurrect` now routes through
+  > `tokenProducingWriteSettings` and IS bound by the same single-PUT cap, so the "size-unlimited on
+  > GCS too" claim above no longer holds. The setting was also renamed
+  > `gcs_max_conditional_put_bytes` → `gcs_max_token_producing_put_bytes` (no alias).
 resurrect is now an UNCONDITIONAL write (`Backend::resurrect`): on remote object storage it streams
 and takes multipart -- size-unlimited on GCS too; the local emulated mode materializes one body at a
 time (see the spill-to-disk debt below). What remains capped is the CONDITIONAL write-once

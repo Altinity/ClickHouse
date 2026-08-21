@@ -312,3 +312,22 @@ window is real but produces a different defect: a cross-key TOCTOU between the l
 `retired_at_ms`, so its next restart is wrongly refused with `CORRUPTED_DATA`. Availability, not
 loss; reproducing it needs a chaos test that restarts the victim between the recheck and the CAS.
 P2. Loosely adjacent: 2031-triage CAS-063 and CAS-007.
+
+## Detached CAS work can outlive `Context`: `~Pool`'s farewell logs through a null shared context (opus review B3+B4) {#detached-pool-outlives-context}
+
+One coupled defect chain, both halves verified at HEAD and neither tracked before:
+
+- **B4** — `shutdown()` does not drain the detached CAS dispatches, and they hold a STRONG reference
+  to `Pool`. The snapshot publisher is a routine path, not an anomalous one, so a detached task can
+  legitimately be the last `Pool` owner; `~Pool` then runs its durable farewell write and emits a
+  mount event arbitrarily late — potentially after the object storage is already shut down. rev.8
+  closed the neighbouring half (GC threads self-exit on a terminal pool), not this one.
+- **B3** — CAS holds a strong `const ContextPtr` and logs through it. `Context::getContentAddressedLog`
+  dereferences `shared` unconditionally, while `resetSharedContext()` nulls it before that last
+  farewell `MountRelease` fires. So the tail of B4 lands on a null `shared` — a null dereference at
+  shutdown, on a background thread.
+
+Fix shape: give the pool's detached work a tracked drain that `shutdown()` waits on (so `~Pool` runs
+while the world still exists), and make the event-emit path tolerate an absent log/context instead of
+dereferencing it. Both are needed: the drain removes the ordering, the tolerance removes the class.
+P1 — a shutdown-path null dereference is a crash on every server that ever mounted a CAS disk.
