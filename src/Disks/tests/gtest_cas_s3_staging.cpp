@@ -88,7 +88,7 @@ public:
             return {.created = false, .dest_etag = {}};
 
         copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
-        return {.created = true, .dest_etag = "fake-etag"};
+        return {.created = true, .dest_etag = next_dest_etag};
     }
 
     int callCount() const { return call_count; }
@@ -96,6 +96,29 @@ public:
     /// The `object_storage_request_mode` carried by the WriteSettings passed to the MOST RECENT call --
     /// lets a test prove a caller marked (or didn't mark) its conditional copy NativeConditional.
     DB::ObjectStorageRequestMode last_request_mode = DB::ObjectStorageRequestMode::Default;
+
+    /// The `dest_etag` the NEXT successful (created) call returns -- lets a test drive
+    /// `ObjectStorageBackend::promoteStaged`'s `tokenFromWriteResult` validation with a valid numeric
+    /// generation, an empty string, or a non-numeric value. Defaults to the pre-existing literal so
+    /// tests that don't care about the value see unchanged behavior.
+    std::string next_dest_etag = "fake-etag";
+
+    /// Counts calls to either metadata-read virtual, so a test can prove `promoteStaged`'s
+    /// Generation-dialect validation never issues a follow-up HEAD -- the token comes from the copy
+    /// response alone.
+    mutable int head_calls = 0;
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        ++head_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override
+    {
+        ++head_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
 
 private:
     Mode mode;
@@ -325,6 +348,85 @@ TEST(CASS3Staging, PromoteStagedNativeConditionalModePropagates)
     const auto result = backend->promoteStaged(staging_key, blob_key);
     ASSERT_EQ(result.outcome, DB::Cas::PutOutcome::Done);
     EXPECT_EQ(storage->last_request_mode, DB::ObjectStorageRequestMode::NativeConditional);
+}
+
+/// Task 3 fix round 1: `promoteStaged`'s Step 7 validation (`tokenFromWriteResult`) was reachable only
+/// by a real GCS backend, with no test in the repository exercising its Generation-dialect branch for
+/// the COPY call site specifically (`ConditionalCopyResult::dest_etag` is a plain `String`, so it
+/// always `has_value()` once wrapped as an optional -- the "no write-time-token concept" story that
+/// applies to the write-buffer callers is inapplicable here; every Generation-dialect copy takes the
+/// strict branch). These two tests close that gap, mirroring
+/// `ResurrectAtSinglePutCapUsesOnePutAndReturnsResponseGeneration` /
+/// `ResurrectMissingGenerationOnSuccessThrows` for the copy path. Unlike the resurrect battery, this
+/// does not need to fight `S3ObjectStorage::getSingleAttemptClient` discarding a mocked client's
+/// overrides: `gtest_cas_s3_staging.cpp` already fakes at the `IObjectStorage` level, and
+/// `copyObjectConditional` (unlike `writeObject`) never consults the retry profile at all.
+
+/// A valid numeric `dest_etag` on a Generation-dialect backend is attributed EXACTLY -- no follow-up
+/// HEAD, matching the "no new metadata request" half of Step 7.
+TEST(CASS3Staging, PromoteStagedGenerationDialectValidGenerationReturnsExactToken)
+{
+    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
+    backend->setNativeTokenTypeForTest(DB::Cas::TokenType::Generation);
+    storage->next_dest_etag = "778899";
+
+    const std::string root = storage->getCommonKeyPrefix();
+    const std::string staging_key = root + "/staging-key-gen-ok";
+    const std::string blob_key = root + "/blob-key-gen-ok";
+    {
+        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
+        const std::string body = "staged-bytes";
+        buf->write(body.data(), body.size());
+        buf->finalize();
+    }
+    storage->head_calls = 0;
+
+    const auto result = backend->promoteStaged(staging_key, blob_key);
+    ASSERT_EQ(result.outcome, DB::Cas::PutOutcome::Done);
+    EXPECT_EQ(result.token, (DB::Cas::Token{"778899", DB::Cas::TokenType::Generation}));
+    EXPECT_EQ(storage->head_calls, 0);
+}
+
+/// A missing (empty) or non-numeric `dest_etag` on a Generation-dialect backend is an exception --
+/// never a silently-empty token, and never patched over by a follow-up HEAD.
+TEST(CASS3Staging, PromoteStagedGenerationDialectMissingOrNonNumericGenerationThrowsCorruptedData)
+{
+    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
+    backend->setNativeTokenTypeForTest(DB::Cas::TokenType::Generation);
+
+    const std::string root = storage->getCommonKeyPrefix();
+
+    {
+        const std::string staging_key = root + "/staging-key-gen-empty";
+        const std::string blob_key = root + "/blob-key-gen-empty";
+        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
+        const std::string body = "staged-bytes";
+        buf->write(body.data(), body.size());
+        buf->finalize();
+        storage->next_dest_etag = "";
+        storage->head_calls = 0;
+
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+            [&] { backend->promoteStaged(staging_key, blob_key); });
+        EXPECT_EQ(storage->head_calls, 0);
+    }
+
+    {
+        const std::string staging_key = root + "/staging-key-gen-bad";
+        const std::string blob_key = root + "/blob-key-gen-bad";
+        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
+        const std::string body = "staged-bytes";
+        buf->write(body.data(), body.size());
+        buf->finalize();
+        storage->next_dest_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+        storage->head_calls = 0;
+
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+            [&] { backend->promoteStaged(staging_key, blob_key); });
+        EXPECT_EQ(storage->head_calls, 0);
+    }
 }
 
 /// Task 2 of the S3-native staging plan: `IObjectStorage::copyObjectConditional` (write-once

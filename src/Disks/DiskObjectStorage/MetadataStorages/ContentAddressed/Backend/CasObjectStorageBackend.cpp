@@ -856,6 +856,21 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 /// chain -- `WriteBufferFromFileDecorator::getResultObjectETag` returns `nullopt` for a wrapped impl
 /// that is not itself a `WriteBufferFromFileBase`, which would silently turn a hard failure back into
 /// a HEAD fallback.
+///
+/// `promoteStaged`'s caller does NOT get the benefit of that `has_value()` discriminator:
+/// `ConditionalCopyResult::dest_etag` is a plain `String`, not `std::optional<String>`, so it always
+/// converts to a `has_value()` optional here -- there is no "this backend has no write-time-token
+/// concept" case for a copy, and a Generation-dialect `promoteStaged` always takes the strict branch.
+/// That is intentional, not an oversight: a server-side copy response either carries a real generation
+/// or it doesn't, so there is no analogous "local files never report one" structural absence to fall
+/// back from.
+///
+/// One behavior change from this centralization, on the ETag dialect specifically: an empty
+/// `dest_etag` on a successful copy now falls through to a fresh HEAD (same as the write-buffer
+/// callers) instead of being forwarded as `Token{"", ETag}` the way `promoteStaged` used to before this
+/// existed. Keep it this way -- forwarding an empty token into CAS protocol state is worse than one
+/// extra metadata request, and a real AWS-compatible `CopyObject`/`CompleteMultipartUpload` response
+/// essentially never omits the ETag on success, so the extra HEAD is not expected to fire in practice.
 Token ObjectStorageBackend::tokenFromWriteResult(const String & key, const std::optional<String> & etag)
 {
     if (native_token_type == TokenType::Generation && etag.has_value())
