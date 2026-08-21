@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS unconditional blob publication design {#cas-unconditional-blob-publication-design}
 
-**Status:** DRAFT for review, rev.2 (2026-08-21). This specification defines a pre-release target
+**Status:** DRAFT for review, rev.3 (2026-08-22). This specification defines a pre-release target
 state. It deliberately does not require compatibility with older writer binaries or compatibility
 aliases for settings that have not shipped.
 
@@ -201,8 +201,8 @@ fixed:
 - it makes a complete object atomically visible or throws;
 - a streaming publication is `[fresh_envelope][payload]` and is eligible for ordinary multipart;
 - a verbatim staged publication is already a complete CAS object with a fresh envelope and is
-  permitted only after this transaction-level attempt observed the destination absent and only
-  while this staged source's one-shot verbatim-copy right is unconsumed;
+  permitted only for the first publication attempt of this logical source and only after that
+  attempt observed the destination absent;
 - the backend verifies the source byte count before visibility or relies on a staging write that
   already performed that verification;
 - no conditional-create or unconditional-delete fallback is permitted.
@@ -218,22 +218,32 @@ variant. Its logical `BlobSource` remains re-readable and, for S3 staging, can b
 staging object and open a reader positioned at its payload after the old envelope. Therefore:
 
 - absent destination plus S3 staging selects `VerbatimStagedBlobPublication` and preserves native
-  server-side copy only on the first transaction-level publication call for that staged source;
+  server-side copy only on the first publication attempt of that logical source;
 - condemned destination always mints a new envelope and selects `StreamingBlobPublication`, even
   when the payload lives in S3 staging.
 
-The one-shot right is consumed before issuing the copy, regardless of whether the call succeeds,
-throws, or loses its response. Any later transaction-level publication from the same staged source
-selects `StreamingBlobPublication` with a newly minted envelope, even if the new `HEAD` reports the
-destination absent. This closes the case where the first copy landed, an exact delete made it absent,
-and a retry of that delete is still queued for the copied ETag.
+The logical source carries monotonic `publication_attempted` state. Immediately before every
+backend publication, after the fence check and before any backend I/O, one atomic
+`beginPublication`-style operation returns whether this is the first attempt and sets the state to
+true. Transport selection uses that returned value and the current observation:
 
-The right belongs to the logical staged-object descriptor, not to one stack iteration. It is
-monotonic and shared by every copy/move of `BlobSource` used by the fan-out and retry layers; copying
-a request cannot reset it. A single `tryTakeVerbatimCopy`-style operation is the only producer of
-`VerbatimStagedBlobPublication` and consumes the right before backend I/O. The existing one-task-per-
-unique-ref rule means legitimate code does not contend for it; shared monotonic state makes an
-accidental duplicate fail closed into the retagged streaming variant.
+| Prior `publication_attempted` | Observation | S3-staged transport | New state |
+|---|---|---|---|
+| `false` | Absent | Verbatim native copy | `true` |
+| `false` | `Condemned` | Retagged streaming PUT | `true` |
+| `true` | Absent or `Condemned` | Retagged streaming PUT | `true` |
+
+The transition happens before the first publication of any kind, not only before copy. Whether the
+backend call succeeds, throws, does not land, or loses its response cannot restore `false`. Thus an
+initial condemned streaming attempt followed by a miss cannot later enable verbatim copy. Likewise,
+after an ambiguous first copy, a later attempt cannot recreate its ETag.
+
+`publication_attempted` belongs to the logical staged-object descriptor, not to one stack iteration.
+It is shared by every copy/move of `BlobSource` used by the fan-out and retry layers; copying a
+request cannot reset it. The existing one-task-per-unique-ref rule means legitimate code does not
+contend for it; atomic monotonic state makes an accidental duplicate select the retagged streaming
+variant. If the transaction fails, its source is destroyed; a new build creates a new staging object
+and envelope rather than reconstructing this state for a commit retry.
 
 The second path is an explicit re-tagging transport, not a fallback after copy failure. The backend
 still decides only how the selected bytes move. A future Azure backend therefore supplies ordinary
@@ -298,9 +308,10 @@ For each unique blob in the existing blob-upload fan-out:
    generation at that decision.
 7. Immediately before the durable write, `checkFenceOrThrow` confirms that the mount still owns the
    same fence generation.
-8. `Backend::publishBlob` publishes the writer's source unconditionally. An absent S3-staged target
-   may use the verbatim-copy variant once; the right is consumed before the request. A condemned
-   target, or any later publication call for that staged source, always uses a newly tagged streaming
+8. Immediately before backend I/O, `beginPublication` atomically sets `publication_attempted` and
+   reports whether this is the first attempt. `Backend::publishBlob` then publishes the writer's
+   source unconditionally. Only a first attempt that observed an absent S3-staged target may use
+   verbatim copy. A condemned target or any later attempt always uses a newly tagged streaming
    variant, including when its payload must be read from S3 staging.
 9. `reconcileBlobMetaClean` establishes a compatible `Clean` marker with the declared size.
 10. The method returns a `Materialized` dependency.
@@ -347,10 +358,11 @@ ETag on an ETag store. Copying it again after its ETag was condemned would let t
 `deleteExact` remove the purported replacement. The retry must instead re-open the staging payload,
 skip its old envelope, and stream it under a new tag.
 
-The same rule applies if the new `HEAD` reports absence: the prior verbatim copy may have landed and
-already been removed by an exact delete whose retry is still pending. Because the one-shot copy
-right was consumed before that ambiguous call, the next publication uses a new envelope and cannot
-recreate the deleted token.
+The same rule applies if the new `HEAD` reports absence: the prior publication may have landed and
+already been removed by an exact delete whose retry is still pending. Because
+`publication_attempted` was set before that ambiguous call, the next publication uses a new envelope
+and cannot recreate the deleted token. This also covers a first condemned streaming PUT that did not
+land: the later miss still cannot enable the source's original verbatim staged copy.
 
 ### Fence loss {#fence-loss}
 
@@ -448,9 +460,10 @@ next publication must also carry a different envelope/token identity.
 protocol.
 
 The staged object is complete `[staging envelope][payload]` content owned by the current transaction.
-After the first destination `HEAD` miss for that staged source, `ObjectStorageBackend::publishBlob`
-uses ordinary native same-store `copyObject`. The caller consumes this one-shot transport right
-before issuing the call. There is no destination precondition and no destination token result.
+When the source's first publication attempt follows a destination `HEAD` miss,
+`ObjectStorageBackend::publishBlob` uses ordinary native same-store `copyObject`. The caller sets
+`publication_attempted` before issuing the call. There is no destination precondition and no
+destination token result.
 
 Verbatim copy is not a universal staged-publication primitive. If the destination is present and
 `Condemned`, or an outer retry newly observes it as `Condemned`, `PartWriteTxn` mints a new envelope,
@@ -459,10 +472,10 @@ through the ordinary PUT/multipart publication variant. This is the provider-neu
 `INV-NO-RETURN` requirement: a repeated copy of identical complete bytes may retain the condemned
 ETag on an ETag store, while a newly tagged body cannot.
 
-Nor may an outer retry repeat the verbatim copy after a new miss. The first copy may have landed,
-been deleted under its ETag, and left a retry of that exact delete in flight. Every publication call
-after the consumed one-shot copy therefore uses the same re-tagging stream path, irrespective of the
-new body observation.
+Nor may an outer retry select verbatim copy after a new miss. The first publication may have been a
+copy that landed and was deleted under its ETag, or a retagged PUT selected from an initial
+`Condemned` observation. In both cases `publication_attempted` is already true, so every later
+publication uses the re-tagging stream path irrespective of the new body observation.
 
 This makes the path usable for generation-token GCS. The current generation-store exclusion and
 conditional-copy capability probe are removed. The replacement capability is narrower and purely
@@ -553,7 +566,8 @@ Add `docs/superpowers/models/CaBlobPublishCore.tla` with two writers and one GC.
 - fence generation and fence loss;
 - a publish that may land after its response is lost;
 - a re-readable logical payload plus a staged object's fixed envelope identity;
-- a per-writer one-shot verbatim-copy right that is consumed before the copy action;
+- per-writer monotonic `publication_attempted` state, atomically set before the first backend
+  publication of any kind;
 - ETag-style token minting derived from complete bytes/envelope identity and generation-style token
   minting that changes on every write.
 
@@ -567,8 +581,11 @@ semantics are tested live, not encoded as provider branches in TLA+.
 - A condemned body is not adopted without a fresh publication.
 - Every publication selected after observing `Condemned` has an incarnation token different from
   the condemned token, including an ETag-derived token for a staged source.
-- Once a staged source's verbatim-copy right is consumed, every later publication from that source
-  uses an envelope identity different from the staged envelope, even after an absent observation.
+- `publication_attempted` changes only from `false` to `true` and never resets while the logical
+  source exists.
+- Verbatim staged copy is enabled only by the transition from `false` to `true` after observing an
+  absent destination; a first publication after observing `Condemned`, and every publication whose
+  prior state was `true`, uses an envelope identity different from the staged envelope.
 - A delete authorized for a retired token cannot remove a different fresh incarnation.
 - An unconditional writer cannot publish different logical content under the same modelled key.
 - A fence-lost writer cannot commit.
@@ -584,8 +601,10 @@ Each sabotage must fail for the named reason:
 - reuse the condemned incarnation instead of minting a fresh one;
 - after ambiguous staged-copy landing, observe that copy as `Condemned`, copy the same staged
   envelope again, transition metadata to `Clean`, and let the old exact-token delete land;
-- after ambiguous staged-copy landing and exact deletion, observe absence, reuse the consumed staged
+- after ambiguous staged-copy landing and exact deletion, observe absence, reuse the original staged
   envelope while an old-token delete retry remains queued, and report ready;
+- start with `Condemned`, perform an ambiguous retagged streaming publication, then observe absence
+  and incorrectly permit verbatim copy of the original staged envelope;
 - replace exact-token delete with unconditional delete;
 - report ready after a lost response without a new observation;
 - publish before durable precommit;
@@ -627,10 +646,12 @@ Cover at least these state-machine cases:
   condemned and queued for `deleteExact`, the retry observes `Condemned`, and the replacement must
   use a new envelope so the queued delete misses;
 - sibling ETag regression: the old exact delete lands before retry `HEAD`, which therefore observes
-  absence, while another delete retry for the same ETag remains queued; the consumed staged copy may
-  not be reused and the replacement must again carry a new envelope;
-- copy/move the staged `BlobSource` through the fan-out request shape and prove its one-shot copy
-  right remains consumed rather than resetting per wrapper or loop iteration;
+  absence, while another delete retry for the same ETag remains queued; the staged envelope may not
+  be reused and the replacement must again carry a new envelope;
+- initial-`Condemned` regression: the first retagged streaming publication has an ambiguous outcome,
+  retry `HEAD` observes absence, and verbatim copy of the original staged envelope remains forbidden;
+- copy/move the staged `BlobSource` through the fan-out request shape and prove its shared
+  `publication_attempted` state remains `true` rather than resetting per wrapper or loop iteration;
 - fence loss before and after durable publication;
 - streaming source-size mismatch publishes nothing;
 - streaming and staged-copy sources produce the same dependency proof;
@@ -791,7 +812,7 @@ smaller and more honest caller set.
 | One additional S3 `HEAD` and RTT for a fresh small/cold blob | Request-count assertions, preserved fan-out, before/after lone and wide insert benchmarks, explicit acceptance before merge |
 | Hidden writer-side consumer of the token value | Exhaustive caller audit, explicit proof enum, compile failures after token removal, focused promotion tests |
 | GC race in the split `HEAD`/publish/meta flow | Focused two-writer TLA+ model, sabotage configurations, deterministic late-landing and exact-delete tests |
-| Re-copying a previously attempted staged envelope reproduces its ETag and lets a queued delete remove the replacement | One-shot verbatim-copy right consumed before I/O; every later publication re-opens the staged payload and prepends a new envelope; ETag-faithful present/absent regressions and TLA+ sabotages |
+| Re-copying a previously attempted staged envelope reproduces its ETag and lets a queued delete remove the replacement | Monotonic `publication_attempted` set before the logical source's first backend publication; verbatim copy only for first-plus-absent; first-plus-`Condemned` and all later publications re-open the staged payload and prepend a new envelope; ETag-faithful regressions and TLA+ sabotages |
 | GCS rejects ordinary multipart or copy wire behavior | Mandatory real-GCS live gate |
 | Server-side copy silently falls back to client transfer | Explicit native-copy capability and fail-closed `staging_backend=s3` mount |
 | Source length changes after hashing | Count before finalize; staged source verified when created |
@@ -846,17 +867,19 @@ The design is implemented only when all of the following hold:
    attempt do not create another correctness decision.
 2. `adoptEvidence` remains I/O-free.
 3. Blob publication works above the former GCS cap through ordinary multipart.
-4. S3 staging uses unconditional native same-store copy at most once, after an observed miss, on
-   AWS-compatible storage and GCS; the right is consumed before I/O, and every later publication or
-   publication selected after `Condemned` uses a newly tagged streaming body.
+4. `publication_attempted` changes from `false` to `true` before the logical source's first backend
+   publication of any kind. S3 staging uses unconditional native same-store copy only when that
+   transition follows an observed miss. A first publication selected after `Condemned`, and every
+   publication whose prior state was `true`, uses a newly tagged streaming body on AWS-compatible
+   storage and GCS.
 5. Writer dependency state contains no incarnation token and uses an explicit proof.
 6. Mutable CAS conditional operations and exact-token deletion retain their token semantics.
 7. The blob conditional-create controller, conditional-copy API, presence cache, and obsolete
    settings are removed with no unexplained call sites.
 8. Fresh-miss request counting shows one added blob `HEAD` and no added common-path metadata GET.
-9. The focused TLA+ safe model includes envelope/token identity and one-shot-copy state; every
-   sabotage, including byte-identical staged reuse after a present or absent retry observation,
-   fails on its named invariant.
+9. The focused TLA+ safe model includes envelope/token identity and monotonic publication-attempt
+   state; every sabotage, including byte-identical staged reuse after a present or absent retry
+   observation, fails on its named invariant.
 10. Existing affected TLA+ models and result documents are audited and made consistent.
 11. Deterministic C++ gates, AWS-compatible integration, and real-GCS live gates pass.
 12. Non-CAS GCP behavior remains on the Default request/response contract.
