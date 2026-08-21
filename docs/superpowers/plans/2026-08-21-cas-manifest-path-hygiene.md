@@ -71,8 +71,9 @@ wrong helper here — build the manifest the way `sample()` builds its Inline en
 
 ```cpp
 /// The path is written twice: escaped into the entry-record line, and -- before this fix -- raw into the
-/// payload-zone banner. Any byte that the escaper spells differently therefore has to survive BOTH, or
-/// the writer produces an object it cannot read back one transaction later.
+/// payload-zone banner. Only a byte that breaks the banner's physical line framing actually corrupts the
+/// object, which today means LF alone; the rest of these cases pin the round trip so a future escaping
+/// change cannot quietly start mangling them.
 TEST(CASPartManifestFormat, InlineEntryPathSurvivesEveryEscapableByte)
 {
     const std::vector<String> paths{
@@ -182,9 +183,12 @@ ${CLICKHOUSE_CLIENT} --query "INSERT INTO ${TABLE} SELECT number, 'v' || (number
 echo 'rows'
 ${CLICKHOUSE_CLIENT} --query "SELECT count() FROM ${TABLE};"
 
-# And the projection itself is usable, which is what a newline in its name must not prevent.
+# And the projection itself is usable, which is what a newline in its name must not prevent. The two
+# settings are the assertion: without force_optimize_projection this same result comes from the main part
+# and the query proves nothing about the projection at all.
 echo 'projection_result'
-${CLICKHOUSE_CLIENT} --query "SELECT v, count() FROM ${TABLE} GROUP BY v ORDER BY v;"
+${CLICKHOUSE_CLIENT} --query "SELECT v, count() FROM ${TABLE} GROUP BY v ORDER BY v
+    SETTINGS optimize_use_projections = 1, force_optimize_projection = 1;"
 
 # No manifest body without a committed owner: the successful INSERT left nothing orphaned, and on the
 # broken tree the failed one did -- that object wedged every later collection round.
@@ -213,29 +217,39 @@ dropped_ok
 ```
 
 Generate the reference from a green run and then read it: check that `rows` is 30 and the three groups are
-10 each, rather than pasting whatever the run produced. Confirm the projection is actually used for that
-`GROUP BY` — `EXPLAIN indexes = 1` on it during development, not in the committed test, whose job is the
-result rather than the plan.
+10 each, rather than pasting whatever the run produced. `force_optimize_projection` defaults to `false`, so
+it must be set explicitly as above; with it the query fails rather than silently falling back, which is what
+makes this line an assertion about the projection instead of about the data.
 
 - [ ] **Step 3: Run both tests RED, against the unmodified tree**
 
 No production file has been touched yet, so the binary under test IS the pre-fix binary and no stashing is
 involved. What matters is that the server serving the stateless test was started from this binary: a bare
 `ninja` leaves whatever server is already running in place, and a red/green pair that shares one server
-proves nothing about either. Use the isolated job, which starts its own server from the build:
+proves nothing about either. Use the isolated job, which starts its own server.
+
+Both arguments below are load-bearing, and neither is obvious:
+
+- the job selector is `functional`, not `"Stateless tests"`. That name is a parametrized job config, so it
+  resolves to dozens of variants and the resolver exits with an ambiguity error before any server starts.
+- `--path` is mandatory. Without it `ci/jobs/functional_tests.py` checks `ci/tmp/clickhouse` **before**
+  `build/programs/clickhouse`, so a leftover symlink from an earlier run would serve this one — the same
+  defect as running against an already-running server, wearing a different hat.
 
 ```bash
 ninja -C build clickhouse unit_tests_dbms > build/040_red_build.log 2>&1; echo "EXIT=$?" >> build/040_red_build.log
 build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_red.log 2>&1; echo "EXIT=$?" >> build/040_fmt_red.log
-python3 -m ci.praktika run "Stateless tests" --test 05026_cas_manifest_path_newline > build/040_stateless_red.log 2>&1; echo "EXIT=$?" >> build/040_stateless_red.log
+python3 -m ci.praktika run functional --test 05026_cas_manifest_path_newline --path "$(pwd)/build/programs" > build/040_stateless_red.log 2>&1; echo "EXIT=$?" >> build/040_stateless_red.log
 ```
 
 Expected, and all three parts are required:
 
-- `InlineEntryPathSurvivesEveryEscapableByte` FAILS on the LF, CR and tab cases with a payload-zone banner
-  mismatch. It should PASS on the quote/backslash case even now — those bytes are escaped in the record
-  line and pass through the raw banner unchanged on both sides — so a failure there means the test builds
-  its manifest wrongly, not that the format is worse than described.
+- `InlineEntryPathSurvivesEveryEscapableByte` FAILS on the **LF case only**, with a payload-zone banner
+  mismatch. `readLine` splits on LF and nothing else — it does not even strip CR — so CR, tab, quote,
+  backslash and NUL all pass through the raw banner unchanged today and would pass this test on the
+  unfixed tree. LF is first in the vector deliberately: `decodePartManifest` throws, the exception leaves
+  the test body, and the later cases do not execute in the RED run. That is the expected RED signal, not a
+  broken test. A failure on any *other* case means the test builds its manifest wrongly.
 - `InlineBannerCarriesTheEscapedPath` FAILS because the banner is unquoted today.
 - the stateless test FAILS at `insert_ok`, and the fsck read reports a **non-zero `unreachable`**. That
   leftover object is what distinguishes fixed from broken here; an earlier revision of this plan asserted
@@ -286,7 +300,7 @@ unrelated to the next task:
 ```bash
 ninja -C build clickhouse unit_tests_dbms > build/040_green_build.log 2>&1; echo "EXIT=$?" >> build/040_green_build.log
 build/src/unit_tests_dbms --gtest_filter='CASPartManifestFormat*' > build/040_fmt_green.log 2>&1; echo "EXIT=$?" >> build/040_fmt_green.log
-python3 -m ci.praktika run "Stateless tests" --test 05026_cas_manifest_path_newline > build/040_stateless_green.log 2>&1; echo "EXIT=$?" >> build/040_stateless_green.log
+python3 -m ci.praktika run functional --test 05026_cas_manifest_path_newline --path "$(pwd)/build/programs" > build/040_stateless_green.log 2>&1; echo "EXIT=$?" >> build/040_stateless_green.log
 build/src/unit_tests_dbms --gtest_filter='CAS*:Cas*:CA*' > build/040_gate_1.log 2>&1; echo "EXIT=$?" >> build/040_gate_1.log
 ```
 
@@ -322,7 +336,8 @@ git commit -m 'Carry a manifest entry path through one escaper in the record lin
 - Read first: that file's `OrphanFixture` (line 47). **Not** `src/Disks/tests/cas_sweep_test_support.h`: that header holds only the `sweepManifestCursorPageForTest` wrapper and builds no pool, no catalog, and no watermark
 
 **Interfaces:**
-- Consumes: nothing from Task 1, and it is not made redundant by it. Task 1 removes ONE cause of an undecodable manifest — the format could not represent the path. This half is about an undecodable body whatever its cause: bit rot, a future format bug, a peer's manifest over the relink channel, or a pool that was already wedged before Task 1 landed. The encoder never produces such bytes, so the test plants them at the pool level rather than going through DDL.
+- Consumes: no production code from Task 1, but its **test** does depend on Task 1 having landed: the poison body is built by corrupting a real encoded banner, and Task 1 changes that banner's bytes. Run these tasks in order. Task 2's production change is independent and would work either way.
+- Not made redundant by Task 1. Task 1 removes ONE cause of an undecodable manifest — the format could not represent the path. This half is about an undecodable body whatever its cause: bit rot, a future format bug, a peer's manifest over the relink channel, or a pool that was already wedged before Task 1 landed. The encoder never produces such bytes, so the test plants them at the pool level rather than going through DDL.
 - Produces: `ManifestSweepResult::undecodable`, a `uint64_t` beside `listed`/`deleted`/`skipped`.
 
 **Why not a `retained_*` counter.** The `retained_*` family is documented in the header as "the §6
@@ -368,9 +383,11 @@ first and corrupting after would fail the seal check, which is a different code 
     good.entries = {<one INLINE entry, path "a.txt", so a banner line exists>};
     good.payload_digest = computePayloadDigest(good);
     String bytes = encodePartManifest(good);
-    const size_t at = bytes.find("==> a.txt");
+    /// The banner quotes the path after Task 1. Searching for the OLD unquoted shape would make this
+    /// ASSERT fire before the sweep is ever called.
+    const size_t at = bytes.find("==> \"a.txt\"");
     ASSERT_NE(at, String::npos) << "no banner line to corrupt -- the entry must be Inline, not Blob";
-    bytes[at + 4] = 'X';   /// same length, so no other offset shifts
+    bytes[at + 5] = 'X';   /// inside the quoted path, same length, so no other offset shifts
     const PutResult put = f.backend->putIfAbsent(f.orphanKey(), sealObject(FormatId::PartManifest, bytes));
     /// `putIfAbsent` over an existing key writes nothing and reports PreconditionFailed, so a
     /// silently-legal body would make every assertion below pass against the wrong object.
@@ -561,15 +578,21 @@ Recorded so it is not re-derived, and so a later reader knows the sweep happened
 
 **Type consistency.** `bannerFor` keeps its signature; only its bytes change. `undecodable` is a `uint64_t` on `ManifestSweepResult`, beside `skipped`, deliberately not a `SweepRetainClass`. The decode result becomes `std::optional<PartManifest>` at one call site, with three deref sites named.
 
-**What earlier revisions got wrong, so none of it is reintroduced.** Six defects. The design one is first because it invalidated a whole task:
+**Task order is now a real dependency.** Task 2's test corrupts a banner produced by the encoder, so it must run after Task 1 changed that banner's bytes. Task 2's production change is independent of Task 1; only its fixture is not.
+
+**What earlier revisions got wrong, so none of it is reintroduced.** Nine defects. The design one is first because it invalidated a whole task:
 
 - the fix was encode-side **rejection** of a control character in a path. `MergeTree` accepts such a projection name, so that would have left the CAS disk permanently refusing a table that works on every other disk type — a functional divergence between metadata types, adopted deliberately, to avoid a two-call-site format fix. Task 1 is now the format fix.
 - the stateless test asserted `unaccounted = 0`. That counter is produced only by blob classification; an orphan manifest lands in `unreachable`. The assertion would have passed on the broken tree.
 - the pre-fix run was placed after the fix, reached for `git stash` in a worktree other sessions are writing to, rebuilt a binary without restarting the server that would serve the test, and reused one pool directory across both runs. It is now Step 3, before any production edit, on unique per-run names, through the isolated job that starts its own server.
 - the sweep test asserted the cursor had moved via `EXPECT_NE(next_cursor, …)`. `InMemoryBackend` returns an empty `next_cursor` at the end of the keyspace, so on a single-object page that assertion fails *after* a correct fix. It is now `EXPECT_TRUE(wrapped)` plus a second object planted beyond the poison key.
 - the poison plant went on top of the fixture's own legal body. `putIfAbsent` over an existing key writes nothing, so every assertion would have run against a manifest that decodes fine. The plant now replaces the fixture's write, and `put.outcome` is asserted.
+- the isolated stateless run named the job `"Stateless tests"`, which is a parametrized config resolving to dozens of variants — the resolver exits on the ambiguity before a server starts — and it omitted `--path`, so `ci/tmp/clickhouse` would have been preferred over the binary just built. The pre-fix/post-fix pair would have proved nothing again, one layer further down.
+- Task 2's poison plant searched for the pre-Task-1 banner `==> a.txt`, so its own `ASSERT_NE` would have fired before the sweep was ever called.
+- the RED expectation claimed CR and tab failed too. `readLine` splits on LF and does not strip CR, so only LF breaks the banner's framing; the rest round-trip today.
+- the projection query asserted a result the main part can produce on its own, with the plan deferring the actual check to a development-time `EXPLAIN`. It now sets `force_optimize_projection`, so the query fails rather than silently falling back.
 - the reason given for keeping the decoder unchanged was that an embedded LF "cannot reach a decoded path". It can: the record line escapes the path and restores it, and only an Inline entry's raw banner is sensitive. Under the new design the decoder changes anyway, through the same function as the encoder.
 
-Five of the six were caught by reading the code that decides — the parser, the counter's increment site, the backend's write contract, the escaper — and the sixth by a reviewer asking why we would reject input the database accepts. None was caught by re-reading the plan's own reasoning.
+Eight of the nine were caught by reading the code that decides — the parser, the counter's increment site, the backend's write contract, the escaper, `readLine`, the job resolver, the runner's binary-preference list — and the ninth by a reviewer asking why we would reject input the database accepts. None was caught by re-reading the plan's own reasoning. Three of them were the same defect wearing different clothes: a check that cannot tell the fixed tree from the broken one.
 
 **The risk this plan cannot remove.** Every Inline entry's banner bytes change, so any test or fixture carrying manifest bytes as literals will move. Two are named from `grep -n '==>'`; a fixture that stores a *checksum* over manifest bytes rather than the bytes would not appear in that grep, and only the gate run finds it. Task 1 Step 6 says such a failure is a finding rather than noise, because the tempting response — regenerating a golden until the suite goes quiet — hides whatever else moved with it.
