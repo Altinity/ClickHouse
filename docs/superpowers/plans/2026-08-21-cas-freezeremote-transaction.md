@@ -356,7 +356,13 @@ The external-transaction case keeps its exact previous behaviour: the removals g
 
 Leave `save_metadata_callback` and the `create(...)` tail exactly as they are. The callback is empty at the only call site and is upstream signature shape.
 
-- [ ] **Step 4: Build and run**
+- [ ] **Step 4: Correct the helper's own justification, which this change outgrows**
+
+`copyDirectoryContentIntoTransaction`'s doc comment justifies copying sequentially rather than through the parallel thread pool by saying "MOVE is a background, latency-insensitive operation, so parallelizing this is a deferred optimization, not a correctness requirement". After this task the same helper also serves `ATTACH PARTITION FROM`, which is a foreground statement a user waits on — so the justification no longer covers all of its callers.
+
+Keep the correctness half untouched (a content-addressed transaction batches every file into one manifest and its staging map is not mutex-guarded — that is why the copy is sequential). Replace only the latency clause: say that the callers are a background move and a user-issued cross-disk attach, and that parallelising it remains a deferred optimisation whose cost is now visible to a waiting statement rather than only to a background one. Do not parallelise anything here — that is a separate change with its own correctness argument to make about the staging map.
+
+- [ ] **Step 5: Build and run**
 
 ```bash
 ninja -C build clickhouse
@@ -366,7 +372,7 @@ ninja -C build clickhouse
 
 Expected: the new test passes all three legs; the two freeze tests are unaffected — they exercise `freeze`, not `freezeRemote`, and this change touches neither `freeze` nor the helper's contents. Also run the `CAS*:Cas*:CA*` gtest gate: it should be unchanged, since no CAS-internal signature moved.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git status --short src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp
@@ -393,16 +399,21 @@ git status --short docs/superpowers/cas/BACKLOG.md
 
 If it reports anything, another session is still working in it. **Stop and report that**; do not edit it, do not stage it, and do not work around it by putting the content somewhere else. The plan's spec-delta section stays authoritative until someone can land it properly.
 
-- [ ] **Step 2: If clean, fold in the four corrections**
+- [ ] **Step 2: If clean, flip the entry to FIXED and fold in the corrections**
 
-Add to the entry's FIX list, in its own words rather than copied verbatim from this plan:
+The `{#issue-2212-shadow-namespace}` entry shows the house format for a fixed issue: the heading changes from `CONFIRMED` to `FIXED`, the mechanism paragraph moves to the past tense, and `FIX (SCHEDULED: …)` becomes `FIX (IMPLEMENTED <date>: <commit hashes>)`. Do the same here. The current heading — "`freezeRemote` lacks the CAS single-transaction branch" — is itself the stalest sentence in the entry once Task 2 lands.
+
+Fold in the four corrections, in the entry's own words rather than copied from this plan:
 
 1. the three post-clone `removeFileIfExists` calls go through the self-created transaction — with the reason, that sending them to the disk would autocommit and reintroduce the very defect;
 2. `freezeRemote`'s `external_transaction` branches are untouched upstream code, dead in this fork only, and deliberately left alone;
 3. the helper had to move above `freezeRemote` because an anonymous namespace declared it after the caller;
 4. the clone path is selected by `on_same_disk`, so a test whose tables share a disk exercises `freeze` instead.
 
-Also record that CAS→CAS same-pool needed no production code and now has a test leg asserting the blobs were reused, and that the `MOVE` ref-collision unknown does not transfer to `ATTACH` because the destination is a different table under a temporary part name.
+Two more edits inside the same entry:
+
+- Record that CAS→CAS same-pool needed no production code, and that the test now asserts the blobs were reused rather than assuming it.
+- The entry's closing sentence reads "The unfixed member of the family is exactly this `freezeRemote` gap." That family now has no unfixed member; say so, because the sentence is the one a reader would trust to know what is left.
 
 - [ ] **Step 3: Commit**
 
@@ -410,6 +421,55 @@ Also record that CAS→CAS same-pool needed no production code and now has a tes
 git add docs/superpowers/cas/BACKLOG.md
 git commit -m 'Record what the freezeRemote fix needed beyond the adjudicated shape'
 ```
+
+---
+
+## Task 4: The rest of the documentation {#task-4}
+
+**Files:**
+- Modify: `docs/superpowers/cas/final-checks-todo.md` (item 1)
+- Modify: `docs/superpowers/cas/BACKLOG/replication.md` (`[VERIFY-ca-ca-same-pool-move]`)
+- Modify: `docs/superpowers/cas/BACKLOG/formats-and-storage.md` (the re-freeze-same-part-name item)
+
+**Interfaces:**
+- Consumes: Tasks 1 and 2 landed.
+- Produces: nothing later tasks depend on.
+
+Documentation-only; no build. Each file gets its own dirtiness check before staging, for the reason in the Global Constraints.
+
+- [ ] **Step 1: Close the scheduling entry**
+
+`final-checks-todo.md` item 1 is the pre-release schedule line for this fix and still reads as pending. Item 2 in the same file was closed by another session for issue #2212 and shows the format: the heading gains `DONE —` and the body names the commits. Do the same for item 1.
+
+- [ ] **Step 2: Record what the new test does and does NOT answer for the same-pool question**
+
+`BACKLOG/replication.md`'s `[VERIFY-ca-ca-same-pool-move]` asks whether a same-pool CA↔CA clone works and whether the target's ref `<part>` collides with the source's. The new test's second leg answers the first half for `ATTACH`: the publish dedup-resolves the blobs and the clone is a ref repoint, now asserted by a counter.
+
+**Do not close the item.** Its collision question is about `MOVE`, where source and target are the SAME table — one namespace, one ref name `<part>`. `ATTACH` writes into the destination table's namespace under a temporary part name, so it cannot collide and therefore proves nothing about the case the item is actually asking about. Add that distinction to the item so the next reader does not close it on the strength of this test.
+
+- [ ] **Step 3: Record that this fix widens another item's reachability**
+
+`BACKLOG/formats-and-storage.md`'s re-freeze item says that re-freezing a DIFFERENT part carrying the same part name — "after `REPLACE PARTITION` / `ATTACH PARTITION FROM`, which can reuse `all_1_1_0`" — silently produces one frozen ref mixing two snapshots. Until now the cross-disk route to that state was closed by the very bug this plan fixes. Note on the item that cross-disk `ATTACH PARTITION FROM` into a content-addressed disk now works, so that route is open and the item's priority should be reconsidered rather than inherited.
+
+This is the kind of consequence a fix does not usually announce about itself: nothing in the fix is wrong, and another item got more reachable because of it.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git status --short docs/superpowers/cas/final-checks-todo.md                    docs/superpowers/cas/BACKLOG/replication.md                    docs/superpowers/cas/BACKLOG/formats-and-storage.md
+git add <only the paths whose diff is yours>
+git commit -m 'Record the cross-disk clone fix across the tracking documents'
+```
+
+## Documentation checked and deliberately NOT changed {#docs-not-changed}
+
+Recorded so the executing agent does not re-derive it, and so a later reader knows the sweep happened:
+
+- **`docs/en/antalya/cas/`** — nothing stale. The user-facing roadmap's `{#known-limitations}` list never mentioned cross-disk `ATTACH PARTITION FROM`, so there is no limitation to retract; and this was a bug rather than an unshipped feature, so there is nothing to announce either. Checked every page for `ATTACH PARTITION`, "not supported" and "limitation".
+- **`BACKLOG/operability-and-introspection.md`** — its list of paths reaching `freeze` includes "Same-disk `ATTACH/REPLACE PARTITION FROM`". That stays true: same-disk still routes to `freeze`, and this plan changes only the cross-disk path. Left alone on purpose.
+- **`BACKLOG/replication.md` `[move-part-to-ca-architecturally-unimplemented]`** — already marked CLOSED at HEAD and kept for provenance. No edit needed there; the stale sentence about the family's remaining unfixed member lives in the `BACKLOG.md` entry and is handled in Task 3.
+- **`BACKLOG/replication.md` `[RPL-5 slice]`** — the replicated queue-clone relink test gap. This plan touches the local cross-disk path, not the queue path, so the gap is unchanged.
+- **`clonePart`'s L2 comment** — says it mirrors `freeze`'s `owned_transaction` shape. Still true after this change; a third mirror does not make it false.
 
 ## Self-review {#self-review}
 
