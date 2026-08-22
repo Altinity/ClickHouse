@@ -553,33 +553,41 @@ TEST(CASPartWriteTxn, PutBlobStreamsSourceOnceNoFullMaterialization)
 
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:
 ///   - trusted adopted leaf at gate: PromoteTrustsAdoptedLeafNoProbeManifestTrust (CasPartWriteTxn) — §4
-///     manifest-trust: a committed-source adopted leaf publishes with NO per-file probe; a tokened leaf
+///     manifest-trust: a committed-source adopted leaf publishes with NO per-file probe; a materialized leaf
 ///     is edge-protected (Phase A) and never re-observed at the gate.
 ///   - absent adopted leaf trusted:  PromoteTrustsAdoptedLeafEvenIfBackendRaced (CasPartWriteTxn) — the D4
 ///     trade-off (a genuinely-absent adopted blob is caught by fsck, not the promote gate).
-///   - evidence tokenless vs tokened: DepIsTokenedDiscriminatesPutBlobVsAdopt (CASPartWriteTxnReuseBlob).
-///   - no-dep / staging-bug fail-closed: PromoteCondemnedLeafWithoutDepAbortsFailClosed (CasPartWriteTxn).
+///   - explicit evidence: DependencyProofDistinguishesMaterializedAndTrustedManifest.
+///   - no-dependency staging bug: MissingDependencyProofFailsClosed.
 
-TEST(CASPartWriteTxnReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
+TEST(CASPartWriteTxnReuseBlob, DependencyProofDistinguishesMaterializedAndTrustedManifest)
 {
-    /// B156b discriminator unit: putBlob records a TOKENED dep (token observed at upload time),
-    /// adoptEvidence records a TOKENLESS W-EVIDENCE dep (no token; liveness from the source ref).
+    /// A successful publication records physical evidence without retaining the backend token in
+    /// writer readiness state.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
     auto build = s->beginPartWrite({});
 
-    /// putBlob'd hash ⇒ tokened.
+    /// A fresh upload is materialized.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
-    EXPECT_TRUE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("written"))}));
+    EXPECT_EQ(build->dependencyProof(idOf("written")), BlobDependencyProof::Materialized);
 
-    /// Adopted hash ⇒ tokenless. adoptEvidence records the dep directly from a resolved ManifestEntry
-    /// (the source manifest's entry); no body needs to be in hand for the dep to be recorded.
+    /// Observing that same live blob under a durable precommit is also materialized.
+    const RootNamespace ns{"srv1/dependency-proof"};
+    auto observer = startBuildFor(s, ns, "observed");
+    const ManifestEntry observed_entry = blobManifestEntry("data.bin", "written");
+    const ManifestId observed_manifest = observer->stageManifest({observed_entry});
+    observer->precommitAdd(ns, "observed", observed_manifest);
+    observer->putBlob(idOf("written"), BlobSource::fromString("written"));
+    EXPECT_EQ(observer->dependencyProof(idOf("written")), BlobDependencyProof::Materialized);
+
+    /// A committed-source manifest supplies trusted-manifest evidence without physical I/O.
     build->adoptEvidence(blobManifestEntry("f", "adopted"));
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("adopted"))}));
+    EXPECT_EQ(build->dependencyProof(idOf("adopted")), BlobDependencyProof::TrustedManifest);
 
-    /// Unknown hash ⇒ no dep, not tokened.
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("unknown"))}));
+    /// An unknown hash has no proof; absence is distinct from both accepted states.
+    EXPECT_EQ(build->dependencyProof(idOf("unknown")), std::nullopt);
 }
 
 /// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone). §4 manifest-trust: a
@@ -955,6 +963,7 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-TR");
     build->adoptEvidence(entry);
+    EXPECT_EQ(build->dependencyProof(entry.ref), BlobDependencyProof::TrustedManifest);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
@@ -968,6 +977,33 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASBlobAdoptTrusted].load() - trusted_before, 1);
     EXPECT_EQ(counting->headCountFor(blob_key) - head_before, 0u) << "trust must not HEAD the adopted blob";
     EXPECT_EQ(counting->getCountFor(meta_key) - meta_get_before, 0u) << "trust must not loadMeta the adopted blob";
+}
+
+TEST(CASPartWriteTxn, PromotionAcceptsBothDependencyProofs)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/proof-promotion"};
+
+    /// Seed the committed-source body used by the trusted-manifest branch.
+    {
+        auto seed = s->beginPartWrite({});
+        seed->putBlob(idOf("trusted-body"), BlobSource::fromString("trusted-body"));
+    }
+
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestEntry materialized = blobManifestEntry("data.bin", "materialized-body");
+    const ManifestEntry trusted = blobManifestEntry("data.cmrk3", "trusted-body");
+    const ManifestId id = build->stageManifest({materialized, trusted});
+    build->precommitAdd(ns, "part_1", id);
+
+    build->putBlob(materialized.ref, BlobSource::fromString("materialized-body"));
+    build->adoptEvidence(trusted);
+    ASSERT_EQ(build->dependencyProof(materialized.ref), BlobDependencyProof::Materialized);
+    ASSERT_EQ(build->dependencyProof(trusted.ref), BlobDependencyProof::TrustedManifest);
+
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
@@ -1035,11 +1071,11 @@ TEST(CASPartWriteTxn, PromoteSwallowsPostDurableEventSinkFailure)
     s->setEventSink(nullptr);
 }
 
-TEST(CASPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
+TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
 {
     /// A manifest blob leaf with NO recorded dep (a staging-bug shape: neither putBlob nor adoptEvidence
-    /// recorded it) must fail closed at the promote gate — isTrustedAdopt is false (no tokened dep and no
-    /// committed-source adopt), so §4 never silently publishes it. Under manifest-trust there is NO per-file
+    /// recorded it) must fail closed at the promote gate because neither accepted proof exists, so §4
+    /// never silently publishes it. Under manifest-trust there is NO per-file
     /// probe, so the fail-closed is a LOGICAL_ERROR decided from the dep set alone — it fires regardless of
     /// the pool blob's presence/condemnation (here the blob is even condemned, but that is never observed).
     /// The no-dep shape is reachable through the public build API (stageManifest names the leaf without any
@@ -1058,7 +1094,7 @@ TEST(CASPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-NODEP");
-    /// NB: NO adoptEvidence(entry) — deps stays empty for this hash, so isTrustedAdopt is false.
+    /// NB: no `adoptEvidence` call — dependencies stay empty for this hash.
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
@@ -1071,7 +1107,7 @@ TEST(CASPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_1", build->buildId(), id);
         },
-        "no tokened and no adopted dep");
+        "no dependency proof");
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
     /// The pool blob was never touched (no probe, no displacement).
     EXPECT_EQ(b->head(blob_key).token, t0);
@@ -1083,7 +1119,7 @@ TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     /// "a committed ref never names a missing dependency" invariant. In the part-manifest model
     /// stageManifest does not validate its entries' bodies. §4 manifest-trust: the fail-closed authority at
     /// the promote gate is now the DEP SET, not a backend HEAD — a leaf named by the manifest with NO
-    /// tokened dep (never putBlob'd) and NO adopted dep (never adoptEvidence'd) is a staging bug and fails
+    /// dependency proof (neither `putBlob` nor `adoptEvidence` recorded one) is a staging bug and fails
     /// closed with LOGICAL_ERROR (a real write always records a dep for every leaf). No per-file probe.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -1094,13 +1130,13 @@ TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "never-uploaded")});
     build->precommitAdd(ns, "part_1", mid);
 
-    /// promote must fail closed: the leaf has no tokened and no adopted dep ⇒ LOGICAL_ERROR. No ref committed.
+    /// Promotion must fail closed because the leaf has no dependency proof. No ref is committed.
     EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_1", build->buildId(), mid);
         },
-        "no tokened and no adopted dep");
+        "no dependency proof");
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 
     /// After uploading the blob, a fresh build's promote succeeds — the same manifest content is now
@@ -1113,10 +1149,10 @@ TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CASPartWriteTxn, AdoptEvidenceRecordsTokenlessDep)
+TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestProof)
 {
-    /// Port of AdoptFromTreeRecordsEvidence. adoptEvidence records a TOKENLESS W-EVIDENCE dep directly
-    /// from a resolved ManifestEntry — a Blob entry is tokenless (depIsTokened false), an Inline entry
+    /// Port of AdoptFromTreeRecordsEvidence. `adoptEvidence` records `TrustedManifest` directly
+    /// from a resolved `ManifestEntry`; a Blob entry has a proof, while an Inline entry
     /// records nothing. §4: whether the dep is a committed-source adopt vs absent (adopted vs no-dep) is
     /// asserted end-to-end at the promote gate by PromoteTrustsAdoptedLeafNoProbeManifestTrust (positive:
     /// adopted leaf ⇒ trusted, no probe) and PromoteCondemnedLeafWithoutDepAbortsFailClosed (negative
@@ -1127,15 +1163,15 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTokenlessDep)
 
     const ManifestEntry adopted = blobManifestEntry("data.bin", "source-blob");
     build->adoptEvidence(adopted);
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("source-blob"))}));
+    EXPECT_EQ(build->dependencyProof(adopted.ref), BlobDependencyProof::TrustedManifest);
 
-    /// An Inline entry references no standalone object → records nothing (never tokened).
+    /// An Inline entry references no standalone object and records no proof.
     ManifestEntry inline_entry;
     inline_entry.path = "small";
     inline_entry.placement = EntryPlacement::Inline;
     inline_entry.inline_bytes = "abc";
     build->adoptEvidence(inline_entry);
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("abc"))}));
+    EXPECT_EQ(build->dependencyProof(idOf("abc")), std::nullopt);
 }
 
 TEST(CASPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
@@ -1341,15 +1377,14 @@ TEST(CASPartWriteTxn, FirstPublishMakesNamespaceDiscoverable)
     EXPECT_EQ(all[0], "srv9/fresh");
 }
 
-TEST(CASPartWriteTxn, AdoptEvidenceNoBackendOp)
+TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutIO)
 {
-    /// B188: adoptEvidence records a TOKENLESS W-EVIDENCE dep from an already-resolved ManifestEntry
+    /// B188: `adoptEvidence` records `TrustedManifest` from an already resolved `ManifestEntry`
     /// WITHOUT any backend call (no HEAD, no GET, no PUT).
     ///
     /// Two behavioural assertions:
     ///   1. No backend op fires during adoptEvidence (counted via a delegating wrapper).
-    ///   2. The recorded dep is tokenless: after adoptEvidence(entry), depIsTokened is false (the
-    ///      W-EVIDENCE dep is what the promote gate later revalidates).
+    ///   2. The recorded dependency proof is `TrustedManifest`.
 
     /// A delegating wrapper that counts every backend access path including the streaming write path.
     struct LocalCountingBackend final : public Backend
@@ -1401,9 +1436,9 @@ TEST(CASPartWriteTxn, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->stream_puts, 0u) << "adoptEvidence must not PUT to the backend";
     EXPECT_EQ(counting->gets, 0u) << "adoptEvidence must not GET from the backend";
 
-    /// The dep is recorded — a tokenless W-EVIDENCE dep (depIsTokened false) that the promote gate later
-    /// revalidates; the no-backend-op counts above are the B188 contract's primary guard.
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("b188-content"))}));
+    /// The dep is recorded as trusted manifest evidence; the no-backend-op counts above are the B188
+    /// contract's primary guard.
+    EXPECT_EQ(build->dependencyProof(entry.ref), BlobDependencyProof::TrustedManifest);
 
     /// Inline entry: adoptEvidence records nothing (Inline has no standalone object) and no backend op.
     ManifestEntry inline_entry;
@@ -1414,7 +1449,7 @@ TEST(CASPartWriteTxn, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->heads, 0u);
     EXPECT_EQ(counting->stream_puts, 0u);
     EXPECT_EQ(counting->gets, 0u);
-    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("xy"))}));
+    EXPECT_EQ(build->dependencyProof(idOf("xy")), std::nullopt);
 }
 
 TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
@@ -2034,10 +2069,10 @@ TEST(CASPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 /// spec §9.9 (mixed-algo pools, Phase 3 T2) — the W-DEP-SET cross-satisfaction crux: a manifest with
 /// two entries carrying the SAME digest VALUE under TWO DIFFERENT algos (`ch128:X` / `xxh3:X`). Only
 /// `ch128:X`'s body is ever putBlob'd; `xxh3:X`'s body never lands anywhere. Promote MUST fail closed —
-/// the tokened `ch128:X` dep must NEVER be read as satisfying the non-tokened `xxh3:X` leaf.
+/// the materialized `ch128:X` proof must never satisfy the missing `xxh3:X` proof.
 /// This test is RED (wrongly passes / silently promotes) if `PartWriteTxn::deps` (the W-DEP-SET) were keyed on
 /// a bare digest instead of the full `BlobRef` pair: both entries would collapse to the SAME map key
-/// (the digest alone), so `depIsTokened` would report the xxh3 leaf as edge-protected via the ch128
+/// (the digest alone), so the proof query would report the xxh3 leaf as edge-protected via the ch128
 /// entry's putBlob and promote would skip its revalidation (and hence its absence) entirely.
 TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
 {
@@ -2068,16 +2103,16 @@ TEST(CASPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// `e_xxh3`'s (`blobs/xxh3/...`), even though the raw digest bytes are identical.
     build->putBlob(BlobRef{BlobHashAlgo::CityHash128, shared_digest}, BlobSource::fromString("abc"));
 
-    /// promote must fail closed: the xxh3:X leaf has NO tokened dep and NO adopted dep — never silently
-    /// satisfied by the ch128:X entry's tokened dep (same digest bytes, distinct object key). §4
-    /// manifest-trust: an unsatisfied leaf is caught by the dep set (isTrustedAdopt false, not tokened) and
+    /// Promotion must fail closed: the xxh3:X leaf has no dependency proof — never silently
+    /// satisfied by the ch128:X entry's materialized proof (same digest bytes, distinct object key). §4
+    /// manifest-trust catches an unsatisfied leaf by the dependency set and
     /// fails closed with LOGICAL_ERROR — a staging bug — without any backend probe on the xxh3 key.
     EXPECT_DEATH(
         {
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->promote(ns, "part_mixed", build->buildId(), id);
         },
-        "no tokened and no adopted dep");
+        "no dependency proof");
 
     /// No committed ref appears — the promote aborted before installing one.
     EXPECT_FALSE(s->resolveRef(ns, "part_mixed").has_value());

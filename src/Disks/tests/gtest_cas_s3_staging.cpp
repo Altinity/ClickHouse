@@ -617,9 +617,9 @@ TEST(CASS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
 /// and records every server-side-copy call). Live 412-vs-created enforcement against a real backend is
 /// Task 7 (with_rustfs integration test).
 
-/// (a) Fresh blob key ⇒ the write-once conditional copy CREATES it; the tokened Blob dep is recorded at
-/// the copy's destination token (the new incarnation token). No unconditional copy is ever issued.
-TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
+/// (a) Fresh blob key ⇒ the write-once conditional copy creates it and records `Materialized`.
+/// The backend retains the new incarnation token. No unconditional copy is ever issued.
+TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingPool(backend);
@@ -643,8 +643,8 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
     EXPECT_EQ(backend->copy_calls[0].to, blob_key);
     EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
 
-    /// A TOKENED Blob dep was recorded (created path); the created blob carries the copy's dest token.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
+    /// Successful publication records materialized evidence; the backend still owns the destination token.
+    EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
     const DB::Cas::HeadResult hr = backend->head(blob_key);
     ASSERT_TRUE(hr.exists);
     EXPECT_FALSE(hr.token.empty());
@@ -690,8 +690,8 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     const DB::Cas::HeadResult after = backend->head(blob_key);
     EXPECT_EQ(after.token, before.token);
 
-    /// The adopt recorded a TOKENED dep at the observed (existing) incarnation's token.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
+    /// Observing the existing incarnation records materialized evidence without retaining its token.
+    EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
 }
 
 /// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by re-uploading its OWN staging PAYLOAD
@@ -768,8 +768,8 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     EXPECT_EQ(got->bytes.substr(header_len), payload);              /// payload preserved
     EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
 
-    /// The resurrect recorded a tokened dep and flipped the meta back to Clean.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
+    /// The resurrection recorded materialized evidence and flipped the meta back to `Clean`.
+    EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
     const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);

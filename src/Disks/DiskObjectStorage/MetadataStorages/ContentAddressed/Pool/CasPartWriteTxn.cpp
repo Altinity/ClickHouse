@@ -170,7 +170,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     /// the request's `declared_size` mirrors it.
     const uint64_t declared_size = source.size;
     const BlobUploadResult r = uploadBlobDetached(BlobUploadRequest{ref, std::move(source), declared_size});
-    deps[r.ref] = r.dep;
+    deps.insert_or_assign(r.ref, r.dep);
     return PutBlobResult{r.ref, r.dep.size};
 }
 
@@ -263,26 +263,18 @@ BlobUploadResult PartWriteTxn::uploadBlobDetached(const BlobUploadRequest & req)
 
 void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> results)
 {
-    /// Prevalidate EVERYTHING first, touching nothing but locals: a result without a token is
-    /// incomplete (every `uploadBlobDetached` branch sets one; a tokenless dep only ever arrives
-    /// through `adoptEvidence`'s separate direct-fold path, never through this method) -- a caller bug,
-    /// failed closed rather than merged as a hole. Two results for the SAME ref must carry an
-    /// IDENTICAL dep record (the fan-out's one-task-per-unique-ref invariant, spec §1); a conflict --
+    /// Prevalidate everything first, touching nothing but locals. Two results for the same ref must
+    /// carry an identical dependency record (the fan-out's one-task-per-unique-ref invariant); a conflict --
     /// most commonly a conflicting size -- means that invariant was violated upstream.
     std::map<DepKey, const BlobDepRecord *> seen;
     for (const auto & r : results)
     {
-        if (!r.dep.token.has_value())
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "PartWriteTxn::mergeBlobUploadResults: incomplete result for {} (no token) -- every "
-                "uploadBlobDetached branch sets one; a tokenless dep must be recorded via adoptEvidence, "
-                "never merged here", blobIdOf(r.ref));
         const auto [it, inserted] = seen.try_emplace(r.ref, &r.dep);
         if (!inserted && !(*it->second == r.dep))
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "PartWriteTxn::mergeBlobUploadResults: dep records differ for {} (sizes {} vs {}) -- "
                 "the fan-out must launch exactly one task per unique ref and merge exactly one result; "
-                "records for one ref that differ in ANY field (size, token, kind, or adopted) are a "
+                "records for one ref that differ in any field (size, proof, or kind) are a "
                 "wiring error, so the sizes shown may be equal when the mismatch is in another field",
                 blobIdOf(r.ref), it->second->size, r.dep.size);
     }
@@ -296,7 +288,7 @@ void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> resu
     size_t applied = 0;
     for (const auto & r : results)
     {
-        candidate[r.ref] = r.dep;
+        candidate.insert_or_assign(r.ref, r.dep);
         ++applied;
         if (merge_hook_for_test)
             merge_hook_for_test(applied);
@@ -304,24 +296,12 @@ void PartWriteTxn::mergeBlobUploadResults(std::span<const BlobUploadResult> resu
     deps.swap(candidate);
 }
 
-bool PartWriteTxn::isTrustedAdopt(const BlobRef & ref) const
+std::optional<BlobDependencyProof> PartWriteTxn::dependencyProof(const BlobRef & ref) const
 {
-    /// §4: a leaf trusted at promote iff this build holds a TOKENLESS dep recorded by adoptEvidence
-    /// (a committed-source W-EVIDENCE adopt: the source pins it, in-degree >= 1, not condemnable). A
-    /// tokenless PENDING-upload dep (recordPendingBlobDep, adopted=false) is NOT trusted — it must be
-    /// tokened by putBlob before promote; reaching promote un-tokened is a staging bug (fail closed).
     auto it = deps.find(ref);
-    return it != deps.end() && !it->second.token.has_value() && it->second.adopted;
-}
-
-bool PartWriteTxn::depIsTokened(const BlobRef & ref) const
-{
-    /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
-    /// adoptFromTree carry-forward records a TOKENLESS W-EVIDENCE dep (not recreatable — pinned by a
-    /// committed source). Returns false when this build has no dep for the ref (the caller decides
-    /// the default; not-tokened is the fail-loud, INV-NO-LOSS-safe choice).
-    auto it = deps.find(ref);
-    return it != deps.end() && it->second.token.has_value();
+    if (it == deps.end())
+        return std::nullopt;
+    return it->second.proof;
 }
 
 BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key) const
@@ -437,8 +417,8 @@ BlobDepRecord PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref
         e.outcome = "adopt";
         e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)";
     });
-    /// Build-neutral: RETURN the adopt dep (tokened, adopted=false) instead of folding it into `deps`.
-    return BlobDepRecord{kind, hr.token, logical_size, /*adopted=*/false};
+    /// Build-neutral: return materialized evidence instead of folding it into `deps`.
+    return BlobDepRecord{kind, BlobDependencyProof::Materialized, logical_size};
 }
 
 BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source) const
@@ -502,8 +482,8 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
         }
     };
 
-    /// Build-neutral: emit the BlobPut audit event and RETURN the fresh/resurrect dep record (tokened,
-    /// adopted=false) for the caller to compose into its `BlobUploadResult` — it folds nothing into `deps`.
+    /// Build-neutral: emit the `BlobPut` audit event and return `Materialized` for the caller to
+    /// compose into its `BlobUploadResult`; it folds nothing into `deps`.
     auto makeDepAndEmit = [&](Token tok) -> BlobDepRecord
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
@@ -517,7 +497,7 @@ BlobUploadResult PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef &
             e.reason = "uploadFromSource: fresh incarnation streamed from writer's own re-readable source (INV-1)";
             e.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
         });
-        return BlobDepRecord{kind, tok, source.size, /*adopted=*/false};
+        return BlobDepRecord{kind, BlobDependencyProof::Materialized, source.size};
     };
 
     /// Meta write for the RESURRECT (condemned-displacement) case: flip the now-stale Condemned meta
@@ -773,17 +753,11 @@ void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
     /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
     if (entry.placement == EntryPlacement::Blob)
     {
-        /// Carry `entry.ref` WHOLE (the pair, never re-derived) — this is what makes a
-        /// mixed-algo manifest's entries each dep-track under their OWN algo. §4: adopted=true marks this a
-        /// committed-source W-EVIDENCE dep, trusted at promote via the durable manifest edge (no probe).
-        deps[entry.ref] = BlobDepRecord{ObjectKind::Blob, std::nullopt, entry.blob_size, /*adopted=*/true};
+        /// Carry `entry.ref` whole (the pair, never re-derived) so mixed-algorithm manifest entries
+        /// track under their own algorithm. The committed source supplies trusted-manifest evidence.
+        deps.insert_or_assign(
+            entry.ref, BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::TrustedManifest, entry.blob_size});
     }
-}
-
-void PartWriteTxn::recordPendingBlobDep(const BlobRef & ref, uint64_t size)
-{
-    requireAlive();
-    deps[ref] = BlobDepRecord{ObjectKind::Blob, std::nullopt, size};
 }
 
 RootNamespace PartWriteTxn::manifestNamespace() const
@@ -1042,11 +1016,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     if (!manifestNamespaceMatches(target_ns, body))
         throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
 
-    /// The copy-forward pre-pass is removed — the
-    /// in-closure blob revalidation below is now the SINGLE copy-forward site. Trade-off: the rare
-    /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the append lane's flush, briefly
-    /// blocking the per-namespace batching queue; it is idempotent under a re-run (a retry sees its own
-    /// fresh token). The meta CAS is the only remaining coordination for this rare case.
+    /// Blob readiness is checked inside the append closure below, after owner liveness. It consumes
+    /// only this build's explicit dependency proofs and performs no backend copy-forward.
 
     /// The intended-repoint operation is an atomic composition of `WDropRef` and `WPromote`: the
     /// manifest the ref currently commits,
@@ -1071,7 +1042,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         /// Capture the closure's INPUTS by value (ref name, manifest id, promote build id, repoint flag,
         /// and the manifest `body` it revalidates) rather than `[&]`, as defense-in-depth against a
         /// closure outliving this stack. Unlike `precommitAdd`, this closure cannot be made fully
-        /// self-contained: `depIsTokened`/`isTrustedAdopt` read this build's `deps` member (so it must
+        /// self-contained: `dependencyProof` reads this build's `deps` member (so it must
         /// keep `this`), and `repoint_old`/`created` are OUTPUTS read after the call returns (so they stay
         /// references). The ref-lane leadership guard is the real fix; both residual by-reference captures
         /// are safe because the guard guarantees the closure is never invoked after this frame unwinds.
@@ -1090,9 +1061,8 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 return {};
 
             /// NO writer-side view refresh here:
-            /// Gate A): promote-time view freshness is not load-bearing — tokened leaves are edge-protected
-            /// (EDGE-BEFORE-OBSERVE) and the tokenless K3 gate below reads the live view, which the floor
-            /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1).
+            /// Gate A): promote-time view freshness is not load-bearing — `Materialized` leaves are
+            /// edge-protected (EDGE-BEFORE-OBSERVE), while `TrustedManifest` relies on the live source edge.
 
             /// The `WPromote` owner guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits
             /// NO blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the
@@ -1109,13 +1079,12 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     "(WPromote owner==bld)",
                     final_ref_name, u128ToHex(promote_build_id)));
 
-            /// Blob-leaf revalidation. TOKENED leaves are
+            /// Blob-leaf revalidation. `Materialized` leaves are
             /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
             /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
             /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
-            /// view under that edge. They are NOT re-checked here. A NON-tokened leaf is EITHER a
-            /// committed-source W-EVIDENCE adopt (adoptEvidence ⇒ adopted=true) or a no-dep / pending-upload
-            /// staging bug. There is NO per-file probe on this path: an adopted leaf is TRUSTED via the
+            /// view under that edge. They are not re-checked here. `TrustedManifest` records a
+            /// committed-source adoption. There is no per-file probe on this path: that leaf is trusted via the
             /// durable manifest edge (the live source pins the blob, in-degree >= 1, not condemnable) and this
             /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
@@ -1124,9 +1093,22 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
-                if (depIsTokened(e.ref))
-                    continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
-                /// §4 manifest-trust: a tokenless adoptEvidence leaf is trusted — no HEAD, no loadMeta, no
+                const auto proof = dependencyProof(e.ref);
+                if (!proof)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "promote: blob leaf {} has no dependency proof at commit — a pending upload "
+                        "never completed; failing closed",
+                        store->layout().blobKey(e.ref));
+
+                switch (*proof)
+                {
+                    case BlobDependencyProof::Materialized:
+                        continue;   /// edge-protected; putBlob validated under the durable edge
+                    case BlobDependencyProof::TrustedManifest:
+                        break;
+                }
+
+                /// §4 manifest-trust: a `TrustedManifest` leaf is trusted — no HEAD, no loadMeta, no
                 /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
                 /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
                 /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
@@ -1135,14 +1117,7 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
                 /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
                 /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
-                /// (`CasFsck.cpp`, `++report.dangling`), NOT this gate. A tokenless PENDING-upload dep
-                /// (adopted=false) or a no-dep leaf never reaches promote un-resolved legitimately: it is a
-                /// staging bug (a pending upload that never completed) and fails closed (LOGICAL_ERROR).
-                if (!isTrustedAdopt(e.ref))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR,
-                        "promote: blob leaf {} has no tokened and no adopted dep at commit — a staging bug "
-                        "(a pending upload never completed); failing closed",
-                        store->layout().blobKey(e.ref));
+                /// (`CasFsck.cpp`, `++report.dangling`), not this gate.
                 ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);
                 EventEmitter{*store}.emit([&](CasEvent & ev)
                 {

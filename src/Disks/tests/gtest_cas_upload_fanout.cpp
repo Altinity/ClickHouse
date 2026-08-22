@@ -135,18 +135,14 @@ BlobUploadRequest s3Request(const String & payload, const String & staging_key)
     return BlobUploadRequest{idOf(payload), std::move(src), payload.size()};
 }
 
-/// The stable, deterministic part of a build's dep set: (kind, size, adopted, has-token) per ref.
-/// The token VALUE itself is intentionally excluded -- the InMemoryBackend mints tokens from ONE
-/// monotonic counter, so a fanned-out world's fresh/resurrect uploads land their tokens in a
-/// non-deterministic order relative to the serial world. Adopt branches reuse the seeded token, but
-/// keying the comparison off (kind,size,adopted,has-token) plus the backend end state (below) captures
-/// the behavioral equivalence without depending on token-mint ordering.
-using StableDep = std::tuple<ObjectKind, uint64_t, bool, bool>;
+/// The stable dependency state is independent of backend incarnation tokens: all successful upload
+/// branches establish `Materialized`, regardless of serial or parallel token-mint ordering.
+using StableDep = std::tuple<ObjectKind, uint64_t, BlobDependencyProof>;
 std::map<BlobRef, StableDep> stableDeps(const PartWriteTxn & build)
 {
     std::map<BlobRef, StableDep> out;
     for (const auto & [ref, dep] : build.depsSnapshotForTest())
-        out.emplace(ref, StableDep{dep.kind, dep.size, dep.adopted, dep.token.has_value()});
+        out.emplace(ref, StableDep{dep.kind, dep.size, dep.proof});
     return out;
 }
 
@@ -307,7 +303,7 @@ WorldA arrangeWorldA()
 
 }
 
-TEST(CASUploadFanout, DepsEquivalenceAcrossBranches)
+TEST(CASUploadFanout, DependencyProofEquivalentAcrossFanoutBranches)
 {
     /// Serial reference: pool size 1.
     WorldA serial = arrangeWorldA();
@@ -327,11 +323,11 @@ TEST(CASUploadFanout, DepsEquivalenceAcrossBranches)
     EXPECT_EQ(serial_deps, fanned_deps) << "recorded deps must match across serial and fanned runs";
     EXPECT_EQ(serial_backend, fanned_backend) << "backend end state must match across serial and fanned runs";
 
-    /// Every dep is a complete tokened blob dep (no branch left its effect behind as a side effect).
+    /// Every successful upload branch records materialized evidence only after the fan-out joins.
     for (const auto & [ref, dep] : serial_deps)
     {
         EXPECT_EQ(std::get<0>(dep), ObjectKind::Blob);
-        EXPECT_TRUE(std::get<3>(dep)) << "every merged fan-out dep carries a token";
+        EXPECT_EQ(std::get<2>(dep), BlobDependencyProof::Materialized);
     }
     for (const auto & p : serial.payloads)
         EXPECT_EQ(metaStateAt(*fanned.b, fanned.s->layout(), p), std::optional<MetaState>(MetaState::Clean));
@@ -445,7 +441,8 @@ TEST(CASUploadFanout, DuplicateRefsLaunchOneTask)
 
     EXPECT_EQ(dispatched.load(), 1) << "two pending-blob records for one ref launch exactly one task";
     EXPECT_EQ(per_ref[idOf(payload)], 1);
-    EXPECT_TRUE(build->depIsTokened(idOf(payload))) << "the one task's dep was merged";
+    EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized)
+        << "the one task's dep was merged";
     EXPECT_EQ(build->depsSnapshotForTest().size(), 1u) << "exactly one dep for the unique ref";
 }
 
@@ -607,7 +604,7 @@ TEST(CASUploadFanout, CondemnedLocalResurrectOpensTheSourcePerAttempt)
     fanOutBlobUploads(*build, reqs, *pool, nullptr);
 
     EXPECT_EQ(opens, 2) << "conditional-create attempt + resurrect: exactly one open each, nothing extra";
-    EXPECT_TRUE(build->depIsTokened(idOf(payload)));
+    EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized);
 }
 
 /// Test 2, condemned-S3 duplicate pair resurrects content-correctly: two duplicate S3-staging records
@@ -642,7 +639,7 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
     fanOutBlobUploads(*build, reqs, *pool, &hooks);
 
     EXPECT_EQ(dispatched.load(), 1) << "duplicate condemned records collapse to one resurrect task";
-    EXPECT_TRUE(build->depIsTokened(idOf(payload)));
+    EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized);
     const Token after_token = b->head(s->layout().blobKey(idOf(payload))).token;
     EXPECT_NE(after_token.value, condemned_token.value) << "a fresh incarnation displaced the condemned one";
     EXPECT_EQ(metaStateAt(*b, s->layout(), payload), std::optional<MetaState>(MetaState::Clean));
@@ -652,7 +649,7 @@ TEST(CASUploadFanout, DuplicateCondemnedS3ResurrectsCorrectly)
 /// Test 3: one task fails (a poisoned source), one sibling succeeds. Merge-nothing means the build stays
 /// at its pre-fan-out state; the abandoned precommit turns the successful sibling's uploaded body into
 /// ORDINARY GC-reclaimable debris (NOT a new orphan class) -- a GC round reclaims it.
-TEST(CASUploadFanout, MergeNothingOnFailure)
+TEST(CASUploadFanout, PendingFanoutFailureCreatesNoDependency)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -669,6 +666,8 @@ TEST(CASUploadFanout, MergeNothingOnFailure)
     const ManifestId id = build->stageManifest({blobEntryFor("data.bin", u128Of(good), good.size()),
                                                 blobEntryFor("data.cmrk3", u128Of(poisoned), poisoned.size())});
     build->precommitAdd(ns, "part", id);
+    EXPECT_EQ(build->dependencyProof(idOf(good)), std::nullopt);
+    EXPECT_EQ(build->dependencyProof(idOf(poisoned)), std::nullopt);
 
     /// Poison the failing sibling via the in-task seam: throw a plain (non-LOGICAL, non-ABORTED)
     /// exception so it is neither retried nor an abort under sanitizer builds.
@@ -687,8 +686,8 @@ TEST(CASUploadFanout, MergeNothingOnFailure)
     });
 
     /// Merge-nothing: the build recorded NO dep, even though the good sibling's body was uploaded.
-    EXPECT_FALSE(build->depIsTokened(idOf(good)));
-    EXPECT_FALSE(build->depIsTokened(idOf(poisoned)));
+    EXPECT_EQ(build->dependencyProof(idOf(good)), std::nullopt);
+    EXPECT_EQ(build->dependencyProof(idOf(poisoned)), std::nullopt);
     EXPECT_EQ(build->depsSnapshotForTest().size(), 0u);
 
     /// Abandon the precommit (the existing failure path), then GC reclaims the orphaned sibling body.
@@ -723,8 +722,8 @@ TEST(CASUploadFanout, ConcurrentDeduplicationCacheInsertion)
     auto pool = makePool(2);
     fanOutBlobUploads(*build, reqs, *pool, &hooks);
 
-    EXPECT_TRUE(build->depIsTokened(idOf(pa)));
-    EXPECT_TRUE(build->depIsTokened(idOf(pb)));
+    EXPECT_EQ(build->dependencyProof(idOf(pa)), BlobDependencyProof::Materialized);
+    EXPECT_EQ(build->dependencyProof(idOf(pb)), BlobDependencyProof::Materialized);
     EXPECT_TRUE(s->dedupCacheContains(idOf(pa))) << "concurrent insertion left both keys present";
     EXPECT_TRUE(s->dedupCacheContains(idOf(pb)));
 }
@@ -765,7 +764,8 @@ TEST(CASUploadFanout, PoolSaturationBounded)
         fanOutBlobUploads(*build, reqs, *pool, &hooks);
 
         for (const auto & p : payloads)
-            EXPECT_TRUE(build->depIsTokened(idOf(p))) << "every blob uploaded (pool_size=" << pool_size << ")";
+            EXPECT_EQ(build->dependencyProof(idOf(p)), BlobDependencyProof::Materialized)
+                << "every blob uploaded (pool_size=" << pool_size << ")";
     };
 
     ConcurrencyProbe probe2;
@@ -819,7 +819,8 @@ TEST(CASUploadFanout, DrainPrecedesUnwind)
 
     EXPECT_TRUE(b->head(s->layout().blobKey(idOf(slow))).exists)
         << "the sibling's upload was drained by the join before the failure surfaced";
-    EXPECT_FALSE(build->depIsTokened(idOf(slow))) << "merge-nothing: the drained sibling's dep is not merged";
+    EXPECT_EQ(build->dependencyProof(idOf(slow)), std::nullopt)
+        << "merge-nothing: the drained sibling's dep is not merged";
 }
 
 /// Test 6b: a throw injected DURING the dispatch loop (before all tasks are enqueued) still drains the

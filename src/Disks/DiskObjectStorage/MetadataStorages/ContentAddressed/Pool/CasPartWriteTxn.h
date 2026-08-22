@@ -47,19 +47,27 @@ struct PutBlobResult
     uint64_t size = 0;
 };
 
-/// One blob dependency this build contributes — EXACTLY the record `putBlob` folds into `deps`.
-/// A token identifies an incarnation uploaded by this transaction and must be retained through
-/// promotion; a tokenless entry relies on the durable source-manifest edge instead. `adopted`
-/// distinguishes trusted committed-source evidence (`adoptEvidence`) from a pending upload that has
-/// not yet been completed. CAS-owned public value type so a transaction-detached upload can RETURN
-/// its complete dep effect instead of folding it as a side effect (spec §1: "no branch may leave its
-/// dep effect behind as a side effect").
+/// The complete proof vocabulary accepted by writer promotion. Backend incarnation tokens remain
+/// backend/metadata evidence; writer readiness records only why a blob dependency is safe to publish.
+enum class BlobDependencyProof : uint8_t
+{
+    Materialized,       /// publication or observation proved a physical blob is present
+    TrustedManifest,    /// a committed source manifest supplies durable liveness evidence
+};
+
+/// One blob dependency this build contributes — exactly the record `putBlob` folds into `deps`.
+/// CAS-owned public value type so a transaction-detached upload can return its complete dependency
+/// effect instead of folding it as a side effect.
 struct BlobDepRecord
 {
-    ObjectKind kind = ObjectKind::Blob;
-    std::optional<Token> token;                       /// nullopt = live-source evidence
-    uint64_t size = 0;
-    bool adopted = false;                             /// true only for `adoptEvidence`
+    BlobDepRecord(ObjectKind kind_, BlobDependencyProof proof_, uint64_t size_)
+        : kind(kind_), proof(proof_), size(size_)
+    {
+    }
+
+    ObjectKind kind;
+    BlobDependencyProof proof;
+    uint64_t size;
 
     bool operator==(const BlobDepRecord &) const = default;
 };
@@ -149,10 +157,8 @@ public:
     /// Applies a fan-out's `uploadBlobDetached` results into `deps` on the CALLING thread, after the
     /// fan-out's join -- so this is an owning-writer-thread API exactly like `putBlob`, and MUST NOT be
     /// called from a pool task. Merge failure must not leave a partially merged build (spec §1): every
-    /// result is prevalidated FIRST -- completeness (a result's dep must carry a token; every branch of
-    /// `uploadBlobDetached` sets one, so a tokenless result is a caller bug, not a valid dep-only-evidence
-    /// state, which is folded through `adoptEvidence` instead) and duplicate-grouping consistency
-    /// (two results for the same `BlobRef` must carry an identical dep record; a conflict -- most
+    /// result is prevalidated FIRST for duplicate-grouping consistency (two results for the same
+    /// `BlobRef` must carry an identical dep record; a conflict -- most
     /// commonly a conflicting size -- means the fan-out's one-task-per-unique-ref invariant was
     /// violated) -- BEFORE any result is applied. Application then runs against a COPY of `deps` (a
     /// "build"), so a mid-application exception (including one raised by `setMergeHookForTest`'s hook, or
@@ -170,22 +176,16 @@ public:
 
     /// Test-only DEEP snapshot of this build's recorded deps, keyed by `BlobRef`. A plain copy of the
     /// private `deps` map -- lets a test assert the whole build is byte-for-byte untouched after a
-    /// rejected or aborted merge, rather than probing one ref at a time via `depIsTokened`.
+    /// rejected or aborted merge, rather than probing one ref at a time via `dependencyProof`.
     std::map<BlobRef, BlobDepRecord> depsSnapshotForTest() const { return deps; }
 
-    /// Return whether this build holds a TOKENED Blob dep for `ref` (`putBlob` ⇒
-    /// tokened) versus a tokenless evidence dep (`adoptEvidence` ⇒ tokenless)? False also when this
-    /// build has no dep for the ref at all.
-    bool depIsTokened(const BlobRef & ref) const;
+    /// Return this build's readiness proof for `ref`, or `std::nullopt` when publication/adoption has
+    /// not established one. Production promotion and tests use this same fail-closed query.
+    std::optional<BlobDependencyProof> dependencyProof(const BlobRef & ref) const;
 
-    /// Record a TOKENLESS evidence blob dep directly from a `ManifestEntry` — no HEAD or backend
-    /// call. Lets staging adopt sites record the dep by hash without asserting presence before
-    /// precommit; the promote gate observes/resurrects it post-precommit. Inline entries record nothing.
+    /// Record `TrustedManifest` directly from a `ManifestEntry` — no HEAD or backend call. Inline
+    /// entries record nothing.
     void adoptEvidence(const ManifestEntry & entry);
-
-    /// Record a TOKENLESS pending blob dep by ref (without a HEAD) for a blob whose bytes are staged locally and
-    /// will be putBlob'd post-precommit. putBlob later overwrites it with the tokened dep on upload.
-    void recordPendingBlobDep(const BlobRef & ref, uint64_t size);
 
     /// Mint a root-local part `ManifestId`, write its body under
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the pool's shared request
@@ -214,15 +214,13 @@ public:
 
     /// Atomically promote the precommit to the committed ref with one `appendRefOps` call on the target ref's
     /// ref-log entry.
-    ///  1. tokened leaves are already protected by the durable precommit edge, so no writer-side retired-view
+    ///  1. `Materialized` leaves are already protected by the durable precommit edge, so no writer-side retired-view
     ///     refresh is needed;
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
-    ///  3. the NON-tokened blob leaves (tokened leaves are edge-protected, not re-checked): a committed-source
-    ///     adoptEvidence leaf is TRUSTED via the durable manifest edge — NO per-file HEAD/loadMeta probe (§4
-    ///     manifest-trust: the live source pins the blob, in-degree >= 1); a genuinely
-    ///     absent adopted blob is an invariant violation caught by fsck, not here;
-    ///  4. a body-absent precommit or a lost owner-liveness ⇒ ABORTED; a non-tokened, non-adopted leaf (no
-    ///     tokened dep and no committed-source adopt — a staging bug) ⇒ LOGICAL_ERROR (fail closed);
+    ///  3. `TrustedManifest` leaves use the durable source-manifest edge with no per-file HEAD/loadMeta
+    ///     probe; a genuinely absent trusted blob is an invariant violation caught by fsck, not here;
+    ///  4. a body-absent precommit or lost owner-liveness ⇒ ABORTED; a missing dependency proof ⇒
+    ///     LOGICAL_ERROR (fail closed);
     ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
     ///     ONE pure-move `RefOp` (old_binding={Precommit,final_ref_name,T}, new_binding={Committed,final_ref_name,T},
     ///     same manifest_ref T) and setting refs[final_ref_name];
@@ -352,14 +350,6 @@ private:
     /// sweep is the durable backstop). Shared by the normal and the namespace-removal-cancelled `abandon`
     /// paths; only ever called on the build's OWN thread.
     void cleanupStagedManifestDebrisBestEffort();
-
-    /// A leaf is trusted at promote iff this build holds a TOKENLESS dep recorded by
-    /// `adoptEvidence` (adopted=true) — a committed-source evidence adopt. The live source pins the blob
-    /// (in-degree >= 1, not condemnable) and this build's precommit edge is durable, so the durable manifest
-    /// edge is the liveness evidence: no HEAD, no loadMeta, no copy-forward. A tokened dep (edge-protected,
-    /// handled by `depIsTokened`), a tokenless PENDING-upload dep (adopted=false), or NO dep at all (a
-    /// staging bug) is NOT trusted — it fails closed. The single gate for the promote non-tokened leaf.
-    bool isTrustedAdopt(const BlobRef & ref) const;
 
     PoolPtr store;
     UInt128 build_id{};

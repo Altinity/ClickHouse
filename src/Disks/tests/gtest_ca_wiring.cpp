@@ -2439,7 +2439,7 @@ TEST(CASWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
                 << "Adopted committed-source blob op '" << log[i].op << "' on '" << log[i].key
                 << "' at index " << i << " came BEFORE the first precommit write at index "
                 << first_precommit_idx << " — violates B188 (committed-source adopt must not HEAD/GET/"
-                << "PUT the adopted blob before precommit; expected a tokenless adoptEvidence dep)";
+                << "PUT the adopted blob before precommit; expected TrustedManifest evidence)";
         }
     }
     EXPECT_FALSE(adopted_blob_touched_before_precommit);
@@ -2475,7 +2475,7 @@ TEST(CASWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
     ///   - src_st = staging for all_10_10_0 (exists: contains the pending blob)
     ///   - dst_st = staging for all_11_11_0 (created fresh here)
     ///   - &dst_st != src_st => PendingBlob is COPIED into dst_st.pending_blobs
-    ///   - Both builds get recordPendingBlobDep (tokenless dep — no pool op until post-precommit)
+    ///   - Neither build has a dependency proof until its post-precommit upload succeeds
     tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin");
 
     /// Nothing visible yet (B188: no uploads before precommit).
@@ -2556,7 +2556,7 @@ TEST(CASWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
     /// The source BLOB key must NOT be accessed (HEAD via exists/getObjectMetadata, GET via readObject,
     /// or PUT via writeObject) before the precommit write. With an eager adopt-by-HEAD on the source
     /// blob (the regression), observeAndAdmit HEADs the blob key at an index < first_precommit_idx,
-    /// failing here. A tokenless adoptEvidence dep touches nothing.
+    /// failing here. `TrustedManifest` evidence touches nothing.
     bool blob_touched_before_precommit = false;
     for (int i = 0; i < first_precommit_idx; ++i)
     {
@@ -2567,7 +2567,7 @@ TEST(CASWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
                 << "republishRef blob op '" << log[i].op << "' on '" << log[i].key
                 << "' at index " << i << " came BEFORE the first precommit write at index "
                 << first_precommit_idx << " — violates B190 precommit-first: republishRef must not "
-                << "HEAD/GET/PUT the source blob before precommit (use tokenless adoptEvidence)";
+                << "HEAD/GET/PUT the source blob before precommit (use TrustedManifest evidence)";
         }
     }
     EXPECT_FALSE(blob_touched_before_precommit);
@@ -2581,7 +2581,7 @@ TEST(CASWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 /// B190-B: the adoptStagedBlob helper unifies the 6 inline pending/uploaded adopt blocks from
 /// createHardLink / moveFile / moveDirectory. The observable invariant: after refactoring, ALL
 /// six sites still produce the same result as before — pending blobs are copied (hardlink) or
-/// moved (moveFile/moveDirectory), and uploaded blobs are adopted by tokenless evidence. This test
+/// moved (moveFile/moveDirectory), and uploaded blobs are adopted with `TrustedManifest`. This test
 /// exercises the non-trivial CROSS-PART pending path (createHardLink copies; moveFile moves) and
 /// verifies both a copy and a move of the SAME pending source produce the correct committed state.
 TEST(CASWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
@@ -2762,13 +2762,13 @@ TEST(CASWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/new.bin"));
 }
 
-/// ==== Promote tokened-leaf edge-protection (spec 2026-07-09-cas-writer-gc-simplification, Phase A) ====
+/// ==== Promote materialized-leaf edge protection (spec 2026-07-09-cas-writer-gc-simplification, Phase A) ====
 ///
 /// A fast GC can PREMATURELY condemn a blob a writer just putBlob'd, in the tiny putBlob->promote window
 /// (the precommit->blob edge is not yet folded, so GC reads in-degree 0). Under EDGE-BEFORE-OBSERVE the
 /// precommit closure named the blob BEFORE putBlob observed it, so the condemnation cannot graduate to a
 /// delete (the next fold sees the edge, d >= 1, spared) — it is doomed, not the blob. promote therefore
-/// does NOT re-validate or resurrect a TOKENED leaf; it commits with the blob's token UNCHANGED. The only
+/// does not revalidate or resurrect a `Materialized` leaf; it commits with the blob's token unchanged. The only
 /// blob-side abort promote still performs is the owner-liveness check (a reclaimed precommit) — which runs
 /// BEFORE any blob work and touches nothing.
 ///
@@ -2831,9 +2831,9 @@ void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
 /// A blob condemned in the putBlob->promote window is EDGE-PROTECTED (spec
 /// 2026-07-09-cas-writer-gc-simplification, Phase A): the precommit closure naming the blob was durable
 /// BEFORE putBlob observed it, so a condemnation in this window cannot graduate to a delete (the next fold
-/// sees the edge, d >= 1, spared). promote therefore does NOT re-check or resurrect a TOKENED leaf — it
+/// sees the edge, d >= 1, spared). promote therefore does not re-check or resurrect a `Materialized` leaf — it
 /// commits leaving the blob's token UNCHANGED (no resurrect PUT). The premature condemn is doomed on its own.
-TEST(CASWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
+TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
 {
     using namespace DB::Cas;
     std::shared_ptr<InMemoryBackend> backend;
@@ -2862,16 +2862,16 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
             << "precondition: the putBlob'd token must be condemned before promote";
     }
 
-    /// promote must NOT abort AND must NOT touch the tokened leaf — it is edge-protected.
+    /// Promote must not abort or touch the materialized leaf — it is edge-protected.
     EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
 
-    /// The ref is committed and the blob's token is UNCHANGED — no resurrect PUT ran (tokened leaves are
+    /// The ref is committed and the blob's token is unchanged — no resurrect PUT ran (`Materialized` leaves are
     /// not re-validated: EDGE-BEFORE-OBSERVE guarantees the condemnation is doomed, not the blob).
     EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after promote";
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
     EXPECT_EQ(h2.token, t0)
-        << "tokened leaf is edge-protected: promote must not re-upload it (token unchanged)";
+        << "materialized leaf is edge-protected: promote must not re-upload it (token unchanged)";
 }
 
 /// promote is a PURE owner MOVE (Δ=0 blob delta) — sound ONLY while this build's precommit is STILL the
@@ -2906,7 +2906,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 
     /// Stage the manifest and upload the (fresh) blob, but DO NOT precommitAdd — so the precommit owner
     /// binding is absent from the ref-table state when promote runs. A fresh putBlob needs no precommit
-    /// (only the ADOPT path requires the durable edge); it records the tokened leaf t0.
+    /// (only the ADOPT path requires the durable edge); it records `Materialized`.
     const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
     build->putBlob(idOf(P), BlobSource::fromString(P));
 
@@ -2937,7 +2937,7 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
     EXPECT_EQ(h2.token, h1.token)
-        << "the aborting path must perform no PUT — the tokened leaf is untouched";
+        << "the aborting path must perform no PUT — the materialized leaf is untouched";
     const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
         << "no re-upload/resurrect before the owner check — the token is still the condemned one";
