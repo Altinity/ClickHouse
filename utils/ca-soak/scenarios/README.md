@@ -64,8 +64,7 @@ reclaimable.
 Collect these for every run:
 
 - Configuration: ClickHouse binary revision, branch, pool prefix, `gc_shards`,
-  `deduplication_cache_bytes`, `deduplication_head_first_min_bytes`, `expect_continue_min_bytes`, replica count, object
-  store version, and seed.
+  `expect_continue_min_bytes`, replica count, object store version, and seed.
 - Pool shape: object count and bytes by prefix: `blobs`, `roots`, `_manifests`, `_files`, and `gc`.
 - `system.cas_gc_log`: round, outcome, candidates, deleted, absent,
   replaced, spared, duration, and per-round `ProfileEvents`.
@@ -85,7 +84,7 @@ Collect these for every run:
   types SEPARATELY — each answers a different question (CPU = busy-spinning, Real = includes blocked/
   off-CPU waits, Memory = allocation hot paths) and must not be conflated into one combined ranking.
 - CA operation counters from `ProfileEvents`: `CASBlobPut`, `CASBlobPutDeduplicated`, `CASBlobHead`,
-  `CASBlobHeadMiss`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDeduplicationCacheHit`, `CASBlobDelete`,
+  `CASBlobHeadMiss`, `CASBlobBodyPutAvoided`, `CASBlobDelete`,
   `CASBlobList`, `CASRootGet`, `CASRootHead`, `CASRootCompareSwap`, `CASRootCompareSwapConflict`, `CASRootList`, `CASGCGet`,
   `CASGCHead`, `CASGCCompareSwap`, `CASGCDelete`, `CASGCList`, and corresponding `DiskS3*`/`S3*` counters.
 - Container samples: cgroup memory, CPU throttling, IO bytes, network bytes, and scratch-dir bytes.
@@ -105,10 +104,9 @@ fsck dangling                  0                                0              p
 These are concrete "we may not have thought about this" risks visible from the current implementation.
 They should be treated as first-class scenario targets, not as speculative notes.
 
-- Huge `blob` upload may still be process-memory-sized. `Build::putBlob` currently materializes a
-  staged `BlobSource` into a `String` before `putIfAbsentStream`. `S01` must therefore measure peak
-  memory during finalize/upload and should be expected to expose a real issue unless this path is made
-  streaming from the staged temp file.
+- Huge `blob` publication streams its staged `BlobSource` through `Backend::publishBlob`. `S01` must
+  continue measuring peak memory during finalize/upload so any regression that materializes the body
+  in process memory is caught.
 - Local scratch pressure is per active staged part, not per single file. `ContentAddressedTransaction`
   stages every pending blob and uploads them during `publishStaging`, after manifest staging and
   `precommitAdd`. Under concurrent wide/large inserts, scratch usage can approach the sum of all active
@@ -190,7 +188,7 @@ Workload:
 
 Observations:
 
-- `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, `CASBlobDeduplicationCacheHit`, `CASBlobPutDeduplicated`, and
+- `CASBlobHead`, `CASBlobBodyPutAvoided`, `CASBlobPutDeduplicated`, and
   multipart counters for the second insert only.
 - Pool bytes before and after the second insert.
 - Query latency for reading both parts.
@@ -700,24 +698,6 @@ Expected:
 - Non-leaders emit `NotALeader` without noisy exceptions.
 - Memory and logs stay flat.
 
-### S24: small dedup-cache capacity
-
-Purpose: prove the known-present blob cache is a hint only and bounded by configuration.
-
-Workload:
-
-- Configure tiny `deduplication_cache_bytes`.
-- Insert a working set larger than the cache, then repeatedly insert a hot subset.
-
-Observations:
-
-- `CASBlobDeduplicationCacheHit`, `CASBlobHeadFirst`, `CASBlobBodyPutAvoided`, memory, and upload counters.
-
-Expected:
-
-- Lower cache hit rate changes cost, not correctness.
-- Cache memory stays near the configured bound.
-
 ### S25: non-`Atomic` database paths
 
 Purpose: prove path parsing and namespace construction are correct outside the `Atomic` `store/<uuid>` layout.
@@ -780,5 +760,5 @@ When a scenario fails or exceeds budget, the report should include:
   - infrastructure/object-store fault, with evidence;
   - budget too strict, with proposed revised threshold and justification.
 
-Known first investigation target: if `S01` memory scales with blob size, inspect `Build::putBlob`, because it
-currently copies a staged `BlobSource` into a `String` before `putIfAbsentStream`.
+Known first investigation target: if `S01` memory scales with blob size, inspect the staged
+`BlobSource` to `Backend::publishBlob` streaming path for an unexpected full-body copy.

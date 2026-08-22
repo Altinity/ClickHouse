@@ -239,7 +239,7 @@ void ContentAddressedTransaction::adoptStagedBlob(
     {
         /// Uploaded / committed: record trusted-manifest evidence — no pool HEAD/GET before precommit.
         /// §4 manifest-trust: the publish gate (promote) TRUSTS this committed-source adopted leaf via the
-        /// durable manifest edge — it does not observe or resurrect it. Pending uploads establish
+        /// durable manifest edge — it does not observe or republish it. Pending uploads establish
         /// `Materialized` through `putBlob` before promote; a genuinely absent adopted blob is an fsck finding.
         dst_build.adoptEvidence(entry);
     }

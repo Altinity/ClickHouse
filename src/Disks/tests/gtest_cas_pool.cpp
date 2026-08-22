@@ -57,7 +57,6 @@ public:
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { ++writes; return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { ++writes; return inner->putIfAbsentStream(k, meta); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         ++writes;
@@ -84,7 +83,6 @@ ManifestId publishPart(
     PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
     auto build = s->beginPartWrite(info);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
     ManifestEntry e;
     e.path = entry_path;
@@ -95,6 +93,7 @@ ManifestId publishPart(
 
     const ManifestId id = build->stageManifest({e});
     build->precommitAdd(nsr, ref, id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(nsr, ref, build->buildId(), id);
     return id;
 }
@@ -176,7 +175,6 @@ public:
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { note(k); return inner->putIfAbsent(k, b, m); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { note(k); return inner->putIfAbsentStream(k, m); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         note(request.destination_key);
@@ -246,7 +244,6 @@ public:
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         inner->publishBlob(request);
@@ -648,7 +645,6 @@ TEST(CASPool, ResolveReturnsManifestId)
     PartWriteInfo info;
     info.intended_ref = ns.string() + "/part_1";
     auto build = s->beginPartWrite(info);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
     ManifestEntry blob_entry;
     blob_entry.path = "data.bin";
@@ -663,6 +659,7 @@ TEST(CASPool, ResolveReturnsManifestId)
 
     const ManifestId id = build->stageManifest({blob_entry, inline_entry});
     build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(ns, "part_1", build->buildId(), id);
 
     auto r = s->resolveRef(ns, "part_1");
@@ -1348,7 +1345,6 @@ public:
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         inner->publishBlob(request);
@@ -1485,9 +1481,15 @@ TEST(CASPoolRemount, OldEpochBuildFailsClosedAfterRemount)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { build->putBlob(DB::Cas::tests::idOf("x"), DB::Cas::BlobSource::fromString("x")); });
 
-    /// A FRESH build under the live incarnation works.
-    auto fresh = store->beginPartWrite({});
+    /// A FRESH build under the live incarnation works once its publication edge is durable.
+    const RootNamespace ns{"srv/remount"};
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/fresh";
+    auto fresh = store->beginPartWrite(info);
+    const ManifestId id = fresh->stageManifest({blobEntryFor("data.bin", DB::Cas::tests::u128Of("y"))});
+    fresh->precommitAdd(ns, "fresh", id);
     EXPECT_NO_THROW(fresh->putBlob(DB::Cas::tests::idOf("y"), DB::Cas::BlobSource::fromString("y")));
+    fresh->abandon();
 }
 
 TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)

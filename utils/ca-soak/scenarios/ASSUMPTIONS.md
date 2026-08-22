@@ -44,8 +44,6 @@ These are recorded as `inconclusive` with a reason — never silently skipped or
   proxy of the same property.)
 - **S22** object-store throttling/retry budget — needs a fault-injecting S3 proxy (503/429/slow/close)
   between ClickHouse and RustFS.
-- **S24** small dedup-cache capacity — needs a storage_conf variant with a tiny `deduplication_cache_bytes`
-  (compose mounts only the default 64 MiB).
 - **S27** backend list-pagination ambiguity — needs an instrumented store returning duplicate/unstable
   LIST pages.
 - **S15** `gc_shards=8` point — compose provides only `gc_shards` 1 and 2; the 1-vs-2 comparison runs.

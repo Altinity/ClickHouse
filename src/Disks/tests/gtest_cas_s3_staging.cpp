@@ -100,42 +100,14 @@ public:
         std::optional<DB::ObjectAttributes> object_to_attributes) override
     {
         ++call_count;
-        last_request_mode = write_settings.object_storage_request_mode;
         if (mode == Mode::Enforcing && exists(object_to))
             return {.created = false, .dest_etag = {}};
 
         copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
-        return {.created = true, .dest_etag = next_dest_etag};
+        return {.created = true, .dest_etag = "fake-etag"};
     }
 
     int callCount() const { return call_count; }
-
-    /// The `object_storage_request_mode` carried by the WriteSettings passed to the MOST RECENT call --
-    /// lets a test prove a caller marked (or didn't mark) its conditional copy NativeConditional.
-    DB::ObjectStorageRequestMode last_request_mode = DB::ObjectStorageRequestMode::Default;
-
-    /// The `dest_etag` the NEXT successful (created) call returns -- lets a test drive
-    /// `ObjectStorageBackend::promoteStaged`'s `tokenFromWriteResult` validation with a valid numeric
-    /// generation, an empty string, or a non-numeric value. Defaults to the pre-existing literal so
-    /// tests that don't care about the value see unchanged behavior.
-    std::string next_dest_etag = "fake-etag";
-
-    /// Counts calls to either metadata-read virtual, so a test can prove `promoteStaged`'s
-    /// Generation-dialect validation never issues a follow-up HEAD -- the token comes from the copy
-    /// response alone.
-    mutable int head_calls = 0;
-
-    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
-    {
-        ++head_calls;
-        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
-    }
-
-    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(const std::string & path, bool with_tags) const override
-    {
-        ++head_calls;
-        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
-    }
 
 private:
     Mode mode;
@@ -228,8 +200,8 @@ public:
         DB::Cas::InMemoryBackend::publishBlob(request);
     }
 
-    /// Every key READ AS A STREAM, with a count. The resurrect opens its source with `getStream`, so
-    /// this counts exactly the reads that path performs -- and deliberately not the materializing
+    /// Every key read as a stream, with a count. Republishing opens its source with `getStream`, so
+    /// this counts exactly those reads -- and deliberately not the materializing
     /// `get`, which the assertions themselves use to inspect bodies.
     std::map<String, size_t> reads_of;
 
@@ -530,115 +502,6 @@ TEST(CASS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
     EXPECT_FALSE(storage->conditionalCopySupported());
 }
 
-/// Task 3: `ObjectStorageBackend::promoteStaged` must pass its caller's request as NativeConditional
-/// -- staging promotion is a write-once conditional server-side copy whose destination token enters
-/// CAS protocol state, exactly the category "Mark every CAS token-producing write" targets. The mode
-/// is dialect-agnostic (it takes effect only when the underlying client also speaks the GCS wire
-/// dialect, gated on Task 4's Client::BuildHttpRequest predicate), so it is asserted here regardless
-/// of this fake's (ETag-like) dialect.
-TEST(CASS3Staging, PromoteStagedNativeConditionalModePropagates)
-{
-    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
-    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
-
-    /// Native mode passes staging_key/blob_key straight through to the object storage with no prefix
-    /// of its own (unlike EmulatedSingleProcess's emuPath), so they must already be valid raw storage
-    /// paths -- rooted under the fake's own common key prefix, exactly like `sweepOwnMountStaging`'s
-    /// test above does for the same `LocalObjectStorage`-backed fake.
-    const std::string root = storage->getCommonKeyPrefix();
-    const std::string staging_key = root + "/staging-key";
-    const std::string blob_key = root + "/blob-key";
-    {
-        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
-        const std::string body = "staged-bytes";
-        buf->write(body.data(), body.size());
-        buf->finalize();
-    }
-
-    const auto result = backend->promoteStaged(staging_key, blob_key);
-    ASSERT_EQ(result.outcome, DB::Cas::PutOutcome::Done);
-    EXPECT_EQ(storage->last_request_mode, DB::ObjectStorageRequestMode::NativeConditional);
-}
-
-/// Task 3 fix round 1: `promoteStaged`'s Step 7 validation (`tokenFromWriteResult`) was reachable only
-/// by a real GCS backend, with no test in the repository exercising its Generation-dialect branch for
-/// the COPY call site specifically (`ConditionalCopyResult::dest_etag` is a plain `String`, so it
-/// always `has_value()` once wrapped as an optional -- the "no write-time-token concept" story that
-/// applies to the write-buffer callers is inapplicable here; every Generation-dialect copy takes the
-/// strict branch). These two tests close that gap, mirroring
-/// `ResurrectAtSinglePutCapUsesOnePutAndReturnsResponseGeneration` /
-/// `ResurrectMissingGenerationOnSuccessThrows` for the copy path. Unlike the resurrect battery, this
-/// does not need to fight `S3ObjectStorage::getSingleAttemptClient` discarding a mocked client's
-/// overrides: `gtest_cas_s3_staging.cpp` already fakes at the `IObjectStorage` level, and
-/// `copyObjectConditional` (unlike `writeObject`) never consults the retry profile at all.
-
-/// A valid numeric `dest_etag` on a Generation-dialect backend is attributed EXACTLY -- no follow-up
-/// HEAD, matching the "no new metadata request" half of Step 7.
-TEST(CASS3Staging, PromoteStagedGenerationDialectValidGenerationReturnsExactToken)
-{
-    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
-    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
-    backend->setNativeTokenTypeForTest(DB::Cas::TokenType::Generation);
-    storage->next_dest_etag = "778899";
-
-    const std::string root = storage->getCommonKeyPrefix();
-    const std::string staging_key = root + "/staging-key-gen-ok";
-    const std::string blob_key = root + "/blob-key-gen-ok";
-    {
-        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
-        const std::string body = "staged-bytes";
-        buf->write(body.data(), body.size());
-        buf->finalize();
-    }
-    storage->head_calls = 0;
-
-    const auto result = backend->promoteStaged(staging_key, blob_key);
-    ASSERT_EQ(result.outcome, DB::Cas::PutOutcome::Done);
-    EXPECT_EQ(result.token, (DB::Cas::Token{"778899", DB::Cas::TokenType::Generation}));
-    EXPECT_EQ(storage->head_calls, 0);
-}
-
-/// A missing (empty) or non-numeric `dest_etag` on a Generation-dialect backend is an exception --
-/// never a silently-empty token, and never patched over by a follow-up HEAD.
-TEST(CASS3Staging, PromoteStagedGenerationDialectMissingOrNonNumericGenerationThrowsCorruptedData)
-{
-    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
-    auto backend = std::make_shared<DB::Cas::ObjectStorageBackend>(storage, DB::Cas::ObjectStorageBackend::Mode::Native);
-    backend->setNativeTokenTypeForTest(DB::Cas::TokenType::Generation);
-
-    const std::string root = storage->getCommonKeyPrefix();
-
-    {
-        const std::string staging_key = root + "/staging-key-gen-empty";
-        const std::string blob_key = root + "/blob-key-gen-empty";
-        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
-        const std::string body = "staged-bytes";
-        buf->write(body.data(), body.size());
-        buf->finalize();
-        storage->next_dest_etag = "";
-        storage->head_calls = 0;
-
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-            [&] { backend->promoteStaged(staging_key, blob_key); });
-        EXPECT_EQ(storage->head_calls, 0);
-    }
-
-    {
-        const std::string staging_key = root + "/staging-key-gen-bad";
-        const std::string blob_key = root + "/blob-key-gen-bad";
-        auto buf = storage->writeObject(DB::StoredObject(staging_key), DB::WriteMode::Rewrite);
-        const std::string body = "staged-bytes";
-        buf->write(body.data(), body.size());
-        buf->finalize();
-        storage->next_dest_etag = "\"d41d8cd98f00b204e9800998ecf8427e\"";
-        storage->head_calls = 0;
-
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-            [&] { backend->promoteStaged(staging_key, blob_key); });
-        EXPECT_EQ(storage->head_calls, 0);
-    }
-}
-
 /// Task 2 of the S3-native staging plan: `IObjectStorage::copyObjectConditional` (write-once
 /// conditional server-side copy) — the interface-level contract. Backends without an enforced,
 /// native conditional copy MUST NOT override the default: it fail-closes with `NOT_IMPLEMENTED`,
@@ -899,12 +762,12 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
 }
 
-/// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by re-uploading its OWN staging PAYLOAD
+/// (c) Blob key exists but is CONDEMNED ⇒ the writer republishes its OWN staging PAYLOAD
 /// under a FRESH-tagged envelope header — NEVER a read/copy of the condemned blob key
-/// (`feedback_ca_resurrect_invariant`) — and the resurrected body DIFFERS from the condemned incarnation
+/// and the replacement body DIFFERS from the condemned incarnation
 /// (INV-NO-RETURN: a verbatim copy would reproduce identical bytes ⇒ identical ETag ⇒ the queued
 /// exact-token delete of the condemned incarnation would kill the live resurrection = data loss).
-TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
+TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingPool(backend);
@@ -930,7 +793,7 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 
     /// Seed the condemned blob body = EXACTLY what a verbatim promote of this staging object would have
     /// produced (the writer's OWN create, later observed condemned). This is the adversarial shape: a
-    /// verbatim resurrect WOULD reproduce these identical bytes ⇒ identical ETag ⇒ collision.
+    /// verbatim republication WOULD reproduce these identical bytes ⇒ identical ETag ⇒ collision.
     backend->putIfAbsent(blob_key, staging_bytes);
     DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/payload.size());
     DB::Cas::tests::condemnMeta(*backend, store->layout(), hash, /*condemn_round=*/5);
@@ -947,9 +810,9 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     ASSERT_EQ(backend->copy_calls.size(), 1u);
     EXPECT_FALSE(backend->copy_calls[0].server_side_copy);
     EXPECT_EQ(backend->copy_calls[0].to, blob_key);
-    /// INV: the resurrect reads the STAGING object and never the condemned blob key. Asserted on the
+    /// INV: republication reads the STAGING object and never the condemned blob key. Asserted on the
     /// reads themselves rather than on a source argument, because the caller now opens the reader.
-    EXPECT_GT(backend->reads_of[staging_key], 0u) << "the resurrect must read the writer's own staging object";
+    EXPECT_GT(backend->reads_of[staging_key], 0u) << "republication must read the writer's own staging object";
     EXPECT_EQ(backend->reads_of[blob_key], 0u) << "the condemned blob key must never be read";
     EXPECT_EQ(backend->streamingPublicationCount(), 1u);
 
@@ -962,18 +825,18 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     ASSERT_TRUE(got.has_value());
     const uint64_t header_len = store->poolMeta().blob_header_len;
 
-    /// INV-NO-RETURN — THE fresh-tag property: the resurrected body is NOT byte-identical to the
+    /// INV-NO-RETURN — THE fresh-tag property: the replacement body is NOT byte-identical to the
     /// condemned incarnation (a verbatim copy would have been). The PAYLOAD is preserved exactly (the
-    /// resurrect read it from OUR staging object, skipping the staging header), but the envelope HEADER
+    /// writer read it from OUR staging object, skipping the staging header), but the envelope HEADER
     /// differs — the writer minted a FRESH incarnation_tag — so on a real content-addressed store the
-    /// resurrected ETag differs and the queued exact-token delete of the condemned incarnation cannot
-    /// match the live resurrection.
+    /// replacement ETag differs and the queued exact-token delete of the condemned incarnation cannot
+    /// match the live replacement.
     EXPECT_NE(got->bytes, staging_bytes);
     ASSERT_GE(got->bytes.size(), header_len);
     EXPECT_EQ(got->bytes.substr(header_len), payload);              /// payload preserved
     EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
 
-    /// The resurrection recorded materialized evidence and flipped the meta back to `Clean`.
+    /// The republication recorded materialized evidence and flipped the meta back to `Clean`.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
     const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm.has_value());
@@ -993,11 +856,9 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 /// against the object storage), so it reports S3 staging as usable independent of the backend mode. This
 /// lets `writeFile` take the S3-staging code path (stream to a staging object while hashing) WITHOUT
 /// needing a live/native conditional-copy backend for the promote: `PartWriteTxn::putBlob`'s
-/// `promoteStaged`/`resurrect` seams (Native-mode only — see `CasObjectStorageBackend.cpp`) are
-/// already covered directly against `Cas::PartWriteTxn`/`RecordingStagingBackend` above (Task 5) and against a
-/// live backend in Task 7's `with_rustfs` integration test; these two tests only ever exercise an S3
-/// pending blob that is either NEVER referenced (the B189 orphan shape — publishStaging skips its
-/// `putBlob`) or read BEFORE commit, so `promoteStaged` is never reached here.
+/// unconditional publication is already covered directly against `Cas::PartWriteTxn` and
+/// `RecordingStagingBackend` above. These tests only exercise an S3 pending blob that is either never
+/// referenced or read before commit.
 
 namespace
 {

@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
-#include <Common/Exception.h>
 #include <base/types.h>
 #include <algorithm>
 #include <functional>
@@ -13,14 +12,6 @@
 #include <string_view>
 #include <variant>
 #include <vector>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int NOT_IMPLEMENTED;
-}
-}
 
 namespace DB::Cas
 {
@@ -155,29 +146,6 @@ struct SentinelProbeResult
     std::optional<String> body;
 };
 
-/// Streaming conditional create (If-None-Match:* semantics). The caller writes the FULL object body
-/// (envelope header + payload) into buffer, then calls finalize exactly once:
-///   - Done                ⇒ the object is durable; the returned PutResult.token is the new incarnation's token
-///   - PreconditionFailed  ⇒ the key already existed — NOTHING was changed (same contract as putIfAbsent)
-/// finalize may throw on storage errors; PreconditionFailed is an OUTCOME, never an exception.
-/// cancel (or destruction before finalize) abandons the upload: the key is never created by it.
-///
-/// MISUSE/LIFETIME CONTRACT: after finalize or cancel the sink is DEAD — any further finalize,
-/// cancel, or write into buffer is a programming error (finalize asserts on it in debug builds).
-/// The caller must not call the underlying buffer's own finalize/cancel directly — only through
-/// the sink. A sink is single-caller: it is NOT thread-safe (only Backend itself is), and it must
-/// not outlive the Backend that created it.
-class WriteSink
-{
-public:
-    virtual ~WriteSink() = default;
-    virtual WriteBuffer & buffer() = 0;
-    virtual PutResult finalize() = 0;
-    virtual void cancel() noexcept = 0;
-};
-
-using WriteSinkPtr = std::unique_ptr<WriteSink>;
-
 /// Re-readable payload transport for one unconditional blob publication. `fresh_envelope` is the
 /// complete CAS envelope to prepend, while `payload_size` is the exact number of bytes the source
 /// must yield before the backend can make the destination visible.
@@ -268,8 +236,8 @@ inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuff
 /// of every backend implementation.
 ///
 /// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
-/// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
-/// String-based because blob payload reads go through the wiring's read stack, not this seam.
+/// objects. Large content blobs use the transport-only `publishBlob` seam; reads stay String-based
+/// because blob payload reads go through the wiring's read stack, not this seam.
 class Backend
 {
 public:
@@ -300,10 +268,6 @@ public:
     /// newly created incarnation.
     virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) = 0;
     PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
-    /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
-    /// ops remain for manifests, trees, probe and GC objects.
-    virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) = 0;
-    WriteSinkPtr putIfAbsentStream(const String & key) { return putIfAbsentStream(key, {}); }
 
     /// Unconditionally publishes one complete blob body. The caller owns every lifecycle decision;
     /// this method only executes the selected streaming or native-copy transport and returns after
@@ -396,66 +360,6 @@ public:
         }
     }
 
-    /// WRITE-ONCE conditional SERVER-SIDE COPY of `staging_key` to `blob_key` (`If-None-Match:*` on the
-    /// destination) — the S3-native staging promote's create primitive. `Done` + `token` = the
-    /// destination ETag (the new incarnation token, exactly the role the
-    /// streaming `putIfAbsentStream` PUT's ETag plays) when this call created `blob_key`;
-    /// `PreconditionFailed` when `blob_key` already existed — NOTHING was changed (same write-once
-    /// contract as `putIfAbsentStream`). No LIVE object is ever overwritten by this call.
-    ///
-    /// DEFAULT: fail closed (`NOT_IMPLEMENTED`) — a backend without a native, enforced conditional
-    /// server-side copy is NEVER selected for S3 staging (the mount-time probe fell back to Local
-    /// staging + `putIfAbsentStream`), so this must throw rather than silently degrade to an
-    /// unconditional overwrite. The caller must use local staging when this primitive is unavailable.
-    virtual PutResult promoteStaged(const String & /*staging_key*/, const String & /*blob_key*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Cas::Backend::promoteStaged (write-once server-side copy) is not implemented for this backend");
-    }
-
-    /// UNCONDITIONAL re-upload of the writer's OWN payload over `blob_key` under a FRESH-tagged
-    /// envelope header — the sanctioned condemned-object resurrection overwrite. Writes
-    /// `[fresh_header][payload]`, streaming `payload` from `reader`, and returns the fresh incarnation's
-    /// token. A Native backend streams the payload and never materializes it whole; on an ETag-dialect
-    /// store that means no size cap, while a generation-token store (GCS) enforces the same single-PUT
-    /// token-producing cap this write would face if it carried a precondition (GCS drops preconditions
-    /// on multipart completion regardless of whether one was set). The emulated backend materializes
-    /// (its conditional ops are whole-`String` by design) and serializes resurrections to bound the
-    /// peak to one body at a time.
-    ///
-    /// The reader is the caller's: it is ALWAYS the writer's own source (a staging object or a local
-    /// staged file), NEVER a read of the condemned `blob_key`, and the caller has already skipped any
-    /// envelope header on it. `fresh_header` must carry a freshly-minted `incarnation_tag`, which is what
-    /// makes the resurrected body — and hence its ETag/token — differ from the condemned incarnation, so
-    /// a queued exact-token delete of that incarnation can never match the live resurrection
-    /// (`INV-NO-RETURN`).
-    ///
-    /// UNCONDITIONAL is deliberate. An `If-Match` on the condemned token would save a redundant
-    /// re-upload when another writer resurrects the same blob first, and would prevent nothing: two
-    /// racing resurrections write payload-identical bodies, no consumer reads a dep token's VALUE, and
-    /// durable references name content hashes rather than incarnations.
-    ///
-    /// The caller MUST have observed the current incarnation as `Condemned` (per-hash meta point-read)
-    /// before calling this. That observation is NOT re-checked at the write: two racing resurrections
-    /// of the same blob may both run, and the loser overwrites the winner's FRESH incarnation. That is
-    /// accepted, not prevented -- the payloads are content-identical by construction and durable
-    /// references name content hashes, so the overwrite rotates the envelope and token of an
-    /// equivalent body. What must never be overwritten is a live incarnation of DIFFERENT content,
-    /// and that is guaranteed by the content address itself, not by this call.
-    /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
-    /// `payload_size` is the payload byte count the caller verified at staging time. The write COUNTS
-    /// while streaming and MUST abort -- publishing nothing -- when the reader yields a different
-    /// number of bytes. With an unconditional write this is the last line of defence: a source
-    /// truncated after hashing would otherwise displace the condemned incarnation with a short body
-    /// that the content address does not match, and a post-write check can only detect it AFTER the
-    /// malformed incarnation became current (and can even inspect a racing writer's incarnation
-    /// instead of its own).
-    virtual Token resurrect(ReadBuffer & /*payload*/, uint64_t /*payload_size*/, const String & /*blob_key*/,
-                            const String & /*fresh_header*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Cas::Backend::resurrect is not implemented for this backend");
-    }
 };
 
 using BackendPtr = std::shared_ptr<Backend>;

@@ -11,22 +11,22 @@ def _tuned_xml(node):
 
 
 def test_render_injects_overrides_into_ca_block():
-    cluster_boot.render_tuned_config({"deduplication_cache_bytes": "268435456",
+    cluster_boot.render_tuned_config({"manifest_decode_cache_bytes": "268435456",
                                        "part_folder_validate": "age 5"})
     for node in ("ch1", "ch2"):
         xml = _tuned_xml(node)
-        assert "<deduplication_cache_bytes>268435456</deduplication_cache_bytes>" in xml
+        assert "<manifest_decode_cache_bytes>268435456</manifest_decode_cache_bytes>" in xml
         assert "<part_folder_validate>age 5</part_folder_validate>" in xml
         assert "<metadata_type>cas</metadata_type>" in xml  # base block preserved
 
 
 def test_render_twice_with_different_value_replaces_not_duplicates():
-    cluster_boot.render_tuned_config({"deduplication_cache_bytes": "1048576"})
-    cluster_boot.render_tuned_config({"deduplication_cache_bytes": "16777216"})
+    cluster_boot.render_tuned_config({"manifest_decode_cache_bytes": "1048576"})
+    cluster_boot.render_tuned_config({"manifest_decode_cache_bytes": "16777216"})
     for node in ("ch1", "ch2"):
         xml = _tuned_xml(node)
-        assert xml.count("<deduplication_cache_bytes>") == 1
-        assert "<deduplication_cache_bytes>16777216</deduplication_cache_bytes>" in xml
+        assert xml.count("<manifest_decode_cache_bytes>") == 1
+        assert "<manifest_decode_cache_bytes>16777216</manifest_decode_cache_bytes>" in xml
         assert "1048576" not in xml
 
 

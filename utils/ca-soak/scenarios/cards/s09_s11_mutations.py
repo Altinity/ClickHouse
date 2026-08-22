@@ -207,7 +207,7 @@ class S09(Scenario):
         # Identity-update body-avoidance: dedup must have avoided the large body PUT.
         idelta = result.observations.get("counters_identity_update", {})
         avoided = _counter(idelta, "CASBlobBodyPutAvoided")
-        dedup = _counter(idelta, "CASBlobPutDeduplicated") + _counter(idelta, "CASBlobDeduplicationCacheHit")
+        dedup = _counter(idelta, "CASBlobPutDeduplicated")
         body_puts = _counter(idelta, "CASBlobPut")
         result.add(Verdict.check(
             "identity update avoids large body re-upload",

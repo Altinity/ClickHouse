@@ -1179,7 +1179,6 @@ public:
     using Backend::get;
     using Backend::getStream;
     using Backend::putIfAbsent;
-    using Backend::putIfAbsentStream;
     using Backend::putOverwrite;
     using Backend::casPut;
 
@@ -1196,10 +1195,6 @@ public:
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         return inner->putIfAbsent(key, bytes, meta);
-    }
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
-    {
-        return inner->putIfAbsentStream(key, meta);
     }
     void publishBlob(const BlobPublishRequest & request) override
     {

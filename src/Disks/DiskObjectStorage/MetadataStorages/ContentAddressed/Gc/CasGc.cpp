@@ -116,7 +116,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// body absent or `TokenMismatch`.
 
 /// Write the per-hash meta to Condemned: a blob newly entering the retired set this round (either the
-/// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
+/// fresh zero-in-degree condemn, or a republication-supersede re-condemn of the current token). Absent meta
 /// is created fresh; an already-Condemned meta (a racing condemn, or a replay of this same round) is left
 /// alone rather than clobbering a possibly-newer condemn_round.
 ///
@@ -858,7 +858,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             ProfileEvents::increment(ProfileEvents::CASGCRetiredRedeleted);
             /// Drop the per-hash meta only on Deleted/NotFound — a Replaced (TokenMismatch) outcome
             /// means a writer already resurrected a fresh incarnation at this hash (INV-1), and that
-            /// writer's own resurrect path already flipped the meta back to Clean; blindly deleting here
+            /// writer's own republication path already flipped the meta back to Clean; blindly deleting here
             /// would race that legitimate Clean write for no reason (the meta is advisory, but there is no
             /// reason to touch it on that path at all).
             if (del_class == DeleteClass::Deleted || del_class == DeleteClass::Absent)
@@ -949,7 +949,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 e.round = new_round;
                 e.gen = generation;
                 e.outcome = "replaced";
-                e.reason = "current object token differs from the retired entry — resurrect replaced the "
+                e.reason = "current object token differs from the retired entry — republication replaced the "
                            "incarnation; superseded the stale entry and re-condemned the current token";
                 e.detail = {{"superseded_token", replaced.old_token.value}};
             });
@@ -1858,8 +1858,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         return adjusted;
     };
 
-    /// Side-effect-free peek: the fold's resurrect-supersede branch (inside
-    /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that a resurrect replaced a stale
+    /// Side-effect-free peek: the fold's republication-supersede branch (inside
+    /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that republication replaced a stale
     /// retired entry, but must NOT emit the fresh-condemn trail or bump `CASGCRetiredCondemned` — that
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
     /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
@@ -1908,7 +1908,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
         /// never destructive -- the eventual exact-token delete is a no-op against the fresh token
         /// (`DeleteOutcome::TokenMismatch`/`NotFound`) -- worst case the resurrecting writer's later
-        /// same-token adopter sees a stale `Condemned` meta and re-uploads once (a spurious resurrect).
+        /// same-token adopter sees stale `Condemned` metadata and republishes once unnecessarily.
         scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
         return false;
     };

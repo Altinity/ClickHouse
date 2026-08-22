@@ -122,8 +122,8 @@ BUCKETS = [
 
 # Upload-relevant ProfileEvents to pull from system.query_log for each measured insert.
 CA_EVENT_KEYS = [
-    "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobHead", "CASBlobHeadMiss", "CASBlobHeadFirst",
-    "CASBlobBodyPutAvoided", "CASBlobDeduplicationCacheHit", "CASBlobDelete", "CASBlobList",
+    "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobHead", "CASBlobHeadMiss",
+    "CASBlobBodyPutAvoided", "CASBlobDelete", "CASBlobList",
     "CASRootGet", "CASRootHead", "CASRootCompareSwap", "CASRootCompareSwapConflict", "CASRootList",
     "CASRefBatchFlushes", "CASRefBatchedMutations", "CASRefQueueWaitMicroseconds",
     "CASRefLogBodyGets", "CASRefGlobalListPages", "CASManifestPut",
@@ -509,21 +509,21 @@ class S41(Scenario):
             "pass",
             "diagnosis recorded; PARTIAL = network-bound but not single-threaded or with material CPU"))
 
-        # (d) HEAD-before-PUT dedup-gate share.
-        head_first = pe_ca.get("CASBlobHeadFirst", 0)
+        # (d) Mandatory blob-presence observation share.
+        blob_heads = pe_ca.get("CASBlobHead", 0)
         blob_put = pe_ca.get("CASBlobPut", 0)
         body_avoided = pe_ca.get("CASBlobBodyPutAvoided", 0)
         head_bucket = rb.get("dedup_head_gate", 0)
         head_time_pct = round(100.0 * head_bucket / rb_total, 1) if rb_total else None
-        result.observations["dedup_head_gate"] = {
-            "CASBlobHeadFirst": head_first, "CASBlobPut": blob_put,
+        result.observations["blob_presence_observation"] = {
+            "CASBlobHead": blob_heads, "CASBlobPut": blob_put,
             "CASBlobBodyPutAvoided": body_avoided,
             "head_trace_pct_of_real": head_time_pct,
         }
         result.add(Verdict(
-            "(d) HEAD-before-PUT dedup-gate share",
-            "count of dedup HEADs + their share of Real trace time",
-            f"CASBlobHeadFirst={head_first}, body-avoided={body_avoided}; "
+            "(d) blob presence observation share",
+            "count of blob HEADs and their share of Real trace time",
+            f"CASBlobHead={blob_heads}, body-avoided={body_avoided}; "
             f"HEAD-gate Real trace share={head_time_pct}%", "pass"))
 
         # (e) S3 op budget: PUT/HEAD/GET per part and per GiB (CA leg).

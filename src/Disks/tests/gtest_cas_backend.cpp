@@ -144,11 +144,6 @@ struct NullBackend final : Backend
         return {PutOutcome::Done, {}};
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & /*key*/, const ObjectMeta & /*meta*/) override
-    {
-        return nullptr;   /// trivial default — streaming behavior is pinned by the CASBackendContract suite
-    }
-
     void publishBlob(const BlobPublishRequest & /*request*/) override
     {
     }
@@ -437,7 +432,7 @@ TEST(CASInMemoryFaults, HeldDeleteLandsLater)
     EXPECT_EQ(d.kind, DeleteOutcome::Kind::Deleted);  // caller sees the send accepted
     EXPECT_TRUE(b.get("k").has_value());              // ... but nothing landed yet
     ASSERT_EQ(b.pendingDeletes(), 1u);
-    // the object is resurrected before the zombie lands:
+    // the object is recreated before the zombie lands:
     b.putOverwrite("k", "v1'", t1);
     auto landed = b.landPendingDelete(0);             // the zombie lands NOW
     EXPECT_EQ(landed.kind, DeleteOutcome::Kind::TokenMismatch);   // 412 — INV-NO-RETURN in miniature
@@ -560,18 +555,10 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_TRUE(b.head(blob_key).exists);
     /// casPut create on a gc key ⇒ Gc Cas.
     EXPECT_EQ(b.casPut("pool/gc/state", "g1", std::nullopt).outcome, CasOutcome::Committed);
-    /// Streaming put to a fresh blob key, then finalize ⇒ Put.
-    {
-        auto sink = b.putIfAbsentStream("pool/blobs/cd/cafebabe");
-        ASSERT_TRUE(sink != nullptr);
-        DB::writeString(String("streamed"), sink->buffer());
-        EXPECT_EQ(sink->finalize().outcome, PutOutcome::Done);
-    }
-
     /// Under coverage builds ProfileEvents propagate into a thread-local subtree that does not reach
     /// `global_counters`; deltas read 0 there only (see gtest_unique_key_index_cache).
 #if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load()      - blob_put_before,   2u);
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load()      - blob_put_before,   1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobPutDeduplicated].load() - blob_dedup_before, 1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHead].load()     - blob_head_before,  1u);
     EXPECT_EQ(global_counters[ProfileEvents::CASBlobHeadMiss].load() - blob_miss_before,  1u);
@@ -782,7 +769,7 @@ String readStorageObject(const DB::ObjectStoragePtr & storage, const String & ke
 TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransport)
 {
     auto storage = makePublicationRecordingStorage();
-    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native, /*token_producing_single_put_cap=*/1);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native, /*conditional_single_put_cap=*/1);
     backend.setNativeTokenTypeForTest(TokenType::Generation);
     const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/streaming");
 

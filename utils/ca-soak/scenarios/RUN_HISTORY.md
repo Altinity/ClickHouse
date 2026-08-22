@@ -4,6 +4,10 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 `scenarios/runs/`. Status is the scenario's overall verdict (`pass` / `fail` / `inconclusive` /
 `error`). See the per-run `report.md` for detail.
 
+> **Historical protocol note (2026-08-22):** S24 rows and references to
+> `deduplication_cache_bytes` describe the superseded conditional blob-publication cache experiment;
+> the scenario, cache, and setting are no longer active.
+
 | started (UTC) | scenario | seed | scale | duration | status | git sha | run_dir | note |
 |---|---|---|---|---|---|---|---|---|
 | 2026-06-27T20:35:36 | S01 | 7 | dev | 900s | pass | ae0cc27b1bf5 | 20260627T203522_S01_seed7 | S01 ran at a small dev blob size; the memory-materialization risk is best exposed at >= 256 MiB (use --scale ci/full) |

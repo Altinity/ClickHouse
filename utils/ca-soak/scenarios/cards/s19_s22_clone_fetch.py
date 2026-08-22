@@ -352,7 +352,7 @@ class S20(Scenario):
         result.observations["follower_fetch_counters"] = {
             k: int(follower_delta.get(k, 0)) for k in (
                 "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap",
-                "CASBlobHead", "CASBlobHeadFirst")}
+                "CASBlobHead")}
         result.observations["total_fetch_counters"] = {
             k: int(total_delta.get(k, 0)) for k in (
                 "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobBodyPutAvoided", "CASRootCompareSwap")}

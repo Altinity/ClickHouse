@@ -523,7 +523,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// The retired row already identifies the blob with the native `BlobRef` used by the run.
             const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
             /// On a re-reference cycle (touched this window, net in-degree 0),
-            /// re-observe the CURRENT token. If it differs from the retired row's token, a resurrect
+            /// re-observe the CURRENT token. If it differs from the retired row's token, republication
             /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
             /// current token so the replacement enters the pipeline (the stale token's exact-token delete
             /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.

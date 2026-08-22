@@ -24,8 +24,6 @@ _VARIANT_FILE = {
     None: None,
     "default": None,
     "gc_shards2": "docker-compose-gc_shards2.yml",
-    # S24: 1 MiB dedup cache (vs 64 MiB default) to exercise eviction + remote-HEAD fallback.
-    "smalldedupcache": "docker-compose-small_dedup_cache.yml",
     # S12: 10-replica shared-pool compose (ch1..ch10 over one CA pool).
     "tenreplicas": "docker-compose-10replicas.yml",
     # S15: gc_shards=8 variant (8-way sharded fold) for the target-shard comparison.
@@ -41,7 +39,7 @@ _VARIANT_FILE = {
     # S36/S37: local+CA (and local+local+CA) multi-disk storage policies (ca_local / ca_local3)
     # alongside the same shared CA disk, for MOVE PART/PARTITION and policy-driven tiering tests.
     "multidisk": "docker-compose-multidisk.yml",
-    # Soak-matrix config sweeps (opt §2 deduplication_cache_bytes, §3 part_folder_validate): render_tuned_config
+    # Soak-matrix config sweeps (`manifest_decode_cache_bytes`, `part_folder_validate`): render_tuned_config
     # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
     # fixed per-variant XML the other entries above use.
     "tuned": "docker-compose-tuned.yml",
@@ -57,7 +55,7 @@ _VARIANT_FILE = {
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
-    None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
+    None: 2, "default": 2, "gc_shards2": 2,
     "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
     "tuned": 2, "multidisk": 2, "s41": 1,
 }
@@ -68,10 +66,8 @@ def render_tuned_config(overrides: dict) -> None:
     one child element per override inside the <ca> disk block (replacing a same-named child if present).
 
     Each call re-parses the base XML from scratch, so repeated calls are idempotent by construction —
-    there is no way to accumulate stale children across runs. Soak-matrix sweeps (opt §2 deduplication_cache_bytes,
-    §3 part_folder_validate) feed one variable per run through here instead of hand-authoring a
-    storage_conf_<variant>.xml + docker-compose-<variant>.yml pair per value (the S24 smalldedupcache
-    variant is the pattern this replaces for ad hoc single-knob sweeps).
+    there is no way to accumulate stale children across runs. Soak-matrix sweeps feed one variable per
+    run through here instead of hand-authoring a storage_conf_<variant>.xml and compose pair per value.
 
     Note: xml.etree.ElementTree does not round-trip comments — the rendered tuned file loses the
     explanatory comments present in the base storage_conf_ch{1,2}.xml. That's acceptable here because

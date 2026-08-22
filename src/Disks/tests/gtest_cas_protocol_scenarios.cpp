@@ -75,6 +75,24 @@ PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const
     return s->beginPartWrite(info);
 }
 
+/// Seed an arbitrary blob identity through a complete writer transaction, preserving the production
+/// ordering that makes physical publication legal.
+void seedBlobWithDurablePrecommit(
+    const PoolPtr & store, const BlobRef & blob_ref, const String & payload)
+{
+    const RootNamespace ns{"fixture/seed"};
+    auto build = startBuildFor(store, ns, "blob");
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = blob_ref;
+    entry.blob_size = payload.size();
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "blob", id);
+    build->putBlob(blob_ref, BlobSource::fromString(payload));
+    build->promote(ns, "blob", build->buildId(), id);
+}
+
 /// The full write flow for a part whose only file is `payload` at `path` (blob placement). Uploads the
 /// blob via putBlob, stages the manifest, precommits, then promotes. Returns the committed ManifestId.
 /// Mirrors what the old single-call `publish` did on the tree model.
@@ -279,11 +297,9 @@ TEST(CASProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 
     /// X pre-exists with token t0; the manifest names it as a tokenless adopted leaf.
     const String hex = streamingHexOf("payload-X");
-    {
-        auto seed = s->beginPartWrite({});
-        seed->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-X"));
-    }
-    const String blob_key = s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
+    const BlobRef seeded_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))};
+    seedBlobWithDurablePrecommit(s, seeded_ref, "payload-X");
+    const String blob_key = s->layout().blobKey(seeded_ref);
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -350,14 +366,16 @@ TEST(CASProtocol, AbandonLeavesDebrisAndDisables)
     const RootNamespace ns{"srv1/tbl"};
 
     auto build = startBuildFor(s, ns, "part_1");
-    auto blob = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
+    build->precommitAdd(ns, "part_1", id);
+    auto blob = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
 
     build->abandon();
 
-    /// The uploaded blob remains as debris; the staged manifest body is best-effort deleted by abandon.
+    /// Both bodies remain as debris: once the manifest has named a durable precommit edge, its body
+    /// must survive until GC folds the matching owner removal.
     EXPECT_TRUE(b->head(s->layout().blobKey(blob.ref)).exists);
-    EXPECT_FALSE(b->head(s->layout().manifestKey(id)).exists);   /// best-effort cleanup ran
+    EXPECT_TRUE(b->head(s->layout().manifestKey(id)).exists);
     EXPECT_TRUE(s->listRefs(ns).empty());
 
     /// Further build ops ⇒ LOGICAL_ERROR (requireAlive).
@@ -485,9 +503,9 @@ TEST(CASProtocol, NewNamespacePublishGatedByShardFenceFloor)
     /// 1. part_1 → a blob in namespace A, through the real PartWriteTxn.
     const RootNamespace ns_a{"srv1/tbl"};
     auto build_a = startBuildFor(s, ns_a, "part_1");
-    build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
     const ManifestId id_a = build_a->stageManifest({blobEntry("data.bin", "floor-payload")});
     build_a->precommitAdd(ns_a, "part_1", id_a);
+    build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
     build_a->promote(ns_a, "part_1", build_a->buildId(), id_a);
     const String blob_key = s->layout().blobKey(idOf("floor-payload"));
 
@@ -540,8 +558,10 @@ TEST(CASProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     const String hex = streamingHexOf("payload-fresh-ev");
     {
         auto s0 = openPool(b);
-        auto build0 = s0->beginPartWrite({});
-        build0->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-fresh-ev"));
+        seedBlobWithDurablePrecommit(
+            s0,
+            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))},
+            "payload-fresh-ev");
     }
     const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
     const Token t0 = b->head(blob_key).token;

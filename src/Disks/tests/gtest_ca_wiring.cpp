@@ -2768,7 +2768,7 @@ TEST(CASWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 /// (the precommit->blob edge is not yet folded, so GC reads in-degree 0). Under EDGE-BEFORE-OBSERVE the
 /// precommit closure named the blob BEFORE putBlob observed it, so the condemnation cannot graduate to a
 /// delete (the next fold sees the edge, d >= 1, spared) — it is doomed, not the blob. promote therefore
-/// does not revalidate or resurrect a `Materialized` leaf; it commits with the blob's token unchanged. The only
+/// does not revalidate or republish a `Materialized` leaf; it commits with the blob's token unchanged. The only
 /// blob-side abort promote still performs is the owner-liveness check (a reclaimed precommit) — which runs
 /// BEFORE any blob work and touches nothing.
 ///
@@ -2831,8 +2831,8 @@ void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
 /// A blob condemned in the putBlob->promote window is EDGE-PROTECTED (spec
 /// 2026-07-09-cas-writer-gc-simplification, Phase A): the precommit closure naming the blob was durable
 /// BEFORE putBlob observed it, so a condemnation in this window cannot graduate to a delete (the next fold
-/// sees the edge, d >= 1, spared). promote therefore does not re-check or resurrect a `Materialized` leaf — it
-/// commits leaving the blob's token UNCHANGED (no resurrect PUT). The premature condemn is doomed on its own.
+/// sees the edge, d >= 1, spared). promote therefore does not re-check or republish a `Materialized` leaf — it
+/// commits leaving the blob's token unchanged (no replacement PUT). The premature condemn is doomed on its own.
 TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
 {
     using namespace DB::Cas;
@@ -2840,7 +2840,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     auto store = openResurrectStore(backend);
     const RootNamespace ns{"test/tbl"};
     const String ref = "all_1_1_0";
-    const String P = "resurrect-me";
+    const String P = "republish-me";
 
     PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -2865,7 +2865,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
     /// Promote must not abort or touch the materialized leaf — it is edge-protected.
     EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
 
-    /// The ref is committed and the blob's token is unchanged — no resurrect PUT ran (`Materialized` leaves are
+    /// The ref is committed and the blob's token is unchanged — no replacement PUT ran (`Materialized` leaves are
     /// not re-validated: EDGE-BEFORE-OBSERVE guarantees the condemnation is doomed, not the blob).
     EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after promote";
     const HeadResult h2 = store->backend().head(blob_key);
@@ -2878,7 +2878,7 @@ TEST(CASWiringResurrect, PromoteIgnoresCondemnedMaterializedBlobEdgeProtected)
 /// live owner of the ref (`WPromote owner==bld` / INV_NO_DANGLE): a Δ=0 move over a ref with no live
 /// precommit edge would republish a committed manifest onto to-be-deleted blobs. So when the precommit
 /// binding is absent from the ref-table state, promote MUST fail closed with ABORTED — at the owner-liveness
-/// check in the append closure, which runs BEFORE any blob revalidation, so NO consequential PUT / resurrect
+/// check in the append closure, which runs before any blob revalidation, so no consequential blob publication
 /// happens (a condemned leaf is left untouched, exactly as on the success path).
 ///
 /// This drives that guard the DETERMINISTIC way: a promote whose precommit was NEVER added (so the binding
@@ -2904,16 +2904,18 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     info.intended_ref = ns.string() + "/" + ref;
     auto build = store->beginPartWrite(info);
 
-    /// Stage the manifest and upload the (fresh) blob, but DO NOT precommitAdd — so the precommit owner
-    /// binding is absent from the ref-table state when promote runs. A fresh putBlob needs no precommit
-    /// (only the ADOPT path requires the durable edge); it records `Materialized`.
+    /// Seed a materialized leaf independently, then stage the manifest but DO NOT call `precommitAdd`.
+    /// Physical publication through `putBlob` requires that durable edge, while this test deliberately
+    /// needs the owner binding absent when `promote` runs.
+    DB::Cas::tests::writeBlobRaw(
+        store->backend(), store->layout(), P, store->poolMeta().blob_header_len, store->poolMeta().pool_id);
+    DB::Cas::tests::writeMetaClean(store->backend(), store->layout(), u128Of(P), P.size());
     const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
-    build->putBlob(idOf(P), BlobSource::fromString(P));
 
     const String blob_key = store->layout().blobKey(idOf(P));
     const HeadResult h1 = store->backend().head(blob_key);
     ASSERT_TRUE(h1.exists);
-    /// Condemn the leaf so that, WERE the blob gate reached, promote would resurrect it — proving the abort
+    /// Condemn the leaf so that, were the blob gate reached, promote would republish it — proving the abort
     /// happens strictly BEFORE any blob work.
     seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
     {
@@ -2933,14 +2935,14 @@ TEST(CASWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     }
 
     /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its
-    /// meta is still Condemned — the owner check aborts before any PUT / resurrect.
+    /// metadata is still Condemned — the owner check aborts before any blob publication.
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
     EXPECT_EQ(h2.token, h1.token)
         << "the aborting path must perform no PUT — the materialized leaf is untouched";
     const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
-        << "no re-upload/resurrect before the owner check — the token is still the condemned one";
+        << "no republication before the owner check — the token is still the condemned one";
 }
 
 /// tryFromDisk must be exception-free for a plain local disk: it runs on every

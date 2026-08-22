@@ -20,7 +20,6 @@
 
 namespace ProfileEvents
 {
-    extern const Event CASBlobHeadFirst;
     extern const Event CASBlobBodyPutAvoided;
     extern const Event CASBlobAdoptTrusted;
     extern const Event CASMetaCreateClean;
@@ -329,7 +328,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
     for (int attempt = 0; attempt < max_publication_attempts; ++attempt)
     {
         requireAlive();
-        ProfileEvents::increment(ProfileEvents::CASBlobHeadFirst);
         const HeadResult head = store->backend().head(key);
         std::optional<LoadedMeta> loaded;
         BlobPublicationReason reason = BlobPublicationReason::Absent;
@@ -425,7 +423,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
-                    "HEAD-first attempts: {}",
+                    "attempts: {}",
                     key,
                     max_publication_attempts,
                     error.what()));
@@ -436,7 +434,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             if (attempt + 1 == max_publication_attempts)
                 throwCasWriteRetryLater(fmt::format(
                     "PartWriteTxn::ensureBlobPresent: publication of {} remained ambiguous after {} "
-                    "HEAD-first attempts",
+                    "attempts",
                     key,
                     max_publication_attempts));
             continue;

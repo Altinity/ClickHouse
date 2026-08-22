@@ -166,13 +166,11 @@ public:
     std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         inner->publishBlob(request);
     }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -200,13 +198,11 @@ public:
     std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     DB::Cas::ListPage list(const String & pfx, const String & c, size_t l) override { return inner->list(pfx, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
     void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
         inner->publishBlob(request);
     }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -217,9 +213,7 @@ private:
     std::map<String, size_t> get_counts;
 };
 
-/// Forces two writers to complete their absent `HEAD` observations before either can publish. The
-/// legacy conditional-create path rendezvouses at sink creation instead, keeping the pre-switch RED
-/// run bounded while making the missing mandatory `HEAD` and unconditional publication observable.
+/// Forces two writers to complete their absent `HEAD` observations before either can publish.
 class RacingBlobPublicationBackend final : public InMemoryBackend
 {
 public:
@@ -228,7 +222,6 @@ public:
         std::lock_guard lock(mutex);
         key = std::move(key_);
         head_calls = 0;
-        legacy_stream_calls = 0;
         publish_calls = 0;
     }
 
@@ -241,21 +234,8 @@ public:
         std::unique_lock lock(mutex);
         ++head_calls;
         cv.notify_all();
-        if (legacy_stream_calls == 0)
-            cv.wait_for(lock, std::chrono::seconds(5), [&] { return head_calls >= 2; });
+        cv.wait_for(lock, std::chrono::seconds(5), [&] { return head_calls >= 2; });
         return observed;
-    }
-
-    WriteSinkPtr putIfAbsentStream(const String & requested_key, const ObjectMeta & meta) override
-    {
-        if (requested_key == key)
-        {
-            std::unique_lock lock(mutex);
-            ++legacy_stream_calls;
-            cv.notify_all();
-            cv.wait_for(lock, std::chrono::seconds(5), [&] { return legacy_stream_calls >= 2; });
-        }
-        return InMemoryBackend::putIfAbsentStream(requested_key, meta);
     }
 
     void publishBlob(const BlobPublishRequest & request) override
@@ -272,7 +252,6 @@ public:
     std::mutex mutex;
     std::condition_variable cv;
     size_t head_calls = 0;
-    size_t legacy_stream_calls = 0;
     size_t publish_calls = 0;
 };
 
@@ -282,7 +261,7 @@ TEST(CASPartWrite, RacingWritersBothHeadMissAndPublishEquivalentBodies)
 {
     auto backend = std::make_shared<RacingBlobPublicationBackend>();
     auto store = openPool(backend);
-    const String payload = "two-racing-head-first-writers";
+    const String payload = "two-racing-mandatory-head-writers";
     const BlobRef ref = idOf(payload);
     auto first = precommittedBuildForPayload(store, RootNamespace{"srv1/racing-a"}, "part", payload);
     auto second = precommittedBuildForPayload(store, RootNamespace{"srv1/racing-b"}, "part", payload);
@@ -581,16 +560,16 @@ TEST(CASPartWriteTxn, AdoptBeforePrecommitFailsClosed)
         "durable precommit required");
 }
 
-/// The resurrect decision (displace a condemned body) is likewise driven PURELY by the meta point-read
+/// The condemned-body replacement decision is likewise driven purely by the metadata point-read
 /// — again, no RetireView is seeded. A condemned meta must cause putBlob to displace the body (a fresh
 /// token, the old one never returns — INV-NO-RETURN, unchanged body mechanics) AND flip the meta back
 /// to Clean.
-TEST(CASPartWriteTxn, PutBlobResurrectsWhenMetaCondemned)
+TEST(CASPartWriteTxn, PutBlobRepublishesWhenMetaCondemned)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
-    const String payload = "resurrect-meta-payload";
+    const String payload = "republish-meta-payload";
     const UInt128 hash = u128Of(payload);
     const BlobRef id = idOf(payload);
     const String blob_key = s->layout().blobKey(id);
@@ -603,27 +582,27 @@ TEST(CASPartWriteTxn, PutBlobResurrectsWhenMetaCondemned)
     condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
     const Token t0 = b->head(blob_key).token;
 
-    /// NO retire-view seeding anywhere: the resurrect must be decided purely from the meta point-read.
+    /// No retire-view seeding: the replacement is decided from the metadata point-read.
     auto build = precommittedBuildForPayload(
-        s, RootNamespace{"srv1/resurrect-meta"}, "part", payload);
+        s, RootNamespace{"srv1/republish-meta"}, "part", payload);
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
     /// Resurrected: the condemned incarnation was displaced by a fresh one.
     const HeadResult hr = b->head(blob_key);
     ASSERT_TRUE(hr.exists);
-    EXPECT_NE(hr.token, t0) << "a condemned incarnation must be displaced by a fresh one (resurrect)";
+    EXPECT_NE(hr.token, t0) << "a condemned incarnation must be displaced by a fresh publication";
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch)
         << "the condemned token must never return (INV-NO-RETURN)";
 
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
     ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(lm->meta.state, MetaState::Clean) << "a resurrect must flip the meta back to Clean";
+    EXPECT_EQ(lm->meta.state, MetaState::Clean) << "republishing must flip the metadata back to Clean";
 }
 
-/// §0 introspection: the resurrect (condemned-displacement) meta flip goes through the `casMeta`
+/// §0 introspection: the condemned-displacement metadata flip goes through the `casMeta`
 /// choke point (`CASMetaCompareSwap`), tagged with its reason (`CASMetaResurrectClean`).
-TEST(CASPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
+TEST(CASPartWriteTxnMetaCounters, CondemnedRepublicationCountsCasAndReason)
 {
     const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CASMetaCompareSwap].load();
     const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CASMetaResurrectClean].load();
@@ -631,7 +610,7 @@ TEST(CASPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
-    const String payload = "resurrect-meta-payload-counters";
+    const String payload = "republish-meta-payload-counters";
     const UInt128 hash = u128Of(payload);
     const BlobRef id = idOf(payload);
 
@@ -643,7 +622,7 @@ TEST(CASPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
     condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
 
     auto build = precommittedBuildForPayload(
-        s, RootNamespace{"srv1/resurrect-meta-counters"}, "part", payload);
+        s, RootNamespace{"srv1/republish-meta-counters"}, "part", payload);
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
@@ -749,7 +728,7 @@ TEST(CASPartWriteTxnReuseBlob, DependencyProofDistinguishesMaterializedAndTruste
 /// committed-source adopted leaf is TRUSTED at the promote gate (no HEAD/loadMeta probe), so a condemned
 /// pool blob no longer surfaces at promote — covered by PromoteTrustsAdoptedLeafNoProbeManifestTrust.
 
-TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
+TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
@@ -759,7 +738,7 @@ TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
     {
         auto s0 = openPool(b);
         auto build0 = precommittedBuildForPayload(
-            s0, RootNamespace{"srv1/resurrect-vanished-seed"}, "part", "payload-X");
+            s0, RootNamespace{"srv1/republish-vanished-seed"}, "part", "payload-X");
         id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
         build0->abandon();
@@ -778,13 +757,11 @@ TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Pool::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = precommittedBuildForPayload(
-        s, RootNamespace{"srv1/resurrect-vanished"}, "part", "payload-X");
+        s, RootNamespace{"srv1/republish-vanished"}, "part", "payload-X");
 
     /// 4. putBlob with a re-invokable body.
-    ///    BEFORE fix: putIfAbsent -> PreconditionFailed -> observeAndAdmit HEAD (present, condemned)
-    ///                -> resurrect GET (vanished, deleted in the window) -> throws FILE_DOESNT_EXIST.
-    ///    AFTER fix:  condemned dedup → uploadFromSource directly from held body; the object is
-    ///                recreated under a FRESH token. NO GET of the condemned object (INV-1).
+    /// The mandatory `HEAD` observes the condemned body and the hook deletes it before returning.
+    /// Publication then recreates the body under a fresh token without reading the condemned object.
     auto ref = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
     EXPECT_EQ(ref.ref, id);
 
@@ -804,7 +781,7 @@ TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
 
     /// The freshness meta must be reconciled to Clean too, not left stale at Condemned: the fresh
     /// re-upload's meta write (writeFreshMetaClean) must find and fix the pre-existing Condemned
-    /// marker via the SAME reload-and-reconcile path a resurrect uses, not silently discard the
+    /// marker via the same reload-and-reconcile path used after condemned replacement, not discard the
     /// conflict (a stale Condemned marker would otherwise mislead every future point-reader).
     const auto lm = loadMetaForTest(*b, s->layout(), u128Of("payload-X"));
     ASSERT_TRUE(lm.has_value());
@@ -864,13 +841,11 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
         void publishBlob(const DB::Cas::BlobPublishRequest & request) override
         {
             inner->publishBlob(request);
         }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -908,10 +883,9 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     auto build = precommittedBuildForPayload(
         s, RootNamespace{"srv1/condemned-absent"}, "part", "payload-Y");
 
-    /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
-    ///    won't fire (object is gone, so putIfAbsentStream → Done on the first attempt).
-    ///    However, even if a racing re-creation happens between the check and the upload, the
-    ///    condemned branch must NEVER call backend().get(blob_key).
+    /// 4. The object is absent, so `putBlob` observes absence and publishes from the held source.
+    /// Even if a racing re-creation happens between observation and publication, the condemned branch
+    /// must never call `Backend::get` on the blob key.
     auto ref = build->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y"));
     EXPECT_EQ(ref.ref, id);
     EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the dying object to revive it";
@@ -945,13 +919,11 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
         void publishBlob(const DB::Cas::BlobPublishRequest & request) override
         {
             inner->publishBlob(request);
         }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -987,8 +959,7 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     auto build = precommittedBuildForPayload(
         s, RootNamespace{"srv1/condemned-present"}, "part", "payload-Z");
 
-    /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
-    ///    sees condemned token → must call uploadFromSource (NOT resurrect/GET).
+    /// 4. `putBlob` observes the condemned metadata and republishes from the held source without a GET.
     auto ref = build->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z"));
     EXPECT_EQ(ref.ref, id);
     EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the condemned object";
@@ -1000,109 +971,6 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     ASSERT_TRUE(raw.has_value());
     const auto hdr = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Z");
-}
-
-TEST(CASPartWriteTxn, PutBlobVanishDuringRevivalReUploadsNotFatal)
-{
-    /// B190 sibling (INV-3): inside uploadFromSource the post-412 path re-observes via the 3-arg
-    /// observeAndAdmit. If the object is GC-deleted in the window (present at the conditional PUT
-    /// → 412, but gone at the subsequent HEAD), the 3-arg overload throws FILE_DOESNT_EXIST. Before
-    /// the fix that escaped putBlob's ABORTED-only retry catch as a FATAL INSERT failure. putBlob
-    /// HOLDS the source bytes, so a vanish here must RE-UPLOAD from those bytes within the bounded
-    /// retry loop — never fatal. The fix wraps uploadFromSource's two 3-arg observeAndAdmit calls so
-    /// FILE_DOESNT_EXIST becomes the retryable ABORTED putBlob already handles.
-    struct ScriptedVanishBackend final : public DB::Cas::Backend
-    {
-        ScriptedVanishBackend(BackendPtr inner_, String watched_key_)
-            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
-
-        size_t head_absent_budget = 2;       /// first N head(watched) calls report absent
-        size_t finalize_412_budget = 2;      /// first N finalize() on watched return PreconditionFailed
-
-        /// A sink wrapper that forces PreconditionFailed for the scripted budget, else delegates.
-        struct ScriptedSink final : public DB::Cas::WriteSink
-        {
-            ScriptedSink(WriteSinkPtr inner_, bool force_412_)
-                : inner(std::move(inner_)), force_412(force_412_) {}
-            DB::WriteBuffer & buffer() override { return inner->buffer(); }
-            DB::Cas::PutResult finalize() override
-            {
-                if (force_412)
-                {
-                    /// Abandon the underlying upload so the key is never created by it, and report 412.
-                    inner->cancel();
-                    return {DB::Cas::PutOutcome::PreconditionFailed, {}};
-                }
-                return inner->finalize();
-            }
-            void cancel() noexcept override { inner->cancel(); }
-            WriteSinkPtr inner;
-            bool force_412;
-        };
-
-        DB::Cas::HeadResult head(const String & k) override
-        {
-            if (k == watched_key && head_absent_budget > 0)
-            {
-                --head_absent_budget;
-                return DB::Cas::HeadResult{};   /// exists == false
-            }
-            return inner->head(k);
-        }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override
-        {
-            const bool force_412 = (k == watched_key && finalize_412_budget > 0);
-            if (force_412)
-                --finalize_412_budget;
-            return std::make_unique<ScriptedSink>(inner->putIfAbsentStream(k, meta), force_412);
-        }
-        void publishBlob(const DB::Cas::BlobPublishRequest & request) override
-        {
-            inner->publishBlob(request);
-        }
-        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
-        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
-        DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
-        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
-        DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
-        bool supportsListTokens() const override { return inner->supportsListTokens(); }
-
-        BackendPtr inner;
-        String watched_key;
-    };
-
-    auto raw = std::make_shared<InMemoryBackend>();
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(idOf("payload-V"));
-
-    /// The blob does NOT need to pre-exist: the scripted backend models the conditional-PUT 412
-    /// (object present at PUT time) independently of the inner store, then reports absent on HEAD.
-    auto scripted = std::make_shared<ScriptedVanishBackend>(raw, blob_key);
-    auto s = Pool::open(scripted, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    /// Wiring order (EDGE-BEFORE-OBSERVE): the revive re-observes via observeAndAdmit, which requires a
-    /// durable precommit edge — stageManifest -> precommitAdd before putBlob.
-    const RootNamespace ns_v{"srv/tbl"};
-    auto build = startBuildFor(s, ns_v, "part_v");
-    const ManifestId id_v = build->stageManifest({blobManifestEntry("data.bin", "payload-V")});
-    build->precommitAdd(ns_v, "part_v", id_v);
-
-    /// putBlob holds "payload-V" as source bytes. The vanish-during-revival must NOT be fatal:
-    ///   BEFORE fix: observeAndAdmit throws FILE_DOESNT_EXIST, escapes putBlob's ABORTED-only catch → fatal.
-    ///   AFTER fix:  wrapped to ABORTED → putBlob retries → re-uploads from held bytes → succeeds.
-    PutBlobResult ref;
-    EXPECT_NO_THROW(ref = build->putBlob(idOf("payload-V"), BlobSource::fromString("payload-V")));
-    EXPECT_EQ(ref.ref, idOf("payload-V"));
-
-    /// The blob is present with a fresh incarnation and the exact payload — re-uploaded from source.
-    const HeadResult hr = raw->head(blob_key);
-    ASSERT_TRUE(hr.exists) << "putBlob must have re-uploaded the vanished blob from its held source bytes";
-    const auto stored = raw->get(blob_key);
-    ASSERT_TRUE(stored.has_value());
-    const auto h = decodeEnvelopeHeader(stored->bytes, stored->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-V");
 }
 
 TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
@@ -1601,30 +1469,29 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
     ///   1. No backend op fires during adoptEvidence (counted via a delegating wrapper).
     ///   2. The recorded dependency proof is `TrustedManifest`.
 
-    /// A delegating wrapper that counts every backend access path including the streaming write path.
+    /// A delegating wrapper that counts every backend access path.
     struct LocalCountingBackend final : public Backend
     {
         explicit LocalCountingBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
         size_t heads = 0;
-        size_t stream_puts = 0;
+        size_t puts = 0;
         size_t gets = 0;
 
         HeadResult head(const String & k) override { ++heads; return inner->head(k); }
-        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta) override
-        {
-            ++stream_puts;
-            return inner->putIfAbsentStream(k, meta);
-        }
         void publishBlob(const BlobPublishRequest & request) override
         {
+            ++puts;
             inner->publishBlob(request);
         }
         std::optional<GetResult> get(const String & k, Range r) override { ++gets; return inner->get(k, r); }
         std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
         ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override
+        {
+            ++puts;
+            return inner->putIfAbsent(k, bts, m);
+        }
         PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
-        Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
@@ -1642,13 +1509,13 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
 
     /// Reset the counters after Pool::open (which may HEAD/GET gc/server-roots etc. during startup).
     counting->heads = 0;
-    counting->stream_puts = 0;
+    counting->puts = 0;
     counting->gets = 0;
 
     /// adoptEvidence — must record the dep WITHOUT touching the backend.
     EXPECT_NO_THROW(build->adoptEvidence(entry));
     EXPECT_EQ(counting->heads, 0u) << "adoptEvidence must not HEAD the backend";
-    EXPECT_EQ(counting->stream_puts, 0u) << "adoptEvidence must not PUT to the backend";
+    EXPECT_EQ(counting->puts, 0u) << "adoptEvidence must not PUT to the backend";
     EXPECT_EQ(counting->gets, 0u) << "adoptEvidence must not GET from the backend";
 
     /// The dep is recorded as trusted manifest evidence; the no-backend-op counts above are the B188
@@ -1662,7 +1529,7 @@ TEST(CASPartWriteTxn, AdoptEvidenceRecordsTrustedManifestDependencyProofWithoutI
     inline_entry.inline_bytes = "xy";
     EXPECT_NO_THROW(build->adoptEvidence(inline_entry));
     EXPECT_EQ(counting->heads, 0u);
-    EXPECT_EQ(counting->stream_puts, 0u);
+    EXPECT_EQ(counting->puts, 0u);
     EXPECT_EQ(counting->gets, 0u);
     EXPECT_EQ(build->dependencyProof(idOf("xy")), std::nullopt);
 }
@@ -2343,17 +2210,14 @@ namespace
 
 /// Faults the part-manifest body PUT (`/cas/manifests/` keys) with an ambiguous
 /// (Unresolved-classified) timeout a bounded number of times, mirroring RefWriterTestBackend's fault
-/// seam (gtest_cas_ref_writer.cpp). Covers BOTH write primitives — `putIfAbsent` (the controller
-/// path) and `putIfAbsentStream` (the pre-controller path) — with ONE shared `fault_count` and the
-/// same land/plant side effects, so the assertions are flip-proof against either implementation of
-/// the stage write.
+/// seam (gtest_cas_ref_writer.cpp). Part manifests use the small-object `putIfAbsent` primitive.
 class ManifestPutFaultBackend final : public InMemoryBackend
 {
 public:
     int fault_count = 0;                 /// remaining ambiguous faults on matching body PUTs
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
     String plant_different_on_fault;     /// a FOREIGN different body lands at the key before the fault
-    int put_attempts = 0;                /// matching body-PUT attempts observed (both primitives)
+    int put_attempts = 0;                /// matching body-PUT attempts observed
 
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
@@ -2362,35 +2226,6 @@ public:
         ++put_attempts;
         maybeFault(key, bytes);
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
-    }
-
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
-    {
-        if (!isManifestBodyKey(key))
-            return InMemoryBackend::putIfAbsentStream(key, meta);
-
-        /// Counts/faults at finalize — the moment the old single-attempt path observed its timeout.
-        struct CountingOrFaultingSink final : WriteSink
-        {
-            ManifestPutFaultBackend & parent;
-            String key;
-            ObjectMeta meta;
-            DB::WriteBufferFromOwnString buf;
-
-            CountingOrFaultingSink(ManifestPutFaultBackend & parent_, String key_, ObjectMeta meta_)
-                : parent(parent_), key(std::move(key_)), meta(std::move(meta_)) {}
-
-            DB::WriteBuffer & buffer() override { return buf; }
-            PutResult finalize() override
-            {
-                ++parent.put_attempts;
-                const String & bytes = buf.str();
-                parent.maybeFault(key, bytes);
-                return parent.InMemoryBackend::putIfAbsent(key, bytes, meta);
-            }
-            void cancel() noexcept override {}
-        };
-        return std::make_unique<CountingOrFaultingSink>(*this, key, meta);
     }
 
 private:
@@ -2508,30 +2343,20 @@ TEST(CASPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 }
 
 /// =====================================================================================
-/// Task B follow-up (availfix): the two conditional-create paths that still bypassed the request
-/// controller — the BLOB body `putIfAbsentStream` create and `promoteStaged`'s conditional
-/// server-side copy (both issued inside `PartWriteTxn::uploadFromSource`'s streamIfAbsent) — now ride the
-/// same budgeted-attempts machinery. Reissue re-streams from the writer's REPLAYABLE source
-/// (`BlobSource::open` re-reads the staged temp file / re-issues the copy from the intact
-/// staging object — INV-1, never a GET-revive); ambiguity resolves by exact-key OCCUPANCY (the key
-/// embeds the content hash, so any occupant IS the intended content — the same trust model as the
-/// plain 412-adopt path).
+/// Blob publication retries re-stream from the writer's replayable source. A retry after a failed
+/// server-side copy retags and streams from the intact source instead of repeating the copy.
 /// =====================================================================================
 
 namespace
 {
 
-/// Faults blob-body conditional creates — BOTH primitives `uploadFromSource` can issue: the streaming
-/// `putIfAbsentStream` (local staging) and `promoteStaged`'s conditional server-side copy (S3-native
-/// staging) — with an ambiguous (Unresolved-classified) timeout a bounded number of times, mirroring
-/// ManifestPutFaultBackend above. Blob META writes (`.meta` keys, plain putIfAbsent) are never faulted.
+/// Faults unconditional blob publications with an ambiguous timeout a bounded number of times.
+/// Blob metadata writes (`.meta` keys, plain `putIfAbsent`) are never faulted.
 class BlobPutFaultBackend final : public InMemoryBackend
 {
 public:
     int fault_count = 0;                 /// remaining ambiguous faults on matching create attempts
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
-    int stream_attempts = 0;             /// blob-body streaming-PUT finalize attempts observed
-    int copy_attempts = 0;               /// promoteStaged conditional-copy attempts observed
     int publish_stream_attempts = 0;     /// unconditional streaming publications observed
     int publish_copy_attempts = 0;       /// unconditional native-copy publications observed
     int blob_head_attempts = 0;          /// transaction-level blob observations
@@ -2541,48 +2366,6 @@ public:
         if (isBlobBodyKey(key))
             ++blob_head_attempts;
         return InMemoryBackend::head(key);
-    }
-
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
-    {
-        if (!isBlobBodyKey(key))
-            return InMemoryBackend::putIfAbsentStream(key, meta);
-
-        /// Counts/faults at finalize — the moment the old single-attempt path observed its timeout.
-        struct CountingOrFaultingSink final : WriteSink
-        {
-            BlobPutFaultBackend & parent;
-            String key;
-            ObjectMeta meta;
-            DB::WriteBufferFromOwnString buf;
-
-            CountingOrFaultingSink(BlobPutFaultBackend & parent_, String key_, ObjectMeta meta_)
-                : parent(parent_), key(std::move(key_)), meta(std::move(meta_)) {}
-
-            DB::WriteBuffer & buffer() override { return buf; }
-            PutResult finalize() override
-            {
-                ++parent.stream_attempts;
-                const String & bytes = buf.str();
-                parent.maybeFault(key, bytes);
-                return parent.InMemoryBackend::putIfAbsent(key, bytes, meta);
-            }
-            void cancel() noexcept override {}
-        };
-        return std::make_unique<CountingOrFaultingSink>(*this, key, meta);
-    }
-
-    PutResult promoteStaged(const String & staging_key, const String & blob_key) override
-    {
-        ++copy_attempts;
-        if (fault_count > 0)
-        {
-            --fault_count;
-            if (land_despite_fault)
-                InMemoryBackend::promoteStaged(staging_key, blob_key);
-            throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous copy (response lost)");
-        }
-        return InMemoryBackend::promoteStaged(staging_key, blob_key);
     }
 
     void publishBlob(const BlobPublishRequest & request) override
@@ -2610,16 +2393,6 @@ private:
         return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
     }
 
-    /// One fault: apply the configured server-side effect, then lose the response.
-    void maybeFault(const String & key, const String & bytes)
-    {
-        if (fault_count <= 0)
-            return;
-        --fault_count;
-        if (land_despite_fault)
-            InMemoryBackend::putIfAbsent(key, bytes, {});
-        throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous result (response lost)");
-    }
 };
 
 /// Zero-backoff store over a BlobPutFaultBackend: the sleep schedule has its own controller-level
@@ -2750,7 +2523,7 @@ TEST(CASPartWrite, AmbiguousNonLandingPublicationStopsAtOuterBound)
     EXPECT_EQ(payload_streams, 8);
 }
 
-/// promoteStaged conditional copy, ambiguous-but-landed: the copy's response is lost AFTER the
+/// A server-side copy publication is ambiguous-but-landed: its response is lost after the
 /// destination was created. The occupancy resolve observes the destination present and the occupant
 /// is adopted — Committed-in-effect WITHOUT a re-copy.
 TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
@@ -2792,7 +2565,7 @@ TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
               events.end()) << "the landed destination must be ADOPTED";
 }
 
-/// promoteStaged conditional copy, ambiguous-and-absent: the first copy attempt times out with
+/// A server-side copy publication is ambiguous-and-absent: the first copy attempt times out with
 /// nothing landing; the resolve observes the destination absent and the copy is REISSUED from the
 /// (intact, still-staged) source object — the second attempt commits.
 TEST(CASPartWrite, AmbiguousCopyAbsentReattemptsAndCommits)

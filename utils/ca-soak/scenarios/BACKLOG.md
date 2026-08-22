@@ -1,5 +1,10 @@
 # Scenario suite backlog
 
+> **Historical protocol note (2026-08-22):** S24 and older references to
+> `deduplication_cache_bytes`, `deduplication_head_first_min_bytes`, `CASBlobHeadFirst`, and
+> `CASBlobDeduplicationCacheHit` describe the superseded conditional blob-publication protocol. The
+> cache experiment, its setting, and its counters are no longer active.
+
 > **TRIAGE SWEEP 2026-07-03** (night binary: queue + copy-forward hash fix + clamp suppression +
 > guard/rebuild). Status of the recurring entry classes below:
 > - **RESOLVED**: `GC-CONCURRENT-LEADER-LEAK` (attempt-scoped generations, marked inline);

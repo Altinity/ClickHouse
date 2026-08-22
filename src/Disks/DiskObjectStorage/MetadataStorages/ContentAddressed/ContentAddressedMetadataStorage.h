@@ -596,8 +596,6 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t deduplication_cache_bytes;            /// P1 known-present cache byte cap (0=off)
-    const uint64_t deduplication_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
     const uint64_t gc_snapshot_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
     const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
@@ -610,10 +608,10 @@ private:
     const uint64_t gc_round_prefix_wholesale_budget;
     const uint64_t gc_round_handoff_prefix_wholesale_budget;
     const uint64_t gc_round_outcome_entry_budget;
-    /// GCS single-PUT budget for every token-producing write, conditional or not (generation-token
-    /// stores only): threaded into the ObjectStorageBackend construction site in startup().
+    /// GCS single-PUT budget for genuine conditional writes (generation-token stores only), threaded
+    /// into the `ObjectStorageBackend` construction site in `startup`.
     /// Irrelevant on ETag stores (AWS et al).
-    const uint64_t gcs_max_token_producing_put_bytes;
+    const uint64_t gcs_max_conditional_put_bytes;
     /// Part-folder view cache settings. `cas_part_folder_cache_bytes == 0` disables retention.
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;

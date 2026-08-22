@@ -32,7 +32,7 @@ def _insert_one_big_part(node, name, *, rows, payload_bytes, op_id=0, timeout=24
     at --scale full (100 GiB) that is an instant MEMORY_LIMIT_EXCEEDED (observed live 2026-07-03).
     A huge part is only constructible the way production constructs one: bounded inserts (one
     ~1 GiB part each), then OPTIMIZE FINAL streams them into the single huge part/blob on disk.
-    The merge phase IS the huge-blob upload under test (streamed via putIfAbsentStream)."""
+    The merge phase IS the huge-blob upload under test (streamed via Backend::publishBlob)."""
     batch_rows = max(1, GIB // payload_bytes)
     done = 0
     while done < rows:
@@ -146,8 +146,8 @@ class S01(Scenario):
                 if not ok:
                     result.note_anomaly(
                         f"S01 peak RSS grew {mem_growth/MIB:.0f} MiB during a {actual_bytes/MIB:.0f} "
-                        f"MiB blob upload — investigate Build::putBlob materializing BlobSource into "
-                        f"a String before putIfAbsentStream (README known first investigation target)")
+                        f"MiB blob upload — investigate the staged BlobSource to "
+                        f"Backend::publishBlob path for a full-body copy (README known first investigation target)")
 
         # --- scratch high-water ----------------------------------------------------------
         scratch_peaks = smp.peak_scratch_bytes()
@@ -210,8 +210,8 @@ class S02(Scenario):
         # byte-identical output across the two inserts (so the dedup test holds — identical content
         # -> identical blobs -> second insert avoids the body PUT), while being random bytes that do
         # NOT LZ4-compress away. `repeat(single_digit)` (the old generator) compressed to ~0, so the
-        # physical blob stayed < deduplication_head_first_min_bytes and the big-blob HEAD-before-PUT dedup
-        # path was never exercised (campaign finding 2026-07-03). Same seed + same block settings on
+        # physical blob compressed away and the large-body publication path was never exercised
+        # (campaign finding 2026-07-03). Same seed + same block settings on
         # both tables => identical row sequence => identical parts.
         gen = (f"SELECT rowNumberInAllBlocks() AS id, payload "
                f"FROM generateRandom('payload String', {int(p.get('gen_seed', 20260703))}, {per_row}) "
@@ -243,7 +243,7 @@ class S02(Scenario):
 
         # Dedup verdict: the second insert must avoid re-uploading existing large blob bodies.
         avoided = delta.get("CASBlobBodyPutAvoided", 0)
-        dedup_hits = delta.get("CASBlobPutDeduplicated", 0) + delta.get("CASBlobDeduplicationCacheHit", 0)
+        dedup_hits = delta.get("CASBlobPutDeduplicated", 0)
         body_puts = delta.get("CASBlobPut", 0)
         result.add(Verdict.check("dedup avoided body upload",
                                  "CASBlobBodyPutAvoided>0 or CASBlobPutDeduplicated>0",

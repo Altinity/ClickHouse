@@ -35,12 +35,10 @@ extern const int LOGICAL_ERROR;
 namespace
 {
 
-/// Open a Pool over `b`. The legacy threshold remains configurable during the atomic writer switch,
-/// but it no longer decides whether a blob `HEAD` occurs.
-PoolPtr openUploadPool(const std::shared_ptr<InMemoryBackend> & b, uint64_t head_first_min_bytes = (1ULL << 20))
+/// Open a Pool over `b`.
+PoolPtr openUploadPool(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                    .deduplication_head_first_min_bytes = head_first_min_bytes});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 BlobSource reReadableStagedSource(
@@ -104,9 +102,7 @@ std::optional<MetaState> metaStateAt(InMemoryBackend & b, const Layout & layout,
 }
 
 /// Records only the watched blob lane, so pool-open and precommit traffic cannot obscure the
-/// transaction-level ordering asserted below. The legacy conditional primitives stay available on
-/// purpose: before the writer switch these tests compile and expose that a body write precedes the
-/// first blob `HEAD`; after the switch only `publishBlob` may appear after `HEAD`.
+/// transaction-level ordering asserted below.
 class ProtocolRecordingBackend final : public InMemoryBackend
 {
 public:
@@ -141,20 +137,6 @@ public:
         return InMemoryBackend::get(key, range);
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
-    {
-        if (key == blob_key)
-            operations.emplace_back("legacy-conditional-stream");
-        return InMemoryBackend::putIfAbsentStream(key, meta);
-    }
-
-    PutResult promoteStaged(const String & staging_key, const String & destination_key) override
-    {
-        if (destination_key == blob_key)
-            operations.emplace_back("legacy-conditional-copy");
-        return InMemoryBackend::promoteStaged(staging_key, destination_key);
-    }
-
     void publishBlob(const BlobPublishRequest & request) override
     {
         if (request.destination_key == blob_key)
@@ -180,7 +162,7 @@ public:
 
 TEST(CASUploadDetached, FreshMissHeadsThenPublishesWithoutPrepublicationMetaGet)
 {
-    const String payload = "head-first-fresh-miss";
+    const String payload = "mandatory-head-fresh-miss";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
@@ -202,7 +184,7 @@ TEST(CASUploadDetached, FreshMissHeadsThenPublishesWithoutPrepublicationMetaGet)
 
 TEST(CASUploadDetached, ExistingCleanHeadsAndObservesWithoutPublication)
 {
-    const String payload = "head-first-existing-clean";
+    const String payload = "mandatory-head-existing-clean";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
@@ -226,7 +208,7 @@ TEST(CASUploadDetached, ExistingCleanHeadsAndObservesWithoutPublication)
 
 TEST(CASUploadDetached, ExistingBodyWithoutMetadataBackfillsWithoutPublication)
 {
-    const String payload = "head-first-metadata-backfill";
+    const String payload = "mandatory-head-metadata-backfill";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
@@ -251,7 +233,7 @@ TEST(CASUploadDetached, ExistingBodyWithoutMetadataBackfillsWithoutPublication)
 
 TEST(CASUploadDetached, AbsentBodyWithStaleCondemnedPublishesBeforeMetadataRead)
 {
-    const String payload = "head-first-absent-stale-condemned";
+    const String payload = "mandatory-head-absent-stale-condemned";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
@@ -276,7 +258,7 @@ TEST(CASUploadDetached, AbsentBodyWithStaleCondemnedPublishesBeforeMetadataRead)
 
 TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
 {
-    const String payload = "head-first-present-condemned";
+    const String payload = "mandatory-head-present-condemned";
     const BlobRef ref = idOf(payload);
     auto backend = std::make_shared<ProtocolRecordingBackend>();
     auto store = openUploadPool(backend);
@@ -302,111 +284,8 @@ TEST(CASUploadDetached, PresentCondemnedPublishesFreshAndQueuedOldDeleteMisses)
     EXPECT_TRUE(backend->head(blob_key).exists);
 }
 
-/// A seeded legacy cache entry cannot skip the mandatory `HEAD`; the present body is observed safely.
-TEST(CASUploadDetached, DeduplicationCacheHitAdoptsBuildUntouched)
-{
-    const RootNamespace ns{"srv1/nsDedup"};
-    const String ref_name = "part";
-    const String payload = "dedup-cache-hit-payload";
-    const BlobRef blob = idOf(payload);
-
-    auto arrange = [&](std::shared_ptr<InMemoryBackend> & b, PoolPtr & s, PartWriteTxnPtr & build)
-    {
-        b = std::make_shared<InMemoryBackend>();
-        s = openUploadPool(b);
-        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);
-        writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
-        s->dedupCacheAdd(blob);
-        build = precommitBuildFor(s, ns, ref_name, payload);
-    };
-
-    std::shared_ptr<InMemoryBackend> b1;
-    PoolPtr s1;
-    PartWriteTxnPtr build1;
-    arrange(b1, s1, build1);
-    const String key = s1->layout().blobKey(blob);
-
-    EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
-
-    const BlobUploadResult r = build1->uploadBlobDetached(
-        BlobUploadRequest{blob, BlobSource::fromString(payload), payload.size()});
-
-    EXPECT_EQ(r.diagnostics.action, BlobMaterializationAction::Observed);
-    EXPECT_EQ(r.diagnostics.reason, std::nullopt);
-    EXPECT_EQ(r.diagnostics.transport, std::nullopt);
-    EXPECT_EQ(r.ref, blob);
-    EXPECT_EQ(r.dep.kind, ObjectKind::Blob);
-    EXPECT_EQ(r.dep.proof, BlobDependencyProof::Materialized);
-    EXPECT_EQ(r.dep.size, payload.size());
-
-    /// Build UNTOUCHED: the detached primitive folded no dep.
-    EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
-
-    /// Serial reference on an identically-arranged world: putBlob folds the dep; end-state matches.
-    std::shared_ptr<InMemoryBackend> b2;
-    PoolPtr s2;
-    PartWriteTxnPtr build2;
-    arrange(b2, s2, build2);
-    const PutBlobResult pr = build2->putBlob(blob, BlobSource::fromString(payload));
-    EXPECT_EQ(build2->dependencyProof(blob), BlobDependencyProof::Materialized);
-    EXPECT_EQ(pr.size, r.dep.size);
-
-    EXPECT_EQ(logicalPayloadAt(*b1, key, s1->poolMeta().blob_header_len),
-              logicalPayloadAt(*b2, key, s2->poolMeta().blob_header_len));
-    EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), metaStateAt(*b2, s2->layout(), payload));
-    EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Clean));
-}
-
-/// The legacy size threshold cannot change mandatory-`HEAD` observation semantics.
-TEST(CASUploadDetached, HeadFirstHitAdopts)
-{
-    const RootNamespace ns{"srv1/nsHead"};
-    const String ref_name = "part";
-    const String payload = "head-first-hit-payload";
-    const BlobRef blob = idOf(payload);
-
-    auto arrange = [&](std::shared_ptr<InMemoryBackend> & b, PoolPtr & s, PartWriteTxnPtr & build)
-    {
-        b = std::make_shared<InMemoryBackend>();
-        s = openUploadPool(b, /*head_first_min_bytes=*/1);   /// force HEAD-first without the dedup cache
-        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);
-        writeMetaClean(*b, s->layout(), u128Of(payload), payload.size());
-        build = precommitBuildFor(s, ns, ref_name, payload);
-    };
-
-    std::shared_ptr<InMemoryBackend> b1;
-    PoolPtr s1;
-    PartWriteTxnPtr build1;
-    arrange(b1, s1, build1);
-    const String key = s1->layout().blobKey(blob);
-
-    EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
-
-    const BlobUploadResult r = build1->uploadBlobDetached(
-        BlobUploadRequest{blob, BlobSource::fromString(payload), payload.size()});
-
-    EXPECT_EQ(r.diagnostics.action, BlobMaterializationAction::Observed);
-    EXPECT_EQ(r.diagnostics.reason, std::nullopt);
-    EXPECT_EQ(r.diagnostics.transport, std::nullopt);
-    EXPECT_EQ(r.dep.proof, BlobDependencyProof::Materialized);
-    EXPECT_EQ(r.dep.size, payload.size());
-
-    EXPECT_EQ(build1->dependencyProof(blob), std::nullopt);
-
-    std::shared_ptr<InMemoryBackend> b2;
-    PoolPtr s2;
-    PartWriteTxnPtr build2;
-    arrange(b2, s2, build2);
-    build2->putBlob(blob, BlobSource::fromString(payload));
-    EXPECT_EQ(build2->dependencyProof(blob), BlobDependencyProof::Materialized);
-
-    EXPECT_EQ(logicalPayloadAt(*b1, key, s1->poolMeta().blob_header_len),
-              logicalPayloadAt(*b2, key, s2->poolMeta().blob_header_len));
-    EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), std::optional<MetaState>(MetaState::Clean));
-}
-
 /// A present body with absent metadata is observed and backfilled `Clean` without publication.
-TEST(CASUploadDetached, HeadMissLiveAdoptBackfills)
+TEST(CASUploadDetached, PresentBodyWithoutMetadataBackfills)
 {
     const RootNamespace ns{"srv1/nsAdopt"};
     const String ref_name = "part";
@@ -416,8 +295,8 @@ TEST(CASUploadDetached, HeadMissLiveAdoptBackfills)
     auto arrange = [&](std::shared_ptr<InMemoryBackend> & b, PoolPtr & s, PartWriteTxnPtr & build)
     {
         b = std::make_shared<InMemoryBackend>();
-        s = openUploadPool(b);                        /// default trigger off ⇒ no HEAD-first
-        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);   /// body present, NO meta ⇒ backfill
+        s = openUploadPool(b);
+        seedPresentBody(*b, s->layout(), s->poolMeta(), blob, payload);   /// body present, no meta: backfill
         build = precommitBuildFor(s, ns, ref_name, payload);
     };
 
@@ -582,7 +461,7 @@ TEST(CASUploadDetached, CondemnedLocalResurrection)
 {
     const RootNamespace ns{"srv1/nsResLocal"};
     const String ref_name = "part";
-    const String payload = "condemned-local-resurrect-payload";
+    const String payload = "condemned-local-republish-payload";
     const BlobRef blob = idOf(payload);
 
     auto arrange = [&](std::shared_ptr<InMemoryBackend> & b, PoolPtr & s, PartWriteTxnPtr & build)
@@ -640,9 +519,9 @@ TEST(CASUploadDetached, CondemnedS3Resurrection)
 {
     const RootNamespace ns{"srv1/nsResS3"};
     const String ref_name = "part";
-    const String payload = "condemned-s3-resurrect-payload";
+    const String payload = "condemned-s3-republish-payload";
     const BlobRef blob = idOf(payload);
-    const String staging_key = "p/staging/mount1/resurrect.tmp";
+    const String staging_key = "p/staging/mount1/republish.tmp";
 
     auto arrange = [&](std::shared_ptr<InMemoryBackend> & b, PoolPtr & s, PartWriteTxnPtr & build)
     {

@@ -264,7 +264,6 @@ public:
         return r;
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override { return inner.putIfAbsentStream(key, meta); }
     void publishBlob(const BlobPublishRequest & request) override
     {
         inner.publishBlob(request);

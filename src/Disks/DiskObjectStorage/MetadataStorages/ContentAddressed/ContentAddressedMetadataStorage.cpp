@@ -58,8 +58,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsString server_root_id;
     extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
-    extern const ContentAddressedSettingsUInt64 deduplication_cache_bytes;
-    extern const ContentAddressedSettingsUInt64 deduplication_head_first_min_bytes;
     extern const ContentAddressedSettingsUInt64 gc_snapshot_generations_to_keep;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
@@ -72,7 +70,7 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 gc_round_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_handoff_prefix_wholesale_budget;
     extern const ContentAddressedSettingsUInt64 gc_round_outcome_entry_budget;
-    extern const ContentAddressedSettingsUInt64 gcs_max_token_producing_put_bytes;
+    extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
     extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
@@ -279,8 +277,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , context(context_)
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
-    , deduplication_cache_bytes(settings_[ContentAddressedSetting::deduplication_cache_bytes].value)
-    , deduplication_head_first_min_bytes(settings_[ContentAddressedSetting::deduplication_head_first_min_bytes].value)
     , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
     , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
     , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
@@ -293,7 +289,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_round_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_prefix_wholesale_budget].value)
     , gc_round_handoff_prefix_wholesale_budget(settings_[ContentAddressedSetting::gc_round_handoff_prefix_wholesale_budget].value)
     , gc_round_outcome_entry_budget(settings_[ContentAddressedSetting::gc_round_outcome_entry_budget].value)
-    , gcs_max_token_producing_put_bytes(settings_[ContentAddressedSetting::gcs_max_token_producing_put_bytes].value)
+    , gcs_max_conditional_put_bytes(settings_[ContentAddressedSetting::gcs_max_conditional_put_bytes].value)
     , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
     , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
     , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
@@ -691,7 +687,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
-    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_token_producing_put_bytes);
+    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_conditional_put_bytes);
     const Cas::TokenType backend_token_type = backend->nativeTokenType();
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
@@ -759,8 +755,6 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     /// `blob_hash_allow_new` or refused (BAD_ARGUMENTS, the default).
     pool_config.blob_hash_algo = blob_hash_algo;
     pool_config.blob_hash_allow_new = blob_hash_allow_new;
-    pool_config.deduplication_cache_bytes = deduplication_cache_bytes;
-    pool_config.deduplication_head_first_min_bytes = deduplication_head_first_min_bytes;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
     pool_config.gc_snapshot_generations_to_keep = gc_snapshot_generations_to_keep;
     pool_config.gc_shards = gc_shards;
@@ -826,7 +820,7 @@ void ContentAddressedMetadataStorage::startup()
     /// copies with a default `WriteSettings`, which never receives the GCS conditional-dialect header
     /// mapping, so it would observe a raw `If-None-Match` that GCS ignores on `CopyObject` and report
     /// enforcement where there is none. Even a corrected probe would not help — the generation that
-    /// `promoteStaged` needs comes back in a response HEADER, and the vendored `CopyObjectResult` the
+    /// native copy publication needs comes back in a response header, and the vendored `CopyObjectResult` the
     /// copy call site reads only ever populates its `ETag` from the response BODY, so the token would
     /// never reach the caller. Excluding generation stores here keeps that dead end unreachable instead
     /// of surfacing it as a corrupted-token exception.
