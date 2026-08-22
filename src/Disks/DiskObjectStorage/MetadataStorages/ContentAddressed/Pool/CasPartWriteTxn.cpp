@@ -260,6 +260,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             ErrorCodes::LOGICAL_ERROR,
             "PartWriteTxn::ensureBlobPresent: durable precommit required before materializing {}",
             blobIdOf(req.ref));
+    /// This generation belongs to the operation, not to one observation/publication attempt. In
+    /// particular, an outer retry after ambiguous I/O must not adopt a re-armed incarnation, and a
+    /// trip-and-rearm hidden inside the mandatory `HEAD` must still invalidate the original writer.
+    const uint64_t admitted_generation = store->fenceGeneration();
 
     const BlobRef & ref = req.ref;
     const BlobSource & source = req.source;
@@ -354,6 +358,10 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
 
             if (!loaded || loaded->meta.state == MetaState::Clean)
             {
+                /// Observation can produce durable metadata and dependency readiness too. Refuse both
+                /// when the mandatory `HEAD` crossed a fence generation, even if the mount has already
+                /// re-armed and is writable again by the time it returns.
+                store->checkFenceOrThrow(admitted_generation);
                 if (!loaded)
                 {
                     ProfileEvents::increment(ProfileEvents::CASMetaAdoptBackfill);
@@ -362,6 +370,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                         ref,
                         BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
                 }
+                store->checkFenceOrThrow(admitted_generation);
                 ProfileEvents::increment(ProfileEvents::CASBlobBodyPutAvoided);
                 EventEmitter{*store}.emit([&](CasEvent & event)
                 {
@@ -373,6 +382,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                     event.reason = "a present non-condemned blob was observed after mandatory `HEAD`";
                     event.detail = {{"action", "observed"}, {"size", std::to_string(source.size)}};
                 });
+                store->checkFenceOrThrow(admitted_generation);
                 return BlobUploadResult{
                     ref,
                     BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},
@@ -381,7 +391,6 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
             reason = BlobPublicationReason::Condemned;
         }
 
-        const uint64_t admitted_generation = store->fenceGeneration();
         store->checkFenceOrThrow(admitted_generation);
         const bool first_publication = source.beginPublication();
 
@@ -437,6 +446,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
         /// but they cannot become dependency proof for the fenced transaction.
         store->checkFenceOrThrow(admitted_generation);
         reconcileMetaClean(loaded, reason);
+        store->checkFenceOrThrow(admitted_generation);
         EventEmitter{*store}.emit([&](CasEvent & event)
         {
             event.type = CasEventType::BlobPut;
@@ -453,6 +463,7 @@ BlobUploadResult PartWriteTxn::ensureBlobPresent(const BlobUploadRequest & req) 
                 {"size", std::to_string(source.size)},
                 {"build_id", u128ToHex(build_id)}};
         });
+        store->checkFenceOrThrow(admitted_generation);
         return BlobUploadResult{
             ref,
             BlobDepRecord{ObjectKind::Blob, BlobDependencyProof::Materialized, source.size},

@@ -3,6 +3,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 
@@ -279,6 +280,36 @@ TEST(CASFenceGeneration, BlobPublicationFenceLossBeforeFinalCheckPublishesNothin
 
     EXPECT_EQ(backend->publish_calls, 0u);
     EXPECT_FALSE(backend->head(backend->watched_key).exists);
+    EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
+}
+
+TEST(CASFenceGeneration, BlobPublicationHeadTripAndRearmCannotAdoptNewFenceGeneration)
+{
+    auto backend = std::make_shared<BlobPublicationFenceBackend>();
+    auto store = openTestPool(backend);
+    const String payload = "fence-trip-and-rearm-during-head";
+    const BlobRef ref = DB::Cas::tests::idOf(payload);
+    auto build = precommittedBuildForBlob(store, RootNamespace{"srv1/fence-rearm-during-head"}, "part", payload);
+    backend->watched_key = store->layout().blobKey(ref);
+    backend->trip_point = BlobPublicationFenceBackend::TripPoint::OnHead;
+    const uint64_t admitted_generation = store->fenceGeneration();
+    backend->trigger = [&]
+    {
+        store->tripMountLost();
+        DB::Cas::tests::rearmMountFenceAfterAnomalyForTest(store);
+        EXPECT_TRUE(store->mayMutate());
+        EXPECT_NE(store->fenceGeneration(), admitted_generation);
+    };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->putBlob(ref, BlobSource::fromString(payload));
+    });
+
+    EXPECT_EQ(backend->publish_calls, 0u);
+    EXPECT_FALSE(backend->head(backend->watched_key).exists);
+    EXPECT_EQ(loadMeta(*backend, store->layout(), ref), std::nullopt)
+        << "the stale operation must not reconcile freshness metadata after trip-and-rearm";
     EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
 }
 

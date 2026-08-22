@@ -116,6 +116,17 @@ PartWriteTxnPtr precommittedBuildForPayload(
     return build;
 }
 
+ManifestId durablyPrecommit(
+    const PartWriteTxnPtr & build,
+    const RootNamespace & ns,
+    const String & ref,
+    std::vector<ManifestEntry> entries)
+{
+    const ManifestId manifest = build->stageManifest(std::move(entries));
+    build->precommitAdd(ns, ref, manifest);
+    return manifest;
+}
+
 /// The full single-blob write flow (EDGE-BEFORE-OBSERVE wiring order):
 /// stageManifest(one entry) -> precommitAdd -> putBlob -> promote. Returns the committed ManifestId.
 ManifestId publishOneBlobPart(
@@ -343,7 +354,8 @@ TEST(CASPartWriteTxn, PutBlobWritesEnvelopeWithFixedHeader)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
-    auto build = s->beginPartWrite({});
+    const RootNamespace ns{"srv1/envelope"};
+    auto build = precommittedBuildForPayload(s, ns, "part", "hello world");
     auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     EXPECT_EQ(ref.size, 11u);
 
@@ -398,8 +410,8 @@ TEST(CASPartWriteTxn, PutBlobDedupSecondWriterAdopts)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
-    /// First writer FRESH-uploads (legal pre-precommit — newborn-debris watermark).
-    auto build_a = s->beginPartWrite({});
+    /// First writer publishes under its durable precommit edge.
+    auto build_a = precommittedBuildForPayload(s, RootNamespace{"srv/tbl-a"}, "ref_a", "dup");
     auto ref_a = build_a->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     const Token token_a = b->head(s->layout().blobKey(ref_a.ref)).token;
 
@@ -423,9 +435,9 @@ TEST(CASPartWriteTxn, PutBlobFreshUploadWritesCleanMeta)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
-    auto build = s->beginPartWrite({});
 
     const String payload = "fresh-meta-payload";
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/fresh-meta"}, "part", payload);
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
@@ -446,9 +458,9 @@ TEST(CASPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
-    auto build = s->beginPartWrite({});
 
     const String payload = "fresh-meta-payload-counters";
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/fresh-meta-counters"}, "part", payload);
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
@@ -537,11 +549,8 @@ TEST(CASPartWriteTxn, PutBlobAdoptsWhenMetaCleanNoRetireView)
     EXPECT_EQ(lm->meta.state, MetaState::Clean) << "an adopt must leave the meta Clean";
 }
 
-/// A4 (negative): observeAndAdmit's EDGE-BEFORE-OBSERVE invariant — adopting an EXISTING incarnation is
-/// safe ONLY under this build's durable precommit closure — was guarded only by chassert(precommitted),
-/// which is compiled out in release. A putBlob that reaches the adopt path with NO precommit (the wiring
-/// order stageManifest -> precommitAdd -> putBlob violated) must fail closed with a real LOGICAL_ERROR,
-/// not silently adopt a blob the newborn-debris watermark does not cover.
+/// A putBlob call without the mandatory durable precommit must fail closed before either observing or
+/// publishing a body. This is the intentional negative fixture for the writer-readiness contract.
 TEST(CASPartWriteTxn, AdoptBeforePrecommitFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -560,7 +569,7 @@ TEST(CASPartWriteTxn, AdoptBeforePrecommitFailsClosed)
     writeRawBlobBody(*b, s->layout(), hash, raw_body);
     writeMetaClean(*b, s->layout(), hash, payload.size());
 
-    /// Start a build but DO NOT call precommitAdd: the adopt runs with `precommitted == false`.
+    /// Start a build but DO NOT call precommitAdd.
     const RootNamespace ns{"srv/tbl"};
     auto build = startBuildFor(s, ns, "ref_adopt");
 
@@ -569,7 +578,7 @@ TEST(CASPartWriteTxn, AdoptBeforePrecommitFailsClosed)
             DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
             build->putBlob(id, BlobSource::fromString(payload));
         },
-        "EDGE-BEFORE-OBSERVE invariant violated");
+        "durable precommit required");
 }
 
 /// The resurrect decision (displace a condemned body) is likewise driven PURELY by the meta point-read
@@ -595,7 +604,8 @@ TEST(CASPartWriteTxn, PutBlobResurrectsWhenMetaCondemned)
     const Token t0 = b->head(blob_key).token;
 
     /// NO retire-view seeding anywhere: the resurrect must be decided purely from the meta point-read.
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/resurrect-meta"}, "part", payload);
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
@@ -632,7 +642,8 @@ TEST(CASPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
     writeMetaClean(*b, s->layout(), hash, payload.size());
     condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
 
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/resurrect-meta-counters"}, "part", payload);
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
@@ -644,20 +655,19 @@ TEST(CASPartWriteTxn, PutBlobWrongSizeFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/wrong-size"}, "part", "hello world");
 
     BlobSource lying;
     lying.size = 11;   /// declares 11 but writes 5
     lying.open = []() -> std::unique_ptr<DB::ReadBuffer>
     { return std::make_unique<DB::ReadBufferFromOwnString>(String("short")); };
 
-    const BlobRef id = idOf("does-not-matter");
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            build->putBlob(id, std::move(lying));
-        },
-        "source streamed");
+    const BlobRef id = idOf("hello world");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->putBlob(id, std::move(lying));
+    });
     /// The cancelled stream created nothing.
     EXPECT_FALSE(b->head(s->layout().blobKey(id)).exists);
 }
@@ -672,9 +682,9 @@ TEST(CASPartWriteTxn, PutBlobStreamsSourceOnceNoFullMaterialization)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
-    auto build = s->beginPartWrite({});
 
     const String payload = "streamed-not-materialized";
+    auto build = precommittedBuildForPayload(s, RootNamespace{"srv1/streaming"}, "part", payload);
     int invocations = 0;
     BlobSource source;
     source.size = payload.size();
@@ -711,7 +721,8 @@ TEST(CASPartWriteTxnReuseBlob, DependencyProofDistinguishesMaterializedAndTruste
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
 
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/dependency-proof/materialized"}, "written", "written");
 
     /// A fresh upload is materialized.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
@@ -747,9 +758,11 @@ TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
     Token t0;
     {
         auto s0 = openPool(b);
-        auto build0 = s0->beginPartWrite({});
+        auto build0 = precommittedBuildForPayload(
+            s0, RootNamespace{"srv1/resurrect-vanished-seed"}, "part", "payload-X");
         id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
+        build0->abandon();
     }
 
     /// 2. Condemn (Blob, hash(X), t0) in the retire view.
@@ -764,7 +777,8 @@ TEST(CASPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
     ///    Pool over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Pool::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/resurrect-vanished"}, "part", "payload-X");
 
     /// 4. putBlob with a re-invokable body.
     ///    BEFORE fix: putIfAbsent -> PreconditionFailed -> observeAndAdmit HEAD (present, condemned)
@@ -813,9 +827,10 @@ TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
     budget.retry_initial_backoff_ms = 0;
     auto b = std::make_shared<DB::Cas::tests::MetaWriteFaultBackend>();
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
-    auto build = s->beginPartWrite({});
 
     const String payload = "fresh-meta-exhaustion-payload";
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/fresh-meta-exhaustion"}, "part", payload);
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->putBlob(idOf(payload), BlobSource::fromString(payload));
@@ -871,9 +886,11 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     Token t0;
     {
         auto s0 = openPool(b);
-        auto build0 = s0->beginPartWrite({});
+        auto build0 = precommittedBuildForPayload(
+            s0, RootNamespace{"srv1/condemned-absent-seed"}, "part", "payload-Y");
         id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
+        build0->abandon();
     }
 
     /// 2. Condemn (Blob, hash(Y), t0) in the retire view, then GC-delete the object so it is absent
@@ -888,7 +905,8 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     /// 3. Open a fresh Pool over a GET-counting wrapper; the retire view sees the condemnation at open.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/condemned-absent"}, "part", "payload-Y");
 
     /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
     ///    won't fire (object is gone, so putIfAbsentStream → Done on the first attempt).
@@ -949,9 +967,11 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     Token t0;
     {
         auto s0 = openPool(b);
-        auto build0 = s0->beginPartWrite({});
+        auto build0 = precommittedBuildForPayload(
+            s0, RootNamespace{"srv1/condemned-present-seed"}, "part", "payload-Z");
         id = build0->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
+        build0->abandon();
     }
 
     /// 2. Condemn (Blob, hash(Z), t0) — object still PRESENT (GC condemned but not yet deleted).
@@ -964,7 +984,8 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     /// 3. Open a fresh Pool over a GET-counting wrapper.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->beginPartWrite({});
+    auto build = precommittedBuildForPayload(
+        s, RootNamespace{"srv1/condemned-present"}, "part", "payload-Z");
 
     /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
     ///    sees condemned token → must call uploadFromSource (NOT resurrect/GET).
@@ -1098,8 +1119,15 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
 
     /// A committed-source blob lives in the shared pool (seeded via a throwaway build on the same store).
     {
-        auto seed = s->beginPartWrite({});
+        const RootNamespace seed_ns{"srv1/trusted-seed"};
+        auto seed = startBuildFor(s, seed_ns, "part");
+        const ManifestId seed_manifest = durablyPrecommit(
+            seed,
+            seed_ns,
+            "part",
+            {blobManifestEntryStreaming("data.bin", "payload-TR")});
         seed->putBlob(streamRefOf("payload-TR"), BlobSource::fromString("payload-TR"));
+        seed->promote(seed_ns, "part", seed->buildId(), seed_manifest);
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-TR"));
     const String meta_key = s->layout().blobMetaKey(streamRefOf("payload-TR"));
@@ -1131,8 +1159,8 @@ TEST(CASPartWriteTxn, PromotionAcceptsBothDependencyProofs)
 
     /// Seed the committed-source body used by the trusted-manifest branch.
     {
-        auto seed = s->beginPartWrite({});
-        seed->putBlob(idOf("trusted-body"), BlobSource::fromString("trusted-body"));
+        publishOneBlobPart(
+            s, RootNamespace{"srv1/proof-promotion-seed"}, "part", "data.bin", "trusted-body");
     }
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -1192,8 +1220,15 @@ TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
     /// Seed X, adopt it, then delete it out from under the build (a landed GC delete in the adopt->promote
     /// window). The pre-§4 gate HEADed X, found it absent, and threw ABORTED; §4 trusts the durable edge.
     {
-        auto seed = s->beginPartWrite({});
+        const RootNamespace seed_ns{"srv1/race-seed"};
+        auto seed = startBuildFor(s, seed_ns, "part");
+        const ManifestId seed_manifest = durablyPrecommit(
+            seed,
+            seed_ns,
+            "part",
+            {blobManifestEntryStreaming("data.bin", "payload-RACE")});
         seed->putBlob(streamRefOf("payload-RACE"), BlobSource::fromString("payload-RACE"));
+        seed->promote(seed_ns, "part", seed->buildId(), seed_manifest);
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-RACE"));
     const Token t0 = b->head(blob_key).token;
@@ -1258,8 +1293,15 @@ TEST(CASPartWriteTxn, MissingDependencyProofFailsClosed)
 
     /// X exists (streaming-keyed) but THIS build records NO dep for it (no putBlob, no adoptEvidence).
     {
-        auto seed = s->beginPartWrite({});
+        const RootNamespace seed_ns{"srv1/missing-proof-seed"};
+        auto seed = startBuildFor(s, seed_ns, "part");
+        const ManifestId seed_manifest = durablyPrecommit(
+            seed,
+            seed_ns,
+            "part",
+            {blobManifestEntryStreaming("data.bin", "payload-NODEP")});
         seed->putBlob(streamRefOf("payload-NODEP"), BlobSource::fromString("payload-NODEP"));
+        seed->promote(seed_ns, "part", seed->buildId(), seed_manifest);
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-NODEP"));
     const Token t0 = b->head(blob_key).token;
@@ -1314,9 +1356,9 @@ TEST(CASPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     /// After uploading the blob, a fresh build's promote succeeds — the same manifest content is now
     /// fully present.
     auto build2 = startBuildFor(s, ns, "part_1");
-    build2->putBlob(idOf("never-uploaded"), BlobSource::fromString("never-uploaded"));
     const ManifestId mid2 = build2->stageManifest({blobManifestEntry("data.bin", "never-uploaded")});
     build2->precommitAdd(ns, "part_1", mid2);
+    build2->putBlob(idOf("never-uploaded"), BlobSource::fromString("never-uploaded"));
     EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), mid2));
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
@@ -1356,6 +1398,8 @@ TEST(CASPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "ref");
 
+    const ManifestId owner = build->stageManifest({blobManifestEntry("owner", "kept")});
+    build->precommitAdd(ns, "ref", owner);
     auto blob_ref = build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
     const ManifestId mid = build->stageManifest({blobManifestEntry("f", "kept")});
 
@@ -1398,11 +1442,11 @@ TEST(CASPartWriteTxn, PublishHappyPathRoundTrip)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
+    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
+    build->precommitAdd(ns, "part_1", id);
     auto blob = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     EXPECT_EQ(blob.size, 11u);
 
-    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
-    build->precommitAdd(ns, "part_1", id);
     build->promote(ns, "part_1", build->buildId(), id);
 
     auto r = s->resolveRef(ns, "part_1");
@@ -1432,7 +1476,6 @@ TEST(CASPartWriteTxn, PromoteCrossNamespaceManifestFailsClosed)
     const RootNamespace other_ns{"srv1/other"};
 
     auto build = startBuildFor(s, ns, "part_1");
-    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     /// The manifest is minted in `ns` (derived from intended_ref). Promoting/precommitting it into a
     /// DIFFERENT namespace must fail closed.
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
@@ -1471,11 +1514,11 @@ TEST(CASPartWriteTxn, PublishIntoSecondNamespaceSameBlob)
 
     /// First build publishes part_1 in ns1, uploading the blob.
     auto build1 = startBuildFor(s, ns1, "part_1");
+    const ManifestId id1 = build1->stageManifest({blobManifestEntry("data.bin", "hello world")});
+    build1->precommitAdd(ns1, "part_1", id1);
     auto blob = build1->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     const String blob_key = s->layout().blobKey(blob.ref);
     const Token blob_token = b->head(blob_key).token;
-    const ManifestId id1 = build1->stageManifest({blobManifestEntry("data.bin", "hello world")});
-    build1->precommitAdd(ns1, "part_1", id1);
     build1->promote(ns1, "part_1", build1->buildId(), id1);
 
     /// Second build publishes part_1 in ns2 referencing the SAME blob: putBlob dedup-hits and ADOPTS the
@@ -1512,15 +1555,15 @@ TEST(CASPartWriteTxn, TwoBuildsPublishToSameNamespaceBothLand)
     const String ref2 = "b";
 
     auto build_a = startBuildFor(s, ns, ref1);
-    build_a->putBlob(idOf("content-a"), BlobSource::fromString("content-a"));
     const ManifestId id_a = build_a->stageManifest({blobManifestEntry("data.bin", "content-a")});
     build_a->precommitAdd(ns, ref1, id_a);
+    build_a->putBlob(idOf("content-a"), BlobSource::fromString("content-a"));
     build_a->promote(ns, ref1, build_a->buildId(), id_a);
 
     auto build_b = startBuildFor(s, ns, ref2);
-    build_b->putBlob(idOf("content-b"), BlobSource::fromString("content-b"));
     const ManifestId id_b = build_b->stageManifest({blobManifestEntry("data.bin", "content-b")});
     build_b->precommitAdd(ns, ref2, id_b);
+    build_b->putBlob(idOf("content-b"), BlobSource::fromString("content-b"));
     build_b->promote(ns, ref2, build_b->buildId(), id_b);
 
     auto r1 = s->resolveRef(ns, ref1);
@@ -1682,6 +1725,10 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     const String blob_key = s->layout().blobKey(h);
     auto build_b = startBuildFor(s, ns, "part_2");
 
+    /// Establish the reachability edge before observing/replacing H.
+    const ManifestId mid_b = build_b->stageManifest({blobManifestEntry("f", content)});
+    build_b->precommitAdd(ns, "part_2", mid_b);
+
     /// B190: use putBlob (holds source bytes). putBlob detects the condemned dedup hit and calls
     /// uploadFromSource — no GET of dying object.
     const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
@@ -1691,12 +1738,7 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     ASSERT_TRUE(after_reupload.exists);
     EXPECT_NE(after_reupload.token, h_token0);   /// a genuinely fresh incarnation
 
-    /// 4. PartWriteTxn B stages its manifest referencing H and PRECOMMITS it (build-root edge). H is now
-    ///    protected by reachability: the GC fold lifts H to in-degree ≥ 1 from the precommit.
-    const ManifestId mid_b = build_b->stageManifest({blobManifestEntry("f", content)});
-    build_b->precommitAdd(ns, "part_2", mid_b);
-
-    /// 5. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. It reclaims the now-
+    /// 4. THE ADVERSARIAL LOOP. A real, productive GC keeps trying to reclaim. It reclaims the now-
     ///    unreferenced part_1 manifest (build A's, UNprotected) but H stays pinned by B's PRECOMMIT edge
     ///    (in-degree ≥ 1), so H is never even a zero-in-degree candidate. We drive far more rounds than B
     ///    needs to promote; H must survive ALL of them. Each round renews B's watermark so the crash
@@ -1779,9 +1821,9 @@ TEST(CASPartWriteTxn, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
 
     /// Make the precommit NO LONGER the live owner: append an exact precommit-removal ref-log
     /// transaction exactly as an abandon / GC reclaim would (spec §Remove Precommit) -- via the SAME
@@ -1814,9 +1856,9 @@ TEST(CASPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
 
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
@@ -1842,19 +1884,19 @@ TEST(CASPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 
     /// Publish ref "part_1" -> M1 through the normal build path.
     auto build1 = startBuildFor(s, ns, "part_1");
-    build1->putBlob(idOf("m1"), BlobSource::fromString("m1"));
     const ManifestId m1_id = build1->stageManifest({blobManifestEntry("data.bin", "m1")});
     build1->precommitAdd(ns, "part_1", m1_id);
+    build1->putBlob(idOf("m1"), BlobSource::fromString("m1"));
     build1->promote(ns, "part_1", build1->buildId(), m1_id);
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
     EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, m1_id);
 
     /// A second build stages M2 (one extra entry) onto the SAME ref.
     auto build2 = startBuildFor(s, ns, "part_1");
-    build2->putBlob(idOf("m2"), BlobSource::fromString("m2"));
-    build2->putBlob(idOf("m2x"), BlobSource::fromString("m2x"));
     const ManifestId m2_id = build2->stageManifest({blobManifestEntry("data.bin", "m2"), blobManifestEntry("extra.bin", "m2x")});
     build2->precommitAdd(ns, "part_1", m2_id);
+    build2->putBlob(idOf("m2"), BlobSource::fromString("m2"));
+    build2->putBlob(idOf("m2x"), BlobSource::fromString("m2x"));
 
     /// allow_repoint = false (the default) -> NETWORK_ERROR (CAS write-retry-later), existing invariant
     /// untouched; M1 still resolves.
@@ -1896,11 +1938,11 @@ TEST(CASPartWriteTxn, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     const String manifest_key = s->layout().manifestKey(mid);
     const UInt128 abandoned_build_id = build->buildId();
     build->precommitAdd(ns, "part_1", mid);
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
 
     /// The precommit manifest body is present before abandon.
     ASSERT_TRUE(b->head(manifest_key).exists);
@@ -1936,11 +1978,11 @@ TEST(CASPartWriteTxn, AbandonStillDeletesNeverPrecommittedStagedDebris)
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
     /// Two staged manifests: one becomes the precommit, the other is pure pre-precommit debris.
     const ManifestId debris = build->stageManifest({blobManifestEntry("debris.bin", "kept")});
     const ManifestId precommitted = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     build->precommitAdd(ns, "part_1", precommitted);
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
 
     build->abandon();
 
@@ -1962,9 +2004,9 @@ TEST(CASPartWriteTxn, AbandonSwallowsThrowingEventSink)
     const RootNamespace ns{"srv1/tbl_abandon_sink"};
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     build->precommitAdd(ns, "part_1", mid);
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
 
     /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): mirrors `PromoteSwallowsPostDurableEventSinkFailure`
     /// above -- this simulates an arbitrary observer/sink callback failing, not a CAS invariant
@@ -2044,9 +2086,9 @@ TEST(CASPartWriteTxn, AbandonRetryableAfterAppendFailure)
     DB::Cas::tests::casAdmitRecoverableEntry(*b, s->layout(), ns, s->liveWriterEpoch());
     auto build = startBuildFor(s, ns, "part_1");
 
-    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
     build->precommitAdd(ns, "part_1", mid);
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
 
     b->corrupt_key_substr = s->layout().namespaceStreamPrefix(DB::Cas::tests::fixture::fixtureLife(ns)) + "_log/";
     b->corrupt_count = 1;
