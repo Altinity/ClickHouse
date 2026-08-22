@@ -70,22 +70,16 @@ short-lived TODO, not the record.
   to `ABORTED` (already in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace).
   Zero upstream-code changes (user constraint).
 
-## 8. Fix CAS-040 — a newline in a part-file path wedges GC pool-wide {#fix-cas-040}
+## 8. DONE — Fix CAS-040 — a newline in a part-file path wedges GC pool-wide {#fix-cas-040}
 
 - Source: issue #2031 finding CAS-040, adjudicated + REPRODUCED live on HEAD (2031-triage, 2026-08-21)
-- Full record: `docs/superpowers/cas/2031-triage.md` `{#cas-040}` + BACKLOG
-  `{#manifest-entry-path-newline-banner}`
-- Mechanism: plain DDL (a projection whose name contains `\n`) makes `bannerFor` write the raw path
-  into the manifest banner while path hygiene exists only on the DECODE side. The INSERT itself fails
-  fail-closed (no committed part, no data loss), but the attempt leaves an undecodable ORPHAN
-  manifest, and `planManifestCursorPage` decodes it unguarded (`Gc/CasOrphanManifestSweep.cpp:878`,
-  no `try` at `Gc/CasGc.cpp:3124`) — so EVERY GC round in the pool fails forever, cursor never
-  advances, nothing is ever reclaimed again.
-- Fix: validate path hygiene on the ENCODE side (reject/escape at `bannerFor`) so such a manifest
-  cannot be written, and make the sweep's decode of a foreign/undecodable manifest non-fatal to the
-  round (record + continue, per [[feedback_ca_gc_never_throw_on_404]]'s principle). Both halves are
-  needed: the first stops new occurrences, the second unwedges an existing pool.
-- Pre-release: yes. A single unlucky DDL permanently disables reclamation for the whole pool.
+- Full record: `docs/superpowers/cas/2031-triage.md` `{#cas-040}`; implementation plan:
+  `docs/superpowers/plans/2026-08-21-cas-manifest-path-hygiene.md`.
+- Implemented 2026-08-22: `6333a986af6905e59f538855f61caf6dc296d1cf` makes the entry record and
+  `bannerFor` use one escaped path representation; `f738450415013c0f3da8b72746eed7edd04ed16d`
+  records an undecodable orphan manifest and continues the sweep.
+- The upstream `ProjectionsDescription::getDirectoryName` change is unnecessary: the manifest now
+  carries arbitrary paths faithfully.
 
 ## 9. Fix the three untracked P1s from the 2026-08-05 umbrella review {#fix-umbrella-p1}
 
