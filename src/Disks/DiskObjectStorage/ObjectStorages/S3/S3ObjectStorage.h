@@ -131,17 +131,6 @@ public:
         const WriteSettings & write_settings,
         std::optional<ObjectAttributes> object_to_attributes = {}) override;
 
-    /// Write-once conditional server-side copy (`CopyObject`/`CompleteMultipartUpload` with
-    /// `If-None-Match: *`). Only performed via the native copy path (`copyS3File`'s
-    /// `allow_native_copy` path); if native copy is not available this throws rather than silently
-    /// falling back to an unconditional overwrite (see `.cpp` for details).
-    ConditionalCopyResult copyObjectConditional(
-        const StoredObject & object_from,
-        const StoredObject & object_to,
-        const ReadSettings & read_settings,
-        const WriteSettings & write_settings,
-        std::optional<ObjectAttributes> object_to_attributes) override;
-
     void copyObjectToAnotherObjectStorage( /// NOLINT
         const StoredObject & object_from,
         const StoredObject & object_to,

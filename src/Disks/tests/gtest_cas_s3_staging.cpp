@@ -6,7 +6,6 @@
 #include <IO/WriteSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -33,14 +32,8 @@
 #include <aws/s3/S3Errors.h>
 #endif
 
-/// Task 0 of the S3-native staging plan: pure config plumbing, ZERO behavior change.
-/// `staging_backend` (default `local`) is parsed
-/// from the CAS disk config; the parsed `StagingBackend` is exposed via
-/// `ContentAddressedMetadataStorage::stagingBackend()`. `::conditionalCopySupported()` is a stored
-/// bool, defaulting to `false` until a later task wires the mount-time capability probe.
-///
-/// The global constraint (OFF BY DEFAULT) is the DEFAULT arm below: absent config keys must parse to
-/// `StagingBackend::Local` with `conditionalCopySupported()==false`.
+/// `staging_backend` defaults to `local`; explicit `s3` selection requires native-copy capability
+/// on writable mounts.
 
 namespace DB::ContentAddressedSetting
 {
@@ -66,68 +59,40 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> configWithDiskSection(const std::str
     return new Poco::Util::XMLConfiguration(xml_stream);
 }
 
-/// A test-only `LocalObjectStorage` subclass whose `copyObjectConditional` is configurable, so the
-/// Task 3 selection logic (`DB::Cas::probeConditionalCopy`) can be exercised without a live S3/RustFS
-/// backend (live enforcement is Task 7). `LocalObjectStorage` already implements every OTHER pure
-/// virtual (`writeObject`, `removeObjectIfExists`, `exists`, `copyObject`, ...) against real files
-/// under a fresh temp root, so overriding just `copyObjectConditional` is enough to fake either an
-/// ENFORCING or a NON-ENFORCING backend; a THROWING (default `NOT_IMPLEMENTED`) backend needs no
-/// fake at all — a plain `LocalObjectStorage` already exercises that path (see
-/// `DefaultCopyObjectConditionalThrowsNotImplemented` above).
-class FakeConditionalCopyObjectStorage : public DB::LocalObjectStorage
+/// A local test store whose copy-mode capability is configurable. Its ordinary `copyObject`
+/// implementation remains the real local implementation; only the advertised transport capability
+/// differs so mount selection can be tested independently of a live S3 service.
+class FakeNativeCopyObjectStorage final : public DB::LocalObjectStorage
 {
 public:
-    enum class Mode
-    {
-        /// Real write-once semantics: creates the destination iff it was absent; a destination that
-        /// already exists is REJECTED (created=false), no bytes touched.
-        Enforcing,
-        /// A backend that silently ignores `If-None-Match`: every call overwrites the destination
-        /// and reports created=true, even when the destination already existed.
-        NonEnforcing,
-    };
-
-    FakeConditionalCopyObjectStorage(DB::LocalObjectStorageSettings settings_, Mode mode_)
-        : DB::LocalObjectStorage(std::move(settings_)), mode(mode_)
+    FakeNativeCopyObjectStorage(DB::LocalObjectStorageSettings settings_, bool native_only_copy_supported_)
+        : DB::LocalObjectStorage(std::move(settings_))
+        , native_only_copy_supported(native_only_copy_supported_)
     {
     }
 
-    DB::ConditionalCopyResult copyObjectConditional(
-        const DB::StoredObject & object_from,
-        const DB::StoredObject & object_to,
-        const DB::ReadSettings & read_settings,
-        const DB::WriteSettings & write_settings,
-        std::optional<DB::ObjectAttributes> object_to_attributes) override
+    bool supportsCopyMode(DB::ObjectStorageCopyMode mode) const override
     {
-        ++call_count;
-        if (mode == Mode::Enforcing && exists(object_to))
-            return {.created = false, .dest_etag = {}};
-
-        copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
-        return {.created = true, .dest_etag = "fake-etag"};
+        return mode == DB::ObjectStorageCopyMode::Default
+            || (mode == DB::ObjectStorageCopyMode::NativeOnly && native_only_copy_supported);
     }
-
-    int callCount() const { return call_count; }
 
 private:
-    Mode mode;
-    int call_count = 0;
+    const bool native_only_copy_supported;
 };
 
-/// Build a `FakeConditionalCopyObjectStorage` rooted at a fresh, unique temp directory (mirrors
-/// `DB::Cas::tests::makeLocalObjectStorageForTest`).
-std::shared_ptr<FakeConditionalCopyObjectStorage> makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode mode)
+std::shared_ptr<FakeNativeCopyObjectStorage> makeFakeNativeCopyStorage(bool native_only_copy_supported)
 {
     static std::atomic<uint64_t> counter{0};
     const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
-    const auto root = (std::filesystem::temp_directory_path() / ("cas_s3_staging_probe_" + unique)).string();
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_s3_staging_native_copy_" + unique)).string();
 
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     std::filesystem::create_directories(root, ec);
 
     DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
-    return std::make_shared<FakeConditionalCopyObjectStorage>(std::move(settings), mode);
+    return std::make_shared<FakeNativeCopyObjectStorage>(std::move(settings), native_only_copy_supported);
 }
 
 /// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::Cas::CaContentWriteBuffer`'s
@@ -488,7 +453,7 @@ TEST(CASS3Staging, UnknownBackendValueThrows)
     EXPECT_THROW(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Exception);
 }
 
-TEST(CASS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
+TEST(CASS3Staging, DefaultConstructedStorageReportsLocal)
 {
     /// Constructed with no staging-related args at all (mirrors the existing gtest call sites, e.g.
     /// gtest_ca_wiring.cpp, which stop at `context_`): the accessors must reflect the same
@@ -499,28 +464,6 @@ TEST(CASS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
         DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
 
     EXPECT_EQ(storage->stagingBackend(), DB::Cas::StagingBackend::Local);
-    EXPECT_FALSE(storage->conditionalCopySupported());
-}
-
-/// Task 2 of the S3-native staging plan: `IObjectStorage::copyObjectConditional` (write-once
-/// conditional server-side copy) — the interface-level contract. Backends without an enforced,
-/// native conditional copy MUST NOT override the default: it fail-closes with `NOT_IMPLEMENTED`,
-/// exactly like the existing `IObjectStorage::removeObjectIfTokenMatches` default (never silently
-/// falls back to an unconditional overwrite). `LocalObjectStorage` (used by
-/// `makeLocalObjectStorageForTest`) does not override `copyObjectConditional`, so it exercises the
-/// base-class default directly. Live 412-vs-created S3 semantics are covered by the Task 7
-/// integration test (with_rustfs); this is deliberately just the fail-closed contract test.
-TEST(CASS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
-{
-    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
-
-    const DB::StoredObject from{"cas_s3_staging_conditional_copy_from"};
-    const DB::StoredObject to{"cas_s3_staging_conditional_copy_to"};
-
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
-    {
-        storage->copyObjectConditional(from, to, DB::ReadSettings{}, DB::WriteSettings{});
-    });
 }
 
 TEST(CASS3Staging, DefaultObjectStorageRejectsNativeOnlyCopyMode)
@@ -529,39 +472,6 @@ TEST(CASS3Staging, DefaultObjectStorageRejectsNativeOnlyCopyMode)
 
     EXPECT_TRUE(storage->supportsCopyMode(DB::ObjectStorageCopyMode::Default));
     EXPECT_FALSE(storage->supportsCopyMode(DB::ObjectStorageCopyMode::NativeOnly));
-}
-
-/// Task 3 of the S3-native staging plan: the mount-time capability probe (`DB::Cas::probeConditionalCopy`)
-/// for the OPTIONAL conditional-copy capability (distinct from the mandatory `runCapabilityProbe`
-/// battery). These three tests cover the fail-close SELECTION logic with fakes — live 412-vs-created
-/// enforcement against a real backend is Task 7 (with_rustfs integration test).
-
-TEST(CASS3Staging, ProbeConditionalCopyReturnsTrueForEnforcingBackend)
-{
-    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
-
-    EXPECT_TRUE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
-    /// Both the "fresh destination" and the "already-existing destination" conditional copies ran.
-    EXPECT_EQ(storage->callCount(), 2);
-}
-
-TEST(CASS3Staging, ProbeConditionalCopyReturnsFalseForNonEnforcingBackend)
-{
-    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::NonEnforcing);
-
-    /// The backend silently overwrites the destination on the second call (created=true again) —
-    /// it does not enforce If-None-Match, so the probe must fail closed.
-    EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
-}
-
-TEST(CASS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThrows)
-{
-    /// A plain `LocalObjectStorage` does not override `copyObjectConditional` at all — it falls
-    /// through to the base-class default, which throws NOT_IMPLEMENTED (exactly what a real backend
-    /// without conditional-copy support does). The probe must never propagate this: it fails closed.
-    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
-
-    EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
 }
 
 /// Task 4 of the S3-native staging plan: `CaContentWriteBuffer`'s S3-staging constructor streams
@@ -847,24 +757,15 @@ TEST(CASS3Staging, PublishOverCondemnedBlobUsesFreshTagNotVerbatim)
 /// Task 6 of the S3-native staging plan: staging cleanup after commit, read-your-writes over an S3
 /// pending blob, and the mount-lease-scoped sweeper (`CASStagingSweeper.h`).
 ///
-/// The wiring-level tests below (cleanup-after-commit, read-your-writes) drive the REAL
-/// `ContentAddressedMetadataStorage` + `ContentAddressedTransaction` over `FakeConditionalCopyObjectStorage`
-/// in `Enforcing` mode. The fake's REAL `getType()` stays `Local`, so `Cas::ObjectStorageBackend` selects
-/// `EmulatedSingleProcess` for the CAS core protocol — the same fully-supported combination every other
-/// `gtest_ca_wiring.cpp` test uses — while the mount-time conditional-copy PROBE
-/// (`Cas::probeConditionalCopy`) is decoupled from that (it exercises `copyObjectConditional` directly
-/// against the object storage), so it reports S3 staging as usable independent of the backend mode. This
-/// lets `writeFile` take the S3-staging code path (stream to a staging object while hashing) WITHOUT
-/// needing a live/native conditional-copy backend for the promote: `PartWriteTxn::putBlob`'s
-/// unconditional publication is already covered directly against `Cas::PartWriteTxn` and
-/// `RecordingStagingBackend` above. These tests only exercise an S3 pending blob that is either never
-/// referenced or read before commit.
+/// The wiring-level tests below drive the real metadata storage and transaction over a local test
+/// store that advertises native copy. Its real `getType` stays `Local`, so the CAS core uses
+/// `EmulatedSingleProcess`; these cases stop before a native-mode staged publication is required.
 
 namespace
 {
 
 /// Construct a `ContentAddressedMetadataStorage` with `staging_backend=s3` over `object_storage`,
-/// mirroring `DefaultConstructedStorageReportsLocalAndNoConditionalCopy`'s settings defaults for every
+/// mirroring `DefaultConstructedStorageReportsLocal`'s settings defaults for every
 /// field this test suite does not care about — only `server_root_id` (the mount identity that names
 /// the staging prefix) and `staging_backend` differ.
 std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorageForTest(
@@ -891,16 +792,44 @@ void writeThroughS3Transaction(DB::ContentAddressedTransaction & tx, const std::
 
 }
 
+TEST(CASS3Staging, WritableS3StagingRequiresNativeOnlyCopy)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountNative");
+    metadata_storage->startup();
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    writeThroughS3Transaction(
+        ca_tx,
+        "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin",
+        "native-staging");
+
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_EQ(staged.size(), 1u);
+}
+
+TEST(CASS3Staging, UnsupportedNativeOnlyCopyDoesNotFallBackToLocal)
+{
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/false);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountUnsupported");
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
+    {
+        metadata_storage->startup();
+    });
+}
+
 /// (a) A successful commit removes the S3 staging object of a pending blob it staged. Uses the B189
 /// orphan shape (the pending blob's entry is unlinked before commit) so `publishStaging` never calls
 /// `putBlob` for it — only `cleanupPendingTempFiles`'s Task 6 branch ever touches this staging object,
 /// which is exactly the seam this test targets.
 TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 {
-    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountA");
     metadata_storage->startup();
-    ASSERT_TRUE(metadata_storage->conditionalCopySupported());
 
     auto tx = metadata_storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
@@ -931,10 +860,9 @@ TEST(CASS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 /// staging object, not a local temp file.
 TEST(CASS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
 {
-    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto object_storage = makeFakeNativeCopyStorage(/*native_only_copy_supported=*/true);
     auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountB");
     metadata_storage->startup();
-    ASSERT_TRUE(metadata_storage->conditionalCopySupported());
 
     auto tx = metadata_storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
@@ -994,22 +922,6 @@ TEST(CASS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
     EXPECT_FALSE(staging_key.starts_with(blobs_prefix));
 }
 
-/// S3-native staging closes on a generation-token store: the converse of
-/// `GenerationDialectStorageSkipsConditionalCopyProbe` below -- an ETag/Emulated-dialect backend (every
-/// backend that is not a generation-token store) must still take the probe. This proves the guard
-/// discriminates on token type rather than skipping the probe unconditionally, which would satisfy the
-/// Generation-dialect test alone but leave S3-native staging permanently unusable everywhere.
-TEST(CASS3Staging, EtagDialectStorageStillProbesConditionalCopy)
-{
-    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
-    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountEtag");
-    metadata_storage->startup();
-
-    EXPECT_EQ(object_storage->callCount(), 2)
-        << "an ETag/Emulated-dialect backend must still take the S3-native staging probe";
-    EXPECT_TRUE(metadata_storage->conditionalCopySupported());
-}
-
 #if USE_AWS_S3
 
 namespace
@@ -1018,8 +930,8 @@ namespace
 /// A `LocalObjectStorage` that reports the GCS generation dialect
 /// (`conditionalOpsUseGenerationTokens() == true`) and a non-`Local` `getType()`, so
 /// `ContentAddressedMetadataStorage::openPoolView` builds its backend in `Mode::Native` with
-/// `native_token_type == TokenType::Generation` — exactly the combination the S3-staging guard
-/// (`ContentAddressedMetadataStorage.cpp`) must refuse to probe.
+/// `native_token_type == TokenType::Generation`. The fake also advertises native copy so generation
+/// token mode can exercise explicit S3 staging without endpoint/provider heuristics.
 ///
 /// Holds every object entirely in memory, keyed by the BARE CAS key exactly as `Backend` hands it to
 /// `object_storage` (e.g. `"pool/_probe/<hex>/token"`). Native mode never asks `object_storage` to
@@ -1046,6 +958,10 @@ public:
     bool conditionalOpsUseGenerationTokens() const override { return true; }
     std::optional<bool> isBucketVersioningEnabled() const override { return false; }
     bool supportsRetryProfile(DB::ObjectStorageRetryProfile) const override { return true; }
+    bool supportsCopyMode(DB::ObjectStorageCopyMode mode) const override
+    {
+        return mode == DB::ObjectStorageCopyMode::Default || mode == DB::ObjectStorageCopyMode::NativeOnly;
+    }
 
     std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
         const DB::StoredObject & object,
@@ -1170,22 +1086,6 @@ public:
         return result;
     }
 
-    /// Never expected to be called under the guard this test suite targets -- kept functional (not a
-    /// hard failure) so a regression surfaces as a wrong call count, the same signal every other
-    /// assertion here relies on, rather than a crash that could mask it.
-    DB::ConditionalCopyResult copyObjectConditional(
-        const DB::StoredObject & object_from,
-        const DB::StoredObject & object_to,
-        const DB::ReadSettings & read_settings,
-        const DB::WriteSettings & write_settings,
-        std::optional<DB::ObjectAttributes> object_to_attributes) override
-    {
-        ++copy_conditional_calls;
-        return DB::LocalObjectStorage::copyObjectConditional(object_from, object_to, read_settings, write_settings, object_to_attributes);
-    }
-
-    int copyConditionalCallCount() const { return copy_conditional_calls; }
-
     /// Checks the write-once/exact-token precondition against the current generation and, on success,
     /// stores `bytes` and mints the next generation. Throws an `S3Exception` naming `PreconditionFailed`
     /// on a lost condition -- the one signal `finalizeConditionalWrite` classifies as
@@ -1254,7 +1154,6 @@ private:
     mutable std::mutex mutex;
     std::map<std::string, Entry> objects;
     uint64_t next_generation = 1;
-    std::atomic<int> copy_conditional_calls{0};
 };
 
 std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForTest()
@@ -1273,29 +1172,22 @@ std::shared_ptr<FakeGenerationObjectStorage> makeFakeGenerationObjectStorageForT
 
 }
 
-/// S3-native staging closes on a generation-token store: the S3-staging capability probe
-/// (`Cas::probeConditionalCopy`) is meaningless on a GCS-dialect backend -- it issues its conditional
-/// copies with a default `WriteSettings`, which never receives the GCS conditional-dialect header
-/// mapping, so it would misreport enforcement where there is none. A generation-token backend must
-/// therefore take no probe at all and fall back to local staging.
-///
-/// Failing first: before the guard exists, `startup()` calls `Cas::probeConditionalCopy` unconditionally
-/// whenever `staging_backend == Cas::StagingBackend::S3 && !read_only`
-/// (`ContentAddressedMetadataStorage.cpp`, inside `startup()`), which drives exactly two
-/// `copyObjectConditional` calls against this fake -- `copyConditionalCallCount()` reads 2, failing the
-/// `EXPECT_EQ(..., 0)` below. The `if (view.native_token_type == Cas::TokenType::Generation)` guard is
-/// the single line that skips that call for this backend.
-TEST(CASS3Staging, GenerationDialectStorageSkipsConditionalCopyProbe)
+TEST(CASS3Staging, GenerationBackendMayUseNativeOnlyCopy)
 {
     auto object_storage = makeFakeGenerationObjectStorageForTest();
-    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountGen");
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountGenerationNative");
     metadata_storage->startup();
 
-    EXPECT_EQ(object_storage->copyConditionalCallCount(), 0)
-        << "a generation-token backend must never be probed for conditional-copy support -- the "
-           "probe's default WriteSettings never receive the GCS dialect mapping, so it would "
-           "misreport enforcement";
-    EXPECT_FALSE(metadata_storage->conditionalCopySupported());
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    writeThroughS3Transaction(
+        ca_tx,
+        "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin",
+        "generation-native-staging");
+
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_EQ(staged.size(), 1u);
 }
 
 #endif

@@ -884,12 +884,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// publication records `Materialized`.
     if (Cas::partFileMustStayBlob(r->file))
     {
-        /// S3-native staging:
-        /// when this disk opted in (`staging_backend=s3`) AND the mount-time capability probe
-        /// a capability probe proved the object storage enforces write-once conditional copy, stream directly
-        /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
-        /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,
-        /// byte-for-byte-unchanged local-temp-file path below.
+        /// When this disk explicitly opts in to `staging_backend=s3`, `startup` has already required
+        /// provider-native same-store copy, so stream directly to a fresh per-mount staging object
+        /// while hashing. The default `local` setting keeps the existing local-temp-file path below.
         /// Hash with this pool's node-local write algorithm rather than a hardcoded city hash;
         /// `PoolMeta` no longer records a single pool-wide algorithm --
         /// mixed-algo pools track `algos_used`; `writeAlgo()` is the write-mint accessor now).
@@ -898,7 +895,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// parse it back at that SAME width via `Cas::codecFor(hash_algo)` (never a pool-wide
         /// `DigestCodec`, which no longer exists) into a full `BlobRef` pair.
 
-        if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3 && metadata_storage.conditionalCopySupported())
+        if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3)
         {
             const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
             auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);

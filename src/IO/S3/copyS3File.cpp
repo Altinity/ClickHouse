@@ -82,10 +82,7 @@ namespace
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
-            const LoggerPtr log_,
-            const std::optional<String> & if_none_match_ = {},
-            String * out_dest_etag_ = nullptr,
-            ObjectStorageRequestMode request_mode_ = ObjectStorageRequestMode::Default)
+            const LoggerPtr log_)
             : client_ptr(client_ptr_)
             , dest_bucket(dest_bucket_)
             , dest_key(dest_key_)
@@ -94,9 +91,6 @@ namespace
             , schedule(schedule_)
             , blob_storage_log(blob_storage_log_)
             , log(log_)
-            , if_none_match(if_none_match_)
-            , out_dest_etag(out_dest_etag_)
-            , request_mode(request_mode_)
             , num_parts(0)
             , normal_part_size(0)
         {
@@ -113,16 +107,6 @@ namespace
         ThreadPoolCallbackRunnerUnsafe<void> schedule;
         BlobStorageLogWriterPtr blob_storage_log;
         const LoggerPtr log;
-
-        /// If set, passed as the `If-None-Match` precondition on the destination write of a copy
-        /// (`CopyObject` and, for large objects, `CompleteMultipartUpload`), making the copy write-once
-        /// conditional. Only meaningful for copyS3File() (CopyFileHelper); unused by copyDataToS3File().
-        const std::optional<String> if_none_match;
-        /// If non-null, filled in with the destination object's ETag on a successful copy.
-        String * out_dest_etag;
-        /// Eligibility for the typed NativeConditional HTTP mode (see WriteSettings), threaded onto
-        /// the destination-write requests below -- see copyS3File's doc comment for exactly which ones.
-        const ObjectStorageRequestMode request_mode;
 
         /// Represents a task uploading a single part.
         /// Keep this struct small because there can be thousands of parts.
@@ -214,18 +198,6 @@ namespace
 
             request.SetMultipartUpload(multipart_upload);
 
-            if (if_none_match.has_value())
-            {
-                request.SetIfNoneMatch(*if_none_match);
-                /// Defense in depth only: a conditional copy on a generation-token store never reaches
-                /// this request (the caller fails closed before multipart when it would exceed the
-                /// single-operation cap -- see S3ObjectStorage::copyObjectConditional). Marking it
-                /// anyway lets Task 4's native adapter reject a conditional CompleteMultipartUpload
-                /// outright if that invariant is ever violated. Upload-part and multipart-creation
-                /// requests are deliberately never marked -- no consumer needs their mode.
-                request.setNativeConditional(request_mode == ObjectStorageRequestMode::NativeConditional);
-            }
-
             size_t max_retries = std::max<UInt64>(request_settings[S3RequestSetting::max_unexpected_write_error_retries].value, 1UL);
             for (size_t retries = 1;; ++retries)
             {
@@ -245,8 +217,6 @@ namespace
 
                 if (outcome.IsSuccess())
                 {
-                    if (out_dest_etag)
-                        *out_dest_etag = outcome.GetResult().GetETag();
                     LOG_TRACE(log, "Multipart upload has completed. Bucket: {}, Key: {}, Upload_id: {}, Parts: {}", dest_bucket, dest_key, multipart_upload_id, multipart_tags.size());
                     break;
                 }
@@ -259,12 +229,6 @@ namespace
                     continue; /// will retry
                 }
                 ProfileEvents::increment(ProfileEvents::WriteBufferFromS3RequestsErrors, 1);
-                /// Preserve the S3 exception name (e.g. `PreconditionFailed` for a rejected
-                /// `If-None-Match` on `CompleteMultipartUpload`) on the thrown exception: `GetErrorType()`
-                /// alone maps an unmodeled error like a 412 to `UNKNOWN`, so callers that need to detect
-                /// a specific condition (a write-once conditional copy losing the race) must be able to
-                /// read `S3Exception::getExceptionName()`, mirroring how `S3ObjectStorage::removeObjectIfTokenMatches`
-                /// reads `AWSError::GetExceptionName()` directly off the (not-yet-thrown) outcome.
                 throw S3Exception(
                     PreformattedMessage::create("Message: {}, Key: {}, Bucket: {}, Tags: {}",
                         outcome.GetError().GetMessage(), dest_key, dest_bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " ")),
@@ -652,9 +616,6 @@ namespace
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
             std::function<void()> fallback_method_,
-            const std::optional<String> & if_none_match_ = {},
-            String * out_dest_etag_ = nullptr,
-            ObjectStorageRequestMode request_mode_ = ObjectStorageRequestMode::Default,
             bool allow_fallback_ = true)
             : UploadHelper(
                 client_ptr_,
@@ -664,10 +625,7 @@ namespace
                 object_metadata_,
                 schedule_,
                 blob_storage_log_,
-                getLogger("copyS3File"),
-                if_none_match_,
-                out_dest_etag_,
-                request_mode_)
+                getLogger("copyS3File"))
             , src_bucket(src_bucket_)
             , src_key(src_key_)
             , offset(src_offset_)
@@ -723,9 +681,6 @@ namespace
                 request.SetMetadataDirective(Aws::S3::Model::MetadataDirective::REPLACE);
             }
 
-            if (if_none_match.has_value())
-                request.SetIfNoneMatch(*if_none_match);
-
             const auto & storage_class_name = request_settings[S3RequestSetting::storage_class_name];
             if (!storage_class_name.value.empty())
                 request.SetStorageClass(Aws::S3::Model::StorageClassMapper::GetStorageClassForName(storage_class_name));
@@ -735,9 +690,6 @@ namespace
 
             client_ptr->setKMSHeaders(request);
 
-            /// The actual single-operation copy that produces a CAS incarnation token: eligible for the
-            /// typed NativeConditional HTTP mode when the caller marked this copy as such.
-            request.setNativeConditional(request_mode == ObjectStorageRequestMode::NativeConditional);
         }
 
         void processCopyRequest(S3::CopyObjectRequest & request)
@@ -752,8 +704,6 @@ namespace
                 auto outcome = client_ptr->CopyObject(request);
                 if (outcome.IsSuccess())
                 {
-                    if (out_dest_etag)
-                        *out_dest_etag = outcome.GetResult().GetCopyObjectResultDetails().GetETag();
                     LOG_TRACE(
                         log,
                         "Single operation copy has completed. Bucket: {}, Key: {}, Object size: {}",
@@ -772,12 +722,6 @@ namespace
                     if (!supports_multipart_copy || outcome.GetError().GetExceptionName() == "AccessDenied")
                     {
                         if (!allow_fallback)
-                            throw S3Exception(
-                                outcome.GetError().GetMessage(),
-                                outcome.GetError().GetErrorType(),
-                                outcome.GetError().GetExceptionName());
-
-                        if (if_none_match.has_value())
                             throw S3Exception(
                                 outcome.GetError().GetMessage(),
                                 outcome.GetError().GetErrorType(),
@@ -821,9 +765,6 @@ namespace
                     continue; /// will retry
                 }
 
-                /// Preserve the S3 exception name for the same reason as the `CompleteMultipartUpload`
-                /// throw in `completeMultipartUpload()` above (a 412 on a conditional `CopyObject` maps
-                /// to `S3Errors::UNKNOWN`; the exception name is the only reliable discriminator).
                 throw S3Exception(
                     PreformattedMessage::create("Message: {}, Key: {}, Bucket: {}, Object size: {}",
                         outcome.GetError().GetMessage(),
@@ -847,9 +788,6 @@ namespace
                     throw;
 
                 if (!allow_fallback)
-                    throw;
-
-                if (if_none_match.has_value())
                     throw;
 
                 tryLogCurrentException(log, "Multi part copy failed, trying with regular upload");
@@ -934,9 +872,6 @@ void copyS3File(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer& fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata,
-    std::optional<String> if_none_match,
-    String * out_dest_etag,
-    ObjectStorageRequestMode request_mode,
     ObjectStorageCopyMode copy_mode)
 {
     if (!dest_s3_client)
@@ -983,9 +918,6 @@ void copyS3File(
         schedule,
         blob_storage_log,
         std::move(fallback_method),
-        if_none_match,
-        out_dest_etag,
-        request_mode,
         /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
     helper.performCopy();
 }

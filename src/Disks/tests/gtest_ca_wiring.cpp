@@ -340,6 +340,11 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace DB::ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString staging_backend;
+}
+
 namespace
 {
 
@@ -802,6 +807,28 @@ void writeThroughTransaction(DB::IMetadataTransaction & tx, const String & path,
     buf->finalize();
 }
 
+}
+
+TEST(CASWiring, LocalStagingRemainsDefault)
+{
+    auto object_storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_local_staging_default");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+
+    EXPECT_EQ(storage->stagingBackend(), DB::Cas::StagingBackend::Local);
+
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(
+        *tx,
+        "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin",
+        "local-staging");
+
+    DB::RelativePathsWithMetadata staged;
+    object_storage->listObjects(storage->stagingKeyPrefix(), staged, /*max_keys=*/0);
+    EXPECT_TRUE(staged.empty());
 }
 
 TEST(CASWiringWrite, ContentRoundTripThroughTransaction)
@@ -2100,9 +2127,13 @@ TEST(CASWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     /// observe-only mount reads the same server-root's data — the WORM scenario.
     auto ro_settings = DB::Cas::tests::makeSettingsForTest(
         "test", std::filesystem::temp_directory_path() / "ca_ro_scratch2");
+    /// An explicit S3-staging selection still opens read-only without native-copy support because
+    /// this mount cannot enter staged publication.
+    ro_settings[DB::ContentAddressedSetting::staging_backend] = "s3";
+    ro_settings.validate();
     auto ro = std::make_shared<DB::ContentAddressedMetadataStorage>(
         ro_os, "pool", "srv1", "", nullptr, ro_settings);
-    ro->startup();   /// must NOT throw (probe skipped — a probe write would fail on a read-only os)
+    ro->startup();   /// must NOT throw: read-only mounts cannot enter staged publication
 
     EXPECT_TRUE(ro->isReadOnly());
     /// Reads work:
