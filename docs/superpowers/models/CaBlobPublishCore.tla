@@ -9,7 +9,8 @@ after recovery has begun.
 
 ETag tokens are a deterministic function of the complete envelope and logical payload.
 Generation tokens consume nextToken at every backend landing. Both token families use
-the same queued exact-delete action.
+the same queued exact-delete action, while post-condemnation freshness compares the
+envelope identity directly.
 *)
 EXTENDS Naturals, FiniteSets
 
@@ -101,14 +102,18 @@ WriterState ==
      plannedEnvelope : 0..MaxEnvelope,
      plannedObservation : Observations,
      plannedOldToken : TokenSet,
+     plannedOldEnvelope : 0..MaxEnvelope,
      plannedObservedSeq : 0..MaxWrites,
+     plannedInvalidVerbatimCopy : BOOLEAN,
      attemptLanded : BOOLEAN,
      latePending : BOOLEAN,
      lateTransport : Transports,
      lateEnvelope : 0..MaxEnvelope,
      lateObservation : Observations,
      lateOldToken : TokenSet,
+     lateOldEnvelope : 0..MaxEnvelope,
      lateObservedSeq : 0..MaxWrites,
+     lateInvalidVerbatimCopy : BOOLEAN,
      needsFreshPublication : BOOLEAN,
      adoptedCondemned : BOOLEAN,
      invalidVerbatimCopy : BOOLEAN,
@@ -119,6 +124,7 @@ WriterState ==
      sawStagedCopy : BOOLEAN,
      publishedFromAbsent : BOOLEAN,
      publishedAbsentSeq : 0..MaxWrites,
+     retryLandedBeforeLate : BOOLEAN,
      sawCondemnedAttempt : BOOLEAN]
 
 VARIABLES
@@ -173,14 +179,18 @@ InitialWriter ==
      plannedEnvelope |-> 0,
      plannedObservation |-> "None",
      plannedOldToken |-> NoToken,
+     plannedOldEnvelope |-> 0,
      plannedObservedSeq |-> 0,
+     plannedInvalidVerbatimCopy |-> FALSE,
      attemptLanded |-> FALSE,
      latePending |-> FALSE,
      lateTransport |-> "None",
      lateEnvelope |-> 0,
      lateObservation |-> "None",
      lateOldToken |-> NoToken,
+     lateOldEnvelope |-> 0,
      lateObservedSeq |-> 0,
+     lateInvalidVerbatimCopy |-> FALSE,
      needsFreshPublication |-> FALSE,
      adoptedCondemned |-> FALSE,
      invalidVerbatimCopy |-> FALSE,
@@ -191,6 +201,7 @@ InitialWriter ==
      sawStagedCopy |-> FALSE,
      publishedFromAbsent |-> FALSE,
      publishedAbsentSeq |-> 0,
+     retryLandedBeforeLate |-> FALSE,
      sawCondemnedAttempt |-> FALSE]
 
 Init ==
@@ -270,6 +281,10 @@ TypeOK ==
     /\ stagedRetagReached \in BOOLEAN
     /\ lateLandingReached \in BOOLEAN
 
+(*
+The honest seed envelope is disjoint from both current staged sources. The first-condemned
+sabotage aliases writer one's staged bytes intentionally so its queued old ETag is reproduced.
+*)
 SeedBody ==
     /\ ~seeded
     /\ ~body.present
@@ -277,7 +292,10 @@ SeedBody ==
     /\ \A w \in Writers : writer[w].phase = "Precommit"
     /\ metaVersion < MaxMetaVersion
     /\ CanLand
-    /\ LET envelope == MaxEnvelope
+    /\ LET envelope ==
+               IF Defect("first_condemned_then_copy")
+               THEN StagedEnvelope(WriterOne)
+               ELSE MaxEnvelope
            payload == KeyPayload
            token == MintToken(envelope, payload)
        IN /\ body' =
@@ -456,10 +474,11 @@ BeginPublication(w) ==
                   ![w].plannedEnvelope = chosenEnvelope,
                   ![w].plannedObservation = observation,
                   ![w].plannedOldToken = writer[w].observedToken,
+                  ![w].plannedOldEnvelope = writer[w].observedEnvelope,
                   ![w].plannedObservedSeq = writer[w].observedWriteSeq,
+                  ![w].plannedInvalidVerbatimCopy =
+                      useCopy /\ ~(~priorAttempted /\ observation = "Absent"),
                   ![w].attemptLanded = FALSE,
-                  ![w].invalidVerbatimCopy =
-                      @ \/ (useCopy /\ ~(~priorAttempted /\ observation = "Absent")),
                   ![w].publishedWithoutPrecommit =
                       @ \/ writer[w].precommit /= "Durable",
                   ![w].sawCondemnedAttempt =
@@ -491,7 +510,12 @@ BackendLand(w) ==
                /\ writer[w].sawStagedCopy
                /\ writer[w].sawResponseLost
                /\ writer[w].sawRecoveryHead
-       IN /\ body' =
+           reproducesQueuedToken ==
+               \E record \in queuedDeletes : record.token = token
+       IN /\ (~(Defect("first_condemned_then_copy")
+                 /\ writer[w].plannedInvalidVerbatimCopy)
+               \/ reproducesQueuedToken)
+          /\ body' =
               [present |-> TRUE,
                payload |-> payload,
                envelope |-> envelope,
@@ -501,17 +525,22 @@ BackendLand(w) ==
           /\ writer' =
               [writer EXCEPT
                   ![w].attemptLanded = TRUE,
+                  ![w].invalidVerbatimCopy =
+                      @ \/ writer[w].plannedInvalidVerbatimCopy,
                   ![w].needsFreshPublication =
                       IF afterCondemned
-                      THEN token = writer[w].plannedOldToken
+                      THEN envelope = writer[w].plannedOldEnvelope
                       ELSE @,
                   ![w].sawStagedCopy = @ \/ stagedCopy,
                   ![w].publishedFromAbsent = @ \/ fromAbsent,
                   ![w].publishedAbsentSeq =
-                      IF fromAbsent THEN writer[w].plannedObservedSeq ELSE @]
+                      IF fromAbsent THEN writer[w].plannedObservedSeq ELSE @,
+                  ![w].retryLandedBeforeLate =
+                      @ \/ writer[w].latePending]
           /\ badFreshAfterCondemned' =
               (badFreshAfterCondemned
-               \/ (afterCondemned /\ token = writer[w].plannedOldToken))
+               \/ (afterCondemned
+                   /\ envelope = writer[w].plannedOldEnvelope))
           /\ racingPublishersReached' =
               (racingPublishersReached
                \/ (fromAbsent
@@ -555,8 +584,14 @@ PublicationResponseLost(w) ==
                 IF writer[w].attemptLanded THEN "None" ELSE writer[w].plannedObservation,
             ![w].lateOldToken =
                 IF writer[w].attemptLanded THEN NoToken ELSE writer[w].plannedOldToken,
+            ![w].lateOldEnvelope =
+                IF writer[w].attemptLanded THEN 0 ELSE writer[w].plannedOldEnvelope,
             ![w].lateObservedSeq =
                 IF writer[w].attemptLanded THEN 0 ELSE writer[w].plannedObservedSeq,
+            ![w].lateInvalidVerbatimCopy =
+                IF writer[w].attemptLanded
+                THEN FALSE
+                ELSE writer[w].plannedInvalidVerbatimCopy,
             ![w].attemptLanded = FALSE]
     /\ UNCHANGED
         <<tokenFamily, fenceGeneration, body, nextToken, nextEnvelope, writeSeq,
@@ -584,7 +619,9 @@ RecoverWithoutLateLanding(w) ==
             ![w].lateEnvelope = 0,
             ![w].lateObservation = "None",
             ![w].lateOldToken = NoToken,
-            ![w].lateObservedSeq = 0]
+            ![w].lateOldEnvelope = 0,
+            ![w].lateObservedSeq = 0,
+            ![w].lateInvalidVerbatimCopy = FALSE]
     /\ UNCHANGED
         <<tokenFamily, fenceGeneration, body, nextToken, nextEnvelope, writeSeq,
           metaState, metaVersion, queuedDeletes, seeded,
@@ -602,17 +639,19 @@ ResolveLateAsNotLanded(w) ==
             ![w].lateEnvelope = 0,
             ![w].lateObservation = "None",
             ![w].lateOldToken = NoToken,
-            ![w].lateObservedSeq = 0]
+            ![w].lateOldEnvelope = 0,
+            ![w].lateObservedSeq = 0,
+            ![w].lateInvalidVerbatimCopy = FALSE]
     /\ UNCHANGED
         <<tokenFamily, fenceGeneration, body, nextToken, nextEnvelope, writeSeq,
           metaState, metaVersion, queuedDeletes, seeded,
           badFreshAfterCondemned, freshIncarnationDeleted,
           racingPublishersReached, stagedRetagReached, lateLandingReached>>
 
+(* An old backend request remains independently landable after retry publication and readiness. *)
 LateBackendLand(w) ==
     /\ writer[w].latePending
     /\ writer[w].sawRecoveryHead
-    /\ writer[w].phase \in {"Head", "MetaRead", "Publish"}
     /\ CanLand
     /\ LET envelope == writer[w].lateEnvelope
            payload == SourcePayload(w)
@@ -629,7 +668,12 @@ LateBackendLand(w) ==
                /\ writer[w].sawStagedCopy
                /\ writer[w].sawResponseLost
                /\ writer[w].sawRecoveryHead
-       IN /\ body' =
+           reproducesQueuedToken ==
+               \E record \in queuedDeletes : record.token = token
+       IN /\ (~(Defect("first_condemned_then_copy")
+                 /\ writer[w].lateInvalidVerbatimCopy)
+               \/ reproducesQueuedToken)
+          /\ body' =
               [present |-> TRUE,
                payload |-> payload,
                envelope |-> envelope,
@@ -643,10 +687,14 @@ LateBackendLand(w) ==
                   ![w].lateEnvelope = 0,
                   ![w].lateObservation = "None",
                   ![w].lateOldToken = NoToken,
+                  ![w].lateOldEnvelope = 0,
                   ![w].lateObservedSeq = 0,
+                  ![w].lateInvalidVerbatimCopy = FALSE,
+                  ![w].invalidVerbatimCopy =
+                      @ \/ writer[w].lateInvalidVerbatimCopy,
                   ![w].needsFreshPublication =
                       IF afterCondemned
-                      THEN token = writer[w].lateOldToken
+                      THEN envelope = writer[w].lateOldEnvelope
                       ELSE @,
                   ![w].sawStagedCopy = @ \/ stagedCopy,
                   ![w].publishedFromAbsent = @ \/ fromAbsent,
@@ -654,7 +702,8 @@ LateBackendLand(w) ==
                       IF fromAbsent THEN writer[w].lateObservedSeq ELSE @]
           /\ badFreshAfterCondemned' =
               (badFreshAfterCondemned
-               \/ (afterCondemned /\ token = writer[w].lateOldToken))
+               \/ (afterCondemned
+                   /\ envelope = writer[w].lateOldEnvelope))
           /\ racingPublishersReached' =
               (racingPublishersReached
                \/ (fromAbsent
@@ -862,8 +911,8 @@ StagedRetagWitnessAction ==
 LateLandingWitnessAction ==
     \E w \in Writers :
         /\ LateBackendLand(w)
-        /\ ~lateLandingReached
-        /\ lateLandingReached'
+        /\ writer[w].phase = "Ready"
+        /\ writer[w].retryLandedBeforeLate
 
 Spec == Init /\ [][Next]_vars
 
@@ -906,9 +955,9 @@ FencedWriterCannotCommit ==
 
 KeyNamesPayload == ~body.present \/ body.payload = KeyPayload
 
-(* Negated reachability predicates: TLC must violate each named witness. *)
+(* Negated reachability checks: TLC must violate each named witness. *)
 WitnessRacingPublishers == ~racingPublishersReached
 WitnessStagedRetag == ~stagedRetagReached
-WitnessLateLanding == ~lateLandingReached
+WitnessLateLanding == [][~LateLandingWitnessAction]_vars
 
 ====================================================================================

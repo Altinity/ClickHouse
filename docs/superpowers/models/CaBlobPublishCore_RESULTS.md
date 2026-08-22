@@ -24,11 +24,11 @@ the safety invariants remained enabled.
 - Workers: `1`.
 - Writers: `w1` and `w2`; one GC actor.
 - Bounds: two publication attempts per writer, two total landed writes, four metadata versions, and
-  two fence generations. Two landed writes are sufficient for every required race, replacement,
-  exact-delete retry, and late-landing trace.
+  two fence generations. `MaxWrites` counts the optional seed as a landed write.
 - The safe configuration explores both deterministic ETag tokens and allocation-based generation
-  tokens. ETag-specific sabotage and witness configurations use `ETag` so byte-identical envelope
-  reproduction is explicit.
+  tokens. `sab_reuse_condemned_envelope` uses `Generation` and still fails by direct condemned-
+  envelope comparison. The staged-copy sabotages use `ETag` so byte-identical reproduction is
+  explicit.
 - TLC metadata, traces, and row logs were stored below the repository `tmp` directory.
 - The runner passes `-noGenerateSpecTE`, so TLC does not create source-adjacent trace modules.
 
@@ -36,8 +36,17 @@ The model separates durable precommit, `HEAD`, metadata observation, publication
 landing, response loss, recovery, metadata reconciliation, readiness, commit, fence loss, and exact
 deletion. Each writer has a fixed staged envelope and monotonic `publicationAttempted` history.
 ETags are a deterministic function of envelope plus payload; generation tokens consume `nextToken`
-on every landed write. A single queued exact-delete record remains available for retries, which is
-the authorization needed by all three staged-copy regressions.
+on every landed write. Freshness after `Condemned` compares the selected envelope directly, not the
+provider token. A single queued exact-delete record remains available for retries, which is the
+authorization needed by all three staged-copy regressions. A pending old backend attempt can land
+in any current writer phase; the late witness requires the retry to land and reach `Ready` first.
+
+The two-write accounting is concrete: the fresh-writer race, both recopy regressions, and the staged
+retag witness use no seed and two landings; the corrected late witness uses the retry landing and
+then the old late landing; condemned-envelope reuse and the first-condemned regression use one seed
+plus one landing. Exact-delete actions do not consume a write. The omitted shape—one seed followed
+by two post-seed racing replacements—is a cross-product not required by a named sabotage or witness;
+its fresh-writer race and seeded condemnation/delete dimensions are checked separately.
 
 ## Safety invariants {#safety-invariants}
 
@@ -61,55 +70,55 @@ observation.
 
 ## First complete run {#first-complete-run}
 
-Command output: `build/task1_blobpublish_tla.log`. TLC row-log run ID:
-`CaBlobPublishCore-11-1787382593629836842`.
+Command output: `build/task1_blobpublish_tla_fix_round1.log`. TLC row-log run ID:
+`CaBlobPublishCore-11-1787384973424501810`.
 
 | Configuration | Expected | Exact observed result | Generated | Distinct | Seconds |
 |---|---|---|---:|---:|---:|
 | `CaBlobPublishCore_sab_adopt_condemned.cfg` | violation | `CondemnedNeedsFreshPublication` | 83 | 49 | 0 |
-| `CaBlobPublishCore_sab_reuse_condemned_envelope.cfg` | violation | `FreshAfterCondemned` | 303 | 159 | 1 |
-| `CaBlobPublishCore_sab_recopy_after_condemned.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 28,567 | 10,778 | 1 |
-| `CaBlobPublishCore_sab_recopy_after_absent.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 17,311 | 6,691 | 0 |
-| `CaBlobPublishCore_sab_first_condemned_then_copy.cfg` | violation | `VerbatimCopyOnlyFirstAbsent` | 4,182 | 1,547 | 0 |
+| `CaBlobPublishCore_sab_reuse_condemned_envelope.cfg` | violation | `FreshAfterCondemned` | 296 | 159 | 1 |
+| `CaBlobPublishCore_sab_recopy_after_condemned.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 31,563 | 11,762 | 0 |
+| `CaBlobPublishCore_sab_recopy_after_absent.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 18,953 | 7,233 | 1 |
+| `CaBlobPublishCore_sab_first_condemned_then_copy.cfg` | violation | `VerbatimCopyOnlyFirstAbsent` | 7,937 | 2,753 | 0 |
 | `CaBlobPublishCore_sab_unconditional_delete.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 608 | 284 | 1 |
 | `CaBlobPublishCore_sab_ready_without_reobserve.cfg` | violation | `ReadyRequiresObservedMaterialization` | 118 | 65 | 0 |
 | `CaBlobPublishCore_sab_publish_before_precommit.cfg` | violation | `PublicationRequiresDurablePrecommit` | 58 | 39 | 0 |
 | `CaBlobPublishCore_sab_skip_meta_clean.cfg` | violation | `ReadyRequiresCleanMeta` | 212 | 107 | 1 |
 | `CaBlobPublishCore_sab_commit_after_fence.cfg` | violation | `FencedWriterCannotCommit` | 146 | 81 | 0 |
 | `CaBlobPublishCore_sab_wrong_payload.cfg` | violation | `KeyNamesPayload` | 56 | 32 | 0 |
-| `CaBlobPublishCore_safe.cfg` | green | `green` | 11,023,983 | 1,696,943 | 67 |
-| `CaBlobPublishCore_witness_racing_publishers.cfg` | witness | `WitnessRacingPublishers` reached | 888 | 380 | 1 |
-| `CaBlobPublishCore_witness_staged_retag.cfg` | witness | `WitnessStagedRetag` reached | 5,087 | 1,783 | 0 |
-| `CaBlobPublishCore_witness_late_landing.cfg` | witness | `WitnessLateLanding` reached | 441 | 203 | 0 |
+| `CaBlobPublishCore_safe.cfg` | green | `green` | 13,270,635 | 2,051,149 | 85 |
+| `CaBlobPublishCore_witness_racing_publishers.cfg` | witness | `WitnessRacingPublishers` reached | 890 | 380 | 1 |
+| `CaBlobPublishCore_witness_staged_retag.cfg` | witness | `WitnessStagedRetag` reached | 5,159 | 1,809 | 0 |
+| `CaBlobPublishCore_witness_late_landing.cfg` | witness | `WitnessLateLanding` reached | 5,344 | 1,853 | 1 |
 
 The safe graph completed at depth `34` with zero states left on the queue. The TLC log reports
-`01min 06s`; the runner's whole-second measurement reports `67` seconds.
+`01min 24s`; the runner's whole-second measurement reports `85` seconds.
 
 ## Second complete run {#second-complete-run}
 
-Command output: `build/task1_blobpublish_tla_rerun.log`. TLC row-log run ID:
-`CaBlobPublishCore-11-1787382699119372279`.
+Command output: `build/task1_blobpublish_tla_fix_round1_rerun.log`. TLC row-log run ID:
+`CaBlobPublishCore-11-1787385081646033514`.
 
 | Configuration | Expected | Exact observed result | Generated | Distinct | Seconds |
 |---|---|---|---:|---:|---:|
 | `CaBlobPublishCore_sab_adopt_condemned.cfg` | violation | `CondemnedNeedsFreshPublication` | 83 | 49 | 0 |
-| `CaBlobPublishCore_sab_reuse_condemned_envelope.cfg` | violation | `FreshAfterCondemned` | 303 | 159 | 0 |
-| `CaBlobPublishCore_sab_recopy_after_condemned.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 28,567 | 10,778 | 1 |
-| `CaBlobPublishCore_sab_recopy_after_absent.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 17,311 | 6,691 | 1 |
-| `CaBlobPublishCore_sab_first_condemned_then_copy.cfg` | violation | `VerbatimCopyOnlyFirstAbsent` | 4,182 | 1,547 | 0 |
+| `CaBlobPublishCore_sab_reuse_condemned_envelope.cfg` | violation | `FreshAfterCondemned` | 296 | 159 | 1 |
+| `CaBlobPublishCore_sab_recopy_after_condemned.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 31,563 | 11,762 | 1 |
+| `CaBlobPublishCore_sab_recopy_after_absent.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 18,953 | 7,233 | 0 |
+| `CaBlobPublishCore_sab_first_condemned_then_copy.cfg` | violation | `VerbatimCopyOnlyFirstAbsent` | 7,937 | 2,753 | 1 |
 | `CaBlobPublishCore_sab_unconditional_delete.cfg` | violation | `ExactDeleteCannotRemoveFreshIncarnation` | 608 | 284 | 0 |
-| `CaBlobPublishCore_sab_ready_without_reobserve.cfg` | violation | `ReadyRequiresObservedMaterialization` | 118 | 65 | 1 |
-| `CaBlobPublishCore_sab_publish_before_precommit.cfg` | violation | `PublicationRequiresDurablePrecommit` | 58 | 39 | 0 |
+| `CaBlobPublishCore_sab_ready_without_reobserve.cfg` | violation | `ReadyRequiresObservedMaterialization` | 118 | 65 | 0 |
+| `CaBlobPublishCore_sab_publish_before_precommit.cfg` | violation | `PublicationRequiresDurablePrecommit` | 58 | 39 | 1 |
 | `CaBlobPublishCore_sab_skip_meta_clean.cfg` | violation | `ReadyRequiresCleanMeta` | 212 | 107 | 0 |
-| `CaBlobPublishCore_sab_commit_after_fence.cfg` | violation | `FencedWriterCannotCommit` | 146 | 81 | 1 |
-| `CaBlobPublishCore_sab_wrong_payload.cfg` | violation | `KeyNamesPayload` | 56 | 32 | 0 |
-| `CaBlobPublishCore_safe.cfg` | green | `green` | 11,023,983 | 1,696,943 | 66 |
-| `CaBlobPublishCore_witness_racing_publishers.cfg` | witness | `WitnessRacingPublishers` reached | 888 | 380 | 1 |
-| `CaBlobPublishCore_witness_staged_retag.cfg` | witness | `WitnessStagedRetag` reached | 5,087 | 1,783 | 0 |
-| `CaBlobPublishCore_witness_late_landing.cfg` | witness | `WitnessLateLanding` reached | 441 | 203 | 0 |
+| `CaBlobPublishCore_sab_commit_after_fence.cfg` | violation | `FencedWriterCannotCommit` | 146 | 81 | 0 |
+| `CaBlobPublishCore_sab_wrong_payload.cfg` | violation | `KeyNamesPayload` | 56 | 32 | 1 |
+| `CaBlobPublishCore_safe.cfg` | green | `green` | 13,270,635 | 2,051,149 | 84 |
+| `CaBlobPublishCore_witness_racing_publishers.cfg` | witness | `WitnessRacingPublishers` reached | 890 | 380 | 0 |
+| `CaBlobPublishCore_witness_staged_retag.cfg` | witness | `WitnessStagedRetag` reached | 5,159 | 1,809 | 1 |
+| `CaBlobPublishCore_witness_late_landing.cfg` | witness | `WitnessLateLanding` reached | 5,344 | 1,853 | 0 |
 
 The second safe graph also completed at depth `34` with zero states left on the queue. The TLC log
-reports `01min 05s`; the runner reports `66` seconds.
+reports `01min 24s`; the runner reports `84` seconds.
 
 ## Counterexample audit {#counterexample-audit}
 
@@ -124,7 +133,9 @@ The underlying TLC traces were inspected, not only the runner summary:
   reconciliation and readiness, then the queued exact-delete retry removes the newer write serial.
 - `sab_first_condemned_then_copy` starts from a present body, observes `Condemned`, begins a retagged
   stream, loses the response before landing, enters recovery, lets the queued exact delete remove the
-  old body, observes absence, and then selects the forbidden original staged copy.
+  old body, observes absence, and then lands the forbidden original staged copy. The seed, queued
+  authorization, and replacement are all `ETag(1, Content)`, while the write serial changes from
+  `1` to `2`; the invariant no longer fires merely at transport selection.
 
 Every other sabotage trace ended at the mapped invariant shown in the tables. No timeout, parse
 error, deadlock, wrong invariant, or unrelated TLC error was classified as a pass.
@@ -135,24 +146,26 @@ error, deadlock, wrong invariant, or unrelated TLC error was classified as a pas
   landing equivalent publications.
 - `WitnessStagedRetag` records an absent verbatim staged copy, backend landing, response loss,
   recovery `HEAD`, `Condemned` re-observation, and a fresh retagged stream landing.
-- `WitnessLateLanding` records response loss before backend landing, recovery `HEAD`, and then
-  `LateBackendLand` from the old attempt.
+- `WitnessLateLanding` records response loss before backend landing, recovery `HEAD`, a retry
+  publication landing and reconciling to `Ready`, and only then `LateBackendLand` from the old
+  attempt. The old request changes the body after the newer request has become ready.
 
-Each witness config lists all eleven safety invariants before its negated reachability invariant.
+Each witness config lists all eleven safety invariants before its negated reachability check.
 The safe config explores the same honest behavior with both token families to completion.
 
 ## Commands {#commands}
 
 ```bash
 mkdir -p build tmp
-docs/superpowers/models/run_blobpublish.sh > build/task1_blobpublish_tla.log 2>&1
-grep -q '^ALL EXPECTATIONS MET$' build/task1_blobpublish_tla.log
-docs/superpowers/models/run_blobpublish.sh > build/task1_blobpublish_tla_rerun.log 2>&1
-grep -q '^ALL EXPECTATIONS MET$' build/task1_blobpublish_tla_rerun.log
+docs/superpowers/models/run_blobpublish.sh > build/task1_blobpublish_tla_fix_round1.log 2>&1
+grep -q '^ALL EXPECTATIONS MET$' build/task1_blobpublish_tla_fix_round1.log
+docs/superpowers/models/run_blobpublish.sh > build/task1_blobpublish_tla_fix_round1_rerun.log 2>&1
+grep -q '^ALL EXPECTATIONS MET$' build/task1_blobpublish_tla_fix_round1_rerun.log
 ```
 
 Both `grep` commands exited `0`. The complete runner output for each run ended with
-`ALL EXPECTATIONS MET`.
+`ALL EXPECTATIONS MET`. A successful focused invocation instead prints
+`SELECTED EXPECTATIONS MET`; it cannot satisfy the full-battery grep gate.
 
 ## Scope note {#scope-note}
 

@@ -72,6 +72,7 @@ witness_declares_safety()
 }
 
 overall=0
+executed=0
 run_id="${MODULE}-$$-$(date +%s%N)"
 printf '%-34s %-10s %-42s %10s %10s %8s %s\n' \
     "CONFIG" "EXPECT" "RESULT" "GENERATED" "DISTINCT" "SECONDS" "VERDICT"
@@ -81,6 +82,7 @@ do
     selected "$name" "$@" || continue
 
     cfg="${MODULE}_${name}.cfg"
+    executed=$((executed + 1))
     log="../../../tmp/tlc-${run_id}-${name}.log"
     meta="../../../tmp/tlc-meta-${run_id}-${name}"
     start=$SECONDS
@@ -150,10 +152,20 @@ then
     done
 fi
 
+if [[ $# -eq 0 && $executed -ne ${#CONFIGS[@]} ]]
+then
+    overall=1
+fi
+
 echo
 if [[ $overall -eq 0 ]]
 then
-    echo "ALL EXPECTATIONS MET"
+    if [[ $# -eq 0 ]]
+    then
+        echo "ALL EXPECTATIONS MET"
+    else
+        echo "SELECTED EXPECTATIONS MET"
+    fi
 else
     echo "SOME EXPECTATIONS UNMET"
 fi
