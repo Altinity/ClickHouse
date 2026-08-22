@@ -328,7 +328,7 @@ def _split_source(raw):
 
 def _request_class(bucket, key):
     """Classify by durable key family, independently of method and conditional headers."""
-    if bucket == "plainbucket":
+    if bucket in ("plainbucket", "plainhmacbucket"):
         return "ordinary_non_cas"
     if bucket not in ("oauthbucket", "hmacbucket"):
         return "probe"
@@ -345,6 +345,15 @@ def _request_operation(bucket, request_class, method, query, headers):
     generation_match = "x-goog-if-generation-match" in headers
     copy_source = _copy_source(headers)
 
+    # Multipart is a wire shape, not an object role. Classify it before conditional headers and key
+    # families so the confinement tests can see a forbidden mutable/control multipart request rather
+    # than having it disappear into `conditional_put` or `ordinary`.
+    if method == "POST" and "uploads" in query:
+        return "blob_multipart_create"
+    if method == "PUT" and "partNumber" in query and "uploadId" in query:
+        return "blob_multipart_part"
+    if method == "POST" and "uploadId" in query:
+        return "blob_multipart_complete"
     if method == "DELETE" and generation_match:
         return "exact_delete"
     if method == "HEAD" and request_class in ("blob_body", "blob_meta", "cas_control"):
@@ -354,12 +363,6 @@ def _request_operation(bucket, request_class, method, query, headers):
             return "conditional_copy"
         return "conditional_put"
     if request_class == "blob_body":
-        if method == "POST" and "uploads" in query:
-            return "blob_multipart_create"
-        if method == "PUT" and "partNumber" in query:
-            return "blob_multipart_part"
-        if method == "POST" and "uploadId" in query:
-            return "blob_multipart_complete"
         if method == "PUT" and copy_source is not None:
             source_bucket, source_key = _split_source(copy_source)
             if source_bucket == bucket and _request_class(source_bucket, source_key) == "staging":

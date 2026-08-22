@@ -231,7 +231,14 @@ def test_gcp_auth_ordinary_contract(started_cluster):
     reset()
     assert node.query("SELECT * FROM s3_ordinary_write") == "hello\n"
     read_requests = get_captured()
-    assert any(r["method"] == "GET" for r in read_requests)
+    assert any(
+        r["method"] == "HEAD" and r["path"].split("?", 1)[0] == "/test/ordinary.txt"
+        for r in read_requests
+    ), "expected the direct-key read to issue HEAD for ordinary.txt"
+    assert any(
+        r["method"] == "GET" and r["path"].split("?", 1)[0] == "/test/ordinary.txt"
+        for r in read_requests
+    ), "expected the direct-key read to issue GET for ordinary.txt"
     assert_default_oauth(read_requests)
 
     # LIST: a glob forces a real ListObjectsV2 call (`list-type=2`), independent of the single-key

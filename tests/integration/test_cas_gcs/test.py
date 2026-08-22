@@ -30,6 +30,7 @@ fake's own behaviour. The prefix mapping is covered by the dialect and client un
 import json
 import os
 import re
+import runpy
 import urllib.parse
 
 import pytest
@@ -47,6 +48,8 @@ METADATA_PORT = 80
 CAS_DISKS = {"cas_gcs_oauth": "oauthbucket", "cas_gcs_hmac": "hmacbucket"}
 PLAIN_DISK = "plain_gcs_oauth"
 PLAIN_BUCKET = "plainbucket"
+PLAIN_HMAC_DISK = "plain_gcs_hmac"
+PLAIN_HMAC_BUCKET = "plainhmacbucket"
 
 NUM_ROWS = 200
 
@@ -54,6 +57,9 @@ NUM_ROWS = 200
 CONFIG_IN_CONTAINER = "/etc/clickhouse-server/config.d/cas_gcs.xml"
 
 cluster = ClickHouseCluster(__file__)
+GCS_MOCK_NAMESPACE = runpy.run_path(
+    os.path.join(os.path.dirname(__file__), "gcs_mocks", "server.py")
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -103,19 +109,46 @@ def start_cluster():
             CONFIG_IN_CONTAINER,
         )
         # Keep OAuth on local staging so the targeted large-blob query can exercise multipart.
-        # Keep GOOG4 on explicit S3 staging so the same fixture also exercises native-only copy and
-        # the condemned-source retagging path. The checked-in XML remains the stable base fixture;
-        # these Task 9 transport choices are local to this test module.
+        # Keep the checked-in CAS GOOG4 disk on explicit S3 staging so the same fixture also
+        # exercises native-only copy and the condemned-source retagging path. Do this before adding
+        # ordinary GOOG4 configuration so its independent client never acquires a CAS-only setting.
         node.replace_in_config(
             CONFIG_IN_CONTAINER,
             "<http_client>gcs_hmac</http_client>",
             "<http_client>gcs_hmac</http_client><staging_backend>s3</staging_backend>",
+        )
+        # Add the ordinary GOOG4 peer dynamically so Task 9 stays within its four-file scope while
+        # exercising the same fake service and signer independently of CAS request marking.
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "</disks>",
+            "<plain_gcs_hmac><type>object_storage</type><object_storage_type>s3</object_storage_type>"
+            "<endpoint>http://fakegcs:8080/plainhmacbucket/plain/</endpoint>"
+            "<http_client>gcs_hmac</http_client><access_key_id>GOOG1EFAKEACCESSKEYID</access_key_id>"
+            "<secret_access_key>fake-goog4-hmac-secret</secret_access_key></plain_gcs_hmac></disks>",
+        )
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "</policies>",
+            "<plain_gcs_hmac><volumes><main><disk>plain_gcs_hmac</disk></main></volumes>"
+            "</plain_gcs_hmac></policies>",
+        )
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "</clickhouse>",
+            "<named_collections><plain_gcs_hmac_conn>"
+            "<url>http://fakegcs:8080/plainhmacbucket/ordinary/</url>"
+            "<http_client>gcs_hmac</http_client>"
+            "<access_key_id>GOOG1EFAKEACCESSKEYID</access_key_id>"
+            "<secret_access_key>fake-goog4-hmac-secret</secret_access_key>"
+            "</plain_gcs_hmac_conn></named_collections></clickhouse>",
         )
         node.restart_clickhouse()
 
         for disk in CAS_DISKS:
             _create_and_fill(node, disk)
         _create_and_fill(node, PLAIN_DISK)
+        _create_and_fill(node, PLAIN_HMAC_DISK)
         yield cluster
     finally:
         cluster.shutdown()
@@ -318,6 +351,32 @@ def _looks_default_on_oauth(record):
     return "x-amz-api-version" in record["headers"]
 
 
+@pytest.mark.parametrize("request_class", ("blob_meta", "cas_control"))
+@pytest.mark.parametrize(
+    "method,query,headers,expected",
+    (
+        ("POST", {"uploads": [""]}, {}, "blob_multipart_create"),
+        (
+            "PUT",
+            {"partNumber": ["1"], "uploadId": ["upload-1"]},
+            {"x-goog-if-generation-match": "7"},
+            "blob_multipart_part",
+        ),
+        ("POST", {"uploadId": ["upload-1"]}, {}, "blob_multipart_complete"),
+    ),
+)
+def test_mock_classifies_multipart_before_object_role(
+    request_class, method, query, headers, expected
+):
+    """A forbidden mutable multipart request must remain visible to confinement assertions."""
+    assert (
+        GCS_MOCK_NAMESPACE["_request_operation"](
+            "oauthbucket", request_class, method, query, headers
+        )
+        == expected
+    )
+
+
 def test_data_is_readable_on_every_disk():
     """Mount, write and read back on both `http_client` values and on the ordinary disk.
 
@@ -329,7 +388,7 @@ def test_data_is_readable_on_every_disk():
     """
     node = cluster.instances["node"]
     expected_sum = (NUM_ROWS - 1) * NUM_ROWS // 2
-    for disk in list(CAS_DISKS) + [PLAIN_DISK]:
+    for disk in list(CAS_DISKS) + [PLAIN_DISK, PLAIN_HMAC_DISK]:
         table = "t_" + disk
         assert int(node.query("SELECT count() FROM {}".format(table))) == NUM_ROWS
         assert int(node.query("SELECT sum(id) FROM {}".format(table))) == expected_sum
@@ -689,6 +748,91 @@ def test_ordinary_gcp_oauth_traffic_keeps_upstream_semantics():
         )
 
 
+def test_ordinary_goog4_traffic_keeps_upstream_semantics():
+    """Exercise ordinary GOOG4 read/write/list/delete/multipart forms independently of CAS."""
+    node = cluster.instances["node"]
+    assert (
+        node.query(
+            "SELECT count() FROM system.disks WHERE name = '{}'".format(PLAIN_HMAC_DISK)
+        ).strip()
+        == "1"
+    ), "the ordinary GOOG4 disk is absent"
+
+    table = "task9_plain_gcs_hmac_s3"
+    multipart_table = "task9_plain_gcs_hmac_multipart"
+    node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    node.query("DROP TABLE IF EXISTS {} SYNC".format(multipart_table))
+    first_seq = _next_seq()
+    node.query(
+        "CREATE TABLE {} (line String) ENGINE = S3(plain_gcs_hmac_conn, "
+        "filename='ordinary.txt', format='LineAsString')".format(table)
+    )
+    node.query("INSERT INTO {} VALUES ('goog4')".format(table))
+    assert node.query("SELECT * FROM {}".format(table)) == "goog4\n"
+    ordinary_etag = node.query(
+        "SELECT _etag FROM s3(plain_gcs_hmac_conn, filename='ordinary.txt', "
+        "format='LineAsString') LIMIT 1"
+    ).strip()
+    assert ordinary_etag and not ordinary_etag.isdigit(), ordinary_etag
+    assert (
+        node.query(
+            "SELECT * FROM s3(plain_gcs_hmac_conn, filename='ordinary*.txt', "
+            "format='LineAsString')"
+        )
+        == "goog4\n"
+    )
+    node.query("TRUNCATE TABLE {}".format(table))
+
+    node.query(
+        "CREATE TABLE {} (line String) ENGINE = S3(plain_gcs_hmac_conn, "
+        "filename='multipart.txt', format='LineAsString')".format(multipart_table)
+    )
+    node.query(
+        "INSERT INTO {} SELECT repeat('m', 512 * 1024)".format(multipart_table),
+        settings={"s3_max_single_part_upload_size": 0, "s3_min_upload_part_size": 65536},
+    )
+    node.query("TRUNCATE TABLE {}".format(multipart_table))
+    node.query("DROP TABLE {} SYNC".format(table))
+    node.query("DROP TABLE {} SYNC".format(multipart_table))
+
+    records = _captured_since(first_seq, PLAIN_HMAC_BUCKET)
+    assert records, "the ordinary GOOG4 workload sent no request"
+    for record in records:
+        headers = record["headers"]
+        assert record["request_class"] == "ordinary_non_cas", record
+        assert headers.get("authorization", "").startswith("GOOG4-HMAC-SHA256 "), record
+        assert "x-goog-if-generation-match" not in headers, record
+        assert "if-match" not in headers, record
+        assert "if-none-match" not in headers, record
+        assert "x-amz-copy-source" not in headers, record
+        assert "x-goog-copy-source" not in headers, record
+        assert not _has_goog_metadata(record), record
+
+    assert [
+        r
+        for r in records
+        if r["method"] == "HEAD" and r["key"] == "ordinary/ordinary.txt"
+    ], "ordinary GOOG4 issued no HEAD for ordinary.txt"
+    assert [r for r in records if r["method"] == "GET" and r["key"]], (
+        "ordinary GOOG4 issued no object GET"
+    )
+    assert [r for r in records if r["method"] == "GET" and "list-type=2" in r["query"]], (
+        "ordinary GOOG4 issued no ListObjectsV2"
+    )
+    assert [r for r in records if r["method"] == "PUT"], "ordinary GOOG4 issued no PUT"
+    assert [r for r in records if r["method"] == "DELETE"], "ordinary GOOG4 issued no DELETE"
+    multipart = [
+        r
+        for r in records
+        if r["operation"]
+        in ("blob_multipart_create", "blob_multipart_part", "blob_multipart_complete")
+    ]
+    assert [r for r in multipart if r["operation"] == "blob_multipart_create"], multipart
+    assert [r for r in multipart if r["operation"] == "blob_multipart_part"], multipart
+    assert [r for r in multipart if r["operation"] == "blob_multipart_complete"], multipart
+    assert all(not _is_translated(r) for r in multipart), multipart
+
+
 def test_marked_and_default_heads_coexist_on_one_oauth_client():
     """Per-request marking, observed on ONE client, for ONE method, in ONE bucket.
 
@@ -861,7 +1005,7 @@ def test_a_permissive_service_does_not_change_what_cas_puts_on_the_wire():
     fake would have masked as a loud mount failure and this one catches as a silent one.
     """
     node = cluster.instances["node"]
-    tables = ["t_" + disk for disk in list(CAS_DISKS) + [PLAIN_DISK]]
+    tables = ["t_" + disk for disk in list(CAS_DISKS) + [PLAIN_DISK, PLAIN_HMAC_DISK]]
     # Read the counts before the remount rather than comparing against NUM_ROWS: later tests in this
     # file insert more rows, and a constant here would make this test's correctness depend on where it
     # sits in the file.
@@ -906,14 +1050,15 @@ def test_native_conditional_writes_seen_so_far_are_single_part():
     This prefix check localises an accidental multipart mutable write before the adversarial restart
     tests. The run-wide version remains last in the module.
     """
-    conditional_multipart = [
+    multipart = [
         r
         for r in _captured()
+        if r["bucket"] in CAS_DISKS.values()
         if r["operation"]
         in ("blob_multipart_create", "blob_multipart_part", "blob_multipart_complete")
-        and _is_translated(r)
     ]
-    assert not conditional_multipart, conditional_multipart
+    assert all(r["request_class"] == "blob_body" for r in multipart), multipart
+    assert all(not _is_translated(r) for r in multipart), multipart
 
 
 def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_client():
@@ -1175,7 +1320,7 @@ def test_multipart_remained_confined_to_default_blob_publication_during_the_whol
     carry no translated conditional header. This replaces the stale run-wide prohibition from the
     conditional-blob design.
     """
-    records = _captured()
+    records = [r for r in _captured() if r["bucket"] in CAS_DISKS.values()]
     multipart = [
         r
         for r in records
