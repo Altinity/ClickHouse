@@ -1105,28 +1105,31 @@ bool PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     case BlobDependencyProof::Materialized:
                         continue;   /// edge-protected; putBlob validated under the durable edge
                     case BlobDependencyProof::TrustedManifest:
-                        break;
+                        /// §4 manifest-trust: a `TrustedManifest` leaf is trusted — no HEAD, no loadMeta, no
+                        /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
+                        /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
+                        /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
+                        /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
+                        /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
+                        /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
+                        /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
+                        /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
+                        /// (`CasFsck.cpp`, `++report.dangling`), not this gate.
+                        ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);
+                        EventEmitter{*store}.emit([&](CasEvent & ev)
+                        {
+                            ev.type = CasEventType::BlobReuseAdopt;
+                            ev.object_kind = CasEventObjectKind::Blob;
+                            ev.object_hash = blobIdOf(e.ref);
+                            ev.outcome = "adopt";
+                            ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
+                        });
+                        continue;
                 }
 
-                /// §4 manifest-trust: a `TrustedManifest` leaf is trusted — no HEAD, no loadMeta, no
-                /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
-                /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
-                /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
-                /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
-                /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
-                /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
-                /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
-                /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
-                /// (`CasFsck.cpp`, `++report.dangling`), not this gate.
-                ProfileEvents::increment(ProfileEvents::CASBlobAdoptTrusted);
-                EventEmitter{*store}.emit([&](CasEvent & ev)
-                {
-                    ev.type = CasEventType::BlobReuseAdopt;
-                    ev.object_kind = CasEventObjectKind::Blob;
-                    ev.object_hash = blobIdOf(e.ref);
-                    ev.outcome = "adopt";
-                    ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
-                });
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "promote: blob leaf {} has an unnamed dependency proof at commit; failing closed",
+                    store->layout().blobKey(e.ref));
             }
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —

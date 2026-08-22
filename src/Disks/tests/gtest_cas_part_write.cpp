@@ -1006,6 +1006,31 @@ TEST(CASPartWriteTxn, PromotionAcceptsBothDependencyProofs)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
+TEST(CASPartWriteTxn, InvalidDependencyProofFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/invalid-proof"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    const ManifestEntry entry = blobManifestEntry("data.bin", "invalid-proof-body");
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
+
+    BlobUploadResult invalid{
+        entry.ref,
+        BlobDepRecord{ObjectKind::Blob, static_cast<BlobDependencyProof>(2), entry.blob_size},
+        BlobUploadOutcome::FreshUpload};
+    build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&invalid, 1));
+
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part_1", build->buildId(), id);
+        },
+        "unnamed dependency proof");
+}
+
 TEST(CASPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
 {
     /// §4 manifest-trust trade-off (D4 relink interserver-trust model): a committed-source adopted leaf is
