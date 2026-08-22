@@ -38,7 +38,7 @@ TXN-ONE-PIPELINE, ack-floor GC и прочее, поэтому часть выв
 | m2 | подтверждено (смежно с дубликат CAS-096) | P3 | нет | частично — `docs/superpowers/cas/2031-triage.md` CAS-096 {#refplan-dead-drop-counters},… | офлайновый `cas-gc-rebuild` печатает 9 полей отчёта, но не два «дисастер-специфичных» — `virgin_by_enumeration` и `adopted_seal_generation`. |
 | m3 | подтверждено | P3 | нет | — (нигде: в `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.md`, `2031-triage.md` про … | `SYSTEM CAS DROP POOL MEMBER` по-прежнему требует строковый литерал для диска, тогда как шесть соседних глаголов принимают bare identifier. |
 | m4 | подтверждено | P3 | нет | — (не отслеживается; `BACKLOG.md:723` {#issue-2211-gc-run-follower-noop} и `final-check… | `SYSTEM CAS GC RUN` без диска по-прежнему итерирует имена дисков без дедупа по нижележащему CA-указателю → двойной раунд на cache-over-CAS. |
-| m5 | дубликат CAS-033 | P2 | нет (пред-релизная половина висит на CAS-040) | `docs/superpowers/cas/2031-triage.md` CAS-033 {#ckpt-damage-no-repair-path} (by-design,… | порча тела манифеста по-прежнему валит весь раунд GC (нет try/catch), в отличие от per-namespace `HOLD` для ref-логов — но это уже покрыто CAS-033/CAS-040. |
+| m5 | дубликат CAS-033 | P2 | нет | `docs/superpowers/cas/2031-triage.md` CAS-033 {#ckpt-damage-no-repair-path} (by-design,… | Повреждённый owned/folded-манифест по-прежнему валит весь раунд GC через `Gc::foldManifestEdges` (нет try/catch), в отличие от per-namespace `HOLD` для ref-логов; это уже покрыто CAS-033. `CasOrphanManifestSweep` теперь записывает недекодируемый orphan и продолжает (`f738450415013c0f3da8b72746eed7edd04ed16d`; CAS-040 исправлен). |
 | m6 | подтверждено | P3 | нет | — (грепы по `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-todo.md`, `2031-triage.md` на `… | `system.cas_gc_log` по-прежнему на руками пронумерованных `Enum8`, тогда как соседний `cas_log` использует `LowCardinality(String)`. |
 | m7 | подтверждено | P3 | нет | — (не отслеживается) | `Primitives/CasTypes.h` по-прежнему включает `Formats/CasFormat.h` и зовёт `storedSuffix`, нарушая собственное правило «Primitives — zero outward dependencies». |
 | m8 | подтверждено | P3 | нет | — (смежно `2031-triage.md` CAS-037 {#numeric-parse-and-window-wrap}, но там про заворот… | `ReadBufferFromFileView::resizeWorkingBuffer` по-прежнему усекает буфер, не трогая `pos`, — латентный выход за границы, недостижимый текущими вызывающими. |
@@ -130,7 +130,7 @@ writepath stage-1, ни TXN-ONE-PIPELINE ни одного пункта этог
 P2-пункты (8): M6 (порядок teardown blob-пула в `clickhouse-local`), M7 (утечка inline-диска —
 осознанно отложена), M10 (динамическое подтверждение non-CAS), M11 (гард на копирование ИЗ CA —
 он же CAS-020), M12 (три док-неточности), M13 (ProfileEvent на retry-later), V4 (TOCTOU
-декоммиссии), m5 (blast radius GC — он же CAS-033/CAS-040). P3-хвост из 27 пунктов — кандидат на
+декоммиссии), m5 (blast radius GC для owned/folded-манифестов — он же CAS-033). P3-хвост из 27 пунктов — кандидат на
 один сводный проход: значительная его часть это прозаические правки (внутренние теги в
 пользовательских строках, «CA» против «CAS», устаревшие комментарии, мёртвый код), и их дешевле
 сделать одной пачкой, чем раундом на пункт.
@@ -528,7 +528,7 @@ P2 и не pre-release: это документация, ни одно из тр
 
 ### m5 (дубликат CAS-033, P2) {#m5}
 
-На HEAD место переехало в `Gc/CasGc.cpp:1301-1324` (`Gc::foldManifestEdges`): `decodePartManifest(...)` на `:1319` и два `throw Exception(ErrorCodes::CORRUPTED_DATA, ...)` на `:1320-1324` (ref mismatch / namespace mismatch) не обёрнуты ничем — исключение поднимается из fold и рвёт раунд целиком. Контраст с ref-логом сохранился (`gtest_cas_gc_fold.cpp:165` `RefMismatchFailsClosed`). Триаж 2031 уже адъюдицировал обе половины: CAS-033 признал пул-широкий destructive gate осознанным fail-closed выбором с трекингом гранулярности в BACKLOG, а CAS-040 (P1, до релиза) фиксирует именно «один битый/осиротевший манифест навсегда заклинивает GC по всему пулу». Отдельного действия по m5 не нужно.
+На HEAD место переехало в `Gc/CasGc.cpp:1301-1324` (`Gc::foldManifestEdges`): `decodePartManifest` на `:1319` и два throw с `CORRUPTED_DATA` на `:1320-1324` (ref mismatch / namespace mismatch) не обёрнуты ничем — исключение поднимается из fold и рвёт раунд целиком. Это fail-closed поведение для owned/folded-манифестов; контраст с ref-логом сохранился (`gtest_cas_gc_fold.cpp:165` `RefMismatchFailsClosed`). Оно отдельно от бывшего orphan-пути: `CasOrphanManifestSweep` теперь записывает недекодируемый orphan и продолжает sweep, поэтому CAS-040 исправлен коммитом `f738450415013c0f3da8b72746eed7edd04ed16d`. Триаж 2031 уже адъюдицировал остающееся поведение как CAS-033: пул-широкий destructive gate — осознанный fail-closed выбор с трекингом гранулярности в BACKLOG. Отдельного действия по m5 не нужно.
 
 ### m6 (подтверждено, P3) {#m6}
 
