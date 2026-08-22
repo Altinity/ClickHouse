@@ -46,6 +46,9 @@ using CreateReadBuffer = std::function<std::unique_ptr<SeekableReadBuffer>()>;
 /// and — only when `if_none_match` is also set — the multipart `CompleteMultipartUpload` as a
 /// defense-in-depth guard) eligible for the typed `NativeConditional` HTTP mode; see
 /// `WriteSettings::object_storage_request_mode`. It does not affect which copy strategy is chosen.
+///
+/// `copy_mode = NativeOnly` forbids the client-side read-write fallback. If native copy is disabled
+/// or cannot complete, the failure is propagated instead.
 void copyS3File(
     std::shared_ptr<const S3::Client> src_s3_client,
     const String & src_bucket,
@@ -63,7 +66,8 @@ void copyS3File(
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
     std::optional<String> if_none_match = {},
     String * out_dest_etag = nullptr,
-    ObjectStorageRequestMode request_mode = ObjectStorageRequestMode::Default);
+    ObjectStorageRequestMode request_mode = ObjectStorageRequestMode::Default,
+    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
 
 /// Copies data from any seekable source to S3.
 /// The same functionality can be done by using the function copyData() and the class WriteBufferFromS3

@@ -475,6 +475,12 @@ public:
     /// fail closed if unsupported (the profile is advisory only to backends that opt in).
     virtual bool supportsRetryProfile(ObjectStorageRetryProfile profile) const { return profile == ObjectStorageRetryProfile::Default; }
 
+    /// True when this object storage can execute copies under the given transport requirement.
+    virtual bool supportsCopyMode(ObjectStorageCopyMode mode) const
+    {
+        return mode == ObjectStorageCopyMode::Default;
+    }
+
     virtual ReadSettings patchSettings(const ReadSettings & read_settings) const;
 
     virtual WriteSettings patchSettings(const WriteSettings & write_settings) const;

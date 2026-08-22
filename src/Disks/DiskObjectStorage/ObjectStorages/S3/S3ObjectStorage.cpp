@@ -555,6 +555,13 @@ bool S3ObjectStorage::conditionalOpsUseGenerationTokens() const
     return client.get()->supportsGcsNativeConditionalRequests();
 }
 
+bool S3ObjectStorage::supportsCopyMode(ObjectStorageCopyMode mode) const
+{
+    return mode == ObjectStorageCopyMode::Default
+        || (mode == ObjectStorageCopyMode::NativeOnly
+            && s3_settings.get()->request_settings[S3RequestSetting::allow_native_copy]);
+}
+
 void S3ObjectStorage::pinConditionalOpsGenerationDialect(bool expect_generation_tokens)
 {
     pinned_generation_dialect.store(expect_generation_tokens ? 1 : 0);
@@ -781,9 +788,16 @@ void S3ObjectStorage::copyObject( // NOLINT
     const StoredObject & object_from,
     const StoredObject & object_to,
     const ReadSettings & read_settings,
-    const WriteSettings &,
+    const WriteSettings & write_settings,
     std::optional<ObjectAttributes> object_to_attributes)
 {
+    if (!supportsCopyMode(write_settings.object_storage_copy_mode))
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Native-only object copy requires the native S3 copy path, which is disabled "
+            "(allow_native_copy=false) for object storage {}",
+            getName());
+
     auto current_client = client.get();
     auto settings_ptr = s3_settings.get();
     auto size = S3::getObjectSize(*current_client, uri.bucket, object_from.remote_path, {});
@@ -804,7 +818,11 @@ void S3ObjectStorage::copyObject( // NOLINT
         BlobStorageLogWriter::create(disk_name),
         scheduler,
         [&, this]{ return readObject(object_from, read_settings_to_use);},
-        object_to_attributes);
+        object_to_attributes,
+        /*if_none_match=*/{},
+        /*out_dest_etag=*/nullptr,
+        /*request_mode=*/ObjectStorageRequestMode::Default,
+        write_settings.object_storage_copy_mode);
 }
 
 /// Consumes exactly two fields of `write_settings`: `object_storage_request_mode` and

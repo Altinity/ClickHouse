@@ -51,6 +51,7 @@ namespace ErrorCodes
     extern const int S3_ERROR;
     extern const int INVALID_CONFIG_PARAMETER;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace S3RequestSetting
@@ -653,7 +654,8 @@ namespace
             std::function<void()> fallback_method_,
             const std::optional<String> & if_none_match_ = {},
             String * out_dest_etag_ = nullptr,
-            ObjectStorageRequestMode request_mode_ = ObjectStorageRequestMode::Default)
+            ObjectStorageRequestMode request_mode_ = ObjectStorageRequestMode::Default,
+            bool allow_fallback_ = true)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -673,6 +675,7 @@ namespace
             , supports_multipart_copy(client_ptr_->supportsMultiPartCopy())
             , read_settings(read_settings_)
             , fallback_method(std::move(fallback_method_))
+            , allow_fallback(allow_fallback_)
         {
         }
 
@@ -699,6 +702,7 @@ namespace
         bool supports_multipart_copy;
         const ReadSettings read_settings;
         std::function<void()> fallback_method;
+        const bool allow_fallback;
 
         void performSingleOperationCopy()
         {
@@ -767,6 +771,12 @@ namespace
                 {
                     if (!supports_multipart_copy || outcome.GetError().GetExceptionName() == "AccessDenied")
                     {
+                        if (!allow_fallback)
+                            throw S3Exception(
+                                outcome.GetError().GetMessage(),
+                                outcome.GetError().GetErrorType(),
+                                outcome.GetError().GetExceptionName());
+
                         if (if_none_match.has_value())
                             throw S3Exception(
                                 outcome.GetError().GetMessage(),
@@ -834,6 +844,9 @@ namespace
             catch (const S3Exception & e)
             {
                 if (e.getS3ErrorCode() != Aws::S3::S3Errors::ACCESS_DENIED)
+                    throw;
+
+                if (!allow_fallback)
                     throw;
 
                 if (if_none_match.has_value())
@@ -923,7 +936,8 @@ void copyS3File(
     const std::optional<ObjectAttributes> & object_metadata,
     std::optional<String> if_none_match,
     String * out_dest_etag,
-    ObjectStorageRequestMode request_mode)
+    ObjectStorageRequestMode request_mode,
+    ObjectStorageCopyMode copy_mode)
 {
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;
@@ -945,6 +959,11 @@ void copyS3File(
 
     if (!settings[S3RequestSetting::allow_native_copy])
     {
+        if (copy_mode == ObjectStorageCopyMode::NativeOnly)
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Native-only S3 object copy is unavailable because allow_native_copy is disabled");
+
         LOG_TRACE(getLogger("copyS3File"), "Native copy is disable for {}", src_key);
         fallback_method();
         return;
@@ -966,7 +985,8 @@ void copyS3File(
         std::move(fallback_method),
         if_none_match,
         out_dest_etag,
-        request_mode};
+        request_mode,
+        /*allow_fallback=*/copy_mode == ObjectStorageCopyMode::Default};
     helper.performCopy();
 }
 

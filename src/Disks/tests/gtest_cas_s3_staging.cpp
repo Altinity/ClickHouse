@@ -459,6 +459,14 @@ TEST(CASS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
     });
 }
 
+TEST(CASS3Staging, DefaultObjectStorageRejectsNativeOnlyCopyMode)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+
+    EXPECT_TRUE(storage->supportsCopyMode(DB::ObjectStorageCopyMode::Default));
+    EXPECT_FALSE(storage->supportsCopyMode(DB::ObjectStorageCopyMode::NativeOnly));
+}
+
 /// Task 3 of the S3-native staging plan: the mount-time capability probe (`DB::Cas::probeConditionalCopy`)
 /// for the OPTIONAL conditional-copy capability (distinct from the mandatory `runCapabilityProbe`
 /// battery). These three tests cover the fail-close SELECTION logic with fakes — live 412-vs-created
