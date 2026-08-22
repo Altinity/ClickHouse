@@ -30,6 +30,7 @@ fake's own behaviour. The prefix mapping is covered by the dialect and client un
 import json
 import os
 import re
+import urllib.parse
 
 import pytest
 
@@ -101,6 +102,15 @@ def start_cluster():
             os.path.join(os.path.dirname(__file__), "configs", "config.xml"),
             CONFIG_IN_CONTAINER,
         )
+        # Keep OAuth on local staging so the targeted large-blob query can exercise multipart.
+        # Keep GOOG4 on explicit S3 staging so the same fixture also exercises native-only copy and
+        # the condemned-source retagging path. The checked-in XML remains the stable base fixture;
+        # these Task 9 transport choices are local to this test module.
+        node.replace_in_config(
+            CONFIG_IN_CONTAINER,
+            "<http_client>gcs_hmac</http_client>",
+            "<http_client>gcs_hmac</http_client><staging_backend>s3</staging_backend>",
+        )
         node.restart_clickhouse()
 
         for disk in CAS_DISKS:
@@ -157,6 +167,14 @@ def _set_if_match_mode(mode):
 
 def _set_omit_generation(enabled):
     return _control_post("/_control/mode?omit_generation=" + ("1" if enabled else "0"))
+
+
+def _condemn_blob(bucket, blob_key):
+    return _control_post(
+        "/_control/condemn?bucket={}&key={}".format(
+            urllib.parse.quote(bucket, safe=""), urllib.parse.quote(blob_key, safe="")
+        )
+    )
 
 
 def _raw(method, path, headers=()):
@@ -236,6 +254,33 @@ def _is_translated(record):
     return "x-goog-if-generation-match" in record["headers"] or _has_goog_metadata(record)
 
 
+def _blob_publications(records, key=None):
+    publications = [
+        record
+        for record in records
+        if record["operation"] in ("blob_put", "staged_copy", "blob_multipart_complete")
+    ]
+    if key is not None:
+        publications = [record for record in publications if record["key"] == key]
+    return publications
+
+
+def _meta_requests(records, blob_key):
+    return [record for record in records if record["key"] == blob_key + ".meta"]
+
+
+def _assert_default_blob_publication(record):
+    assert record["request_class"] == "blob_body", record
+    assert "x-goog-if-generation-match" not in record["headers"], record
+    assert "if-match" not in record["headers"], record
+    assert "if-none-match" not in record["headers"], record
+    assert not _has_goog_metadata(record), record
+    if record["bucket"] == CAS_DISKS["cas_gcs_oauth"]:
+        assert record["headers"].get("authorization", "").startswith("Bearer "), record
+    if record["bucket"] == CAS_DISKS["cas_gcs_hmac"]:
+        assert record["headers"].get("authorization", "").startswith("GOOG4-HMAC-SHA256 "), record
+
+
 # `AWS_HEADERS_CLEARED_BEFORE_GCS_AUTHENTICATION` in GCSConditionalDialect.cpp lists
 # `x-amz-api-version`, and `prepareGcsRequestForOAuthAuthentication` — which runs ONLY for a marked
 # request on the OAuth client — deletes every header in it. So on a `gcp_oauth` client the header's
@@ -304,6 +349,176 @@ def test_fake_service_keeps_the_two_token_domains_disjoint():
     for etag in minted["etags"]:
         assert not _unquote(etag).isdigit(), etag
     assert not (set(minted["generations"]) & {_unquote(e) for e in minted["etags"]})
+
+
+@pytest.mark.parametrize("disk", sorted(CAS_DISKS))
+def test_blob_publication_request_budget_and_default_mode(disk):
+    """Pin the fresh and cold-duplicate request shapes for one real blob key per CAS disk.
+
+    The OAuth disk publishes from local staging with an unconditional body PUT. The GOOG4 disk uses
+    explicit S3 staging and publishes with a native-only, unconditional copy. Repeating byte-identical
+    data then selects a blob that both inserts touched and proves the cold path uses one body `HEAD`,
+    one metadata GET, and no publication. The mock proves syntax, routing, and count isolation only;
+    live GCS acceptance belongs to the credential-gated Task 10 lane.
+
+    Would fail if: the mandatory blob `HEAD` were skipped or duplicated, fresh publication read meta
+    before writing, a fresh body regained a conditional request mode, `Clean` metadata stopped being
+    created, or a cold duplicate issued another body PUT/copy.
+    """
+    node = cluster.instances["node"]
+    bucket = CAS_DISKS[disk]
+    table = "task9_budget_" + disk
+    insert = (
+        "INSERT INTO {} SELECT number, concat('task9-{}-', toString(number), repeat('q', 2048)) "
+        "FROM numbers(32)".format(table, disk)
+    )
+
+    node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    node.query(
+        "CREATE TABLE {} (id UInt64, payload String) ENGINE = MergeTree ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(table, disk)
+    )
+
+    fresh_seq = _next_seq()
+    node.query(insert)
+    fresh = _captured_since(fresh_seq, bucket)
+    publications = _blob_publications(fresh)
+    assert publications, "the fresh insert published no classified blob body"
+
+    for publication in publications:
+        key = publication["key"]
+        heads = [r for r in fresh if r["key"] == key and r["operation"] == "native_token_head"]
+        assert len(heads) == 1, (key, heads)
+        assert heads[0]["status"] == 404, heads[0]
+        if disk == "cas_gcs_oauth":
+            assert not _looks_default_on_oauth(heads[0]), heads[0]
+            assert heads[0]["headers"].get("authorization", "").startswith("Bearer "), heads[0]
+        else:
+            assert heads[0]["headers"].get("authorization", "").startswith(
+                "GOOG4-HMAC-SHA256 "
+            ), heads[0]
+        assert len(_blob_publications(fresh, key)) == 1, (key, _blob_publications(fresh, key))
+        _assert_default_blob_publication(publication)
+
+        meta = _meta_requests(fresh, key)
+        publication_seq = publication["seq"]
+        assert not [
+            r for r in meta if r["method"] == "GET" and r["seq"] < publication_seq
+        ], (key, meta)
+        creates = [
+            r
+            for r in meta
+            if r["method"] == "PUT"
+            and r["headers"].get("x-goog-if-generation-match") == "0"
+            and '"st":"clean"' in r["request_body"]
+        ]
+        assert len(creates) == 1, (key, meta)
+
+    duplicate_seq = _next_seq()
+    node.query(insert)
+    duplicate = _captured_since(duplicate_seq, bucket)
+    reusable = []
+    for key in {record["key"] for record in publications}:
+        heads = [
+            r for r in duplicate if r["key"] == key and r["operation"] == "native_token_head"
+        ]
+        meta_gets = [r for r in _meta_requests(duplicate, key) if r["method"] == "GET"]
+        if heads and meta_gets:
+            assert len(heads) == 1, (key, heads)
+            assert heads[0]["status"] == 200, heads[0]
+            assert len(meta_gets) == 1, (key, meta_gets)
+            assert not _blob_publications(duplicate, key), (key, _blob_publications(duplicate, key))
+            reusable.append(key)
+    assert reusable, "no fresh blob was observed as a cold duplicate on the second insert"
+
+    if disk == "cas_gcs_hmac":
+        target = sorted(reusable)[0]
+        condemned = _condemn_blob(bucket, target)
+        assert condemned["state"] == "condemned", condemned
+
+        retry_seq = _next_seq()
+        node.query(insert)
+        retry = _captured_since(retry_seq, bucket)
+
+        target_heads = [
+            r for r in retry if r["key"] == target and r["operation"] == "native_token_head"
+        ]
+        target_meta_gets = [r for r in _meta_requests(retry, target) if r["method"] == "GET"]
+        staging_gets = [
+            r for r in retry if r["request_class"] == "staging" and r["method"] == "GET"
+        ]
+        retagged_puts = [
+            r for r in retry if r["key"] == target and r["operation"] == "blob_put"
+        ]
+        conditional_copies = [r for r in retry if r["operation"] == "conditional_copy"]
+
+        assert len(target_heads) == 1, target_heads
+        assert len(target_meta_gets) == 1, target_meta_gets
+        assert len(staging_gets) == 1, staging_gets
+        assert len(retagged_puts) == 1, retagged_puts
+        assert not conditional_copies, conditional_copies
+        _assert_default_blob_publication(retagged_puts[0])
+        assert retagged_puts[0]["response_generation"] != target_heads[0]["response_generation"]
+
+        clean_cas = [
+            r
+            for r in _meta_requests(retry, target)
+            if r["method"] == "PUT"
+            and r["headers"].get("x-goog-if-generation-match", "0") != "0"
+            and '"st":"clean"' in r["request_body"]
+        ]
+        assert len(clean_cas) == 1, clean_cas
+
+    node.query("DROP TABLE {} SYNC".format(table))
+
+
+def test_default_blob_multipart_is_allowed_but_mutable_cas_stays_single_part():
+    """A large OAuth blob may use multipart because its publication is unconditional and Default.
+
+    Mutable CAS metadata/control PUTs still carry `NativeConditional` generation preconditions and
+    never fragment. Would fail if the old generation-wide single-part restriction survived, or if the
+    new multipart permission leaked from blob bodies into mutable coordination objects.
+    """
+    node = cluster.instances["node"]
+    disk = "cas_gcs_oauth"
+    bucket = CAS_DISKS[disk]
+    table = "task9_blob_multipart"
+
+    node.query("DROP TABLE IF EXISTS {} SYNC".format(table))
+    node.query(
+        "CREATE TABLE {} (id UInt64, payload String) ENGINE = MergeTree ORDER BY id "
+        "SETTINGS storage_policy = '{}'".format(table, disk)
+    )
+
+    first_seq = _next_seq()
+    node.query(
+        "INSERT INTO {} SELECT 1, arrayStringConcat(arrayMap(x -> hex(cityHash64(x + 987654321)), "
+        "range(160000)))".format(table),
+        settings={"s3_max_single_part_upload_size": 0, "s3_min_upload_part_size": 65536},
+    )
+    records = _captured_since(first_seq, bucket)
+    multipart = [
+        r
+        for r in records
+        if r["operation"]
+        in ("blob_multipart_create", "blob_multipart_part", "blob_multipart_complete")
+    ]
+    assert [r for r in multipart if r["operation"] == "blob_multipart_create"], multipart
+    assert [r for r in multipart if r["operation"] == "blob_multipart_part"], multipart
+    assert [r for r in multipart if r["operation"] == "blob_multipart_complete"], multipart
+    assert all(r["request_class"] == "blob_body" for r in multipart), multipart
+    assert all(not _is_translated(r) for r in multipart), multipart
+
+    conditional_puts = [
+        r
+        for r in records
+        if r["operation"] == "conditional_put"
+        and r["request_class"] in ("blob_meta", "cas_control")
+    ]
+    assert conditional_puts, "the insert issued no classified mutable conditional PUT"
+    assert all("uploads" not in r["query"] and "uploadId" not in r["query"] for r in conditional_puts)
+
+    node.query("DROP TABLE {} SYNC".format(table))
 
 
 @pytest.mark.parametrize("disk", sorted(CAS_DISKS))
@@ -388,7 +603,7 @@ def test_stale_exact_delete_preserves_the_object_and_a_matching_one_removes_it(d
     deletes = [
         r
         for r in records
-        if r["method"] == "DELETE" and "x-goog-if-generation-match" in r["headers"]
+        if r["operation"] == "exact_delete"
     ]
     assert deletes, "no generation-conditioned DELETE was sent"
 
@@ -456,7 +671,12 @@ def test_ordinary_gcp_oauth_traffic_keeps_upstream_semantics():
     records = _captured(PLAIN_BUCKET)
     assert records, "the ordinary disk sent no request, so this test would be vacuous"
     for record in records:
+        assert record["headers"].get("authorization", "").startswith("Bearer "), record
         assert "x-goog-if-generation-match" not in record["headers"], record["query"]
+        assert "if-match" not in record["headers"], record["query"]
+        assert "if-none-match" not in record["headers"], record["query"]
+        assert "x-amz-copy-source" not in record["headers"], record["query"]
+        assert "x-goog-copy-source" not in record["headers"], record["query"]
         assert not _has_goog_metadata(record), record["query"]
 
     observable = [r for r in records if r["method"] in _MARKING_OBSERVABLE_METHODS]
@@ -523,8 +743,8 @@ def test_translated_requests_are_confined_to_conditional_operations(disk):
         if record["method"] == "GET" and not record["key"]:
             assert not _is_translated(record), "a LIST carried a translated header"
 
-    # Every translated request is a mutation: a conditional PUT, a CAS-owned copy, or an exact DELETE.
-    # A plain read must never acquire one.
+    # Every translated request is a mutable conditional PUT or an exact DELETE. Blob publication,
+    # including native staged copy, is now deliberately Default and absent from this set.
     for record in translated:
         assert record["method"] in ("PUT", "DELETE", "POST"), (
             "a {} on {} carried a translated header but is not a mutation".format(
@@ -538,7 +758,8 @@ def test_the_fake_refused_nothing_it_had_to_serve(disk):
     """A `501 NotImplemented` from the fake means the mount needed an operation the fake refuses.
 
     That is a fixture gap, not a product bug, and it must not hide behind a passing suite. Would fail
-    if: a CAS path started using multipart upload, versioning or another refused operation.
+    if: a CAS path started using versioning or another operation the deterministic fixture does not
+    model. Multipart blob publication is modelled and classified explicitly.
     """
     refused = [r for r in _captured(CAS_DISKS[disk]) if r["status"] == 501]
     assert not refused, "the fake refused operations it was asked for: {}".format(
@@ -679,39 +900,20 @@ def test_a_permissive_service_does_not_change_what_cas_puts_on_the_wire():
     )
 
 
-def test_a_token_producing_write_never_fragments_into_a_multipart_upload():
-    """No multipart operation in the traffic the fake has seen UP TO THIS POINT in the module.
+def test_native_conditional_writes_seen_so_far_are_single_part():
+    """Multipart permission is confined to Default blob-body publication.
 
-    The counters are global and cumulative and this test is not last in the file, so its reach is a
-    PREFIX of the run — it covers the mount, the initial fills and every test above it, and nothing
-    below. `test_no_multipart_operation_was_issued_anywhere_in_the_whole_run` at the end of the file is
-    what makes the run-wide claim; this one localises a failure to the first half.
-
-    GCS enforces no precondition on `CompleteMultipartUpload`, so a token-producing write that
-    fragmented would lose its write-once guarantee at the moment of completion.
-    `tokenProducingWriteSettings` therefore forces a single part for the Generation dialect.
-
-    Would fail if: `s3_force_single_part_upload` stopped being set for the Generation dialect and a
-    blob crossed the ordinary multipart threshold.
-
-    What this does NOT cover, and cannot from here: the ABOVE-THE-CAP arm, where a token-producing
-    body larger than `token_producing_single_put_cap` must be refused before any request is issued.
-    That cap is a 1 GiB constructor default with no configuration key, so an integration test cannot
-    reach it. `CopyObjectConditionalAboveSinglePutCapThrowsNotImplementedBeforeAnyRequest` covers it
-    at unit level.
-
-    It also overlaps `test_the_fake_refused_nothing_it_had_to_serve`, which would catch a multipart
-    attempt as a `501` — but only in the two CAS buckets, and only once it happened. The counters
-    below distinguish "never attempted" from "attempted and refused".
+    This prefix check localises an accidental multipart mutable write before the adversarial restart
+    tests. The run-wide version remains last in the module.
     """
-    counters = _counters()
-    assert counters.get("method_PUT", 0) > 0, (
-        "no PUT was ever sent, so the absence of multipart operations proves nothing"
-    )
-    for name in ("CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"):
-        assert counters.get(name, 0) == 0, "{} was issued {} time(s)".format(
-            name, counters[name]
-        )
+    conditional_multipart = [
+        r
+        for r in _captured()
+        if r["operation"]
+        in ("blob_multipart_create", "blob_multipart_part", "blob_multipart_complete")
+        and _is_translated(r)
+    ]
+    assert not conditional_multipart, conditional_multipart
 
 
 def test_interleaved_ordinary_and_cas_operations_do_not_leak_mode_or_build_a_client():
@@ -960,34 +1162,26 @@ def test_a_reload_that_would_flip_the_token_dialect_is_refused():
         )
 
 
-# MUST STAY LAST IN THIS FILE. The fake's counters are global and cumulative and nothing in this module
-# resets them, so a counter assertion covers exactly the traffic that precedes it. Placed anywhere but
-# last, the test below silently becomes a prefix check and stops seeing the traffic of whatever now
-# follows it — which is how it read before, and the reason the run-wide claim was not being made.
+# MUST STAY LAST IN THIS FILE. The fake's capture log is global and cumulative and nothing in this
+# module resets it, so this assertion covers exactly the traffic that precedes it.
 # Add new tests ABOVE this line.
 # ---------------------------------------------------------------------------------------------------
 
 
-def test_no_multipart_operation_was_issued_anywhere_in_the_whole_run():
-    """The run-wide form of the single-part invariant, over every request the fake ever saw.
+def test_multipart_remained_confined_to_default_blob_publication_during_the_whole_run():
+    """Run-wide classification fence for multipart and conditional isolation.
 
-    On a generation-token store a token-producing write must stay one PUT: GCS enforces no
-    precondition on `CompleteMultipartUpload`, so a fragmented write would lose its write-once
-    guarantee at the moment of completion, which is why the single-part cap exists at all. The claim
-    worth making is therefore the unqualified one — nothing in this module, at any point, fragmented.
-
-    Would fail if: `s3_force_single_part_upload` stopped being set for the Generation dialect, or any
-    later-added scenario drove a write over the ordinary multipart threshold. Unlike the
-    partway-through check above, a regression introduced by the last test in the file is caught here.
-
-    `method_PUT > 0` keeps it from passing vacuously: on a module where nothing ever wrote, three
-    absent counters would prove nothing at all.
+    At least one blob completion must exist, while every multipart request must name a blob body and
+    carry no translated conditional header. This replaces the stale run-wide prohibition from the
+    conditional-blob design.
     """
-    counters = _counters()
-    assert counters.get("method_PUT", 0) > 0, (
-        "no PUT was ever sent in the entire run, so the absence of multipart operations proves nothing"
-    )
-    for name in ("CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload"):
-        assert counters.get(name, 0) == 0, "{} was issued {} time(s) during the run".format(
-            name, counters[name]
-        )
+    records = _captured()
+    multipart = [
+        r
+        for r in records
+        if r["operation"]
+        in ("blob_multipart_create", "blob_multipart_part", "blob_multipart_complete")
+    ]
+    assert [r for r in multipart if r["operation"] == "blob_multipart_complete"], multipart
+    assert all(r["request_class"] == "blob_body" for r in multipart), multipart
+    assert all(not _is_translated(r) for r in multipart), multipart
