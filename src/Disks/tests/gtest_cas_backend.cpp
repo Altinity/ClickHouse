@@ -853,6 +853,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
         DB::writeString(String("old-complete-body"), *out);
         out->finalize();
     }
+    const Token old_token = backend.head(key).token;
 
     storage->throw_after_open = true;
     EXPECT_THROW(
@@ -863,6 +864,7 @@ TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinatio
     EXPECT_NE(storage->last_opened_key, physical_key);
     EXPECT_FALSE(storage->exists(DB::StoredObject(storage->last_opened_key)));
     EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
+    EXPECT_EQ(backend.head(key).token, old_token);
 }
 
 TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
@@ -1380,6 +1382,28 @@ TEST(CASObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
     /// A stale delete using the FIRST incarnation's token must not match the live (second) one.
     EXPECT_EQ(backend.deleteExact("k/tick", put1.token).kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(backend.head("k/tick").exists);
+}
+
+TEST(CASObjectStorageBackend, PublishBlobEmulatedDisambiguatesSameEtagFromStaleDelete)
+{
+    ObjectStorageBackend backend(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    const String key = "k/publish-tick";
+
+    ASSERT_EQ(backend.putIfAbsent(key, "old-complete-body").outcome, PutOutcome::Done);
+    const Token stale_token = backend.head(key).token;
+
+    backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7));
+
+    const HeadResult published = backend.head(key);
+    ASSERT_TRUE(published.exists);
+    EXPECT_NE(published.token, stale_token);
+    EXPECT_EQ(published.token.type, TokenType::Emulated);
+    EXPECT_EQ(backend.deleteExact(key, stale_token).kind, DeleteOutcome::Kind::TokenMismatch);
+
+    const auto live = backend.get(key);
+    ASSERT_TRUE(live.has_value());
+    EXPECT_EQ(live->bytes, "fresh-envelopepayload");
+    EXPECT_EQ(live->token, published.token);
 }
 
 namespace

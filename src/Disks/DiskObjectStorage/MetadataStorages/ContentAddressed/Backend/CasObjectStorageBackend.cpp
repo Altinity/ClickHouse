@@ -600,6 +600,7 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
     const String root = object_storage->getCommonKeyPrefix();
     const String destination_path = resolvePathRelativelyToBase(destination_object, root);
     const String temporary_path = resolvePathRelativelyToBase(temporary_object, root);
+    const auto existing_token_state = emu_token_state.find(key);
 
     try
     {
@@ -614,6 +615,14 @@ void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const St
         std::filesystem::remove(temporary_path, cleanup_error);
         throw;
     }
+
+    /// Publication is transport-only and cannot HEAD to learn the replacement's ETag. Advancing an
+    /// existing disambiguator is sufficient: if the next observation sees the same ETag, it returns
+    /// a token distinct from the old incarnation; if the ETag changed, emuMintToken resets the state
+    /// to that new ETag. With no existing state, this backend has issued no same-process stale token
+    /// that needs fencing. The post-rename increment cannot allocate or throw.
+    if (existing_token_state != emu_token_state.end())
+        ++existing_token_state->second.second;
 }
 
 Token ObjectStorageBackend::emuObserveToken(const String & key)
