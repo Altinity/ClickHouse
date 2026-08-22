@@ -56,12 +56,12 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 | M4 | дубликат CAS-098 | P2 | нет | [{#gc-health-zero-is-ambiguous}](docs/superpowers/cas/BACKLOG/operability-and-introspection.… | Дубликат CAS-098 пункт 1; ключевая проверяемая часть — «фикс уже есть, но не используется» — ПОДТВЕРЖДЕНА дословно: `ever_succeeded` вычисляется в `gcHealth` и не потребляется ни одним продакшн-читателем (только двумя gtest'ами), а SQL-колонка уже `Nullable(UInt64)` и уже вставляет NULL на peer-строках. |
 | M5 | подтверждено | P2 | нет | частично — класс «настойчивый отказ confirm ⇒ шторм `NETWORK_ERROR`» отслеживается через яко… | Подтверждено дословно: строки таксономии 3 и 5b бросают `NETWORK_ERROR` мимо тормоза, все четыре top-level вызова `fetchSelectedPart` идут с `allow_ca_relink = true` по умолчанию, счётчика попыток или настройки-выключателя нет, а на двух репликах shuffle — no-op, так что постоянный отказ confirm циклится без деградации в байтовый fetch. |
 | M6 | подтверждено | P2 | нет | половина «контракт изменён, релиз-нота нужна» — [{#disks-exit-code-upstream}](docs/superpowe… | Обе половины живы на HEAD: сырой код ошибки ClickHouse по-прежнему возвращается из `DisksApp::main` как POSIX-статус (усечение до 8 бит, коды кратные 256 дают `exit 0`), а `clickhouse-disks.md` не описывает ни контракт кода выхода, ни пять новых CAS-подкоманд. |
-| M7 | ⏳ | — | — | — | — |
-| M8 | ⏳ | — | — | — | — |
-| M9 | ⏳ | — | — | — | — |
-| M10 | ⏳ | — | — | — | — |
-| M11 | ⏳ | — | — | — | — |
-| M12 | ⏳ | — | — | — | — |
+| M7 | дубликат CAS-055 + CAS-118 | P2 | нет | `docs/superpowers/cas/BACKLOG/performance.md:287` {#hardlink-per-file-forcefresh-head} (P2);… | Формы кода на HEAD верны, но головное «под дефолтами КАЖДЫЙ доступ платит HEAD» на read-path не подтверждается — тёплый `CachedForLoad`-хит обслуживается без единого обращения к бэкенду; реальный остаток (ForceFresh-HEAD на файл в `createHardLink`) уже отслежен как CAS-055. |
+| M8 | подтверждено (частично дубликат fable n1 + fable M12/12a) | P2 | нет | не отслеживается как отдельный пункт; частично покрыто адъюдикациями `docs/superpowers/cas/f… | Все три канала утечки внутреннего происхождения на HEAD воспроизводятся, причём opus впервые даёт масштаб: ~239 строк с тегами `B<число>` в 74 файлах, включая ~35 файлов ОБЩЕГО апстрим-кода вне CAS-каталога. |
+| M9 | подтверждено | P3 | нет | отдельного пункта нет; смежное — `docs/superpowers/cas/BACKLOG/performance.md` {#standalone-… | Подтверждено: 29 дисковых настроек CAS не содержат ни одной ручки verbosity/sampling, сток пишет каждое событие без фильтрации, и ожидаемый row-rate не описан ни в `cas_log.md`, ни в `monitoring.md`. |
+| M10 | подтверждено | P3 | нет | не отслеживается (grep по `InMemoryBackend` в `BACKLOG.md`, `BACKLOG/*.md`, `final-checks-to… | «Ноль продакшн-вызывающих» проверено точно и подтверждается: ни одной конструкции и ни одной записи в реестре вне `src/Disks/tests`, при этом 598 строк fault-injection безусловно попадают в `dbms` через каталожный glob. |
+| M11 | подтверждено | P2 | нет | не отслеживается (grep по `experimental`/`gate` в `BACKLOG.md`, `BACKLOG/*.md`, `final-check… | Подтверждено: ни настройки `allow_experimental_*`, ни какого-либо эквивалента нет; практический гейт сегодня — только строка в конфиге диска `<metadata_type>cas</metadata_type>` плюс проза в `docs/en/antalya/cas/index.md`, причём при регистрации диска не печатается ни одного предупреждения. |
+| M12 | подтверждено | P2 | нет | не отслеживается; смежное (другой механизм того же гейта) — `docs/superpowers/cas/BACKLOG/gc… | Подтверждено: единственный дренаж — шов `mutateRefsAfterWriterCleanup` перед очередной durable ref-мутацией того же namespace; ни GC-раунд, ни монтирование, ни FSCK, ни фоновый publisher, ни teardown его не дренируют — teardown только НАБЛЮДАЕТ долг. |
 
 ## Minor m1-m31 {#minors}
 
@@ -1259,3 +1259,170 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 починить висячую ссылку на `upstream.md`. P2: направление fail-open, фикс однострочный, и от него
 зависит объявленный способ гейтинга `cas-fsck`; но сегодня недостижимого `exit 0` нет, поэтому релиз
 не блокирует.
+
+## M7 (дубликат CAS-055 + CAS-118, P2) {#m7}
+
+**Формы кода на HEAD верны, но головное «под дефолтами КАЖДЫЙ доступ платит HEAD» на read-path не подтверждается — тёплый `CachedForLoad`-хит обслуживается без единого обращения к бэкенду; реальный остаток (ForceFresh-HEAD на файл в `createHardLink`) уже отслежен как CAS-055.**
+
+**Заявлено (M7).** `readManifestShared` делает безусловный `backend.head(key)` до пробы `manifest_cache`; выше `getView` отдаёт удержанный view без обращения к бэкенду только при `fresh_enough = (mode == Never) || (now - validated_at) < age_seconds*1000`, а дефолт — `Mode::Always` с `age_seconds = 0`, т.е. неравенство `< 0` никогда не истинно ⇒ «под дефолтами каждый доступ падает вниз и платит HEAD».
+
+**Что на HEAD.**
+
+1. `HEAD` перед пробой decode-кеша — подтверждён дословно: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasManifestReader.cpp:63-66` («`HEAD` is mandatory even on a cache hit. It proves that the live reference still names an existing object and supplies the token that identifies the immutable bytes being reused»), проба кеша ниже — `:84-86`, токен входит в ключ (`:43-54`). Обоснование — INV-NO-DANGLE, промах даёт громкий `FILE_DOESNT_EXIST` (`:79-81`).
+
+2. Арифметика `fresh_enough` формально верна (`Parts/PartFolderAccess.cpp:202-204`: `mode == Never || (now_ms_fn() - cached->validatedAtMs()) < params.validate.age_seconds * 1000ULL`, дефолты `part_folder_validate = "always"` — `ContentAddressedSettings.cpp:97`), но **несущественна**: весь этот блок входится только при `params.validate.mode != PartFolderValidate::Mode::Always` (`Parts/PartFolderAccess.cpp:197`). Под дефолтом `always` в него вообще не заходят, так что «неравенство `< 0`» — мёртвая ветка, а не причина HEAD'а.
+
+3. **Головное следствие не воспроизводится.** Read-path идёт под `Freshness::CachedForLoad`, и для него в `getView` есть отдельный тёплый путь ВЫШЕ: `Parts/PartFolderAccess.cpp:176-190` — при совпадении `cached->manifestId() == resolved->manifest_id` возвращается удержанный view (`return cached;` на `:186`) без вызова `buildView`, т.е. без `readManifestShared` и без `HEAD`. `readManifestShared` на read-path вызывается только из `buildView` (`Parts/PartFolderAccess.cpp:270`, `:295`). Предшествующий `resolve` (`:166`) — чисто in-memory (`CasRefLedger::resolveRef`, см. CAS-118 §2). Дефолты кеша включены: `part_folder_cache_bytes = 64 MiB` (`ContentAddressedSettings.cpp:94`), `manifest_decode_cache_bytes = 128 MiB` (`:98`). Итого тёплое чтение части = ноль запросов.
+
+4. Единственный `ForceFresh` в `ContentAddressedMetadataStorage.cpp` — `:2128` (не чтение данных); остальные — в транзакции: `ContentAddressedTransaction.cpp:339`, `:1191`, `:1602`.
+
+**Реальный остаток.** `createHardLink` carry-forward всё ещё делает `getView(..., ForceFresh)` на КАЖДЫЙ файл источника: `ContentAddressedTransaction.cpp:1189-1191`. Под дефолтным `always` это обязательный `HEAD` манифеста на файл части. Мемоизация «одно доказательство на (транзакцию, ref)» существует только на пути `unlinkFile` — `ContentAddressedTransaction.cpp:1595-1603` (`force_fresh_validated_refs`, коммит `a60bfde9700` «cas: one ForceFresh body proof per (transaction, ref) on the fast-removal path»), и на `createHardLink` не распространена. Это ровно CAS-055 (подтверждено, P2, `BACKLOG/performance.md:287`, где прямо цитируется `Pool/CasManifestReader.cpp:63-65` и фиксируется, что остаток — «the `HEAD` round trip, not a re-decode»).
+
+**Чем opus-формулировка отличается от сиблингов.** CAS-055 смотрит на сторону ЗАПИСИ (`createHardLink`), CAS-118 — на дублирование parse+route+getView на одно открытие. Opus M7 добавляет только одно: явную арифметику дефолтов `Mode::Always` + `age_seconds = 0` как доказательство «HEAD-skip недостижим», и предлагает по существу новое направление фикса — дефолт `Mode::Age` с ненулевым `age_seconds` либо ограничение HEAD-skip областью запроса/транзакции. Первое (смена дефолта на `Age`) — это ослабление INV-NO-DANGLE-проверки на read-path и требует отдельного решения; второе — уже реализованный на `unlinkFile` приём, который стоит распространить на `createHardLink` (это и есть фикс CAS-055).
+
+**Фиксящего коммита нет** — форма кода не менялась в заявленной части; изменилось только то, что головного эффекта на read-path не было и на дату обзора (тёплый `CachedForLoad`-хит присутствует).
+
+## M8 (подтверждено (частично дубликат fable n1 + fable M12/12a), P2) {#m8}
+
+**Все три канала утечки внутреннего происхождения на HEAD воспроизводятся, причём opus впервые даёт масштаб: ~239 строк с тегами `B<число>` в 74 файлах, включая ~35 файлов ОБЩЕГО апстрим-кода вне CAS-каталога.**
+
+**Заявлено (M8).** Три канала: (a) ~135 тегов `B<число>` в ~50 файлах, включая общий апстрим-код (`src/IO/ReadBufferFromS3.cpp` «B117», `src/IO/S3/Client.cpp` «B166», `src/IO/S3Defines.h` «B118», `src/IO/S3/PocoHTTPClient.cpp` «see B118», `src/IO/WriteSettings.h` «RFC cas-s3-timeout-retry-control»); (b) 7 ссылок на `docs/superpowers/…` — путь, которого нет в поставляемом дереве, в том числе в ПОЛЬЗОВАТЕЛЬСКОЙ доке и в общем апстрим-хедере; (c) `B11` внутри комментария колонки живой системной таблицы.
+
+**Что на HEAD — (a) теги, подтверждено, все пять названных мест дословно:**
+- `src/IO/ReadBufferFromS3.cpp:357` — «Stop retrying once the query is cancelled (B117)»;
+- `src/IO/S3/Client.cpp:112` — «downstream SYSTEM SYNC REPLICA (B166)»;
+- `src/IO/S3Defines.h:39` — «(B118). The default is DISABLED…»;
+- `src/IO/S3/PocoHTTPClient.cpp:636` — «(see B118)», плюс не названный обзором `src/IO/S3/PocoHTTPClient.h:93` — «(B118)»;
+- `src/IO/WriteSettings.h:81` — «(RFC cas-s3-timeout-retry-control)».
+
+Перепись на HEAD (`git grep -cE '(^|[^0-9A-Za-z])B[0-9]{1,3}([^0-9A-Za-z]|$)' -- src programs`, минус явные ложные срабатывания — `gtest_async_loader` (имена job'ов), `gtest_coordination_storage` (нумерация Keeper-кейсов), `Core/UUID.h` (hex)): **74 файла, 239 строк** — то есть шире, чем «~135 в ~50». Из них вне CAS-каталога и вне `src/Disks/tests` — 35 файлов, и это именно ОБЩИЙ код: `src/Common/ThreadStatus.h:91` («use-after-free, B90»), `src/Interpreters/ThreadStatusExt.cpp:132`, `:148` («(B90)»), `src/Common/ProfileEvents.cpp:787` («B168 P0»), `src/Disks/DiskObjectStorage/DiskObjectStorage.h:52-53` («зero-copy subsystem (B1)… honest capability — B31»), `DiskObjectStorageTransaction.{cpp:432,h:107}` («B58/B63», «B59»), `src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:156` и `src/Disks/IDiskTransaction.h:142` («(B59)»), `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:419,540,541,581` («B34», «B21», «B36»), `DataPartStorageOnDiskFull.cpp` (8 строк, «B59»), `DataPartsExchange.cpp` (3), `IDataPartStorage.h`, `MergeTask.{cpp,h}`, `MergeProjectionPartsTask.cpp`, `MutateTask.cpp`, `MergeTreeDeduplicationLog.cpp`, `StorageReplicatedMergeTree.cpp` (2). Это прямое нарушение стоячего правила «комментарий не цитирует планы/задачи/ревью» — и, отдельно, правила «не добавлять CAS-специфику в общий Replicated/Keeper-код».
+В `docs/en` тегов `B<число>` нет вообще (единственные совпадения — hex-дампы в `docs/en/interfaces/specs/NativeFormat.md`), так что часть заявления «ships in … user docs» относится не к тегам, а к каналу (b).
+
+**(b) ссылки `docs/superpowers/…` — подтверждено, стало 7 попаданий в 6 файлах** (`git grep -n "docs/superpowers" -- src programs docs/en`):
+- ПОЛЬЗОВАТЕЛЬСКАЯ дока: `docs/en/antalya/cas/architecture/correctness.md:21` («The full model index … lives at `docs/superpowers/models/`») и `:25` (заголовок таблицы);
+- общий апстрим-хедер: `src/Storages/StorageTableProxy.h:62` — «tracked in docs/superpowers/cas/BACKLOG.md»;
+- `programs/disks/CommandCaGcRebuild.cpp:20` — «see docs/superpowers/cas/04-gc-protocol.md#gc-rebuild» (файл удалён консолидацией 2026-08 — ссылка битая даже на ветке разработки);
+- `src/.../ContentAddressed/Gc/CasGc.cpp:1569` — на `BACKLOG.md`;
+- `src/.../ContentAddressed/Tools/CasFsck.h:239` — на `AGENTS.md`;
+- `src/Disks/tests/gtest_cas_parallel_commit.cpp:11` — на `docs/superpowers/sdd`, каталог удалён (`e8ecc2c5bdc`).
+Это ровно fable M12/12a (подтверждено, P2), где уже зафиксировано, что суть не «путь не существует», а «публичная страница адресует читателя в дерево разработки, которого он не получит», и что `docs/superpowers/` в релизную ветку не едет по построению.
+
+**(c) `B11` в комментарии колонки живой системной таблицы — подтверждено, не менялось:** `src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:47` — `{"manifests_deleted", …, "Owner-removed manifest bodies physically deleted this round (counted separately from blob deletes, B11)."}`; дубль в POD-хедере `ContentAddressedGarbageCollectionLog.h:37`. Виден через `system.columns.comment` и `DESCRIBE TABLE`. Это дубликат fable n1 (подтверждено, P3), который называет ещё два места того же класса: `programs/disks/CommandFsck.cpp:147` («INV-NO-LOSS violation» в тексте исключения) и `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:427` («not supported on a CAS disk yet (B16/B34)»).
+
+**Чем opus-формулировка отличается от сиблингов.** fable n1 фиксирует три точечных места утечки тегов в пользовательские строки; fable M12/12a — ссылки на дерево разработки. Opus M8 сводит это в один класс и добавляет то, чего у обоих нет: **масштаб и локализацию по общему апстрим-коду** — тег не в CAS-каталоге, а в `src/IO`, `src/Common`, `src/Storages/MergeTree`, `src/Disks/DiskObjectStorage`, т.е. в файлах, которые читают люди, вообще не работающие с CAS. Отсюда и вывод обзора, который стоит принять: содержательное обоснование почти везде стоит рядом с тегом, поэтому фикс — удаление тега, а не его расшифровка.
+
+**Фиксящего коммита нет.** Что осталось: (1) сплошной проход по 74 файлам с удалением тегов `B<число>`/`RFC …` при сохранении причины — начиная с 35 файлов общего кода; (2) снять 5 ссылок `docs/superpowers/*` из `src/`/`programs/` и переписать `correctness.md:21,25` без путей в дерево разработки; (3) убрать `B11` из комментария колонки (в `cas_gc_log.md` та же мысль уже сформулирована без тега). Всё механическое, поведения сервера не меняет — поэтому P2 и не pre-release.
+
+## M9 (подтверждено, P3) {#m9}
+
+**Подтверждено: 29 дисковых настроек CAS не содержат ни одной ручки verbosity/sampling, сток пишет каждое событие без фильтрации, и ожидаемый row-rate не описан ни в `cas_log.md`, ни в `monitoring.md`.**
+
+**Заявлено (M9).** Гран лога — на решение (одна строка на PUT блоба, на dedup-adopt, на retire-решение; перечисление `CasEventType` ~50 значений), а не на запрос. Ни дисковой, ни глобальной настройки, которая семплирует/тротлит/снижает verbosity, кроме удаления всей секции `<cas_log>`. Иллюстративная граница по собственным per-round бюджетам кода (`gc_round_graduation_budget` = 5000, `gc_round_redelete_budget` = 5000 при `gc_interval_sec` = 60) — десятки тысяч строк в час на диск, плюс writer-side строки, помноженные на intra-part fan-out загрузок. `monitoring.md` не обсуждает рост хранения самого лога.
+
+**Что на HEAD.**
+
+1. **Гран «на решение» — подтверждён.** `Primitives/CasEvent.h`, `enum class CasEventType` — 48 значений от `BlobPut`/`BlobReuseAdopt`/`BlobRetire` до `RefResolve`/`ReadMissing`/`Exception`, т.е. счёт «~50» верен. Событие эмитится в точке решения (пример: `Pool/CasManifestReader.cpp:69-78` — `CasEventType::ReadMissing` на каждый промах).
+
+2. **Ни одной ручки verbosity/sampling — подтверждено.** `ContentAddressedSettings.cpp:71-100` содержит ровно 29 `DECLARE(...)`; ни одна не относится к логу (перечислены: `scratch_path`, `gc_*`, `blob_hash*`, `skip_access_check`, `deduplication_*`, `manifest_sweep_*`, `part_folder_*`, `manifest_decode_cache_bytes`, `gc_meta_pool_size`, `staging_backend`, `server_root_id`, `gcs_max_token_producing_put_bytes`). Сток тоже не фильтрует: `ContentAddressedMetadataStorage.cpp:564-596` (`makeCasEventSink`) — единственные два раннихвыхода это `!context` (`:567`) и `!log` (`:576`); дальше КАЖДОЕ событие безусловно превращается в `ContentAddressedLogElement` и уходит в `SystemLog`. Ни по типу события, ни по `outcome`, ни по вероятности отбора ничего не отсекается.
+
+3. **Уточнение к формулировке «кроме удаления всей секции».** Строго говоря, доступны стандартные `SystemLog`-ручки, и они прямо в поставляемом `config.xml`: `programs/server/config.xml:1201-1213` (`flush_interval_milliseconds` 7500, `max_size_rows` 1048576, `buffer_size_rows_flush_threshold` 524288) и закомментированный пример TTL на `:1210-1212` («example of a retention policy; disabled by default like every other log's TTL»); то же для `<cas_gc_log>` на `:1321-1329`. Но это границы ХРАНЕНИЯ и буфера, а не объёма записи: сам поток строк они не уменьшают. То есть суть претензии стоит, а её буквальная формулировка немного пережата.
+
+4. **Обе таблицы поставляются ВКЛЮЧЁННЫМИ по умолчанию** — комментарий над секцией: `config.xml:1197-1200` («Enabled by default while the feature is experimental … Remove the section to disable»). Отдельно отмечу связанное расхождение, уже зафиксированное как fable n7: `src/Interpreters/ContentAddressedLog.h:12` до сих пор пишет «Optional (off by default); enabled for soak/CI», что прямо противоречит поставляемому конфигу.
+
+5. **Документация роста — подтверждено с одной поправкой.** `docs/en/operations/system-tables/cas_log.md` не содержит ни оценки row-rate, ни слова о росте/TTL (grep по `volume|row|grow|ttl|retention|disable` даёт только `:17` про грануляцию `cas_gc_log` и `:39` про `LowCardinality`). В `docs/en/antalya/cas/operations/monitoring.md` есть ровно одна пограничная фраза — `:27`: «two are ordinary `system.*_log` tables and follow the usual flush/retention settings» — но ни ожидаемой интенсивности, ни правила «прикидки на глаз», ни привязки к профилю нагрузки нет. Так что «never discusses the log's own storage growth» — почти верно: упоминание ручек есть, обсуждения объёма нет.
+
+6. **Иллюстративная арифметика обзора воспроизводится:** `gc_round_graduation_budget = 5000` (`ContentAddressedSettings.cpp:84`), `gc_round_redelete_budget = 5000` (`:85`), `gc_interval_sec = 60` (`:74`) — это верхние границы деструктивной работы раунда, и каждая единица этой работы имеет свой тип события; при 60 раундах в час десятки тысяч строк на диск достижимы без экзотики. Мягчащий фактор, который обзор сам называет, тоже верен: обычная асинхронно-буферизованная семантика `SystemLog` и нулевая цена без сконфигурированного CAS-диска.
+
+**Не дубликат по существу.** Ближайший ранее адъюдицированный сосед — CAS-104 (`BACKLOG/operability-and-introspection.md:533`), но он про другое: сток УСТАНОВЛЕН даже при удалённой секции `<cas_log>`, поэтому событие строится и выбрасывается (цена CPU при выключенном логе). Про сам ОБЪЁМ записи при включённом логе в `2031-triage.md` пункта нет (grep по `verbos`/`sampl`/row-rate — пусто). Единственное частичное покрытие — `BACKLOG/performance.md` {#standalone-write-scratch-manifest-cost}, где отмечено, что «объём audit-строк лечится независимо: одна агрегированная строка класса `BlobReuseAdopt` на публикацию со счётчиком», т.е. записан один конкретный класс агрегации, а не общая ручка.
+
+**Что осталось (P3, операбельность, без риска корректности).** (1) Дописать в `cas_log.md`/`monitoring.md` ожидаемую интенсивность с правилом прикидки (строки на вставленную часть × число блобов + строки на GC-раунд) и явно указать TTL как рекомендуемую практику для этих двух таблиц. (2) Рассмотреть дисковую настройку verbosity, отсекающую не-аномальные исходы (`outcome == "success"` для объёмных классов `BlobPut`/`BlobReuseAdopt`/`RefResolve`), оставляя аномалии всегда — сток для этого уже единая точка (`ContentAddressedMetadataStorage.cpp:573`). (3) Заодно исправить неверный комментарий `src/Interpreters/ContentAddressedLog.h:12` («off by default»).
+
+**Фиксящего коммита нет** — ни настройки, ни фильтрации, ни документации объёма на HEAD не появилось.
+
+## M10 (подтверждено, P3) {#m10}
+
+**«Ноль продакшн-вызывающих» проверено точно и подтверждается: ни одной конструкции и ни одной записи в реестре вне `src/Disks/tests`, при этом 598 строк fault-injection безусловно попадают в `dbms` через каталожный glob.**
+
+**Заявлено (M10).** `Backend/CasInMemoryBackend.{h,cpp}` — 598 строк fault-injection (`failNextCasPut`, `setEnforceTokens(false)`, симулированные delete-маркеры) — попадают в `dbms` через безусловный `add_headers_and_sources(dbms .../Backend)`, при нуле вызывающих вне `/tests/`; контраст с соглашением, которое корректно исключает 147 `gtest_cas_*.cpp` через glob `gtest*.cpp`. Фикс — перенести в `src/Disks/tests/`.
+
+**Проверка «ноль вызывающих» на HEAD — точная.**
+
+1. **Размер совпадает буквально:** `wc -l` → `CasInMemoryBackend.h` 172 + `CasInMemoryBackend.cpp` 426 = **598**.
+
+2. **Конструкции.** `git grep -n "InMemoryBackend" -- src programs`, за вычетом самого класса и `src/Disks/tests/`, даёт ровно **три попадания, и все три — текст комментария**, ни одной конструкции и ни одного объявления переменной:
+   - `Backend/CasBackend.h:299` — «(…e.g. `InMemoryBackend`)» в описании контракта;
+   - `Gc/CasGcShardPlan.h:81` — «sealed run back over an `InMemoryBackend`»;
+   - `Pool/CasPlainObjects.cpp:120` — «deterministic instead of relying on `InMemoryBackend` ordering»;
+   плюс перечисление в `ContentAddressed/README.md:95`.
+   Единственный продакшн-подобный сосед, который РЕАЛЬНО конструируется, — `InstrumentedBackend`: `Pool/CasPool.cpp:372` и `:809` (`backend = std::make_shared<InstrumentedBackend>(std::move(backend));`), т.е. поправка обзора про четыре «настоящих» класса верна.
+
+3. **Реестр.** Ни одной записи: `git grep -n "in_memory\|inmemory"` по каталогу `ContentAddressed` и по `MetadataStorageFactory.cpp` — пусто. Backend выбирается не по имени из конфига, так что «строкой в конфиге» его тоже не поднять.
+
+4. **Test-only использование — единственное.** Все вызывающие лежат в `src/Disks/tests`: подключение в общем хелпере (`src/Disks/tests/cas_test_helpers.h:11`), три производных фейк-бэкенда над ним (`CountingBackend` — `:1401`; `HintHoleBackend` — `:1739-1740`; `MetaWriteFaultBackend` — `:1953`) и прямые конструкции в gtest'ах (`gtest_ca_dedup_cache.cpp:66,76,86,100,138,173,194`, `gtest_ca_wiring.cpp:2788-2790,2839,2897`, `gtest_cas_b140_dangle.cpp:19-21,66`, `gtest_cas_backend.cpp:6,124` и др.).
+
+5. **Бенчмарк тоже не пользователь.** Единственный не-gtest-потребитель CAS в дереве — `ContentAddressed/benchmarks/benchmark_cas_ref_protocol.cpp` (подключается через `add_subdirectory` на `src/CMakeLists.txt:144`), и `grep "InMemoryBackend"` по нему пуст. То есть никакой «стал использоваться» не произошло.
+
+6. **Механизм попадания в бинарь подтверждён, номер строки сместился:** glob-и лежат на `src/CMakeLists.txt:135-142`, и Backend-каталог забирается строкой **`:138`** — `add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend)` (в обзоре указано `:135`, это строка родительского каталога после переезда `592b9b83568`). Контраст с gtest-соглашением тоже верен: `src/CMakeLists.txt:901-908` — `grep_gtest_sources` собирает `gtest*.cpp` в отдельную цель `unit_tests_dbms`, т.е. тестовый код в `dbms` не попадает — а этот файл именем `gtest*` не начинается и потому попадает.
+
+7. **Fault-injection-поверхность подтверждена дословно:** `CasInMemoryBackend.h:18-19` (докблок: «`failNextCasPut`: inject a one-shot conflict», «`setEnforceTokens(false)`: mimic a "dumb" backend that ignores token checks»), объявления — `:112` (`void failNextCasPut(const String & key);`), `:127` (`void setEnforceTokens(bool enforce);`), состояние — `:166` (`std::set<String> fail_next_cas_;`), `:169` (`bool simulate_delete_markers_ = false;`).
+
+**Что осталось.** Ровно предложенный обзором перенос: `Backend/CasInMemoryBackend.{h,cpp}` → `src/Disks/tests/` рядом с `cas_test_helpers.h` (все реальные потребители уже там), либо — если файл хочется оставить на месте — исключить его из `dbms`-glob'а явно. Блокирующих зависимостей нет: три упоминания в продакшн-коде текстовые, реестра нет, бенчмарк не использует. P3: не поведение, а Ockham/поверхность бинаря — но фикс дешёвый и снимает из релизного бинаря класс «умышленно ломающий бэкенд».
+
+**Фиксящего коммита нет.** Последние коммиты по файлу — `b967100a6ff`, `a3554bd696d`, `56e0294c095` (resurrect-семантика), размещения не касались.
+
+## M11 (подтверждено, P2) {#m11}
+
+**Подтверждено: ни настройки `allow_experimental_*`, ни какого-либо эквивалента нет; практический гейт сегодня — только строка в конфиге диска `<metadata_type>cas</metadata_type>` плюс проза в `docs/en/antalya/cas/index.md`, причём при регистрации диска не печатается ни одного предупреждения.**
+
+**Заявлено (M11).** ~50 настроек `allow_experimental_*` гейтят куда меньшие фичи, CAS не гейтит ни одна. При регистрации `cas`-диска не срабатывает никакого предупреждения. Единственный гейт — строка конфига `<metadata_type>cas</metadata_type>`, а оговорка «experimental, format may change» живёт только в прозе, которую пользователь должен уже знать, что надо прочитать.
+
+**Что на HEAD.**
+
+1. **Настройки-гейта нет.** `grep "allow_experimental" src/Core/Settings.cpp` даёт 82 попадания (обзор говорил «~50» — на HEAD их даже больше), плюс 11 в `src/Storages/MergeTree/MergeTreeSettings.cpp`; ни одно из них не относится к CAS (`grep "allow_experimental" src/Core/Settings.cpp | grep -iE "cas|content"` — пусто). Эквивалента на серверном уровне тоже нет: в `src/Core/ServerSettings.cpp` из CAS-специфичного объявлен только `cas_blob_upload_pool_size` (`:152`) — ручка размера пула, не гейт.
+
+2. **Регистрация диска молчит.** `src/Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.cpp:217-244` — `registerContentAddressedMetadataStorage` регистрирует тип `"cas"` (`:219`) и сразу конструирует `ContentAddressedMetadataStorage` (`:240-242`); ни `LOG_WARNING`, ни проверки настройки, ни аргумента «acknowledge» в этой функции нет. Более того, слово «experimental» вообще не встречается ни в одном файле каталога `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` (`grep -rni "experimental"` — пусто), то есть у сервера в рантайме нет ни одной строки, которая сообщала бы оператору статус фичи.
+
+3. **Практический гейт сегодня** — ровно три вещи, и все три слабые:
+   - **Конфиг-строка.** Диск нужно объявить с `metadata_type = cas`. Это опт-ин на диск, но опт-ин ровно того же вида, что и любой поддерживаемый тип метаданных: никакой дополнительной отметки «я понимаю, что это эксперимент» не требуется.
+   - **Проза.** `docs/en/antalya/cas/index.md:69-73`, секция `## Status`: «`CAS` is **experimental**. It ships in Altinity Antalya builds. Experimental means the on-disk format and the SQL surface can still change between releases…». Это единственное место, где статус зафиксирован для пользователя, и оно на странице, до которой надо дойти.
+   - **Сборка.** Косвенный, но реальный барьер: фича поставляется в билдах Altinity Antalya (там же, `index.md:69`), а не в апстрим-сборках. Это ограничивает аудиторию, но не является гейтом внутри бинаря.
+   Единственное упоминание статуса, которое реально попадает в поставку рядом с настройками, — комментарий в `programs/server/config.xml:1197-1200`: «Enabled by default while the feature is experimental». То есть в конфиге статус упомянут только применительно к включённому по умолчанию `cas_log`, а не к самому диску.
+
+4. **Привилегии — не тот гейт.** SQL-поверхность закрыта грантами (7 CAS-привилегий), но это контроль ДОСТУПА, а не признание экспериментальности; к тому же по fable n3 ни одна из них не описана в `docs/en/sql-reference/statements/grant.md`.
+
+**Что осталось (P2, compat/операторская безопасность).** Минимальный вариант — при регистрации `cas`-типа печатать однократный `LOG_WARNING` («experimental: on-disk format and SQL surface may change between releases; no compatibility scaffolding») в `MetadataStorageFactory.cpp:219`, чтобы факт попадал в лог сервера и в отчёт об инциденте. Полный вариант — обычный для дерева гейт вида `allow_experimental_content_addressed_storage` (или серверная настройка/флаг диска-подтверждения), отказывающий в монтировании без явного опт-ина. Решение о форме гейта — продуктовое: pre-release-позиция «формат меняется дёшево, без compat-scaffolding» (та самая `index.md:71-73`) как раз и есть аргумент ЗА жёсткий гейт, потому что она означает, что данные на CAS-диске между релизами могут не пережить апгрейд.
+
+**PRE-RELEASE: нет** — не P1: сегодняшний опт-ин на диск не даёт CAS включиться самому, а Antalya-сборка ограничивает аудиторию; но пометить до релиза стоит именно потому, что после первого «настоящего» релиза добавление гейта станет ломающим изменением конфигов.
+
+**Фиксящего коммита нет** — ни настройки, ни предупреждения на HEAD не появилось; заявление обзора верно целиком, поправка только в счёте (`allow_experimental_*` не ~50, а 82 + 11).
+
+## M12 (подтверждено, P2) {#m12}
+
+**Подтверждено: единственный дренаж — шов `mutateRefsAfterWriterCleanup` перед очередной durable ref-мутацией того же namespace; ни GC-раунд, ни монтирование, ни FSCK, ни фоновый publisher, ни teardown его не дренируют — teardown только НАБЛЮДАЕТ долг.**
+
+**Заявлено (M12).** `drainWriterCleanupDuties` имеет ровно одного вызывающего — шаблон `mutateRefsAfterWriterCleanup` (6 call site'ов, все — durable ref-мутации). Ни фонового, ни периодического, ни GC-, ни shutdown-дренажа нет. На teardown долг только наблюдается (`const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();`). Следствие 1: namespace, у которого сорвался publish и который больше не получает durable ref-мутаций, держит долг бесконечно; `~PartWriteTxn` намеренно оставляет build активным ⇒ `min_active` не двигается ⇒ `prefixEligible` ложен для каждого следующего build-префикса на этом server root ⇒ неограниченное удержание manifest-debris. Следствие 2: незаслуженное «нечистое» прощание ухудшает путь восстановления сукцессора при каждом последующем рестарте.
+
+**Что на HEAD — граф вызовов ровно как заявлено (номера строк новые).**
+
+1. **Один вызывающий дренажа.** `git grep "drainWriterCleanupDuties" -- src` даёт объявление (`Pool/CasPool.h:1056`), определение (`Pool/CasPool.cpp:1297`) и ЕДИНСТВЕННЫЙ вызов — `Pool/CasPool.h:1065`, внутри `mutateRefsAfterWriterCleanup`. Контракт зафиксирован в комментариях дословно: `Pool/CasPool.h:1052-1053` («Drain `ns` before admitting its next ordinary mutation») и `:1059-1061` («The single admission seam for durable ref mutations exposed by `Pool`»).
+
+2. **Шесть точек допуска, все — durable ref-мутации:** `Pool/CasPool.cpp:1661` (`dropRef`), `:1670` (`updateRefPublishedAt`), `:1678` и `:1686` (две перегрузки `dropNamespace`), `:1722` (`appendRefOps`), `:1731` (`tryPublishSnapshotAndAdvanceCheckpointOnce`).
+
+3. **Другого пути дренажа НЕ появилось — проверено по каждому кандидату:**
+   - **GC-раунд: нет.** `grep` по `Gc/*.cpp` на `appendRefOps|dropRef|dropNamespace|updateRefPublishedAt|tryPublishSnapshot` — ни одного попадания. GC ходит по namespace'ам, но не через шов `Pool`.
+   - **FSCK: нет.** То же по `Tools/*.cpp`: единственное попадание — `Tools/CasDecommission.cpp:185-194` (`admin->dropNamespace(life)`). То есть дренаж случайно происходит только при операторском декоммиссии дохлого участника, и только для его namespace'ов.
+   - **Фоновый publisher снапшотов: нет.** `Pool::tryPublishSnapshotAndAdvanceCheckpointOnce` (со швом) продакшн-вызывающих вне тестов не имеет; фоновый поток `CAS_REF_SNAPSHOT_PUBLISH` зовёт внутренний `tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` напрямую (`Pool/CasRefLedger.cpp:4010`, диспетчер `:3993-4015`), обходя обёртку `Pool` и, значит, дренаж.
+   - **Монтирование/remount: нет.** Ни `writer_cleanup*`, ни `drainWriterCleanupDuties` не встречаются вне `Pool/CasPool.{h,cpp}` (`git grep "writer_cleanup" -- src`, за вычетом тестов, даёт только эти два файла).
+   - **Фонового потока/периодики нет вовсе:** нет ни `ThreadName`, ни таймера, связанного с этой очередью.
+   - **Teardown: только наблюдение, подтверждено дословно** — `Pool/CasPool.cpp:893` (в `~Pool`) и `:956` (в пути `SYSTEM CAS FORGET`): `const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();`. Дренируются только ref-полосы (`ref_ledger.drainRefLanesForShutdown`), долг — нет.
+   Итого: **«только следующая мутация того же namespace» на HEAD держится**, с единственной добавкой — операторский `dropNamespace` в декоммиссии.
+
+4. **Механизм пина floor'а подтверждён по цепочке.** `PartWriteTxn::~PartWriteTxn` (`Pool/CasPartWriteTxn.cpp:124-140`): при `precommit_state == Uncertain || Durable` — `store->enqueueWriterCleanupDuty(...)` и **`return`** без `retireBuildSeq` (комментарий `:126-130`: «Transfer that exact cleanup duty to the mount and KEEP the build active»); `retireBuildSeq` вызывается только на ветке «долга нет» (`:139`). Дальше: `CasMountRuntime::minActive()` — `active_build_seqs.empty() ? next_build_seq : *active_build_seqs.begin()` (`Pool/CasMountRuntime.cpp:150-154`), т.е. неснятый seq пинит floor; `minActive` штампуется в heartbeat mount-lease (`Pool/CasMountRuntime.cpp:236-241`); а `prefixEligible` (`Gc/CasOrphanManifestSweep.cpp:475-493`) при равном `writer_epoch` требует `w.min_active > prefix.build_sequence` (`:493`), и `sweepNamespace` при неeligible удаляет НОЛЬ (`:499-501`). Так что удержание manifest-debris — реальное следствие, и оно **server-root-широкое** (floor берётся из mount-lease server root'а), а не только для сорвавшегося namespace.
+
+5. **Уточнение к слову «неограниченное».** Удержание ограничено ЖИЗНЬЮ ПРОЦЕССА: `prefixEligible` сначала сравнивает эпохи (`:485-489`, «old-epoch debris drains after a process restart even when its build_sequence is above the current min_active»), поэтому после рестарта весь debris прошлой эпохи становится eligible. Точная формулировка — «удержание на всё время работы процесса и для всей его эпохи», а не «навсегда». Это тот же гейт, который уже адъюдицирован в CAS-077 ({#dead-member-frozen-build-floor}), но там источник заморозки floor'а другой — непереклеймленный слот мёртвого узла; здесь узел ЖИВ, а floor пинит собственный недренированный долг. Не дубликат.
+
+6. **Второе следствие подтверждено, и у него есть добавочный дефект диагностируемости.** `mount_runtime.finishTeardown(drained)` при `drained == false` намеренно не пишет terminal-маркер: `Pool/CasMountRuntime.cpp:505-531` — «If draining did not certify that every in-flight PUT resolved, a clean farewell would be false evidence. Stop background renewal without a terminal operation so the successor uses the slower but safe observation-based reclaim path» (`:526-528`); при `drained == true` — `mount_keeper->stop()` с farewell `min_active = UINT64_MAX` (`:507-509`), который сукцессор трактует как немедленную reclaim-годность. То есть «незаслуженное прощание меняет путь восстановления» — не только комментарий, а прослеженная развилка. **Добавка к находке:** WARNING в этой ветке (`:529-530`) утверждает «CAS store shutdown with an unresolved ref-log PUT», хотя причиной может быть именно неразряженный writer-cleanup долг при полностью дренированных ref-полосах — то есть оператор получает неверную первопричину.
+
+**Что осталось (P2).** Предложение обзора правильное и остаётся невыполненным: добавить триггер дренажа, не зависящий от повторной записи в namespace. Естественное место — GC-раунд (он и так обходит каждый namespace), либо шаг перед teardown-наблюдением в `~Pool`/`FORGET` (сейчас там ровно наблюдение). Плюс мелочь: развести в WARNING'е `Pool/CasMountRuntime.cpp:529-530` две разные причины нечистого прощания. Класс — удержание (retention) и деградация пути восстановления, не потеря данных, поэтому не pre-release; но P2, потому что один сорвавшийся publish на затихшем namespace тормозит уборку по ВСЕМУ server root'у до рестарта.
+
+**Фиксящего коммита нет.**

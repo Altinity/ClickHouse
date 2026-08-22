@@ -719,3 +719,41 @@ the fix is unusually cheap and already half-built: `gcHealth` computes `ever_suc
 reader consumes it (only two gtests do), and the SQL column is ALREADY `Nullable(UInt64)` and already
 inserts NULL on peer rows. So distinguishing "never led" from "just succeeded" is one line at
 `StorageSystemContentAddressedMounts.cpp:201`. P2.
+
+## CAS has no experimental gate (opus review M11) {#no-experimental-gate}
+
+There is no `allow_experimental_*` setting or equivalent for CAS — 82 such settings exist in
+`Settings.cpp` and none is CAS's; the word "experimental" does not appear anywhere in the CAS source
+tree. The practical gate today is one config line (`<metadata_type>cas</metadata_type>`) plus prose
+in `docs/en/antalya/cas/index.md`, and registering a CAS disk prints no warning at all. Decide
+deliberately: either add a gate (setting or a loud registration warning naming the experimental
+status), or state in the docs that the config line IS the gate. P2 — this is the difference between
+"a user opted in" and "a user typed a metadata_type".
+
+## Internal development provenance ships in source, docs and SQL metadata (opus review M8) {#internal-provenance-ships}
+
+Scale measured by the opus review and re-confirmed: ~239 lines carrying `B<number>` tags across 74
+files, ~35 of them in SHARED upstream code outside the CAS directory, plus user-facing docs and live
+SQL column comments (visible through `DESCRIBE`). Partly adjudicated already as prose findings
+(`fable-review-triage.md` {#n1}, {#m12} 12a), but nothing tracks the sweep itself. Per
+[[feedback_comment_policy_no_internal_refs]] the reason stays and the provenance goes; do it as ONE
+pass, not a fix round per site. P2 because of the upstream-code share.
+
+## `CasInMemoryBackend` ships in the production binary with zero callers (opus review M10) {#in-memory-backend-ships-unused}
+
+598 lines of fault-injection backend land in `dbms` through the directory glob (`src/CMakeLists.txt:138`)
+with zero production construction sites and no registry entry — verified precisely: only three
+comment mentions in production code, and the benchmark does not use it either. Either move it under
+`src/Disks/tests/` (where its only users live) or exclude it from the production target. P3: dead
+weight and an audit smell, no behaviour.
+
+## Writer-cleanup duty has exactly one drain path (opus review M12) {#writer-cleanup-single-drain}
+
+The only drain is the `mutateRefsAfterWriterCleanup` seam, taken before the next durable ref mutation
+of the SAME namespace. Neither a GC round, nor mount, nor FSCK, nor the background snapshot publisher
+drains it; teardown only OBSERVES the debt (`Pool/CasPool.cpp:893`, `:956`). So a namespace that stops
+being written keeps its cleanup duty indefinitely — bounded in practice only by a process restart,
+since `prefixEligible` compares `writer_epoch` first (`Gc/CasOrphanManifestSweep.cpp:485-489`).
+Sub-finding: the unclean-farewell WARNING (`Pool/CasMountRuntime.cpp:529-530`) blames "an unresolved
+ref-log PUT" even when the real cause is an undrained cleanup duty — misleading at exactly the moment
+an operator reads it. P2.
