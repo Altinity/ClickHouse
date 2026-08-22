@@ -295,6 +295,9 @@ private:
     /// Write a body as the new incarnation of `key` and return its freshly minted token (the
     /// object's own post-write etag — see emuMintToken).
     Token emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
+    /// Write a complete blob body to a sibling temporary local object, then atomically replace `key`.
+    /// A failure before the rename leaves the old destination untouched and cleans the temporary.
+    void emuPublishBlobAtomically(const String & key, const String & bytes);
     /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —
     /// does NOT advance the same-etag disambiguator (that only applies to a just-completed write).
     Token emuObserveToken(const String & key);

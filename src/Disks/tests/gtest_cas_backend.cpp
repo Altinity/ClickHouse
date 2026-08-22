@@ -57,6 +57,55 @@ BlobPublishRequest streamingPublication(
             }}};
 }
 
+struct CountingSourceState
+{
+    size_t bytes_exposed = 0;
+};
+
+class OneByteAtATimeReadBuffer final : public DB::ReadBuffer
+{
+public:
+    OneByteAtATimeReadBuffer(size_t total_bytes_, std::shared_ptr<CountingSourceState> state_)
+        : DB::ReadBuffer(nullptr, 0)
+        , total_bytes(total_bytes_)
+        , state(std::move(state_))
+    {
+    }
+
+private:
+    bool nextImpl() override
+    {
+        if (state->bytes_exposed == total_bytes)
+            return false;
+
+        ++state->bytes_exposed;
+        working_buffer = Buffer(&byte, &byte + 1);
+        return true;
+    }
+
+    const size_t total_bytes;
+    const std::shared_ptr<CountingSourceState> state;
+    char byte = 'x';
+};
+
+BlobPublishRequest countedLongPublication(
+    String destination_key,
+    String fresh_envelope,
+    uint64_t payload_size,
+    size_t source_size,
+    const std::shared_ptr<CountingSourceState> & state)
+{
+    return BlobPublishRequest{
+        .destination_key = std::move(destination_key),
+        .publication = StreamingBlobPublication{
+            .payload_size = payload_size,
+            .fresh_envelope = std::move(fresh_envelope),
+            .open_payload = [source_size, state]
+            {
+                return std::make_unique<OneByteAtATimeReadBuffer>(source_size, state);
+            }}};
+}
+
 class PublishCountingInMemoryBackend final : public InMemoryBackend
 {
 public:
@@ -294,6 +343,27 @@ TEST(CASInMemory, PublishBlobRejectsShortAndLongStreamingSourcesWithoutVisibilit
 
     EXPECT_EQ(backend.get("short")->bytes, "old-short");
     EXPECT_EQ(backend.get("long")->bytes, "old-long");
+}
+
+TEST(CASInMemory, PublishBlobLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)
+{
+    InMemoryBackend backend;
+    ASSERT_EQ(backend.putIfAbsent("long", "old-complete-body").outcome, PutOutcome::Done);
+    auto state = std::make_shared<CountingSourceState>();
+
+    try
+    {
+        backend.publishBlob(countedLongPublication("long", "fresh", 3, 1024, state));
+        FAIL() << "expected a long-source mismatch";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+
+    EXPECT_EQ(state->bytes_exposed, 4u);
+    ASSERT_TRUE(backend.get("long").has_value());
+    EXPECT_EQ(backend.get("long")->bytes, "old-complete-body");
 }
 
 TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteBodyIsReady)
@@ -545,10 +615,11 @@ namespace
 class PublicationRecordingWriteBuffer final : public DB::WriteBufferFromFileBase
 {
 public:
-    PublicationRecordingWriteBuffer(size_t & cancel_calls_, size_t & finalize_calls_)
+    PublicationRecordingWriteBuffer(size_t & cancel_calls_, size_t & finalize_calls_, size_t & bytes_at_cancel_)
         : DB::WriteBufferFromFileBase(DB::DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
         , cancel_calls(cancel_calls_)
         , finalize_calls(finalize_calls_)
+        , bytes_at_cancel(bytes_at_cancel_)
     {
     }
 
@@ -575,11 +646,20 @@ private:
 
     void cancelImpl() noexcept override
     {
+        bytes_at_cancel = count();
         ++cancel_calls;
     }
 
     size_t & cancel_calls;
     size_t & finalize_calls;
+    size_t & bytes_at_cancel;
+};
+
+struct PublicationWriteBarrier
+{
+    std::promise<void> opened;
+    std::promise<void> release;
+    std::shared_future<void> release_future = release.get_future().share();
 };
 
 class PublicationRecordingLocalObjectStorage final : public DB::LocalObjectStorage
@@ -595,11 +675,21 @@ public:
         const DB::WriteSettings & write_settings) override
     {
         ++write_calls;
+        last_opened_key = object.remote_path;
         last_write_mode = mode;
         last_write_settings = write_settings;
         if (record_cancellation_only)
-            return std::make_unique<PublicationRecordingWriteBuffer>(cancel_calls, finalize_calls);
-        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+            return std::make_unique<PublicationRecordingWriteBuffer>(cancel_calls, finalize_calls, bytes_at_cancel);
+
+        auto out = DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+        if (throw_after_open)
+            throw std::runtime_error("injected write failure after opening local object");
+        if (write_barrier)
+        {
+            write_barrier->opened.set_value();
+            write_barrier->release_future.wait();
+        }
+        return out;
     }
 
     void copyObject(
@@ -628,13 +718,21 @@ public:
         return DB::LocalObjectStorage::tryGetObjectMetadataWithNativeToken(path, with_tags);
     }
 
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        ++metadata_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+    }
+
     void resetRecording()
     {
         write_calls = 0;
         copy_calls = 0;
+        metadata_calls = 0;
         native_metadata_calls = 0;
         cancel_calls = 0;
         finalize_calls = 0;
+        bytes_at_cancel = 0;
         last_write_mode.reset();
         last_write_settings.reset();
         last_copy_settings.reset();
@@ -642,11 +740,16 @@ public:
 
     bool native_copy_supported = true;
     bool record_cancellation_only = false;
+    bool throw_after_open = false;
+    std::shared_ptr<PublicationWriteBarrier> write_barrier;
     size_t write_calls = 0;
     size_t copy_calls = 0;
+    mutable size_t metadata_calls = 0;
     mutable size_t native_metadata_calls = 0;
     size_t cancel_calls = 0;
     size_t finalize_calls = 0;
+    size_t bytes_at_cancel = 0;
+    String last_opened_key;
     std::optional<DB::WriteMode> last_write_mode;
     std::optional<DB::WriteSettings> last_write_settings;
     std::optional<DB::WriteSettings> last_copy_settings;
@@ -701,6 +804,67 @@ TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransp
     EXPECT_EQ(readStorageObject(storage, destination), "fresh-envelopepayload");
 }
 
+TEST(CASObjectStorageBackend, PublishBlobEmulatedKeepsDestinationCompleteUntilAtomicReplacement)
+{
+    using namespace std::chrono_literals;
+
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    const String key = "publish/emulated-atomic";
+    const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(physical_key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("old-complete-body"), *out);
+        out->finalize();
+    }
+    storage->resetRecording();
+
+    auto barrier = std::make_shared<PublicationWriteBarrier>();
+    storage->write_barrier = barrier;
+    auto opened = barrier->opened.get_future();
+    auto publication = std::async(std::launch::async, [&]
+    {
+        backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7));
+    });
+
+    const auto opened_status = opened.wait_for(2s);
+    EXPECT_EQ(opened_status, std::future_status::ready);
+    if (opened_status == std::future_status::ready)
+        EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
+
+    barrier->release.set_value();
+    EXPECT_NO_THROW(publication.get());
+    EXPECT_EQ(storage->metadata_calls, 0u);
+    EXPECT_EQ(readStorageObject(storage, physical_key), "fresh-envelopepayload");
+}
+
+TEST(CASObjectStorageBackend, PublishBlobEmulatedWriteFailurePreservesDestinationAndCleansTemporary)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    const String key = "publish/emulated-failure";
+    const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(physical_key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("old-complete-body"), *out);
+        out->finalize();
+    }
+
+    storage->throw_after_open = true;
+    EXPECT_THROW(
+        backend.publishBlob(streamingPublication(key, "fresh-envelope", "payload", 7)),
+        std::runtime_error);
+    storage->throw_after_open = false;
+
+    EXPECT_NE(storage->last_opened_key, physical_key);
+    EXPECT_FALSE(storage->exists(DB::StoredObject(storage->last_opened_key)));
+    EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
+}
+
 TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
 {
     auto storage = makePublicationRecordingStorage();
@@ -716,21 +880,49 @@ TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBefo
     storage->resetRecording();
     storage->record_cancellation_only = true;
 
-    size_t expected_cancel_calls = 0;
-    for (const auto & [payload, declared_size] : std::vector<std::pair<String, uint64_t>>{
-             {"abc", 4},
-             {"abcd", 3}})
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
     {
-        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
-        {
-            backend.publishBlob(streamingPublication(destination, "fresh", payload, declared_size));
-        });
+        backend.publishBlob(streamingPublication(destination, "fresh", "abc", 4));
+    });
+    EXPECT_EQ(storage->cancel_calls, 1u);
+    EXPECT_EQ(storage->finalize_calls, 0u);
+    EXPECT_EQ(storage->bytes_at_cancel, 8u);
+    EXPECT_EQ(readStorageObject(storage, destination), "old-complete-body");
 
-        ++expected_cancel_calls;
-        EXPECT_EQ(storage->cancel_calls, expected_cancel_calls);
-        EXPECT_EQ(storage->finalize_calls, 0u);
-        EXPECT_EQ(readStorageObject(storage, destination), "old-complete-body");
+    auto state = std::make_shared<CountingSourceState>();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        backend.publishBlob(countedLongPublication(destination, "fresh", 3, 1024, state));
+    });
+    EXPECT_EQ(state->bytes_exposed, 4u);
+    EXPECT_EQ(storage->cancel_calls, 2u);
+    EXPECT_EQ(storage->finalize_calls, 0u);
+    EXPECT_EQ(storage->bytes_at_cancel, 8u);
+    EXPECT_EQ(readStorageObject(storage, destination), "old-complete-body");
+}
+
+TEST(CASObjectStorageBackend, PublishBlobEmulatedLongSourceReadsOnlyDeclaredPayloadAndOneProbeByte)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    const String key = "publish/emulated-long";
+    const String physical_key = DB::Cas::tests::nativeKeyUnder(storage, key);
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(physical_key), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("old-complete-body"), *out);
+        out->finalize();
     }
+
+    auto state = std::make_shared<CountingSourceState>();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        backend.publishBlob(countedLongPublication(key, "fresh", 3, 1024, state));
+    });
+
+    EXPECT_EQ(state->bytes_exposed, 4u);
+    EXPECT_EQ(readStorageObject(storage, physical_key), "old-complete-body");
 }
 
 TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultRequestMode)

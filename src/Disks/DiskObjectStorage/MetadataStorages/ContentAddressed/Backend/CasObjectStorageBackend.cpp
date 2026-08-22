@@ -1,15 +1,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
 
 #include <Core/Defines.h>
+#include <Core/UUID.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <IO/copyData.h>
 #include <IO/WriteSettings.h>
 
@@ -25,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 
 namespace DB
 {
@@ -584,6 +588,34 @@ Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes, c
     return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/true);
 }
 
+void ObjectStorageBackend::emuPublishBlobAtomically(const String & key, const String & bytes)
+{
+    if (object_storage->getType() != ObjectStorageType::Local)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "ObjectStorageBackend::publishBlob: atomic emulated publication requires local object storage");
+
+    const String destination_object = emuPath(key);
+    const String temporary_object = destination_object + ".publish-" + toString(UUIDHelpers::generateV4()) + ".tmp";
+    const String root = object_storage->getCommonKeyPrefix();
+    const String destination_path = resolvePathRelativelyToBase(destination_object, root);
+    const String temporary_path = resolvePathRelativelyToBase(temporary_object, root);
+
+    try
+    {
+        auto out = object_storage->writeObject(StoredObject(temporary_object), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+        std::filesystem::rename(temporary_path, destination_path);
+    }
+    catch (...)
+    {
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary_path, cleanup_error);
+        throw;
+    }
+}
+
 Token ObjectStorageBackend::emuObserveToken(const String & key)
 {
     const auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
@@ -991,23 +1023,27 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
             std::lock_guard publish_lock(emulatedBlobPublicationMutex());
 
             String body = streaming->fresh_envelope;
+            blob_publication_detail::BlobPayloadCopyResult copy_result;
             {
                 WriteBufferFromString out(body, AppendModeTag{});
-                copyData(*payload, out);
-                out.finalize();
+                copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, out, streaming->payload_size);
+                if (copy_result.exact(streaming->payload_size))
+                    out.finalize();
+                else
+                    out.cancel();
             }
 
-            const size_t streamed = body.size() - streaming->fresh_envelope.size();
-            if (streamed != streaming->payload_size)
+            if (!copy_result.exact(streaming->payload_size))
                 throw Exception(
                     ErrorCodes::CORRUPTED_DATA,
-                    "ObjectStorageBackend::publishBlob: source yielded {} payload bytes for {}, declared {} -- nothing was published",
-                    streamed,
+                    "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- nothing was published",
+                    copy_result.has_excess ? "more than " : "",
+                    copy_result.copied,
                     request.destination_key,
                     streaming->payload_size);
 
             std::lock_guard lock(emu_mutex);
-            emuWrite(request.destination_key, body, /*meta=*/{});
+            emuPublishBlobAtomically(request.destination_key, body);
             return;
         }
 
@@ -1020,16 +1056,24 @@ void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
             DBMS_DEFAULT_BUFFER_SIZE,
             WriteSettings{});
         out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
-        const size_t before = out->count();
-        copyData(*payload, *out);
-        const size_t streamed = out->count() - before;
-        if (streamed != streaming->payload_size)
+        blob_publication_detail::BlobPayloadCopyResult copy_result;
+        try
+        {
+            copy_result = blob_publication_detail::copyBlobPayloadBounded(*payload, *out, streaming->payload_size);
+        }
+        catch (...)
+        {
+            out->cancel();
+            throw;
+        }
+        if (!copy_result.exact(streaming->payload_size))
         {
             out->cancel();
             throw Exception(
                 ErrorCodes::CORRUPTED_DATA,
-                "ObjectStorageBackend::publishBlob: source yielded {} payload bytes for {}, declared {} -- upload aborted, nothing published",
-                streamed,
+                "ObjectStorageBackend::publishBlob: source yielded {}{} payload bytes for {}, declared {} -- upload aborted, nothing published",
+                copy_result.has_excess ? "more than " : "",
+                copy_result.copied,
                 request.destination_key,
                 streaming->payload_size);
         }

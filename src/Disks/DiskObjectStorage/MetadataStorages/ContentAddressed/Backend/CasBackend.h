@@ -4,6 +4,7 @@
 #include <IO/WriteBuffer.h>
 #include <Common/Exception.h>
 #include <base/types.h>
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -205,6 +206,46 @@ struct BlobPublishRequest
     String destination_key;
     BlobPublication publication;
 };
+
+namespace blob_publication_detail
+{
+
+struct BlobPayloadCopyResult
+{
+    uint64_t copied = 0;
+    bool has_excess = false;
+
+    bool exact(uint64_t expected) const
+    {
+        return copied == expected && !has_excess;
+    }
+};
+
+/// Copy no more than the declared payload, then consume one byte solely to distinguish exact input
+/// from a long source. The probe byte never reaches `to`, so callers can cancel without having sent
+/// more than the promised body to their destination transport.
+inline BlobPayloadCopyResult copyBlobPayloadBounded(ReadBuffer & from, WriteBuffer & to, uint64_t expected)
+{
+    uint64_t remaining = expected;
+    while (remaining != 0 && !from.eof())
+    {
+        const size_t available = static_cast<size_t>(from.buffer().end() - from.position());
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(remaining, available));
+        to.write(from.position(), count);
+        from.position() += count;
+        remaining -= count;
+    }
+
+    BlobPayloadCopyResult result{.copied = expected - remaining};
+    if (remaining == 0)
+    {
+        char excess;
+        result.has_excess = from.read(excess);
+    }
+    return result;
+}
+
+}
 
 /// Token-aware storage seam used by the content-addressed pool. TOKEN SEMANTICS ARE THE CONTRACT:
 ///   - every present key has exactly one current incarnation identified by an opaque Token;
