@@ -3,6 +3,9 @@
    One key per hash; tokens = naturals per key; deletes exact-token via in-flight messages that may
    land arbitrarily late; CAS root manifests with embedded journal; GC = fold -> retire -> fence ->
    recheck -> delete.  Sabotage* flags break one load-bearing rule each and MUST yield counterexamples.
+   This remains the broad writer/GC incarnation model. `CaBlobPublishCore` is authoritative for the
+   split HEAD/publication protocol, envelope identity, late landing, staged-envelope reuse, and the
+   monotonic publication-attempt state; those focused transitions are not duplicated here.
    2026-06-12 amendments (B91 refresh): EnableRegistry models the namespace registry + manifest
    creation (W-REGISTER, R3 step 0, fence-time universe + absent-shard minting); EnableEvStale
    models evidence staleness (amended W-EVIDENCE: stale tokenless evidence must be re-observed)
@@ -56,8 +59,8 @@ VARIABLES
     tokOf,     \* [Hashes -> 0..MaxToken]          current incarnation token (0 = never created)
     nextTok,   \* [Hashes -> 1..MaxToken+1]        fresh-token allocator (W-FRESH-TAG by construction)
     deadTok,   \* [Hashes -> SUBSET Toks]          tokens that have stopped being current (history; INV_NO_RETURN).
-               \* MODEL RULE: any action that makes a token stop being current — in-place overwrite (WResurrect,
-               \* and the future WOverwrite in stage 5) OR physical delete (Land) — MUST add that token here.
+               \* MODEL RULE: any action that makes a token stop being current — in-place overwrite
+               \* (WResurrect or WOverwrite) OR physical delete (Land) — MUST add that token here.
                \* CondemnedAtView consults deadTok, so this is what rejects a stale token-bearing dependency.
                \* Omitting the deadTok update in any such action silently reintroduces a dangling-ref bug.
                \* NAMING: "dead as a publish dependency" (displaced by resurrect/overwrite OR deleted),
@@ -176,8 +179,10 @@ Init ==
     /\ wEv      = [w \in Writers |-> {}]
 
 \* ---------------------------------------------------------------- writer actions
-\* Create a missing object: fresh token from the allocator (W-SAME-CONTENT is by construction:
-\* the model's key IS the content). Dependency recorded with the created token.
+\* Abstract materialization of a missing object: fresh token from the allocator (W-SAME-CONTENT is
+\* by construction because the model's key IS the content). Dependency recorded with the created
+\* token. This action intentionally keeps observation and publication atomic; `CaBlobPublishCore`
+\* owns the split HEAD/publication race, transport selection, and late-landing behaviors.
 WCreate(w, h) ==
     /\ present[h] = FALSE /\ nextTok[h] <= MaxToken
     /\ (h \in TreeHashes => \A c \in Children[h] : present[c])
@@ -203,9 +208,11 @@ WReuse(w, h) ==
 
 \* Anonymous environment churn: an unconditional same-content re-PUT by anyone, any time (spec §12:
 \* safety must not rest on PUT conditions). No dependency recorded — writer-intent overwrites are
-\* WResurrect (condemned) / WReuse (adopt). Per the deadTok MODEL RULE, the in-place overwrite makes
-\* the OLD token stop being current, so it MUST join deadTok (else a stale token-bearing dep on it
-\* dangles — the bug WResurrect fixed). creator gated on EnableDebris (keeps earlier stages inert).
+\* abstracted by WResurrect (condemned) / WReuse (adopt). Per the deadTok MODEL RULE, the in-place
+\* overwrite makes the OLD token stop being current, so it MUST join deadTok (else a stale token-
+\* bearing dep on it dangles — the bug WResurrect fixed). `CaBlobPublishCore` owns the concrete
+\* unconditional-publication decision and envelope rules. creator gated on EnableDebris (keeps
+\* earlier stages inert).
 WOverwrite(w, h) ==
     /\ EnableOverwrite /\ present[h] /\ nextTok[h] <= MaxToken
     /\ tokOf'   = [tokOf   EXCEPT ![h] = nextTok[h]]
@@ -216,7 +223,9 @@ WOverwrite(w, h) ==
                     fencePos, cursor, trimBase, rootEdges, treeEdges, marker, everEdged, pendCasc,
                     wDeps, wView, hbAlive, hbSeq, wedged, hbObs, fgPhase, fgCut, fgRefs, fgSeen, reg, wEv >>
 
-\* Resurrect a condemned current incarnation: overwrite in place with a FRESH token (W-FRESH-TAG).
+\* Abstract replacement of a condemned current incarnation: overwrite in place with a FRESH token
+\* (W-FRESH-TAG). `CaBlobPublishCore` owns condemned observation, fresh-envelope selection, staged
+\* reuse restrictions, and monotonic publication-attempt state.
 \* The overwrite is an in-place replacement of the single physical slot, so the OLD token is gone for
 \* good — record it in deadTok exactly as a physical delete would (INV-NO-RETURN: the overwritten token
 \* can never again be a valid dependency, even though its retire entry is later consumed by a landing
