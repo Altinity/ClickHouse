@@ -94,11 +94,27 @@ gated by CURRENT models regardless: `CaGcRoundDeferCore`, `CaGcCondemnMarkerGate
 `CaGcAckFloorZombie` (two-phase graduation), `CaRetiredInRun`, and the fold/orphan/attempt machinery
 of `CaGcRootLocalPartManifestCore`.
 
+## Blob-publication model routing (2026-08-22) {#blob-publication-model-routing-2026-08-22}
+
+`CaBlobPublishCore` is the authoritative model for blob-body publication: the split `HEAD` and
+publication phases, unconditional equivalent writes, envelope identity, ambiguous late landing,
+staged-envelope reuse, metadata reconciliation, and monotonic `publicationAttempted` state.
+`CaIncarnationCore` remains the broader writer/GC incarnation model; its atomic `WCreate`,
+`WOverwrite`, and `WResurrect` actions establish same-content replacement and exact-token GC safety,
+but do not duplicate or prove the focused publication transition system.
+
+The audit required no semantic change to `CaGcRoundDeferCore`: its `NoDangle` already states logical
+presence for every referenced blob and does not require equality with a previously observed
+incarnation token. `CaGcCondemnMarkerGate::NoDangle` now uses the same logical interpretation. Its
+one fixed content-addressed key makes presence equivalent to content identity, while tokens remain
+exact-delete authorization.
+
 ## Summary table {#summary-table}
 
 | Model | Proves / gates | Status | Runner |
 |---|---|---|---|
-| `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
+| `CaBlobPublishCore.tla` | authoritative split `HEAD`/unconditional-publication protocol, envelope identity, late landing, staged reuse, metadata reconciliation, and monotonic publication attempt | CURRENT focused blob-publication gate | `run_blobpublish.sh` |
+| `CaIncarnationCore.tla` | broad incarnation-token writer/GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim); publication actions are atomic abstractions routed to `CaBlobPublishCore` | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
 | `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | `run_buildrootprecommit.sh` |
 | `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | `run_gclease.sh` |
 | `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim, and the v9 recovery-generation layer (a generation captured at admission and rechecked post-I/O before every publication; a successor's `EpochSeal` as a conclusive rejection; the acked-then-lost byte comparison) | CURRENT (v9 extension 2026-07-28; gates the ref-chain implementation's `slot-occupy` / `_ckpt` / install changes) | `run_mount.sh` |
@@ -129,6 +145,17 @@ of `CaGcRootLocalPartManifestCore`.
 
 ## Model groups {#model-groups}
 
+### Blob publication {#group-blob-publication}
+
+- **`CaBlobPublishCore.tla`** — the authoritative focused protocol for a durable precommit followed
+  by split body `HEAD`, metadata observation, unconditional publication, metadata reconciliation,
+  readiness, and commit. It models ambiguous responses and late landing, deterministic
+  envelope-derived tokens, allocation-derived generation tokens, fresh envelopes after
+  `Condemned`, exact-token deletion, and the monotonic `publicationAttempted` rule that permits a
+  verbatim staged copy only on the first absent observation. Sabotages isolate each rule, while
+  witnesses reach racing equivalent publishers, staged retagging, and an old backend attempt
+  landing after a newer attempt reached `Ready`. Raw TLC evidence: `CaBlobPublishCore_RESULTS.md`.
+
 ### GC core and proofs {#group-gc-core}
 
 - **`CaIncarnationCore.tla`** — the canonical adversarial GC core: concurrent writers and GC
@@ -140,7 +167,9 @@ of `CaGcRootLocalPartManifestCore`.
   recheck requires the fold to have advanced through the fence; deletes are exact-token; cascade is
   atomic with the delete; the registry fence must use the committed (not fold-time) namespace
   universe; stale dependency evidence must be re-observed before publish. Configs: `_stage1..6*`,
-  `_hunt_*`, `_reval_stage2`, `_sab_*`.
+  `_hunt_*`, `_reval_stage2`, `_sab_*`. Its writer materialization actions are intentionally atomic;
+  `CaBlobPublishCore` owns split `HEAD`/publication, envelope reuse, late landing, and monotonic
+  publication-attempt semantics.
 - **`CaGcAckFloorCore.tla`** / **`CaGcAckFloorZombie.tla`** — the one-pass GC round and its
   two-leader hardening. The round pipeline (`GBegin`/`GFold`/`GComplete`), the clamp-suppression
   guard (a pass that had to hold back an unreadable shard makes no destructive decision), the
@@ -178,7 +207,8 @@ of `CaGcRootLocalPartManifestCore`.
 - **`CaGcRoundDeferCore.tla`** — a GC round that would make no destructive decision may re-adopt
   the sealed in-degree snapshot instead of rebuilding it, but a due graduation must force a fold
   first (no physical delete while an unfolded delta could still touch the blob), and deferral is
-  bounded so an unfolded delta is never skipped forever. Raw TLC evidence:
+  bounded so an unfolded delta is never skipped forever. Its `NoDangle` already uses logical blob
+  presence, so equivalent replacement needs no semantic change here. Raw TLC evidence:
   `CaGcRoundDeferCore_RESULTS.md`.
 - **`CaGcDestructiveGateCore.tla`** — separates later whole-round physical authorization from the
   earlier exact catalog-only lifecycle reconciliation. The lifecycle proof represents a matching
@@ -199,6 +229,9 @@ of `CaGcRootLocalPartManifestCore`.
   `delete_pending` requires confirmed durable Condemned evidence (write-completion callback or a
   synchronous meta re-read); otherwise the entry is carried to the next round, fail-safe. Landed
   as `Gc::scheduleCondemnMarkerWrite` / `noteCondemnMarkerDurable` and the confirmed-markers set.
+  Its current `NoDangle` checks logical content presence rather than equality with the token the
+  writer observed; the missing-marker sabotage still removes the body and violates the invariant.
+  Raw TLC evidence: `CaGcCondemnMarkerGate_RESULTS.md`.
 
 ### Writer protection and freshness meta {#group-writer-meta}
 

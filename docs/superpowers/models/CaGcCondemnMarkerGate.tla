@@ -1,6 +1,8 @@
 --------------------------- MODULE CaGcCondemnMarkerGate ---------------------------
 (* Gate for triage 2026-07-17 §3.4 (codex review №4): the swallowed condemn-marker    *)
-(* write vs same-token adopt.                                                         *)
+(* write vs same-token adopt. This focused GC gate models one fixed content-addressed *)
+(* key, so every present body has that key's logical content; incarnation tokens      *)
+(* authorize exact deletion but are not part of a committed reference's identity.     *)
 (*                                                                                    *)
 (* THE HAZARD (pre-fix). `Gc::scheduleMetaJob` swallows every exception from          *)
 (* `writeCondemnedMeta`, while the round commits the retired (hash, token) entry      *)
@@ -236,8 +238,9 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-(* THE invariant: no delete of a token with a live committed edge — a committed
-   writer's adopted incarnation is always the present body (no dangling manifest). *)
-NoDangle == committed => (body.present /\ body.tok = adopted)
+(* THE invariant: a live committed edge names the key's logical content, not the
+   incarnation token observed by the writer. Because this model has one fixed content-addressed
+   key, presence is also content identity; a safe equivalent replacement may change body.tok. *)
+NoDangle == committed => body.present
 
 =====================================================================================
