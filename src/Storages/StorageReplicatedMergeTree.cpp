@@ -127,7 +127,6 @@
 
 #include <Common/CurrentThread.h>
 #include <Common/scope_guard_safe.h>
-#include "Functions/generateSnowflakeID.h"
 #include "Interpreters/StorageID.h"
 #include "QueryPipeline/QueryPlanResourceHolder.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
@@ -230,6 +229,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
+    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
@@ -7292,7 +7292,12 @@ void StorageReplicatedMergeTree::restoreMetadataInZooKeeper(
         for (const auto & part_name : active_parts_names)
         {
             command.partition = make_intrusive<ASTLiteral>(part_name);
-            attachPartition(command, metadata_snapshot, getContext());
+            attachPartitionImpl(
+                command,
+                metadata_snapshot,
+                getContext(),
+                /* allow_attach_while_readonly */ true,
+                /* deduplicate_part */ false);
         }
     }
 
@@ -7398,8 +7403,18 @@ void StorageReplicatedMergeTree::truncate(
 PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
     const PartitionCommand & command, const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context)
 {
-    /// Allow ATTACH PARTITION on readonly replica when restoring it.
-    if (!are_restoring_replica)
+    return attachPartitionImpl(
+        command, metadata_snapshot, query_context, /* allow_attach_while_readonly */ false, /* deduplicate_part */ true);
+}
+
+PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartitionImpl(
+    const PartitionCommand & command,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr query_context,
+    bool allow_attach_while_readonly,
+    bool deduplicate_part)
+{
+    if (!allow_attach_while_readonly)
         assertNotReadonly();
 
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::attachPartition");
@@ -7419,7 +7434,7 @@ PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
         /* majority_quorum */ false,
         query_context,
         /* is_attach */ true,
-        /* allow_attach_while_readonly */ true);
+        /* allow_attach_while_readonly */ allow_attach_while_readonly);
 
     results.reserve(loaded_parts.size());
 
@@ -7427,7 +7442,7 @@ PartitionCommandsResultInfo StorageReplicatedMergeTree::attachPartition(
     {
         const String old_name = loaded_parts[i]->name;
 
-        output.writeExistingPart(loaded_parts[i]);
+        output.writeExistingPart(loaded_parts[i], deduplicate_part);
 
         renamed_parts.old_and_new_names[i].old_dir.clear();
 
@@ -8394,11 +8409,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto src_snapshot = getInMemoryMetadataPtr();
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
@@ -8406,13 +8416,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     ExportPartitionUtils::verifyExportSchemaCastable(
         src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
 
-    /// Iceberg partition compatibility is checked below; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
     if (!dest_storage->isDataLake())
-    {
-        if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
+        ExportPartitionUtils::assertPartitionKeyASTAreEqual(src_snapshot, destination_snapshot);
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8505,7 +8510,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ExportReplicatedMergeTreePartitionManifest manifest;
 
-    manifest.transaction_id = generateSnowflakeIDString();
+    manifest.transaction_id = toString(UUIDHelpers::generateV4());
     manifest.query_id = query_context->getCurrentQueryId();
     manifest.partition_id = partition_id;
     manifest.destination_database = dest_database;
@@ -8531,6 +8536,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     manifest.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
+    manifest.schema_mismatch_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
 
     if (dest_storage->isDataLake())
     {
@@ -9524,7 +9530,7 @@ std::unique_ptr<ReplicatedMergeTreeLogEntryData> StorageReplicatedMergeTree::rep
             }
 
             UInt64 index = lock.getNumber();
-            MergeTreePartInfo dst_part_info(partition_id, index, index, src_part->info.level);
+            MergeTreePartInfo dst_part_info(partition_id, index, index, getLevelForAdoptedPart(src_data, src_part->info.level));
 
             IDataPartStorage::ClonePartParams clone_params
             {
@@ -9811,7 +9817,7 @@ void StorageReplicatedMergeTree::movePartitionToTable(const StoragePtr & dest_ta
             }
 
             UInt64 index = lock.getNumber();
-            MergeTreePartInfo dst_part_info(partition_id, index, index, src_part->info.level);
+            MergeTreePartInfo dst_part_info(partition_id, index, index, dest_table_storage->getLevelForAdoptedPart(src_data, src_part->info.level));
 
             /// Don't do hardlinks in case of zero-copy at any side (defensive programming)
             bool zero_copy_enabled = (*storage_settings_ptr)[MergeTreeSetting::allow_remote_fs_zero_copy_replication]
@@ -12222,8 +12228,8 @@ void StorageReplicatedMergeTree::attachRestoredParts(
         /* async_insert */ false, *this, metadata_snapshot, /* quorum */ 0, /* quorum_timeout_ms */ 0, /* max_parts_per_block */ 0, /* quorum_parallel */ false,
         /* majority_quorum */ false, getContext(), /* is_attach */ true, /* allow_attach_while_readonly */ false, zookeeper_retries_info);
 
-    for (auto part : parts)
-        sink->writeExistingPart(part);
+    for (auto & part : parts)
+        sink->writeExistingPart(part, /* deduplicate_part */ false);
 }
 
 }
