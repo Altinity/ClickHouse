@@ -102,3 +102,13 @@ existing domain-separation assertions stay meaningful.
 **Also worth noting:** an absent key is not a flip. Settings merge through `updateIfChanged`, which
 applies only values the incoming configuration sets, so deleting `http_client` leaves the previous value
 in force. Only an explicitly different value flips the dialect.
+
+## `SYSTEM SYNC REPLICA` on a lazy materialized view misses the MV (opus-review triage T11) {#sync-replica-lazy-mv-proxy}
+
+Found while re-verifying the review's claim that "every single-table `dynamic_cast` site was verified
+covered" by the table-proxy unwrapping change — it no longer holds. `trySyncReplica` casts to
+`StorageMaterializedView` at `InterpreterSystemQuery.cpp:2160` WITHOUT unwrapping the proxy, so with
+`lazy_load_tables` enabled `SYSTEM SYNC REPLICA` on a lazy MV silently does not reach the MV.
+`StorageProxy::checkMutationIsPossible` forwarding reaches `StorageTableFunctionProxy` on the same
+principle. Non-CAS surface (it is the `lazy_load_tables` feature), so it belongs to the upstream
+carve-out rather than the CAS release. P3, but a silent no-op on a SYSTEM verb is worth a line.

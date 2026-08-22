@@ -19,18 +19,18 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 
 | ID | Статус на HEAD | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|----------------|-----------|------------|-------------------|------|
-| T1 | ⏳ | — | — | — | — |
-| T2 | ⏳ | — | — | — | — |
-| T3 | ⏳ | — | — | — | — |
-| T4 | ⏳ | — | — | — | — |
-| T5 | ⏳ | — | — | — | — |
-| T6 | ⏳ | — | — | — | — |
-| T7 | ⏳ | — | — | — | — |
-| T8 | ⏳ | — | — | — | — |
-| T9 | ⏳ | — | — | — | — |
-| T10 | ⏳ | — | — | — | — |
-| T11 | ⏳ | — | — | — | — |
-| T12 | ⏳ | — | — | — | — |
+| T1 | исправлено | P3 | нет | `BACKLOG/formats-and-storage.md` (GCS Task 9, живой прогон) + `BACKLOG/docs-and-cleanup.md:2… | Кросс-ссылка точна: клиент-широкий GCS-диалект по `http_client = gcp_oauth` снят, следствие про Iceberg `version-hint.text` закрыто отдельно. |
+| T2 | подтверждено | P2 | да | `BACKLOG/operability-and-introspection.md:707` {#disks-exit-code-truncation} + {#disks-exit-… | Кросс-ссылка точна: контракт кода выхода `clickhouse-disks --query` изменён тул-широко, 8-битное усечение живо, документация не тронута. |
+| T3 | подтверждено | P3 | нет | `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} (`S3Exception::isPreconditionFailed` в … | Кросс-ссылка точна: третий дизъюнкт (поиск подстроки в сообщении сервера) жив и по-прежнему консультируется на глобальном пути ретрая всего S3-трафика. |
+| T4 | частично | P2 | да (только как доказательство, не как правка кода) | `fable-review-triage.md` {#m10}; отдельного BACKLOG-пункта под «зафиксировать не-CAS прогон»… | Кросс-ссылка точна: статический гейтинг на HEAD держится, но динамического доказательства «на не-CAS дельты против базы нет» так и не зафиксировано. |
+| T5 | подтверждено | P3 | нет | `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} («`ReadBufferFromS3` cancel-stop (B117)… | Обрыв внешнего ретрай-цикла `ReadBufferFromS3` по отмене запроса на HEAD жив, безусловен для всех S3-читателей, нигде не задокументирован. |
+| T6 | частично | P3 | нет | `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} («`MergeTreeDeduplicationLog` null-writ… | Изменение на HEAD живо и безусловно, но формулировка обзора «converts a silent pass into a throw» неверна — в апстриме на этом месте был `chassert` плюс безусловное разыменование, т.е. в release-сборке падение. |
+| T7 | подтверждено | P3 | нет | `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} («`ThreadStatus parent_thread_group` (B… | Удержание родительской `ThreadGroup` дочерней группой на HEAD живо и безусловно для всех запросов; следствие «поздний лог peak memory из фонового потока» не смягчено и не задокументировано. |
+| T8 | подтверждено | P3 | нет | не отслеживается (в `opus-review-triage.md` таблице m28 стоит ⏳; отдельного BACKLOG-пункта нет) | Кросс-ссылка точна: `initializeBlobUploadPool` вызывается безусловно и бросает `BAD_ARGUMENTS` на нуле, так что CAS-only настройка `cas_blob_upload_pool_size = 0` не даёт стартовать и не-CAS серверу — но запрет описан в самой настройке. |
+| T9 | частично | P3 | нет | смежно `BACKLOG/operability-and-introspection.md:533` {#cas-event-sink-installed-when-log-di… | Секции `<cas_log>`/`<cas_gc_log>` действительно поставляются включёнными, но «две пустые таблицы материализуются на каждом сервере» — неточно: таблица создаётся только при первой записи или при `SYSTEM FLUSH LOGS`. |
+| T10 | частично | P3 | нет | `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} («`LocalObjectStorage` TOCTOU (B38)»); … | Главная часть — snapshot-семантика листинга — УШЛА В АПСТРИМ и уже присутствует в базе ветки, так что дельты по ней нет; локальным остался один шестистрочный хунк. |
+| T11 | подтверждено | P3 | нет | не отслеживается (NV-14 обзора; отдельного пункта в BACKLOG нет) | Разворачивание прокси в одно-табличных `SYSTEM`-командах на HEAD живо и безусловно для пользователей `lazy_load_tables`; заявление «каждая одно-табличная точка покрыта» на HEAD уже неточно — нашёл непокрытый `dynamic_cast`. |
+| T12 | исправлено | — | нет | — (закрыто) | Новая style-проверка удалена из общего скрипта коммитом `eee9a2b8a11`; файл на HEAD побайтово совпадает с базой. |
 
 ## Блокеры B1-B9 {#blockers}
 
@@ -1426,3 +1426,53 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 **Что осталось (P2).** Предложение обзора правильное и остаётся невыполненным: добавить триггер дренажа, не зависящий от повторной записи в namespace. Естественное место — GC-раунд (он и так обходит каждый namespace), либо шаг перед teardown-наблюдением в `~Pool`/`FORGET` (сейчас там ровно наблюдение). Плюс мелочь: развести в WARNING'е `Pool/CasMountRuntime.cpp:529-530` две разные причины нечистого прощания. Класс — удержание (retention) и деградация пути восстановления, не потеря данных, поэтому не pre-release; но P2, потому что один сорвавшийся publish на затихшем namespace тормозит уборку по ВСЕМУ server root'у до рестарта.
 
 **Фиксящего коммита нет.**
+
+## Blast radius — детали {#tiers-details}
+
+### T1 (исправлено, P3) {#t1}
+
+Перепроверка не переделывалась — подтверждаю корректность кросс-ссылок `opus-review-triage.md` {#b1} и `fable-review-triage.md` {#m9} (фикс `faab6678d8f`). На HEAD `grep -rn "gcs_conditional_dialect\|usesGcsConditionalDialect" src/` даёт 0 вхождений, а адаптация запроса/ответа гейтится по запросу: `src/IO/S3/PocoHTTPClient.cpp:760` (ответ), `:911` и `:1021` (запрос) — все под `isNativeConditionalRequest(request)`. Контракт зафиксирован в `src/IO/S3/GCSConditionalDialect.h:11-13`. Не-CAS трафик через тот же клиент идёт как `Default` байт-в-байт по upstream-пути, т.е. Tier-1-регрессия снята. Остаток P3 — живой прогон на GCS и релиз-нота про новую строгость `gcs_hmac`, но это уже не blast radius.
+
+### T2 (подтверждено, P2) {#t2}
+
+Подтверждаю `opus-review-triage.md` {#m6} дословно на HEAD: `programs/disks/DisksApp.cpp:622-623` — `if (query.has_value() && last_command_exit_code != 0) return last_command_exit_code;`, а в `last_command_exit_code` кладётся сырой код ClickHouse (`:238` `= code`, `:255`/`:260` `= ErrorCodes::STD_EXCEPTION` = 1001 → `& 0xFF` = 233). Коды, кратные 256, существуют (`PARTITION_ALREADY_EXISTS` 256, `SET_NON_GRANTED_ROLE` 512, `CANNOT_EXECUTE_PROMQL_QUERY` 768) и дали бы `exit 0` — латентный fail-open ровно в том сценарии (CI/cron-гейтинг `cas-fsck`), для которого изменение и делалось. `docs/en/operations/utilities/clickhouse-disks.md` по-прежнему не содержит ни слова про exit code (`grep -n exit` → 0) и не упоминает ни одну из пяти новых `cas-*` подкоманд. Это единственная строка блока, затрагивающая пользовательский контракт вне CAS и не имеющая ни документации, ни релиз-ноты.
+
+### T3 (подтверждено, P3) {#t3}
+
+Подтверждаю `opus-review-triage.md` {#m1}. На HEAD `src/IO/S3Common.h:96-99` — `return error.GetResponseCode() == PRECONDITION_FAILED || error.GetExceptionName() == "PreconditionFailed" || error.GetMessage().find("PreconditionFailed") != npos;`, и `src/IO/S3/Client.cpp:113` — `if (S3::isPreconditionFailedError(error)) return false;` внутри `Client::RetryStrategy::ShouldRetry`, до проверок `attemptedRetries`/`isQueryCanceled`/`error.ShouldRetry()`. То есть подавление ретрая по подстроке из тела ответа действует для бэкапов, Iceberg, `s3queue` и обычных S3-дисков. Комментарий над предикатом (`S3Common.h:70-95`) после обзора переписан честно (message-fallback объявлен), сам дизъюнкт не тронут. Направление политики 412 остаётся улучшением; риск — только over-match на транзиентной ошибке.
+
+### T4 (частично, P2) {#t4}
+
+Подтверждаю `fable-review-triage.md` {#m10}. Статика на HEAD: `src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp:405` и `:419` — `if (has_shared_transaction) return;` в `beginTransaction`/`commitTransaction`; `src/Storages/MergeTree/MergeTreeData.cpp:9374` и `:9396` — закрытие дисковой транзакции части в `Transaction::renameParts`/`commit` под `hasActiveTransaction()`; `:5968` и `:8739` — те же гейты. Дефолты не-CAS не тронуты (`IDataPartStorage.h` `isContentAddressed() → false`, `IDiskTransaction.h` `tryGetInFlight* → {}`). Централизации нет: `PartTransactionScope` в дереве отсутствует, правило по-прежнему выводится заново примерно в десятке мест. Записи «прогнали апстримные stateless/stress/integration полосы и дельты против базы нет» в `docs/superpowers/cas/` нет ни одной — это самая широкая по охвату строка блока (все таблицы MergeTree), и обязательство остаётся доказательственным, а не кодовым.
+
+### T5 (подтверждено, P3) {#t5}
+
+`src/IO/ReadBufferFromS3.cpp:361` — `if (CurrentThread::isInitialized() && CurrentThread::get().isQueryCanceled()) return false;` в `processException`, т.е. на пути каждого S3-чтения, а не только CAS. Изменение согласовано с уже существующей upstream-проверкой в SDK-стратегии (`src/IO/S3/Client.cpp:119`, та же строка есть в базе `4b7cecaa3cf`), поэтому это выравнивание внешнего цикла с внутренним, а не новая политика. Наблюдаемая дельта для не-CAS: чтение, которое ранее завершалось после сигнала отмены (пройдя backoff), теперь прерывается — killed-запрос больше не «зомбирует» минутами. Ни `CHANGELOG.md`, ни `docs/en/` про это ничего не говорят; трекинг только как carve-out в upstream. Риск считаю низким: направление — фикс, и оно уже было полу-реализовано апстримом.
+
+### T6 (частично, P3) {#t6}
+
+Дифф против базы (`git diff 4b7cecaa3cf HEAD -- src/Storages/MergeTree/MergeTreeDeduplicationLog.cpp`) показывает замену `chassert(current_writer != nullptr);` на бросок в двух местах: `MergeTreeDeduplicationLog.cpp:281-287` (`addPart`) и `:325-331` (`dropPart`), оба `ErrorCodes::LOGICAL_ERROR`. Дальше в апстримном коде шёл `writeRecord(record, *current_writer)` (`:296`), так что «тихого прохода» не было — был segfault в release; новое поведение строго лучше. Достижимость на не-CAS низкая: конструктор создаёт `logs_dir` при `deduplication_window != 0` (`:97-98`), а `rotateAndDropIfNeeded` (`:240`) при `!disk_supports_writing_with_append` всегда вызывает `rotate()` и создаёт writer; ранний выход `load()` (`:103-117`) теперь пропускает `Plain` и `CAS`, т.е. окно с null-writer сузилось. Два дефекта гигиены: код `LOGICAL_ERROR` для условия, зависящего от конфигурации диска (per [[feedback_logical_error_tests_death_split]] это скорее не-`LOGICAL_ERROR`), и комментарий `:278-279` ссылается на «the release-build chassert above», которого в файле больше нет.
+
+### T7 (подтверждено, P3) {#t7}
+
+`src/Common/ThreadStatus.h:87-93` объявляет `ThreadGroupPtr parent_thread_group` с объяснением UAF, и оба дочерних конструктора его заполняют: `src/Interpreters/ThreadStatusExt.cpp:133` (borrowed child, из `createForMaterializedView`, `:241`) и `:149` (`createForFlushAsyncInsertQueue`, `:254`). Значит для НЕ-CAS сервера экспозиция тоже есть — через группы материализованных представлений и flush async-insert, а не только через CAS. Следствие подтверждается механикой апстрима: пик логируется в деструкторе трекера уровня `Process` (`src/Common/MemoryTracker.cpp:183-187`, `log_peak_memory_usage_in_destructor` по умолчанию `true`), а деструктор родительской группы теперь наступает после смерти последней дочерней. Практический масштаб задержки на не-CAS мал (группы MV/flush обычно живут в пределах запроса); длинные хвосты ~90-120 с — это CAS-специфичный `operation_deadline_ms`. Сам фикс корректен, ничего в `CHANGELOG.md`/`docs/en/` про смену времени логирования нет.
+
+### T8 (подтверждено, P3) {#t8}
+
+На HEAD `src/Disks/.../ContentAddressed/Pool/CasBlobUploadPool.cpp:36-38` — `if (size == 0) throw Exception(ErrorCodes::BAD_ARGUMENTS, "cas_blob_upload_pool_size must not be 0");`, и вызов безусловен из `programs/server/Server.cpp:1735` и `programs/local/LocalServer.cpp:438` (плюс `programs/disks/DisksApp.cpp:560` с константой 16). То есть строка обзора воспроизводится дословно. Смягчающее обстоятельство, которого в находке нет: описание настройки прямо говорит «Zero is rejected: the pool must have at least one thread» (`src/Core/ServerSettings.cpp:152-156`) — причём эта формулировка была уже в дереве обзора (`git show 056488b47a0:src/Core/ServerSettings.cpp:151-155`), т.е. это документированный fail-loud, а не сюрприз. Достижимость требует, чтобы администратор сам выставил 0 CAS-настройки на не-CAS сервере; риск считаю P3, но пункт стоит завести в BACKLOG (сейчас он не отслеживается нигде).
+
+### T9 (частично, P3) {#t9}
+
+Секции на месте и без всякого гейта: `programs/server/config.xml:1201-1213` (`<cas_log>`, с комментарием «Enabled by default while the feature is experimental … Remove the section to disable») и `:1321-1330` (`<cas_gc_log>`). Механика создания: `src/Interpreters/SystemLog.cpp:634-643` — `prepareTable()` вызывается только если `!result.logs.empty()` либо `result.create_table_force`, а форс приходит только из `SystemLogs::flush` с `should_prepare_tables_anyway = true` (`:534-536`, путь `SYSTEM FLUSH LOGS`). Значит на не-CAS сервере таблицы не появляются при старте, но появляются после любого `SYSTEM FLUSH LOGS` — что и делает почти вся тулинг/тесты, поэтому практический вывод обзора («сюрприз для тулинга, диффящего `system.tables`») в силе. Реальная безусловная цена, которой в находке нет: два `SystemLog`-объекта поднимают по потоку сохранения на каждом сервере (`src/Common/SystemLogBase.cpp:303`). Документация есть: `docs/en/operations/system-tables/cas_log.md:19-20` прямо говорит «it is enabled by default in the shipped `config.xml`»; в `CHANGELOG.md` — ничего.
+
+### T10 (частично, P3) {#t10}
+
+`git diff 4b7cecaa3cf HEAD -- src/Disks/DiskObjectStorage/ObjectStorages/Local/` даёт ровно 6 добавленных строк. Весь переписанный `LocalObjectStorage::listObjects` (явный стек `directory_iterator`, `isVanishedEntryError`, symlink-guard, проверка встроенного NUL) уже есть в базе `4b7cecaa3cf` — он был принят апстримом (`7b89d9e0786` «Merge pull request #111483 from ClickHouse/iceberg_local_fix», ветка `altinity/backports/antalya-26.6/111483`). Единственная branch-local дельта — `LocalObjectStorage.cpp:432-436`: в `tryStatResolvedPath` каталог теперь возвращает `nullopt` вместо броска `fs::file_size` «Is a directory» (комментарий прямо ссылается на обход `system.remote_data_paths` по CA-пулу). Это влияет только на `LocalObjectStorage::tryGetObjectMetadata` (`:470-474`); бросающий `getObjectMetadata` (`:455`) не тронут, а `listObjects` вызывает хелпер только для не-каталогов. Т.е. формулировка обзора «it changes listing semantics on a shared path» на HEAD больше неверна; остаётся микро-расширение контракта «try»-функции. Ни changelog, ни доков.
+
+### T11 (подтверждено, P3) {#t11}
+
+Хелпер на месте: `src/Interpreters/InterpreterSystemQuery.cpp:283-288` (`unwrapTableProxy`), с 11 точками применения (`:1402`, `:1479`, `:1688`, `:2166`, `:2212`, `:2284`, `:2725`, `:2871`, `:2885`, `:2912`, `:2936`). Fan-out-точки по-прежнему сознательно не разворачивают (`:1653`, `:1749`, `:2248`, `:2747` — все через `it->table()`), что корректно: разворот там материализовал бы каждую ленивую таблицу. Однако одно-табличный путь НЕ полон: в `trySyncReplica` цикл разворота материализованного представления делает `dynamic_cast<StorageMaterializedView *>(table.get())` без разворота прокси (`:2160`), и только последующий каст к `StorageReplicatedMergeTree` идёт через `unwrapTableProxy` (`:2166`) — значит `SYSTEM SYNC REPLICA` по ленивому MV не увидит MV. Отдельная безусловная дельта в общем коде: `src/Storages/StorageProxy.h:150-157` добавляет форвардинг `checkMutationIsPossible` в nested, что затрагивает не только `StorageTableProxy`, но и `StorageTableFunctionProxy` (`src/Storages/StorageTableFunction.h:25`) — там `getNested()` инстанцирует вложенное хранилище до отказа. Направление изменения — фикс (раньше `SYSTEM`-глагол по ленивой таблице врал «Table is not replicated»), но в `CHANGELOG.md`/`docs/en/` про смену поведения `lazy_load_tables` нет ничего.
+
+### T12 (исправлено, —) {#t12}
+
+`git diff 4b7cecaa3cf HEAD -- ci/jobs/scripts/check_style/various_checks.sh` пуст, а `git diff 056488b47a0 HEAD` по тому же файлу показывает `26 deletions` — проверку сняли. Коммит `eee9a2b8a11` («ci: drop the triple-quote SQL style check from the shared style script», 2026-08-05) в сообщении прямо объясняет: «It rode into the CAS branch after a CAS test tripped the class it detects, but it is a generic check in a shared upstream file … The check itself is kept aside untracked for a standalone upstream submission». Соответственно риск «упасть на предсуществующих нарушениях в чужих местах дерева» снят полностью, CI-поверхность ветки по этому файлу нулевая.
