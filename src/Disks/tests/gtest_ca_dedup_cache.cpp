@@ -36,6 +36,10 @@ public:
         ++stream_puts;
         return inner->putIfAbsentStream(k, meta);
     }
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        inner->publishBlob(request);
+    }
 
     std::optional<GetResult> get(const String & k, Range r) override { return inner->get(k, r); }
     std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }

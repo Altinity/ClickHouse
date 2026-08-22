@@ -6,8 +6,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Common/ProfileEvents.h>
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteHelpers.h>
+
+#include <chrono>
+#include <atomic>
+#include <future>
+#include <tuple>
+#include <type_traits>
 
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
@@ -25,6 +33,43 @@
 #endif
 
 using namespace DB::Cas;
+
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+extern const int NOT_IMPLEMENTED;
+}
+
+namespace
+{
+
+BlobPublishRequest streamingPublication(
+    String destination_key, String fresh_envelope, String payload, uint64_t payload_size)
+{
+    return BlobPublishRequest{
+        .destination_key = std::move(destination_key),
+        .publication = StreamingBlobPublication{
+            .payload_size = payload_size,
+            .fresh_envelope = std::move(fresh_envelope),
+            .open_payload = [stored_payload = std::move(payload)]
+            {
+                return std::make_unique<DB::ReadBufferFromOwnString>(stored_payload);
+            }}};
+}
+
+class PublishCountingInMemoryBackend final : public InMemoryBackend
+{
+public:
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        ++publish_calls;
+        InMemoryBackend::publishBlob(request);
+    }
+
+    size_t publish_calls = 0;
+};
+
+}
 
 /// Minimal concrete implementation that overrides every pure virtual with trivial defaults.
 /// Purpose: verify the interface compiles, is overridable, and result-type defaults are sane.
@@ -55,6 +100,10 @@ struct NullBackend final : Backend
         return nullptr;   /// trivial default — streaming behavior is pinned by the CASBackendContract suite
     }
 
+    void publishBlob(const BlobPublishRequest & /*request*/) override
+    {
+    }
+
     PutResult putOverwrite(const String & /*key*/, const String & /*bytes*/, const Token & /*expected*/, const ObjectMeta & /*meta*/) override
     {
         return {PutOutcome::PreconditionFailed, {}};
@@ -77,6 +126,13 @@ struct NullBackend final : Backend
 
     bool supportsListTokens() const override { return false; }
 };
+
+TEST(CASBackend, PublishBlobReturnsNoIncarnationToken)
+{
+    static_assert(std::is_same_v<
+        decltype(std::declval<Backend &>().publishBlob(std::declval<const BlobPublishRequest &>())),
+        void>);
+}
 
 TEST(CASBackend, NullBackendShapeAndDefaults)
 {
@@ -200,6 +256,102 @@ TEST(CASInMemory, RangeGetAndHeadAndList)
     EXPECT_FALSE(page1.next_cursor.empty());
     auto page2 = b.list("p/", page1.next_cursor, 1);
     EXPECT_EQ(page2.keys[0].key, "p/b");
+}
+
+TEST(CASInMemory, PublishBlobStreamingWritesFreshEnvelopeAndExactPayload)
+{
+    InMemoryBackend backend;
+    const auto request = streamingPublication("blob", "fresh-envelope", "payload", 7);
+
+    backend.publishBlob(request);
+
+    const auto result = backend.get("blob");
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->bytes, "fresh-envelopepayload");
+}
+
+TEST(CASInMemory, PublishBlobRejectsShortAndLongStreamingSourcesWithoutVisibility)
+{
+    InMemoryBackend backend;
+    ASSERT_EQ(backend.putIfAbsent("short", "old-short").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent("long", "old-long").outcome, PutOutcome::Done);
+
+    for (const auto & [key, payload, declared_size] : std::vector<std::tuple<String, String, uint64_t>>{
+             {"short", "abc", 4},
+             {"long", "abcd", 3}})
+    {
+        const auto request = streamingPublication(key, "fresh", payload, declared_size);
+        try
+        {
+            backend.publishBlob(request);
+            FAIL() << "expected a source-size mismatch for " << key;
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        }
+    }
+
+    EXPECT_EQ(backend.get("short")->bytes, "old-short");
+    EXPECT_EQ(backend.get("long")->bytes, "old-long");
+}
+
+TEST(CASInMemory, PublishBlobKeepsThePreviousIncarnationVisibleUntilTheCompleteBodyIsReady)
+{
+    using namespace std::chrono_literals;
+
+    InMemoryBackend backend;
+    ASSERT_EQ(backend.putIfAbsent("blob", "old-complete-body").outcome, PutOutcome::Done);
+
+    std::promise<void> source_opened;
+    std::promise<void> release_source;
+    const std::shared_future<void> release = release_source.get_future().share();
+    const BlobPublishRequest request{
+        .destination_key = "blob",
+        .publication = StreamingBlobPublication{
+            .payload_size = 7,
+            .fresh_envelope = "fresh-envelope",
+            .open_payload = [&source_opened, release]
+            {
+                source_opened.set_value();
+                release.wait();
+                return std::make_unique<DB::ReadBufferFromOwnString>(String("payload"));
+            }}};
+
+    auto publication = std::async(std::launch::async, [&] { backend.publishBlob(request); });
+    source_opened.get_future().wait();
+
+    auto observation = std::async(std::launch::async, [&] { return backend.get("blob"); });
+    const auto observation_status = observation.wait_for(2s);
+    EXPECT_EQ(observation_status, std::future_status::ready)
+        << "publication must not hold the visibility lock while draining its source";
+    if (observation_status == std::future_status::ready)
+    {
+        const auto visible = observation.get();
+        ASSERT_TRUE(visible.has_value());
+        EXPECT_EQ(visible->bytes, "old-complete-body");
+    }
+
+    release_source.set_value();
+    EXPECT_NO_THROW(publication.get());
+    ASSERT_TRUE(backend.get("blob").has_value());
+    EXPECT_EQ(backend.get("blob")->bytes, "fresh-envelopepayload");
+}
+
+TEST(CASInMemory, PublishBlobCopiesStagedObjectBytesVerbatim)
+{
+    InMemoryBackend backend;
+    ASSERT_EQ(backend.putIfAbsent("stage", "staged-envelopepayload").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.putIfAbsent("blob", "old-body").outcome, PutOutcome::Done);
+
+    backend.publishBlob(BlobPublishRequest{
+        .destination_key = "blob",
+        .publication = VerbatimStagedBlobPublication{
+            .object_key = "stage",
+            .object_size = 22}});
+
+    ASSERT_TRUE(backend.get("blob").has_value());
+    EXPECT_EQ(backend.get("blob")->bytes, "staged-envelopepayload");
 }
 
 // =====================================================================
@@ -360,11 +512,286 @@ TEST(CASInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
 #endif
 }
 
+TEST(CASInstrumentedBackend, PublishBlobDelegatesOnceAndRecordsOnePhysicalBlobWrite)
+{
+    auto inner = std::make_shared<PublishCountingInMemoryBackend>();
+    InstrumentedBackend backend(inner);
+
+    using ProfileEvents::global_counters;
+    const auto blob_put_before = global_counters[ProfileEvents::CASBlobPut].load();
+
+    const auto request = streamingPublication("pool/blobs/ab/published", "fresh", "payload", 7);
+    backend.publishBlob(request);
+
+    EXPECT_EQ(inner->publish_calls, 1u);
+    ASSERT_TRUE(inner->get("pool/blobs/ab/published").has_value());
+    EXPECT_EQ(inner->get("pool/blobs/ab/published")->bytes, "freshpayload");
+#if !WITH_COVERAGE
+    EXPECT_EQ(global_counters[ProfileEvents::CASBlobPut].load() - blob_put_before, 1u);
+#else
+    (void)blob_put_before;
+#endif
+}
+
 // =====================================================================
 // M-C2 Task 2: typed S3 precondition signal
 // =====================================================================
 
 #if USE_AWS_S3
+
+namespace
+{
+
+class PublicationRecordingWriteBuffer final : public DB::WriteBufferFromFileBase
+{
+public:
+    PublicationRecordingWriteBuffer(size_t & cancel_calls_, size_t & finalize_calls_)
+        : DB::WriteBufferFromFileBase(DB::DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
+        , cancel_calls(cancel_calls_)
+        , finalize_calls(finalize_calls_)
+    {
+    }
+
+    void sync() override
+    {
+        next();
+    }
+
+    std::string getFileName() const override
+    {
+        return "publication-recording-write-buffer";
+    }
+
+private:
+    void nextImpl() override
+    {
+    }
+
+    void finalizeImpl() override
+    {
+        next();
+        ++finalize_calls;
+    }
+
+    void cancelImpl() noexcept override
+    {
+        ++cancel_calls;
+    }
+
+    size_t & cancel_calls;
+    size_t & finalize_calls;
+};
+
+class PublicationRecordingLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        ++write_calls;
+        last_write_mode = mode;
+        last_write_settings = write_settings;
+        if (record_cancellation_only)
+            return std::make_unique<PublicationRecordingWriteBuffer>(cancel_calls, finalize_calls);
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    void copyObject(
+        const DB::StoredObject & object_from,
+        const DB::StoredObject & object_to,
+        const DB::ReadSettings & read_settings,
+        const DB::WriteSettings & write_settings,
+        std::optional<DB::ObjectAttributes> object_to_attributes) override
+    {
+        ++copy_calls;
+        last_copy_settings = write_settings;
+        DB::LocalObjectStorage::copyObject(
+            object_from, object_to, read_settings, write_settings, object_to_attributes);
+    }
+
+    bool supportsCopyMode(DB::ObjectStorageCopyMode copy_mode) const override
+    {
+        return copy_mode == DB::ObjectStorageCopyMode::Default
+            || (copy_mode == DB::ObjectStorageCopyMode::NativeOnly && native_copy_supported);
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadataWithNativeToken(
+        const std::string & path, bool with_tags) const override
+    {
+        ++native_metadata_calls;
+        return DB::LocalObjectStorage::tryGetObjectMetadataWithNativeToken(path, with_tags);
+    }
+
+    void resetRecording()
+    {
+        write_calls = 0;
+        copy_calls = 0;
+        native_metadata_calls = 0;
+        cancel_calls = 0;
+        finalize_calls = 0;
+        last_write_mode.reset();
+        last_write_settings.reset();
+        last_copy_settings.reset();
+    }
+
+    bool native_copy_supported = true;
+    bool record_cancellation_only = false;
+    size_t write_calls = 0;
+    size_t copy_calls = 0;
+    mutable size_t native_metadata_calls = 0;
+    size_t cancel_calls = 0;
+    size_t finalize_calls = 0;
+    std::optional<DB::WriteMode> last_write_mode;
+    std::optional<DB::WriteSettings> last_write_settings;
+    std::optional<DB::WriteSettings> last_copy_settings;
+};
+
+std::shared_ptr<PublicationRecordingLocalObjectStorage> makePublicationRecordingStorage()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_publish_blob_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<PublicationRecordingLocalObjectStorage>(std::move(settings));
+}
+
+String readStorageObject(const DB::ObjectStoragePtr & storage, const String & key)
+{
+    auto in = storage->readObject(DB::StoredObject(key), DB::ReadSettings{});
+    String bytes;
+    DB::readStringUntilEOF(bytes, *in);
+    return bytes;
+}
+
+}
+
+TEST(CASObjectStorageBackend, PublishBlobStreamingUsesOrdinaryDefaultWriteTransport)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native, /*token_producing_single_put_cap=*/1);
+    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/streaming");
+
+    const auto request = streamingPublication(destination, "fresh-envelope", "payload", 7);
+    backend.publishBlob(request);
+
+    ASSERT_EQ(storage->write_calls, 1u);
+    ASSERT_TRUE(storage->last_write_mode.has_value());
+    EXPECT_EQ(*storage->last_write_mode, DB::WriteMode::Rewrite);
+    ASSERT_TRUE(storage->last_write_settings.has_value());
+    EXPECT_EQ(storage->last_write_settings->object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
+    EXPECT_EQ(storage->last_write_settings->object_storage_retry_profile, DB::ObjectStorageRetryProfile::Default);
+    EXPECT_EQ(storage->last_write_settings->s3_max_unexpected_write_error_retries_override, 0u);
+    EXPECT_FALSE(storage->last_write_settings->s3_force_single_part_upload);
+    EXPECT_TRUE(storage->last_write_settings->object_storage_write_if_none_match.empty());
+    EXPECT_TRUE(storage->last_write_settings->object_storage_write_if_match.empty());
+    EXPECT_EQ(storage->native_metadata_calls, 0u)
+        << "tokenless publication must not issue a response-token HEAD";
+    EXPECT_EQ(readStorageObject(storage, destination), "fresh-envelopepayload");
+}
+
+TEST(CASObjectStorageBackend, PublishBlobCancelsShortAndLongStreamingSourcesBeforeVisibility)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/mismatch");
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(destination), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("old-complete-body"), *out);
+        out->finalize();
+    }
+    storage->resetRecording();
+    storage->record_cancellation_only = true;
+
+    size_t expected_cancel_calls = 0;
+    for (const auto & [payload, declared_size] : std::vector<std::pair<String, uint64_t>>{
+             {"abc", 4},
+             {"abcd", 3}})
+    {
+        DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+        {
+            backend.publishBlob(streamingPublication(destination, "fresh", payload, declared_size));
+        });
+
+        ++expected_cancel_calls;
+        EXPECT_EQ(storage->cancel_calls, expected_cancel_calls);
+        EXPECT_EQ(storage->finalize_calls, 0u);
+        EXPECT_EQ(readStorageObject(storage, destination), "old-complete-body");
+    }
+}
+
+TEST(CASObjectStorageBackend, PublishBlobCopiesStagedBytesWithNativeOnlyDefaultRequestMode)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/staging");
+    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/copied");
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(staging), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("staged-envelopepayload"), *out);
+        out->finalize();
+    }
+    storage->resetRecording();
+
+    backend.publishBlob(BlobPublishRequest{
+        .destination_key = destination,
+        .publication = VerbatimStagedBlobPublication{
+            .object_key = staging,
+            .object_size = 22}});
+
+    ASSERT_EQ(storage->copy_calls, 1u);
+    ASSERT_TRUE(storage->last_copy_settings.has_value());
+    EXPECT_EQ(storage->last_copy_settings->object_storage_copy_mode, DB::ObjectStorageCopyMode::NativeOnly);
+    EXPECT_EQ(storage->last_copy_settings->object_storage_request_mode, DB::ObjectStorageRequestMode::Default);
+    EXPECT_EQ(storage->last_copy_settings->object_storage_retry_profile, DB::ObjectStorageRetryProfile::Default);
+    EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_none_match.empty());
+    EXPECT_TRUE(storage->last_copy_settings->object_storage_write_if_match.empty());
+    EXPECT_EQ(readStorageObject(storage, destination), "staged-envelopepayload");
+}
+
+TEST(CASObjectStorageBackend, PublishBlobRefusesVerbatimCopyWithoutNativeTransport)
+{
+    auto storage = makePublicationRecordingStorage();
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    const String staging = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-staging");
+    const String destination = DB::Cas::tests::nativeKeyUnder(storage, "publish/unsupported-copy");
+
+    {
+        auto out = storage->writeObject(
+            DB::StoredObject(staging), DB::WriteMode::Rewrite, {}, DB::DBMS_DEFAULT_BUFFER_SIZE, DB::WriteSettings{});
+        DB::writeString(String("complete-staged-object"), *out);
+        out->finalize();
+    }
+    storage->resetRecording();
+    storage->native_copy_supported = false;
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
+    {
+        backend.publishBlob(BlobPublishRequest{
+            .destination_key = destination,
+            .publication = VerbatimStagedBlobPublication{
+                .object_key = staging,
+                .object_size = 22}});
+    });
+
+    EXPECT_EQ(storage->copy_calls, 0u);
+    EXPECT_FALSE(storage->exists(DB::StoredObject(destination)));
+}
 
 /// The Native conditional-PUT path discriminates a lost precondition by the canonical S3 error code
 /// string ("PreconditionFailed", "NoSuchKey", ...) that `S3Exception` carries from the response XML

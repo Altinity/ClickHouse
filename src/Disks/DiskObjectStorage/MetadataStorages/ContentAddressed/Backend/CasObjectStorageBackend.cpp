@@ -252,6 +252,14 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
 namespace
 {
 
+/// Keep the one-body emulated memory bound across both the new `publishBlob` path and the temporarily
+/// retained `resurrect` path while the writer migration is additive.
+std::mutex & emulatedBlobPublicationMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
 /// True-streaming WriteSink for Native mode: the underlying object-storage write buffer was opened
 /// with `If-None-Match: *` riding on its WriteSettings, so bytes stream through it directly and the
 /// condition is checked when finalize completes the object — see finalizeConditionalWrite for the
@@ -965,6 +973,91 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
     return std::make_unique<EmulatedBufferedSink>(*this, key, meta);
 }
 
+void ObjectStorageBackend::publishBlob(const BlobPublishRequest & request)
+{
+    if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+    {
+        std::unique_ptr<ReadBuffer> payload = streaming->open_payload();
+        if (!payload)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ObjectStorageBackend::publishBlob: payload source for {} returned no reader",
+                request.destination_key);
+
+        if (mode != Mode::Native)
+        {
+            /// The emulated adapter's writes are whole-body operations. Serialize materialization so
+            /// concurrent publications retain the existing one-body peak-memory bound.
+            std::lock_guard publish_lock(emulatedBlobPublicationMutex());
+
+            String body = streaming->fresh_envelope;
+            {
+                WriteBufferFromString out(body, AppendModeTag{});
+                copyData(*payload, out);
+                out.finalize();
+            }
+
+            const size_t streamed = body.size() - streaming->fresh_envelope.size();
+            if (streamed != streaming->payload_size)
+                throw Exception(
+                    ErrorCodes::CORRUPTED_DATA,
+                    "ObjectStorageBackend::publishBlob: source yielded {} payload bytes for {}, declared {} -- nothing was published",
+                    streamed,
+                    request.destination_key,
+                    streaming->payload_size);
+
+            std::lock_guard lock(emu_mutex);
+            emuWrite(request.destination_key, body, /*meta=*/{});
+            return;
+        }
+
+        /// Ordinary unconditional rewrite: default request mode, retry profile, and multipart policy.
+        /// In particular, generation stores are not restricted by the conditional single-PUT cap.
+        auto out = object_storage->writeObject(
+            StoredObject(request.destination_key),
+            WriteMode::Rewrite,
+            /*attributes=*/std::nullopt,
+            DBMS_DEFAULT_BUFFER_SIZE,
+            WriteSettings{});
+        out->write(streaming->fresh_envelope.data(), streaming->fresh_envelope.size());
+        const size_t before = out->count();
+        copyData(*payload, *out);
+        const size_t streamed = out->count() - before;
+        if (streamed != streaming->payload_size)
+        {
+            out->cancel();
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ObjectStorageBackend::publishBlob: source yielded {} payload bytes for {}, declared {} -- upload aborted, nothing published",
+                streamed,
+                request.destination_key,
+                streaming->payload_size);
+        }
+        out->finalize();
+        return;
+    }
+
+    const auto & staged = std::get<VerbatimStagedBlobPublication>(request.publication);
+    if (mode != Mode::Native)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "ObjectStorageBackend::publishBlob: verbatim staged publication requires Native mode");
+
+    WriteSettings write_settings;
+    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
+    if (!object_storage->supportsCopyMode(write_settings.object_storage_copy_mode))
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "ObjectStorageBackend::publishBlob: object storage {} does not support native-only same-store copy",
+            object_storage->getName());
+
+    object_storage->copyObject(
+        StoredObject(staged.object_key),
+        StoredObject(request.destination_key),
+        getReadSettings(),
+        write_settings);
+}
+
 PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
     /// §3.18 №19: reject a wrong-dialect expected token before it ever reaches the wire (Native) or
@@ -1137,14 +1230,13 @@ Token ObjectStorageBackend::resurrect(ReadBuffer & payload, uint64_t payload_siz
     if (mode != Mode::Native)
     {
         /// EmulatedSingleProcess (local object storage): same unconditional semantics. The body is
-        /// materialized -- the emulated conditional ops are whole-`String` by design -- so resurrections
-        /// are SERIALIZED process-wide by their own mutex: the fan-out may run N resurrect tasks at
-        /// once, and without this the peak would be the SUM of the bodies. One at a time bounds the
+        /// materialized -- the emulated conditional ops are whole-`String` by design -- so blob
+        /// publications are serialized process-wide by their own mutex: the fan-out may run N tasks at
+        /// once, and without this the peak would be the sum of the bodies. One at a time bounds the
         /// peak to the largest single body, the same guarantee the byte-weighted admission's exclusive
         /// arm used to give. A dedicated mutex, not `emu_mutex`: the drain may read through the same
         /// store, and `emu_mutex` guards individual ops inside it.
-        static std::mutex emulated_resurrect_mutex;
-        std::lock_guard resurrect_lock(emulated_resurrect_mutex);
+        std::lock_guard resurrect_lock(emulatedBlobPublicationMutex());
         String body = fresh_header;
         {
             WriteBufferFromString out(body, AppendModeTag{});

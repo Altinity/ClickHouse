@@ -92,6 +92,11 @@ public:
     /// `If-None-Match: *` riding on the request. EmulatedSingleProcess mode: memory-buffered delegation
     /// to putIfAbsent (acceptable: this mode exists for unit tests only).
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
+
+    /// Execute the selected unconditional blob transport without observing destination state or
+    /// returning a write-response token. Streaming uses ordinary write settings; staged bytes require
+    /// a native same-store copy.
+    void publishBlob(const BlobPublishRequest & request) override;
     /// Replace `key` only when its current token exactly equals `expected`; a mismatch leaves the
     /// existing incarnation untouched. Storage exceptions propagate instead of being reported as a
     /// successful or failed precondition.

@@ -173,4 +173,10 @@ WriteSinkPtr InstrumentedBackend::putIfAbsentStream(const String & key, const Ob
     return std::make_unique<InstrumentedWriteSink>(std::move(sink), classifyCasNs(key));
 }
 
+void InstrumentedBackend::publishBlob(const BlobPublishRequest & request)
+{
+    inner->publishBlob(request);
+    incrementCasEvent(classifyCasNs(request.destination_key), CasOp::Put);
+}
+
 }

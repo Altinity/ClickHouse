@@ -143,6 +143,10 @@ public:
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
     DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
+    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+    {
+        inner->publishBlob(request);
+    }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
     DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
@@ -173,6 +177,10 @@ public:
     DB::Cas::ListPage list(const String & pfx, const String & c, size_t l) override { return inner->list(pfx, c, l); }
     DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
     DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
+    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+    {
+        inner->publishBlob(request);
+    }
     DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
     DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
     DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
@@ -690,6 +698,10 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+        void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+        {
+            inner->publishBlob(request);
+        }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
         DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
@@ -764,6 +776,10 @@ TEST(CASPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
         DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
         DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+        void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+        {
+            inner->publishBlob(request);
+        }
         DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
         DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & k, const String & fresh_header) override { return inner->resurrect(payload, payload_size, k, fresh_header); }
         DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
@@ -866,6 +882,10 @@ TEST(CASPartWriteTxn, PutBlobVanishDuringRevivalReUploadsNotFatal)
             if (force_412)
                 --finalize_412_budget;
             return std::make_unique<ScriptedSink>(inner->putIfAbsentStream(k, meta), force_412);
+        }
+        void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+        {
+            inner->publishBlob(request);
         }
         std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
         std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
@@ -1344,6 +1364,10 @@ TEST(CASPartWriteTxn, AdoptEvidenceNoBackendOp)
         {
             ++stream_puts;
             return inner->putIfAbsentStream(k, meta);
+        }
+        void publishBlob(const BlobPublishRequest & request) override
+        {
+            inner->publishBlob(request);
         }
         std::optional<GetResult> get(const String & k, Range r) override { ++gets; return inner->get(k, r); }
         std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }

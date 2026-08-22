@@ -167,6 +167,58 @@ WriteSinkPtr InMemoryBackend::putIfAbsentStream(const String & key, const Object
     return std::make_unique<InMemoryWriteSink>(*this, key, meta);
 }
 
+void InMemoryBackend::publishBlob(const BlobPublishRequest & request)
+{
+    if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+    {
+        std::unique_ptr<ReadBuffer> payload = streaming->open_payload();
+        if (!payload)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "InMemoryBackend::publishBlob: payload source for {} returned no reader",
+                request.destination_key);
+
+        /// Drain before taking the store lock: the source may itself read another object from this
+        /// backend. The complete body remains private until its size has been validated.
+        String body = streaming->fresh_envelope;
+        {
+            WriteBufferFromString out(body, AppendModeTag{});
+            copyData(*payload, out);
+            out.finalize();
+        }
+
+        const size_t streamed = body.size() - streaming->fresh_envelope.size();
+        if (streamed != streaming->payload_size)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "InMemoryBackend::publishBlob: source yielded {} payload bytes for {}, declared {} -- nothing was published",
+                streamed,
+                request.destination_key,
+                streaming->payload_size);
+
+        std::lock_guard lock(mutex_);
+        Object object;
+        object.bytes = std::move(body);
+        object.token = mintToken();
+        store_[request.destination_key] = std::move(object);
+        return;
+    }
+
+    const auto & staged = std::get<VerbatimStagedBlobPublication>(request.publication);
+    std::lock_guard lock(mutex_);
+    const auto source = store_.find(staged.object_key);
+    if (source == store_.end())
+        throw Exception(
+            ErrorCodes::FILE_DOESNT_EXIST,
+            "InMemoryBackend::publishBlob: staging object {} is absent",
+            staged.object_key);
+
+    Object object;
+    object.bytes = source->second.bytes;
+    object.token = mintToken();
+    store_[request.destination_key] = std::move(object);
+}
+
 PutResult InMemoryBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);

@@ -60,6 +60,10 @@ public:
     /// not publish anything.
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
 
+    /// Publishes either `[fresh_envelope][payload]` or the complete staged bytes as one atomic
+    /// in-memory replacement. Streaming sources are fully validated before the destination changes.
+    void publishBlob(const BlobPublishRequest & request) override;
+
     /// Replaces the existing object only when `expected` is its current token. Token enforcement can
     /// be disabled with `setEnforceTokens` to model a backend that incorrectly ignores this condition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,

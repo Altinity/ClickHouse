@@ -138,6 +138,10 @@ public:
     /// Return a sink that records the create outcome when its `finalize` is called.
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
 
+    /// Count one successful physical blob publication after delegating exactly once. The backend has
+    /// no lifecycle reason to classify here; decision diagnostics remain with the writer.
+    void publishBlob(const BlobPublishRequest & request) override;
+
     /// Count a successful token-conditional overwrite as `Overwrite`; a precondition conflict is
     /// counted as `CasConflict`.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,

@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace DB
@@ -176,6 +177,35 @@ public:
 
 using WriteSinkPtr = std::unique_ptr<WriteSink>;
 
+/// Re-readable payload transport for one unconditional blob publication. `fresh_envelope` is the
+/// complete CAS envelope to prepend, while `payload_size` is the exact number of bytes the source
+/// must yield before the backend can make the destination visible.
+struct StreamingBlobPublication
+{
+    uint64_t payload_size;
+    String fresh_envelope;
+    std::function<std::unique_ptr<ReadBuffer>()> open_payload;
+};
+
+/// A complete, already-size-verified CAS object that can be copied byte-for-byte to the destination.
+/// This transport requires a provider-native same-store copy; the backend must never replace it with
+/// a client-side read/write fallback.
+struct VerbatimStagedBlobPublication
+{
+    String object_key;
+    uint64_t object_size;
+};
+
+using BlobPublication = std::variant<StreamingBlobPublication, VerbatimStagedBlobPublication>;
+
+/// Transport-only request for an unconditional blob rewrite. Publication does not inspect destination
+/// state or freshness metadata and does not produce an incarnation token.
+struct BlobPublishRequest
+{
+    String destination_key;
+    BlobPublication publication;
+};
+
 /// Token-aware storage seam used by the content-addressed pool. TOKEN SEMANTICS ARE THE CONTRACT:
 ///   - every present key has exactly one current incarnation identified by an opaque Token;
 ///   - putOverwrite/casPut succeed only against the expected current token (or expected absence);
@@ -233,6 +263,11 @@ public:
     /// ops remain for manifests, trees, probe and GC objects.
     virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) = 0;
     WriteSinkPtr putIfAbsentStream(const String & key) { return putIfAbsentStream(key, {}); }
+
+    /// Unconditionally publishes one complete blob body. The caller owns every lifecycle decision;
+    /// this method only executes the selected streaming or native-copy transport and returns after
+    /// the complete destination becomes visible.
+    virtual void publishBlob(const BlobPublishRequest & request) = 0;
 
     /// Replaces the current object only when its token equals `expected`. A mismatch leaves the
     /// object unchanged and returns `PreconditionFailed`; the returned token is meaningful only on

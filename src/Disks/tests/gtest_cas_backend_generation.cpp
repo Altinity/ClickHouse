@@ -11,6 +11,10 @@
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/config/AWSProfileConfigLoader.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/s3/model/CreateMultipartUploadRequest.h>
+#include <aws/s3/model/CompleteMultipartUploadRequest.h>
+#include <aws/s3/model/AbortMultipartUploadRequest.h>
+#include <aws/s3/model/UploadPartRequest.h>
 #include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/S3Client.h>
@@ -21,6 +25,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
 #include <Common/tests/gtest_global_context.h>
 
+#include <mutex>
 #include <sstream>
 #endif
 
@@ -30,6 +35,14 @@ namespace DB::ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
 }
+
+#if USE_AWS_S3
+namespace DB::S3RequestSetting
+{
+extern const S3RequestSettingsUInt64 max_single_part_upload_size;
+extern const S3RequestSettingsUInt64 min_upload_part_size;
+}
+#endif
 
 namespace
 {
@@ -338,14 +351,11 @@ namespace
 {
 
 /// Minimal S3 double for the CasObjectStorageBackend generation-token write battery: just enough of
-/// `DB::S3::Client` to drive a real `WriteBufferFromS3` end to end (PutObject, HeadObject).
-/// CreateMultipartUpload/UploadPart/CompleteMultipartUpload are deliberately NOT overridden: every
-/// test below that expects `NOT_IMPLEMENTED` relies on WriteBufferFromS3::createMultipartUpload
-/// throwing BEFORE any multipart request is ever built, so those requests must never reach the wire in
-/// the first place -- an unimplemented override would only matter if that invariant broke. `GetObject`
-/// is likewise not overridden: reading a written body back verifies against `objects` directly (see
-/// the tests below), rather than through the considerably more involved `ReadBufferFromS3` read path
-/// (range/retry/prefetch machinery), which this fake does not attempt to support.
+/// `DB::S3::Client` to drive a real `WriteBufferFromS3` end to end (`PutObject`, multipart upload, and
+/// `HeadObject`). `GetObject` is not overridden: reading a written body back verifies against
+/// `objects` directly (see the tests below), rather than through the considerably more involved
+/// `ReadBufferFromS3` read path (range/retry/prefetch machinery), which this fake does not attempt to
+/// support.
 class FakeGenerationS3Client : public DB::S3::Client
 {
 public:
@@ -388,16 +398,20 @@ public:
 
     mutable size_t put_object_calls = 0;
     mutable size_t head_object_calls = 0;
+    mutable size_t create_multipart_calls = 0;
+    mutable size_t upload_part_calls = 0;
+    mutable size_t complete_multipart_calls = 0;
+    mutable size_t abort_multipart_calls = 0;
 
     Aws::S3::Model::PutObjectOutcome PutObject(const Aws::S3::Model::PutObjectRequest & request) const override
     {
+        std::lock_guard lock(mutex);
         ++put_object_calls;
         std::stringstream data;
         data << request.GetBody()->rdbuf();
         objects[request.GetKey()] = data.str();
 
-        Aws::S3::Model::PutObjectOutcome outcome;
-        Aws::S3::Model::PutObjectResult result(outcome.GetResultWithOwnership());
+        Aws::S3::Model::PutObjectResult result;
         if (!put_returns_no_etag)
             result.SetETag(next_put_etag);
         return result;
@@ -409,6 +423,7 @@ public:
 
     Aws::S3::Model::HeadObjectOutcome HeadObject(const Aws::S3::Model::HeadObjectRequest & request) const override
     {
+        std::lock_guard lock(mutex);
         ++head_object_calls;
         Aws::S3::Model::HeadObjectOutcome outcome;
         Aws::S3::Model::HeadObjectResult result(outcome.GetResultWithOwnership());
@@ -419,10 +434,65 @@ public:
         return result;
     }
 
+    Aws::S3::Model::CreateMultipartUploadOutcome CreateMultipartUpload(
+        const Aws::S3::Model::CreateMultipartUploadRequest & /*request*/) const override
+    {
+        std::lock_guard lock(mutex);
+        ++create_multipart_calls;
+        multipart_parts.clear();
+        Aws::S3::Model::CreateMultipartUploadResult result;
+        result.SetUploadId("publish-upload");
+        return result;
+    }
+
+    Aws::S3::Model::UploadPartOutcome UploadPart(const Aws::S3::Model::UploadPartRequest & request) const override
+    {
+        std::lock_guard lock(mutex);
+        ++upload_part_calls;
+        std::stringstream data;
+        data << request.GetBody()->rdbuf();
+        multipart_parts[request.GetPartNumber()] = data.str();
+
+        Aws::S3::Model::UploadPartResult result;
+        result.SetETag("part-" + std::to_string(request.GetPartNumber()));
+        return result;
+    }
+
+    Aws::S3::Model::CompleteMultipartUploadOutcome CompleteMultipartUpload(
+        const Aws::S3::Model::CompleteMultipartUploadRequest & request) const override
+    {
+        std::lock_guard lock(mutex);
+        ++complete_multipart_calls;
+        String body;
+        for (const auto & [part_number, part] : multipart_parts)
+        {
+            (void)part_number;
+            body += part;
+        }
+        objects[request.GetKey()] = std::move(body);
+
+        Aws::S3::Model::CompleteMultipartUploadResult result;
+        if (!put_returns_no_etag)
+            result.SetETag(next_put_etag);
+        return result;
+    }
+
+    Aws::S3::Model::AbortMultipartUploadOutcome AbortMultipartUpload(
+        const Aws::S3::Model::AbortMultipartUploadRequest & /*request*/) const override
+    {
+        std::lock_guard lock(mutex);
+        ++abort_multipart_calls;
+        multipart_parts.clear();
+        return Aws::S3::Model::AbortMultipartUploadResult{};
+    }
+
     mutable std::map<std::string, std::string> objects;
+    mutable std::map<int, std::string> multipart_parts;
+    mutable std::mutex mutex;
 };
 
-std::shared_ptr<DB::S3ObjectStorage> makeGenerationS3ObjectStorageForTest(FakeGenerationS3Client *& out_client)
+std::shared_ptr<DB::S3ObjectStorage> makeGenerationS3ObjectStorageForTest(
+    FakeGenerationS3Client *& out_client, bool force_multipart = false)
 {
     auto owned_client = std::make_unique<FakeGenerationS3Client>();
     out_client = owned_client.get();
@@ -432,8 +502,15 @@ std::shared_ptr<DB::S3ObjectStorage> makeGenerationS3ObjectStorageForTest(FakeGe
     DB::S3Capabilities capabilities;
     DB::ObjectStorageKeyGeneratorPtr key_generator;
 
+    auto settings = std::make_unique<DB::S3Settings>();
+    if (force_multipart)
+    {
+        settings->request_settings[DB::S3RequestSetting::max_single_part_upload_size] = 0;
+        settings->request_settings[DB::S3RequestSetting::min_upload_part_size] = 64;
+    }
+
     return std::make_shared<DB::S3ObjectStorage>(
-        std::move(owned_client), std::make_unique<DB::S3Settings>(), std::move(uri), capabilities, key_generator, "cas-generation-disk");
+        std::move(owned_client), std::move(settings), std::move(uri), capabilities, key_generator, "cas-generation-disk");
 }
 
 }
@@ -463,6 +540,59 @@ protected:
         return b;
     }
 };
+
+TEST(CASBackendGeneration, PublishBlobAboveFormerGenerationCapUsesOrdinaryMultipart)
+{
+    (void)getContext();
+    FakeGenerationS3Client * client = nullptr;
+    auto storage = makeGenerationS3ObjectStorageForTest(client, /*force_multipart=*/true);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native, /*token_producing_single_put_cap=*/16);
+    backend.setNativeTokenTypeForTest(TokenType::Generation);
+
+    const String payload(1024, 'x');
+    backend.publishBlob(BlobPublishRequest{
+        .destination_key = "p/gen/publish-multipart",
+        .publication = StreamingBlobPublication{
+            .payload_size = payload.size(),
+            .fresh_envelope = "fresh",
+            .open_payload = [payload]
+            {
+                return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+            }}});
+
+    EXPECT_EQ(client->put_object_calls, 0u);
+    EXPECT_EQ(client->create_multipart_calls, 1u);
+    EXPECT_GT(client->upload_part_calls, 0u);
+    EXPECT_EQ(client->complete_multipart_calls, 1u);
+    EXPECT_EQ(client->abort_multipart_calls, 0u);
+    EXPECT_EQ(client->head_object_calls, 0u);
+    EXPECT_EQ(client->objects.at("p/gen/publish-multipart"), "fresh" + payload);
+}
+
+TEST(CASBackendGeneration, PublishBlobSucceedsWithoutResponseGeneration)
+{
+    (void)getContext();
+    FakeGenerationS3Client * client = nullptr;
+    auto storage = makeGenerationS3ObjectStorageForTest(client);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native, /*token_producing_single_put_cap=*/1);
+    backend.setNativeTokenTypeForTest(TokenType::Generation);
+    client->put_returns_no_etag = true;
+
+    const String payload = "payload";
+    EXPECT_NO_THROW(backend.publishBlob(BlobPublishRequest{
+        .destination_key = "p/gen/publish-no-generation",
+        .publication = StreamingBlobPublication{
+            .payload_size = payload.size(),
+            .fresh_envelope = "fresh",
+            .open_payload = [payload]
+            {
+                return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+            }}}));
+
+    EXPECT_EQ(client->put_object_calls, 1u);
+    EXPECT_EQ(client->head_object_calls, 0u);
+    EXPECT_EQ(client->objects.at("p/gen/publish-no-generation"), "freshpayload");
+}
 
 /// NOTE: putIfAbsent/casPut/putOverwrite (compare/create writes) are NOT covered end to end here.
 /// conditionalWriteSettings() selects the SingleAttempt object-storage retry profile, and

@@ -1201,6 +1201,10 @@ public:
     {
         return inner->putIfAbsentStream(key, meta);
     }
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        inner->publishBlob(request);
+    }
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
     {
         return inner->putOverwrite(key, bytes, expected, meta);
