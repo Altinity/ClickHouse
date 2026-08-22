@@ -50,12 +50,12 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 
 | ID | Статус на HEAD | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|----------------|-----------|------------|-------------------|------|
-| M1 | ⏳ | — | — | — | — |
-| M2 | ⏳ | — | — | — | — |
-| M3 | ⏳ | — | — | — | — |
-| M4 | ⏳ | — | — | — | — |
-| M5 | ⏳ | — | — | — | — |
-| M6 | ⏳ | — | — | — | — |
+| M1 | подтверждено | P3 | нет | — (не отслеживается: грепы `isPreconditionFailedError`/`ShouldRetry`/`412` по `docs/superpow… | Третий дизъюнкт — поиск подстроки `PreconditionFailed` в сообщении сервера — на HEAD жив и по-прежнему консультируется в глобальном `Client::RetryStrategy::ShouldRetry` для всего S3-трафика; комментарий переписан лишь частично. |
+| M2 | дубликат CAS-066 | P2 | нет | [{#local-backend}](docs/superpowers/cas/BACKLOG/formats-and-storage.md#local-backend) — пунк… | Дубликат CAS-066 (адъюдицировано by-design): выбор режима по типу хранилища и INFO-уровень подтверждены и на HEAD, единственный живой остаток — отсутствие оговорки «только один сервер» в `quick-start.md`/`configuration.md`. |
+| M3 | подтверждено | P2 | нет | — (именно эти семь счётчиков и инверсия уровня лога не отслеживаются: `grep -rn` по всем сем… | Обе половины подтверждены дословно: ни один из семи терминальных счётчиков не упоминается в `docs/`, а `CASIdentityLost`/`CASDataRootVanished` — состояния, которые код сам называет TERMINAL — по-прежнему логируются на `LOG_WARNING`, тогда как алерт по ERROR настроен на `CASMountExclusivityViolation`. |
+| M4 | дубликат CAS-098 | P2 | нет | [{#gc-health-zero-is-ambiguous}](docs/superpowers/cas/BACKLOG/operability-and-introspection.… | Дубликат CAS-098 пункт 1; ключевая проверяемая часть — «фикс уже есть, но не используется» — ПОДТВЕРЖДЕНА дословно: `ever_succeeded` вычисляется в `gcHealth` и не потребляется ни одним продакшн-читателем (только двумя gtest'ами), а SQL-колонка уже `Nullable(UInt64)` и уже вставляет NULL на peer-строках. |
+| M5 | подтверждено | P2 | нет | частично — класс «настойчивый отказ confirm ⇒ шторм `NETWORK_ERROR`» отслеживается через яко… | Подтверждено дословно: строки таксономии 3 и 5b бросают `NETWORK_ERROR` мимо тормоза, все четыре top-level вызова `fetchSelectedPart` идут с `allow_ca_relink = true` по умолчанию, счётчика попыток или настройки-выключателя нет, а на двух репликах shuffle — no-op, так что постоянный отказ confirm циклится без деградации в байтовый fetch. |
+| M6 | подтверждено | P2 | нет | половина «контракт изменён, релиз-нота нужна» — [{#disks-exit-code-upstream}](docs/superpowe… | Обе половины живы на HEAD: сырой код ошибки ClickHouse по-прежнему возвращается из `DisksApp::main` как POSIX-статус (усечение до 8 бит, коды кратные 256 дают `exit 0`), а `clickhouse-disks.md` не описывает ни контракт кода выхода, ни пять новых CAS-подкоманд. |
 | M7 | ⏳ | — | — | — | — |
 | M8 | ⏳ | — | — | — | — |
 | M9 | ⏳ | — | — | — | — |
@@ -811,3 +811,451 @@ Fable M6 (`docs/superpowers/cas/fable-review-triage.md:289`) — про тот �
 **Чем формулировка opus отличается от сиблинга.** Два добавления, оба уместные. Во-первых, opus точно называет, ПОЧЕМУ замены покрытия нет, разобрав оба кандидата: `05002` — один непараллельный FETCH, `04289_cas_multi_detach_drop.sql` — другой, уже закрытый write-side баг (последовательные DETACH-коммиты, перезаписывавшие общий ref); сиблинг проверял только `05002`. Во-вторых, opus формулирует запасной вариант фикса, которого у сиблинга нет: если продуктовый фикс отложен на релиз, добавить тест уменьшенного объёма, пиннящий ЗАДОКУМЕНТИРОВАННОЕ fail-closed поведение, чтобы будущий переход к ТИХОЙ порче был пойман — это правильный ход, потому что дешёвый и он покрывает именно тот риск, который отложенность создаёт. С другой стороны, opus подсвечивает quick-start с локальным конфигом как усиливающий фактор, а это как раз то, что сиблинг парирует ссылкой на `documented-unsafe`-статус локального бэкенда.
 
 **Что осталось (в порядке дешевизны).** (а) прогнать `03350` под CA-полосой и проверить, заслужен ли ещё тег после B181; (б) если падает — привести комментарий теста в соответствие с реальным механизмом (ref-лог namespace'а на неатомарном локальном бэкенде, а не «shared detached ref»); (в) продуктовый фикс `[disk-error-audit]` (temp-file + `rename`), который бэклог прямо называет закрывающим механизм B66a; (г) добавленное opus: либо reduced-scope тест на fail-closed, либо строка в `roadmap.md` known limitations. P3 и не pre-release: на S3/GCS-пулах — единственной production-посадке — класс не воспроизводится; реальная цена сегодня — слепое пятно в CI и, возможно, лишний тег на тесте, который бы уже проходил.
+
+## M1 (подтверждено, P3) {#m1}
+
+**Третий дизъюнкт — поиск подстроки `PreconditionFailed` в сообщении сервера — на HEAD жив и по-прежнему консультируется в глобальном `Client::RetryStrategy::ShouldRetry` для всего S3-трафика; комментарий переписан лишь частично.**
+
+**Что заявлено.** `S3::isPreconditionFailedError` содержит третий дизъюнкт
+`error.GetMessage().find("PreconditionFailed") != npos` — сканирование подстроки в сообщении,
+которое приходит от сервера. Предикат безусловно вызывается из `Client::RetryStrategy::ShouldRetry`,
+т.е. на пути ВСЕГО S3-трафика (бэкапы, Iceberg, `s3queue`, обычные S3-диски). Для CAS-вызывающего
+over-match безопасен (форсит re-validate), а для `ShouldRetry` направление инвертировано: over-match
+подавляет ретрай реально транзиентной ошибки. Плюс: комментарий с внутренним тикет-ID, и нет теста
+на условный commit Iceberg.
+
+**Что на HEAD.** Форма кода воспроизводится дословно.
+
+`src/IO/S3Common.h:94-99`:
+```cpp
+inline bool isPreconditionFailedError(const Aws::Client::AWSError<ErrorType> & error)
+{
+    return error.GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED
+        || error.GetExceptionName() == "PreconditionFailed"
+        || error.GetMessage().find("PreconditionFailed") != std::string::npos;
+}
+```
+
+`src/IO/S3/Client.cpp:108-114` — консультация безусловна и стоит ДО проверки `attemptedRetries`,
+`isQueryCanceled` и `error.ShouldRetry()`, т.е. это первый по порядку глобальный обрыв ретрая
+(после `MOVED_PERMANENTLY`):
+```cpp
+    /// ... downstream SYSTEM SYNC REPLICA (B166). One 412 policy across the retry and CA conditional ops.
+    if (S3::isPreconditionFailedError(error))
+        return false;
+```
+
+Правки после ревью были, но косметические: `354b1df855f` («final-review polish — truthful S3
+predicate comment») переписал комментарий над предикатом в `S3Common.h:70-93` так, что он теперь
+честно объявляет message-fallback и объясняет мотивацию (не-AWS тело, RustFS, пустой `ExceptionName`),
+и убрал оттуда внутренний тег. Сам дизъюнкт не тронут. Внутренний тег `B166` при этом остался в
+`src/IO/S3/Client.cpp:111` и в имени/комментарии теста
+`src/IO/S3/tests/gtest_aws_s3_client.cpp:215-219` — это уже территория M8, но половина «rewrite the
+comment without the internal ticket ID» выполнена только в одном из трёх мест.
+
+Существующий тест `IOTestAwsS3Client.DoesNotRetryPreconditionFailed`
+(`src/IO/S3/tests/gtest_aws_s3_client.cpp:214-241`) закрепляет как раз ЖЕЛАЕМОЕ поведение обеих
+безопасных ветвей (response code и exact `ExceptionName`) и отдельно проверяет, что
+`SLOW_DOWN`/`SERVICE_UNAVAILABLE` ретраится. То есть предложенный фикс (снять message-дизъюнкт с
+пути `ShouldRetry`) существующие тесты НЕ ломает: ни один тест не требует message-матчинга именно на
+retry-пути (строка `:237` проверяет `named`, где совпадает `ExceptionName`).
+
+Теста на условный commit Iceberg (`writeMetadataFileAndVersionHint`,
+`src/Storages/ObjectStorage/DataLakes/Iceberg/Utils.cpp`) по-прежнему нет.
+
+**Дубликат?** Нет. `2031-triage.md` CAS-021 (`:875`) и CAS-010 (`:428`) — про контроллер условной
+записи и пустой токен, они трогают отображение `NoSuchKey → PreconditionFailed` в
+`Backend/CasObjectStorageBackend.cpp:156-159`, но не глобальный retry-путь. `fable-review-triage.md`
+V6 (`:74`, `:689-691`) разбирает `copyObjectConditional` и тоже не касается `ShouldRetry`.
+
+**Что осталось / приоритет.** Механика подтверждена, но достижимость узкая: response-code-проверка
+стоит первой, поэтому вред возникает только для ошибки, которая НЕ является 412, но чьё тело
+содержит подстроку `PreconditionFailed` — например 5xx от S3-совместимого шлюза, эхом
+пересылающего исходный текст. Демонстрируемого пути на HEAD нет, а последствие — потеря ретрая
+(громкая ошибка запроса), не порча данных. Отсюда P3, не до релиза. Остаток: (а) снять
+message-дизъюнкт с пути `ShouldRetry`, оставив его только CA-вызывающим (например расщепить на
+`isPreconditionFailedError` и `isPreconditionFailedErrorLenient`); (б) добить `B166` в `Client.cpp:111`
+и в тесте; (в) тест на условный commit Iceberg.
+
+## M2 (дубликат CAS-066, P2) {#m2}
+
+**Дубликат CAS-066 (адъюдицировано by-design): выбор режима по типу хранилища и INFO-уровень подтверждены и на HEAD, единственный живой остаток — отсутствие оговорки «только один сервер» в `quick-start.md`/`configuration.md`.**
+
+**Что заявлено.** `local` object storage молча включает `EmulatedSingleProcess`; комментарий сам
+признаёт, что два сервера над одним локальным пулом «would silently violate the CAS invariants — the
+capability probe cannot detect this», а уровень лога понижен до INFO именно чтобы не валить ~15
+stateless-тестов; при этом ограничение «один сервер» не упомянуто нигде в `docs/en/antalya/cas/**`,
+а `quick-start.md` рекомендует ровно эту конфигурацию как самый простой вход.
+
+**Что на HEAD.** Всё воспроизводится дословно, файл переехал не был (CAS-код в подкаталоги двигал
+`592b9b83568`, но сам `ContentAddressedMetadataStorage.cpp` остался на месте), сместились только
+строки.
+
+`ContentAddressedMetadataStorage.cpp:689-693` — выбор режима по типу хранилища, без ручки:
+```cpp
+    const auto mode = object_storage->getType() == ObjectStorageType::Local
+        ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
+        : Cas::ObjectStorageBackend::Mode::Native;
+```
+`:697-710` — тот же комментарий («…would silently violate the CAS invariants — the capability probe
+cannot detect this (each process passes it alone). Make a shared-pool misconfiguration visible at
+INFO, not WARNING») с тем же обоснованием про `send_logs_level=warning` и с той же отложенной
+альтернативой «a future `system.warnings` entry could restore a louder, test-safe signal».
+`:711-717` — сам `LOG_INFO` с текстом «safe ONLY for a single server… Do NOT share this pool path
+between multiple ClickHouse servers (e.g. a shared/NFS mount)».
+
+Механизм `system.warnings` НЕ подключён: единственное упоминание `system.warnings` во всём
+CAS-каталоге — это тот самый комментарий (`grep -rn "system.warnings\|addWarningMessage"` по
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` даёт одно попадание, `:708`).
+
+Документационная половина тоже подтверждена на HEAD: `grep -rn "single server\|single-server\|NFS\|
+shared mount\|multi-server" docs/en/antalya/cas/` — **ноль** попаданий. При этом
+`docs/en/antalya/cas/quick-start.md:15` по-прежнему подаёт local как беспроблемный онрамп («This
+example uses the `local` object-storage backend so it needs…») и `:24` показывает
+`<object_storage_type>local</object_storage_type>`. В `configuration.md` `local` фигурирует только
+как значение `staging_backend` (`:104`), основной пример — `s3` (`:26`), т.е. страницы конфигурации
+эта оговорка тоже не касается.
+
+**Почему дубликат.** `2031-triage.md` CAS-066 (`:2947-2985`) разбирает ровно этот код и вынес
+**by-design, P2**: режим — свойство возможностей хранилища, а не вкуса оператора; обе «неправильные»
+комбинации закрыты (Native над не-S3 отклоняется громко в `Backend/CasObjectStorageBackend.cpp:94-110`
+через `supportsRetryProfile(SingleAttempt)`; Emulated над S3 недостижим по конструкции); INFO —
+зафиксированное в коде решение с обоснованием; единственный остаток — user-facing оговорка,
+отнесённая к уже существующему B26/B135 внутри `{#local-backend}`.
+
+**Что опус-формулировка добавляет к сиблингу.** CAS-066 закрыл вопрос как чисто документационный
+долг («без кода-фикса»); опус, наоборот, называет вторую, кодовую половину фикса — восстановить
+*громкий* сигнал через `system.warnings`, т.е. предлагает исполнить ту самую отложенную
+альтернативу, которую комментарий кода сам себе выписал, вместо того чтобы оставить сигнал на INFO
+навсегда. Плюс опус явно расширяет doc-фикс на `configuration.md` (CAS-066 указывал только
+`quick-start.md`) и подчёркивает противоречие: страница, рекомендующая конфигурацию, молчит о том,
+что сам код называет «would break silently».
+
+**Что осталось.** (а) оговорка «single server only, не разделяемый/NFS путь» в `quick-start.md`
+рядом с примером на `:24` и в `configuration.md`; (б) опционально — запись в `system.warnings`
+вместо/в дополнение к INFO (test-safe, не форвардится клиенту). Приоритет остаётся P2 как у
+CAS-066: цена ошибки высокая, вероятность низкая, релиз не блокирует.
+
+## M3 (подтверждено, P2) {#m3}
+
+**Обе половины подтверждены дословно: ни один из семи терминальных счётчиков не упоминается в `docs/`, а `CASIdentityLost`/`CASDataRootVanished` — состояния, которые код сам называет TERMINAL — по-прежнему логируются на `LOG_WARNING`, тогда как алерт по ERROR настроен на `CASMountExclusivityViolation`.**
+
+**Что заявлено.** Семь из девяти приоритетных для алертинга событий
+(`CASMountExclusivityViolation`, `CASIdentityLost`, `CASDataRootVanished`, `CASMountLeaseLost`,
+`CASGCStuckRemovals`, `CASConditionalWriteFenceLostPostWrite`, `CASRemountHeldTransient`) не
+встречаются нигде в дереве документации, при том что их собственные описания в `ProfileEvents.cpp` —
+самые тяжёлые в наборе; курированная таблица `monitoring.md` вместо них перечисляет счётчики
+contention/dedup. Сверху — инверсия уровней: `CASMountExclusivityViolation` пишется на `LOG_ERROR`, а
+два состояния, которые код сам называет TERMINAL, — на `LOG_WARNING`, так что алерт «только ERROR»
+пропускает именно терминальные случаи.
+
+**Что на HEAD, половина 1 (документация).** Подтверждено ровно как заявлено.
+`grep -rn` по всем семи именам в `docs/` даёт: сам обзор
+(`docs/superpowers/cas/random/opus-review-20250805.md:411-421`), плюс `CASConditionalWriteFenceLostPostWrite`
+в `fable-review-triage.md:486` и `2031-triage.md:974,4172`, плюс `CASRemountHeldTransient` в
+`2031-triage.md:2739`. В `docs/en/**` — **ноль** попаданий по всем семи.
+
+Курированная таблица `docs/en/antalya/cas/operations/monitoring.md` (`## Key metrics {#key-metrics}`,
+`:29`) содержит десять строк (`:38-47`) и все они — contention/dedup/GC-progress:
+`CASBlobCompareSwapConflict`, `CASBlobHeadFirst`/`CASBlobBodyPutAvoided`, `CASRefAppendWedged`,
+`CASRefNeedsRecovery`, `CASRefAppendSealRejected`, `CASGCHeartbeatFenceOuts`,
+`CASGCUnmatchedRemoveDeltas`, `CASGCCondemnMarkerUnconfirmedCarry`, `CASGCMetaWriteAnomaly`,
+`CASRefRollbackBestEffortDropFailed`. Ни одного из семи.
+
+Сами счётчики живы и описания действительно самые тяжёлые в наборе —
+`src/Common/ProfileEvents.cpp:915` (`CASGCStuckRemovals`), `:929`
+(`CASConditionalWriteFenceLostPostWrite`), `:930` (`CASMountLeaseLost`), `:932`
+(`CASMountExclusivityViolation`: «This is the single-writer guarantee being broken… **This must always
+be zero**»), `:933` (`CASRemountHeldTransient`), `:934` (`CASIdentityLost`: «IdentityLost is a
+**fail-loud TERMINAL state**»), `:935` (`CASDataRootVanished`: «entered a **terminal Vanished**
+lifecycle state»).
+
+**Что на HEAD, половина 2 (инверсия уровней).** Тоже подтверждено дословно.
+- `Pool/CasMountRuntime.cpp:363-364`: `ProfileEvents::increment(ProfileEvents::CASIdentityLost);`
+  сразу за ним `LOG_WARNING(getLogger("CasPool"), "…entered IdentityLost: … This is a fail-loud
+  TERMINAL state: store-class access now fails loud and this pool's remount + GC threads self-exit…")`
+  — то есть текст сам говорит TERMINAL, а уровень WARNING.
+- `Pool/CasMountRuntime.cpp:415-419`: `ProfileEvents::increment(ProfileEvents::CASDataRootVanished);`
+  + `LOG_WARNING(… "entered Vanished({}) … store-class access now fails loud with a typed error")`.
+- `Pool/CasServerRoot.cpp:1242-1250`: `ProfileEvents::increment(ProfileEvents::CASMountExclusivityViolation);`
+  + `emitMountEvent(..., CasEventType::MountConflict, ...)` + `LOG_ERROR(getLogger("CasMountLeaseKeeper"), …)`.
+  Комментарий над этим местом (`:1232-1241`) объясняет, почему тут нет `chassert`/abort, но про
+  соотношение с уровнями двух терминальных состояний ничего не говорит.
+
+Т.е. на HEAD ровно три уровня для трёх событий одного класса «инвариант сломан / состояние
+терминально»: ERROR у одного и WARNING у двух более тяжёлых.
+
+**Дубликат?** Нет. Ближайший сиблинг `fable-review-triage.md` M13 (`:478`) — про отсутствие
+`ProfileEvent` у `throwCasWriteRetryLater`, про `gc_scheduler_running` и про тестовые пробелы; он не
+касается ни публикации терминальных счётчиков в `monitoring.md`, ни уровней логов.
+`BACKLOG/operability-and-introspection.md` `{#profileevents-surface-residuals}` (`:366`) разбирает
+другие два дефекта той же поверхности (мёртвая строка `CASServer*`, перекос
+`CASBlobBodyPutAvoided`) и прямо отмечает, что «Mount and lease activity itself is not
+unobservable», т.е. подтверждает наличие механизма — но не его документированность.
+
+**Что осталось.** (а) добавить семь счётчиков в таблицу `monitoring.md` с пометкой «healthy = zero» и
+указанием, что делать (для `CASMountExclusivityViolation` — «this must always be zero», прямая цитата
+из описания события); (б) поднять `CASIdentityLost` и `CASDataRootVanished` до `LOG_ERROR`
+(`Pool/CasMountRuntime.cpp:364`, `:416`), чтобы ERROR-алерт покрывал терминальные состояния;
+(в) при этом стоит заодно свести таблицу и `system.cas_mounts.lifecycle` в один раздел, чтобы
+оператор видел, как счётчик соотносится с наблюдаемым состоянием пула. P2: данные не под угрозой,
+счётчики существуют и запрашиваемы через `system.events`, дефект — в том, что оператор не знает, за
+чем следить; но это релизный doc-долг того же класса, что **[B197]/[B198]** (помеченные GATE), так
+что закрывать до объявления фичи операционно поддерживаемой.
+
+## M4 (дубликат CAS-098, P2) {#m4}
+
+**Дубликат CAS-098 пункт 1; ключевая проверяемая часть — «фикс уже есть, но не используется» — ПОДТВЕРЖДЕНА дословно: `ever_succeeded` вычисляется в `gcHealth` и не потребляется ни одним продакшн-читателем (только двумя gtest'ами), а SQL-колонка уже `Nullable(UInt64)` и уже вставляет NULL на peer-строках.**
+
+**Что заявлено.** Лидер GC (`is_leader = 1`), у которого каждый раунд падал до `Finish`, вечно
+отдаёт `last_success_age_seconds = 0` — байт-в-байт то же значение, что через миг после первого
+успешного раунда. Дисамбигуатор `ever_succeeded` вычисляется в `GcHealth` и теряется, не доходя ни
+до SQL, ни до Prometheus-гейджа. Естественный алерт «page if age > N while is_leader = 1» для худшего
+случая не срабатывает никогда, потому что застрявший 0 не пересекает никакого положительного порога.
+SQL-колонка при этом **уже** `Nullable(UInt64)`.
+
+**Проверка заявления «фикс уже есть, но не используется» — ПОДТВЕРЖДЕНО, все четыре точки.**
+
+1. Дисамбигуатор вычисляется. `Gc/CasGcScheduler.cpp:392-407`:
+```cpp
+    const UInt64 last_ms = last_success_ms.load(std::memory_order_relaxed);
+    h.ever_succeeded = last_ms != 0;
+    if (last_ms != 0)
+    {
+        ...
+        h.last_success_age_seconds = now_ms > last_ms ? (now_ms - last_ms) / 1000 : 0;
+    }
+```
+Поле объявлено на `Gc/CasGcScheduler.h:126` (`bool ever_succeeded = false;`), рядом честный
+комментарий `:128`: `UInt64 last_success_age_seconds = 0;   /// seconds since the last led round (0 if never)`.
+Обратите внимание: при `last_ms == 0` ветка `if` вообще не исполняется, т.е. поле остаётся своим
+дефолтным нулём — «никогда не лидировал» и «успел прямо сейчас» неотличимы именно так, как заявлено.
+
+2. Ни один продакшн-потребитель `ever_succeeded` не существует. `grep -rn "ever_succeeded" src/`
+даёт РОВНО четыре попадания: два в самой схеме/вычислении (`CasGcScheduler.cpp:398`,
+`CasGcScheduler.h:126`) и два в тесте (`src/Disks/tests/gtest_cas_gc_log.cpp:475` —
+`EXPECT_FALSE(h0.ever_succeeded);` и `:484` — `EXPECT_TRUE(h1.ever_succeeded);`). То есть поле
+проверено тестом и не прочитано ни одной рендер-поверхностью — «present but unused» буквально.
+
+3. SQL-колонка уже Nullable и NULL уже используется рядом.
+`src/Storages/System/StorageSystemContentAddressedMounts.cpp:54`:
+```cpp
+{"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it never led). NULL on rows describing other servers' mounts."},
+```
+Вставка безусловна для локальной строки — `:201`: `col_last_success->insert(health->last_success_age_seconds);`,
+а на peer-строках уже идёт `col_last_success->insertDefault();` (`:206`), что для Nullable-колонки и
+есть NULL (комментарий `:195-196` объясняет почему). Т.е. механика NULL уже развёрнута, нужный
+`if (!health->ever_succeeded) col_last_success->insertDefault(); else ...` — одна строка. Побочное
+наблюдение, которого в находке нет: после такого фикса NULL станет нести два смысла (peer-строка и
+«ни разу не преуспел»), но они различимы соседними колонками (`is_leader`/`pending_reclaim` не NULL
+только на локальной строке), так что перегрузка безвредна — и всё равно её стоит проговорить в
+описании колонки, иначе описание `:54` («0 if it never led») станет ложным.
+
+4. Prometheus-гейдж тоже отдаёт двусмысленный ноль и даже документирует его.
+`src/Interpreters/ServerAsynchronousMetrics.cpp:389-390`:
+```cpp
+    new_values[fmt::format("CASGCLastSuccessAgeSeconds_{}", name)] = { health->last_success_age_seconds,
+        "Seconds since this process last completed a successful content-addressed GC round as leader on the disk (0 if it has never led one)." };
+```
+Ни `CASGCEverSucceeded_<disk>`, ни пропуска гейджа при `!ever_succeeded` нет (`grep -rn
+"EverSucceeded" src/` — ноль).
+
+**Почему дубликат.** `BACKLOG/operability-and-introspection.md:480-489` (раздел
+`{#gc-health-zero-is-ambiguous}`, перенос 2031-triage CAS-098) содержит этот пункт первым, с теми же
+якорями (`Gc/CasGcScheduler.cpp:398`, поле на `:126`), тем же выводом («an alert of the shape
+`CASGCLastSuccessAgeSeconds_<disk> > threshold` can NEVER fire») и тем же предложением фикса
+(«render `NULL` (and skip the metric) when `!ever_succeeded`… the alternative is to expose
+`ever_succeeded` alongside»). `fable-review-triage.md:478` M13(б) ссылается на тот же пункт
+бэклога. Т.е. земля уже адъюдицирована как P2, не до релиза.
+
+**Что опус-формулировка добавляет к сиблингу.** Опус явно фиксирует, что *нужный тип уже стоит* —
+колонка уже `Nullable(UInt64)`, — т.е. переводит пункт из «нужно расширить схему наблюдаемости» в
+«одна строка на существующей поверхности, миграции схемы не требуется». CAS-098 предлагает фикс, но
+не отмечает, что схема к нему уже готова; именно это делает пункт дешёвым. Плюс опус формулирует
+худший случай точнее — не «алерт не может сработать вообще», а «лидер (`is_leader = 1`), у которого
+ВСЕ раунды падают, неотличим от здорового», т.е. называет ту самую комбинацию, для отлова которой
+метрика и существует.
+
+**Что осталось.** (а) `StorageSystemContentAddressedMounts.cpp:201` — вставлять NULL при
+`!health->ever_succeeded` и поправить описание колонки `:54`; (б)
+`ServerAsynchronousMetrics.cpp:389` — либо не публиковать гейдж до первого успеха, либо добавить
+`CASGCEverSucceeded_<disk>`; (в) тест: `gtest_cas_gc_log.cpp:475/484` уже пинает `ever_succeeded` на
+уровне структуры, но рендер-поверхности им не покрыты — нужна ассерция на NULL в
+`05007_cas_gc_introspection.sh` или его соседе.
+
+## M5 (подтверждено, P2) {#m5}
+
+**Подтверждено дословно: строки таксономии 3 и 5b бросают `NETWORK_ERROR` мимо тормоза, все четыре top-level вызова `fetchSelectedPart` идут с `allow_ca_relink = true` по умолчанию, счётчика попыток или настройки-выключателя нет, а на двух репликах shuffle — no-op, так что постоянный отказ confirm циклится без деградации в байтовый fetch.**
+
+**Что заявлено.** Тормоз рекурсии (`allow_ca_relink = false`) ограничивает ОДИН вызов, а не петлю
+ретраев. Строки 1, 2, 5 возвращают `nullptr` и оба in-file fallback-сайта корректно рекурсируют с
+`allow_ca_relink = false` — тормоз работает. Строки 3 («confirm не доказал источник») и 5b («promote
+вернул `Unresolved`») БРОСАЮТ `NETWORK_ERROR`, исключение уходит в очередь репликации, та
+пере-исполняет запись как СВЕЖИЙ top-level вызов с `allow_ca_relink` обратно в дефолтном `true`. Все
+четыре call-site используют дефолт; счётчика попыток / circuit breaker через исполнения очереди нет;
+настройки, позволяющей оператору выключить relink, нет. Итог: НАСТОЙЧИВЫЙ (не транзиентный) отказ
+confirm циклится вечно, никогда не деградируя в байтовый fetch, который источник мог бы обслужить.
+Liveness, не safety. Topology scoping: при ≥3 репликах shuffle каждый раз выбирает нового отправителя
+и тройка-специфичный отказ самолечится (недостижимо); при 2 репликах петля пропускает себя, остаётся
+один кандидат, shuffle — no-op, отправитель тот же каждый раз (достижимо).
+
+**Что на HEAD.** Подтверждается целиком, включая scoping.
+
+1. Тормоз и его область. `src/Storages/MergeTree/DataPartsExchange.cpp:895-905` — комментарий
+«THE RECURSION BRAKE (B66b). `allow_ca_relink=false` is what bounds this… it must be spelled out at
+EVERY same-sender fallback», лямбда `fall_back_to_byte_fetch` на `:906-914` действительно передаёт
+`/*allow_ca_relink=*/ false` (`:913`); второй сайт — `:994-1008` (zero-copy fallback), тоже `false`
+(`:1008`). Т.е. половина находки «тормоз работает для nullptr-строк» верна.
+
+2. Асимметрия зафиксирована в коде КАК НАМЕРЕНИЕ, а не как упущение.
+`DataPartsExchange.cpp:940-944`:
+```
+    /// ... A `nullptr` means the mechanism cannot work but the sender still has the part, so the byte
+    /// re-request below is sound; a THROW means the source did not prove the binding, and the whole
+    /// point of it being a throw is that this fallback must NOT run for it.
+```
+Т.е. «throw пролетает мимо fallback» — сознательное решение. Но заявление находки в другом: тормоз
+не переживает *пере-исполнение записи очереди*, и про это код молчит.
+
+3. Строки 3 и 5b бросают `NETWORK_ERROR`. Таксономия в комментарии:
+`DataPartsExchange.cpp:1314-1321` (строка 3: «an `unproven` answer, an absent answer cookie, a
+transport failure, a timeout. All one outcome… Action: THROW a locally generated retry-later
+`NETWORK_ERROR`… never `nullptr`, because a byte re-request goes back to the very source whose state is
+in doubt») и `:1337-1345` (строка 5b: «Action: THROW the retry-later `NETWORK_ERROR`, as row 3 --
+returning `nullptr` is the one thing that must not happen, because a byte fetch would publish the part
+a SECOND time over a relink that may already be committed»). Сами `throw` — `:1549` (после
+`tryLogCurrentException` про confirm) и `:1568` (`case CaRelinkPromote::Unresolved`).
+
+4. Все четыре top-level call-site идут с дефолтом. Сигнатура: `DataPartsExchange.h:129`
+`bool allow_ca_relink = true);`, определение `DataPartsExchange.cpp:649`. Вызовы
+`fetcher.fetchSelectedPart` вне самого `DataPartsExchange.cpp`:
+`StorageReplicatedMergeTree.cpp:3483` (REPLACE PARTITION), `:3611` (clone to detached), `:5823`
+(`fetchPart`), `:6009` (`replaced_disk`-путь) — ни один не передаёт последний аргумент, т.е. каждый
+top-level fetch снова предлагает relink.
+
+5. Ни счётчика попыток, ни настройки. `grep -rn "relink" src/Core/Settings.cpp
+src/Storages/MergeTree/MergeTreeSettings.cpp
+.../ContentAddressed/ContentAddressedSettings.cpp` — **ноль** попаданий: оператор не может выключить
+relink ни глобально, ни на диске. `allow_ca_relink` — только параметр функции, не настройка;
+ничего вроде «после N попыток предложить байты» в `DataPartsExchange.cpp` нет.
+
+6. Topology scoping подтверждён. Оба цикла выбора отправителя шаффлят:
+`StorageReplicatedMergeTree.cpp:5211-5217` (`findReplicaHavingPart`) и `:5391-5397`
+(`findReplicaHavingCoveringPartImplLowLevel`), в обоих над `std::shuffle(replicas.begin(),
+replicas.end(), thread_local_rng);` стоит комментарий «Select replicas in uniformly random order»; в
+обоих внутри цикла есть `if (replica == replica_name) continue;` (`:5397+`), т.е. на двух репликах
+кандидат ровно один и shuffle ничего не решает. Вывод находки (≥3 — недостижимо, 2 — достижимо)
+верен.
+
+**Дубликат?** Не полностью. Ближайшие сиблинги:
+- `BACKLOG/replication.md:23` `{#relink-fallback-unknown-format-version}` (2031-triage CAS-043) — про
+  то, КАКИЕ исключения доходят до fallback (`CORRUPTED_DATA`-only catch в
+  `ContentAddressedMetadataStorage.cpp:2259-2272`). Тот же общий класс «throw вместо деградации», но
+  другой источник и другое следствие; про переживание тормоза через очередь там ничего.
+- `BACKLOG.md:558-562` (`{#issue-2233-followups}`) — прямо называет «refusal storm» «the known,
+  designed `{#relink-confirm-busy-lane}` behavior (all four remediations there still open — the
+  per-ref rule-3 refinement is the availability fix)». Это ровно сердцевина M5 (постоянный отказ
+  confirm ⇒ повторяющийся `NETWORK_ERROR`), плюс полевое измерение: 112 598 отказов за 90-минутный
+  soak, пик 9 219/мин. Но: секция с якорем `{#relink-confirm-busy-lane}` в дереве ОТСУТСТВУЕТ (обе
+  ссылки висячие), так что «отслеживается» тут — на честном слове.
+
+**Что опус-формулировка добавляет.** Сиблинги смотрят на этот класс как на *доступность/шум*
+(шторм отказов, уровень логов — issue #2219, наблюдаемость confirm). Опус называет структурную
+причину: тормоз рекурсии — свойство ОДНОГО вызова, а не записи очереди, поэтому у системы нет
+состояния, в котором она могла бы решить «хватит, возьми байтами»; и добавляет topology scoping,
+объясняющий, почему это не всплывает на трёхнодовом тестовом кластере (2 реплики — канонический HA,
+и именно там shuffle не спасает).
+
+**Что осталось.** (а) сохранять счётчик top-level попыток relink для (part, source) — например в
+записи очереди или в in-memory карте `StorageReplicatedMergeTree` — и после N попыток вызывать
+`fetchSelectedPart` с `allow_ca_relink = false`; заметить, что для строки 5b это НЕЛЬЗЯ делать
+слепо (байтовый fetch поверх возможно закоммиченного relink — ровно то, что запрещает комментарий
+`:1342-1344`), значит фикс безопасен только для строки 3, а для 5b нужен сначала resolve
+неопределённости; (б) оператор-ручка выключения relink; (в) как минимум — задокументировать
+асимметрию (nullptr-строки заторможены, throw-строки нет) рядом с таксономией, которая сегодня
+исчерпывающе разбирает safety и молчит про liveness; (г) восстановить или заново написать секцию
+`{#relink-confirm-busy-lane}` — сейчас на неё ссылаются, а её нет. P2: liveness-дефект, достижимый в
+самой типовой топологии, но backoff очереди предотвращает spin, а safety-утверждения таксономии
+держатся.
+
+## M6 (подтверждено, P2) {#m6}
+
+**Обе половины живы на HEAD: сырой код ошибки ClickHouse по-прежнему возвращается из `DisksApp::main` как POSIX-статус (усечение до 8 бит, коды кратные 256 дают `exit 0`), а `clickhouse-disks.md` не описывает ни контракт кода выхода, ни пять новых CAS-подкоманд.**
+
+**Что заявлено.** Раньше `clickhouse-disks --query "..."` всегда возвращал `EXIT_OK`; теперь любое
+исключение любой команды даёт ненулевой выход для всех пользователей `--query`. Референсная
+документация инструмента не тронута — ни пять новых подкоманд, ни смена кода выхода. Дополнительно:
+сырой код ошибки ClickHouse (диапазон 0–1008) возвращается прямо как POSIX-статус и маскируется до
+8 бит, т.е. коды, кратные 256, становятся `exit 0` (`256 PARTITION_ALREADY_EXISTS`,
+`512 SET_NON_GRANTED_ROLE`, `768 CANNOT_EXECUTE_PROMQL_QUERY`), а любой код ≥256 отдаёт искажённый
+статус (`S3_ERROR` 499 → 243). Заявленная цель изменения — гейтинг CI/cron на `cas-fsck`, т.е. ровно
+тот случай, который никогда не должен молча сообщать успех.
+
+**Что на HEAD.** Подтверждается полностью.
+
+`programs/disks/DisksApp.cpp:618-624`:
+```cpp
+    /// Non-interactive runs surface a failing command as a nonzero process exit (CI/cron gating,
+    /// e.g. `cas-fsck` reporting dangling objects). Interactive sessions are unaffected.
+    if (query.has_value() && last_command_exit_code != 0)
+        return last_command_exit_code;
+    return Application::EXIT_OK;
+```
+Возвращается именно `last_command_exit_code`, а не 1: `programs/disks/DisksApp.cpp:238`
+(`last_command_exit_code = code;`, где `code = err.code()`), `:255` и `:260`
+(`last_command_exit_code = ErrorCodes::STD_EXCEPTION;`). `STD_EXCEPTION` = 1001
+(`src/Common/ErrorCodes.cpp:671`), т.е. `1001 & 0xFF = 233`. Указанные кратные 256 коды существуют
+именно с теми номерами: `src/Common/ErrorCodes.cpp:220` `M(256, PARTITION_ALREADY_EXISTS)`, `:419`
+`M(512, SET_NON_GRANTED_ROLE)`, `:650` `M(768, CANNOT_EXECUTE_PROMQL_QUERY)`. Поле объявлено в
+`programs/disks/DisksApp.h:95` и сбрасывается в 0 на каждый ввод (`DisksApp.cpp:218`), т.е. при
+многокомандном `--query "a; b"` наверх уходит код ПОСЛЕДНЕЙ упавшей подкоманды — деталь, которой в
+находке нет и которая тоже стоит документирования.
+
+Достижимость `exit 0` на HEAD остаётся нулевой, и честная оценка обзора («none of the three
+exact-zero codes looks reachable from a disks sub-command today») подтверждается: все броски пяти
+новых команд идут одним кодом `BAD_ARGUMENTS` = 36 (`src/Common/ErrorCodes.cpp:45`) — в
+`programs/disks/CommandFsck.cpp:45,49,52,146,153,164,175` (в т.ч. hard-findings путь
+«`cas-fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)`», `:147`), и `grep -o
+"ErrorCodes::[A-Z_]*"` по `CommandFsck.cpp`/`CommandCaGcRebuild.cpp`/`CommandCaDropMember.cpp` даёт
+ровно `BAD_ARGUMENTS`. Т.е. это латентный fail-open плюс действующий баг искажения статуса (любое
+исключение из самого пула — `S3_ERROR` 499 → 243, `CORRUPTED_DATA`, `UNKNOWN_FORMAT_VERSION` — уже
+искажается), а не сегодняшняя дыра в гейтинге.
+
+Документационная половина подтверждена дословно. `docs/en/operations/utilities/clickhouse-disks.md` —
+73 строки, разделы `Program-wide options`, `Lazy initialization`, `Default Disks`,
+`Clickhouse-disks state`, `Commands`; про код выхода — ни слова (`grep -n "exit"` — ноль). Список
+команд (`:36-73`) содержит `cd/copy/current_disk_with_path/help/move/remove/link/list/list-disks/
+mkdir/read/read-bitmap/switch-disk/write/sed/read-checksums` и НЕ содержит ни одной из пяти CAS-команд,
+которые существуют в `programs/disks/`: `CommandFsck.cpp` (`cas-fsck`), `CommandCaInspect.cpp`,
+`CommandCaGcRebuild.cpp`, `CommandCaGcDryRun.cpp`, `CommandCaDropMember.cpp`. `git log -3` по этому
+файлу показывает только merge-коммиты, т.е. содержательно он не менялся.
+
+**Дубликат?** Первая половина — да: `fable-review-triage.md:549` **m10** (подтверждено, P3) фиксирует
+ровно смену контракта (`DisksApp.cpp:238`, `:622-623`, коммит
+`f85cb4330c8` «clickhouse-disks: non-interactive runs exit nonzero on a failed command») и отмечает,
+что релиз-нота не написана; трекинг — `BACKLOG.md:190` `{#disks-exit-code-upstream}` как
+carve-out-обязательство («it **rides in the CAS pull request for now**… must later be carved out into
+its own upstream PR»). Замечание по гигиене трекинга: этот пункт отправляет читателя за деталями в
+`docs/superpowers/cas/upstream.md` («The record lives with the carve inventory, not here»,
+`BACKLOG.md:198`), а такого файла в дереве нет — ссылка висячая.
+
+Вторая и третья половины (усечение до 8 бит / `exit 0` и отсутствие документации на пять подкоманд +
+контракт кода выхода) в m10 отсутствуют и нигде не отслеживаются.
+
+**Что опус-формулировка добавляет к сиблингу.** m10 читает изменение как breaking change для
+`set -e`-скриптов, т.е. вопрос совместимости и релиз-ноты. Опус берёт другое следствие того же кода:
+возвращается не «1», а сырой код ClickHouse, поэтому механизм гейтинга технически неверен независимо
+от совместимости — статус искажается для всех кодов ≥256 и в принципе может стать нулевым, что
+превращает «команда упала» в «команда прошла» именно в CI-гейтинге, для которого правку и делали.
+Плюс опус называет вторую цену молчания документации: не только контракт выхода, но и то, что пять
+новых подкоманд вообще не описаны.
+
+**Что осталось.** (а) `programs/disks/DisksApp.cpp:622-623` → `return last_command_exit_code != 0 ? 1
+: 0;` (или клампить в 1–125), чтобы POSIX-статус нёс только «упало/не упало»; сам код ошибки уже
+печатается в stderr (`:262-264`). (б) описать контракт кода выхода в
+`docs/en/operations/utilities/clickhouse-disks.md`, включая правило «последняя упавшая подкоманда» для
+многокомандного `--query`. (в) добавить в тот же файл пять CAS-подкоманд. (г) при carve-out в
+upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения вместе с самой правкой, а не после, и
+починить висячую ссылку на `upstream.md`. P2: направление fail-open, фикс однострочный, и от него
+зависит объявленный способ гейтинга `cas-fsck`; но сегодня недостижимого `exit 0` нет, поэтому релиз
+не блокирует.

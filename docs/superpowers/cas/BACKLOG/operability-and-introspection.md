@@ -694,3 +694,28 @@ Checked while triaging, NOT defects: the deliberate skip of the `RefResolve` row
 `CASPartFolderViewHits`; and the part-folder cache counters, which are all plain counts with
 descriptions matching the code (`src/Common/ProfileEvents.cpp:919-924,943`), with the bytes/entries
 gauges kept as separate `CurrentMetrics` (`src/Common/CurrentMetrics.cpp:234-235`).
+
+## Terminal counters are undocumented and logged below their own severity (opus review M3) {#terminal-counters-undocumented-and-warned}
+
+Both halves reproduce verbatim at HEAD: none of the seven terminal counters appears anywhere in
+`docs/`, and `CASIdentityLost`/`CASDataRootVanished` — states the code itself calls TERMINAL — are
+emitted at `LOG_WARNING`, while the documented alerting example keys on ERROR
+(`CASMountExclusivityViolation`). So the two signals that mean "this mount is finished" are both
+invisible in the docs and below the severity an operator is told to alert on. Fix: document the
+terminal family in `monitoring.md` and raise those two to ERROR. P2.
+
+## `clickhouse-disks` exit code: 8-bit truncation and five undocumented subcommands (opus review M6) {#disks-exit-code-truncation}
+
+The contract change itself is tracked as {#disks-exit-code-upstream}; two halves are not. (1) The raw
+ClickHouse error code is returned from `DisksApp::main` as a POSIX status, so it is masked to 8 bits —
+codes ≥256 report a mangled value and 256/512/768 become `exit 0`, i.e. a failure that scripts read as
+success. Map to a small set of stable exit codes instead. (2) `clickhouse-disks.md` documents neither
+the exit-code contract nor the five new `cas-*` subcommands. P2.
+
+## `ever_succeeded` is computed and never read — the one-line fix for the ambiguous zero (opus review M4) {#ever-succeeded-unused}
+
+Sub-item of {#gc-health-zero-is-ambiguous} (2031-triage CAS-098 item 1), recorded separately because
+the fix is unusually cheap and already half-built: `gcHealth` computes `ever_succeeded`, no production
+reader consumes it (only two gtests do), and the SQL column is ALREADY `Nullable(UInt64)` and already
+inserts NULL on peer rows. So distinguishing "never led" from "just succeeded" is one line at
+`StorageSystemContentAddressedMounts.cpp:201`. P2.
