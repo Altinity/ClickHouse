@@ -36,7 +36,7 @@
 	url = https://github.com/jemalloc/jemalloc
 [submodule "contrib/google-protobuf"]
 	path = contrib/google-protobuf
-	url = https://github.com/ClickHouse/google-protobuf.git
+	url = https://github.com/protocolbuffers/protobuf.git
 [submodule "contrib/boost"]
 	path = contrib/boost
 	url = https://github.com/ClickHouse/boost
@@ -45,7 +45,7 @@
 	url = https://github.com/ClickHouse/arrow
 [submodule "contrib/thrift"]
 	path = contrib/thrift
-	url = https://github.com/ClickHouse/thrift.git
+	url = https://github.com/ClickHouse/thrift
 [submodule "contrib/libhdfs3"]
 	path = contrib/libhdfs3
 	url = https://github.com/ClickHouse/libhdfs3

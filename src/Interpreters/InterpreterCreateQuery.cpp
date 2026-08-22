@@ -171,6 +171,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_DATABASE;
     extern const int PATH_ACCESS_DENIED;
+    extern const int ACCESS_DENIED;
     extern const int NOT_IMPLEMENTED;
     extern const int ENGINE_REQUIRED;
     extern const int UNKNOWN_STORAGE;
@@ -947,7 +948,9 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
 
         if (getContext()->getSettingsRef()[Setting::allow_experimental_analyzer])
         {
-            as_select_sample = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(), getContext());
+            as_select_sample = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(),
+                getContext(),
+                SelectQueryOptions{}.analyze().checkSubqueryTableAccess());
         }
         else
         {
@@ -962,7 +965,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
         /// Table function without columns list.
         auto table_function_ast = create.as_table_function->ptr();
         auto table_function = TableFunctionFactory::instance().get(table_function_ast, getContext());
-        properties.columns = table_function->getActualTableStructure(getContext(), /*is_insert_query*/ true);
+        properties.columns = table_function->getActualTableStructureWithAccess(getContext(), /*is_insert_query*/ true);
     }
     else if (create.is_dictionary)
     {
@@ -1102,7 +1105,9 @@ void InterpreterCreateQuery::validateMaterializedViewColumnsAndEngine(const ASTC
                 /// We should treat SELECT as an initial query in order to properly analyze it.
                 auto context = Context::createCopy(getContext());
                 context->setQueryKindInitial();
-                input_block = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(), context, SelectQueryOptions{}.analyze().createView());
+                input_block = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(),
+                    context,
+                    SelectQueryOptions{}.analyze().createView().checkSubqueryTableAccess());
             }
             else
             {
@@ -1111,8 +1116,11 @@ void InterpreterCreateQuery::validateMaterializedViewColumnsAndEngine(const ASTC
                     SelectQueryOptions().analyze()).getSampleBlock();
             }
         }
-        catch (Exception &)
+        catch (Exception & e)
         {
+            if (e.code() == ErrorCodes::ACCESS_DENIED)
+                throw;
+
             if (!getContext()->getSettingsRef()[Setting::allow_materialized_view_with_bad_select])
                 throw;
             check_columns = false;
@@ -1637,7 +1645,7 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
     if (create.select && create.isView())
     {
         // Expand CTE before filling default database
-        ApplyWithSubqueryVisitor(getContext()).visit(*create.select);
+        ApplyWithSubqueryVisitor::visit(*create.select);
         AddDefaultDatabaseVisitor visitor(getContext(), current_database);
         visitor.visit(*create.select);
     }
@@ -2179,6 +2187,11 @@ BlockIO InterpreterCreateQuery::doCreateOrReplaceTable(ASTCreateQuery & create,
 
         if (!interpreter_rename.renamedInsteadOfExchange())
         {
+            /// After the exchange the temporary name holds the replaced table, which may be of a different
+            /// kind than the new one (e.g. a dictionary replaced by a view), so the drop must match its kind.
+            if (auto replaced = DatabaseCatalog::instance().tryGetTable(StorageID{create.getDatabase(), create.getTable()}, current_context))
+                ast_drop->is_dictionary = replaced->isDictionary();
+
             /// Target table was replaced with new one, drop old table
             auto drop_context = make_drop_context();
             InterpreterDropQuery(ast_drop, drop_context).execute();

@@ -101,7 +101,6 @@ Iceberg::ManifestFilePtr getManifestFile(
         return std::make_shared<Iceberg::ManifestFileContent>(
             manifest_file_deserializer,
             resolved_key_in_storage,
-            persistent_table_components.format_version,
             configuration->getPathForRead().path,
             *persistent_table_components.schema_processor,
             inherited_sequence_number,
@@ -150,6 +149,12 @@ ManifestFileCacheKeys getManifestList(
         auto manifest_list_buf = createReadBuffer(object_info, object_storage, local_context, log, read_settings);
         AvroForIcebergDeserializer manifest_list_deserializer(std::move(manifest_list_buf), key_in_storage, getFormatSettings(local_context));
 
+        /// The manifest list's own Avro metadata governs how it is parsed. A table whose
+        /// `format-version` was upgraded from v1 to v2 by an external tool (e.g. Spark) may
+        /// still reference v1 manifest lists, and those do not carry the v2-only
+        /// `sequence_number`/`content` columns.
+        const Int64 manifest_list_format_version = manifest_list_deserializer.getFormatVersionFromManifestFileMetadata();
+
         ManifestFileCacheKeys manifest_file_cache_keys;
 
         auto dump_metadata = [&]()->String { return manifest_list_deserializer.getMetadataContent(); };
@@ -177,7 +182,7 @@ ManifestFileCacheKeys getManifestList(
                     f_added_snapshot_id);
 
             ManifestFileContentType content_type = ManifestFileContentType::DATA;
-            if (persistent_table_components.format_version > 1)
+            if (manifest_list_format_version > 1)
             {
                 added_sequence_number
                     = manifest_list_deserializer.getValueFromRowByName(i, f_sequence_number, TypeIndex::Int64).safeGet<Int64>();
