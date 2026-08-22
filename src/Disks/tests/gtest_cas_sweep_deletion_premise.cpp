@@ -234,8 +234,8 @@ TEST(CASSweepDeletionPremise, AnUndecodableManifestDoesNotWedgeTheCursorPage)
     good.entries = {inline_entry};
     good.payload_digest = computePayloadDigest(good);
     String bytes = encodePartManifest(good);
-    /// The banner quotes the path after Task 1. Searching for the old unquoted shape would make this
-    /// assertion fire before the sweep is ever called.
+    /// The canonical banner quotes the path. Searching for the former unquoted spelling would fail
+    /// before the sweep is called.
     const size_t at = bytes.find("==> \"a.txt\"");
     ASSERT_NE(at, String::npos) << "no banner line to corrupt -- the entry must be Inline, not Blob";
     bytes[at + 5] = 'X';   /// Inside the quoted path, same length, so no other offset shifts.
