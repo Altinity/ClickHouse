@@ -15,6 +15,7 @@
 #include <Common/Exception.h>
 #include <Common/ThreadPool.h>
 #include <base/scope_guard.h>
+#include <Poco/Exception.h>
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +46,7 @@ namespace DB::ErrorCodes
 {
 extern const int LOGICAL_ERROR;
 extern const int INCORRECT_DATA;
+extern const int NOT_IMPLEMENTED;
 }
 
 namespace CurrentMetrics
@@ -132,6 +134,10 @@ BlobUploadRequest s3Request(const String & payload, const String & staging_key)
     BlobSource src;
     src.size = payload.size();
     src.server_side_copy_from = staging_key;
+    src.open = [payload]() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+    };
     return BlobUploadRequest{idOf(payload), std::move(src), payload.size()};
 }
 
@@ -214,6 +220,98 @@ struct ConcurrencyProbe
     }
 };
 
+/// A deterministic native-copy rejection used to prove that the logical source's publication state
+/// survives every request copy made by the fan-out. The first call must propagate; a later request
+/// copied from the same source may only stream a newly tagged envelope, never retry verbatim copy.
+class RejectFirstStagedCopyBackend final : public InMemoryBackend
+{
+public:
+    PutResult promoteStaged(const String & staging_key, const String & blob_key) override
+    {
+        ++legacy_copy_attempts;
+        if (reject_copy)
+        {
+            reject_copy = false;
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "test rejects the first staged copy");
+        }
+        return InMemoryBackend::promoteStaged(staging_key, blob_key);
+    }
+
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        if (std::holds_alternative<VerbatimStagedBlobPublication>(request.publication))
+        {
+            ++copy_publications;
+            if (reject_copy)
+            {
+                reject_copy = false;
+                throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "test rejects the first staged copy");
+            }
+        }
+        else
+        {
+            ++streaming_publications;
+        }
+        InMemoryBackend::publishBlob(request);
+    }
+
+    bool reject_copy = true;
+    size_t legacy_copy_attempts = 0;
+    size_t copy_publications = 0;
+    size_t streaming_publications = 0;
+};
+
+}
+
+TEST(CASUploadFanout, CopiedAndMovedRequestsSharePublicationAttemptedState)
+{
+    auto backend = std::make_shared<RejectFirstStagedCopyBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/shared-publication-state"};
+    auto build = precommitBuildFor(store, ns, "part");
+    const String payload = "shared-publication-attempted-payload";
+    const BlobRef ref = idOf(payload);
+    const String staging_key = "p/staging/mount1/shared-attempt.tmp";
+
+    EnvelopeHeader header;
+    header.kind = ObjectKind::Blob;
+    header.incarnation_tag = DB::UInt128(0xC0FFEE);
+    const String staging_bytes
+        = encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload;
+    backend->putIfAbsent(staging_key, staging_bytes);
+
+    BlobSource source;
+    source.size = payload.size();
+    source.server_side_copy_from = staging_key;
+    source.open = [payload]() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+    };
+
+    BlobUploadRequest original{ref, source, payload.size()};
+    BlobUploadRequest first_copy = original;
+    BlobUploadRequest fanout_copy = original;
+
+    expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
+    {
+        build->uploadBlobDetached(first_copy);
+    });
+
+    std::vector<BlobUploadRequest> requests;
+    requests.emplace_back(std::move(fanout_copy));
+    auto pool = makePool(1);
+    fanOutBlobUploads(*build, requests, *pool);
+
+    EXPECT_EQ(backend->copy_publications, 1u)
+        << "only the source's first publication may attempt verbatim staged copy";
+    EXPECT_EQ(backend->legacy_copy_attempts, 0u)
+        << "the retired conditional-copy API must stay dead after the writer switch";
+    EXPECT_EQ(backend->streaming_publications, 1u)
+        << "the request copied and moved through fan-out must retain the consumed first-attempt state";
+    EXPECT_EQ(build->dependencyProof(ref), BlobDependencyProof::Materialized);
+    const auto stored = backend->get(store->layout().blobKey(ref));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->bytes.substr(store->poolMeta().blob_header_len), payload);
 }
 
 /// Test 1 (spec §1 "serial-vs-parallel equivalence for successful runs"): a multi-blob part that
@@ -573,12 +671,9 @@ TEST(CASUploadFanout, CondemnedLocalResurrectStreamsAndFlipsMetaClean)
     EXPECT_EQ(lm->meta.state, MetaState::Clean);
 }
 
-/// `open` is the per-attempt unit of re-readability, and this pins the attempt count for the
-/// present-condemned shape: open #1 is the ordinary conditional-create attempt (streamed, refused at
-/// finalize because the body exists), open #2 is the resurrect itself. Anything ABOVE two would mean
-/// a hidden materialization pass or a mid-write re-open crept in; anything below would mean the
-/// create attempt stopped streaming (a protocol change, not an optimization to make silently).
-TEST(CASUploadFanout, CondemnedLocalResurrectOpensTheSourcePerAttempt)
+/// `open` is the per-publication unit of re-readability. A present `Condemned` observation selects
+/// exactly one unconditional stream; the mandatory `HEAD` itself never opens the source.
+TEST(CASUploadFanout, CondemnedLocalPublicationOpensSourceOnce)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -603,7 +698,7 @@ TEST(CASUploadFanout, CondemnedLocalResurrectOpensTheSourcePerAttempt)
     auto pool = makePool(2);
     fanOutBlobUploads(*build, reqs, *pool, nullptr);
 
-    EXPECT_EQ(opens, 2) << "conditional-create attempt + resurrect: exactly one open each, nothing extra";
+    EXPECT_EQ(opens, 1) << "the mandatory `HEAD` selects one unconditional streaming publication";
     EXPECT_EQ(build->dependencyProof(idOf(payload)), BlobDependencyProof::Materialized);
 }
 
@@ -699,10 +794,8 @@ TEST(CASUploadFanout, PendingFanoutFailureCreatesNoDependency)
     EXPECT_TRUE(blobAbsent(*b, s->layout(), u128Of(poisoned))) << "the poisoned sibling never uploaded a body";
 }
 
-/// Test 4: two DISTINCT-ref fresh uploads, latch-crossed so both are inside `uploadBlobDetached` (hence
-/// both touching the ONE shared dedup cache) at once. The cache's internal locking makes the concurrent
-/// insertion correct; on the TSan lane this pins that there is no data race on the shared cache.
-TEST(CASUploadFanout, ConcurrentDeduplicationCacheInsertion)
+/// Two distinct refs publish concurrently without using the now decision-free presence cache.
+TEST(CASUploadFanout, ConcurrentPublicationsEstablishProofWithoutCache)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openPool(b);
@@ -724,8 +817,8 @@ TEST(CASUploadFanout, ConcurrentDeduplicationCacheInsertion)
 
     EXPECT_EQ(build->dependencyProof(idOf(pa)), BlobDependencyProof::Materialized);
     EXPECT_EQ(build->dependencyProof(idOf(pb)), BlobDependencyProof::Materialized);
-    EXPECT_TRUE(s->dedupCacheContains(idOf(pa))) << "concurrent insertion left both keys present";
-    EXPECT_TRUE(s->dedupCacheContains(idOf(pb)));
+    EXPECT_FALSE(s->dedupCacheContains(idOf(pa)));
+    EXPECT_FALSE(s->dedupCacheContains(idOf(pb)));
 }
 
 /// Test 5: pool saturation is bounded. Eight blobs run through a pool of 2 (peak concurrency 2 is

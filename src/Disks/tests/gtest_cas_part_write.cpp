@@ -1,6 +1,10 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -103,6 +107,15 @@ ManifestEntry blobManifestEntryStreaming(const String & path, const String & pay
     return e;
 }
 
+PartWriteTxnPtr precommittedBuildForPayload(
+    const PoolPtr & store, const RootNamespace & ns, const String & ref, const String & payload)
+{
+    auto build = startBuildFor(store, ns, ref);
+    const ManifestId manifest = build->stageManifest({blobManifestEntry("data.bin", payload)});
+    build->precommitAdd(ns, ref, manifest);
+    return build;
+}
+
 /// The full single-blob write flow (EDGE-BEFORE-OBSERVE wiring order):
 /// stageManifest(one entry) -> precommitAdd -> putBlob -> promote. Returns the committed ManifestId.
 ManifestId publishOneBlobPart(
@@ -193,6 +206,137 @@ private:
     std::map<String, size_t> get_counts;
 };
 
+/// Forces two writers to complete their absent `HEAD` observations before either can publish. The
+/// legacy conditional-create path rendezvouses at sink creation instead, keeping the pre-switch RED
+/// run bounded while making the missing mandatory `HEAD` and unconditional publication observable.
+class RacingBlobPublicationBackend final : public InMemoryBackend
+{
+public:
+    void watch(String key_)
+    {
+        std::lock_guard lock(mutex);
+        key = std::move(key_);
+        head_calls = 0;
+        legacy_stream_calls = 0;
+        publish_calls = 0;
+    }
+
+    HeadResult head(const String & requested_key) override
+    {
+        if (requested_key != key)
+            return InMemoryBackend::head(requested_key);
+
+        const HeadResult observed = InMemoryBackend::head(requested_key);
+        std::unique_lock lock(mutex);
+        ++head_calls;
+        cv.notify_all();
+        if (legacy_stream_calls == 0)
+            cv.wait_for(lock, std::chrono::seconds(5), [&] { return head_calls >= 2; });
+        return observed;
+    }
+
+    WriteSinkPtr putIfAbsentStream(const String & requested_key, const ObjectMeta & meta) override
+    {
+        if (requested_key == key)
+        {
+            std::unique_lock lock(mutex);
+            ++legacy_stream_calls;
+            cv.notify_all();
+            cv.wait_for(lock, std::chrono::seconds(5), [&] { return legacy_stream_calls >= 2; });
+        }
+        return InMemoryBackend::putIfAbsentStream(requested_key, meta);
+    }
+
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        if (request.destination_key == key)
+        {
+            std::lock_guard lock(mutex);
+            ++publish_calls;
+        }
+        InMemoryBackend::publishBlob(request);
+    }
+
+    String key;
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t head_calls = 0;
+    size_t legacy_stream_calls = 0;
+    size_t publish_calls = 0;
+};
+
+}
+
+TEST(CASPartWrite, RacingWritersBothHeadMissAndPublishEquivalentBodies)
+{
+    auto backend = std::make_shared<RacingBlobPublicationBackend>();
+    auto store = openPool(backend);
+    const String payload = "two-racing-head-first-writers";
+    const BlobRef ref = idOf(payload);
+    auto first = precommittedBuildForPayload(store, RootNamespace{"srv1/racing-a"}, "part", payload);
+    auto second = precommittedBuildForPayload(store, RootNamespace{"srv1/racing-b"}, "part", payload);
+    backend->watch(store->layout().blobKey(ref));
+
+    std::exception_ptr first_error;
+    std::exception_ptr second_error;
+    std::thread first_thread([&]
+    {
+        try
+        {
+            first->putBlob(ref, BlobSource::fromString(payload));
+        }
+        catch (...)
+        {
+            first_error = std::current_exception();
+        }
+    });
+    std::thread second_thread([&]
+    {
+        try
+        {
+            second->putBlob(ref, BlobSource::fromString(payload));
+        }
+        catch (...)
+        {
+            second_error = std::current_exception();
+        }
+    });
+    first_thread.join();
+    second_thread.join();
+
+    EXPECT_EQ(first_error, nullptr);
+    EXPECT_EQ(second_error, nullptr);
+    EXPECT_EQ(backend->head_calls, 2u);
+    EXPECT_EQ(backend->publish_calls, 2u)
+        << "both equivalent writers may publish after racing absent observations";
+    EXPECT_EQ(first->dependencyProof(ref), BlobDependencyProof::Materialized);
+    EXPECT_EQ(second->dependencyProof(ref), BlobDependencyProof::Materialized);
+    const auto stored = backend->get(store->layout().blobKey(ref));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->bytes.substr(store->poolMeta().blob_header_len), payload);
+}
+
+TEST(CASPartWrite, WrongSizeSourcePublishesNothing)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPool(backend);
+    const String expected_payload = "declared-eleven-bytes";
+    const BlobRef ref = idOf(expected_payload);
+    auto build = precommittedBuildForPayload(
+        store, RootNamespace{"srv1/wrong-size-publication"}, "part", expected_payload);
+
+    BlobSource source;
+    source.size = 11;
+    source.open = []() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        return std::make_unique<DB::ReadBufferFromOwnString>(String("short"));
+    };
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->putBlob(ref, std::move(source));
+    });
+    EXPECT_FALSE(backend->head(store->layout().blobKey(ref)).exists);
 }
 
 TEST(CASPartWriteTxn, PutBlobWritesEnvelopeWithFixedHeader)
@@ -1020,7 +1164,10 @@ TEST(CASPartWriteTxn, InvalidDependencyProofFailsClosed)
     BlobUploadResult invalid{
         entry.ref,
         BlobDepRecord{ObjectKind::Blob, static_cast<BlobDependencyProof>(2), entry.blob_size},
-        BlobUploadOutcome::FreshUpload};
+        BlobUploadDiagnostics{
+            BlobMaterializationAction::Published,
+            BlobPublicationReason::Absent,
+            BlobPublicationTransport::Streaming}};
     build->mergeBlobUploadResults(std::span<const BlobUploadResult>(&invalid, 1));
 
     EXPECT_DEATH(
@@ -2343,6 +2490,16 @@ public:
     bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
     int stream_attempts = 0;             /// blob-body streaming-PUT finalize attempts observed
     int copy_attempts = 0;               /// promoteStaged conditional-copy attempts observed
+    int publish_stream_attempts = 0;     /// unconditional streaming publications observed
+    int publish_copy_attempts = 0;       /// unconditional native-copy publications observed
+    int blob_head_attempts = 0;          /// transaction-level blob observations
+
+    HeadResult head(const String & key) override
+    {
+        if (isBlobBodyKey(key))
+            ++blob_head_attempts;
+        return InMemoryBackend::head(key);
+    }
 
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
     {
@@ -2384,6 +2541,25 @@ public:
             throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous copy (response lost)");
         }
         return InMemoryBackend::promoteStaged(staging_key, blob_key);
+    }
+
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        if (std::holds_alternative<StreamingBlobPublication>(request.publication))
+            ++publish_stream_attempts;
+        else
+            ++publish_copy_attempts;
+
+        if (fault_count > 0)
+        {
+            --fault_count;
+            if (land_despite_fault)
+                InMemoryBackend::publishBlob(request);
+            else if (const auto * streaming = std::get_if<StreamingBlobPublication>(&request.publication))
+                (void)streaming->open_payload();
+            throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous publication (response lost)");
+        }
+        InMemoryBackend::publishBlob(request);
     }
 
 private:
@@ -2435,7 +2611,7 @@ BlobSource countingSource(const String & payload, int & payload_streams)
 /// path failed the whole INSERT on the FIRST timeout (the raw Poco::TimeoutException escaped
 /// putBlob); the controller path rides its budget, RE-STREAMING the payload from the writer's own
 /// replayable source on every attempt.
-TEST(CASPartWriteTxnBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource)
+TEST(CASPartWrite, AmbiguousTimeoutsThenCommitRestreamsFromSource)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b);
@@ -2451,7 +2627,8 @@ TEST(CASPartWriteTxnBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource
     const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->stream_attempts, 3) << "two faulted attempts + the committing third";
+    EXPECT_EQ(b->publish_stream_attempts, 3) << "two ambiguous publications + the committing third";
+    EXPECT_EQ(b->blob_head_attempts, 3) << "every outer retry restarts from a fresh blob HEAD";
     EXPECT_EQ(payload_streams, 3) << "every reissue must RE-STREAM from the writer's own source (INV-1)";
     EXPECT_TRUE(b->head(s->layout().blobKey(idOf(payload))).exists) << "the blob body must be durable";
 }
@@ -2460,7 +2637,7 @@ TEST(CASPartWriteTxnBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource
 /// server-side. The occupancy resolve observes the key present and the existing 412 machinery takes
 /// over — the occupant is ADOPTED (content-addressed identity: any occupant of this key IS the
 /// content), with NO reissue and NO second body upload.
-TEST(CASPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
+TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
@@ -2481,7 +2658,8 @@ TEST(CASPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupl
     const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->stream_attempts, 1) << "a landed ambiguous attempt must be resolved, never reissued";
+    EXPECT_EQ(b->publish_stream_attempts, 1) << "a landed ambiguous attempt must be observed, never reissued";
+    EXPECT_EQ(b->blob_head_attempts, 2) << "the ambiguity is resolved by restarting from HEAD";
     EXPECT_EQ(payload_streams, 1);
 
     const String key = s->layout().blobKey(idOf(payload));
@@ -2500,7 +2678,7 @@ TEST(CASPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupl
 /// ABORTED mapping, putBlob's bounded condemned-churn loop (8 rounds) does NOT re-drive this: it only
 /// catches ABORTED, so a NETWORK_ERROR escapes on the FIRST attempt -- desirable (no point hammering a
 /// lost fence locally 8 times; the caller's own backoff, e.g. the merge queue's, is what should retry).
-TEST(CASPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToNetworkErrorAndEscapesImmediately)
+TEST(CASPartWrite, AmbiguousNonLandingPublicationStopsAtOuterBound)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b, /*max_attempts=*/3);
@@ -2522,17 +2700,18 @@ TEST(CASPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToNetworkErrorAndEscapesIm
     {
         threw = true;
         EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
-        EXPECT_NE(e.message().find("UNCERTAIN"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("ambiguous"), String::npos) << e.message();
     }
     EXPECT_TRUE(threw);
-    EXPECT_EQ(b->stream_attempts, 3) << "the 3-attempt controller budget for ONE outer attempt -- "
-                                          "putBlob's outer condemned-churn loop must NOT re-drive a NETWORK_ERROR";
+    EXPECT_EQ(b->publish_stream_attempts, 8) << "the writer's correctness retry loop is bounded";
+    EXPECT_EQ(b->blob_head_attempts, 8) << "every ambiguous retry is preceded by a new observation";
+    EXPECT_EQ(payload_streams, 8);
 }
 
 /// promoteStaged conditional copy, ambiguous-but-landed: the copy's response is lost AFTER the
 /// destination was created. The occupancy resolve observes the destination present and the occupant
 /// is adopted — Committed-in-effect WITHOUT a re-copy.
-TEST(CASPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
+TEST(CASPartWrite, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
@@ -2559,7 +2738,9 @@ TEST(CASPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWith
     const PutBlobResult res = build->putBlob(idOf(payload), std::move(source));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->copy_attempts, 1) << "a landed ambiguous copy must be resolved, never re-copied";
+    EXPECT_EQ(b->publish_copy_attempts, 1) << "a landed ambiguous copy must be resolved, never re-copied";
+    EXPECT_EQ(b->publish_stream_attempts, 0);
+    EXPECT_EQ(b->blob_head_attempts, 2);
     const String key = s->layout().blobKey(idOf(payload));
     const auto got = b->get(key);
     ASSERT_TRUE(got.has_value());
@@ -2572,7 +2753,7 @@ TEST(CASPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWith
 /// promoteStaged conditional copy, ambiguous-and-absent: the first copy attempt times out with
 /// nothing landing; the resolve observes the destination absent and the copy is REISSUED from the
 /// (intact, still-staged) source object — the second attempt commits.
-TEST(CASPartWriteTxnPromoteStagedRetry, AmbiguousCopyAbsentReattemptsAndCommits)
+TEST(CASPartWrite, AmbiguousCopyAbsentReattemptsAndCommits)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b);
@@ -2589,13 +2770,20 @@ TEST(CASPartWriteTxnPromoteStagedRetry, AmbiguousCopyAbsentReattemptsAndCommits)
     BlobSource source;
     source.size = payload.size();
     source.server_side_copy_from = staging_key;
+    source.open = [payload]() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        return std::make_unique<DB::ReadBufferFromOwnString>(payload);
+    };
     b->fault_count = 1;
     const PutBlobResult res = build->putBlob(idOf(payload), std::move(source));
     EXPECT_EQ(res.size, payload.size());
 
-    EXPECT_EQ(b->copy_attempts, 2) << "the faulted attempt + the committing reissue";
+    EXPECT_EQ(b->publish_copy_attempts, 1) << "only the first absent observation may select verbatim copy";
+    EXPECT_EQ(b->publish_stream_attempts, 1) << "the absent retry must retag and stream";
+    EXPECT_EQ(b->blob_head_attempts, 2);
     const String key = s->layout().blobKey(idOf(payload));
     const auto got = b->get(key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, staging_bytes);
+    EXPECT_NE(got->bytes, staging_bytes);
+    EXPECT_EQ(got->bytes.substr(s->poolMeta().blob_header_len), payload);
 }

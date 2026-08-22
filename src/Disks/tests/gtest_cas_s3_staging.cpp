@@ -13,8 +13,10 @@
 #include <Disks/DiskCommitTransactionOptions.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
+#include <Common/SipHash.h>
 
 #include <Poco/AutoPtr.h>
+#include <Poco/Exception.h>
 #include <Poco/Util/XMLConfiguration.h>
 
 #include <atomic>
@@ -43,6 +45,12 @@
 namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsString staging_backend;
+}
+
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+    extern const int FILE_DOESNT_EXIST;
 }
 
 namespace
@@ -196,14 +204,9 @@ private:
     bool did_finalize = false;
 };
 
-/// Task 5 of the S3-native staging plan: the promote path (`PartWriteTxn::putBlob` with
-/// `BlobSource::server_side_copy_from` set) drives a WRITE-ONCE conditional server-side copy through
-/// the SAME condemn/resurrect gate the streaming path uses. This backend is a `DB::Cas::InMemoryBackend`
-/// (which models conditional create, so it honors both the write-once `promoteStaged` and the
-/// unconditional `resurrect` contracts) that RECORDS every server-side-copy call so a test can
-/// assert the copy source/destination and the conditional-vs-unconditional distinction — in particular
-/// that a condemned-blob RESURRECT copies FROM the staging key, NEVER from the condemned blob key
-/// (`feedback_ca_resurrect_invariant`), and that a live blob is NEVER unconditionally overwritten.
+/// Records whether each unconditional publication used verbatim native copy or a retagged stream.
+/// Stream reads are counted separately so condemned-destination tests can prove they read only the
+/// writer-owned staging object.
 class RecordingStagingBackend : public DB::Cas::InMemoryBackend
 {
 public:
@@ -211,26 +214,18 @@ public:
     {
         std::string from;
         std::string to;
-        bool conditional;   /// true = promoteStaged (write-once); false = resurrect (unconditional)
+        bool server_side_copy;
     };
 
     std::vector<CopyCall> copy_calls;
 
-    DB::Cas::PutResult promoteStaged(const String & staging_key, const String & blob_key) override
+    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
     {
-        copy_calls.push_back({staging_key, blob_key, /*conditional=*/true});
-        return DB::Cas::InMemoryBackend::promoteStaged(staging_key, blob_key);
-    }
-
-    DB::Cas::Token resurrect(DB::ReadBuffer & payload, uint64_t payload_size, const String & blob_key,
-                             const String & fresh_header) override
-    {
-        /// The source is no longer an argument -- the caller opens the reader -- so `from` is recorded
-        /// as empty here and the "never the condemned key" invariant is asserted through `reads_of`
-        /// below, which counts what was actually READ. That is the stronger check: it observes the I/O
-        /// rather than a parameter the backend was told about.
-        copy_calls.push_back({String{}, blob_key, /*conditional=*/false});
-        return DB::Cas::InMemoryBackend::resurrect(payload, payload_size, blob_key, fresh_header);
+        if (const auto * copy = std::get_if<DB::Cas::VerbatimStagedBlobPublication>(&request.publication))
+            copy_calls.push_back({copy->object_key, request.destination_key, true});
+        else
+            copy_calls.push_back({String{}, request.destination_key, false});
+        DB::Cas::InMemoryBackend::publishBlob(request);
     }
 
     /// Every key READ AS A STREAM, with a count. The resurrect opens its source with `getStream`, so
@@ -246,14 +241,92 @@ public:
     }
 
 
-    /// Every unconditional (resurrect) copy this backend saw — empty iff no live/condemned body was ever
-    /// overwritten. `assertNeverOverwritesLiveBlob` reads this to enforce invariant (d).
-    size_t unconditionalCopyCount() const
+    size_t streamingPublicationCount() const
     {
         size_t n = 0;
         for (const CopyCall & c : copy_calls)
-            n += c.conditional ? 0 : 1;
+            n += c.server_side_copy ? 0 : 1;
         return n;
+    }
+};
+
+/// Models an ETag store faithfully enough for the staged-envelope regressions: a blob token is a
+/// deterministic digest of the complete object bytes, so copying the same staging object again would
+/// reproduce the same token. Each script injects a different ambiguity transition from the design.
+class EtagFaithfulPublicationBackend final : public DB::Cas::InMemoryBackend
+{
+public:
+    enum class FaultScript : uint8_t
+    {
+        CopyLandsThenCondemned,
+        CopyLandsThenDeletedBeforeAbsentRetry,
+        FirstCondemnedStreamLandsThenDeleted,
+    };
+
+    explicit EtagFaithfulPublicationBackend(FaultScript script_) : script(script_) {}
+
+    DB::Cas::HeadResult head(const String & key) override
+    {
+        DB::Cas::HeadResult result = DB::Cas::InMemoryBackend::head(key);
+        if (result.exists && isBlobBodyKey(key))
+        {
+            const auto body = DB::Cas::InMemoryBackend::get(key);
+            chassert(body.has_value());
+            result.token = DB::Cas::Token{sipHash128String(body->bytes), DB::Cas::TokenType::ETag};
+        }
+        return result;
+    }
+
+    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    {
+        if (!isBlobBodyKey(key))
+            return DB::Cas::InMemoryBackend::deleteExact(key, token);
+
+        const DB::Cas::HeadResult current = head(key);
+        if (!current.exists)
+            return DB::Cas::DeleteOutcome{.kind = DB::Cas::DeleteOutcome::Kind::NotFound};
+        if (current.token != token)
+            return DB::Cas::DeleteOutcome{.kind = DB::Cas::DeleteOutcome::Kind::TokenMismatch};
+        return DB::Cas::InMemoryBackend::deleteExact(key, DB::Cas::InMemoryBackend::head(key).token);
+    }
+
+    void publishBlob(const DB::Cas::BlobPublishRequest & request) override
+    {
+        const bool is_copy = std::holds_alternative<DB::Cas::VerbatimStagedBlobPublication>(request.publication);
+        if (is_copy)
+            ++copy_publications;
+        else
+            ++streaming_publications;
+
+        if (!fault_fired
+            && ((script == FaultScript::CopyLandsThenCondemned && is_copy)
+                || (script == FaultScript::CopyLandsThenDeletedBeforeAbsentRetry && is_copy)
+                || (script == FaultScript::FirstCondemnedStreamLandsThenDeleted && !is_copy)))
+        {
+            fault_fired = true;
+            DB::Cas::InMemoryBackend::publishBlob(request);
+            queued_delete_token = head(request.destination_key).token;
+
+            if (script != FaultScript::CopyLandsThenCondemned)
+                first_delete = deleteExact(request.destination_key, queued_delete_token);
+
+            throw Poco::TimeoutException("ETag-faithful staged publication response lost");
+        }
+
+        DB::Cas::InMemoryBackend::publishBlob(request);
+    }
+
+    FaultScript script;
+    bool fault_fired = false;
+    size_t copy_publications = 0;
+    size_t streaming_publications = 0;
+    DB::Cas::Token queued_delete_token;
+    DB::Cas::DeleteOutcome first_delete;
+
+private:
+    static bool isBlobBodyKey(const String & key)
+    {
+        return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
     }
 };
 
@@ -283,15 +356,143 @@ DB::Cas::PartWriteTxnPtr precommittedBuildFor(
     return build;
 }
 
-/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `open`).
-DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
+DB::Cas::BlobSource reReadableStagedSource(
+    const DB::Cas::BackendPtr & backend, const std::string & staging_key, uint64_t payload_size, uint64_t header_len)
 {
     DB::Cas::BlobSource source;
-    source.size = size;
+    source.size = payload_size;
     source.server_side_copy_from = staging_key;
+    source.open = [backend, staging_key, header_len]() -> std::unique_ptr<DB::ReadBuffer>
+    {
+        auto staged = backend->getStream(staging_key);
+        if (!staged)
+            throw DB::Exception(DB::ErrorCodes::FILE_DOESNT_EXIST, "staging object {} is absent", staging_key);
+
+        String encoded_header(header_len, '\0');
+        staged->stream->readStrict(encoded_header.data(), encoded_header.size());
+        const DB::Cas::EnvelopeHeader decoded
+            = DB::Cas::decodeEnvelopeHeader(encoded_header, encoded_header.size(), DB::Cas::ObjectKind::Blob);
+        if (decoded.header_len != header_len)
+            throw DB::Exception(
+                DB::ErrorCodes::CORRUPTED_DATA,
+                "staging object {} uses envelope length {}, expected {}",
+                staging_key,
+                decoded.header_len,
+                header_len);
+        return std::move(staged->stream);
+    };
     return source;
 }
 
+String stagedBytes(uint64_t header_len, const String & payload, DB::UInt128 tag)
+{
+    DB::Cas::EnvelopeHeader header;
+    header.kind = DB::Cas::ObjectKind::Blob;
+    header.incarnation_tag = tag;
+    return DB::Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(header_len)) + payload;
+}
+
+}
+
+TEST(CASS3Staging, StagedCopyCondemnedRetryRetagsBeforeQueuedDelete)
+{
+    auto backend = std::make_shared<EtagFaithfulPublicationBackend>(
+        EtagFaithfulPublicationBackend::FaultScript::CopyLandsThenCondemned);
+    auto store = DB::Cas::Pool::open(
+        backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const String payload = "etag-copy-condemned-retry";
+    const DB::Cas::BlobRef ref = DB::Cas::tests::idOf(payload);
+    const String staging_key = "p/staging/mount1/etag-condemned.tmp";
+    const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{101});
+    backend->putIfAbsent(staging_key, staging_bytes);
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
+    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 31);
+    auto build = precommittedBuildFor(
+        store, DB::Cas::RootNamespace{"srv1/etag-condemned"}, "part",
+        DB::Cas::tests::u128Of(payload), payload.size());
+
+    build->putBlob(
+        ref,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
+
+    EXPECT_EQ(backend->copy_publications, 1u);
+    EXPECT_EQ(backend->streaming_publications, 1u);
+    EXPECT_EQ(
+        backend->deleteExact(store->layout().blobKey(ref), backend->queued_delete_token).kind,
+        DB::Cas::DeleteOutcome::Kind::TokenMismatch);
+    const auto current = backend->get(store->layout().blobKey(ref));
+    ASSERT_TRUE(current.has_value());
+    EXPECT_NE(current->bytes, staging_bytes);
+    EXPECT_EQ(current->bytes.substr(store->poolMeta().blob_header_len), payload);
+}
+
+TEST(CASS3Staging, StagedCopyDeletedBeforeAbsentRetryRetagsBeforeQueuedDelete)
+{
+    auto backend = std::make_shared<EtagFaithfulPublicationBackend>(
+        EtagFaithfulPublicationBackend::FaultScript::CopyLandsThenDeletedBeforeAbsentRetry);
+    auto store = DB::Cas::Pool::open(
+        backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const String payload = "etag-copy-deleted-before-retry";
+    const DB::Cas::BlobRef ref = DB::Cas::tests::idOf(payload);
+    const String staging_key = "p/staging/mount1/etag-deleted.tmp";
+    const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{202});
+    backend->putIfAbsent(staging_key, staging_bytes);
+    auto build = precommittedBuildFor(
+        store, DB::Cas::RootNamespace{"srv1/etag-deleted"}, "part",
+        DB::Cas::tests::u128Of(payload), payload.size());
+
+    build->putBlob(
+        ref,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
+
+    EXPECT_EQ(backend->first_delete.kind, DB::Cas::DeleteOutcome::Kind::Deleted);
+    EXPECT_EQ(backend->copy_publications, 1u)
+        << "the absent retry must not copy the original staged envelope again";
+    EXPECT_EQ(backend->streaming_publications, 1u);
+    EXPECT_EQ(
+        backend->deleteExact(store->layout().blobKey(ref), backend->queued_delete_token).kind,
+        DB::Cas::DeleteOutcome::Kind::TokenMismatch)
+        << "the second queued exact delete for the copied ETag must miss the retagged replacement";
+    const auto current = backend->get(store->layout().blobKey(ref));
+    ASSERT_TRUE(current.has_value());
+    EXPECT_NE(current->bytes, staging_bytes);
+    EXPECT_EQ(current->bytes.substr(store->poolMeta().blob_header_len), payload);
+}
+
+TEST(CASS3Staging, FirstCondemnedAttemptThenAbsentRetryNeverRecopies)
+{
+    auto backend = std::make_shared<EtagFaithfulPublicationBackend>(
+        EtagFaithfulPublicationBackend::FaultScript::FirstCondemnedStreamLandsThenDeleted);
+    auto store = DB::Cas::Pool::open(
+        backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const String payload = "etag-first-condemned-then-absent";
+    const DB::Cas::BlobRef ref = DB::Cas::tests::idOf(payload);
+    const String staging_key = "p/staging/mount1/etag-first-condemned.tmp";
+    const String staging_bytes = stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{303});
+    backend->putIfAbsent(staging_key, staging_bytes);
+    backend->putIfAbsent(store->layout().blobKey(ref), staging_bytes);
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), DB::Cas::tests::u128Of(payload), payload.size());
+    DB::Cas::tests::condemnMeta(*backend, store->layout(), DB::Cas::tests::u128Of(payload), 37);
+    const DB::Cas::Token original_staged_etag = backend->head(store->layout().blobKey(ref)).token;
+    auto build = precommittedBuildFor(
+        store, DB::Cas::RootNamespace{"srv1/etag-first-condemned"}, "part",
+        DB::Cas::tests::u128Of(payload), payload.size());
+
+    build->putBlob(
+        ref,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
+
+    EXPECT_EQ(backend->first_delete.kind, DB::Cas::DeleteOutcome::Kind::Deleted);
+    EXPECT_EQ(backend->copy_publications, 0u)
+        << "a first condemned publication and every later absent retry must stream, never copy";
+    EXPECT_EQ(backend->streaming_publications, 2u);
+    EXPECT_EQ(
+        backend->deleteExact(store->layout().blobKey(ref), original_staged_etag).kind,
+        DB::Cas::DeleteOutcome::Kind::TokenMismatch);
+    const auto current = backend->get(store->layout().blobKey(ref));
+    ASSERT_TRUE(current.has_value());
+    EXPECT_NE(current->bytes, staging_bytes);
+    EXPECT_EQ(current->bytes.substr(store->poolMeta().blob_header_len), payload);
 }
 
 TEST(CASS3Staging, ParsesS3BackendFromConfig)
@@ -610,15 +811,11 @@ TEST(CASS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
     EXPECT_FALSE(on_finalized_called);
 }
 
-/// Task 5 of the S3-native staging plan: the promote path. `PartWriteTxn::putBlob` with
-/// `BlobSource::server_side_copy_from` set drives a WRITE-ONCE conditional SERVER-SIDE COPY through the
-/// SAME condemn/resurrect gate as the streaming path (spec 2026-07-11-cas-s3-native-staging §5/§9). The
-/// four cases below use `RecordingStagingBackend` (an emulated backend that models conditional create
-/// and records every server-side-copy call). Live 412-vs-created enforcement against a real backend is
-/// Task 7 (with_rustfs integration test).
+/// The ordinary staged cases below pin the same mandatory-`HEAD` selection used by the ETag-faithful
+/// regressions: native verbatim copy only after a first absent observation, no publication for a live
+/// body, and retagged streaming for `Condemned`.
 
-/// (a) Fresh blob key ⇒ the write-once conditional copy creates it and records `Materialized`.
-/// The backend retains the new incarnation token. No unconditional copy is ever issued.
+/// (a) Fresh blob key ⇒ the first-plus-absent native copy publishes verbatim and records `Materialized`.
 TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
@@ -626,22 +823,26 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
     const DB::Cas::RootNamespace ns{"srv1/nsA"};
     const std::string ref = "part_a";
 
-    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-A");
+    const std::string payload(300, 'a');
+    const DB::UInt128 hash = DB::Cas::tests::u128Of(payload);
     const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/aaa.tmp";
-    const std::string payload(300, 'a');
-    backend->putIfAbsent(staging_key, payload);
+    const std::string staging_bytes = stagedBytes(
+        store->poolMeta().blob_header_len, payload, DB::UInt128{0xA});
+    backend->putIfAbsent(staging_key, staging_bytes);
 
     auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
-    const DB::Cas::PutBlobResult bref = build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
+    const DB::Cas::PutBlobResult bref = build->putBlob(
+        blob_id,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
 
-    /// EXACTLY one CONDITIONAL server-side copy staging->blobKey; zero unconditional copies.
+    /// Exactly one native verbatim publication from staging to the blob key.
     ASSERT_EQ(backend->copy_calls.size(), 1u);
-    EXPECT_TRUE(backend->copy_calls[0].conditional);
+    EXPECT_TRUE(backend->copy_calls[0].server_side_copy);
     EXPECT_EQ(backend->copy_calls[0].from, staging_key);
     EXPECT_EQ(backend->copy_calls[0].to, blob_key);
-    EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
+    EXPECT_EQ(backend->streamingPublicationCount(), 0u);
 
     /// Successful publication records materialized evidence; the backend still owns the destination token.
     EXPECT_EQ(build->dependencyProof(blob_id), DB::Cas::BlobDependencyProof::Materialized);
@@ -653,12 +854,10 @@ TEST(CASS3Staging, PromoteViaServerSideCopyCreatesFreshBlobMaterializedProof)
     /// The promoted blob body IS the staging bytes (server-side copy moved them verbatim).
     const auto got = backend->get(blob_key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, payload);
+    EXPECT_EQ(got->bytes, staging_bytes);
 }
 
-/// (b) Blob key already exists and is CLEAN ⇒ the conditional copy 412s and the writer ADOPTS the
-/// existing incarnation. No copy of any kind lands over the live blob. Also covers invariant (d): NO
-/// unconditional copy is ever issued over a live (non-condemned) blob.
+/// (b) Blob key already exists and is `Clean` ⇒ the writer observes it without publication.
 TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
@@ -666,25 +865,31 @@ TEST(CASS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     const DB::Cas::RootNamespace ns{"srv1/nsB"};
     const std::string ref = "part_b";
 
-    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-B");
+    const std::string payload(300, 'b');
+    const DB::UInt128 hash = DB::Cas::tests::u128Of(payload);
     const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/bbb.tmp";
-    backend->putIfAbsent(staging_key, std::string(300, 'b'));
+    backend->putIfAbsent(
+        staging_key,
+        stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{0xB}));
 
     /// A pre-existing, well-formed, CLEAN blob (envelope + payload) already at the content key.
-    DB::Cas::tests::writeBlobBody(*backend, store->layout(), hash);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/1);
+    backend->putIfAbsent(
+        blob_key,
+        stagedBytes(store->poolMeta().blob_header_len, payload, DB::UInt128{0xBB}));
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, payload.size());
     const DB::Cas::HeadResult before = backend->head(blob_key);
     ASSERT_TRUE(before.exists);
 
-    auto build = precommittedBuildFor(store, ns, ref, hash, 300);
-    build->putBlob(blob_id, serverSideCopySource(staging_key, 300));
+    auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
+    build->putBlob(
+        blob_id,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
 
-    /// Exactly one CONDITIONAL promote (which 412s) — then ADOPT. Invariant (d): zero unconditional copies.
-    ASSERT_EQ(backend->copy_calls.size(), 1u);
-    EXPECT_TRUE(backend->copy_calls[0].conditional);
-    EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
+    /// Mandatory `HEAD` observes the live body, so no transport call is made.
+    EXPECT_TRUE(backend->copy_calls.empty());
+    EXPECT_EQ(backend->streamingPublicationCount(), 0u);
 
     /// The existing incarnation is untouched: same token, same bytes.
     const DB::Cas::HeadResult after = backend->head(blob_key);
@@ -706,11 +911,11 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     const DB::Cas::RootNamespace ns{"srv1/nsC"};
     const std::string ref = "part_c";
 
-    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-C");
+    const std::string payload(300, 'c');
+    const DB::UInt128 hash = DB::Cas::tests::u128Of(payload);
     const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/ccc.tmp";
-    const std::string payload(300, 'c');
 
     /// The staging object holds `[header][payload]` (as `writeFile` now emits it). The staging header is
     /// a fixed 256-byte CABL envelope with its OWN incarnation_tag.
@@ -733,20 +938,20 @@ TEST(CASS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     ASSERT_TRUE(before.exists);
 
     auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
-    build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
+    build->putBlob(
+        blob_id,
+        reReadableStagedSource(backend, staging_key, payload.size(), store->poolMeta().blob_header_len));
 
-    /// A CONDITIONAL promote (412 — blob present) FOLLOWED BY exactly one UNCONDITIONAL resurrect
-    /// whose SOURCE is the staging key, NEVER the condemned blob key.
-    ASSERT_EQ(backend->copy_calls.size(), 2u);
-    EXPECT_TRUE(backend->copy_calls[0].conditional);
+    /// A present `Condemned` destination selects exactly one retagged streaming publication. It never
+    /// attempts the verbatim-copy transport.
+    ASSERT_EQ(backend->copy_calls.size(), 1u);
+    EXPECT_FALSE(backend->copy_calls[0].server_side_copy);
     EXPECT_EQ(backend->copy_calls[0].to, blob_key);
-    EXPECT_FALSE(backend->copy_calls[1].conditional);
-    EXPECT_EQ(backend->copy_calls[1].to, blob_key);
     /// INV: the resurrect reads the STAGING object and never the condemned blob key. Asserted on the
     /// reads themselves rather than on a source argument, because the caller now opens the reader.
     EXPECT_GT(backend->reads_of[staging_key], 0u) << "the resurrect must read the writer's own staging object";
     EXPECT_EQ(backend->reads_of[blob_key], 0u) << "the condemned blob key must never be read";
-    EXPECT_EQ(backend->unconditionalCopyCount(), 1u);
+    EXPECT_EQ(backend->streamingPublicationCount(), 1u);
 
     /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
     const DB::Cas::HeadResult after = backend->head(blob_key);

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -17,24 +18,26 @@ namespace DB::Cas
 
 /// Re-readable source for one content-addressed blob upload.
 ///
-/// `open` returns a FRESH reader over exactly `size` logical bytes and may be called more than once: an
-/// upload can race with another writer or with GC, in which case the transaction retries from the writer's
-/// own source and each attempt must read from the beginning. `server_side_copy_from` is set only for an S3
-/// staging object; the ordinary create then promotes it by a server-side copy instead of streaming through
-/// ClickHouse, and `open` reads that same staging object when a resurrection has to re-upload it
-/// (`Backend::resurrect` streams from a `ReadBuffer`, it does not copy). The staging object must remain
-/// available through a condemned-object resurrection.
+/// `open` returns a fresh reader over exactly `size` logical bytes and may be called more than once.
+/// `server_side_copy_from` names an already-verified complete staged object that may be copied verbatim
+/// only on this logical source's first publication after an absent observation. Every copy and move of
+/// the source shares `publication_attempted`, so ambiguity or fan-out wrapping cannot re-enable that
+/// staged envelope. Later publications use `open` to stream the same payload under a new envelope.
 struct BlobSource
 {
     uint64_t size = 0;
     std::function<std::unique_ptr<ReadBuffer>()> open;   /// yields exactly `size` bytes, from the start
-    /// When set, the blob's bytes already live in an S3 staging object with this key, and `putBlob` promotes it by a
-    /// WRITE-ONCE conditional SERVER-SIDE COPY (`Backend::promoteStaged`) instead of streaming
-    /// `open` — and resurrects a condemned incarnation by an unconditional re-upload streamed from
-    /// the SAME staging object via `open` (`Backend::resurrect`), never a read of the condemned blob
-    /// (revival must always be a fresh write from the source). Unset (the default, `StagingBackend::Local`) ⇒ the local
-    /// streaming path is byte-for-byte unchanged and `open` is the source.
     std::optional<String> server_side_copy_from;
+    std::shared_ptr<std::atomic<bool>> publication_attempted
+        = std::make_shared<std::atomic<bool>>(false);
+
+    /// Atomically consume the logical source's first-publication privilege. Called after the final
+    /// fence check and immediately before backend publication I/O.
+    bool beginPublication() const
+    {
+        return !publication_attempted->exchange(true, std::memory_order_acq_rel);
+    }
+
     /// Build a re-readable source backed by an owned string; intended for small payloads and tests.
     static BlobSource fromString(String bytes);
 };
@@ -72,17 +75,30 @@ struct BlobDepRecord
     bool operator==(const BlobDepRecord &) const = default;
 };
 
-/// Which branch of the upload primitive admitted a blob. Carried out of `uploadBlobDetached` so the
-/// merge/fan-out layers (and tests) can assert the branch taken without inferring it from the dep.
-enum class BlobUploadOutcome
+enum class BlobMaterializationAction : uint8_t
 {
-    DeduplicationCacheHit,      /// dedup cache said present; HEAD-first confirmed a live incarnation; adopted
-    HeadHit,            /// size-triggered HEAD-first found a present live incarnation; adopted
-    HeadMissAdopted,    /// the write-once create 412'd on a live incarnation (or a racing writer's); adopted
-    FreshUpload,        /// the write-once conditional create streamed a fresh local body
-    StagingPromoted,    /// the write-once conditional server-side copy promoted an S3 staging object
-    ResurrectedLocal,   /// a condemned incarnation displaced by a fresh local `putOverwrite`
-    ResurrectedS3,      /// a condemned incarnation displaced by a fresh server-side copy from staging
+    Observed,
+    Published,
+};
+
+enum class BlobPublicationReason : uint8_t
+{
+    Absent,
+    Condemned,
+};
+
+enum class BlobPublicationTransport : uint8_t
+{
+    Streaming,
+    ServerSideCopy,
+};
+
+/// Independent decision and transport dimensions for one completed materialization.
+struct BlobUploadDiagnostics
+{
+    BlobMaterializationAction action = BlobMaterializationAction::Observed;
+    std::optional<BlobPublicationReason> reason;
+    std::optional<BlobPublicationTransport> transport;
 };
 
 /// Public, CAS-owned input to `uploadBlobDetached`; the transaction's private dep representation is not
@@ -97,12 +113,12 @@ struct BlobUploadRequest
 };
 
 /// Complete result of one detached upload: the addressed ref, the COMPLETE dep effect the upload
-/// contributes (no side channel), and the branch outcome.
+/// contributes (no side channel), and orthogonal materialization diagnostics.
 struct BlobUploadResult
 {
     BlobRef ref;
     BlobDepRecord dep;
-    BlobUploadOutcome outcome = BlobUploadOutcome::FreshUpload;
+    BlobUploadDiagnostics diagnostics;
 };
 
 /// Hash `payload` with `algo` using the same convention as the streaming blob writer and return the complete
@@ -133,23 +149,17 @@ public:
     /// `promote` or `abandon` already retired the sequence, and also covers destruction during unwinding.
     ~PartWriteTxn();
 
-    /// Every upload attempt mints a fresh random `incarnation_tag`.
-    /// New content: streaming PUT If-None-Match:*; on PreconditionFailed ⇒ the cold-reuse rule
-    /// (observe current token; condemned ⇒ uploadFromSource — re-upload from the writer's source
-    /// bytes; else adopt — free).
+    /// Every publication attempt selected by the mandatory blob `HEAD` mints a fresh random
+    /// `incarnation_tag`, except the one permitted first-plus-absent verbatim staged copy.
     /// Ordering: `putBlob` is always called after `precommitAdd` (the wiring order is
-    /// `stageManifest` → `precommitAdd` → `putBlob` → `promote`). Its
-    /// ADOPT paths observe an existing incarnation, so they are safe only under this build's durable
-    /// precommit closure — enforced by a fail-closed throw (LOGICAL_ERROR, not a `chassert`, which is
-    /// compiled out in release) in observeAndAdmit. A FRESH upload before precommit is legal
-    /// (newborn-debris watermark), but production never does it.
+    /// `stageManifest` → `precommitAdd` → `putBlob` → `promote`). Both observation and publication
+    /// require the build's durable precommit closure.
     PutBlobResult putBlob(const BlobRef & ref, BlobSource source);
 
     /// Transaction-DETACHED upload primitive (spec §1). Runs the SAME durable, ordering-sensitive pool
-    /// effects `putBlob` runs — the HEAD-first dedup gate, the write-once conditional create, condemned
-    /// resurrection (INV-1: never GET a condemned object), the freshness-meta `Clean` transition,
-    /// dedup-cache reads/inserts, event emission, ProfileEvents — but folds NOTHING into `build`
-    /// (`deps`), returning the complete dep effect + branch outcome as a value instead. It is therefore
+    /// effects `putBlob` runs — mandatory blob `HEAD`, safe observation or unconditional publication,
+    /// freshness-meta `Clean` reconciliation, event emission, and ProfileEvents — but folds NOTHING into `build`
+    /// (`deps`), returning the complete dep effect plus orthogonal diagnostics as a value instead. It is therefore
     /// safe to run off the owning writer thread while `PartWriteTxn` stays single-writer for `build`.
     /// `putBlob` = this primitive + a single-result `deps` fold on the calling thread.
     BlobUploadResult uploadBlobDetached(const BlobUploadRequest & req) const;
@@ -230,8 +240,8 @@ public:
     /// PROCESS-RESTART INVARIANT: a `PartWriteTxn` is a plain in-memory C++ object owned by the wiring's
     /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
     /// restart. There is no "replay a precommit" code path anywhere in the core: `promote` is called
-    /// synchronously, in-process, strictly AFTER every referenced blob's `putBlob` (which for S3
-    /// staging drives `promoteStaged`'s conditional copy) has already returned successfully. If the
+    /// synchronously, in-process, strictly AFTER every referenced blob's `putBlob` (which may use
+    /// `publishBlob`'s native staged-copy transport) has already returned successfully. If the
     /// process exits between `precommitAdd` and `promote` (e.g. between staging a blob and its
     /// server-side-copy promote completing), the `PartWriteTxn` object is simply lost with it: nothing ever
     /// "wakes up" that precommit and finishes promoting it. The precommit's owner binding is left as a
@@ -321,22 +331,9 @@ private:
     /// dependencies are blob-only, so `ObjectKind` is not part of the key.
     using DepKey = BlobRef;
 
-    /// Apply the cold-reuse rule: HEAD the key; absent ⇒ FILE_DOESNT_EXIST;
-    /// condemned-at-current-token ⇒ throw ABORTED (caller must re-upload from its own source bytes);
-    /// else RETURN the adopt dep record (current token, admitted logical size). Build-neutral: it folds
-    /// nothing into `deps` (its callers compose the returned record into a `BlobUploadResult`).
-    BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key) const;
-    /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
-    /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true.
-    BlobDepRecord observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr) const;
-    /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
-    /// OWN re-readable source without reading the dying object (no backend().get). On a Native backend the
-    /// source is STREAMED into the put sink (header + `source.open`); the emulated backend materializes
-    /// one body at a time inside `Backend::resurrect`;
-    /// `source.open` may be re-invoked on each conditional-write attempt (it re-reads the staged
-    /// temp file / re-emits the captured String), so it is taken by const ref and not consumed. Build-neutral:
-    /// RETURNS the complete `BlobUploadResult` (dep + branch outcome); it folds nothing into `deps`.
-    BlobUploadResult uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source) const;
+    /// Own the complete bounded `HEAD`/metadata/publication/reconciliation state machine. Build-neutral:
+    /// returns the materialized dependency and diagnostics without folding into `deps`.
+    BlobUploadResult ensureBlobPresent(const BlobUploadRequest & req) const;
 
     /// The build's owning root namespace, derived from PartWriteInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.

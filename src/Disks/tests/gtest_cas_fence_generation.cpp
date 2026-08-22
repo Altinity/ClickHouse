@@ -176,6 +176,52 @@ BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
     return source;
 }
 
+PartWriteTxnPtr precommittedBuildForBlob(
+    const PoolPtr & store, const RootNamespace & ns, const String & ref_name, const String & payload)
+{
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/" + ref_name;
+    auto build = store->beginPartWrite(std::move(info));
+    const ManifestId manifest = build->stageManifest(
+        {DB::Cas::tests::blobEntryFor("data.bin", DB::Cas::tests::u128Of(payload), payload.size())});
+    build->precommitAdd(ns, ref_name, manifest);
+    return build;
+}
+
+/// Trips the mount either while returning the mandatory blob `HEAD`, or immediately after an
+/// unconditional publication has landed. These are the two sides of the writer's final pre-I/O fence
+/// check: the first must send no publication; the second may leave equivalent debris but no proof.
+class BlobPublicationFenceBackend final : public InMemoryBackend
+{
+public:
+    enum class TripPoint : uint8_t
+    {
+        OnHead,
+        AfterPublication,
+    };
+
+    HeadResult head(const String & key) override
+    {
+        const HeadResult result = InMemoryBackend::head(key);
+        if (key == watched_key && trip_point == TripPoint::OnHead && trigger)
+            std::exchange(trigger, {})();
+        return result;
+    }
+
+    void publishBlob(const BlobPublishRequest & request) override
+    {
+        ++publish_calls;
+        InMemoryBackend::publishBlob(request);
+        if (request.destination_key == watched_key && trip_point == TripPoint::AfterPublication && trigger)
+            std::exchange(trigger, {})();
+    }
+
+    String watched_key;
+    TripPoint trip_point = TripPoint::OnHead;
+    std::function<void()> trigger;
+    size_t publish_calls = 0;
+};
+
 TEST(CASFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -213,6 +259,49 @@ TEST(CASFenceGeneration, RearmPublishesTheNewGenerationBeforeOpeningTheFence)
     EXPECT_EQ(store->refTableRuntimeAdmittedFenceGenerationForTest(ns), store->fenceGeneration());
 }
 
+}
+
+TEST(CASFenceGeneration, BlobPublicationFenceLossBeforeFinalCheckPublishesNothing)
+{
+    auto backend = std::make_shared<BlobPublicationFenceBackend>();
+    auto store = openTestPool(backend);
+    const String payload = "fence-before-unconditional-publication";
+    const BlobRef ref = DB::Cas::tests::idOf(payload);
+    auto build = precommittedBuildForBlob(store, RootNamespace{"srv1/fence-before"}, "part", payload);
+    backend->watched_key = store->layout().blobKey(ref);
+    backend->trip_point = BlobPublicationFenceBackend::TripPoint::OnHead;
+    backend->trigger = [&] { store->tripMountLost(); };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->putBlob(ref, BlobSource::fromString(payload));
+    });
+
+    EXPECT_EQ(backend->publish_calls, 0u);
+    EXPECT_FALSE(backend->head(backend->watched_key).exists);
+    EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
+}
+
+TEST(CASFenceGeneration, BlobPublicationFenceLossAfterLandingReturnsNoProof)
+{
+    auto backend = std::make_shared<BlobPublicationFenceBackend>();
+    auto store = openTestPool(backend);
+    const String payload = "fence-after-unconditional-publication";
+    const BlobRef ref = DB::Cas::tests::idOf(payload);
+    auto build = precommittedBuildForBlob(store, RootNamespace{"srv1/fence-after"}, "part", payload);
+    backend->watched_key = store->layout().blobKey(ref);
+    backend->trip_point = BlobPublicationFenceBackend::TripPoint::AfterPublication;
+    backend->trigger = [&] { store->tripMountLost(); };
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->putBlob(ref, BlobSource::fromString(payload));
+    });
+
+    EXPECT_EQ(backend->publish_calls, 1u);
+    EXPECT_TRUE(backend->head(backend->watched_key).exists)
+        << "a publication that landed before fence loss is safe unreferenced debris";
+    EXPECT_EQ(build->dependencyProof(ref), std::nullopt);
 }
 
 /// (a) `casPutObject` (reached via `Pool::putNamespaceFile`) with the fence tripped BETWEEN admission
@@ -401,7 +490,7 @@ TEST(CASFenceGeneration, CondemnedPutOverwriteAbortsWhenFenceTripsBeforeDurableC
     const DB::Cas::Token condemned_token = backend->head(blob_key).token;
     ASSERT_FALSE(condemned_token.empty());
 
-    auto build = store->beginPartWrite({});
+    auto build = precommittedBuildForBlob(store, RootNamespace{"srv1/condemned-fence"}, "part", payload);
     /// Reset counters past the setup writes (`condemnMeta` itself putOverwrites the meta key) and arm AFTER
     /// beginPartWrite (whose W-HEARTBEAT would otherwise consume the one-shot trigger). The first head()
     /// after this is the `head(key)` at uploadFromSource's condemned-displacement decision.
@@ -453,7 +542,7 @@ TEST(CASFenceGeneration, CondemnedResurrectStagedAbortsWhenFenceTripsBeforeDurab
     const DB::Cas::Token condemned_token = backend->head(blob_key).token;
     ASSERT_FALSE(condemned_token.empty());
 
-    auto build = store->beginPartWrite({});
+    auto build = precommittedBuildForBlob(store, RootNamespace{"srv1/staged-condemned-fence"}, "part", payload);
     backend->put_overwrite_calls = 0;
     backend->resurrect_staged_calls = 0;
     backend->trigger = [&] { store->tripMountLost(); };
