@@ -38,10 +38,13 @@
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
 #include <Disks/IO/AsynchronousBoundedReadBuffer.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <Common/filesystemHelpers.h>
 #include <Common/tests/gtest_global_context.h>
 #include <Core/Settings.h>
+
+#include <Poco/TemporaryFile.h>
 
 
 namespace DB
@@ -1434,21 +1437,35 @@ public:
     std::shared_ptr<MockS3::S3MemStrore> store;
 
 protected:
-    void resetObjectStorage(bool allow_native_copy = true)
+    std::shared_ptr<S3ObjectStorage> createObjectStorage(
+        const String & storage_bucket,
+        const String & storage_disk_name,
+        bool allow_native_copy,
+        MockS3::Client *& client_out)
     {
         auto owned_client = std::make_unique<MockS3::Client>(store);
-        mock_client = owned_client.get();
+        client_out = owned_client.get();
 
         auto settings = std::make_unique<S3Settings>();
         settings->request_settings[S3RequestSetting::allow_native_copy] = allow_native_copy;
 
         S3::URI uri;
-        uri.bucket = bucket;
+        uri.bucket = storage_bucket;
         S3Capabilities capabilities;
         ObjectStorageKeyGeneratorPtr key_generator;
 
-        object_storage = std::make_shared<S3ObjectStorage>(
-            std::move(owned_client), std::move(settings), std::move(uri), capabilities, key_generator, disk_name);
+        return std::make_shared<S3ObjectStorage>(
+            std::move(owned_client),
+            std::move(settings),
+            std::move(uri),
+            capabilities,
+            key_generator,
+            storage_disk_name);
+    }
+
+    void resetObjectStorage(bool allow_native_copy = true)
+    {
+        object_storage = createObjectStorage(bucket, disk_name, allow_native_copy, mock_client);
     }
 
     void SetUp() override
@@ -1543,6 +1560,132 @@ TEST_F(S3ObjectStorageConditionalOpsTest, NativeOnlyCopyObjectNeverFallsBack)
     EXPECT_EQ(mock_client->counters.copyObject, 0);
     EXPECT_EQ(mock_client->counters.putObject, 0);
     EXPECT_FALSE(store->GetBucketStore(bucket).objects.contains("disabled-dst-key"));
+}
+
+TEST_F(S3ObjectStorageConditionalOpsTest, NativeOnlyCrossStorageCopyUsesNativeTransport)
+{
+    const String destination_bucket = "cond-ops-destination-bucket";
+    store->CreateBucket(destination_bucket);
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    MockS3::Client * destination_client = nullptr;
+    auto destination_storage = createObjectStorage(
+        destination_bucket, "cond-ops-destination-disk", /*allow_native_copy=*/true, destination_client);
+
+    WriteSettings write_settings;
+    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
+    object_storage->copyObjectToAnotherObjectStorage(
+        StoredObject("src-key"),
+        StoredObject("dst-key"),
+        ReadSettings{},
+        write_settings,
+        *destination_storage,
+        std::nullopt);
+
+    EXPECT_EQ(store->GetBucketStore(destination_bucket).objects.at("dst-key"), "hello-world");
+    EXPECT_EQ(destination_client->counters.copyObject, 1);
+    EXPECT_EQ(destination_client->counters.putObject, 0);
+    EXPECT_EQ(mock_client->counters.getObject, 0);
+}
+
+TEST_F(S3ObjectStorageConditionalOpsTest, NativeOnlyCrossStorageCopyNeverFallsBackAfterAccessDenied)
+{
+    const String destination_bucket = "cond-ops-destination-bucket";
+    store->CreateBucket(destination_bucket);
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    MockS3::Client * destination_client = nullptr;
+    auto destination_storage = createObjectStorage(
+        destination_bucket, "cond-ops-destination-disk", /*allow_native_copy=*/true, destination_client);
+    destination_client->setInjectionModel(std::make_shared<MockS3::CopyObjectErrorInjection>(
+        Aws::Client::AWSError<Aws::S3::S3Errors>(Aws::S3::S3Errors::ACCESS_DENIED, "AccessDenied", "access denied", false)));
+
+    WriteSettings write_settings;
+    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
+    EXPECT_THROW(
+        object_storage->copyObjectToAnotherObjectStorage(
+            StoredObject("src-key"),
+            StoredObject("dst-key"),
+            ReadSettings{},
+            write_settings,
+            *destination_storage,
+            std::nullopt),
+        DB::S3Exception);
+
+    EXPECT_EQ(destination_client->counters.copyObject, 1);
+    EXPECT_EQ(destination_client->counters.putObject, 0);
+    EXPECT_EQ(mock_client->counters.getObject, 0);
+    EXPECT_FALSE(store->GetBucketStore(destination_bucket).objects.contains("dst-key"));
+}
+
+TEST_F(S3ObjectStorageConditionalOpsTest, NativeOnlyCrossStorageCopyNeverFallsBackWhenNativeCopyIsDisabled)
+{
+    const String destination_bucket = "cond-ops-destination-bucket";
+    store->CreateBucket(destination_bucket);
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    resetObjectStorage(/*allow_native_copy=*/false);
+    MockS3::Client * destination_client = nullptr;
+    auto destination_storage = createObjectStorage(
+        destination_bucket, "cond-ops-destination-disk", /*allow_native_copy=*/true, destination_client);
+
+    WriteSettings write_settings;
+    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
+    EXPECT_THROW({
+        try
+        {
+            object_storage->copyObjectToAnotherObjectStorage(
+                StoredObject("src-key"),
+                StoredObject("dst-key"),
+                ReadSettings{},
+                write_settings,
+                *destination_storage,
+                std::nullopt);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::NOT_IMPLEMENTED);
+            throw;
+        }
+    }, DB::Exception);
+
+    EXPECT_EQ(destination_client->counters.copyObject, 0);
+    EXPECT_EQ(destination_client->counters.putObject, 0);
+    EXPECT_EQ(mock_client->counters.getObject, 0);
+    EXPECT_FALSE(store->GetBucketStore(destination_bucket).objects.contains("dst-key"));
+}
+
+TEST_F(S3ObjectStorageConditionalOpsTest, NativeOnlyCopyToNonS3StorageFailsClosed)
+{
+    store->GetBucketStore(bucket).PutObject("src-key", "hello-world");
+
+    Poco::TemporaryFile destination_directory;
+    destination_directory.createDirectories();
+    LocalObjectStorage destination_storage(LocalObjectStorageSettings(
+        "cond-ops-local-destination", destination_directory.path(), /*read_only_=*/false));
+
+    WriteSettings write_settings;
+    write_settings.object_storage_copy_mode = ObjectStorageCopyMode::NativeOnly;
+    EXPECT_THROW({
+        try
+        {
+            object_storage->copyObjectToAnotherObjectStorage(
+                StoredObject("src-key"),
+                StoredObject("dst-key"),
+                ReadSettings{},
+                write_settings,
+                destination_storage,
+                std::nullopt);
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::NOT_IMPLEMENTED);
+            throw;
+        }
+    }, DB::Exception);
+
+    EXPECT_EQ(mock_client->counters.getObject, 0);
+    EXPECT_FALSE(destination_storage.exists(StoredObject("dst-key")));
 }
 
 TEST_F(S3ObjectStorageConditionalOpsTest, RemoveObjectIfTokenMatchesSuccess)

@@ -752,13 +752,16 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 BlobStorageLogWriter::create(disk_name),
                 scheduler,
                 [&, this]{ return readObject(object_from, read_settings_to_use);},
-                object_to_attributes);
+                object_to_attributes,
+                write_settings.object_storage_copy_mode);
             return;
         }
         catch (S3Exception & exc)
         {
-            /// If authentication/permissions error occurs then fallthrough to copy with buffer.
-            if (exc.getS3ErrorCode() != Aws::S3::S3Errors::ACCESS_DENIED)
+            /// Default mode may fall through to a buffered copy after an authentication/permissions error;
+            /// NativeOnly must preserve the native-copy failure.
+            if (write_settings.object_storage_copy_mode == ObjectStorageCopyMode::NativeOnly
+                || exc.getS3ErrorCode() != Aws::S3::S3Errors::ACCESS_DENIED)
                 throw;
             else
             {
@@ -780,6 +783,11 @@ void S3ObjectStorage::copyObjectToAnotherObjectStorage( // NOLINT
                 getName(), dest_s3->getName(), exc.what());
         }
     }
+
+    if (write_settings.object_storage_copy_mode == ObjectStorageCopyMode::NativeOnly)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Native-only object copy requires both object storages to use the native S3 copy path");
 
     IObjectStorage::copyObjectToAnotherObjectStorage(object_from, object_to, read_settings, write_settings, object_storage_to, object_to_attributes);
 }
