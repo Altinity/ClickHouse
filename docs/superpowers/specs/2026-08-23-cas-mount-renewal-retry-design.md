@@ -202,7 +202,8 @@ delay cadence.
 ### Result classification {#result-classification}
 
 `CasRequestController::putOverwriteControlled` applies its existing resolve-before-reissue rules,
-with the operation context adding a gate before every request:
+with the operation context adding stop/deadline gates before every request and the physical-attempt
+limit only before a new `PUT`:
 
 1. `PUT` returns `Done`: the attempt committed and supplies the new token.
 2. `PUT` throws transiently or returns `PreconditionFailed`: issue one exact `GET`.
@@ -212,7 +213,13 @@ with the operation context adding a gate before every request:
    committed; adopt the observed token.
 5. A different token and different bytes: return `Conflict` and run the existing body-aware mount
    classification.
-6. An absent/unreadable result remains ambiguous and may reissue only while all budget gates allow it.
+6. An absent/unreadable result remains ambiguous and may reissue only while all budget gates allow
+   another `PUT`.
+
+The exact resolving `GET` belongs to the physical attempt that just ran; it is not another physical
+attempt. `max_attempts` therefore never suppresses that read, even when the ambiguous `PUT` consumed
+the final allowed attempt. `AttemptsExhausted` is selected only after the final attempt's resolution
+remains inconclusive and the controller would otherwise reissue the immutable body.
 
 The final controller fence check remains mandatory after both direct and read-resolved success. A
 result learned after the last confirmed lease's safety boundary is `Unresolved`, even when the exact
@@ -239,12 +246,12 @@ request and do not create a new lease-loss transition.
 
 The runtime consumes the result only after the keeper frame has returned. On success it refreshes the
 local BOOTTIME fence from `attempt_start_boot_ms` for background and direct calls alike. On a terminal
-result from the background worker or fully-open direct seam, it idempotently increments the keeper
-generation's loss accounting, trips the fence, schedules the existing remount worker, and reports or
-rethrows the captured exception. The startup-only TTL-consumed redo propagates a terminal result to
-the existing open rollback without scheduling remount, because the pool has not published a live
-fence/runtime yet. No keeper method calls into `CasMountRuntime`, and no error is converted to
-success.
+result from a background call returning to `WorkerIdle`, or from the fully-open direct seam, it
+idempotently increments the keeper generation's loss accounting, trips the fence, requests remount,
+and reports or rethrows the captured exception. A background call returning to `Parked` reuses the
+remount generation that caused the park instead of requesting another. Startup-only and remount-only
+redo propagate a terminal result to their enclosing open/remount attempt without scheduling a nested
+request. No keeper method calls into `CasMountRuntime`, and no error is converted to success.
 
 ### Scheduling after success {#scheduling-after-success}
 
@@ -446,14 +453,18 @@ reconstructed after the fact.
 
 ### Gate precedence and diagnostics {#gate-precedence-and-diagnostics}
 
-One controller helper evaluates every pre-`PUT`, pre-resolve, pre-wait, post-wait, and post-commit
-gate. It samples each input once and applies this precedence:
+One controller helper evaluates stop and deadline at every pre-`PUT`, pre-resolve, pre-wait,
+post-wait, and post-commit gate. It samples each input once and applies this precedence:
 
 1. `FenceOrLifecycleLost`;
 2. `Cancelled`;
 3. absolute deadline, with `ExternalLeaseSafety` winning a tie against `RequestBudget`;
-4. physical attempt limit;
-5. the backend/result transition.
+4. the backend/result transition.
+
+Only the pre-`PUT` admission also evaluates the physical-attempt limit, after stop and deadline but
+before sending. It does not gate the resolving `GET` or final acceptance checks for an already-sent
+attempt. After the final attempt's exact resolution remains inconclusive, the next pre-`PUT` gate
+selects `AttemptsExhausted` instead of reissuing.
 
 The runtime's `stop_cause` callback itself returns `FenceOrLifecycleLost` when fence/lifecycle loss
 and owner cancellation are simultaneous. `wait_before_retry` returns `false` only after publishing a
@@ -550,12 +561,17 @@ The runtime enforces these entry points:
   maintenance seam that acquires `Dormant -> DirectCall -> Dormant` and refuses whenever background
   operation is configured or either worker exists.
 
-One runtime helper consumes `MountRenewResult`. It refreshes the fence on every committed result,
-including direct success. For a terminal result on a fully open runtime it uses an installed-keeper
-generation to deposit `CASMountLeaseLost`, `tripMountLost`, and `scheduleRemount` exactly once, after
-all keeper access has ended. If owner shutdown caused the result, it does not increment operational
-lease-loss accounting or request remount. A terminal result after a sent request still trips the
-fence and forbids farewell. Startup does not call this helper.
+One runtime helper consumes `MountRenewResult` after the driver lease has restored and reported the
+runtime state under the admission mutex. It refreshes the fence on every committed result, including
+direct success. For a terminal result returning to `WorkerIdle` on a fully open runtime it uses an
+installed-keeper generation to deposit `CASMountLeaseLost`, `tripMountLost`, and `scheduleRemount`
+exactly once, after all keeper access has ended. A terminal result returning to `Parked` records the
+deposition and keeps the fence closed, but neither duplicates the installed generation's loss
+accounting nor increments the requested generation: the generation that caused `ParkRequested`
+already owns recovery. A result returning to `Stopping` does not increment operational lease-loss
+accounting or request remount. A terminal result after a sent request always forbids farewell.
+Startup and remount-only redo do not call this helper; each propagates failure to its enclosing
+open/remount attempt without scheduling a nested request.
 
 With background operation disabled, the direct seam still invokes the same terminal consumer. Its
 call to `scheduleRemount` records the request, but the deliberately absent remount worker performs no
@@ -600,8 +616,9 @@ logs/events/counters. Renewal and remount remain separate protocols and separate
 | Remount TTL redo | `Parked -> RemountCall -> Parked` | committed or terminal | re-arm from returned anchor, or fail this attempt |
 | Start background | `Dormant -> WorkerIdle` | `Active` | create both workers; roll both back on failure |
 | Background/direct success | `WorkerCall -> WorkerIdle` or `DirectCall -> Dormant` | `Active` | refresh fence from attempt anchor |
-| Background/direct terminal | driver lease returns first | `RenewalTerminal` | trip once; request remount once; rethrow only to direct caller |
-| External lease loss | `WorkerCall/WorkerIdle -> ParkRequested -> Parked` | current call settles | latch generation; remount worker waits for park |
+| Background/direct terminal | driver lease returns to `WorkerIdle`/`Dormant` | `RenewalTerminal` | trip once; request remount once; rethrow only to direct caller |
+| External lease loss while idle | `WorkerIdle -> ParkRequested -> Parked` | `Active` | latch generation; remount worker waits for park |
+| External lease loss during renewal | `WorkerCall -> ParkRequested -> Parked` | current call may become terminal | latch one generation; deposit terminal result without requesting another |
 | Remount success | remain `Parked` through commit | fresh `Active` keeper | publish epoch/quiescence/fence/`Live`; handle generation; resume |
 | Graceful stop before send | worker returns `NotAttempted`, then `Stopping -> Dormant` | `Active` | no loss/remount; clean release allowed |
 | Stop after any sent ambiguity | `Stopping -> Dormant` after call | `RenewalTerminal` | trip fence; no recovery during shutdown; no farewell |
@@ -783,7 +800,9 @@ Fault-injecting backends and clocks must prove:
 6. successor epoch, foreign UUID, and vanished body retain their existing fail-closed outcomes;
 7. failing resolve reads exhaust the narrowed budget without an attempt after the boundary;
 8. a valid budget with `max_attempts = 1` that ends unresolved terminalizes the keeper immediately;
-   the runtime worker never wakes later to mint a new body for the old expected token;
+   the runtime worker never wakes later to mint a new body for the old expected token; separately, a
+   lost response to that sole `PUT` still performs the exact resolving `GET` and adopts a proven
+   commit rather than reporting `AttemptsExhausted` before resolution;
 9. a deterministic/non-retryable failure through the real background path terminalizes immediately
    rather than waiting one normal cadence;
 10. a slowly resolved success refreshes from attempt start and schedules an immediate catch-up beat;
@@ -815,6 +834,9 @@ Fault-injecting backends and clocks must prove:
     remount worker returns to wait, and its newer remount generation is still processed;
 24. a concurrent external remount request during an active remount is retained by generation and is
     processed in the next loop iteration rather than inferred to be satisfied by the current one;
+    an external loss during an in-flight renewal parks that driver, and a terminal result from the
+    parked call produces no duplicate loss metric and, on successful recovery, exactly one remount
+    callback and one fresh epoch rather than requesting a second generation;
 25. a remount whose start anchor no longer passes the operation-fit gate performs a parked controlled
     redo before fence arm;
 26. a throwing event sink after fence arm cannot turn the no-throw remount commit into failure or
@@ -825,8 +847,9 @@ Fault-injecting backends and clocks must prove:
 28. owner cancellation before any request returns `NotAttempted`, performs no lease-loss accounting
     or remount scheduling, and permits clean release; cancellation after a sent/ambiguous request is
     terminal and forbids farewell without scheduling recovery during shutdown;
-29. simultaneous fence/cancellation/deadline/attempt-limit shapes follow the gate-precedence table at
-    every gate position, including interrupted wait;
+29. simultaneous fence/cancellation/deadline shapes follow the gate-precedence table at every gate
+    position, including interrupted wait; attempt exhaustion participates only in pre-`PUT`
+    admission and never prevents resolution or acceptance of the final sent attempt;
 30. retry metrics/events count once at their documented granularity and `CASMountLeaseLost` is not
     doubled;
 31. every deadline/attempt/cancellation/fence terminal shape maps to the documented diagnostics, and
@@ -969,8 +992,9 @@ its diagnosis but makes no claim that its recovery latency is optimal.
    timeout fits before the last confirmed lease's safety boundary, no result is accepted after that
    boundary, and the boundary is never extended without a proven commit.
 6. Any remaining ambiguity or admitted deterministic terminal failure in a fully open runtime fences
-   exactly once and schedules the existing remount path exactly once. The startup-only redo instead
-   fails open before publication and never schedules remount.
+   exactly once and has exactly one recovery generation: a normal worker terminal schedules it,
+   while a worker parked by an existing request reuses that generation. Startup-only and remount-only
+   redo instead fail their enclosing open/remount attempt and never schedule a nested remount.
 7. Slow successful resolution cannot shift the next cadence by response latency.
 8. `MountLeaseKeeper` is synchronous, has explicit `New`/`Active`/`RenewalTerminal`/`Released` state,
    and has no worker or owner callback; `SingleWriterSlot` is removed.
