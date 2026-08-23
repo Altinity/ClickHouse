@@ -39,12 +39,8 @@
              raise only for very large pools (allows concurrent per-shard reduce). -->
         <!-- <gc_shards>1</gc_shards> -->
 
-        <!-- In-memory dedup cache (hash -> known-present) that skips duplicate uploads. -->
-        <!-- <deduplication_cache_bytes>67108864</deduplication_cache_bytes> -->
-
-        <!-- Blobs >= this size do a HEAD before the conditional PUT (cheap dedup probe for
-             big objects; small ones just PUT with If-None-Match). -->
-        <!-- <deduplication_head_first_min_bytes>1048576</deduplication_head_first_min_bytes> -->
+        <!-- Blob publication has no override setting: every materialization starts with HEAD.
+             An absent or condemned body is published unconditionally and may use multipart. -->
 
         <!-- How many sealed GC snapshot generations to retain for introspection/debug. -->
         <!-- <gc_snapshot_generations_to_keep>3</gc_snapshot_generations_to_keep> -->
