@@ -6,8 +6,6 @@ cd "$(dirname "$0")"
 
 JAR=${TLC_JAR:-../../../tmp/tla2tools.jar}
 MODULE=CaMountRenewRetryCore
-source ./tlc_temporal_gate.sh
-check_tlc_pin "$JAR" || exit 3
 mkdir -p ../../../tmp
 
 SAFETY_INVARIANTS=(
@@ -73,6 +71,190 @@ witness_declares_safety()
     done
 }
 
+classify_tlc_result()
+{
+    local log="$1"
+    local rc="$2"
+    local violation_count
+    local behavior_count
+    local error_count
+    local fatal_count
+    local statistics_count
+    local depth_count
+    local footer_count
+    local no_error_count
+    local green_statistics_count
+    local violated
+
+    if [[ $rc -eq 124 ]]
+    then
+        echo timeout
+        return
+    fi
+    if grep -qE 'Deadlock reached|Error: Deadlock' "$log"
+    then
+        echo deadlock
+        return
+    fi
+    if grep -qE 'Parse Error|Error: Parsing|Semantic errors|Parsing or semantic analysis failed' "$log"
+    then
+        echo parse-error
+        return
+    fi
+
+    violation_count="$(grep -cE '^Error: (Invariant|Property|Action property) [A-Za-z0-9_]+ is violated\.$' "$log" || true)"
+    behavior_count="$(grep -cE '^Error: The behavior up to this point is:$' "$log" || true)"
+    error_count="$(grep -cE '^Error:' "$log" || true)"
+    fatal_count="$(grep -cE 'Exception in thread|java\.[A-Za-z0-9_.]*(Error|Exception)|OutOfMemoryError|StackOverflowError|TLC threw an unexpected exception|^Killed$|^Aborted$' "$log" || true)"
+    statistics_count="$(grep -cE '^[0-9,]+ states generated, [0-9,]+ distinct states found, [0-9,]+ states left on queue\.$' "$log" || true)"
+    green_statistics_count="$(grep -cE '^[0-9,]+ states generated, [0-9,]+ distinct states found, 0 states left on queue\.$' "$log" || true)"
+    depth_count="$(grep -cE '^The depth of the complete state graph search is [0-9]+\.$' "$log" || true)"
+    footer_count="$(grep -cE '^Finished in .* at \(.*\)$' "$log" || true)"
+    no_error_count="$(grep -cE '^Model checking completed\. No error has been found\.$' "$log" || true)"
+
+    if [[ $violation_count -gt 0 ]]
+    then
+        if [[ $rc -ne 12 ]]
+        then
+            echo unallowed-exit
+            return
+        fi
+        if [[ $violation_count -ne 1 ]]
+        then
+            echo multiple-violations
+            return
+        fi
+        if [[ $fatal_count -ne 0 \
+              || $behavior_count -gt 1 \
+              || $error_count -ne $((violation_count + behavior_count)) \
+              || $no_error_count -ne 0 ]]
+        then
+            echo additional-error
+            return
+        fi
+        if [[ $behavior_count -ne 1 \
+              || $statistics_count -ne 1 \
+              || $depth_count -ne 1 \
+              || $footer_count -ne 1 ]]
+        then
+            echo incomplete
+            return
+        fi
+        violated="$(sed -nE 's/^Error: (Invariant|Property|Action property) ([A-Za-z0-9_]+) is violated\.$/\2/p' "$log")"
+        echo "violation:${violated}"
+        return
+    fi
+
+    if [[ $rc -ne 0 ]]
+    then
+        echo unallowed-exit
+        return
+    fi
+    if [[ $fatal_count -ne 0 || $error_count -ne 0 ]]
+    then
+        echo additional-error
+        return
+    fi
+    if [[ $no_error_count -ne 1 \
+          || $statistics_count -ne 1 \
+          || $green_statistics_count -ne 1 \
+          || $depth_count -ne 1 \
+          || $footer_count -ne 1 ]]
+    then
+        echo incomplete
+        return
+    fi
+    echo green
+}
+
+write_violation_fixture()
+{
+    local log="$1"
+    local name="$2"
+    {
+        printf 'Error: Invariant %s is violated.\n' "$name"
+        printf 'Error: The behavior up to this point is:\n'
+        printf '10 states generated, 8 distinct states found, 2 states left on queue.\n'
+        printf 'The depth of the complete state graph search is 4.\n'
+        printf 'Finished in 00s at (fixture)\n'
+    } > "$log"
+}
+
+write_green_fixture()
+{
+    local log="$1"
+    {
+        printf 'Model checking completed. No error has been found.\n'
+        printf '10 states generated, 8 distinct states found, 0 states left on queue.\n'
+        printf 'The depth of the complete state graph search is 4.\n'
+        printf 'Finished in 00s at (fixture)\n'
+    } > "$log"
+}
+
+runner_self_test()
+{
+    local fixture_dir
+    local failures=0
+    fixture_dir="$(mktemp -d ../../../tmp/mountrenewretry-runner-selftest.XXXXXX)" || return 1
+    trap "rm -rf -- '$fixture_dir'" EXIT
+
+    local complete_violation="$fixture_dir/complete-violation.log"
+    local complete_green="$fixture_dir/complete-green.log"
+    local second_violation="$fixture_dir/second-violation.log"
+    local additional_error="$fixture_dir/additional-error.log"
+    local missing_statistics="$fixture_dir/missing-statistics.log"
+    local missing_footer="$fixture_dir/missing-footer.log"
+
+    write_violation_fixture "$complete_violation" ExpectedInvariant
+    write_green_fixture "$complete_green"
+    write_violation_fixture "$second_violation" ExpectedInvariant
+    printf 'Error: Invariant SecondInvariant is violated.\n' >> "$second_violation"
+    write_violation_fixture "$additional_error" ExpectedInvariant
+    printf 'Error: synthetic checker failure\n' >> "$additional_error"
+    write_violation_fixture "$missing_statistics" ExpectedInvariant
+    sed -i '/states generated/d' "$missing_statistics"
+    write_violation_fixture "$missing_footer" ExpectedInvariant
+    sed -i '/^Finished in /d' "$missing_footer"
+
+    check_fixture()
+    {
+        local label="$1"
+        local want="$2"
+        local log="$3"
+        local rc="$4"
+        local got
+        got="$(classify_tlc_result "$log" "$rc")"
+        if [[ "$got" == "$want" ]]
+        then
+            printf 'PASS %-32s %s\n' "$label" "$got"
+        else
+            printf 'FAIL %-32s wanted=%s got=%s\n' "$label" "$want" "$got"
+            failures=$((failures + 1))
+        fi
+    }
+
+    check_fixture complete-violation violation:ExpectedInvariant "$complete_violation" 12
+    check_fixture complete-green green "$complete_green" 0
+    check_fixture abnormal-exit unallowed-exit "$complete_violation" 137
+    check_fixture second-violation multiple-violations "$second_violation" 12
+    check_fixture additional-error additional-error "$additional_error" 12
+    check_fixture missing-statistics incomplete "$missing_statistics" 12
+    check_fixture missing-footer incomplete "$missing_footer" 12
+
+    printf 'SELF-TESTS: %s/7 passed\n' "$((7 - failures))"
+    [[ $failures -eq 0 ]]
+}
+
+if [[ ${1:-} == "--self-test" ]]
+then
+    [[ $# -eq 1 ]] || { echo "--self-test takes no additional arguments" >&2; exit 2; }
+    runner_self_test
+    exit $?
+fi
+
+source ./tlc_temporal_gate.sh
+check_tlc_pin "$JAR" || exit 3
+
 overall=0
 executed=0
 run_id="${MODULE}-$$-$(date +%s%N)"
@@ -94,25 +276,7 @@ do
     rc=$?
     elapsed=$((SECONDS - start))
 
-    result=error
-    if [[ $rc -eq 124 ]]
-    then
-        result=timeout
-    elif grep -qE 'Deadlock reached|Error: Deadlock' "$log"
-    then
-        result=deadlock
-    elif grep -qE 'Parse Error|Error: Parsing|Semantic errors|Parsing or semantic analysis failed' "$log"
-    then
-        result=parse-error
-    elif grep -qE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' "$log"
-    then
-        violated="$(grep -oE '(Invariant|Property|Action property) [A-Za-z0-9_]+ is violated' "$log" \
-            | sed -n '1{s/.* \([A-Za-z0-9_]*\) is violated/\1/p;}')"
-        result="violation:${violated}"
-    elif [[ $rc -eq 0 ]] && grep -q 'No error has been found' "$log"
-    then
-        result=green
-    fi
+    result="$(classify_tlc_result "$log" "$rc")"
 
     stats="$(grep -E '[0-9,]+ states generated, [0-9,]+ distinct states found' "$log" | tail -n 1)"
     generated="$(sed -nE 's/^([0-9,]+) states generated,.*/\1/p' <<<"$stats")"
