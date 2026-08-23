@@ -454,9 +454,9 @@ TEST(CASUploadDetached, S3StagingPromotion)
     EXPECT_EQ(got->bytes, got2->bytes);
 }
 
-/// Condemned-local resurrection: a present body observed condemned via the meta point-read is displaced
-/// by a fresh incarnation streamed from the writer's OWN source (`putOverwrite`), never a read of the
-/// dying object. Outcome `ResurrectedLocal`; the token is refreshed and the meta returns to Clean.
+/// Condemned-local replacement: a present body observed condemned via the metadata point-read is displaced
+/// by a fresh incarnation streamed from the writer's OWN source, never a read of the dying object.
+/// Diagnostics are `Published` + `Condemned` + `Streaming`; the token changes and metadata returns to `Clean`.
 TEST(CASUploadDetached, CondemnedLocalResurrection)
 {
     const RootNamespace ns{"srv1/nsResLocal"};
@@ -512,9 +512,9 @@ TEST(CASUploadDetached, CondemnedLocalResurrection)
     EXPECT_EQ(metaStateAt(*b1, s1->layout(), payload), metaStateAt(*b2, s2->layout(), payload));
 }
 
-/// Condemned-S3 resurrection: a present body observed condemned with an S3 staging source is displaced
-/// by an unconditional server-side copy from the SAME staging object under a fresh-tagged header, never
-/// a read/copy of the condemned blob key. Outcome `ResurrectedS3`.
+/// Condemned-S3 replacement: a present body observed condemned with an S3 staging source is displaced
+/// by an unconditional retagged stream from that writer-owned staging payload, never a read/copy of
+/// the condemned blob key. Diagnostics are `Published` + `Condemned` + `Streaming`.
 TEST(CASUploadDetached, CondemnedS3Resurrection)
 {
     const RootNamespace ns{"srv1/nsResS3"};

@@ -464,7 +464,7 @@ TEST(CASPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
     const UInt128 hash = u128Of(payload);
     const BlobRef id = idOf(payload);
 
-    /// Pre-seed a present body big enough that observeAndAdmit's logical-size guard does not underflow —
+    /// Pre-seed a present body big enough that `ensureBlobPresent`'s logical-size guard does not underflow —
     /// deliberately WITHOUT any meta (unlike PutBlobAdoptsWhenMetaCleanNoRetireView), so the adopt reaches
     /// the `!lm` backfill branch.
     const uint64_t header_len = s->poolMeta().blob_header_len;
@@ -501,7 +501,7 @@ TEST(CASPartWriteTxn, PutBlobAdoptsWhenMetaCleanNoRetireView)
     const BlobRef id = idOf(payload);
     const String blob_key = s->layout().blobKey(id);
 
-    /// Pre-seed a body big enough that observeAndAdmit's logical-size guard (hr.size - header_len)
+    /// Pre-seed a body big enough that `ensureBlobPresent`'s logical-size guard (hr.size - header_len)
     /// does not underflow, plus an INDEPENDENT Clean meta — deliberately NOT via a real putBlob (so the
     /// adopt decision below cannot be riding on THIS task's own fresh-upload meta write).
     const uint64_t header_len = s->poolMeta().blob_header_len;
@@ -541,7 +541,7 @@ TEST(CASPartWriteTxn, AdoptBeforePrecommitFailsClosed)
 
     /// Pre-seed a present body (padded past the pool header so the logical-size guard does not
     /// underflow) + an independent Clean meta, so putBlob's upload conflicts on the present object and
-    /// takes the ADOPT branch of observeAndAdmit — mirroring PutBlobAdoptsWhenMetaCleanNoRetireView.
+    /// takes the observation/adoption branch of `ensureBlobPresent` — mirroring PutBlobAdoptsWhenMetaCleanNoRetireView.
     const uint64_t header_len = s->poolMeta().blob_header_len;
     String raw_body(header_len, '\0');
     raw_body += payload;
@@ -796,7 +796,7 @@ TEST(CASPartWriteTxn, PutBlobRepublishesVanishedBodyFromHeldSource)
 /// exhausts, and that exhaustion must reach putBlob's caller as NETWORK_ERROR.
 TEST(CASPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
 {
-    /// Short budget + zero backoff: keep the test fast. Each of writeResurrectMetaClean's 8 outer
+    /// Short budget + zero backoff: keep the test fast. Each of the metadata reconciliation loop's 8 outer
     /// attempts calls putMetaIfAbsent, which itself retries up to max_attempts times internally —
     /// with max_attempts=1 the controller gives up on the first faulted attempt each time.
     CasRequestBudget budget;
@@ -1585,8 +1585,8 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
                       .size = content.size()}});
     condemnMeta(*b, layout, u128Of(content), /*condemn_round*/ 1);
 
-    /// 3. Open the live Pool and start build B. B dedup-hits the condemned H and re-uploads from
-    ///    source (uploadFromSource via putBlob): a fresh incarnation, a NEW token. B stays ACTIVE for
+    /// 3. Open the live Pool and start build B. B observes condemned H and republishes from
+    ///    its own source through `putBlob`: a fresh incarnation, a NEW token. B stays ACTIVE for
     ///    the whole adversarial loop — its build_seq is never retired below.
     auto s = Pool::open(b, cfg);
     const String blob_key = s->layout().blobKey(h);
@@ -1596,8 +1596,8 @@ TEST(CASPartWriteTxn, ConvergesUnderProductiveGc)
     const ManifestId mid_b = build_b->stageManifest({blobManifestEntry("f", content)});
     build_b->precommitAdd(ns, "part_2", mid_b);
 
-    /// B190: use putBlob (holds source bytes). putBlob detects the condemned dedup hit and calls
-    /// uploadFromSource — no GET of dying object.
+    /// B190: use `putBlob` (holds source bytes). It detects the condemned observation and publishes
+    /// unconditionally — no GET of the dying object.
     const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
     ASSERT_EQ(ref_b.ref, h);
 
@@ -2488,7 +2488,7 @@ TEST(CASPartWrite, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 }
 
 /// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports the
-/// uncertainty and uploadFromSource maps it to NETWORK_ERROR (fix #37 phase 2) -- the same retryable
+/// uncertainty and `ensureBlobPresent` maps it to `NETWORK_ERROR` -- the same retryable
 /// abort class stageManifest and the ref-log lane map their exhausted budgets to. Unlike the OLD
 /// ABORTED mapping, putBlob's bounded condemned-churn loop (8 rounds) does NOT re-drive this: it only
 /// catches ABORTED, so a NETWORK_ERROR escapes on the FIRST attempt -- desirable (no point hammering a

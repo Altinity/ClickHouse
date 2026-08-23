@@ -2067,7 +2067,7 @@ TEST(CASRemountWaits, ALateTouchedTableClosesEveryDeadEpochInBandHoweverItsPrede
     /// ns2's epoch-1 data: never touched again by this incarnation until the final check below, well
     /// after both remounts -- the "table recovered for the first time, late" the fix must not over-seal.
     /// Distinct content from ns1's part: identical payloads collide on the same blob and race
-    /// `PartWriteTxn::observeAndAdmit`'s newborn-debris watermark, unrelated to what this test is about.
+    /// `PartWriteTxn::ensureBlobPresent`'s mandatory observation, unrelated to what this test is about.
     publishPart(store, ns2.string(), "y", "payload-b");
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors

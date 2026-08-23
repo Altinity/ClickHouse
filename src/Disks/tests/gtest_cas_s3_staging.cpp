@@ -282,7 +282,7 @@ DB::Cas::PartWriteTxnPtr startStagingBuild(const DB::Cas::PoolPtr & s, const DB:
 }
 
 /// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE fail-closed check in
-/// `observeAndAdmit` holds), returning the build ready for a `putBlob` promote of `hash`.
+/// `PartWriteTxn::ensureBlobPresent` holds), returning the build ready for `putBlob` on `hash`.
 DB::Cas::PartWriteTxnPtr precommittedBuildFor(
     const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
     const DB::UInt128 & hash, uint64_t blob_size)

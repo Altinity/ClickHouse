@@ -444,7 +444,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// A delete_pending entry recovering in-degree is the expected shape of a dedup-adopt vs
             /// condemn race, not an ack-floor violation: a graduated blob carries NO surviving prior
             /// edges (see the comment on the sentinel emission below), so any edge that resurrects its
-            /// in-degree is necessarily a FRESH this-generation edge -- a writer's `observeAndAdmit`
+            /// in-degree is necessarily a FRESH this-generation edge -- a writer's non-condemned
+            /// observation in `PartWriteTxn::ensureBlobPresent`
             /// point-read of the per-hash meta raced GC's `Condemned` write and adopted the (about to
             /// be deleted) token instead of resurrecting from source. Spare it LOUDLY (never a
             /// fail-closed abort, never a delete of a re-referenced blob), but at Debug: this is a

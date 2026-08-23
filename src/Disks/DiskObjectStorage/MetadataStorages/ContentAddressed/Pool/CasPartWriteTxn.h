@@ -327,7 +327,7 @@ public:
 private:
     /// Keyed on the full `BlobRef` pair (algorithm + digest), because a bare digest is not a blob identity.
     /// This remains an ordered `std::map` (not `unordered_map`): `BlobRef` already provides `operator<=>`, so
-    /// no hasher is needed here. `BlobRefHash` is for unordered dedup-cache/set consumers elsewhere. The
+    /// no hasher is needed here. `BlobRefHash` is for unordered-set consumers elsewhere. The
     /// dependencies are blob-only, so `ObjectKind` is not part of the key.
     using DepKey = BlobRef;
 

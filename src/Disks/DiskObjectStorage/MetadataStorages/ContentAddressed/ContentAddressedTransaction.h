@@ -252,7 +252,7 @@ struct BlobUploadFanoutHooksForTest
     /// destructor drains every already-scheduled task before the stack unwinds).
     std::function<void(const BlobRef &)> on_dispatch;
     /// Invoked at the TOP of each pool task (on the pool thread) BEFORE `uploadBlobDetached`, with the
-    /// task's `BlobRef`. Lets a test rendezvous tasks on a latch (concurrent dedup-cache insertion, pool
+    /// task's `BlobRef`. Lets a test rendezvous publication tasks on a latch (shared-source state, pool
     /// saturation) or fail a specific task deterministically, all without a sleep.
     std::function<void(const BlobRef &)> in_task;
     /// Invoked on the DISPATCH thread immediately AFTER a task has been scheduled AND recorded in the

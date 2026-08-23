@@ -424,7 +424,7 @@ TEST(CASGCRetire, SpareLeavesMetaCondemned)
     }
 
     /// Only a WRITER re-publishes Clean, and only by displacing the body with a fresh incarnation token:
-    /// a dedup-attempt on the condemned hash resurrects (uploadFromSource) — the body token CHANGES and
+    /// a materialization attempt on the condemned hash republishes the writer's source — the body token CHANGES and
     /// the meta flips to Clean WITH that token change.
     const RootNamespace writer_ns{"00/spare-writer@cas@"};
     auto ref_w = publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
@@ -492,7 +492,7 @@ TEST(CASGCRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     }
 
     /// A writer dedup-hits h. It point-reads Condemned and RESURRECTS to a fresh token t2
-    /// (uploadFromSource) — it never reuses t1.
+    /// from the writer's own source — it never reuses t1.
     const RootNamespace writer_ns{"00/redelete-writer@cas@"};
     publishBlobWithDurablePrecommit(store, writer_ns, "writer", id, payload);
     const Token t2 = backend->head(blob_key).token;

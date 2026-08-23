@@ -107,7 +107,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
 /// token is confirmed deleted/absent (`deleteConfirmedMeta`), but it NEVER transitions `Condemned ->
 /// Clean` on a spare. The SOLE `-> Clean` transition is a WRITER that has already displaced the body with
-/// a fresh incarnation token (`PartWriteTxn::uploadFromSource` + `writeResurrectMetaClean`). Rationale: a deposed leader that cleared a
+/// a fresh incarnation token (`PartWriteTxn::ensureBlobPresent` publication + metadata reconciliation). Rationale: a deposed leader that cleared a
 /// spare's meta then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body;
 /// a writer reading `Clean` would reuse the exact condemned token, which a stale pre-CAS exact-token
 /// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token
@@ -904,12 +904,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
             /// but the meta stays `Condemned` (conservative marker) until a WRITER displaces the body with
-            /// a fresh incarnation token (`uploadFromSource` + `writeResurrectMetaClean`) — the SOLE
+            /// a fresh incarnation token (unconditional publication + metadata reconciliation in
+            /// `PartWriteTxn::ensureBlobPresent`) — the SOLE
             /// `Condemned -> Clean` transition. Clearing here on a
             /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
             /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
             /// The next `putBlob` self-heals
-            /// the marker: `observeAndAdmit` refuses same-token adoption on `Condemned` and resurrects.
+            /// the marker: `PartWriteTxn::ensureBlobPresent` refuses adoption on `Condemned` and
+            /// publishes the writer's source under a fresh envelope.
             /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
             forgetCondemnMarker(entry.ref, entry.token);
         }

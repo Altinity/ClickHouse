@@ -2401,7 +2401,7 @@ TEST(CASWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 /// from a COMMITTED source part (the source is NOT staged in this transaction), it takes the
 /// adoptFromTree -> adoptEvidence branch — a TOKENLESS W-EVIDENCE dep with NO eager HEAD on the
 /// adopted blob. The regression this guards is reverting adoptEvidence to a reuseBlob(false) (or any
-/// observeAndAdmit) that HEADs the adopted blob during staging, before any precommit protection
+/// `ensureBlobPresent`) that HEADs a materialized blob during staging, before any precommit protection
 /// exists. The own-content gate in NoContentPoolOpBeforePrecommit CANNOT catch this: the adopted blob
 /// is FOREIGN (owned by the live source part, never written by this transaction), so it is absent from
 /// own_content_keys. This test asserts a TARGETED invariant on that exact foreign blob key: no
@@ -2458,7 +2458,8 @@ TEST(CASWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 
     /// TARGETED assertion: the adopted (foreign, committed) blob key must NOT be touched by ANY op
     /// (HEAD via exists/getObjectMetadata, GET via readObject, or PUT via writeObject) before the
-    /// precommit write. With the bug reintroduced, adoptEvidence -> reuseBlob -> observeAndAdmit would
+    /// precommit write. With the bug reintroduced, `adoptEvidence` would route through physical
+    /// materialization and `ensureBlobPresent`, which would
     /// HEAD this exact key during staging at an index < first_precommit_idx, failing here.
     bool adopted_blob_touched_before_precommit = false;
     for (int i = 0; i < first_precommit_idx; ++i)
@@ -2586,7 +2587,7 @@ TEST(CASWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 
     /// The source BLOB key must NOT be accessed (HEAD via exists/getObjectMetadata, GET via readObject,
     /// or PUT via writeObject) before the precommit write. With an eager adopt-by-HEAD on the source
-    /// blob (the regression), observeAndAdmit HEADs the blob key at an index < first_precommit_idx,
+    /// blob (the regression), `ensureBlobPresent` HEADs the blob key at an index < first_precommit_idx,
     /// failing here. `TrustedManifest` evidence touches nothing.
     bool blob_touched_before_precommit = false;
     for (int i = 0; i < first_precommit_idx; ++i)

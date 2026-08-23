@@ -107,7 +107,7 @@ TEST(GCSConditionalDialect, ConditionalCompleteMultipartUploadThrows)
 {
     /// GCS silently IGNORES preconditions on CompleteMultipartUpload (measured live 2026-07-03) --
     /// sending one would be silent data loss, so this fails closed client-side with a LOGICAL_ERROR:
-    /// token-producing writes force a single PUT, so reaching here is a wiring break. Aborts under
+    /// genuine mutable conditional writes force a single PUT, so reaching here is a wiring break. Aborts under
     /// abort_on_logical_error -- see the DeathTest below.
     auto r = makeRequest("https://storage.googleapis.com/b/k?uploadId=abc", Aws::Http::HttpMethod::HTTP_POST);
     r.SetHeaderValue("if-none-match", "*");
