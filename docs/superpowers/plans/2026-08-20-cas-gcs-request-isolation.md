@@ -11,6 +11,14 @@ doc_type: 'reference'
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Blob-publication supersession (2026-08-23).** This plan is superseded for blob-body publication
+by the [unconditional-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
+and [implementation plan](/superpowers/plans/cas-unconditional-blob-publication). Its typed
+`NativeConditional` request isolation remains authoritative only for conditional non-blob
+create-if-absent and replacement writes, native-token `HEAD`, and exact deletion. Blob-body
+PUT/copy and their single-`PUT` cap below are historical steps and must not be implemented as the
+current body-publication contract.
+
 **Goal:** Preserve the exact public configuration and ordinary ETag behavior of every non-CAS GCS authentication path while giving explicitly marked CAS requests exact GCS generation semantics.
 
 **Architecture:** Carry a backend-neutral `NativeConditional` bit from CAS through ClickHouse's existing AWS request wrapper into a typed `ExtendedHttpRequest`; derive it anew in `Client::BuildHttpRequest` on every SDK attempt. The OAuth and dedicated GOOG4 clients adapt generation preconditions, metadata, and response tokens only when that typed bit is set, while retry policy, authentication, and ordinary request behavior remain independent.

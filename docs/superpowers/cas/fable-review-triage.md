@@ -8,6 +8,13 @@
 прошедшие с обзора недели уехали rev.8 disk-lifecycle (17/17), writepath stage-1 (14/14),
 TXN-ONE-PIPELINE, ack-floor GC и прочее, поэтому часть выводов устарела.
 
+**Исторический снимок (2026-08-23).** Этот файл заморожен как аудит указанного выше диапазона и
+датированного HEAD. Старые helper-методы, настройки и conditional blob publication внутри него —
+исторические свидетельства, не current implementation guidance. Текущий контракт задают
+[спецификация](/superpowers/specs/cas-unconditional-blob-publication-design),
+[план реализации](/superpowers/plans/cas-unconditional-blob-publication),
+[live backlog](/superpowers/cas/backlog) и [операторская документация](/antalya/cas).
+
 Статусы: **исправлено** (было реально, закрыто — с коммитом) · **подтверждено** (всё ещё на HEAD) ·
 **частично** (закрыта часть) · **не подтвердилось** (при перепроверке оказалось неверным) ·
 **by-design** (осознанная позиция). Приоритет: P1 (до релиза) · P2 · P3 · — .

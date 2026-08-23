@@ -9,6 +9,13 @@
 землю, что уже разобранный пункт `fable-review-triage.md` или `2031-triage.md`, ставится
 **дубликат** со ссылкой — заново не выводим.
 
+**Исторический снимок (2026-08-23).** Этот файл заморожен как аудит указанного выше диапазона и
+датированного HEAD. Старые helper-методы, настройки и conditional blob publication внутри него —
+исторические свидетельства, не current implementation guidance. Текущий контракт задают
+[спецификация](/superpowers/specs/cas-unconditional-blob-publication-design),
+[план реализации](/superpowers/plans/cas-unconditional-blob-publication),
+[live backlog](/superpowers/cas/backlog) и [операторская документация](/antalya/cas).
+
 Статусы: **исправлено** · **подтверждено** · **частично** · **не подтвердилось** · **by-design** ·
 **дубликат**. Приоритет: P1 (до релиза) · P2 · P3 · — .
 
