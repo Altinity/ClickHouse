@@ -175,8 +175,8 @@ MountLease decodeMountLease(std::string_view data)
         }
         else r.skipUnknown(key);
     }
-    if (!saw_su || !saw_we || !saw_write_attempt_id)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing identity field");
+    if (!saw_su || !saw_we || !saw_write_attempt_id || m.write_attempt_id == UInt128{})
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing or zero identity field");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: trailing bytes");
     return m;

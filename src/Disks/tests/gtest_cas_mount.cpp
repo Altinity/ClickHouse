@@ -139,6 +139,7 @@ TEST(CASServerRoot, KeysAndCodecsRoundTrip)
         m.started_at_ms = 1700000000000ULL;
         m.seq = 99;
         m.expires_at_ms = 1700000030000ULL;
+        m.write_attempt_id = UInt128{1};
         const MountLease back = decodeMountLease(encodeMountLease(m));
         EXPECT_EQ(back.server_uuid, m.server_uuid);
         EXPECT_EQ(back.writer_epoch, m.writer_epoch);
@@ -1066,6 +1067,7 @@ TEST(CASMountLease, BodyCarriesFloorAndFence)
     m.expires_at_ms = 2000;
     m.min_active = 5;
     m.gc_fenced = true;
+    m.write_attempt_id = UInt128{1};
     const MountLease d = decodeMountLease(encodeMountLease(m));
     EXPECT_EQ(d.min_active, 5u);
     EXPECT_TRUE(d.gc_fenced);
@@ -1076,6 +1078,7 @@ TEST(CASMountLease, RetiredSentinelRoundTrips)
 {
     MountLease m;
     m.min_active = std::numeric_limits<uint64_t>::max();
+    m.write_attempt_id = UInt128{1};
     EXPECT_EQ(decodeMountLease(encodeMountLease(m)).min_active,
               std::numeric_limits<uint64_t>::max());
 }
@@ -1108,6 +1111,7 @@ MountLease seedMount(
     m.expires_at_ms = expires_at_ms;
     m.min_active = min_active;
     m.gc_fenced = gc_fenced;
+    m.write_attempt_id = UInt128{1};
     b.putIfAbsent(l.mountKey(srid), encodeMountLease(m));
     return m;
 }

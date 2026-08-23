@@ -89,8 +89,8 @@ ServerEpoch decodeServerEpoch(std::string_view data);
 String encodeMountLease(const MountLease & m);
 
 /// Decode a mount lease and reject bytes after its body line. The reader accepts unknown JSON fields
-/// so newer lease metadata can be read by older code, while malformed field values, a missing required
-/// identity field, and trailing data throw `CORRUPTED_DATA`; cross-field lease validity is enforced by
+/// so newer lease metadata can be read by older code, while malformed field values, a missing or zero
+/// required identity field, and trailing data throw `CORRUPTED_DATA`; cross-field lease validity is enforced by
 /// the mount/GC protocol, not here.
 MountLease decodeMountLease(std::string_view data);
 

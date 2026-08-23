@@ -98,6 +98,23 @@ TEST(CASMountLeaseFormat, WriteAttemptIdIsRequiredAndCanonical)
     }
 }
 
+TEST(CASMountLeaseFormat, ZeroWriteAttemptIdIsRejected)
+{
+    const String data = currentFormatHeader("cas_mount_lease") +
+        "{\"su\":\"0123456789abcdeffedcba9876543210\",\"we\":\"7\",\"hn\":\"\",\"pid\":0,"
+        "\"sat\":0,\"seq\":\"0\",\"eat\":0,\"ma\":\"0\",\"fen\":false,"
+        "\"write_attempt_id\":\"00000000000000000000000000000000\"}\n";
+    try
+    {
+        decodeMountLease(data);
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
 TEST(CASMountLeaseFormat, UnknownFieldsRemainTolerated)
 {
     MountLease m;
