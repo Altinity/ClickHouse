@@ -18,8 +18,9 @@ Two things in particular can only be settled here:
 
 ## Gating
 
-Every group is opt-in through environment variables and skips cleanly when they are absent. This
-suite touches a real bucket and issues real, billable requests, so it must never run by default.
+Every live group is opt-in through environment variables and skips cleanly when they are absent.
+The two credential-free helper regressions run by default, but they use only local files and a
+synthetic query result. No test that touches a real bucket or issues billable requests runs by default.
 
   - `GCS_LIVE_BUCKET`             — required for any group. A bucket the caller is willing to have
                                     objects created and deleted in.
@@ -117,6 +118,7 @@ So the outbound header set stays with the unit tests. What is left for this gate
 acceptance is the part a unit test structurally cannot reach.
 """
 
+import hashlib
 import html
 import json
 import os
@@ -130,7 +132,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from helpers.cluster import ClickHouseCluster
+from helpers.cluster import ClickHouseCluster, ClickHouseInstance
 
 BUCKET = os.environ.get("GCS_LIVE_BUCKET", "")
 BASE_PREFIX = os.environ.get("GCS_LIVE_PREFIX", "clickhouse-gcs-live-gate")
@@ -220,11 +222,7 @@ AMBIGUITY_SUBPREFIX = {
 # either a normal one-shot PUT or ordinary multipart; mutable CAS objects keep this ceiling.
 FORMER_CONDITIONAL_PUT_CAP = 5 * 1024 * 1024
 LIVE_LARGE_VALUE_ITEMS = 400000
-
-pytestmark = pytest.mark.skipif(
-    not BUCKET,
-    reason="live GCS gate: set GCS_LIVE_BUCKET (and the per-group credential variables) to run it",
-)
+BATCH_DELETE_LOG_PATTERN = r"Objects with paths \["
 
 cluster = ClickHouseCluster(__file__)
 
@@ -459,6 +457,10 @@ def _configured_cas_disks():
 
 @pytest.fixture(scope="module", autouse=True)
 def start_cluster():
+    if not (HMAC_AVAILABLE or OAUTH_AVAILABLE):
+        yield cluster
+        return
+
     configs_dir = os.path.join(os.path.dirname(__file__), "configs")
     os.makedirs(configs_dir, exist_ok=True)
     config_path = os.path.join(configs_dir, "live_gcs_generated.xml")
@@ -526,13 +528,45 @@ def _create(node, disk, table=None):
     return table
 
 
-def _cas_tokens(node, disk):
-    """Every non-empty incarnation token `system.cas_log` recorded for this disk."""
+def _opaque_generation_evidence(node, query):
+    """Keep raw generations in a hidden frame and return only domain evidence plus one-way digests."""
+    __tracebackhide__ = True
     node.query("SYSTEM FLUSH LOGS")
-    raw = node.query("SELECT DISTINCT token FROM system.cas_log WHERE disk_name = '{}' AND token != '' FORMAT TSV".format(disk))
-    # The transport quotes a generation, and `tokenForHead` is what strips that syntax; strip it here
-    # too so the digit check below is about the token's DOMAIN and not about its quoting.
-    return [line.strip().strip('"') for line in raw.strip().splitlines() if line.strip()]
+    raw = node.query(query)
+    generations = [line.strip().strip('"') for line in raw.strip().splitlines() if line.strip()]
+    return (
+        len(generations),
+        bool(generations) and all(generation.isdigit() for generation in generations),
+        tuple(hashlib.sha256(generation.encode("utf-8")).hexdigest() for generation in generations),
+    )
+
+
+def _cas_generation_domain(node, disk):
+    """Whether this disk recorded generations and every recorded value belongs to the numeric domain."""
+    __tracebackhide__ = True
+    count, all_numeric, _digests = _opaque_generation_evidence(
+        node,
+        "SELECT DISTINCT token FROM system.cas_log WHERE disk_name = '{}' AND token != '' FORMAT TSV".format(disk),
+    )
+    return count > 0, all_numeric
+
+
+def _cas_event_generation_evidence(node, disk, object_hash, event_type, outcome=""):
+    """Return count, numeric-domain evidence, and an opaque digest for one CAS event generation."""
+    __tracebackhide__ = True
+    clauses = [
+        "disk_name = '{}'".format(disk),
+        "object_hash = '{}'".format(object_hash),
+        "event_type = '{}'".format(event_type),
+        "token != ''",
+    ]
+    if outcome:
+        clauses.append("outcome = '{}'".format(outcome))
+    count, all_numeric, digests = _opaque_generation_evidence(
+        node,
+        "SELECT token FROM system.cas_log WHERE {} ORDER BY event_time_microseconds FORMAT TSV".format(" AND ".join(clauses)),
+    )
+    return count, all_numeric, digests[0] if count == 1 else ""
 
 
 def _query_id(scenario, auth_mode):
@@ -541,6 +575,7 @@ def _query_id(scenario, auth_mode):
 
 def _cas_events(node, disk, query_id="", event_types=(), object_hash=""):
     """Return attributable CAS events without ever reading configuration or authentication data."""
+    __tracebackhide__ = True
     node.query("SYSTEM FLUSH LOGS")
     clauses = ["disk_name = '{}'".format(disk)]
     if query_id:
@@ -549,8 +584,19 @@ def _cas_events(node, disk, query_id="", event_types=(), object_hash=""):
         clauses.append("event_type IN ({})".format(", ".join("'{}'".format(event_type) for event_type in event_types)))
     if object_hash:
         clauses.append("object_hash = '{}'".format(object_hash))
-    raw = node.query("SELECT event_type, object_hash, token, outcome, detail FROM system.cas_log WHERE {} ORDER BY event_time_microseconds FORMAT JSONEachRow".format(" AND ".join(clauses)))
-    return [json.loads(line) for line in raw.splitlines() if line]
+    raw = node.query("SELECT event_type, object_hash, outcome, detail FROM system.cas_log WHERE {} ORDER BY event_time_microseconds FORMAT JSONEachRow".format(" AND ".join(clauses)))
+    events = [json.loads(line) for line in raw.splitlines() if line]
+    for event in events:
+        event.pop("token", None)
+    return events
+
+
+def _ordinary_etag_domain(node, probe):
+    """Keep raw ETags hidden and report only whether observed values remain ordinary and non-empty."""
+    __tracebackhide__ = True
+    lines = node.grep_in_log("{} |".format(probe))
+    values = [line.rsplit("|", 1)[1].strip().strip('"') for line in lines.splitlines() if "|" in line]
+    return bool(lines), bool(values), bool(values) and all(value and not value.isdigit() for value in values)
 
 
 def _query_profile_events(node, query_id, names):
@@ -806,7 +852,7 @@ def test_default_gcs_client_accepts_the_ordinary_object_storage_operation_set(au
     # Filtered to this test's own key prefix: the log carries every disk's traffic, and the CAS disks
     # in this configuration delete objects too, so an unfiltered match would be the same
     # someone-else's-traffic confound the module docstring warns about for counters.
-    batch_lines = [line for line in node.grep_in_log("Objects with paths [").splitlines() if PREFIX in line and path_fragment in line]
+    batch_lines = [line for line in node.grep_in_log(BATCH_DELETE_LOG_PATTERN).splitlines() if PREFIX in line and path_fragment in line]
     assert batch_lines, "no batch delete was logged for this run's own keys, so GCS acceptance of the batch DeleteObjects shape is unproven"
     assert not node.grep_in_log("DeleteObjects is not supported"), (
         "GCS refused the batch DeleteObjects shape and ClickHouse fell back to singular deletes; the counter and the row counts cannot see this, which is why it is asserted here"
@@ -920,15 +966,12 @@ def test_default_gcs_client_parquet_metadata_cache_keys_on_the_ordinary_etag(aut
     after_warm = _events(node, events)
     assert after_warm["ParquetMetadataCacheHits"] > after_cold["ParquetMetadataCacheHits"], "the second read of an unchanged object missed the cache, so the key is not stable"
 
-    # The key's own ETag component, read off the cache's log line: `cache miss <path> | <etag>`.
-    lines = node.grep_in_log("{} |".format(probe))
-    assert lines, "the cache logged no key for this object, so the value below cannot be checked"
-    etags = {line.rsplit("|", 1)[1].strip() for line in lines.splitlines() if "|" in line}
-    assert etags, lines
-    for etag in etags:
-        value = etag.strip('"')
-        assert value, "the Parquet cache key carried an EMPTY etag: {!r}".format(etag)
-        assert not value.isdigit(), "a numeric generation reached the Parquet metadata cache key: {!r}. On this path the value must be the ordinary ETag".format(etag)
+    # The key's own ETag component comes from `cache miss <path> | <etag>`. Raw provider values stay
+    # inside a traceback-hidden helper so a domain failure cannot disclose one through `--showlocals`.
+    cache_key_logged, etag_observed, ordinary_etag_domain = _ordinary_etag_domain(node, probe)
+    assert cache_key_logged, "the cache logged no key for this object, so the ETag domain cannot be checked"
+    assert etag_observed, "the cache key carried no observable ETag"
+    assert ordinary_etag_domain, "the cache key ETag was empty or entered the numeric generation domain"
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -955,12 +998,9 @@ def _run_cas_group(disk):
     node.query("ALTER TABLE {} DROP PARTITION tuple()".format(table))
     assert int(node.query("SELECT count() FROM {}".format(table))) == 0
 
-    tokens = _cas_tokens(node, disk)
-    assert tokens, "no incarnation token was recorded, so the token assertion below is vacuous"
-    for token in tokens:
-        assert token.isdigit(), "CAS recorded a non-numeric incarnation token {!r} on {}: the response carried an ETag where the generation adapter should have supplied a generation".format(
-            token, disk
-        )
+    generations_seen, numeric_generation_domain = _cas_generation_domain(node, disk)
+    assert generations_seen, "no incarnation generation was recorded, so the domain assertion is vacuous"
+    assert numeric_generation_domain, "a CAS incarnation left the numeric GCS generation domain"
 
 
 @requires_oauth
@@ -1188,6 +1228,75 @@ def test_live_cas_native_staged_copy_is_first_absent_publication(auth_mode, stag
     node.query("DROP TABLE {} SYNC".format(table))
 
 
+def test_batch_delete_log_pattern_matches_literal_prefix_via_grep_in_log(tmp_path):
+    """The ordinary batch-delete matcher must survive `grep_in_log`'s regex-mode `zgrep`."""
+    representative = "Objects with paths [/bucket/prefix/plain/a] were removed from S3"
+    absent = "Object with path /bucket/prefix/plain/a was removed from S3"
+    (tmp_path / "batch.log").write_text(representative + "\n", encoding="utf-8")
+    (tmp_path / "absent.log").write_text(absent + "\n", encoding="utf-8")
+
+    instance = object.__new__(ClickHouseInstance)
+    instance.logs_dir = str(tmp_path)
+
+    matched = instance.grep_in_log(
+        BATCH_DELETE_LOG_PATTERN,
+        from_host=True,
+        filename="batch.log",
+        only_latest=True,
+    )
+    missing = instance.grep_in_log(
+        BATCH_DELETE_LOG_PATTERN,
+        from_host=True,
+        filename="absent.log",
+        only_latest=True,
+    )
+    assert matched.strip() == representative
+    assert missing == ""
+
+
+def test_generation_evidence_does_not_cross_the_test_frame_boundary():
+    """CAS generations stay inside traceback-hidden helpers; callers receive redacted evidence."""
+
+    class GenerationEvidenceProbeNode:
+        def query(self, query):
+            if "FORMAT JSONEachRow" in query:
+                return '{"event_type":"blob_retire","object_hash":"probe-hash","token":"0","outcome":"pending","detail":{}}\n'
+            return '"0"\n'
+
+    node = GenerationEvidenceProbeNode()
+    events = _cas_events(
+        node,
+        "probe-disk",
+        event_types=("blob_retire",),
+        object_hash="probe-hash",
+    )
+    assert events == [
+        {
+            "event_type": "blob_retire",
+            "object_hash": "probe-hash",
+            "outcome": "pending",
+            "detail": {},
+        }
+    ]
+
+    seen, all_numeric = _cas_generation_domain(node, "probe-disk")
+    assert seen is True
+    assert all_numeric is True
+
+    count, numeric, generation_digest = _cas_event_generation_evidence(
+        node,
+        "probe-disk",
+        "probe-hash",
+        "blob_retire",
+        outcome="pending",
+    )
+    assert count == 1
+    assert numeric is True
+    assert len(generation_digest) == 64
+    assert all(character in string.hexdigits for character in generation_digest)
+    assert not any(value == "0" or '"token":"0"' in repr(value) for value in locals().values()), "a raw generation reached the focused test frame"
+
+
 @pytest.mark.parametrize("auth_mode,staged_disk", CAS_STAGED_CASES)
 def test_live_cas_condemned_staged_source_retags_by_streaming(auth_mode, staged_disk):
     """A staged payload observed as `Condemned` gets a new streaming envelope."""
@@ -1207,9 +1316,16 @@ def test_live_cas_condemned_staged_source_retags_by_streaming(auth_mode, staged_
     assert target["detail"].get("transport") == "server_side_copy"
     node.query("DROP TABLE {} SYNC".format(first_table))
 
-    retired = _gc_until(node, staged_disk, target_hash, "blob_retire")
-    retired_token = retired["token"].strip('"')
-    assert retired_token.isdigit(), "the retired GCS incarnation was not a generation"
+    _gc_until(node, staged_disk, target_hash, "blob_retire")
+    retired_count, retired_numeric, retired_generation_digest = _cas_event_generation_evidence(
+        node,
+        staged_disk,
+        target_hash,
+        "blob_retire",
+    )
+    assert retired_count == 1, "the target did not record exactly one retirement generation"
+    assert retired_numeric, "the retired incarnation left the numeric GCS generation domain"
+    assert retired_generation_digest, "the retired incarnation produced no opaque generation evidence"
 
     _create_payload_table(node, second_table, staged_disk)
     retag_query_id = _query_id("condemned_retag", auth_mode)
@@ -1268,9 +1384,16 @@ def test_live_cas_queued_old_token_delete_misses_retagged_replacement(auth_mode,
     assert target["detail"].get("transport") == "server_side_copy"
     node.query("DROP TABLE {} SYNC".format(first_table))
 
-    retired = _gc_until(node, ambiguity_disk, target_hash, "blob_retire")
-    retired_token = retired["token"].strip('"')
-    assert retired_token.isdigit(), "the queued GCS incarnation was not a generation"
+    _gc_until(node, ambiguity_disk, target_hash, "blob_retire")
+    retired_count, retired_numeric, retired_generation_digest = _cas_event_generation_evidence(
+        node,
+        ambiguity_disk,
+        target_hash,
+        "blob_retire",
+    )
+    assert retired_count == 1, "the queued target did not record exactly one retirement generation"
+    assert retired_numeric, "the queued incarnation left the numeric GCS generation domain"
+    assert retired_generation_digest, "the queued incarnation produced no opaque generation evidence"
     _gc_until(
         node,
         ambiguity_disk,
@@ -1324,7 +1447,16 @@ def test_live_cas_queued_old_token_delete_misses_retagged_replacement(auth_mode,
     )
     replaced = [event for event in delete_events if event["outcome"] == "replaced"]
     assert len(replaced) == 1, "the released old exact delete did not miss the replacement"
-    assert replaced[0]["token"].strip('"') == retired_token, "the released delete did not carry the generation captured at retirement"
+    replaced_count, replaced_numeric, replaced_generation_digest = _cas_event_generation_evidence(
+        node,
+        ambiguity_disk,
+        target_hash,
+        "blob_delete",
+        outcome="replaced",
+    )
+    assert replaced_count == 1, "the replaced delete did not record exactly one generation"
+    assert replaced_numeric, "the replaced delete left the numeric GCS generation domain"
+    assert replaced_generation_digest == retired_generation_digest, "the released delete did not carry the generation captured at retirement"
 
     result = _ambiguity_driver_request("/v1/queued-old-delete/result", {"scenario_id": scenario_id})
     for phase in (

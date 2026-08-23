@@ -13,11 +13,11 @@ doc_type: 'reference'
 
 Implementation status is `DONE_WITH_CONCERNS`; release readiness is **blocked**.
 
-The real Google Cloud Storage gate collected every required case, but no Google credential source was
-available and all 25 cases skipped. Therefore this run contains no evidence that Google accepted the
-new live request shapes. The AWS-compatible CAS lane passed both cases. The ordinary S3 lane was
-blocked during fixture setup because its historical ClickHouse image is unavailable; its partial
-result is not green.
+The real Google Cloud Storage gate collected every required live case, but no Google credential
+source was available and all 25 live cases skipped. Two credential-free evidence-safety regressions
+passed. Therefore this run contains no evidence that Google accepted the new live request shapes.
+The AWS-compatible CAS lane passed both cases. The ordinary S3 lane was blocked during fixture setup
+because its historical ClickHouse image is unavailable; its partial result is not green.
 
 Deterministic fake-GCS evidence remains useful for syntax and request classification, but it is not a
 substitute for this missing provider acceptance.
@@ -40,6 +40,19 @@ substitute for this missing provider acceptance.
 
 Only presence or absence was inspected. No credential, authorization token, access key, secret, or
 configuration value is included in this document or in the test output inspected for this result.
+
+## Credential-free evidence hardening {#credential-free-evidence-hardening}
+
+Two local regressions now run without a bucket or credential source. The first exercises the actual
+regex-mode `ClickHouseInstance.grep_in_log` path with a representative batch-DELETE line and requires
+both a literal-prefix match and rejection of an absent prefix. The production matcher escapes the
+opening bracket in `Objects with paths [` so `zgrep` cannot reject it as an invalid expression.
+
+The second injects a synthetic numeric generation through the CAS-log helper boundary. Raw
+generation and ordinary ETag values stay inside helpers marked with `__tracebackhide__`; live test
+frames receive only domain booleans and SHA-256 digests. CAS event dictionaries returned to tests do
+not contain `token`, and assertion messages contain no raw provider value. This matters because the
+Praktika pytest runner enables `--showlocals`.
 
 ## Implemented live scenario inventory {#implemented-live-scenario-inventory}
 
@@ -119,7 +132,8 @@ The ordinary real-GCS matrix retains the pre-change `Default` contract for both 
 
 The CAS baseline separately requires every non-empty recorded incarnation token to be numeric, which
 characterizes the GCS generation domain. The ordinary metadata-cache assertion requires a non-numeric
-ETag. Because all live cases skipped, neither value-domain observation was made in this run.
+ETag. Those checks retain only booleans or opaque one-way digests outside traceback-hidden helpers.
+Because all live cases skipped, neither provider value-domain observation was made in this run.
 
 Outbound headers remain encrypted on the public endpoint and are not logged by this fixture. The
 deterministic request-object tests pin the exact header partition; this lane's distinct responsibility
@@ -131,9 +145,9 @@ The lanes ran strictly sequentially and retained `ci/tmp`.
 
 | Lane | Praktika job | Pytest runtime | Counts | Skips | Result |
 |---|---|---:|---|---|---|
-| `test_gcs_live` | `Integration tests (amd_tsan, 1/6)` | 1.14 s | 0 passed, 0 failed, 25 skipped | 11 `gcs_hmac` credential; 10 `gcp_oauth` credential; 4 TLS fault-driver prerequisites | **Blocked: no live GCS acceptance** |
-| `test_cas_s3` | `Integration tests (amd_tsan, 1/6)` | 31.70 s | 2 passed, 0 failed | 0 | Passed |
-| `test_storage_s3` | `Integration tests (amd_tsan, 1/6)` | 94.40 s | 9 passed, 81 setup errors | 0 | **External image blocker** |
+| `test_gcs_live` | `Integration tests (amd_tsan, 1/6)` | 1.19 s | 2 passed, 0 failed, 25 skipped | 11 `gcs_hmac` credential; 10 `gcp_oauth` credential; 4 TLS fault-driver prerequisites | **Credential-free regressions passed; blocked: no live GCS acceptance** |
+| `test_cas_s3` | `Integration tests (amd_tsan, 1/6)` | 27.51 s | 2 passed, 0 failed | 0 | Passed |
+| `test_storage_s3` | `Integration tests (amd_tsan, 1/6)` | 94.46 s | 9 passed, 81 setup errors | 0 | **External image blocker** |
 
 Commands and retained logs:
 
