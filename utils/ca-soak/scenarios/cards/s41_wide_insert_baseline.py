@@ -1,24 +1,28 @@
-"""S41 wide-insert write-path baseline (P1).
+"""S41 CAS write-path performance measurement (P1).
 
-Establishes the CAS-on-S3 WRITE-PATH performance baseline for a wide insert and produces a measured
-bottleneck diagnosis. The workload is one big INSERT into a WIDE MergeTree table with 30 mixed-type
-columns partitioned into many partitions, so a single insert commits ~one part per partition — many
-parts x 30 columns => thousands of blobs through the serial commit path. This is the exact shape the
-write-path stage-1 design targets, and this card is the measurement that gates it.
+Measures the CAS-on-S3 write path with both a lone one-part insert and the established wide insert.
+The wide workload uses one big `INSERT` into a `Wide` `MergeTree` table with 30 mixed-type columns
+partitioned into many partitions, so a single insert commits about one part per partition and sends
+thousands of blobs through the commit path.
 
-Two legs on the SAME node, identical DDL + identical deterministic INSERT:
+Every workload runs on the same node with deterministic input under both policies:
 
-- `s3plain` policy (the standard `metadata_type=local` S3 disk) — the comparison baseline.
-- `ca` policy (content-addressed over the same RustFS) — the disk under test.
+- `s3plain` (the standard `metadata_type=local` S3 disk) is the comparison control;
+- `ca` (content addressed over the same RustFS endpoint) is the disk under test.
 
-Both measured inserts run with the Real AND CPU query profilers enabled at a fine period, so
-`system.trace_log` for the insert's `query_id` gives thousands of stacks. Real-vs-CPU divergence is
-the single-threaded-blob-upload detector: if wall time concentrates in one thread blocked on
-sequential PUT/HEAD network waits (Real) while CPU stays low, the standing hypothesis is confirmed.
+All measured inserts run with the Real and CPU query profilers enabled at a fine period, so
+`system.trace_log` for each insert's `query_id` provides attributed stacks. Real-versus-CPU
+divergence shows whether wall time is concentrated in network waits while CPU remains low.
 
-The report answers, with numbers: (a) CA-vs-plain slowdown factor; (b) top write-path cost centers
-with % attribution from trace_log; (c) is single-threaded blob upload the dominant bottleneck; (d)
-the HEAD-before-PUT dedup-gate share; (e) the S3 op budget (PUT/HEAD/GET per part and per GiB).
+The card retains the 30-column throughput workload and adds a one-column, one-part workload whose
+small blobs expose the latency of the mandatory blob `HEAD`. Each workload runs a fresh insert and
+an identical second insert on both plain S3 and CAS. The CAS pair therefore separates fresh body
+publication from duplicate adoption while the plain pair controls for ordinary second-run warmth.
+
+The report records wall and query duration, per-leg peak resident memory, exact logical blob-body
+and metadata request classes, physical S3 operations, and per-part/per-GiB request rates. Protocol
+verdicts fail if a fresh blob does not issue exactly one `HEAD`, if a common-path fresh blob reads
+metadata before publication, or if an identical duplicate republishes its body.
 
 ISOLATION: this card runs on the isolated single-node `ca-s41` compose project (compose_variant
 "s41"). On a host where the shared `ca-soak` soak stack is running, it MUST be driven with
@@ -30,12 +34,13 @@ CA_SOAK_FSCK_CONTAINER=ca-s41-ch1-1). See docker-compose-s41.yml / configs/stora
 
 import time
 
-from ..framework import observe, sampler as sampler_mod, sql
+from ..framework import sampler as sampler_mod, sql
 from ..framework.base import Scenario, register
 from ..framework.report import Verdict
 from . import _common
 
 GIB = 1024 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Deterministic 30-column wide schema. Every value is a pure function of the row number, so the
@@ -85,6 +90,11 @@ def _columns(rows_per_part: int):
     ]
 
 
+def _small_columns():
+    """One narrow column whose small, forced-Wide part makes serial request latency visible."""
+    return [("c01", "UInt64", "number + 1000000000000")]
+
+
 def _columns_ddl(cols) -> str:
     return ", ".join(f"{n} {t}" for n, t, _ in cols)
 
@@ -101,96 +111,300 @@ def _select_sql(cols, rows: int) -> str:
 # actual symbolized top stacks from the dev smoke run (RelWithDebInfo has symbols).
 # ---------------------------------------------------------------------------
 BUCKETS = [
-    ("dedup_head_gate", ["HeadObject", "headObject", "requestHead", "getObjectMetadata",
-                         "existsBlob", "objectExists"]),
-    ("s3_network", ["WriteBufferFromS3", "writeToS3", "uploadPart", "MultipartUpload",
-                    "PutObject", "GetObject", "PocoHTTPClient", "makeRequest", "Aws::",
-                    "Poco::Net", "S3::Client", "ReadBufferFromS3", "getObject"]),
-    ("blob_hashing", ["XXH", "CityHash", "HashingWriteBuffer", "IHashing", "sipHash",
-                      "updateHash", "Hasher"]),
-    ("ledger_manifest", ["RefLedger", "CasRef", "Manifest", "CasBuild", "PartWriteTxn",
-                         "ContentAddressedTransaction", "precommit", "promote", "CasPool",
-                         "CasText", "CasProtocol"]),
-    ("serialization", ["ISerialization", "SerializationString", "SerializationLowCardinality",
-                       "SerializationNullable", "CompressedWriteBuffer", "CompressionCodec",
-                       "serializeBinaryBulk", "writeColumnSingleGranule"]),
-    ("mergetree_part_write", ["MergeTreeDataPartWriter", "MergedBlockOutputStream",
-                              "MergeTreeDataWriter", "writeTempPart", "IMergeTreeDataPart",
-                              "MergeTreeSink", "ReplicatedMergeTreeSink", "finishDelayed",
-                              "commitPart", "renameTempPart"]),
+    ("dedup_head_gate", ["HeadObject", "headObject", "requestHead", "getObjectMetadata", "existsBlob", "objectExists"]),
+    (
+        "s3_network",
+        [
+            "WriteBufferFromS3",
+            "writeToS3",
+            "uploadPart",
+            "MultipartUpload",
+            "PutObject",
+            "GetObject",
+            "PocoHTTPClient",
+            "makeRequest",
+            "Aws::",
+            "Poco::Net",
+            "S3::Client",
+            "ReadBufferFromS3",
+            "getObject",
+        ],
+    ),
+    ("blob_hashing", ["XXH", "CityHash", "HashingWriteBuffer", "IHashing", "sipHash", "updateHash", "Hasher"]),
+    ("ledger_manifest", ["RefLedger", "CasRef", "Manifest", "CasBuild", "PartWriteTxn", "ContentAddressedTransaction", "precommit", "promote", "CasPool", "CasText", "CasProtocol"]),
+    (
+        "serialization",
+        [
+            "ISerialization",
+            "SerializationString",
+            "SerializationLowCardinality",
+            "SerializationNullable",
+            "CompressedWriteBuffer",
+            "CompressionCodec",
+            "serializeBinaryBulk",
+            "writeColumnSingleGranule",
+        ],
+    ),
+    (
+        "mergetree_part_write",
+        [
+            "MergeTreeDataPartWriter",
+            "MergedBlockOutputStream",
+            "MergeTreeDataWriter",
+            "writeTempPart",
+            "IMergeTreeDataPart",
+            "MergeTreeSink",
+            "ReplicatedMergeTreeSink",
+            "finishDelayed",
+            "commitPart",
+            "renameTempPart",
+        ],
+    ),
 ]
 
 # Upload-relevant ProfileEvents to pull from system.query_log for each measured insert.
 CA_EVENT_KEYS = [
-    "CASBlobPut", "CASBlobPutDeduplicated", "CASBlobHead", "CASBlobHeadMiss",
-    "CASBlobBodyPutAvoided", "CASBlobDelete", "CASBlobList",
-    "CASRootGet", "CASRootHead", "CASRootCompareSwap", "CASRootCompareSwapConflict", "CASRootList",
-    "CASRefBatchFlushes", "CASRefBatchedMutations", "CASRefQueueWaitMicroseconds",
-    "CASRefLogBodyGets", "CASRefGlobalListPages", "CASManifestPut",
+    "CASBlobPut",
+    "CASBlobPutDeduplicated",
+    "CASBlobHead",
+    "CASBlobHeadMiss",
+    "CASBlobGet",
+    "CASBlobGetStream",
+    "CASBlobBodyPutAvoided",
+    "CASBlobUploadFanoutBatches",
+    "CASBlobUploadFanoutTasks",
+    "CASBlobDelete",
+    "CASBlobList",
+    "CASMetaPut",
+    "CASMetaCompareSwap",
+    "CASMetaCreateClean",
+    "CASMetaAdoptBackfill",
+    "CASMetaResurrectClean",
+    "CASRootGet",
+    "CASRootHead",
+    "CASRootCompareSwap",
+    "CASRootCompareSwapConflict",
+    "CASRootList",
+    "CASRefBatchFlushes",
+    "CASRefBatchedMutations",
+    "CASRefQueueWaitMicroseconds",
+    "CASRefLogBodyGets",
+    "CASRefGlobalListPages",
+    "CASManifestPut",
 ]
 S3_EVENT_KEYS = [
-    "S3PutObject", "S3HeadObject", "S3GetObject", "S3CopyObject", "S3ListObjects",
-    "S3UploadPart", "S3CreateMultipartUpload", "S3CompleteMultipartUpload", "S3AbortMultipartUpload",
-    "DiskS3PutObject", "DiskS3HeadObject", "DiskS3GetObject", "DiskS3ListObjects",
-    "DiskS3UploadPart", "DiskS3CreateMultipartUpload", "DiskS3CompleteMultipartUpload",
-    "WriteBufferFromS3Bytes", "WriteBufferFromS3Microseconds", "ReadBufferFromS3Bytes",
-    "S3WriteRequestsCount", "S3ReadRequestsCount", "S3WriteRequestsErrors", "S3ReadRequestsErrors",
+    "S3PutObject",
+    "S3HeadObject",
+    "S3GetObject",
+    "S3CopyObject",
+    "S3ListObjects",
+    "S3UploadPart",
+    "S3CreateMultipartUpload",
+    "S3CompleteMultipartUpload",
+    "S3AbortMultipartUpload",
+    "DiskS3PutObject",
+    "DiskS3HeadObject",
+    "DiskS3GetObject",
+    "DiskS3CopyObject",
+    "DiskS3ListObjects",
+    "DiskS3UploadPart",
+    "DiskS3CreateMultipartUpload",
+    "DiskS3CompleteMultipartUpload",
+    "WriteBufferFromS3Bytes",
+    "WriteBufferFromS3Microseconds",
+    "ReadBufferFromS3Bytes",
+    "S3WriteRequestsCount",
+    "S3ReadRequestsCount",
+    "S3WriteRequestsErrors",
+    "S3ReadRequestsErrors",
 ]
 TIME_EVENT_KEYS = [
-    "RealTimeMicroseconds", "UserTimeMicroseconds", "SystemTimeMicroseconds",
-    "OSCPUVirtualTimeMicroseconds", "OSIOWaitMicroseconds", "OSCPUWaitMicroseconds",
+    "RealTimeMicroseconds",
+    "UserTimeMicroseconds",
+    "SystemTimeMicroseconds",
+    "OSCPUVirtualTimeMicroseconds",
+    "OSIOWaitMicroseconds",
+    "OSCPUWaitMicroseconds",
 ]
+
+
+def _rate(value: int, denominator: float, digits: int = 3):
+    return round(value / denominator, digits) if denominator else None
+
+
+def _write_path_metrics(leg: dict) -> dict:
+    """Return non-overlapping logical request classes and raw physical S3 counters for one insert.
+
+    `CASBlobPut` classifies every successful PUT under `blobs/`, including the adjacent `.meta`
+    object. `CASMetaPut` is the metadata-create choke point, so their difference is the number of
+    blob-body publications for these successful, contention-free measurement inserts. A native
+    staged publication is also represented by `CASBlobPut`; `S3CopyObject` splits its transport from
+    streaming PUT. `CASBlobGet` is a metadata GET here because S41 never reads blob bodies during an
+    INSERT and local scratch supplies publication bytes.
+    """
+    qlog = leg.get("query_log") or {}
+    pe = qlog.get("profile_events") or {}
+
+    def event(name):
+        return int(pe.get(name, 0) or 0)
+
+    parts = leg.get("parts") or {}
+    n_parts = int(parts.get("new_parts") or 0)
+    written_bytes = int(qlog.get("written_bytes") or 0)
+    written_gib = written_bytes / GIB if written_bytes else 0.0
+
+    head_hits = event("CASBlobHead")
+    head_misses = event("CASBlobHeadMiss")
+    metadata_creates = event("CASMetaPut")
+    body_publications = max(0, event("CASBlobPut") - metadata_creates)
+    body_copies = min(body_publications, event("S3CopyObject"))
+    body_puts = body_publications - body_copies
+    body_avoided = event("CASBlobBodyPutAvoided")
+    fanout_tasks = event("CASBlobUploadFanoutTasks")
+
+    counts = {
+        "blob_heads": head_hits + head_misses,
+        "body_publications": body_publications,
+        "body_puts": body_puts,
+        "body_copies": body_copies,
+        "metadata_gets": event("CASBlobGet"),
+        "metadata_creates": metadata_creates,
+        "metadata_compare_swaps": event("CASMetaCompareSwap"),
+    }
+
+    return {
+        "n_parts": n_parts,
+        "written_bytes": written_bytes,
+        "written_gib": round(written_gib, 6),
+        "fanout_tasks": fanout_tasks,
+        "blob_head": {"hits": head_hits, "misses": head_misses, "total": counts["blob_heads"]},
+        "blob_body": {
+            "publications": body_publications,
+            "puts": body_puts,
+            "copies": body_copies,
+            "avoided": body_avoided,
+        },
+        "metadata": {
+            "gets": counts["metadata_gets"],
+            "create_attempts": metadata_creates,
+            "compare_swap_attempts": counts["metadata_compare_swaps"],
+            "clean_creates": event("CASMetaCreateClean"),
+            "adopt_backfills": event("CASMetaAdoptBackfill"),
+            "resurrect_cleans": event("CASMetaResurrectClean"),
+        },
+        "per_part": {name: _rate(value, n_parts, 3) for name, value in counts.items()},
+        "per_gib": {name: _rate(value, written_gib, 3) for name, value in counts.items()},
+        "request_ratios": {
+            "heads_per_fanout_task": _rate(counts["blob_heads"], fanout_tasks, 6),
+            "body_publications_per_fanout_task": _rate(body_publications, fanout_tasks, 6),
+            "metadata_gets_per_fanout_task": _rate(counts["metadata_gets"], fanout_tasks, 6),
+            "body_avoided_fraction": _rate(body_avoided, fanout_tasks, 6),
+        },
+        "physical_s3": {name: event(name) for name in S3_EVENT_KEYS},
+    }
+
+
+def _protocol_errors(metrics: dict, path_kind: str) -> list[str]:
+    """Check the request shape that distinguishes fresh publication from duplicate adoption."""
+    tasks = metrics["fanout_tasks"]
+    heads = metrics["blob_head"]
+    body = metrics["blob_body"]
+    metadata = metrics["metadata"]
+    errors = []
+
+    if tasks <= 0:
+        return ["no CAS blob fan-out tasks were observed"]
+    if heads["total"] != tasks:
+        errors.append(f"observed {heads['total']} blob HEAD requests for {tasks} fan-out tasks")
+
+    if path_kind == "fresh":
+        if heads["hits"] != 0 or heads["misses"] != tasks:
+            errors.append(f"fresh path had {heads['hits']} HEAD hit(s) and {heads['misses']} miss(es) for {tasks} tasks")
+        if body["publications"] != tasks:
+            errors.append(f"fresh path published {body['publications']} blob body/bodies for {tasks} tasks")
+        if body["avoided"] != 0:
+            errors.append(f"fresh path avoided {body['avoided']} body publication(s)")
+        if metadata["gets"] != 0:
+            errors.append(f"fresh path issued {metadata['gets']} metadata GET request(s)")
+        if metadata["clean_creates"] != tasks:
+            errors.append(f"fresh path recorded {metadata['clean_creates']} clean metadata create(s) for {tasks} tasks")
+    elif path_kind == "cold_mixed":
+        if heads["misses"] <= 0:
+            errors.append("cold mixed path did not contain any genuinely fresh blob")
+        if body["publications"] != heads["misses"]:
+            errors.append(f"cold mixed path published {body['publications']} bodies for {heads['misses']} HEAD misses")
+        if metadata["clean_creates"] != heads["misses"] or metadata["create_attempts"] != heads["misses"]:
+            errors.append(f"cold mixed path metadata creates did not match fresh blobs ({metadata['clean_creates']} reasons/{metadata['create_attempts']} attempts for {heads['misses']} misses)")
+        if body["avoided"] != heads["hits"]:
+            errors.append(f"cold mixed path avoided {body['avoided']} bodies for {heads['hits']} HEAD hits")
+        if metadata["gets"] != heads["hits"]:
+            errors.append(f"cold mixed path issued {metadata['gets']} metadata GETs for {heads['hits']} adopted blobs")
+        if body["publications"] + body["avoided"] != tasks:
+            errors.append(f"cold mixed path resolved {body['publications'] + body['avoided']} bodies for {tasks} tasks")
+        if metadata["compare_swap_attempts"] != 0:
+            errors.append(f"cold mixed path unexpectedly issued {metadata['compare_swap_attempts']} metadata compare-and-swaps")
+    elif path_kind == "duplicate_adopt":
+        if heads["hits"] != tasks or heads["misses"] != 0:
+            errors.append(f"duplicate path had {heads['hits']} HEAD hit(s) and {heads['misses']} miss(es) for {tasks} tasks")
+        if metadata["gets"] != tasks:
+            errors.append(f"duplicate path issued {metadata['gets']} metadata GET request(s) for {tasks} tasks")
+        if body["publications"] != 0:
+            errors.append(f"duplicate path republished {body['publications']} blob body/bodies")
+        if body["avoided"] != tasks:
+            errors.append(f"duplicate path avoided {body['avoided']} body publication(s) for {tasks} tasks")
+        if metadata["create_attempts"] != 0 or metadata["compare_swap_attempts"] != 0:
+            errors.append(f"duplicate path mutated metadata ({metadata['create_attempts']} create, {metadata['compare_swap_attempts']} compare-and-swap)")
+    else:
+        raise ValueError(f"unknown CAS path kind: {path_kind}")
+
+    return errors
 
 
 @register
 class S41(Scenario):
     name = "S41"
-    title = "wide-insert write-path baseline (CA vs plain S3)"
+    title = "CAS write-path performance (lone and wide inserts)"
     priority = "P1"
     compose_variant = "s41"
     requires_stack_attribution = True
 
     param_table = {
         # dev: a fast smoke to validate wiring + refine bucket patterns from real symbolized stacks.
-        "dev": {"rows": 200000, "partitions": 50,
-                "real_period_ns": 2000000, "cpu_period_ns": 5000000},
+        "dev": {"rows": 200000, "partitions": 50, "small_rows": 1000, "real_period_ns": 2000000, "cpu_period_ns": 5000000},
         # ci: mid scale.
-        "ci": {"rows": 2000000, "partitions": 200,
-               "real_period_ns": 5000000, "cpu_period_ns": 10000000},
+        "ci": {"rows": 2000000, "partitions": 200, "small_rows": 1000, "real_period_ns": 5000000, "cpu_period_ns": 10000000},
         # full: the user-specified spec target — 10M rows, 30 columns, 500 partitions.
-        "full": {"rows": 10000000, "partitions": 500,
-                 "real_period_ns": 5000000, "cpu_period_ns": 10000000},
+        "full": {"rows": 10000000, "partitions": 500, "small_rows": 1000, "real_period_ns": 5000000, "cpu_period_ns": 10000000},
     }
 
-    # -- measured-insert helper --------------------------------------------------------------------
-    def _measured_insert(self, ctx, result, *, node, table, policy, cols, rows, partitions,
-                         rows_per_part, real_ns, cpu_ns, leg):
-        """Create the table on `policy`, STOP MERGES (isolate the pure write path), run ONE measured
-        INSERT with both profilers on, START MERGES, then collect query_log + trace_log for it.
-        Returns a dict of everything measured for this leg."""
-        qid = f"s41_{leg}_{ctx.timestamp}"
+    # -- measured-insert helpers -------------------------------------------------------------------
+    @staticmethod
+    def _prepare_table(ctx, *, node, table, policy, cols, partition_by):
         ddl_cols = _columns_ddl(cols)
-        select = _select_sql(cols, rows)
-        # Table settings: force Wide parts and lift the many-parts guards so ~`partitions` parts in a
-        # single insert do not trip parts_to_throw / delay. Zero-copy off (single node, plain vs CA).
         extra = {
             "parts_to_delay_insert": 100000,
             "parts_to_throw_insert": 100000,
             "inactive_parts_to_throw_insert": 0,
             "max_parts_in_total": 10000000,
         }
-        ctx.log(f"S41[{leg}]: CREATE {table} on policy '{policy}' ({len(cols)} cols)")
-        sql.create_ca_table(node, table, columns=ddl_cols, order_by="c01",
-                            partition_by="c02", wide=True,
-                            extra_settings={**{"storage_policy": f"'{policy}'"}, **extra})
+        ctx.log(f"S41: CREATE {table} on policy '{policy}' ({len(cols)} cols)")
+        sql.create_ca_table(
+            node,
+            table,
+            columns=ddl_cols,
+            order_by="c01",
+            partition_by=partition_by,
+            wide=True,
+            extra_settings={**{"storage_policy": f"'{policy}'"}, **extra},
+        )
+        # This is a measurement invariant, not a best-effort setup step: a failure would make the
+        # requested repeated runs incomparable, so propagate it.
+        node.command(f"SYSTEM STOP MERGES {table}")
 
-        # Isolate the write path: no concurrent background merges consuming the same S3 connection
-        # pool / CPU during the measured window. (SYSTEM STOP MERGES is explicit + reversible; this
-        # is a measurement control, not a workaround for a race.)
-        try:
-            node.command(f"SYSTEM STOP MERGES {table}")
-        except Exception as e:
-            ctx.log(f"S41[{leg}]: STOP MERGES failed (continuing): {e}")
+    def _measured_insert(self, ctx, result, *, node, table, policy, cols, rows, partitions, rows_per_part, real_ns, cpu_ns, leg, path_kind, sampler, phase_state):
+        """Run one measured insert on an already-prepared table and collect its system logs."""
+        qid = f"s41_{leg}_{ctx.timestamp}"
+        select = _select_sql(cols, rows)
 
         # Block sizing: one partition per block => one part per partition, bounded memory. `numbers`
         # emits max_block_size-row blocks aligned to [k*rpp, (k+1)*rpp); max_insert_block_size=rpp
@@ -210,15 +424,18 @@ class S41(Scenario):
             "query_profiler_cpu_time_period_ns": cpu_ns,
         }
         ctx.log(f"S41[{leg}]: measured INSERT {rows} rows -> ~{partitions} parts (qid={qid})")
-        t0 = time.monotonic()
-        node.command(f"INSERT INTO {table} {select}", timeout=3600.0, settings=insert_settings)
-        wall_s = time.monotonic() - t0
-        ctx.log(f"S41[{leg}]: INSERT wall={wall_s:.2f}s")
-
+        phase_state["name"] = leg
+        sampler.sample_once(phase=leg)
         try:
-            node.command(f"SYSTEM START MERGES {table}")
-        except Exception:
-            pass
+            t0 = time.monotonic()
+            node.command(f"INSERT INTO {table} {select}", timeout=3600.0, settings=insert_settings)
+            wall_s = time.monotonic() - t0
+            # Guarantee at least a before/after RSS sample even when the small insert is shorter than
+            # the periodic sampler interval. Periodic samples cover the interior of longer inserts.
+            sampler.sample_once(phase=leg)
+        finally:
+            phase_state["name"] = "setup"
+        ctx.log(f"S41[{leg}]: INSERT wall={wall_s:.2f}s")
 
         node.command("SYSTEM FLUSH LOGS")
         qlog = self._query_log_metrics(node, qid)
@@ -230,15 +447,80 @@ class S41(Scenario):
         real_threads = self._trace_thread_spread(node, qid, "Real")
 
         leg_obs = {
-            "leg": leg, "policy": policy, "table": table, "query_id": qid,
-            "wall_s": round(wall_s, 3), "rows": rows, "parts": parts,
+            "leg": leg,
+            "path_kind": path_kind,
+            "policy": policy,
+            "table": table,
+            "query_id": qid,
+            "wall_s": round(wall_s, 3),
+            "rows": rows,
+            "parts": parts,
             "query_log": qlog,
-            "trace_real_top30": real_top, "trace_cpu_top30": cpu_top,
-            "trace_real_buckets": real_buckets, "trace_cpu_buckets": cpu_buckets,
+            "trace_real_top30": real_top,
+            "trace_cpu_top30": cpu_top,
+            "trace_real_buckets": real_buckets,
+            "trace_cpu_buckets": cpu_buckets,
             "trace_real_thread_spread": real_threads,
         }
-        result.observations[f"leg_{leg}"] = leg_obs
+        leg_obs["write_path_metrics"] = _write_path_metrics(leg_obs)
+        result.observations.setdefault("legs", {})[leg] = leg_obs
         return leg_obs
+
+    def _measure_pair(self, ctx, result, *, node, table, policy, cols, rows, partitions, rows_per_part, real_ns, cpu_ns, workload, sampler, phase_state, stopped_tables):
+        partition_by = "c02" if partitions > 1 else None
+        self._prepare_table(
+            ctx,
+            node=node,
+            table=table,
+            policy=policy,
+            cols=cols,
+            partition_by=partition_by,
+        )
+        stopped_tables.append(table)
+        is_ca = policy == "ca"
+        fresh = self._measured_insert(
+            ctx,
+            result,
+            node=node,
+            table=table,
+            policy=policy,
+            cols=cols,
+            rows=rows,
+            partitions=partitions,
+            rows_per_part=rows_per_part,
+            real_ns=real_ns,
+            cpu_ns=cpu_ns,
+            leg=f"{workload}_{'ca' if is_ca else 'plain'}_fresh",
+            path_kind=("fresh" if workload == "small" else "cold_mixed") if is_ca else "control_fresh",
+            sampler=sampler,
+            phase_state=phase_state,
+        )
+        duplicate = self._measured_insert(
+            ctx,
+            result,
+            node=node,
+            table=table,
+            policy=policy,
+            cols=cols,
+            rows=rows,
+            partitions=partitions,
+            rows_per_part=rows_per_part,
+            real_ns=real_ns,
+            cpu_ns=cpu_ns,
+            leg=f"{workload}_{'ca' if is_ca else 'plain'}_duplicate",
+            path_kind="duplicate_adopt" if is_ca else "control_repeat",
+            sampler=sampler,
+            phase_state=phase_state,
+        )
+        return fresh, duplicate
+
+    @staticmethod
+    def _phase_memory_peaks(sampler) -> dict:
+        rows = sampler.conn.execute("SELECT phase, node, max(mem_resident) FROM samples WHERE mem_resident IS NOT NULL GROUP BY phase, node").fetchall()
+        peaks = {}
+        for phase, node, peak in rows:
+            peaks.setdefault(phase, {})[node] = int(peak)
+        return peaks
 
     # -- system-table collectors -------------------------------------------------------------------
     @staticmethod
@@ -250,14 +532,14 @@ class S41(Scenario):
                 "SELECT query_duration_ms, read_rows, written_rows, written_bytes, "
                 "result_bytes, memory_usage, exception_code "
                 f"FROM system.query_log WHERE query_id='{qid}' AND type='QueryFinish' "
-                "ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TabSeparated").strip()
+                "ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT TabSeparated"
+            ).strip()
         except Exception:
             row = ""
         if row:
             f = row.split("\t")
             if len(f) == 7:
-                keys = ["query_duration_ms", "read_rows", "written_rows", "written_bytes",
-                        "result_bytes", "memory_usage", "exception_code"]
+                keys = ["query_duration_ms", "read_rows", "written_rows", "written_bytes", "result_bytes", "memory_usage", "exception_code"]
                 for k, v in zip(keys, f):
                     try:
                         out[k] = int(v)
@@ -271,7 +553,8 @@ class S41(Scenario):
                 "SELECT PE.1, PE.2 FROM system.query_log "
                 "ARRAY JOIN arrayZip(mapKeys(ProfileEvents), mapValues(ProfileEvents)) AS PE "
                 f"WHERE query_id='{qid}' AND type='QueryFinish' "
-                "ORDER BY event_time_microseconds DESC FORMAT TabSeparated")
+                "ORDER BY event_time_microseconds DESC FORMAT TabSeparated"
+            )
             seen = set()
             for line in txt.splitlines():
                 if "\t" not in line:
@@ -295,15 +578,12 @@ class S41(Scenario):
         current active/total part count for the table."""
         out = {}
         try:
-            out["new_parts"] = int(node.scalar(
-                "SELECT count() FROM system.part_log WHERE query_id='%s' AND event_type='NewPart'"
-                % qid) or 0)
+            out["new_parts"] = int(node.scalar("SELECT count() FROM system.part_log WHERE query_id='%s' AND event_type='NewPart'" % qid) or 0)
         except Exception:
             out["new_parts"] = None
         for k, pred in (("active", "active"), ("total", "1")):
             try:
-                out[k] = int(node.scalar(
-                    f"SELECT count() FROM system.parts WHERE table='{table}' AND {pred}") or 0)
+                out[k] = int(node.scalar(f"SELECT count() FROM system.parts WHERE table='{table}' AND {pred}") or 0)
             except Exception:
                 out[k] = None
         return out
@@ -311,13 +591,14 @@ class S41(Scenario):
     @staticmethod
     def _trace_top(node, qid, trace_type, limit=30) -> list:
         """Top-`limit` folded symbolized stacks by sample count for one trace_type of the insert."""
-        stack = ("arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\\n')")
+        stack = "arrayStringConcat(arrayMap(x -> demangle(addressToSymbol(x)), trace), '\\n')"
         try:
             txt = node.query(
                 f"SELECT count() AS c, {stack} AS s FROM system.trace_log "
                 f"WHERE query_id='{qid}' AND trace_type='{trace_type}' "
                 f"GROUP BY s ORDER BY c DESC LIMIT {limit} "
-                "SETTINGS allow_introspection_functions=1 FORMAT TabSeparated")
+                "SETTINGS allow_introspection_functions=1 FORMAT TabSeparated"
+            )
         except Exception as e:
             return [{"error": str(e)}]
         rows = []
@@ -338,8 +619,7 @@ class S41(Scenario):
         h = "demangle(addressToSymbol(x))"
         clauses = []
         for bucket, pats in BUCKETS:
-            cond = " OR ".join(
-                f"arrayExists(x -> position({h}, '{p}') > 0, trace)" for p in pats)
+            cond = " OR ".join(f"arrayExists(x -> position({h}, '{p}') > 0, trace)" for p in pats)
             clauses.append(f"if({cond}, '{bucket}',")
         multi = " ".join(clauses) + " 'other'" + (")" * len(clauses))
         try:
@@ -347,7 +627,8 @@ class S41(Scenario):
                 f"SELECT b, count() FROM (SELECT {multi} AS b FROM system.trace_log "
                 f"WHERE query_id='{qid}' AND trace_type='{trace_type}') "
                 "GROUP BY b ORDER BY count() DESC "
-                "SETTINGS allow_introspection_functions=1 FORMAT TabSeparated")
+                "SETTINGS allow_introspection_functions=1 FORMAT TabSeparated"
+            )
         except Exception as e:
             return {"error": str(e)}
         out = {}
@@ -369,10 +650,7 @@ class S41(Scenario):
         """Distribution of samples across thread_ids for one trace_type — the single-threaded
         detector. Returns {distinct_threads, top_thread_samples, total_samples, top_fraction}."""
         try:
-            txt = node.query(
-                "SELECT thread_id, count() c FROM system.trace_log "
-                f"WHERE query_id='{qid}' AND trace_type='{trace_type}' "
-                "GROUP BY thread_id ORDER BY c DESC FORMAT TabSeparated")
+            txt = node.query(f"SELECT thread_id, count() c FROM system.trace_log WHERE query_id='{qid}' AND trace_type='{trace_type}' GROUP BY thread_id ORDER BY c DESC FORMAT TabSeparated")
         except Exception as e:
             return {"error": str(e)}
         counts = []
@@ -398,172 +676,299 @@ class S41(Scenario):
         p = ctx.params
         rows = int(p["rows"])
         partitions = int(p["partitions"])
+        small_rows = int(p["small_rows"])
         rows_per_part = max(1, rows // partitions)
         real_ns = int(p["real_period_ns"])
         cpu_ns = int(p["cpu_period_ns"])
-        cols = _columns(rows_per_part)
+        wide_cols = _columns(rows_per_part)
+        small_cols = _small_columns()
         node = cl.node1
 
         result.observations["scale"] = {
-            "rows": rows, "partitions": partitions, "rows_per_part": rows_per_part,
-            "columns": len(cols), "real_period_ns": real_ns, "cpu_period_ns": cpu_ns,
+            "rows": rows,
+            "partitions": partitions,
+            "rows_per_part": rows_per_part,
+            "columns": len(wide_cols),
+            "small_rows": small_rows,
+            "small_columns": len(small_cols),
+            "small_parts": 1,
+            "real_period_ns": real_ns,
+            "cpu_period_ns": cpu_ns,
             "scale": ctx.scale,
         }
-        result.add(Verdict("scale used", "spec target = 10M rows, 30 cols, 500 partitions",
-                           f"{rows} rows, {len(cols)} cols, {partitions} partitions "
-                           f"(scale={ctx.scale})", "pass",
-                           "dev/ci are scaled down; only --scale full is the spec target"))
+        result.add(
+            Verdict(
+                "scale used",
+                "spec target = 10M rows, 30 cols, 500 partitions",
+                f"{rows} rows, {len(wide_cols)} cols, {partitions} partitions (scale={ctx.scale})",
+                "pass",
+                "dev/ci are scaled down; only --scale full is the spec target",
+            )
+        )
 
-        smp = sampler_mod.MetricsSampler(sampler_mod.open_db(ctx.path("metrics.sqlite")), cl,
-                                         interval_s=3.0, pool_every=1000,
-                                         phase_fn=lambda: "wide_insert", log_fn=ctx.log)
+        result.observations["measurement_order"] = [
+            "small_plain_fresh",
+            "small_plain_duplicate",
+            "small_ca_fresh",
+            "small_ca_duplicate",
+            "wide_plain_fresh",
+            "wide_plain_duplicate",
+            "wide_ca_fresh",
+            "wide_ca_duplicate",
+        ]
+        version_row = node.query("SELECT version(), buildId(), revision() FORMAT TabSeparated").strip().split("\t")
+        if len(version_row) != 3:
+            raise RuntimeError(f"S41: server binary provenance returned {version_row!r}")
+        result.observations["server_binary"] = {
+            "version": version_row[0],
+            "build_id": version_row[1],
+            "revision": int(version_row[2]),
+        }
+
+        phase_state = {"name": "setup"}
+        stopped_tables = []
+        node.command("SYSTEM CAS GC STOP ca")
+        smp = sampler_mod.MetricsSampler(sampler_mod.open_db(ctx.path("metrics.sqlite")), cl, interval_s=1.0, pool_every=1000, phase_fn=lambda: phase_state["name"], log_fn=ctx.log)
         smp.start()
         try:
-            # Leg A: plain S3 baseline first.
-            plain = self._measured_insert(
-                ctx, result, node=node, table="s41_plain", policy="s3plain", cols=cols,
-                rows=rows, partitions=partitions, rows_per_part=rows_per_part,
-                real_ns=real_ns, cpu_ns=cpu_ns, leg="plain")
-            # Leg B: content-addressed (the disk under test).
-            ca = self._measured_insert(
-                ctx, result, node=node, table="s41_ca", policy="ca", cols=cols,
-                rows=rows, partitions=partitions, rows_per_part=rows_per_part,
-                real_ns=real_ns, cpu_ns=cpu_ns, leg="ca")
+            self._measure_pair(
+                ctx,
+                result,
+                node=node,
+                table="s41_small_plain",
+                policy="s3plain",
+                cols=small_cols,
+                rows=small_rows,
+                partitions=1,
+                rows_per_part=small_rows,
+                real_ns=real_ns,
+                cpu_ns=cpu_ns,
+                workload="small",
+                sampler=smp,
+                phase_state=phase_state,
+                stopped_tables=stopped_tables,
+            )
+            self._measure_pair(
+                ctx,
+                result,
+                node=node,
+                table="s41_small_ca",
+                policy="ca",
+                cols=small_cols,
+                rows=small_rows,
+                partitions=1,
+                rows_per_part=small_rows,
+                real_ns=real_ns,
+                cpu_ns=cpu_ns,
+                workload="small",
+                sampler=smp,
+                phase_state=phase_state,
+                stopped_tables=stopped_tables,
+            )
+            self._measure_pair(
+                ctx,
+                result,
+                node=node,
+                table="s41_plain",
+                policy="s3plain",
+                cols=wide_cols,
+                rows=rows,
+                partitions=partitions,
+                rows_per_part=rows_per_part,
+                real_ns=real_ns,
+                cpu_ns=cpu_ns,
+                workload="wide",
+                sampler=smp,
+                phase_state=phase_state,
+                stopped_tables=stopped_tables,
+            )
+            self._measure_pair(
+                ctx,
+                result,
+                node=node,
+                table="s41_ca",
+                policy="ca",
+                cols=wide_cols,
+                rows=rows,
+                partitions=partitions,
+                rows_per_part=rows_per_part,
+                real_ns=real_ns,
+                cpu_ns=cpu_ns,
+                workload="wide",
+                sampler=smp,
+                phase_state=phase_state,
+                stopped_tables=stopped_tables,
+            )
         finally:
             smp.stop()
+            cleanup_errors = []
+            for table in stopped_tables:
+                try:
+                    node.command(f"SYSTEM START MERGES {table}")
+                except Exception as e:
+                    cleanup_errors.append(f"failed to restart merges for {table}: {e}")
+            try:
+                node.command("SYSTEM CAS GC START ca")
+            except Exception as e:
+                cleanup_errors.append(f"failed to restart CAS GC: {e}")
+            if cleanup_errors:
+                raise RuntimeError("S41 cleanup failed: " + "; ".join(cleanup_errors))
 
-        _common.record_peak_memory(result, smp, label="peak MemoryResident during wide inserts")
-        self._verdicts(ctx, result, plain, ca, rows)
+        phase_peaks = self._phase_memory_peaks(smp)
+        result.observations["peak_mem_resident_by_phase"] = phase_peaks
+        for leg, observation in result.observations["legs"].items():
+            by_node = phase_peaks.get(leg, {})
+            observation["peak_mem_resident_by_node"] = by_node
+            observation["peak_mem_resident_bytes"] = max(by_node.values()) if by_node else None
+            result.timings[leg] = {
+                "wall_s": observation["wall_s"],
+                "query_duration_ms": observation["query_log"].get("query_duration_ms"),
+                "query_peak_memory_bytes": observation["query_log"].get("memory_usage"),
+                "peak_mem_resident_bytes": observation["peak_mem_resident_bytes"],
+            }
 
-        # Standard quiesced end checkpoint on the CA table (fsck dangling==0 etc.). The plain-S3
-        # table is invisible to cas-fsck (different pool prefix) — drop it so only the CA table
-        # remains for the checkpoint's structural assertions.
-        try:
-            sql.drop_table_both(cl, "s41_plain")
-        except Exception as e:
-            ctx.log(f"S41: drop s41_plain failed (non-fatal): {e}")
-        end = _common.standard_end(ctx, result, ["s41_ca"])
+        _common.record_peak_memory(result, smp, label="peak MemoryResident during S41 inserts")
+        self._verdicts(result, result.observations["legs"], partitions)
+
+        # The plain-S3 tables are outside the CA pool and do not belong in the structural checkpoint.
+        sql.drop_table_both(cl, "s41_small_plain")
+        sql.drop_table_both(cl, "s41_plain")
+        end = _common.standard_end(ctx, result, ["s41_small_ca", "s41_ca"])
         dangling = end.get("fsck_final", {}).get("dangling")
-        result.add(Verdict.check("no dangling after wide insert", "fsck dangling==0",
-                                 dangling, dangling == 0))
+        result.add(Verdict.check("no dangling after S41 inserts", "fsck dangling==0", dangling, dangling == 0))
 
     # -- verdicts / diagnosis ----------------------------------------------------------------------
-    def _verdicts(self, ctx, result, plain, ca, rows):
+    def _verdicts(self, result, legs, wide_partitions):
+        protocol_checks = {}
+        expected_parts = {name: (1 if name.startswith("small_") else wide_partitions) for name in legs}
+        for name, leg in legs.items():
+            qlog = leg.get("query_log") or {}
+            result.add(
+                Verdict.check(
+                    f"{name}: query log captured",
+                    "one QueryFinish row",
+                    qlog.get("found", False),
+                    qlog.get("found", False),
+                )
+            )
+            new_parts = (leg.get("parts") or {}).get("new_parts")
+            result.add(
+                Verdict.check(
+                    f"{name}: part count",
+                    str(expected_parts[name]),
+                    new_parts,
+                    new_parts == expected_parts[name],
+                )
+            )
+            peak_rss = leg.get("peak_mem_resident_bytes")
+            if peak_rss is None:
+                result.add(Verdict.inconclusive(f"{name}: peak resident memory", "recorded", "no RSS sample for this phase"))
+            else:
+                result.add(Verdict.reported(f"{name}: peak resident memory", "recorded", f"{peak_rss / GIB:.3f} GiB"))
+
+            if leg["path_kind"] not in ("fresh", "cold_mixed", "duplicate_adopt"):
+                continue
+            metrics = leg["write_path_metrics"]
+            errors = _protocol_errors(metrics, leg["path_kind"])
+            protocol_checks[name] = {"accepted": not errors, "errors": errors}
+            head = metrics["blob_head"]
+            body = metrics["blob_body"]
+            meta = metrics["metadata"]
+            observed = (
+                f"HEAD={head['total']} ({head['hits']} hit/{head['misses']} miss), "
+                f"body PUT/copy={body['puts']}/{body['copies']}, avoided={body['avoided']}, "
+                f"metadata GET/create/CAS={meta['gets']}/{meta['create_attempts']}/"
+                f"{meta['compare_swap_attempts']}"
+            )
+            result.add(
+                Verdict.check(
+                    f"{name}: blob publication protocol",
+                    "one HEAD per blob; fresh has body publication and no metadata GET; duplicate adopts",
+                    observed,
+                    not errors,
+                    "; ".join(errors),
+                )
+            )
+            result.add(
+                Verdict.reported(
+                    f"{name}: request budget",
+                    "logical request counts per part and per GiB recorded",
+                    f"per-part={metrics['per_part']}; per-GiB={metrics['per_gib']}",
+                )
+            )
+        result.observations["protocol_checks"] = protocol_checks
+
+        comparisons = {}
+        for workload in ("small", "wide"):
+            plain_fresh = legs[f"{workload}_plain_fresh"]
+            plain_duplicate = legs[f"{workload}_plain_duplicate"]
+            ca_fresh = legs[f"{workload}_ca_fresh"]
+            ca_duplicate = legs[f"{workload}_ca_duplicate"]
+
+            def ratio(numerator, denominator):
+                return round(numerator / denominator, 6) if denominator else None
+
+            comparisons[workload] = {
+                "ca_fresh_over_plain_fresh_wall": ratio(ca_fresh["wall_s"], plain_fresh["wall_s"]),
+                "ca_duplicate_over_ca_fresh_wall": ratio(ca_duplicate["wall_s"], ca_fresh["wall_s"]),
+                "plain_duplicate_over_plain_fresh_wall": ratio(plain_duplicate["wall_s"], plain_fresh["wall_s"]),
+                "ca_fresh_over_plain_fresh_query_duration": ratio(ca_fresh["query_log"].get("query_duration_ms"), plain_fresh["query_log"].get("query_duration_ms")),
+                "ca_duplicate_over_ca_fresh_query_duration": ratio(ca_duplicate["query_log"].get("query_duration_ms"), ca_fresh["query_log"].get("query_duration_ms")),
+            }
+            result.add(
+                Verdict.reported(
+                    f"{workload}: current CA/plain and duplicate/fresh wall ratios",
+                    "recorded for matched before/after aggregation across runs",
+                    comparisons[workload],
+                )
+            )
+        result.observations["comparisons"] = comparisons
+        result.observations["slowdown_factor"] = comparisons["wide"]["ca_fresh_over_plain_fresh_wall"]
+
+        # Preserve the original profiler diagnosis on the fresh wide CAS leg.
+        ca = legs["wide_ca_fresh"]
         pe_ca = ca["query_log"].get("profile_events", {}) or {}
-        pe_pl = plain["query_log"].get("profile_events", {}) or {}
-
-        # (a) CA-vs-plain slowdown factor.
-        w_ca = ca["wall_s"] or 0.0
-        w_pl = plain["wall_s"] or 0.0
-        factor = (w_ca / w_pl) if w_pl > 0 else None
-        result.observations["slowdown_factor"] = factor
-        result.add(Verdict(
-            "(a) CA-vs-plain slowdown factor", "recorded (prior finding ~7.6x at 500 partitions)",
-            f"{factor:.2f}x  (CA {w_ca:.1f}s vs plain {w_pl:.1f}s)" if factor else
-            f"CA {w_ca:.1f}s vs plain {w_pl:.1f}s (plain wall unavailable)", "pass"))
-
-        # (b) top-3 write-path cost centers for the CA leg (Real trace = includes off-CPU waits).
         rb = {k: v for k, v in (ca.get("trace_real_buckets") or {}).items() if k != "_total"}
         rb_total = (ca.get("trace_real_buckets") or {}).get("_total", 0) or 0
         top3 = sorted(rb.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        top3_str = ", ".join(
-            f"{b} {100.0 * c / rb_total:.0f}%" for b, c in top3) if rb_total else "no Real samples"
-        result.observations["ca_real_bucket_pct"] = {
-            b: (round(100.0 * c / rb_total, 1) if rb_total else None) for b, c in rb.items()}
-        result.add(Verdict("(b) top write-path cost centers (CA, Real trace)",
-                           "attributed from system.trace_log Real samples",
-                           top3_str, "pass" if rb_total else "inconclusive",
-                           "" if rb_total else "no Real trace samples captured for the CA insert"))
+        top3_str = ", ".join(f"{bucket} {100.0 * count / rb_total:.0f}%" for bucket, count in top3) if rb_total else "no Real samples"
+        result.observations["ca_real_bucket_pct"] = {bucket: (round(100.0 * count / rb_total, 1) if rb_total else None) for bucket, count in rb.items()}
+        result.add(
+            Verdict(
+                "fresh wide CAS write-path cost centers",
+                "attributed from system.trace_log Real samples",
+                top3_str,
+                "pass" if rb_total else "inconclusive",
+                "" if rb_total else "no Real trace samples captured for the fresh wide CAS insert",
+            )
+        )
 
-        # (c) single-threaded blob upload dominant? Real wall concentrated in ~one thread doing S3
-        # network/HEAD waits, while CPU busy time is a small fraction of wall.
         spread = ca.get("trace_real_thread_spread", {}) or {}
-        top_frac = spread.get("top_fraction")
-        net_samples = rb.get("s3_network", 0) + rb.get("dedup_head_gate", 0)
-        net_frac = (net_samples / rb_total) if rb_total else 0.0
-        dur_ms = ca["query_log"].get("query_duration_ms")
-        cpu_us = (pe_ca.get("OSCPUVirtualTimeMicroseconds")
-                  or (pe_ca.get("UserTimeMicroseconds", 0) + pe_ca.get("SystemTimeMicroseconds", 0)))
-        cpu_frac = None
-        if dur_ms and cpu_us:
-            cpu_frac = round((cpu_us / 1000.0) / dur_ms, 3)  # CPU-busy ms / wall ms
+        top_fraction = spread.get("top_fraction")
+        network_samples = rb.get("s3_network", 0) + rb.get("dedup_head_gate", 0)
+        network_fraction = network_samples / rb_total if rb_total else 0.0
+        duration_ms = ca["query_log"].get("query_duration_ms")
+        cpu_us = pe_ca.get("OSCPUVirtualTimeMicroseconds") or (pe_ca.get("UserTimeMicroseconds", 0) + pe_ca.get("SystemTimeMicroseconds", 0))
+        cpu_fraction = round((cpu_us / 1000.0) / duration_ms, 3) if duration_ms and cpu_us else None
         result.observations["single_thread_signal"] = {
-            "real_top_thread_fraction": top_frac,
-            "real_network_bucket_fraction": round(net_frac, 3) if rb_total else None,
-            "cpu_busy_over_wall": cpu_frac,
-            "query_duration_ms": dur_ms,
+            "real_top_thread_fraction": top_fraction,
+            "real_network_bucket_fraction": round(network_fraction, 3) if rb_total else None,
+            "cpu_busy_over_wall": cpu_fraction,
+            "query_duration_ms": duration_ms,
         }
-        # Confirmed if the wall is network-bound (>=50% Real in network/HEAD) AND those waits sit in
-        # a single dominant thread (>=70%) AND CPU-busy is a minority of wall (<50%).
-        confirmed = (rb_total > 0 and net_frac >= 0.5
-                     and (top_frac is not None and top_frac >= 0.7)
-                     and (cpu_frac is not None and cpu_frac < 0.5))
-        partial = (rb_total > 0 and net_frac >= 0.5) and not confirmed
-        verdict_c = "YES" if confirmed else ("PARTIAL" if partial else "NO")
-        result.observations["single_thread_verdict"] = verdict_c
-        result.add(Verdict(
-            "(c) single-threaded blob upload is the dominant bottleneck",
-            "YES iff Real wall is network/HEAD-bound, concentrated in ~1 thread, CPU-busy << wall",
-            f"{verdict_c}  (Real net/HEAD={net_frac:.0%}, top-thread={top_frac}, "
-            f"CPU-busy/wall={cpu_frac})",
-            "pass",
-            "diagnosis recorded; PARTIAL = network-bound but not single-threaded or with material CPU"))
 
-        # (d) Mandatory blob-presence observation share.
-        blob_heads = pe_ca.get("CASBlobHead", 0)
-        blob_put = pe_ca.get("CASBlobPut", 0)
-        body_avoided = pe_ca.get("CASBlobBodyPutAvoided", 0)
-        head_bucket = rb.get("dedup_head_gate", 0)
-        head_time_pct = round(100.0 * head_bucket / rb_total, 1) if rb_total else None
-        result.observations["blob_presence_observation"] = {
-            "CASBlobHead": blob_heads, "CASBlobPut": blob_put,
-            "CASBlobBodyPutAvoided": body_avoided,
-            "head_trace_pct_of_real": head_time_pct,
-        }
-        result.add(Verdict(
-            "(d) blob presence observation share",
-            "count of blob HEADs and their share of Real trace time",
-            f"CASBlobHead={blob_heads}, body-avoided={body_avoided}; "
-            f"HEAD-gate Real trace share={head_time_pct}%", "pass"))
-
-        # (e) S3 op budget: PUT/HEAD/GET per part and per GiB (CA leg).
-        n_parts = (ca.get("parts") or {}).get("new_parts") or (ca.get("parts") or {}).get("active") or 0
-        written = ca["query_log"].get("written_bytes") or 0
-        gib = written / GIB if written else 0.0
-
-        def _op(*keys):
-            return sum(int(pe_ca.get(k, 0)) for k in keys)
-        puts = _op("S3PutObject", "DiskS3PutObject", "CASBlobPut", "CASManifestPut")
-        heads = _op("S3HeadObject", "DiskS3HeadObject", "CASBlobHead")
-        gets = _op("S3GetObject", "DiskS3GetObject", "CASRootGet")
-        budget = {
-            "n_parts": n_parts, "written_bytes": written, "written_gib": round(gib, 3),
-            "s3_puts": puts, "s3_heads": heads, "s3_gets": gets,
-            "puts_per_part": round(puts / n_parts, 2) if n_parts else None,
-            "heads_per_part": round(heads / n_parts, 2) if n_parts else None,
-            "gets_per_part": round(gets / n_parts, 2) if n_parts else None,
-            "puts_per_gib": round(puts / gib, 1) if gib else None,
-            "heads_per_gib": round(heads / gib, 1) if gib else None,
-        }
-        # Plain-S3 op budget for contrast.
-        def _opp(*keys):
-            return sum(int(pe_pl.get(k, 0)) for k in keys)
-        budget["plain_s3_puts"] = _opp("S3PutObject", "DiskS3PutObject")
-        budget["plain_s3_heads"] = _opp("S3HeadObject", "DiskS3HeadObject")
-        result.observations["s3_op_budget"] = budget
-        result.add(Verdict(
-            "(e) S3 op budget (CA leg)", "PUT/HEAD/GET per part and per GiB",
-            f"{puts} PUT / {heads} HEAD / {gets} GET over {n_parts} parts "
-            f"({budget['puts_per_part']} PUT/part, {budget['heads_per_part']} HEAD/part); "
-            f"plain S3: {budget['plain_s3_puts']} PUT / {budget['plain_s3_heads']} HEAD", "pass"))
-
-        # Ledger batch-size sanity (design cites measured batch 1.0 on the serial commit path).
-        flushes = pe_ca.get("CASRefBatchFlushes", 0)
-        mutations = pe_ca.get("CASRefBatchedMutations", 0)
-        batch = round(mutations / flushes, 2) if flushes else None
+        flushes = int(pe_ca.get("CASRefBatchFlushes", 0))
+        mutations = int(pe_ca.get("CASRefBatchedMutations", 0))
+        average_batch = round(mutations / flushes, 2) if flushes else None
         result.observations["ref_batch_size"] = {
-            "CASRefBatchFlushes": flushes, "CASRefBatchedMutations": mutations, "avg_batch": batch}
-        result.add(Verdict(
-            "ref-ledger batch size (context for stage 2)",
-            "recorded; ~1.0 expected on the serial commit path (stage-2 target, not this stage)",
-            f"avg batch={batch} ({mutations} mutations / {flushes} flushes)", "pass"))
+            "CASRefBatchFlushes": flushes,
+            "CASRefBatchedMutations": mutations,
+            "avg_batch": average_batch,
+        }
+        result.add(
+            Verdict.reported(
+                "fresh wide CAS ref-ledger batch size",
+                "recorded as write-path context",
+                f"avg batch={average_batch} ({mutations} mutations / {flushes} flushes)",
+            )
+        )
