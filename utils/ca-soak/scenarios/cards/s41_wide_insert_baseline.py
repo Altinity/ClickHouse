@@ -33,6 +33,7 @@ CA_SOAK_FSCK_CONTAINER=ca-s41-ch1-1). See docker-compose-s41.yml / configs/stora
 """
 
 import time
+from contextlib import contextmanager
 
 from ..framework import sampler as sampler_mod, sql
 from ..framework.base import Scenario, register
@@ -232,15 +233,140 @@ def _rate(value: int, denominator: float, digits: int = 3):
     return round(value / denominator, digits) if denominator else None
 
 
+def _ratio(numerator, denominator, digits: int = 6):
+    if numerator is None or denominator in (None, 0):
+        return None
+    return round(numerator / denominator, digits)
+
+
+def _paired_second_leg_metrics(*, ca_first, ca_second, control_first, control_second) -> dict:
+    """Describe a within-run second leg and adjust it for the paired control's ordinary warmth.
+
+    The ratio of ratios divides the CA second/first ratio by the plain-S3 second/first ratio. The
+    difference in differences subtracts the plain-S3 time change from the CA time change. Neither is
+    a code-version before/after estimate: both characterize the two fixed-order legs of one target
+    run. Ratios fail closed to ``None`` when either first-leg denominator is zero or unavailable.
+    """
+    values = (ca_first, ca_second, control_first, control_second)
+    ca_ratio = _ratio(ca_second, ca_first)
+    control_ratio = _ratio(control_second, control_first)
+    difference_in_differences = None
+    if all(value is not None for value in values):
+        difference_in_differences = round((ca_second - ca_first) - (control_second - control_first), 6)
+    return {
+        "ca_second_over_first": ca_ratio,
+        "control_second_over_first": control_ratio,
+        "control_adjusted_ratio_of_ratios": _ratio(ca_ratio, control_ratio),
+        "control_adjusted_difference_in_differences": difference_in_differences,
+    }
+
+
+class _RestorationEnvelope:
+    """Track every attempted measurement-state mutation and restore all of them on exit."""
+
+    def __init__(self, node):
+        self.node = node
+        self.gc_stop_attempted = False
+        self.merge_stop_attempts = []
+        self.connection = None
+        self.sampler = None
+        self.sampler_start_attempted = False
+        self.sampler_stop_attempted = False
+
+    def __enter__(self):
+        return self
+
+    def stop_gc(self):
+        # Register before issuing the command: a failed request can leave the remote state unknown.
+        self.gc_stop_attempted = True
+        self.node.command("SYSTEM CAS GC STOP ca")
+
+    def stop_merges(self, table):
+        # The same fail-close rule applies to a table stop with an ambiguous outcome.
+        if table not in self.merge_stop_attempts:
+            self.merge_stop_attempts.append(table)
+        self.node.command(f"SYSTEM STOP MERGES {table}")
+
+    def track_connection(self, connection):
+        self.connection = connection
+
+    def track_sampler(self, sampler):
+        self.sampler = sampler
+
+    def start_sampler(self):
+        self.sampler_start_attempted = True
+        self.sampler.start()
+
+    def stop_sampler(self):
+        if self.sampler is None or not self.sampler_start_attempted or self.sampler_stop_attempted:
+            return
+        self.sampler_stop_attempted = True
+        self.sampler.stop()
+
+    @staticmethod
+    def _error_text(error):
+        return f"{type(error).__name__}: {error}"
+
+    def __exit__(self, _exc_type, primary_error, _traceback):
+        cleanup_errors = []
+
+        def attempt(label, operation):
+            try:
+                operation()
+            except BaseException as error:
+                cleanup_errors.append(f"{label}: {self._error_text(error)}")
+
+        attempt("failed to stop metrics sampler", self.stop_sampler)
+        for table in self.merge_stop_attempts:
+            attempt(
+                f"failed to restart merges for {table}",
+                lambda table=table: self.node.command(f"SYSTEM START MERGES {table}"),
+            )
+        if self.gc_stop_attempted:
+            attempt("failed to restart CAS GC", lambda: self.node.command("SYSTEM CAS GC START ca"))
+        if self.connection is not None:
+            attempt("failed to close metrics DB", self.connection.close)
+
+        if cleanup_errors:
+            cleanup_summary = "; ".join(cleanup_errors)
+            if primary_error is not None:
+                primary_summary = self._error_text(primary_error)
+                raise RuntimeError(f"S41 failed ({primary_summary}); cleanup also failed: {cleanup_summary}") from primary_error
+            raise RuntimeError(f"S41 cleanup failed: {cleanup_summary}")
+        return False
+
+
+@contextmanager
+def _measurement_envelope(*, node, metrics_path, cluster, phase_fn, log_fn):
+    """Open all S41 measurement resources inside one fail-close restoration scope."""
+    with _RestorationEnvelope(node) as restoration:
+        restoration.stop_gc()
+        connection = sampler_mod.open_db(metrics_path)
+        restoration.track_connection(connection)
+        sampler = sampler_mod.MetricsSampler(
+            connection,
+            cluster,
+            interval_s=1.0,
+            pool_every=1000,
+            phase_fn=phase_fn,
+            log_fn=log_fn,
+        )
+        restoration.track_sampler(sampler)
+        restoration.start_sampler()
+        yield restoration
+
+
 def _write_path_metrics(leg: dict) -> dict:
     """Return non-overlapping logical request classes and raw physical S3 counters for one insert.
 
     `CASBlobPut` classifies every successful PUT under `blobs/`, including the adjacent `.meta`
     object. `CASMetaPut` is the metadata-create choke point, so their difference is the number of
-    blob-body publications for these successful, contention-free measurement inserts. A native
-    staged publication is also represented by `CASBlobPut`; `S3CopyObject` splits its transport from
-    streaming PUT. `CASBlobGet` is a metadata GET here because S41 never reads blob bodies during an
-    INSERT and local scratch supplies publication bytes.
+    blob-body publications for these successful, contention-free measurement inserts. There is no
+    query-attributed ProfileEvent that splits those successful logical publications by streaming
+    versus server-side-copy transport. `S3CopyObject` counts physical attempts, including retries,
+    and is therefore reported separately without being subtracted from the logical total.
+    `CASBlobGet` is a metadata GET here because S41 never reads blob bodies during an INSERT and local
+    scratch supplies publication bytes.
     """
     qlog = leg.get("query_log") or {}
     pe = qlog.get("profile_events") or {}
@@ -257,47 +383,65 @@ def _write_path_metrics(leg: dict) -> dict:
     head_misses = event("CASBlobHeadMiss")
     metadata_creates = event("CASMetaPut")
     body_publications = max(0, event("CASBlobPut") - metadata_creates)
-    body_copies = min(body_publications, event("S3CopyObject"))
-    body_puts = body_publications - body_copies
     body_avoided = event("CASBlobBodyPutAvoided")
     fanout_tasks = event("CASBlobUploadFanoutTasks")
+    metadata_gets = event("CASBlobGet")
+    metadata_compare_swaps = event("CASMetaCompareSwap")
+    metadata_clean_creates = event("CASMetaCreateClean")
+    metadata_adopt_backfills = event("CASMetaAdoptBackfill")
+    metadata_resurrect_cleans = event("CASMetaResurrectClean")
 
-    counts = {
-        "blob_heads": head_hits + head_misses,
+    logical_counts = {
+        "head_hits": head_hits,
+        "head_misses": head_misses,
+        "head_total": head_hits + head_misses,
         "body_publications": body_publications,
-        "body_puts": body_puts,
-        "body_copies": body_copies,
-        "metadata_gets": event("CASBlobGet"),
-        "metadata_creates": metadata_creates,
-        "metadata_compare_swaps": event("CASMetaCompareSwap"),
+        "body_publications_avoided": body_avoided,
+        "metadata_gets": metadata_gets,
+        "metadata_create_attempts": metadata_creates,
+        "metadata_compare_swap_attempts": metadata_compare_swaps,
+        "metadata_clean_creates": metadata_clean_creates,
+        "metadata_adopt_backfills": metadata_adopt_backfills,
+        "metadata_resurrect_cleans": metadata_resurrect_cleans,
     }
+    per_part = {name: _rate(value, n_parts, 3) for name, value in logical_counts.items()}
+    per_input_gib = {name: _rate(value, written_gib, 3) for name, value in logical_counts.items()}
+    per_fanout_task = {name: _rate(value, fanout_tasks, 6) for name, value in logical_counts.items()}
 
     return {
         "n_parts": n_parts,
         "written_bytes": written_bytes,
         "written_gib": round(written_gib, 6),
         "fanout_tasks": fanout_tasks,
-        "blob_head": {"hits": head_hits, "misses": head_misses, "total": counts["blob_heads"]},
+        "blob_head": {"hits": head_hits, "misses": head_misses, "total": logical_counts["head_total"]},
         "blob_body": {
             "publications": body_publications,
-            "puts": body_puts,
-            "copies": body_copies,
             "avoided": body_avoided,
         },
-        "metadata": {
-            "gets": counts["metadata_gets"],
-            "create_attempts": metadata_creates,
-            "compare_swap_attempts": counts["metadata_compare_swaps"],
-            "clean_creates": event("CASMetaCreateClean"),
-            "adopt_backfills": event("CASMetaAdoptBackfill"),
-            "resurrect_cleans": event("CASMetaResurrectClean"),
+        "publication_transport": {
+            "logical_split_available": False,
+            "logical_streaming_publications": None,
+            "logical_server_side_copy_publications": None,
+            "physical_s3_copy_attempts": event("S3CopyObject"),
         },
-        "per_part": {name: _rate(value, n_parts, 3) for name, value in counts.items()},
-        "per_gib": {name: _rate(value, written_gib, 3) for name, value in counts.items()},
+        "metadata": {
+            "gets": metadata_gets,
+            "create_attempts": metadata_creates,
+            "compare_swap_attempts": metadata_compare_swaps,
+            "clean_creates": metadata_clean_creates,
+            "adopt_backfills": metadata_adopt_backfills,
+            "resurrect_cleans": metadata_resurrect_cleans,
+        },
+        "logical_counts": logical_counts,
+        "per_part": per_part,
+        "per_input_gib": per_input_gib,
+        "per_fanout_task": per_fanout_task,
+        # Kept as a schema-compatible alias for older report consumers.
+        "per_gib": per_input_gib,
         "request_ratios": {
-            "heads_per_fanout_task": _rate(counts["blob_heads"], fanout_tasks, 6),
+            "heads_per_fanout_task": _rate(logical_counts["head_total"], fanout_tasks, 6),
             "body_publications_per_fanout_task": _rate(body_publications, fanout_tasks, 6),
-            "metadata_gets_per_fanout_task": _rate(counts["metadata_gets"], fanout_tasks, 6),
+            "metadata_gets_per_fanout_task": _rate(metadata_gets, fanout_tasks, 6),
             "body_avoided_fraction": _rate(body_avoided, fanout_tasks, 6),
         },
         "physical_s3": {name: event(name) for name in S3_EVENT_KEYS},
@@ -326,8 +470,16 @@ def _protocol_errors(metrics: dict, path_kind: str) -> list[str]:
             errors.append(f"fresh path avoided {body['avoided']} body publication(s)")
         if metadata["gets"] != 0:
             errors.append(f"fresh path issued {metadata['gets']} metadata GET request(s)")
+        if metadata["create_attempts"] != tasks:
+            errors.append(f"fresh path recorded {metadata['create_attempts']} metadata create attempt(s) for {tasks} task(s)")
         if metadata["clean_creates"] != tasks:
             errors.append(f"fresh path recorded {metadata['clean_creates']} clean metadata create(s) for {tasks} tasks")
+        if metadata["compare_swap_attempts"] != 0:
+            errors.append(f"fresh path unexpectedly issued {metadata['compare_swap_attempts']} metadata compare-and-swap attempt(s)")
+        if metadata["adopt_backfills"] != 0:
+            errors.append(f"fresh path unexpectedly recorded {metadata['adopt_backfills']} metadata adopt-backfill reason(s)")
+        if metadata["resurrect_cleans"] != 0:
+            errors.append(f"fresh path unexpectedly recorded {metadata['resurrect_cleans']} metadata resurrect-clean reason(s)")
     elif path_kind == "cold_mixed":
         if heads["misses"] <= 0:
             errors.append("cold mixed path did not contain any genuinely fresh blob")
@@ -379,7 +531,7 @@ class S41(Scenario):
 
     # -- measured-insert helpers -------------------------------------------------------------------
     @staticmethod
-    def _prepare_table(ctx, *, node, table, policy, cols, partition_by):
+    def _prepare_table(ctx, *, node, table, policy, cols, partition_by, restoration):
         ddl_cols = _columns_ddl(cols)
         extra = {
             "parts_to_delay_insert": 100000,
@@ -399,7 +551,7 @@ class S41(Scenario):
         )
         # This is a measurement invariant, not a best-effort setup step: a failure would make the
         # requested repeated runs incomparable, so propagate it.
-        node.command(f"SYSTEM STOP MERGES {table}")
+        restoration.stop_merges(table)
 
     def _measured_insert(self, ctx, result, *, node, table, policy, cols, rows, partitions, rows_per_part, real_ns, cpu_ns, leg, path_kind, sampler, phase_state):
         """Run one measured insert on an already-prepared table and collect its system logs."""
@@ -466,7 +618,25 @@ class S41(Scenario):
         result.observations.setdefault("legs", {})[leg] = leg_obs
         return leg_obs
 
-    def _measure_pair(self, ctx, result, *, node, table, policy, cols, rows, partitions, rows_per_part, real_ns, cpu_ns, workload, sampler, phase_state, stopped_tables):
+    def _measure_pair(
+        self,
+        ctx,
+        result,
+        *,
+        node,
+        table,
+        policy,
+        cols,
+        rows,
+        partitions,
+        rows_per_part,
+        real_ns,
+        cpu_ns,
+        workload,
+        sampler,
+        phase_state,
+        restoration,
+    ):
         partition_by = "c02" if partitions > 1 else None
         self._prepare_table(
             ctx,
@@ -475,8 +645,8 @@ class S41(Scenario):
             policy=policy,
             cols=cols,
             partition_by=partition_by,
+            restoration=restoration,
         )
-        stopped_tables.append(table)
         is_ca = policy == "ca"
         fresh = self._measured_insert(
             ctx,
@@ -726,11 +896,14 @@ class S41(Scenario):
         }
 
         phase_state = {"name": "setup"}
-        stopped_tables = []
-        node.command("SYSTEM CAS GC STOP ca")
-        smp = sampler_mod.MetricsSampler(sampler_mod.open_db(ctx.path("metrics.sqlite")), cl, interval_s=1.0, pool_every=1000, phase_fn=lambda: phase_state["name"], log_fn=ctx.log)
-        smp.start()
-        try:
+        with _measurement_envelope(
+            node=node,
+            metrics_path=ctx.path("metrics.sqlite"),
+            cluster=cl,
+            phase_fn=lambda: phase_state["name"],
+            log_fn=ctx.log,
+        ) as restoration:
+            smp = restoration.sampler
             self._measure_pair(
                 ctx,
                 result,
@@ -746,7 +919,7 @@ class S41(Scenario):
                 workload="small",
                 sampler=smp,
                 phase_state=phase_state,
-                stopped_tables=stopped_tables,
+                restoration=restoration,
             )
             self._measure_pair(
                 ctx,
@@ -763,7 +936,7 @@ class S41(Scenario):
                 workload="small",
                 sampler=smp,
                 phase_state=phase_state,
-                stopped_tables=stopped_tables,
+                restoration=restoration,
             )
             self._measure_pair(
                 ctx,
@@ -780,7 +953,7 @@ class S41(Scenario):
                 workload="wide",
                 sampler=smp,
                 phase_state=phase_state,
-                stopped_tables=stopped_tables,
+                restoration=restoration,
             )
             self._measure_pair(
                 ctx,
@@ -797,38 +970,27 @@ class S41(Scenario):
                 workload="wide",
                 sampler=smp,
                 phase_state=phase_state,
-                stopped_tables=stopped_tables,
+                restoration=restoration,
             )
-        finally:
-            smp.stop()
-            cleanup_errors = []
-            for table in stopped_tables:
-                try:
-                    node.command(f"SYSTEM START MERGES {table}")
-                except Exception as e:
-                    cleanup_errors.append(f"failed to restart merges for {table}: {e}")
-            try:
-                node.command("SYSTEM CAS GC START ca")
-            except Exception as e:
-                cleanup_errors.append(f"failed to restart CAS GC: {e}")
-            if cleanup_errors:
-                raise RuntimeError("S41 cleanup failed: " + "; ".join(cleanup_errors))
 
-        phase_peaks = self._phase_memory_peaks(smp)
-        result.observations["peak_mem_resident_by_phase"] = phase_peaks
-        for leg, observation in result.observations["legs"].items():
-            by_node = phase_peaks.get(leg, {})
-            observation["peak_mem_resident_by_node"] = by_node
-            observation["peak_mem_resident_bytes"] = max(by_node.values()) if by_node else None
-            result.timings[leg] = {
-                "wall_s": observation["wall_s"],
-                "query_duration_ms": observation["query_log"].get("query_duration_ms"),
-                "query_peak_memory_bytes": observation["query_log"].get("memory_usage"),
-                "peak_mem_resident_bytes": observation["peak_mem_resident_bytes"],
-            }
+            # Stop the writer before querying its SQLite connection. The outer envelope still owns
+            # every restoration action and will attempt any remaining cleanup if processing fails.
+            restoration.stop_sampler()
+            phase_peaks = self._phase_memory_peaks(smp)
+            result.observations["peak_mem_resident_by_phase"] = phase_peaks
+            for leg, observation in result.observations["legs"].items():
+                by_node = phase_peaks.get(leg, {})
+                observation["peak_mem_resident_by_node"] = by_node
+                observation["peak_mem_resident_bytes"] = max(by_node.values()) if by_node else None
+                result.timings[leg] = {
+                    "wall_s": observation["wall_s"],
+                    "query_duration_ms": observation["query_log"].get("query_duration_ms"),
+                    "query_peak_memory_bytes": observation["query_log"].get("memory_usage"),
+                    "peak_mem_resident_bytes": observation["peak_mem_resident_bytes"],
+                }
 
-        _common.record_peak_memory(result, smp, label="peak MemoryResident during S41 inserts")
-        self._verdicts(result, result.observations["legs"], partitions)
+            _common.record_peak_memory(result, smp, label="peak MemoryResident during S41 inserts")
+            self._verdicts(result, result.observations["legs"], partitions)
 
         # The plain-S3 tables are outside the CA pool and do not belong in the structural checkpoint.
         sql.drop_table_both(cl, "s41_small_plain")
@@ -874,9 +1036,12 @@ class S41(Scenario):
             head = metrics["blob_head"]
             body = metrics["blob_body"]
             meta = metrics["metadata"]
+            transport = metrics["publication_transport"]
             observed = (
                 f"HEAD={head['total']} ({head['hits']} hit/{head['misses']} miss), "
-                f"body PUT/copy={body['puts']}/{body['copies']}, avoided={body['avoided']}, "
+                f"body published/avoided={body['publications']}/{body['avoided']}, "
+                f"logical transport split=unavailable, physical S3 CopyObject attempts="
+                f"{transport['physical_s3_copy_attempts']}, "
                 f"metadata GET/create/CAS={meta['gets']}/{meta['create_attempts']}/"
                 f"{meta['compare_swap_attempts']}"
             )
@@ -892,8 +1057,8 @@ class S41(Scenario):
             result.add(
                 Verdict.reported(
                     f"{name}: request budget",
-                    "logical request counts per part and per GiB recorded",
-                    f"per-part={metrics['per_part']}; per-GiB={metrics['per_gib']}",
+                    "every logical request class normalized per part, input GiB, and fan-out task",
+                    f"per-part={metrics['per_part']}; per-input-GiB={metrics['per_input_gib']}; per-task={metrics['per_fanout_task']}",
                 )
             )
         result.observations["protocol_checks"] = protocol_checks
@@ -905,25 +1070,34 @@ class S41(Scenario):
             ca_fresh = legs[f"{workload}_ca_fresh"]
             ca_duplicate = legs[f"{workload}_ca_duplicate"]
 
-            def ratio(numerator, denominator):
-                return round(numerator / denominator, 6) if denominator else None
-
             comparisons[workload] = {
-                "ca_fresh_over_plain_fresh_wall": ratio(ca_fresh["wall_s"], plain_fresh["wall_s"]),
-                "ca_duplicate_over_ca_fresh_wall": ratio(ca_duplicate["wall_s"], ca_fresh["wall_s"]),
-                "plain_duplicate_over_plain_fresh_wall": ratio(plain_duplicate["wall_s"], plain_fresh["wall_s"]),
-                "ca_fresh_over_plain_fresh_query_duration": ratio(ca_fresh["query_log"].get("query_duration_ms"), plain_fresh["query_log"].get("query_duration_ms")),
-                "ca_duplicate_over_ca_fresh_query_duration": ratio(ca_duplicate["query_log"].get("query_duration_ms"), ca_fresh["query_log"].get("query_duration_ms")),
+                "ca_first_over_control_first_wall": _ratio(ca_fresh["wall_s"], plain_fresh["wall_s"]),
+                "wall_second_leg": _paired_second_leg_metrics(
+                    ca_first=ca_fresh["wall_s"],
+                    ca_second=ca_duplicate["wall_s"],
+                    control_first=plain_fresh["wall_s"],
+                    control_second=plain_duplicate["wall_s"],
+                ),
+                "ca_first_over_control_first_query_duration": _ratio(
+                    ca_fresh["query_log"].get("query_duration_ms"),
+                    plain_fresh["query_log"].get("query_duration_ms"),
+                ),
+                "query_duration_second_leg": _paired_second_leg_metrics(
+                    ca_first=ca_fresh["query_log"].get("query_duration_ms"),
+                    ca_second=ca_duplicate["query_log"].get("query_duration_ms"),
+                    control_first=plain_fresh["query_log"].get("query_duration_ms"),
+                    control_second=plain_duplicate["query_log"].get("query_duration_ms"),
+                ),
             }
             result.add(
                 Verdict.reported(
-                    f"{workload}: current CA/plain and duplicate/fresh wall ratios",
-                    "recorded for matched before/after aggregation across runs",
+                    f"{workload}: target-only first-leg and paired second-leg observations",
+                    "raw second-leg and plain-control-adjusted values recorded; not a code-version delta",
                     comparisons[workload],
                 )
             )
         result.observations["comparisons"] = comparisons
-        result.observations["slowdown_factor"] = comparisons["wide"]["ca_fresh_over_plain_fresh_wall"]
+        result.observations["slowdown_factor"] = comparisons["wide"]["ca_first_over_control_first_wall"]
 
         # Preserve the original profiler diagnosis on the fresh wide CAS leg.
         ca = legs["wide_ca_fresh"]
