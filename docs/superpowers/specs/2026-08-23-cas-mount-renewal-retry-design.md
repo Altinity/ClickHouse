@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS mount renewal retry design {#cas-mount-renewal-retry-design}
 
-**Status:** DRAFT for review, rev.2 (2026-08-23). This specification defines the minimum pre-release
+**Status:** DRAFT for review, rev.3 (2026-08-23). This specification defines the minimum pre-release
 fix for Altinity/ClickHouse issue `#2244`. It deliberately does not require compatibility with CAS
 mount objects written by older, unreleased writer binaries.
 
@@ -31,10 +31,17 @@ The periodic scheduler derives the next renewal from that same timestamp, not fr
 slowly resolved renewal therefore triggers its next beat immediately when the nominal cadence has
 already elapsed.
 
+Ownership is simplified before retries are added. `SingleWriterSlot` is removed: it has exactly one
+subclass and currently mixes durable slot protocol, a worker thread, callback-based lifecycle
+effects, and subclass destruction ordering. `MountLeaseKeeper` becomes a synchronous state machine
+for the durable mount object. The stable `CasMountRuntime` owns the renewal worker, wakeup,
+cancellation, fence refresh, terminal failure handling, and remount scheduling. Renewal and remount
+remain separate workers; combining them would change the remount protocol and is outside this fix.
+
 This change also closes the snapshot-publication warning loop found in the issue RCA, and makes
 renewal/remount recovery observable through bounded logs, `system.cas_log`, and `ProfileEvents`.
-The remount protocol itself is unchanged. Per-step remount retries, persistent remount progress, and
-the own-ambiguous-claim observation window are deferred explicitly to the backlog.
+The durable remount protocol itself is unchanged. Per-step remount retries, persistent remount
+progress, and the own-ambiguous-claim observation window are deferred explicitly to the backlog.
 
 ## Goals {#goals}
 
@@ -47,6 +54,8 @@ the own-ambiguous-claim observation window are deferred explicitly to the backlo
    producing per-attempt warning storms.
 6. Bound the snapshot-publication `NotReady` redispatch loop with its existing per-table backoff.
 7. Prove the split-phase retry protocol with a focused TLA+ model before changing production C++.
+8. Reduce the renewal ownership surface rather than adding callbacks and latches to the existing
+   single-subclass hierarchy.
 
 ## Non-goals {#non-goals}
 
@@ -59,6 +68,7 @@ the own-ambiguous-claim observation window are deferred explicitly to the backlo
 - Allowing a writer to continue after an unresolved logical renewal.
 - Compatibility with old CAS writer binaries or mount-lease bodies. CAS has not shipped.
 - New retry, timeout, logging, or snapshot-backoff settings.
+- Combining renewal and remount into one maintenance state machine.
 
 ## Context and problem statement {#context-and-problem-statement}
 
@@ -98,9 +108,12 @@ admits another publish, and recreates the same refusal loop.
 5. The durable expiry and local fence deadline are anchored before I/O; a slow acknowledgement cannot
    move either deadline forward.
 6. One unresolved logical write never gives birth to a different body under the same expected token.
-7. Teardown stops and joins renewal before running the terminal mount operation.
+7. Teardown and remount stop and join the runtime-owned renewal worker before releasing or replacing
+   the keeper.
 8. Remount allocates a fresh writer epoch and re-arms the fence only after keeper installation and ref
-   runtime quiescence; this ordering is untouched.
+   runtime quiescence. A parked renewal worker is released to run only after the fresh epoch, keeper,
+   fence, and `Live` lifecycle are all published.
+9. No keeper method calls back into its owner or can schedule destruction of the keeper executing it.
 
 ## Durable attempt identity {#durable-attempt-identity}
 
@@ -136,8 +149,7 @@ values and includes an explicit sabotage that ignores them.
 
 ### Immutable logical request {#immutable-logical-request}
 
-At the start of one `renewOnce`, while preserving the existing `state_mutex` serialization, the
-keeper fixes:
+At the start of one synchronous `MountLeaseKeeper::renew`, the keeper fixes:
 
 - the currently held `expected_token`;
 - `seq + 1`;
@@ -149,6 +161,11 @@ keeper fixes:
 No field changes between physical attempts. In particular, a retry does not refresh
 `expires_at_ms`. Refreshing it would manufacture lease time from an unconfirmed attempt and make a
 late straggler carry different authority from the request being resolved.
+
+The runtime enforces a single renewal driver. Startup may call the internal redo before a worker
+exists. Afterwards either the runtime worker drives renewal, or a deterministic direct test seam does
+so while background renewal is disabled. Keeper replacement and release occur only after the worker
+has joined. The keeper consequently needs no thread, callback, or general-purpose state mutex.
 
 ### Deadline derivation {#deadline-derivation}
 
@@ -170,12 +187,15 @@ receives the absolute deadline rather than a duration that it would re-anchor fr
 Preemption between calculation and controller entry can therefore only consume budget, never move
 the boundary forward.
 
-The controller uses the keeper's BOOTTIME callback. Before every backend request -- both a conditional
+The controller uses the runtime's BOOTTIME callback. Before every backend request -- both a conditional
 `PUT` and its resolving `GET` -- it requires `now + attempt_timeout_ms <= absolute_deadline_boot_ms`
-and a true cancellation gate. It applies the same checks before and after every backoff. The local
-BOOTTIME mount fence and renewal controller consequently share one suspend-safe proof window. Wall
-clock jumps may change the timestamp encoded in a future body, as today, but cannot enlarge retry
-authority or delay the next beat.
+and a true cancellation gate. It applies the same checks before and after every backoff. A relative
+`condition_variable` wait may finish later than its BOOTTIME target after host suspend, because the
+two clocks intentionally differ. That can delay detection/recovery by the unused part of the wait,
+but the mandatory post-wait BOOTTIME gate sends no request and grants no authority after the absolute
+deadline. This change claims suspend safety, not an immediate wakeup from suspend. Wall-clock jumps
+may change the timestamp encoded in a future body, as today, but cannot enlarge retry authority or
+delay cadence.
 
 ### Result classification {#result-classification}
 
@@ -197,29 +217,33 @@ result learned after the last confirmed lease's safety boundary is `Unresolved`,
 body is visible. This is conservative: the durable body may keep the slot occupied, but the local
 writer does not reclaim authority after its proof window closed.
 
-`Committed` records the new `seq` and token and calls the existing commit hooks. `Conflict` invokes
-`onRenewMismatch`, which re-reads and classifies `gc_fenced`, superseded, foreign, vanished, or
-same-pair uncertainty exactly as today. `Unresolved` is an explicit terminal result, not an ordinary
-exception for `backgroundLoop` to reconsider on the next cadence.
+`MountLeaseKeeper::renew` converts these outcomes into a non-throwing admitted-operation result.
+`Committed` records the new `seq`, token, confirmed BOOTTIME deadline, and cadence anchor before
+returning. `Conflict` runs the existing body-aware classification for `gc_fenced`, superseded,
+foreign, vanished, or same-pair uncertainty, but captures the classified exception into the returned
+terminal result. `Unresolved` and a caught deterministic/non-retryable backend exception are also
+terminal results. The keeper enters `RenewalTerminal` before returning any of them and records
+`deposition_observed`; it cannot prepare another body or publish a clean farewell afterwards.
 
-`SingleWriterSlot::renewOnce` owns terminalization for every admitted logical renewal, regardless of
-its caller. On `Unresolved`, `Conflict` classification, or a thrown deterministic/non-retryable
-backend error it records the terminal outcome, releases `state_mutex`, invokes an idempotent
-`notifyRenewFailedOnce`, and then returns the exception to its caller. Calling the lifecycle callback
-outside `state_mutex` preserves the existing lock order into pool/remount code. Programming
-precondition guards that reject a call before a logical renewal is admitted remain plain exceptions:
-they send no request and do not manufacture a lease-loss notification.
+Programming preconditions detected before admitting a logical operation -- renew before start,
+renew after terminal/release, and concurrent-driver misuse -- remain direct exceptions. They send no
+request and do not create a new lease-loss transition.
 
-`notifyRenewFailedOnce` latches the keeper and schedules remount exactly once even for direct calls.
-The background loop only logs the already terminal outcome and exits; it never converts it into a
-later new-body attempt. No fallback converts an error into success.
+The runtime consumes the result only after the keeper frame has returned. On success it refreshes the
+local BOOTTIME fence from `attempt_start_boot_ms` for background and direct calls alike. On a terminal
+result from the background worker or fully-open direct seam, it idempotently increments the keeper
+generation's loss accounting, trips the fence, schedules the existing remount worker, and reports or
+rethrows the captured exception. The startup-only TTL-consumed redo propagates a terminal result to
+the existing open rollback without scheduling remount, because the pool has not published a live
+fence/runtime yet. No keeper method calls into `CasMountRuntime`, and no error is converted to
+success.
 
 ### Scheduling after success {#scheduling-after-success}
 
 The background loop currently waits one full `period` after the response. That is safe for a fast
 response but wrong after a long retry: it shifts the next request later by the entire recovery time.
 
-The mount keeper instead computes the next due time as:
+The runtime renewal worker instead computes the next due time from the keeper's committed result:
 
 ```text
 last_committed_attempt_start_boot_ms + mount_renew_period
@@ -229,14 +253,15 @@ If it is in the future, the loop waits only until that point. If it is now or in
 logical renewal begins immediately with a new `seq`, timestamp, and `write_attempt_id`. A successful
 late resolution still anchors `confirmed_deadline_boot_ms` and the BOOTTIME fence at its original
 attempt start, never its response time. Forward or backward wall-clock changes have no effect on this
-calculation.
+calculation. A host suspend during the relative wait may delay the worker's wakeup, but the next
+BOOTTIME admission check refuses stale work as described above.
 
 ### Exhaustion and late stragglers {#exhaustion-and-late-stragglers}
 
 When the controller returns `Unresolved`, at least one exact request may still land later. The keeper
 must not create a different renewal body against that request's expected token, nor continue waiting
-for a later scheduled beat. It fences immediately and hands recovery to the existing fresh-epoch
-remount path.
+for a later scheduled beat. It enters `RenewalTerminal`; after the synchronous call returns, the
+runtime fences immediately and hands recovery to the existing fresh-epoch remount path.
 
 A late straggler can therefore extend the durable old-epoch body after the local writer has fenced.
 This may delay the existing observation-based reclaim, but cannot authorize another local mutation.
@@ -245,114 +270,237 @@ the safety direction to avoid it.
 
 ## Class and API changes {#class-and-api-changes}
 
-### `SingleWriterSlot` {#singlewriterslot}
+### Remove `SingleWriterSlot` {#remove-singlewriterslot}
 
-The base keeps ownership of `seq`, `last_token`, `dead`, `state_mutex`, the renewal thread, and the
-start/stop/terminal lifecycle. It gains an explicit write result and two protected policy hooks:
+`SingleWriterSlot` is deleted rather than extended. `MountLeaseKeeper` is its only subclass, so the
+base currently buys no polymorphic reuse while owning a worker thread, two mutexes, a condition
+variable, virtual payload/commit/failure hooks, a mismatch side-channel flag, and a derived-destructor
+join workaround. Those responsibilities are split by ownership instead:
 
-```cpp
-struct RenewalWriteResult
-{
-    enum class Kind { Committed, Conflict, Unresolved };
-    Kind kind;
-    Token token;
-    CasOverwriteDiagnostics diagnostics;
-};
+- `MountLeaseKeeper` owns the durable mount-slot state machine;
+- `CasMountRuntime` owns scheduling, cancellation, the local fence, lifecycle, and both worker
+  handles;
+- `Pool` retains only the existing high-level mount/remount orchestration.
 
-virtual RenewalWriteResult writeRenewal(
-    const String & body,
-    const Token & expected_token);
-
-virtual std::chrono::milliseconds nextRenewalDelay(
-    std::chrono::milliseconds period) const;
-```
-
-The default `writeRenewal` performs the current raw one-shot `backend->putOverwrite` and maps its
-returned outcome. The default `nextRenewalDelay` returns `period`. `renewOnce` creates one
-payload/body, calls the write hook, records a committed token, and invokes `onRenewMismatch` only for
-`Conflict`.
-
-After its existing precondition guards admit a logical renewal, `renewOnce` translates every
-terminal write outcome into a captured exception, releases `state_mutex`, and calls
-`notifyRenewFailedOnce` before rethrowing. `notifyRenewFailedOnce` uses a base-owned one-way latch, so
-a direct `renewWatermarkOnce`/`keeperRenewOnce`, the background loop, and teardown cannot double-fire
-`onRenewFailed`, `CASMountLeaseLost`, or remount scheduling. After the latch is set, another direct or
-background `renewOnce` refuses before encoding or sending a body. It may still evaluate the existing
-off-lock payload callbacks before acquiring `state_mutex`; preserving that ordering avoids inverting
-the pool/state locks. A precondition exception raised before admission does not call the notification
-hook.
-
-The old `last_renew_failure_was_confirmed_mismatch` and
-`shouldFenceOnTransientRenewFailure` cadence-level mechanism is removed. Its availability role is
-superseded by the controlled retry loop; retaining it would allow an exhausted logical request to be
-replaced by a new body.
-
-The opaque `RenewPayload` gains the holder write ID so `prepareRenew` can mint it once and
-`encodeBody` can encode it without mutable side channels.
-
-The background wait becomes interruptible for both the nominal cadence and retry backoff. A protected
-base helper exposes an interruptible wait and cancellation predicate backed by the existing
-`wakeup`/`stop_requested` state; no new public cancellation API is exposed. A stop wakes the retry
-sleep. The operation context rechecks cancellation before a resolving `GET`, after the wait, and
-before another `PUT`, so shutdown joins at most the one backend request already in flight when stop
-was published.
+This refactor is contained in fork-owned CAS files. `CasServerRoot.{h,cpp}` and
+`CasMountRuntime.{h,cpp}` do not exist at the `altinity/antalya-26.6` merge base, so it adds no new
+overlap with upstream ClickHouse code.
 
 ### `MountLeaseKeeper` {#mountleasekeeper}
 
-The keeper receives the existing `CasRequestBudget` from `CasMountRuntime`/`Pool` in addition to the
-existing TTL and safety margin. It overrides:
+The keeper is synchronous and has no thread, condition variable, owner callback, or runtime pointer.
+Its explicit state is:
 
-- `writeRenewal` to create the narrowed controller and translate `Committed`, `Conflict`, and
-  `Unresolved` into the base contract;
-- `nextRenewalDelay` to schedule from the last committed attempt's anchor;
-- the existing mismatch/failure hooks, whose body classification remains unchanged.
+```cpp
+enum class MountLeaseKeeperState : uint8_t
+{
+    New,
+    Active,
+    RenewalTerminal,
+    Released,
+};
 
-The controller is a lightweight per-logical-operation value. Constructing it does not construct an
-S3 client, authentication provider, connection pool, or retry strategy; it shares the existing
-`BackendPtr`.
+enum class MountRenewOutcome : uint8_t
+{
+    Committed,
+    Terminal,
+};
+
+struct MountRenewResult
+{
+    MountRenewOutcome outcome;
+    uint64_t attempt_start_boot_ms;
+    CasOverwriteDiagnostics diagnostics;
+    std::exception_ptr failure; // set only for Terminal
+};
+
+struct MountRenewOperationEnvironment
+{
+    std::function<uint64_t()> boot_ms;
+    std::function<CasOverwriteStopCause()> stop_cause;
+    std::function<bool(uint64_t)> wait_before_retry;
+    std::function<void(const CasOverwriteProgress &)> observe;
+};
+```
+
+Its public protocol is:
+
+```cpp
+uint64_t start(); // committed attempt-start BOOTTIME anchor
+MountRenewResult renew(
+    const CasRequestBudget & budget,
+    const MountRenewOperationEnvironment & environment);
+void release();
+```
+
+`start` changes `New -> Active`; `renew` is admitted only in `Active`; a terminal admitted result
+changes `Active -> RenewalTerminal`; and a clean `release` changes only `Active -> Released`.
+Destruction performs no write. In particular, `RenewalTerminal` can never emit a clean farewell for
+an unresolved request. Returning the start anchor removes the parallel timestamp capture currently
+maintained by `Pool`; the fence is armed from the exact attempt the keeper proved.
+
+`renew` receives the existing `CasRequestBudget` plus a small operation environment supplied by the
+runtime: BOOTTIME, cancellation, interruptible backoff, and progress observation. It samples
+`min_active` before constructing the body, preserving the existing lock order in which the pool's
+build registry is never entered under keeper state. The single-driver contract makes a keeper mutex
+unnecessary; misuse is rejected before I/O.
+
+For an admitted operation, `renew` returns `MountRenewResult` rather than letting a backend or
+body-classification exception escape across the runtime ownership boundary. A terminal result keeps
+the original exception in `failure`; the synchronous/direct caller may rethrow it after applying its
+lifecycle policy. Programming misuse before admission still throws directly. The controlled request
+uses the existing `BackendPtr`; it does not construct an S3 client, authentication provider,
+connection pool, or SDK retry strategy.
 
 ### `CasRequestController` operation context and diagnostics {#casrequestcontroller-diagnostics}
 
 The controlled-overwrite API gains an optional `CasOverwriteOperationContext` used by mount renewal:
 
 ```cpp
+enum class CasOverwriteDeadlineSource : uint8_t
+{
+    RequestBudget,
+    ExternalLeaseSafety,
+};
+
+enum class CasOverwriteStopCause : uint8_t
+{
+    Continue,
+    Cancelled,
+    FenceOrLifecycleLost,
+};
+
+enum class CasOverwriteProgressKind : uint8_t
+{
+    PutStarted,
+    BecameAmbiguous,
+    ResolveStarted,
+    RetryStarted,
+    ResolvedByGet,
+};
+
+struct CasOverwriteProgress
+{
+    CasOverwriteProgressKind kind;
+    uint32_t attempt_no;
+};
+
 struct CasOverwriteOperationContext
 {
     uint64_t absolute_deadline_ms;
-    std::function<bool()> may_continue;
+    CasOverwriteDeadlineSource deadline_source;
+    std::function<CasOverwriteStopCause()> stop_cause;
     std::function<bool(uint64_t)> wait_before_retry;
     std::function<void(const CasOverwriteProgress &)> observe;
 };
+
+struct CasOverwriteDiagnostics
+{
+    uint32_t attempts_sent = 0;
+    bool resolved_by_get = false;
+    CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
+    CasOverwriteDeadlineSource deadline_source = CasOverwriteDeadlineSource::RequestBudget;
+    CasOverwriteStopCause stop_cause = CasOverwriteStopCause::Continue;
+};
 ```
 
-The deadline uses the same clock as the controller's injected `now_ms`. `may_continue` is checked
-before every `PUT`, resolving `GET`, wait, and committed return. `wait_before_retry` returns `false`
-when shutdown interrupts it. `observe` reports request start, first transition to ambiguity, retry,
-read-resolved success, and terminal result; it does not make protocol decisions.
+The deadline uses the same clock as the controller's injected `now_ms`. `stop_cause` is checked before
+every `PUT`, resolving `GET`, wait, and committed return; only `Continue` admits work.
+`wait_before_retry` returns `false` when shutdown interrupts it. `observe` reports request start,
+first transition to ambiguity, retry, and read-resolved success; the returned diagnostics report the
+terminal result. The observer does not make protocol decisions. Every observer call is contained by
+a non-throwing adapter: an allocation or event-sink exception is suppressed and reported at most once
+at `DEBUG`, never converted into a lease failure.
 
 Existing callers keep the current overload and behavior. The mount overload/context adds the
 absolute deadline and additional cancellation gates without changing their relative-deadline
 operations.
 
-`CasOverwriteResult` is extended with diagnostic-only fields needed by final mount observability:
+`CasOverwriteResult` gains `CasOverwriteDiagnostics`. Existing `CasUnresolvedReason` remains the
+protocol-level reason; no duplicate reason enum is introduced. The deadline source says which input
+won the `min` when the context was built. A tie is classified as `ExternalLeaseSafety`, because the
+lease boundary is the correctness reason the mount must stop. `AttemptsExhausted`, cancellation/fence
+loss, pre-attempt refusal, post-write refusal, request-budget deadline, and external lease-safety
+deadline therefore have deterministic final log/metric mappings. Only the existing
+`unresolvedProvesNothingWasSent` predicate may branch on `unresolved_reason`; all newly added fields
+are diagnostic.
 
-- physical attempts sent;
-- whether success was resolved by `GET`;
-- the final unresolved reason.
-
-No caller branches on diagnostic fields for correctness. Mount counters and the one-time `retrying`
-event are emitted by the progress observer at the physical transition, so an unfinished call is not
-silently missing its attempts and the event is not reconstructed after the fact.
+Mount counters and the one-time `retrying` event are emitted by the progress observer at the physical
+transition, so an unfinished call is not silently missing its attempts and the event is not
+reconstructed after the fact.
 
 ### `CasMountRuntime` and `Pool` {#casmountruntime-and-pool}
 
-`CasMountRuntime::installKeeper` passes the already validated `cas_request_budget` to the keeper. No
-new setting is loaded or merged.
+`CasMountRuntime` gains the renewal worker state currently owned by `SingleWriterSlot`: thread handle,
+wakeup condition, stop flag, and committed cadence anchor. The condition-variable mutex guards only
+the wait state and thread handle; it is never held across backend I/O, a keeper call, failure handling,
+remount scheduling, or thread join. Controller lambdas may safely reference the runtime because the
+runtime stops and joins its worker before destruction.
 
-The remount callback remains whole-chain and returns `bool`. `Pool::tryRemountOnce` adds a local step
-label and monotonically increasing attempt number solely for logs/events/counters; the sequence of
-backend operations, retries, locks, epoch allocation, keeper replacement, quiescence, and fence
-re-arm is byte-for-byte behaviorally unchanged.
+The ownership API is deliberately small:
+
+```cpp
+uint64_t renewKeeperForStartupOnce();
+void renewWatermarkOnce();
+void startRenewalWorker(std::chrono::milliseconds period);
+void stopRenewalWorker();
+
+void renewalLoop(std::chrono::milliseconds period);        // private
+void consumeLiveRenewResult(MountRenewResult result);      // private
+```
+
+`consumeLiveRenewResult` is called only after `MountLeaseKeeper::renew` has returned and the caller
+will not touch that keeper again. The startup method deliberately does not call it: on success it
+returns the attempt's BOOTTIME anchor for the initial fence arm; on terminal result it rethrows into
+open rollback without publishing loss/remount lifecycle.
+
+The runtime enforces these entry points:
+
+- the startup-only `renewKeeperForStartupOnce` runs before a worker exists and propagates failure to
+  open rollback without scheduling remount;
+- the renewal worker is the sole caller after background operation starts;
+- `Pool::renewWatermarkOnce`/`CasMountRuntime::renewWatermarkOnce` is a deterministic test and
+  maintenance seam that refuses when background renewal is configured or a worker exists.
+
+One runtime helper consumes `MountRenewResult`. It refreshes the fence on every committed result,
+including direct success. For a terminal result on a fully open runtime it uses an installed-keeper
+generation to deposit `CASMountLeaseLost`, `tripMountLost`, and `scheduleRemount` exactly once, after
+all keeper access has ended. Startup does not call this helper.
+
+Keeper reset, replacement, and clean release require a stopped and joined renewal worker. Remount
+keeps its existing separate worker and whole-chain callback. It joins renewal before replacing the
+old keeper, installs and starts the new synchronous keeper, publishes the fresh epoch, quiesces ref
+runtimes, and arms the fence in the existing load-bearing order. A newly constructed renewal worker
+must additionally observe `Live` before sending; during remount it may be constructed while lifecycle
+is still `TransientNotLive`, but it remains parked until `noteRemounted` publishes the completed
+runtime and wakes it. Thread-construction failure therefore leaves the pool fenced and transient, and
+the current remount attempt fails closed.
+
+Initial open has no externally visible pool yet. It installs/starts the keeper, performs the optional
+TTL-consumed redo, publishes epoch and fence, then starts the worker. A worker-construction failure
+trips the fence and fails open; it never leaves a writable pool without renewal.
+
+The remount callback still returns `bool`. `Pool::tryRemountOnce` adds a local step label and
+monotonically increasing attempt number solely for logs/events/counters; its durable claim, epoch,
+quiescence, and fence ordering are otherwise unchanged. Renewal and remount remain separate workers.
+
+## Change footprint and risk {#change-footprint-and-risk}
+
+The ownership refactor principally changes `CasServerRoot.{h,cpp}`, `CasMountRuntime.{h,cpp}`, a
+small amount of `CasPool.cpp` ordering/wiring, and their CAS tests. Expect several hundred mechanically
+changed lines but a smaller production result: deleting the one-subclass base, its virtual hooks,
+thread state, derived-destructor workaround, and callbacks should remove roughly 50--150 net lines.
+
+Initial implementation risk is medium because start/adopt/release and remount ordering are
+load-bearing. It does not change durable owner/epoch allocation, reclaim qualification, ref-runtime
+quiescence, or fence-generation admission. The risk is concentrated in worker lifecycle and is
+covered by deterministic join/replacement/startup-failure tests. Long-term concurrency risk is lower:
+one stable object owns both worker handles and every local lifecycle effect, while the replaceable
+keeper cannot call back into its owner.
+
+The upstream merge surface does not grow. The principal files are absent at merge base
+`4b7cecaa3cf5fe67bea984e43c5a6b875da3e821`; generic `CasRequestController` additions are optional
+fields/overloads that preserve existing callers. No non-CAS object-storage path changes.
 
 ## Observability {#observability}
 
@@ -364,15 +512,16 @@ Add:
 - `CASMountRenewalRetries`: every physical `PUT` after the first within one logical renewal;
 - `CASMountRenewalResolved`: committed outcome proved by exact `GET`;
 - `CASMountRenewalRecovered`: logical renewal that committed after a retry or resolving read;
-- `CASMountRenewalDeadlineExceeded`: logical renewal whose confirmed-lease budget ended unresolved;
+- `CASMountRenewalDeadlineExceeded`: logical renewal stopped by a deadline gate whose winning source
+  was `ExternalLeaseSafety`;
 - `CASRemountAttempts`: every invocation of the current whole-chain remount attempt;
 - `CASRemountSucceeded`: attempts that restored `Live` under a fresh epoch;
 - `CASRemountFailed`: attempts that returned without restoring `Live`, including a caught step error.
 
-`CASMountLeaseLost` is normalized to increment exactly once when `onRenewFailed` actually deposits the
-keeper. Classification branches must not also increment it. Its description is updated to include
-deadline exhaustion. Existing specialized counters such as `CASRemountHeldTransient` remain subsets
-with their current meaning.
+`CASMountLeaseLost` is normalized to increment exactly once when the runtime consumes the first
+terminal result for an installed keeper generation. Classification branches must not also increment
+it. Its description is updated to include deadline exhaustion. Existing specialized counters such as
+`CASRemountHeldTransient` remain subsets with their current meaning.
 
 ### `system.cas_log` {#system-cas-log}
 
@@ -383,8 +532,8 @@ The existing `watermark_renew` event type records only nontrivial logical renewa
 - `failed`: the logical renewal ended without retained authority.
 
 Structured detail includes `server_root_id`, `writer_epoch`, `seq`, a shortened attempt ID, attempts
-sent, elapsed milliseconds, remaining confirmed budget, and final classification. An ordinary
-first-attempt success emits no row.
+sent, elapsed milliseconds, remaining confirmed budget, `unresolved_reason`, `deadline_source`,
+`stop_cause`, and final classification. An ordinary first-attempt success emits no row.
 
 `mount_remount` events add the whole-chain attempt number and current step. Success retains
 `outcome=ok`; failures retain `outcome=failed` but name the step that returned or threw. This is
@@ -431,7 +580,8 @@ The focused model represents:
 
 - confirmed token/body/deadline and local fencing authority;
 - one logical request with a symbolic unique attempt ID;
-- sent, landed, response-lost, resolved, committed, conflict, and unresolved states;
+- an outstanding network request that remains independently deliverable after local `Unresolved`;
+- sent, landed, response-lost, resolved, committed, conflict, and unresolved local states;
 - a same-pair twin, GC fence, successor epoch, and foreign holder;
 - backoff/time advance, cancellation, budget exhaustion, and next-beat scheduling.
 
@@ -444,19 +594,26 @@ Required invariants include:
 5. no mutation authority is re-armed from an unresolved or post-deadline result;
 6. one unresolved logical request is never followed by a different body under the same expected
    token;
-7. every acknowledged renewal names a durable body and its current token.
+7. every acknowledged renewal names a durable body and its current token;
+8. delivery after local terminalization cannot restore old local authority or overwrite a fresh
+   successor incarnation.
 
 Required honest witnesses reach:
 
 - a non-landed transient followed by direct retry success;
 - a landed/lost response followed by exact-ID read adoption;
 - unresolved exhaustion followed by fencing;
+- local `Unresolved`, then late delivery before fresh-epoch reclaim, with the old runtime remaining
+  fenced and recovery treating the extended body conservatively;
+- local `Unresolved`, then fresh successor claim, then refusal of the old conditional straggler;
 - slow success followed by an immediate catch-up renewal.
 
 Each load-bearing rule receives a sabotage configuration, including adoption by pair while ignoring
 the ID, response-time deadline refresh, new-body retry after ambiguity, acceptance after fence or
-supersession, and response-relative cadence. Witnesses must be non-vacuous and sabotage runs must fail
-the intended invariant rather than a shallower unrelated one.
+supersession, dropping the outstanding message at local terminalization, allowing late delivery to
+re-arm authority, and response-relative cadence. The late-delivery witness makes message retention
+non-vacuous; the corresponding sabotage must fail the intended invariant or witness rather than a
+shallower unrelated one.
 
 The focused model owns the split state that the existing model deliberately abstracts away: a body
 may already be durable while the local keeper has not yet proved or committed it. Observer actions
@@ -490,27 +647,39 @@ Fault-injecting backends and clocks must prove:
 6. successor epoch, foreign UUID, and vanished body retain their existing fail-closed outcomes;
 7. failing resolve reads exhaust the narrowed budget without an attempt after the boundary;
 8. a valid budget with `max_attempts = 1` that ends unresolved terminalizes the keeper immediately;
-   the background loop never wakes later to mint a new body for the old expected token;
+   the runtime worker never wakes later to mint a new body for the old expected token;
 9. a deterministic/non-retryable failure through the real background path terminalizes immediately
    rather than waiting one normal cadence;
 10. a slowly resolved success refreshes from attempt start and schedules an immediate catch-up beat;
-11. `stopBackground` published while a `PUT` is in flight permits that bounded call to finish but
+11. `stopRenewalWorker` published while a `PUT` is in flight permits that bounded call to finish but
     prevents the resolving `GET`; interruption during backoff sends nothing afterward;
 12. preemption between deadline calculation and controller entry consumes the absolute budget and
     cannot re-anchor it later;
 13. forward and backward wall-clock steps do not change BOOTTIME request admission, local fencing,
-    or cadence; BOOTTIME advancement does;
-14. direct `CasMountRuntime::renewWatermarkOnce` and `Pool::keeperRenewOnce` use the same controlled
-    operation and deposit terminal failure/remount exactly once;
-15. all holder-originated encoders mint a fresh `write_attempt_id`, retries preserve it, GC fencing
+    or cadence; BOOTTIME advancement does, including an overshoot representing host suspend;
+14. `Pool::renewWatermarkOnce` through `CasMountRuntime::renewWatermarkOnce` refreshes the local fence
+    on success and deposits terminal failure/remount exactly once; it refuses while a worker exists;
+15. the startup-only `renewKeeperForStartupOnce` uses the same controlled request but never schedules
+    remount; failure propagates into open rollback before a live fence/runtime is published;
+16. a request remains deliverable after local `Unresolved`: landing before fresh-epoch reclaim leaves
+    the old runtime fenced, while landing after successor claim is conditionally refused;
+17. all holder-originated encoders mint a fresh `write_attempt_id`, retries preserve it, GC fencing
     preserves the observed ID, and reclaim/successor bodies replace it;
-16. a missing `write_attempt_id` is rejected and a generation-9 pool is rejected at the
+18. a missing `write_attempt_id` is rejected and a generation-9 pool is rejected at the
     generation-10 `PoolMeta` reader floor before any old mount body is interpreted;
-17. retry metrics/events count once at their documented granularity and `CASMountLeaseLost` is not
+19. `MountLeaseKeeper` admits only `New -> Active -> Released` or
+    `New -> Active -> RenewalTerminal`; terminal state forbids another body and clean farewell;
+20. keeper reset, replacement, and release occur only after the runtime renewal worker joins, and
+    direct renewal cannot race worker ownership;
+21. worker-construction failure during initial open or remount leaves the pool fail closed; a remount
+    worker sends nothing until the fresh runtime is `Live`;
+22. retry metrics/events count once at their documented granularity and `CASMountLeaseLost` is not
     doubled;
-18. `NotReady` snapshot publication arms exponential backoff, suppresses immediate settlement
+23. every deadline/attempt/cancellation/fence terminal shape maps to the documented diagnostics, and
+    an observer exception cannot change the renewal result;
+24. `NotReady` snapshot publication arms exponential backoff, suppresses immediate settlement
     redispatch, and resets after durable success;
-19. remount attempts report attempt number and exact failed step without changing their operation
+25. remount attempts report attempt number and exact failed step without changing their operation
     sequence.
 
 Tests use injected clocks and interruptible wait seams. They must not use real sleeps to prove a
@@ -549,8 +718,9 @@ Implementation updates:
   gates pass;
 - `docs/superpowers/cas/BACKLOG.md`: retain the remount follow-up under its own anchor;
 - `CaMountRenewRetryCore_RESULTS.md` and `CaCasMountCore_RESULTS.md`;
-- stale comments in `SingleWriterSlot`, `MountLeaseKeeper`, `CasRequestBudget`, snapshot publisher,
-  remount loop, tests, and soak classification.
+- removal of stale `SingleWriterSlot` prose and updates to comments in `MountLeaseKeeper`,
+  `CasMountRuntime`, `CasRequestBudget`, snapshot publisher, remount loop, tests, and soak
+  classification.
 
 Searches for claims such as “no retry”, “one attempt per cadence”, “never re-armed”, and immediate
 snapshot redispatch are part of the final documentation audit.
@@ -582,6 +752,29 @@ Duplicating resolve-before-reissue, attempt classification, deadline gates, and 
 `MountLeaseKeeper` would create two subtly different conditional-write controllers. The existing
 controlled mutable overwrite already has the required semantics; this design narrows its budget and
 adds lease policy around it.
+
+### Extend `SingleWriterSlot` with more hooks {#extend-singlewriterslot-with-more-hooks}
+
+Adding `writeRenewal`, cadence, cancellation, terminalization, and notification hooks preserves a
+nominal abstraction that has one subclass. It also leaves a derived object owning a thread that can
+schedule replacement of its own `unique_ptr`, forcing separate rules for background, fully-open
+direct, and startup-direct calls. The stable runtime already owns every lifecycle effect, so retaining
+the hierarchy makes ownership harder to prove without providing reuse.
+
+### Keep callback ownership with `shared_ptr` {#keep-callback-ownership-with-sharedptr}
+
+Extending keeper lifetime through callbacks can prevent immediate destruction, but it does not make
+startup remount valid, define which caller publishes fence success/failure, or remove callback/thread
+cycles. It turns an explicit join-before-replace invariant into distributed lifetime retention.
+
+### One combined renewal/remount worker {#one-combined-renewal-remount-worker}
+
+A single maintenance state machine could eventually remove another thread, but it changes the
+remount protocol. External interference may request remount while renewal I/O is in flight; long claim
+observation and whole-chain backoff would share scheduling with lease cadence; and old-renewal
+completion would need generation-qualified arbitration against a fresh claim. That belongs with the
+deferred remount redesign and its own focused model. This fix retains two workers under one stable
+owner.
 
 ### New `mount_renew_retry_*` settings {#new-mount-renew-retry-settings}
 
@@ -618,21 +811,29 @@ its diagnosis but makes no claim that its recovery latency is optimal.
    attempt.
 3. A landed/lost-response renewal can be adopted only by exact attempt identity and bytes.
 4. Same-pair twins, GC fences, successor epochs, foreign UUIDs, and vanished mounts remain fail closed.
-5. Retry work uses one absolute BOOTTIME deadline, never crosses the last confirmed lease's safety
-   boundary, and never extends that boundary without a proven commit.
-6. Any remaining ambiguity or admitted deterministic terminal failure fences exactly once and
-   schedules the existing remount path exactly once, including through either direct renewal API.
+5. Retry work uses one absolute BOOTTIME deadline. No backend request starts unless its configured
+   timeout fits before the last confirmed lease's safety boundary, no result is accepted after that
+   boundary, and the boundary is never extended without a proven commit.
+6. Any remaining ambiguity or admitted deterministic terminal failure in a fully open runtime fences
+   exactly once and schedules the existing remount path exactly once. The startup-only redo instead
+   fails open before publication and never schedules remount.
 7. Slow successful resolution cannot shift the next cadence by response latency.
-8. Shutdown interrupts backoff and waits only for an already in-flight bounded request.
-9. Snapshot `NotReady` refusal is rate limited by the existing per-table backoff.
-10. Renewal and remount outcomes are reconstructible from counters plus aggregate logs without
+8. `MountLeaseKeeper` is synchronous, has explicit `New`/`Active`/`RenewalTerminal`/`Released` state,
+   and has no worker or owner callback; `SingleWriterSlot` is removed.
+9. `CasMountRuntime` is the sole renewal-worker owner. Direct renewal cannot coexist with that worker,
+   and reset/replacement/release require it to be joined.
+10. Shutdown interrupts backoff and waits only for an already in-flight bounded request. A host
+    suspend may delay a relative wait, but its post-wait BOOTTIME check sends no stale request.
+11. Snapshot `NotReady` refusal is rate limited by the existing per-table backoff.
+12. Renewal and remount outcomes are reconstructible from counters plus aggregate logs without
     per-attempt warning spam.
-11. The focused split-phase TLA+ honest/sabotage/witness gate and the complete existing
+13. The focused split-phase TLA+ honest/sabotage/witness gate, including post-terminal late delivery,
+    and the complete existing
     `CaCasMountCore` regression battery have recorded expected verdicts without a false atomic
     refinement claim.
-12. Deterministic C++ tests, the object-storage integration fault, and the lease-sensitive chaos soak
+14. Deterministic C++ tests, the object-storage integration fault, and the lease-sensitive chaos soak
     pass.
-13. Mount format, architecture, debugging, model results, TODO, backlog, soak policy, and stale code
+15. Mount format, architecture, debugging, model results, TODO, backlog, soak policy, and stale code
     comments are updated consistently.
-14. Deferred per-step remount work is present in the backlog and is not accidentally implemented as
+16. Deferred per-step remount work is present in the backlog and is not accidentally implemented as
     an unreviewed side effect of this change.
