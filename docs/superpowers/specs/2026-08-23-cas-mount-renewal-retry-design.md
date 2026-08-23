@@ -662,12 +662,14 @@ Add:
 - `CASRemountSucceeded`: attempts that restored `Live` under a fresh epoch;
 - `CASRemountFailed`: attempts that returned without restoring `Live`, including a caught step error.
 
-`CASMountLeaseLost` is normalized to increment exactly once when the runtime consumes the first
-terminal result for an installed keeper generation. Classification branches must not also increment
-it. Owner-initiated shutdown cancellation is excluded: after a sent ambiguity it still terminalizes
-the keeper and skips farewell, but it does not describe an operational lease loss or request recovery.
-The counter description is updated to include deadline exhaustion. Existing specialized counters
-such as `CASRemountHeldTransient` remain subsets with their current meaning.
+`CASMountLeaseLost` is normalized to increment exactly once per operational
+`Live -> TransientNotLive` loss/recovery generation: either the initiating external loss owns it, or
+the first ordinary terminal consumption owns it. A later `Parked` deposit, classification branch, or
+shutdown path must not increment it again. Owner-initiated shutdown cancellation is excluded: after
+a sent ambiguity it still terminalizes the keeper and skips farewell, but it does not describe an
+operational lease loss or request recovery. The counter description is updated to include deadline
+exhaustion. Existing specialized counters such as `CASRemountHeldTransient` remain subsets with their
+current meaning.
 
 ### `system.cas_log` {#system-cas-log}
 
