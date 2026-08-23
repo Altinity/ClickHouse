@@ -20,7 +20,7 @@ every present key has exactly one current incarnation identified by an opaque `T
 |---|---|
 | `get` / `getStream` | Read bytes (or a forward-only stream, for write-once objects) plus the token of the incarnation read |
 | `head` | Existence, size, token, and metadata without reading the body |
-| `putIfAbsent` | Create a small write-once metadata/control object only when absent; `PreconditionFailed` is a returned outcome, never an exception |
+| `putIfAbsent` | Create a write-once metadata/control object only when absent; `PreconditionFailed` is a returned outcome, never an exception |
 | `publishBlob` | Publish a complete blob unconditionally by streaming rewrite or native same-store copy; it makes no lifecycle decision and returns no token |
 | `putOverwrite` | Replace the current object only when its token equals `expected`; a mismatch is a returned outcome |
 | `casPut` | `expected == nullopt` ⇒ create-if-absent CAS (used for the first write of a root object); a set `expected` conditionally replaces that exact incarnation |
@@ -59,10 +59,12 @@ its token dialect from `IObjectStorage::conditionalOpsUseGenerationTokens`:
 The GCS dialect is opted into by client configuration (`http_client = gcs_hmac` or `gcp_oauth`), not
 auto-detected from the endpoint host. Within such a disk it applies only to `CAS`'s own requests;
 ordinary reads, writes, copies, and all blob-body publications through the same disk keep standard
-`ETag` semantics. Genuine mutable conditional writes reject conditional
-`CompleteMultipartUpload` rather than silently dropping the precondition, so those writes take the
-single-`PUT` path on a generation-dialect backend. Unconditional `publishBlob` uses Default request
-mode and ordinary multipart policy, including above the conditional cap.
+`ETag` semantics. Every conditional non-blob write rejects conditional `CompleteMultipartUpload`
+rather than silently dropping the precondition, so create-if-absent artifacts (`putIfAbsent` and
+`casPut` with no expected token) and conditional replacements (`putOverwrite` and `casPut` with an
+expected token) take the single-`PUT` path on a generation-dialect backend. Unconditional
+`publishBlob` uses Default request mode and ordinary multipart policy, including above the
+conditional cap.
 
 With `http_client = gcs_hmac`, requests are signed with Google's native `GOOG4-HMAC-SHA256` scheme,
 and the request is deliberately normalised to `x-goog-` prefixes before signing. Every `x-amz-*`
@@ -73,9 +75,10 @@ contract than `x-amz-server-side-encryption*`; and any custom `x-amz-*` header s
 `<header>`. Both fail with a clear error rather than being sent under a guessed `x-goog-` name GCS
 would not honour. Configure such a disk against an AWS-compatible endpoint instead.
 
-`gcs_max_conditional_put_bytes` bounds only genuine mutable conditional writes on a generation
-dialect. It does not apply to blob publication because the writer neither consumes nor records the
-write-response generation.
+`gcs_max_conditional_put_bytes` bounds every conditional non-blob `PUT` on a generation dialect,
+including create-if-absent metadata/control artifacts and conditional replacements. It does not
+apply to blob publication because the writer neither consumes nor records the write-response
+generation.
 
 The two authentication paths clean up differently, and neither renames headers wholesale. On
 `gcs_hmac` every request the client sends — marked or not — goes through

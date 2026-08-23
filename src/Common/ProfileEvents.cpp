@@ -791,8 +791,8 @@ The server successfully detected this situation and will download merged part fr
     M(CASBlobOverwrite,  "Number of CAS blob overwrite requests. Growing values indicate repeated replacement writes.", ValueType::Number) \
     M(CASBlobCompareSwap,        "Number of CAS blob compare-and-swap requests. Grows with concurrent metadata updates.", ValueType::Number) \
     M(CASBlobCompareSwapConflict,"Number of CAS blob compare-and-swap conflicts. A non-zero value indicates concurrent update contention.", ValueType::Number) \
-    M(CASBlobHead,       "Number of CAS blob HEAD requests. Grows with blob existence checks and read validation.", ValueType::Number) \
-    M(CASBlobHeadMiss,   "Number of CAS blob HEAD requests that found no object. A non-zero value indicates absent blobs or stale references.", ValueType::Number) \
+    M(CASBlobHead,       "Number of successful backend HEAD requests under CAS blob paths that found an object, aggregated across all callers.", ValueType::Number) \
+    M(CASBlobHeadMiss,   "Number of successful backend HEAD requests under CAS blob paths that found no object, aggregated across all callers.", ValueType::Number) \
     M(CASBlobBodyPutAvoided, "Number of physical CAS blob body publications avoided after a safe presence observation found the object present. Growing values indicate saved upload traffic.", ValueType::Number) \
     M(CASBlobUploadFanoutBatches, "Number of CAS intra-part blob-upload fan-out invocations (one per part publish that had at least one unique blob to upload). Compare with CASBlobUploadFanoutTasks for the average number of unique blobs uploaded per part.", ValueType::Number) \
     M(CASBlobUploadFanoutTasks, "Number of CAS blob-upload tasks dispatched to the fan-out pool (one per unique blob ref across all part publishes). Duplicate references within a part collapse to one task.", ValueType::Number) \
@@ -903,9 +903,9 @@ The server successfully detected this situation and will download merged part fr
     M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of clean metadata records created after publication of an absent blob. Growth indicates new blob publications.", ValueType::Number) \
-    M(CASMetaAdoptBackfill, "Number of clean metadata records backfilled during blob adoption. A non-zero value indicates missing or legacy metadata.", ValueType::Number) \
-    M(CASMetaResurrectClean, "Number of blob metadata records reset to Clean after replacing a condemned body. A non-zero value indicates condemned-body replacement activity.", ValueType::Number) \
+    M(CASMetaCreateClean,  "Number of absent-body publication paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaAdoptBackfill, "Number of blob-adoption paths that attempted a missing-metadata Clean backfill. Counts the attempt, not a guaranteed metadata creation.", ValueType::Number) \
+    M(CASMetaResurrectClean, "Number of condemned-body replacement paths that entered Clean metadata reconciliation. Counts the reason entry, not a guaranteed metadata reset.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \
     M(CASGCRefWalkPlansBuilt, "Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers.", ValueType::Number) \

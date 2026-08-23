@@ -28,7 +28,8 @@ backend validation, the local/emulated backend, and codec/format items.
   The refactor is justified primarily if Azure is the next concrete backend.
 - **[GCS production-grade follow-ups]** — DESIRABLE / RELEASE GATE — Conditional compose for blob
   bodies is obsolete: body publication is unconditional and ordinary multipart now handles objects
-  above `gcs_max_conditional_put_bytes`; the setting applies only to mutable conditional writes.
+  above `gcs_max_conditional_put_bytes`; the setting applies to every conditional non-blob `PUT`,
+  including create-if-absent artifacts and conditional replacements.
   Still open: execute every credentialed `gcs_hmac`/`gcp_oauth` group and the TLS ambiguity driver in
   the [live-results gate](/superpowers/cas/unconditional-blob-publication-live-results), validate the
   ordinary `test_storage_s3` lane once its historical image is available, generation-aware LIST
@@ -40,31 +41,28 @@ backend validation, the local/emulated backend, and codec/format items.
 ## Local / emulated backend {#local-backend}
 
 Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible
-as one body of work instead of scattered minors. Common root: `LocalObjectStorage` writes are plain
-`O_TRUNC` file writes — no atomic PUT and no torn-read protection. Mutable objects still rely on
-conditional operations; blob bodies now use `HEAD` followed by unconditional publication, but require
-complete-object atomic visibility and exact size validation. Nothing in this section affects S3/GCS
-production pools.
+as one body of work instead of scattered minors. Blob bodies now use `HEAD` followed by unconditional
+publication, and `emuPublishBlobAtomically` installs them with a sibling temporary file plus rename.
+Ordinary emulated metadata/ref writes still use `LocalObjectStorage`'s direct `O_TRUNC` path and lack
+atomic visibility to concurrent readers. Nothing in this section affects S3/GCS production pools.
 
-- **[disk-error-audit] temp-file + rename in the local blob write path** — HARD — (moved from the
-  2026-07-21 disk-error audit) `emuWrite` (`CasObjectStorageBackend.cpp:546-557`) streams through
-  `LocalObjectStorage::writeObject`, which opens a plain `WriteBufferFromFile` directly on the final
-  key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write can leave a partial
-  file at the final content-addressed key. The new mandatory `HEAD` plus envelope-adjusted size check
-  refuses that body instead of adopting it, closing the silent-corruption window, but the bad key then
-  blocks progress until repaired. Fix the remaining availability/atomicity debt by writing to a sibling
-  temp name and renaming into place (or by fixing it inside `LocalObjectStorage`). Native S3/GCS mode is
-  not affected because completed object publication is atomically visible. This also closes B66a's
-  torn-read mechanism below.
+- **[disk-error-audit] ✅ CLOSED 2026-08-23: temp-file + rename in the local blob write path** —
+  `ObjectStorageBackend::emuPublishBlobAtomically` writes a fully validated blob body to a sibling
+  `.publish-<uuid>.tmp` object, renames it over the destination under `emu_mutex`, and cleans the
+  temporary file on failure. Deterministic tests cover complete old-or-new visibility and failure
+  cleanup. The independent peak-memory debt remains under
+  [`emulated-resurrect-should-spill-to-disk`](../BACKLOG.md#emulated-resurrect-spill-to-disk).
 - **[B26 / B135] local / NFS / shared-fs as a first-class backend** — DESIRABLE — Unit-tested over
   `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer
   on local/NFS) + multi-mount safety notes. (B66a is the concrete instance of the caveat.)
-- **[B66a] concurrent-fetch torn read of a shared `detached` ref on local storage** — MINOR —
-  `LocalObjectStorage` write is not atomic; a concurrent reader/writer of the SAME ref key can observe
-  a half-written object. Safe on S3 (atomic PUT). Freeze dodged this class by design (one ref per
-  frozen part, no shared container by design); the residual case is concurrent
-  writers of one `detached/<part>` name. Mechanism is closed by the temp-file+rename item above;
-  until then racy multi-writer on local/NFS stays documented-unsafe. Deliberately OUT of the
+- **[B66a] concurrent-fetch torn read of a shared `detached` ref on local storage** — MINOR — OPEN.
+  Ordinary emulated metadata/ref writes still use `emuWrite` and
+  `LocalObjectStorage::writeObject` directly on the final key with `O_TRUNC`; the blob-only
+  `emuPublishBlobAtomically` helper does not cover them. A concurrent reader/writer of the same ref
+  key can therefore observe a half-written object. Safe on S3 (atomic PUT). Freeze dodged this class
+  by design (one ref per frozen part, no shared container); the residual case is concurrent writers
+  of one `detached/<part>` name. Fix ordinary emulated mutable/ref installation with an atomic sibling
+  temporary file plus rename while preserving its lock and token semantics. Deliberately out of the
   2026-07-23 reserved-precommit iteration (orthogonal to the handoff protocol).
 - **[emulated list-token contract]** — MINOR / VERIFY — `ObjectStorageBackend::list`
   in `EmulatedSingleProcess` mode may still return a different token kind than

@@ -20,8 +20,8 @@ genuinely-live long designs keep structured detail below their header line inste
 compressed). Issue IDs are never renumbered.
 
 **Blob-publication baseline since 2026-08-23.** Every blob decision begins with `HEAD`; an absent or
-`Condemned` body is published unconditionally, while mutable metadata/control objects retain native
-conditional operations. The [real-storage gate](/superpowers/cas/unconditional-blob-publication-live-results)
+`Condemned` body is published unconditionally, while metadata/control objects retain native
+conditional operations for create-if-absent and conditional replacement. The [real-storage gate](/superpowers/cas/unconditional-blob-publication-live-results)
 and [performance gate](/superpowers/cas/unconditional-blob-publication-performance) are both still
 blocked for the external/evidence reasons recorded in those reports. Backlog text below marked
 historical or closed must not be read as the current body-publication API.
@@ -33,7 +33,7 @@ historical or closed must not be read as the current body-publication API.
 | [`BACKLOG/ref-protocol.md`](BACKLOG/ref-protocol.md) | 11 | Rev.6 lease-boundary exclusivity, the ref-lane state machine, ref-ledger internals. Top items: `[Late Predecessor PUT]`, `[PART-WRITE-RELEASE-SEAM]`, `[MOUNT-CLAIM-EPOCH-REGRESSION]`. |
 | [`BACKLOG/gc.md`](BACKLOG/gc.md) | 46 | GC scalability & byte cost, correctness/observability follow-ups, throughput-collapse and fsck-vs-GC RCAs. Top items: `[gc-frontier-one-list]`, `[GC-DEFER-DECISION-LIST-COST]`, `[gc-rebuild-lease-interlock]`. |
 | [`BACKLOG/mounts-and-lifecycle.md`](BACKLOG/mounts-and-lifecycle.md) | 10 items + 2 prose sections | Mount-lease/fence recovery, CA disk lifecycle (rev.8 residuals), pool bootstrap, operator recovery. Top items: `[POOL-REFUSAL-NODE-FATAL]`, `[decommission-successor-mount-race]`, disk-lifecycle-leak (deferred, prose section). |
-| [`BACKLOG/formats-and-storage.md`](BACKLOG/formats-and-storage.md) | 23 | Staging/adoption, real-store backends (S3/GCS/Azure), the local/emulated backend, codec/format items. Top items: `[GATE #1: Azure]`, `[disk-error-audit]` temp-file+rename, `[sec4-decoder-size-bounds]`. |
+| [`BACKLOG/formats-and-storage.md`](BACKLOG/formats-and-storage.md) | 23 | Staging/adoption, real-store backends (S3/GCS/Azure), the local/emulated backend, codec/format items. Top items: `[GATE #1: Azure]`, `[B66a]` atomic ordinary emulated writes, `[sec4-decoder-size-bounds]`. |
 | [`BACKLOG/replication.md`](BACKLOG/replication.md) | 7 | `MOVE PART`/`PARTITION` onto CA disks, merge/insert retry vs. the mount-lease fence, cross-replica relink. Top items: `[move-part-to-ca-architecturally-unimplemented]`, `[merge-progress-reset-mount-fence]`, `[RPL-5 slice]`. |
 | [`BACKLOG/testing-and-ci.md`](BACKLOG/testing-and-ci.md) | 39 | Test coverage & harness, gate-filter/gate-suite gaps, soak/chaos hygiene, standing testing-methodology rules. Top items: `[unconditional-blob-publication-live-gate]`, `[gate-filter-gap-3-backend-contract]`, `[4h continuous chaos soak]`. |
 | [`BACKLOG/operability-and-introspection.md`](BACKLOG/operability-and-introspection.md) | 24 | Operability & release gates, disk-error audit follow-ups, fsck/introspection surfaces, the `lazy_load_tables` decision. Top items: `[B197]` SYSTEM control surface, `lazy_load_tables` USER DECISION, `[fsck-partial-degrade-false-consistency]`. |
@@ -438,9 +438,10 @@ publication may use native same-store copy. A `Condemned` or subsequent staged a
 streams so an already-queued exact delete cannot remove the new incarnation.
 
 Consequently, blob bodies above the former ceiling are supported and do not use
-`gcs_max_conditional_put_bytes`. That setting now applies only to genuinely mutable conditional
-metadata/control writes. Native-conditional plumbing remains for those writes, native-token `HEAD`,
-and exact deletion; it is not a blob-body transport.
+`gcs_max_conditional_put_bytes`. That setting now applies to every conditional non-blob `PUT`,
+including create-if-absent metadata/control artifacts and conditional replacements.
+Native-conditional plumbing remains for those writes, native-token `HEAD`, and exact deletion; it
+is not a blob-body transport.
 
 Evidence is intentionally not overstated. The [real-storage results](/superpowers/cas/unconditional-blob-publication-live-results)
 record complete test scenarios, but all 25 credentialed GCS cases skipped because credentials and the
@@ -483,11 +484,12 @@ materializes the complete `[header][payload]` body before installing it. This re
 visibility and bounds concurrency, but peak memory is still the largest single blob even though the
 backing store is a local disk.
 
-The desired follow-up is unchanged in substance: stream to a temporary file under the emulated root
-or pool scratch path, validate the declared size, then install atomically under `emu_mutex`. Temp-file
-lifecycle must be airtight on success, size mismatch, and mid-stream exception. This is emulated-mode
-memory/atomic-install work only; native S3/GCS `publishBlob` already streams or uses native copy and is
-not affected.
+Atomic install itself is already implemented by `emuPublishBlobAtomically`: the fully materialized
+body is written to a sibling temporary object and renamed into place under `emu_mutex`. The separate
+remaining follow-up is to stream directly to that temporary file (or the pool scratch path), validate
+the declared size, and retain airtight cleanup on success, size mismatch, and mid-stream exception.
+This is emulated-mode peak-memory work only; native S3/GCS `publishBlob` already streams or uses
+native copy and is not affected.
 
 ## CAS-021 (issue #2207) adjudication follow-ups: controller-outcome honesty + condemn-memo staleness (2026-08-20) {#cas-021-followups}
 

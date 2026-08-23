@@ -531,10 +531,11 @@ disk-level and server-level settings surface.
   an absent or condemned blob is published unconditionally and its freshness metadata is reconciled
   to `Clean`. A genuine fresh miss issues no metadata GET before publication.
 - `gc_snapshot_generations_to_keep` — `3` by default. Number of past GC snapshot generations retained.
-- `gcs_max_conditional_put_bytes` — `1` GiB by default. Bounds genuine mutable conditional writes on
-  generation-token backends, where the precondition must survive one `PUT`. Blob bodies do not
-  consume a write-response token: their unconditional publication can use ordinary multipart and is
-  not subject to this cap. Irrelevant on `ETag`-based backends such as AWS S3.
+- `gcs_max_conditional_put_bytes` — `1` GiB by default. Bounds every conditional non-blob `PUT` on
+  generation-token backends, where the precondition must survive one request. This includes
+  create-if-absent metadata/control artifacts and conditional replacements. Blob bodies do not
+  consume a write-response token: their unconditional publication can use ordinary multipart and
+  is not subject to this cap. Irrelevant on `ETag`-based backends such as AWS S3.
 - `part_folder_cache_bytes` — `64` MiB by default. Size of the part-folder view cache. `0` disables
   retention; this is a supported permanent operational configuration, not only a debug aid.
 - `part_folder_cache_max_entries` — `10000` by default. Maximum number of entries in the part-folder

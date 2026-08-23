@@ -34,18 +34,20 @@ sequenceDiagram
     Writer->>Writer: hash source, derive key from digest
     Writer->>S3: HEAD blobs/algo/hex
     alt body present
+        S3-->>Writer: present, size, backend token t1
         Writer->>S3: GET .meta (point read, body never streamed)
         alt meta Clean or absent
-            Writer->>Writer: record Materialized proof
+            Writer->>Writer: record token-free BlobDependencyProof::Materialized (never adopt t1)
         else meta Condemned
             Writer->>S3: unconditional publish with fresh envelope
             Writer->>S3: reconcile .meta to Clean
         end
     else body absent
+        S3-->>Writer: absent
         Writer->>S3: unconditional publish
         Writer->>S3: create or reconcile .meta to Clean
     end
-    Writer->>Writer: record Materialized proof
+    Writer->>Writer: record token-free BlobDependencyProof::Materialized (never retain a body token)
 ```
 
 Ordered steps in `PartWriteTxn::ensureBlobPresent`:
@@ -236,7 +238,7 @@ prefix.
 | `blob_hash_allow_new` | Explicit opt-in to admit a new hash algorithm into an existing pool's `algos_used` | `false` |
 | `staging_backend` | Blob staging backend (`local` \| `s3`); `s3` is opt-in | `local` |
 | `scratch_path` | Server-local scratch directory for the local-staging write-buffer spill; a relative value is anchored to the server data path | `""` |
-| `gcs_max_conditional_put_bytes` | Largest genuine mutable conditional write on a generation-token store; unconditional blob publication is not subject to this cap | 1 GiB |
+| `gcs_max_conditional_put_bytes` | Largest conditional non-blob `PUT` on a generation-token store, covering create-if-absent artifacts and conditional replacements; unconditional blob publication is not subject to this cap | 1 GiB |
 
 `GC`-round budgets that gate condemnation and reclaim of these same blobs (graduation, redelete,
 sweep budgets) live on the GC architecture page, not here — they govern the `GC` side of the race

@@ -92,7 +92,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
 | `gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
 | `gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
-| `gcs_max_conditional_put_bytes` | 1 GiB | Largest genuine mutable conditional write on a generation-token store. Blob publication is unconditional, uses ordinary multipart, and is not subject to this cap |
+| `gcs_max_conditional_put_bytes` | 1 GiB | Largest conditional non-blob `PUT` on a generation-token store, including create-if-absent metadata/control artifacts and conditional replacements. Blob publication is unconditional, uses ordinary multipart, and is not subject to this cap |
 | `part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
 | `part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
 | `part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
