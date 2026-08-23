@@ -8,6 +8,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
+#include <Core/UUID.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -294,6 +295,15 @@ uint64_t allocateWriterEpoch(
 
 namespace
 {
+/// Every holder-originated mount body gets a random durable identity. UUIDv4 cannot be zero, but
+/// keep the postcondition explicit because zero is reserved as an uninitialized in-memory value.
+UInt128 newMountWriteAttemptId()
+{
+    const UInt128 id = UUIDHelpers::generateV4().toUnderType();
+    chassert(id != UInt128{});
+    return id;
+}
+
 /// Build a fresh mount-lease body for (uuid, epoch) with the given seq, stamped from `now_ms`.
 MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t now_ms, uint64_t ttl_ms)
 {
@@ -305,6 +315,7 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
         .started_at_ms = now_ms,
         .seq = seq,
         .expires_at_ms = now_ms + ttl_ms,
+        .write_attempt_id = newMountWriteAttemptId(),
     };
 }
 
@@ -924,6 +935,7 @@ String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload)
         .seq = seq_,
         .expires_at_ms = now_ms + ttl_ms,
         .min_active = payload.value2,
+        .write_attempt_id = newMountWriteAttemptId(),
     });
 }
 
@@ -1182,6 +1194,7 @@ void MountLeaseKeeper::terminate()
         .seq = seq + 1,
         .expires_at_ms = now_ms,
         .min_active = std::numeric_limits<uint64_t>::max(),
+        .write_attempt_id = newMountWriteAttemptId(),
     });
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)

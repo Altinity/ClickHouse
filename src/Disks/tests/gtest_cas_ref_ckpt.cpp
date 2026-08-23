@@ -272,7 +272,7 @@ TEST(CASRefCheckpoint, CommittedThroughHasCanonicalExactWireEncoding)
                        .committed_through = RefTxnId{9, 11},
                        .checkpoint_snapshot_id = RefTxnId{9, 10},
                        .last_epoch_seal = RefTxnId{8, 12}};
-    const String expected = R"({"type":"cas_ref_ckpt","v":9}
+    const String expected = R"({"type":"cas_ref_ckpt","v":10}
 {"le":"7","cte":"9","cts":"11","cse":"9","css":"10","lse":"8","lss":"12"}
 )";
 

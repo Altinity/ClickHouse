@@ -326,12 +326,14 @@ TEST(CASObservability, CaInspectDecodesMountLeaseToJson)
     MountLease lease;
     lease.server_uuid = hexToU128("000000000000000000000000000000ab");
     lease.writer_epoch = 5;
+    lease.write_attempt_id = hexToU128("00112233445566778899aabbccddeeff");
     lease.hostname = "host1";
     lease.pid = 123;
 
     const String key = layout.mountKey("srid1");
     const String json = caInspectToJson(layout, key, encodeMountLease(lease));
     EXPECT_NE(json.find("\"writer_epoch\":5"), String::npos);
+    EXPECT_NE(json.find("\"write_attempt_id\":\"00112233445566778899aabbccddeeff\""), String::npos);
     EXPECT_NE(json.find("host1"), String::npos);
 }
 

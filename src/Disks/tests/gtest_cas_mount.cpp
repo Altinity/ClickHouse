@@ -414,6 +414,56 @@ TEST(CASMountLease, AbsentClaimThenRenewBumpsSeq)
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 2u);
 }
 
+TEST(CASMountLease, HolderBodiesMintFreshAttemptIdsAndFenceCopiesIt)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*backend, layout, "r", UInt128{1}, 7, now, 100).kind, MountClaimResult::Claimed);
+    const String key = layout.mountKey("r");
+    const MountLease claimed = decodeMountLease(backend->get(key)->bytes);
+
+    MountLeaseKeeper keeper(backend, layout, "r", UInt128{1}, 7, std::chrono::milliseconds(100), [&] { return now; },
+                            [] { return uint64_t{0}; });
+    keeper.start();
+    keeper.renewOnce();
+    const MountLease renewed = decodeMountLease(backend->get(key)->bytes);
+    EXPECT_NE(claimed.write_attempt_id, UInt128{});
+    EXPECT_NE(renewed.write_attempt_id, UInt128{});
+    EXPECT_NE(claimed.write_attempt_id, renewed.write_attempt_id);
+
+    auto observed = backend->get(key);
+    ASSERT_TRUE(observed.has_value());
+    MountLease fenced = decodeMountLease(observed->bytes);
+    fenced.gc_fenced = true;
+    ++fenced.seq;
+    ASSERT_EQ(backend->putOverwrite(key, encodeMountLease(fenced), observed->token).outcome, PutOutcome::Done);
+    EXPECT_EQ(decodeMountLease(backend->get(key)->bytes).write_attempt_id, renewed.write_attempt_id);
+}
+
+TEST(CASMountLease, ReclaimAndSuccessorBodiesMintNewAttemptIds)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("p");
+    const String key = layout.mountKey("r");
+    ASSERT_EQ(claimMount(*backend, layout, "r", UInt128{1}, 7, 1000, 100).kind, MountClaimResult::Claimed);
+    const MountLease first = decodeMountLease(backend->get(key)->bytes);
+
+    auto observed = backend->get(key);
+    ASSERT_TRUE(observed.has_value());
+    MountLease fenced = decodeMountLease(observed->bytes);
+    fenced.gc_fenced = true;
+    ++fenced.seq;
+    ASSERT_EQ(backend->putOverwrite(key, encodeMountLease(fenced), observed->token).outcome, PutOutcome::Done);
+    const MountLease fence = decodeMountLease(backend->get(key)->bytes);
+    EXPECT_EQ(fence.write_attempt_id, first.write_attempt_id);
+
+    ASSERT_EQ(claimMount(*backend, layout, "r", UInt128{1}, 8, 2000, 100).kind, MountClaimResult::Claimed);
+    const MountLease successor = decodeMountLease(backend->get(key)->bytes);
+    EXPECT_NE(successor.write_attempt_id, first.write_attempt_id);
+    EXPECT_NE(successor.write_attempt_id, UInt128{});
+}
+
 /// STID 3982-3b48: `rm -rf` of the pool dir under a live mount deletes the mount slot object out from
 /// under a running keeper. The next background renewal must fail closed (stop renewing, latch the
 /// write fence to lost) WITHOUT constructing a `LOGICAL_ERROR` -- that aborts debug/ASan builds at
