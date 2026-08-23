@@ -836,3 +836,84 @@ this section is transcribed from the logs of the single full-suite run that prod
 The two caveats round 1 recorded at `{#v9-verdict}` are unchanged and still limit what the gate
 licenses: the `_ckpt` CAS is not one of the sites modelled here, and the catalog-token half of the
 zombie install stays with `CaRefCatalogCore`.
+
+## 2026-08-24 — atomic mount-model regression gate {#2026-08-24-atomic-mount-model-regression-gate}
+
+This is the required regression gate after the focused `CaMountRenewRetryCore` split-phase model
+gate. It reruns the existing atomic `CaCasMountCore` battery unchanged; it does not add transport
+state to this model.
+
+### Abstraction audit {#2026-08-24-abstraction-audit}
+
+`CaCasMountCore.Renew` remains the deliberately atomic successful-renewal abstraction: it advances
+the holder's durable mount deadline and write token together, then refreshes the local
+`fenceUntil` authority. The focused model owns the split phase where a request may have landed but
+the keeper has not yet proved it. The correspondence is only this: a focused local `Committed`
+state has the durable body/token and local-authority postconditions of atomic `Renew`; focused
+terminal outcomes leave local authority fenced and enter this model's existing fence/remount
+boundary. This is an audit correspondence, not a formal refinement. In particular, a landed but
+locally unconfirmed focused state is not claimed to be atomic-model stuttering.
+
+### Config inventory {#2026-08-24-config-inventory}
+
+Compared `git ls-files 'CaCasMountCore_*.cfg'` with the `CONFIGS` table in `run_mount.sh`. The table
+has 22 default rows, covering every tracked green, sabotage, and witness configuration. The only
+tracked configurations outside it are:
+
+- `CaCasMountCore_rev6_observe.cfg`, the documented `SLOW=1` row, expected to remain
+  `incomplete` (or visibly report an improvement if it completes);
+- `CaCasMountCore_empty_actors.cfg`, the separate empty-set survey configuration recorded in
+  `2026-07-30-empty-set-survey.md`, not a green/sabotage/witness battery member.
+
+No tracked green, sabotage, or witness configuration is absent from the runner.
+
+### Fresh asserted battery {#2026-08-24-fresh-asserted-battery}
+
+Command, run from the repository root:
+
+```bash
+docs/superpowers/models/run_mount.sh > tmp/run_mount_2244.log 2>&1
+```
+
+The command exited `0` with `ALL EXPECTATIONS MET`. `run_mount.sh` used its default
+`TLC_WORKERS=1`; the runner's 22 `CONFIGS` rows all reported `PASS`. TLC was
+`tla2tools-official.jar` (`sha256`
+`cc4803dce2a8ffaf0f5920a9dc39df4b5ee34ab4cb53fb58ac557277a7e516b3`), reporting version
+`2026.07.18.145032` revision `30cc360`. Runner elapsed time was 583 seconds. The counts below are
+transcribed from the fresh per-row `tmp/tlc_CaCasMountCore_<name>.log` files; `queue = 0` marks an
+exhaustive green search, while violation/witness runs stop at the first expected counterexample.
+
+| cfg | expectation / result | depth | generated | distinct | queue | s |
+|---|---|---:|---:|---:|---:|---:|
+| `sab_epochreset` | violation `WriterEpochMonotoneUnique` | 6 | 539 | 321 | 230 | 1 |
+| `sab_foreigntakeover` | violation `ForeignUuidNeverAutoTakesOver` | 6 | 585 | 339 | 242 | 0 |
+| `sab_adoptwedge` | violation `NoPermanentWedge` | 6 | 669 | 372 | 264 | 1 |
+| `sab_fenceresurrect` | violation `FenceCostsEpoch` | 7 | 2,551 | 1,088 | 750 | 0 |
+| `sab_wallclockreclaim` | violation `GlobalSupersededWriterMakesNoMutation` | 9 | 111,240 | 24,905 | 15,382 | 1 |
+| `sab_epochwipelive` | violation `SupersededWriterMakesNoMutation` | 9 | 21,920 | 8,606 | 5,581 | 0 |
+| `sab_decomblindbypass` | violation `FenceCostsEpoch` | 14 | 1,755,204 | 528,248 | 259,613 | 6 |
+| `sab_staleinstall` | violation `GlobalSupersededWriterMakesNoMutation` | 10 | 183,007 | 54,878 | 34,670 | 1 |
+| `sab_wedgeretryoldgen` | violation `GlobalSupersededWriterMakesNoMutation` | 10 | 181,242 | 54,956 | 34,720 | 1 |
+| `sab_slotnocompare` | violation `AckedOpsAreDurable` | 7 | 5,300 | 2,276 | 1,682 | 1 |
+| `sab_staleinstall_strictorder` | violation `GlobalSupersededWriterMakesNoMutation` | 11 | 219,350 | 63,123 | 39,811 | 1 |
+| `sab_wedgeretryoldgen_strictorder` | violation `GlobalSupersededWriterMakesNoMutation` | 11 | 217,299 | 63,188 | 39,850 | 1 |
+| `sab_slotnocompare_strictorder` | violation `AckedOpsAreDurable` | 8 | 6,520 | 2,660 | 1,965 | 1 |
+| `stage1` | green | 28 | 51,231,925 | 10,616,665 | **0** | 141 |
+| `v9_recoverygen` | green | 26 | 82,299,033 | 15,658,147 | **0** | 253 |
+| `witness_reclaim` | violation `W_SameUuidReclaimsExpired` | 6 | 584 | 338 | 241 | 0 |
+| `witness_remountafterfence` | violation `W_RemountAfterFence` | 8 | 7,749 | 3,266 | 2,178 | 0 |
+| `witness_observedreclaim` | violation `W_ObservedReclaim` | 10 | 287,089 | 59,375 | 34,702 | 2 |
+| `witness_recoveryafterobservedreclaim` | violation `W_RecoveryAfterObservedReclaim` | 18 | 78,998,500 | 12,981,026 | 5,613,320 | 167 |
+| `witness_genrefused` | violation `W_GenerationRefused` | 9 | 59,473 | 20,209 | 13,632 | 1 |
+| `witness_sealrejected` | violation `W_SealRejectedRetry` | 12 | 1,082,395 | 295,419 | 161,651 | 4 |
+| `witness_ackhappened` | violation `W_AckHappened` | 5 | 213 | 140 | 105 | 0 |
+
+The existing `rev6_observe` incomplete finding is preserved at
+`{#rev6-observe-not-completed}`. It was not part of this default regression command and remains
+distinct from this 22-row asserted regression.
+
+### Verdict {#2026-08-24-atomic-mount-model-regression-verdict}
+
+**GREEN.** The complete committed atomic battery's 22 executed rows matched the runner's exact
+green/violation/witness expectations. This gate records the established mount/remount safety
+battery unchanged; it is not evidence of a formal refinement from the focused retry model.
