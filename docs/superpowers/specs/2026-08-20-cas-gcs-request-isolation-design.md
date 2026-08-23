@@ -18,10 +18,11 @@ current branch already contains the GCS conditional adapter and response generat
 per-request GCS isolation remain authoritative. The later
 [unconditional blob-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
 removed blob-body PUT/copy from its caller set. Blob materialization now starts with native-token
-`HEAD`, then adopts or publishes unconditionally in Default mode; only mutable metadata/control
-writes, native-token `HEAD`, and exact deletion use generation semantics. Historical sections below
-that discuss token-producing blob PUT/copy or their single-`PUT` cap describe the superseded caller
-inventory, not current production code.
+`HEAD`, then adopts or publishes unconditionally in Default mode. All remaining conditional
+non-blob writes use generation semantics, including create-if-absent metadata/control artifacts and
+conditional replacements; native-token `HEAD` and exact deletion use them too. Historical sections
+below that discuss token-producing blob PUT/copy or their single-`PUT` cap describe the superseded
+caller inventory, not current production code.
 
 ## Decision {#decision}
 

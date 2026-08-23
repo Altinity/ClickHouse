@@ -68,7 +68,8 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
     }
 }
 
-/// The generation-store single-PUT cap applies only to genuine mutable conditional operations.
+/// The generation-store single-PUT cap applies to every conditional non-blob write, including
+/// create-if-absent artifacts and conditional replacements. Blob publication remains unconditional.
 TEST(CASContentAddressedSettings, ConditionalPutCapParsesAndDefaults)
 {
     auto with_override = makeConfig(

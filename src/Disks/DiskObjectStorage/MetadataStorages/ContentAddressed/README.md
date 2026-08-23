@@ -96,7 +96,8 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
   `get`/`putIfAbsent`/`casPut`/`deleteExact` with CAS tokens, plus unconditional
   transport-only `publishBlob`),
   `CasObjectStorageBackend`, `CasInMemoryBackend`, `CasInstrumentedBackend`,
-  `CasRequestControl` (single-attempt mutable conditional writes, explicit
+  `CasRequestControl` (single-attempt conditional non-blob writes, including create-if-absent
+  artifacts and conditional replacements, with explicit
   state-aware retries), `CasProbe` (mount-time capability probe).
 - **`Pool/`** — the pool engine: `CasPool` (composition root), `CasPartWriteTxn`
   (one-part write transaction), `CasRefLedger` + `CasRefProtocol` (ref-table
@@ -159,8 +160,9 @@ claim, no capability probe, no writes — the mode `clickhouse-disks` tools and
 post-mortem inspection use. The full knob set (staging backend, cache sizes,
 GC sharding, hash algorithm, request budgets) is parsed in
 `ContentAddressedSettings.cpp`; each knob is documented at its declaration site. Blob publication
-has no presence-cache setting: `HEAD` is mandatory. `gcs_max_conditional_put_bytes` applies only to
-genuine mutable conditional writes, not to multipart-capable blob publication.
+has no presence-cache setting: `HEAD` is mandatory. `gcs_max_conditional_put_bytes` applies to all
+conditional non-blob writes, including create-if-absent artifacts and conditional replacements, but
+not to multipart-capable blob publication.
 
 ## Operations and observability
 

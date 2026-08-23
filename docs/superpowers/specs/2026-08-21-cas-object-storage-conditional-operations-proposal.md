@@ -1,5 +1,5 @@
 ---
-description: 'Narrowed proposal for provider-neutral mutable conditional operations, native-token HEAD, and exact deletion for CAS'
+description: 'Narrowed proposal for provider-neutral conditional non-blob operations, native-token HEAD, and exact deletion for CAS'
 sidebar_label: 'CAS conditional object storage'
 sidebar_position: 2
 slug: /superpowers/specs/cas-object-storage-conditional-operations-proposal
@@ -17,7 +17,8 @@ verification or change its wire behavior.
 The later
 [unconditional blob-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
 removed conditional blob PUT/copy and their response tokens from the production contract. This
-proposal now applies only to mutable metadata/control-object writes, native-version `HEAD`, and
+proposal now applies to every conditional non-blob write, including create-if-absent
+metadata/control artifacts and conditional replacements, plus native-version `HEAD` and
 exact-version deletion. Historical API sketches below that mention conditional streaming blob
 writes, write-once blob copy, or `copyObjectConditional` are retained as decision history and must
 not be implemented as current requirements. Unconditional blob transport belongs to

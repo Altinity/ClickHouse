@@ -800,7 +800,8 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 }
 
 /// See the declaration in the header for the policy. Centralizes the generation-vs-ETag attribution
-/// decision for successful mutable conditional writes.
+/// decision for all successful conditional non-blob writes, including create-if-absent artifacts
+/// and conditional replacements.
 ///
 /// The strict Generation-dialect check below is gated on `etag.has_value()`, not merely on
 /// `native_token_type`: `WriteBufferFromS3` unconditionally assigns `object_etag = outcome.GetResult().GetETag()`
