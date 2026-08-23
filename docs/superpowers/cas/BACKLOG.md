@@ -644,6 +644,21 @@ on one table — NEW defect, no backoff on that loop). CI-env extra: RustFS logs
 its log level in the CA lanes (re-opens the [CAS CI observability gaps] rustfs item at the level
 dimension).
 
+The minimum pre-release fix is specified in
+`docs/superpowers/specs/2026-08-23-cas-mount-renewal-retry-design.md`: ambiguity-aware in-period
+renewal retries, renewal/remount observability, and the snapshot-refusal backoff hole. It deliberately
+does not change the remount protocol.
+
+### Issue #2244 follow-up: per-step remount recovery {#issue-2244-remount-retry-follow-up}
+
+After the minimum renewal fix, replace whole-chain remount retry with an explicitly modeled state
+machine. Required design questions: per-step retry classification; which owner/catalog/epoch results
+may be preserved; whether an own ambiguous claim preserves or resets token-stability observation;
+prevention of repeated epoch burning; cancellation at every teardown boundary; and deterministic
+fault injection before/after every state-changing step. This is safety-critical single-writer work and
+requires its own focused TLA+ gate plus a refinement audit against `CaCasMountCore`; do not fold it into
+the minimum renewal implementation without that design review.
+
 Triage bonus recorded: the RustFS "Erasure decode failed ... downstream_closed" error class is a red
 herring = ClickHouse's silent-by-design mid-body aborts (cancellations, LIMIT, abandoned prefetch);
 do not chase it in future triage.
