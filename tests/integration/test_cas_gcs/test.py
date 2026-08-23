@@ -1165,16 +1165,11 @@ def test_a_write_whose_response_carries_no_generation_is_refused():
     missing generation. So a regression that replaced the strict branch with a HEAD-and-adopt fallback
     turns the error assertion red on its own.
 
-    Do NOT add an assertion here about which requests follow that write. Two forms were tried and both
-    had to be removed, for a reason no assertion on this seam can escape: what follows depends on WHICH
-    controlled lane the refused write happened to be on, and which object gets refused first varies
-    between runs. `putIfAbsentControlled` treats any raising attempt as unresolved and then runs
-    `resolveByExactGet`, so a HEAD and a GET of the key follow; `conditionalCreateControlled` filters
-    the attempt through `isDeterministicLocalFailure`, which lists `CORRUPTED_DATA`, and propagates
-    without resolving, so nothing follows at all. A manifest write takes the first lane and a blob write
-    the second, and nothing on the wire distinguishes a manifest put from a blob create — so the test
-    cannot know whether a resolve is expected, and `omit_generation` is global, so which object draws the
-    short straw varies between runs.
+    Do NOT add an assertion here about which requests follow that write. The remaining conditional
+    metadata/control lane may classify an unattributed attempt as unresolved and call
+    `resolveByExactGet`, while the globally enabled injection can be consumed by more than one object
+    kind. Blob-body publication is no longer part of this test: it is unconditional, consumes no
+    response generation, and therefore cannot be the source of this refusal.
 
     What fences the behaviour is the error text above, and nothing else here needs to.
 

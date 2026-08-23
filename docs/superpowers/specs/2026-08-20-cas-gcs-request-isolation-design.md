@@ -14,6 +14,15 @@ current branch already contains the GCS conditional adapter and response generat
 (`41a247e3310`), plus their authentication-wide wiring and the `gcs_hmac` client
 (`9604d6a5be9`); their current behavior and the required target-state changes are described below.
 
+**Blob-publication supersession (2026-08-23):** the typed `NativeConditional` carrier and its
+per-request GCS isolation remain authoritative. The later
+[unconditional blob-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
+removed blob-body PUT/copy from its caller set. Blob materialization now starts with native-token
+`HEAD`, then adopts or publishes unconditionally in Default mode; only mutable metadata/control
+writes, native-token `HEAD`, and exact deletion use generation semantics. Historical sections below
+that discuss token-producing blob PUT/copy or their single-`PUT` cap describe the superseded caller
+inventory, not current production code.
+
 ## Decision {#decision}
 
 GCS authentication and CAS generation-token semantics are independent concerns. An ordinary
@@ -116,7 +125,7 @@ the operation routing around them.
   call sites.
 - Preserve existing CAS configuration and persistent token formats.
 - Do not rename or remove a non-CAS authentication option.
-- Fail closed when generation semantics, exact deletion, single-PUT limits, metadata round trips,
+- Fail closed when generation semantics, exact deletion, mutable-write single-PUT limits, metadata round trips,
   or bucket-versioning safety cannot be verified.
 
 ## Non-goals {#non-goals}

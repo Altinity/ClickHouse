@@ -19,6 +19,13 @@ instead of scanning one flat multi-hundred-item file. Item format is uniform:
 genuinely-live long designs keep structured detail below their header line instead of being
 compressed). Issue IDs are never renumbered.
 
+**Blob-publication baseline since 2026-08-23.** Every blob decision begins with `HEAD`; an absent or
+`Condemned` body is published unconditionally, while mutable metadata/control objects retain native
+conditional operations. The [real-storage gate](/superpowers/cas/unconditional-blob-publication-live-results)
+and [performance gate](/superpowers/cas/unconditional-blob-publication-performance) are both still
+blocked for the external/evidence reasons recorded in those reports. Backlog text below marked
+historical or closed must not be read as the current body-publication API.
+
 ## Topic files {#topics}
 
 | File | Items | Covers |
@@ -28,7 +35,7 @@ compressed). Issue IDs are never renumbered.
 | [`BACKLOG/mounts-and-lifecycle.md`](BACKLOG/mounts-and-lifecycle.md) | 10 items + 2 prose sections | Mount-lease/fence recovery, CA disk lifecycle (rev.8 residuals), pool bootstrap, operator recovery. Top items: `[POOL-REFUSAL-NODE-FATAL]`, `[decommission-successor-mount-race]`, disk-lifecycle-leak (deferred, prose section). |
 | [`BACKLOG/formats-and-storage.md`](BACKLOG/formats-and-storage.md) | 23 | Staging/adoption, real-store backends (S3/GCS/Azure), the local/emulated backend, codec/format items. Top items: `[GATE #1: Azure]`, `[disk-error-audit]` temp-file+rename, `[sec4-decoder-size-bounds]`. |
 | [`BACKLOG/replication.md`](BACKLOG/replication.md) | 7 | `MOVE PART`/`PARTITION` onto CA disks, merge/insert retry vs. the mount-lease fence, cross-replica relink. Top items: `[move-part-to-ca-architecturally-unimplemented]`, `[merge-progress-reset-mount-fence]`, `[RPL-5 slice]`. |
-| [`BACKLOG/testing-and-ci.md`](BACKLOG/testing-and-ci.md) | 38 | Test coverage & harness, gate-filter/gate-suite gaps, soak/chaos hygiene, standing testing-methodology rules. Top items: `[gate-filter-gap-3-backend-contract]`, `[rule-no-chassert-over-handled-branch]`, `[4h continuous chaos soak]`. |
+| [`BACKLOG/testing-and-ci.md`](BACKLOG/testing-and-ci.md) | 39 | Test coverage & harness, gate-filter/gate-suite gaps, soak/chaos hygiene, standing testing-methodology rules. Top items: `[unconditional-blob-publication-live-gate]`, `[gate-filter-gap-3-backend-contract]`, `[4h continuous chaos soak]`. |
 | [`BACKLOG/operability-and-introspection.md`](BACKLOG/operability-and-introspection.md) | 24 | Operability & release gates, disk-error audit follow-ups, fsck/introspection surfaces, the `lazy_load_tables` decision. Top items: `[B197]` SYSTEM control surface, `lazy_load_tables` USER DECISION, `[fsck-partial-degrade-false-consistency]`. |
 | [`BACKLOG/performance.md`](BACKLOG/performance.md) | 26 | Read/write path, write-path optimization candidates, stage 2 (postponed), scalability findings from the full-scale campaign. Top items: `[ckpt-read-policy]`, `[ref-catalog-write-hotspot]`, stage-2 concurrent commitPart (postponed). |
 | [`BACKLOG/docs-and-cleanup.md`](BACKLOG/docs-and-cleanup.md) | 25 | Architecture/refactoring (no behavior change), minor/polish, source-layout residue, standing hygiene checklist items. Top items: `[refactor: CasGc split]`, `[Group G]` upstream carve-outs, `[phase4-blob-uploader-descoped]`. |
@@ -417,52 +424,33 @@ continuing the ID series, not renumbering anything above.
 - **[s3cache-config-comment-stale] stale comment in `utils/ca-soak/configs/storage_conf_s3cache_ch1.xml`** — MINOR — The comment claims cache-over-CA fails with `NOT_IMPLEMENTED`; this was fixed by `3ed0e5f5030` (2026-07-08) and the cache-over-CA path is now live-validated (see the quick-start cache example, `380688e8a66`). Remove the stale comment.
 - **[part-folder-validate-never-gating] `part_folder_validate=never` needs a gate, not a silent accept** — HARD (user settings-policy direction) — `PartFolderAccess.h:135-138` accepts `never` (skip the `ForceFresh` body re-proof entirely) with no acknowledgment of the risk. Either remove the `never` value or require an explicit risk-acknowledgment setting alongside it. Docs already carry a strong warning on this value (`configuration.md`); the code should not make it this easy to select silently.
 - **[gc-enabled-false-silent] `gc_enabled=false` accumulates garbage silently** — HARD (user settings-policy direction) — Disabling the background GC scheduler produces no ongoing signal that reclamation has stopped. Add a periodic warning log line plus a metric while `gc_enabled=false` and the pool has reclaimable debris, so an operator who disabled GC for a legitimate reason (or by mistake) finds out before the pool grows unbounded.
-- **[dedup-presence-only-window-recheck] re-verify the deduplication presence-only-admit corruption window** — VERIFY (user-flagged from memory, re-derive from the disk-error audit) — The 2026-07-21 disk-error audit (operability-and-introspection.md, disk-error-audit-followups) identified a presence-only dedup admit as a corruption-window class; re-verify against HEAD whether this window is still open post the format/staging changes since that audit, and either close it out or fold it back into an active item with current evidence.
+- **[dedup-presence-only-window-recheck] ✅ CLOSED by the unconditional blob-publication rewrite (2026-08-23); kept for provenance** — The presence cache was deleted. Every blob decision now begins with an exact blob `HEAD`, validates the observed envelope-adjusted size, and only then adopts or publishes. The surviving local-store atomic-install debt is tracked in `BACKLOG/formats-and-storage.md`; it can fail publication or leave a bad object that the size check refuses, but cannot silently admit a truncated body.
 
-## `[gcs-conditional-overwrite-rethink]` GCS conditional overwrite needs re-thinking from the premise, not a bigger cap {#gcs-conditional-overwrite-rethink}
+## `[gcs-conditional-overwrite-rethink]` ✅ CLOSED: blob publication is unconditional and no longer GCS-capped {#gcs-conditional-overwrite-rethink}
 
-**SCOPE NARROWED (2026-08-04): the resurrect path no longer has this problem.** The condemned-blob
-  > **Correction (opus-review triage, 2026-08-22):** stale — `resurrect` now routes through
-  > `tokenProducingWriteSettings` and IS bound by the same single-PUT cap, so the "size-unlimited on
-  > GCS too" claim above no longer holds. The setting was also renamed
-  > `gcs_max_conditional_put_bytes` → `gcs_max_token_producing_put_bytes` (no alias).
-resurrect is now an UNCONDITIONAL write (`Backend::resurrect`): on remote object storage it streams
-and takes multipart -- size-unlimited on GCS too; the local emulated mode materializes one body at a
-time (see the spill-to-disk debt below). What remains capped is the CONDITIONAL write-once
-CREATE (`If-None-Match`), still forced single-part under `gcs_max_token_producing_put_bytes` (renamed
-from `gcs_max_conditional_put_bytes` with no alias -- the old name is now rejected as unknown) -- so this
-item is now only about creating a blob larger than the cap on GCS, and everything below about the
-overwrite/resurrect shape is historical context.
+Closed by the [unconditional blob-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
+and its implementation on 2026-08-23. The historical problem was real: GCS does not enforce the
+required destination precondition at multipart completion, so a conditional blob-body design either
+needed a one-part ceiling or a more elaborate compose protocol. The implemented answer removes the
+premise instead. Every blob decision starts with `HEAD`; an absent or `Condemned` body is then
+published unconditionally. Fresh streaming uses ordinary multipart, and the first absent staged
+publication may use native same-store copy. A `Condemned` or subsequent staged attempt retags and
+streams so an already-queued exact delete cannot remove the new incarnation.
 
-GCS honours no preconditions on multipart completion — Google's own XML API documentation says
-"Preconditions are not supported in the requests", and it was measured independently on 2026-07-03
-(`0a3bc2f1fc6`). A lost precondition there does not fail the write, it **silently overwrites**, which
-is the one outcome CAS's whole token protocol exists to prevent. Hence `s3_force_single_part_upload`
-for generation-token stores, and `gcs_max_token_producing_put_bytes` (1 GiB, formerly
-`gcs_max_conditional_put_bytes`) as its forced companion: with
-multipart off, the body must go in ONE part, buffered whole in RAM.
+Consequently, blob bodies above the former ceiling are supported and do not use
+`gcs_max_conditional_put_bytes`. That setting now applies only to genuinely mutable conditional
+metadata/control writes. Native-conditional plumbing remains for those writes, native-token `HEAD`,
+and exact deletion; it is not a blob-body transport.
 
-The consequences are larger than a settings row suggests, and they are worth re-deriving rather than
-patching:
-
-- **A conditional overwrite of a body above the cap is impossible on GCS**, not slow. Blob bodies have
-  no size cap, so a large-enough blob simply cannot be resurrected from a condemned incarnation there.
-- **Raising the cap does not help**, it just moves the memory ceiling: one part means one RAM buffer.
-- The streaming design (`docs/superpowers/specs/2026-08-04-cas-streaming-conditional-overwrite-design.md`)
-  fixes S3 and deliberately does NOT fix this — it only makes the limit fail early and legibly.
-
-The mechanism named when the limit was introduced is: unconditional multipart to a TEMPORARY key, then
-a CONDITIONAL `Compose` onto the target. ClickHouse already carries `S3::ComposeObjectRequest` and
-`Client::ComposeObject` (added for GCS copy), but the request exposes no precondition — it would need
-`x-goog-if-generation-match` through `GetRequestSpecificHeaders`, i.e. a change to SHARED UPSTREAM code
-in `src/IO/S3/`. It also creates a debris class that does not exist today: temporary keys orphaned by a
-crash between the upload and the compose, which GC or fsck must then own.
-
-**What to re-think, before designing that.** Whether `Compose` is even the right primitive; whether the
-temp-key debris is acceptable given that every other CAS object is either write-once or exactly-token
-deleted; whether GCS should instead be documented as supporting CAS only below a stated blob size;
-and whether the upstream change is worth it for one backend. The answer may legitimately be "cap it,
-document it, and refuse bigger blobs" — that is a design decision, and it has not been made.
+Evidence is intentionally not overstated. The [real-storage results](/superpowers/cas/unconditional-blob-publication-live-results)
+record complete test scenarios, but all 25 credentialed GCS cases skipped because credentials and the
+TLS fault driver were unavailable; release readiness is blocked. `test_storage_s3` is also blocked by
+the unavailable `clickhouse/clickhouse-server:23.3.19.33.altinitystable` image. The
+[performance report](/superpowers/cas/unconditional-blob-publication-performance) records passing
+target-only runs, but no matched same-environment pre-change binary; its control-adjusted sequence
+ratios are not a code-version delta, so performance acceptance is also blocked pending a matched pair
+and explicit human acceptance. The earlier cap/compose analysis remains in git history as the decision
+record that led to this simpler protocol.
 
 
 ## `[gc-deferred-round-pays-full-list]` A Deferred GC round still pays the full ref-prefix listing — measured at 23% of server CPU under the parallel stateless lane {#gc-deferred-round-pays-full-list}
@@ -487,34 +475,28 @@ Two independent contributors, each with its own fix:
    from completed tests kept scanning for the rest of the run. The lifecycle redesign
    (`UNMOUNT` stops background work and ejects the disk) subsumes this half.
 
-## `[emulated-resurrect-should-spill-to-disk]` The emulated resurrect sits ON a local disk and still builds the body in RAM {#emulated-resurrect-spill-to-disk}
+## `[emulated-resurrect-should-spill-to-disk]` Emulated `publishBlob` should spill before atomic install {#emulated-resurrect-spill-to-disk}
 
-The emulated (local object storage) resurrect materializes the whole `[header][payload]` in a
-`String` before installing it. Today this is bounded by serializing resurrections process-wide — one
-body at a time, so the peak is the largest single body — which restored the guarantee the deleted
-byte-weighted admission used to give. But the bound is the wrong SHAPE for this backend: the whole
-point of the emulated mode is that the storage IS a local disk, so the natural staging area for a
-body of any size is a scratch file next to the destination, not gigabytes of RAM.
+**REFRAMED 2026-08-23; identifier and history preserved.** The separate resurrection API was deleted.
+The remaining debt is `ObjectStorageBackend::publishBlob` in `EmulatedSingleProcess` mode: it
+materializes the complete `[header][payload]` body before installing it. This retains complete-object
+visibility and bounds concurrency, but peak memory is still the largest single blob even though the
+backing store is a local disk.
 
-The debt: stream the reader into a temp file under the emulated root (or the pool scratch path),
-then install it under `emu_mutex` — rename where the object layout allows it, read-back+`emuWrite`
-where it does not. That removes both the materialization AND the serialization (no reason to run
-resurrections one at a time once they stop competing for RAM), and the size guard moves to the spill
-loop, still refusing before anything becomes current. Temp-file lifecycle must be airtight on every
-exit path: success, size mismatch, exception mid-drain — no residue in any outcome.
-
-Not urgent: the emulated mode serves CI lanes, local development, and tests — no production
-deployment runs CAS over local paths, and a single materialized body was this path's behaviour for
-its whole life. It is recorded because the current shape is a contradiction (a disk-backed backend
-buffering in memory), not because anything is on fire.
+The desired follow-up is unchanged in substance: stream to a temporary file under the emulated root
+or pool scratch path, validate the declared size, then install atomically under `emu_mutex`. Temp-file
+lifecycle must be airtight on success, size mismatch, and mid-stream exception. This is emulated-mode
+memory/atomic-install work only; native S3/GCS `publishBlob` already streams or uses native copy and is
+not affected.
 
 ## CAS-021 (issue #2207) adjudication follow-ups: controller-outcome honesty + condemn-memo staleness (2026-08-20) {#cas-021-followups}
 
 Adjudication of https://github.com/Altinity/ClickHouse/issues/2207 (two read-only code sweeps against
-HEAD `684161dcc03`): all six quoted controller behaviors are real, but every claimed integrity
-consequence is neutralized on the current tree — the delete path is guarded by the normative
-delete-site in-degree re-read (`CasBlobInDegree.cpp:423`, spec §5 arm 3), the exact-token delete
-against a resurrect-rotated `incarnation_tag` (`CasPartWriteTxn.cpp:741`), and the [C2] fence checks;
+HEAD `684161dcc03`; updated for the 2026-08-23 rewrite): the controller-outcome observation remains
+relevant to mutable blob metadata, but the old conditional body-displacement branch was deleted. The
+claimed integrity consequence remains neutralized — the delete path is guarded by the normative
+delete-site in-degree re-read, exact-token deletion cannot remove a fresh retagged publication, and
+the writer checks its admitted fence generation before publication;
 the equality-resolved meta etag is consumed by NOBODY (`writeCondemnedMeta` reads only `.outcome`);
 the ref-log lane adjudicates authorship by byte equality over a payload that carries txn identity
 (`classifyRefLogOccupant`, `CasRefLedger.cpp:2240`); a false-`Occupied` → mount-fault path does not
@@ -531,21 +513,21 @@ Follow-ups, in recommended packaging:
   pointers to the three system invariants that make it safe) and the ownership-decidability table by
   key class (immutable content-addressed / mutable identity-in-payload / mutable identity-free /
   owner-anchor `claimOwnerOrThrow`); cross-reference sentences at `writeCondemnedMeta` ("a foreign
-  Condemned marker satisfies the predicate by design, same as the `:137` arm") and
-  `writeResurrectMetaClean` ("false Committed = desired Clean record already durable — benign");
+  `Condemned` marker satisfies the predicate by design") and `reconcileMetaClean` ("an
+  equality-resolved desired `Clean` record is already durable");
   rename the pin tests to read as spec. ~150-250 line diff + test renames; controller = adversarial
   review mandatory. This addresses the CORE of CAS-021 at the type level: the external auditor's
   reading becomes impossible to write.
 - (2) **Stale condemn-marker memoization — ACCEPTED RESIDUAL, do NOT fix with re-reads** (user
   decision 2026-08-20): the in-process `condemn_markers_confirmed` note survives a legitimate
-  `Condemned -> Clean` transition (no `forgetCondemnMarker` on resurrect-without-intervening-fold),
+  `Condemned -> Clean` transition (no `forgetCondemnMarker` on writer replacement without an intervening fold),
   so `confirm_condemned_marker` (`CasGc.cpp:1885`) can graduate an entry whose durable meta says
   Clean. Consequence when it fires (ultra-rare race): ONE spurious `deleteExact` — an S3 DELETE,
   which is FREE — self-healing at `CasGc.cpp:862-870` (TokenMismatch drops the confirmation, meta
   untouched). The re-read fix would cost +1 BILLABLE GET per graduating condemned entry on the
   COMMON path (P9 GET-budget class) to save free DELETEs in a rare race — worse than the disease.
-  No zero-cost invalidation exists either (the window is by definition "nothing observed the
-  resurrect"). Only sanctioned improvement: the observability LABEL at the self-heal site (counter/
+  No zero-cost invalidation exists either (the window is by definition "nothing observed the fresh
+  replacement"). Only sanctioned improvement: the observability LABEL at the self-heal site (counter/
   log as "spared by token rotation", not an anomaly) — zero extra requests; fold into (1) if done.
 - (3) One trust-model paragraph for conditional writes in the numbered doc set
   (`03-writer-protocol.md`) — documentation only.
@@ -815,10 +797,11 @@ then omits `If-Match` for an empty string (`WriteBufferFromS3.cpp:656-657,746-74
 write becomes an unconditional clobber. Emulated/InMemory backends fail closed, so the gap is
 Native-only and invisible to the emu doubles.
 
-No call site passes an empty token by construction (all guard `head.exists` or use
-`optional<Token>`), and `resurrect` already throws on one (`:1154`) — i.e. the guard is intended,
-just not applied uniformly. The one path that can legitimately produce an empty token on a `Done`
-write is `tokenFromWriteResult`'s HEAD-fallback (`:879-880`), whose value flows into
+No call site intentionally passes an empty expected token: callers either guard `head.exists` or use
+`optional<Token>`. Generation-token paths additionally validate the numeric generation value, but an
+empty ETag can still pass the type-only guard in `putOverwrite`, `casPut`, or `deleteExact`. The one
+path that can legitimately produce an empty token on a `Done` write is `tokenFromWriteResult`'s
+`HEAD` fallback, whose value flows into
 `SingleWriterSlot::last_token` (`CasServerRoot.cpp:1291-1295 → :1186/:1337`); reaching it needs two
 simultaneous store anomalies. Fix: reject an empty ETag token at the conditional-write entry
 (fail-closed `LOGICAL_ERROR`-class throw) so no future call site can turn a fence into a clobber,

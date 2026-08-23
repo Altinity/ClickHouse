@@ -20,7 +20,7 @@ disk-error hardening, fsck/introspection surfaces, and the `lazy_load_tables` de
 - **[B15/B99/B169/B159] `system.*` views for pool/blob/part refcounts + `clickhouse-disks` decode/introspect** — HARD (PARTIAL) — GC log + event log + `content_addressed_mounts` + ca-fsck/dryrun/rebuild/ca-inspect CLI done; per-part/ref `system.*` views + a top-down decode/traversal surface not yet. (INTROSPECTION-1/2 close signals.)
 - **[B13] migration path for existing tables** — HARD — `ALTER TABLE … MOVE PARTITION` to a `content_addressed` disk re-packs; mixed-version rollout rule (read-new-before-write-new; format self-check fails closed) + a rollout-safety spec.
 - **[F1-prod] read-only same-pool shadow disk (`ca_ro`) breaks table load on restart** — GATE (prod) — MergeTree part discovery finds every part twice → `UNKNOWN_DISK` on restart with CA tables. Stand workaround shipped (standalone `clickhouse-disks -C` fsck-only config; propagated to the default stand); PRODUCT fix (part discovery skips `readonly` same-pool disks, or a `hidden`/`introspection_only` disk flag) still open; `10replicas`/`gc_shards2`/`awss3` server configs may still embed `ca_ro`.
-- **[B165] server OOM at hour-4 soak (~49 GiB RSS)** — VERIFY — Not reproduced since the `putBlob` streaming fix; re-run a long soak to confirm resolved.
+- **[B165] server OOM at hour-4 soak (~49 GiB RSS)** — VERIFY — Not reproduced since the streaming `publishBlob` path landed; re-run a long soak to confirm resolved. Emulated/local publication still materializes one complete body and is tracked separately by `[emulated-resurrect-should-spill-to-disk]`.
 - **[B14] expedited / GDPR right-to-erasure delete** — DESIRABLE — Under GC lock, confirm no live ref, then delete bypassing the two-phase graduation delay; no layout change.
 - **[B17] encryption-at-rest × content-addressing** — DESIRABLE — Dedup scope per-encryption-key; local to key/hash derivation.
 - **[B131] repo hygiene + M-W comment sweep** — GATE — 30 dangling `M-W`/`D-W1`/`2026-06-12-ca-core-m-w` comment references across 13 src files (incl. `ContentAddressedMetadataStorage.{h,cpp}`, `CasGcScheduler.h`, `DataPartsExchange.cpp:106`) reference the deleted plan — sweep to self-contained wording. Non-shippable files: `poc/cas_mergetree/` already deleted (F1 landed); the untracked empty `poc/` husk remains.
@@ -30,11 +30,12 @@ disk-error hardening, fsck/introspection surfaces, and the `lazy_load_tables` de
 Staging/target/GC disk-error audit verdict held (staging ENOSPC fail-loud, Native S3 corruption-free,
 GC decision-durable-before-delete). Residual gaps, ordered by value:
 
-- **HARD: size guard at dedup-admit** — `PartWriteTxn::observeAndAdmit` never compares the observed
-  size against the caller's expected size, so a truncated object at a content-addressed key can be
-  admitted as a dedup hit, producing a durably unreadable part.
+- **✅ CLOSED: size guard at blob adoption** — `PartWriteTxn::ensureBlobPresent` now subtracts the
+  envelope length from the mandatory `HEAD` size and compares the logical result with the source;
+  loaded metadata size is checked too. A truncated object is refused as `CORRUPTED_DATA`, not adopted.
 - **HARD: temp-file + rename in the local blob write path** — tracked in formats-and-storage.md
-  (`disk-error-audit`), paired with the guard above.
+  (`disk-error-audit`). The guard above prevents silent adoption but does not make local publication
+  atomic or remove a partial final key after failure.
 - **DESIRABLE: fsck physical-size check for blob bodies** — `runFsck` HEADs every blob but never
   compares physical size against the expected size, so a truncated blob passes as `Reachable`; the
   listing already carries the sizes, so this is free.
@@ -47,9 +48,10 @@ GC decision-durable-before-delete). Residual gaps, ordered by value:
 - **DESIRABLE: GC scheduler backoff + a distinct storage-full signal** — the pacing loop retries a
   failing round forever with no backoff and no ProfileEvent distinguishing target-storage-full from
   generic instability.
-- **VERIFY: late-landing conditional PUT after fence loss** — same hazard class as the historical
+- **VERIFY: late-landing mutable conditional PUT after fence loss** — same hazard class as the historical
   Late-Predecessor-PUT item (ref-protocol.md); confirm successor-side `writer_epoch` gating rejects it,
-  fold into rev.6 lease work rather than tracking separately.
+  fold into rev.6 lease work rather than tracking separately. Blob-body PUT/copy is unconditional and
+  covered by dependency proof, fresh-envelope retagging, and exact-delete safety instead.
 - **MINOR: destructor-`abandon` live-epoch precommit debris** — if `abandon` fails during a failed
   transaction's destruction, the live-epoch precommit binding persists until remount; bounded, but
   worth a periodic re-`abandon` retry under a persistently broken backend.
@@ -365,9 +367,8 @@ a QUERYABLE surface listing the currently-wedged namespaces —
 
 ## ProfileEvents surface residuals {#profileevents-surface-residuals}
 
-Two small, non-correctness residuals in the CAS `ProfileEvents` surface. Both are cosmetic
-observability debt: nothing in the write or GC protocol depends on these counters, and neither can
-lose or corrupt data.
+One small, non-correctness residual remains in the CAS `ProfileEvents` surface. The former blob
+presence-cache/accounting half is closed below for provenance.
 
 **(a) The `CASServer*` row is unreachable, so eleven shipped counters are permanently zero.**
 `classifyCasNs` returns only `Blob`, `Manifest`, `Root`, `Gc` and `Other`
@@ -387,18 +388,10 @@ lease activity itself is not unobservable meanwhile: `system.content_addressed_l
 `MountClaim`/`MountRelease`/`MountConflict`/`WatermarkRenew`/`GcLease*`
 (`Primitives/CasEvent.h:30-33`) and `system.content_addressed_mounts` exposes the slots.
 
-**(b) `CASBlobBodyPutAvoided` over-counts on the condemned HEAD-first hit.** In the HEAD-first
-branch the counter (and `CASBlobDeduplicationCacheHit`) is incremented as soon as the `head` reports
-present (`Pool/CasPartWriteTxn.cpp:210-214`), before `observeAndAdmit` decides whether that
-incarnation is admissible. When it is condemned, `observeAndAdmit` throws `ABORTED`
-(`:391`), the branch swallows exactly that code (`:222-228`) and falls through to
-`uploadFromSource` (`:241`) — the body IS sent, yet the "body PUT avoided" event already fired. Only
-`ABORTED` is swallowed, so this is drift on a rare race path, not a hidden failure; move both
-increments below the successful `observeAndAdmit` to close it. `CASBlobHeadFirst` (`:208`) is
-correctly placed — a HEAD really was issued. Related stale prose: `Pool/CasPool.cpp:250-253` still
-says the dedup-cache seam is probed "up to twice ... once more just to attribute
-`CASBlobBodyPutAvoided` to the cache" and names the caller `putBlob`; at HEAD the membership is read
-exactly once into `cache_hit` (`CasPartWriteTxn.cpp:202`) and the caller is `uploadBlobDetached`.
+**(b) ✅ CLOSED by the unconditional blob-publication rewrite.** The presence cache and its cache-only
+events were deleted. `CASBlobBodyPutAvoided` now increments only after mandatory blob `HEAD`, size
+validation, metadata classification, and fence checks have established a safe present observation.
+A `Condemned` body proceeds to unconditional publication without incrementing the avoided-body event.
 
 ## `FsckReport::clean` asserts more than the scan checked — no coverage flag for a skipped check family (2031-triage CAS-100) {#fsck-clean-verdict-has-no-coverage-flag}
 
@@ -446,7 +439,7 @@ when the disk object is CREATED. On a config reload `DiskSelector::updateFromCon
 `ContentAddressedMetadataStorage` does not override that virtual — the base is an empty no-op
 (`src/Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h:365-368`; only
 `MetadataStorageFromCacheObjectStorage` overrides it, to forward to the underlying storage). So an
-operator who edits `gc_interval_sec`, `deduplication_cache_bytes`, `part_folder_cache_bytes`,
+operator who edits `gc_interval_sec`, `part_folder_cache_bytes`,
 `part_folder_validate`, `manifest_decode_cache_bytes`, any `gc_round_*` budget, ... and reloads gets a
 successful reload, no log line, and no behaviour change. The S3 half of the same disk block DOES
 reload (`DiskObjectStorage.cpp:988-989`), which makes the split especially surprising.
@@ -454,7 +447,7 @@ reload (`DiskObjectStorage.cpp:988-989`), which makes the split especially surpr
 Not every setting is reloadable in principle — `server_root_id`, `gc_shards`, `blob_hash`,
 `scratch_path`, `staging_backend` are pool-/mount-creation identities and must stay creation-time
 only. Owed shape: an `applyNewSettings` override that (a) re-parses the block, (b) applies the
-genuinely dynamic subset (GC cadence and the per-round budgets, the cache byte/entry budgets,
+genuinely dynamic subset (GC cadence and the per-round budgets, the remaining cache byte/entry budgets,
 `part_folder_validate`, `gc_enabled` — the last already has runtime verbs, `SYSTEM CAS GC
 STOP`/`START`), and (c) LOGS a warning naming any changed creation-time key as ignored-until-restart,
 instead of today's silence. Fixing this also removes a second silent surface: the unknown-key gate

@@ -57,6 +57,24 @@ join in this script draws on the same `verdicts.jsonl` that residual applies to,
 for a cluster inside that unswept pool carries the same accepted uncertainty the T7 report already documents
 (`verdicts/audit-t7/gate-c-audit-report.md`).
 
+## Post-freeze unconditional-publication routing {#post-freeze-unconditional-publication-routing}
+
+The 421-file counts above describe the 2026-08-04 frozen corpus and are intentionally unchanged.
+The following 2026-08-21 through 2026-08-23 files postdate that freeze and therefore need explicit
+routing outside the generated totals:
+
+| File | Fate |
+|---|---|
+| `docs/superpowers/specs/2026-08-21-cas-unconditional-blob-publication-design.md` | KEEP-IN-PLACE: current design for mandatory blob `HEAD`, unconditional body publication, shared monotonic `publication_attempted`, metadata reconciliation, and retained mutable conditional operations |
+| `docs/superpowers/plans/2026-08-22-cas-unconditional-blob-publication.md` | KEEP-IN-PLACE as the implementation and verification record; superseded API names inside completed task history are not current-code claims |
+| `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-live-results.md` | KEEP-IN-PLACE: release-gate record; credentialed GCS cases have not run and `test_storage_s3` is externally blocked, so it is not a completion claim |
+| `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md` | KEEP-IN-PLACE: target-only measurement record; no matched pre-change binary exists and performance acceptance remains blocked |
+| `docs/superpowers/specs/2026-08-20-cas-gcs-request-isolation-design.md` | KEEP-IN-PLACE with a supersession note: typed NativeConditional request state remains authoritative for mutable objects, native-token `HEAD`, and exact delete, not blob bodies |
+| `docs/superpowers/specs/2026-08-21-cas-object-storage-conditional-operations-proposal.md` | KEEP-IN-PLACE as the provider-neutral mutable-operations proposal; conditional blob PUT/copy is outside its current scope |
+
+Current operator behavior routes to `docs/en/antalya/cas/`, while open work and release blockers route
+to `BACKLOG.md` and its topic files. Historical reviews are not rewritten to impersonate current code.
+
 ## Mostly-open specs kept in place {#mostly-open-specs}
 
 Four specs whose clusters' verdict profile has `open` as the single largest bucket (plurality, not strict
@@ -599,4 +617,3 @@ Grouped by `corpus-manifest.tsv`'s `group` column, alphabetical within group.
 | `utils/ca-soak/scenarios/RUN_HISTORY.md` | KEEP-IN-PLACE: live, actively-appended operational run log for the soak framework, not part of the docs/superpowers planning corpus |
 | `utils/ca-soak/scenarios/framework/API.md` | KEEP-IN-PLACE: live operational documentation for the soak framework |
 | `utils/ca-soak/scenarios/gc_wedge_forensics_20260710.txt` | -> docs/en/antalya/cas/operations/debugging.md |
-

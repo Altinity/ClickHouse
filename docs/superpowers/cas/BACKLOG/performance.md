@@ -14,7 +14,23 @@ insert/write-path optimization candidates, and scalability findings from the ful
 
 ## Read / write path {#read-write}
 
-- **[ckpt-read-policy] Modular `_ckpt` first-attempt view: conservative / cached / prefetch** — DESIRABLE — USER-DIRECTED design shape, 2026-08-03: `_ckpt` handling must be modular/replaceable. Protocol-adjacent (touches the commit path); ships as an explicit reviewed decision with before/after numbers, per the `HEAD`-before-`PUT` protocol-step veto.
+### Mandatory blob `HEAD`: accepted protocol cost, performance gate still blocked {#mandatory-blob-head-cost}
+
+The 2026-08-23 design decision accepts one blob `HEAD` before every fresh/adopt publication decision
+because it removes conditional blob creation, provider-specific size cliffs, and the common-path
+metadata GET. Fresh publication then uses ordinary unconditional streaming/multipart or the first
+absent native staged copy; a present candidate reads metadata and avoids the body when safe.
+
+The [target-only performance report](/superpowers/cas/unconditional-blob-publication-performance)
+measured exactly one blob `HEAD` per fan-out task and no pre-publication metadata GET on genuine fresh
+misses. Its small fresh `ca - s3plain` first-leg difference was 71 ms median; the target-only wide
+`ca` first leg was 145.427 s median and its duplicate/adopt second leg 50.948 s. These values include
+all policy and sequence effects and do **not** isolate the new `HEAD`. No matched same-environment
+pre-change binary/artifact exists, and the control-adjusted second/first ratios are not a code-version
+delta. Protocol adoption is settled; performance acceptance remains blocked until a matched
+before/after pair is measured and explicitly accepted by a human.
+
+- **[ckpt-read-policy] Modular `_ckpt` first-attempt view: conservative / cached / prefetch** — DESIRABLE — USER-DIRECTED design shape, 2026-08-03: `_ckpt` handling must be modular/replaceable. Protocol-adjacent (touches the commit path); ships only as an explicit reviewed decision with matched before/after numbers. The blob-publication decision above does not authorize changing this separate mutable-control-object fence.
 
   Cost being addressed: every committed ref-log chunk pays `GET _ckpt` + token-CAS serially after the log `PUT`, so a lone `INSERT` pays +4 serial RTTs. A pluggable policy chooses only where `publishCkpt`'s first attempt gets its `{body, token}` view — the invariant core (retry-after-conflict always does a whole-body exact re-read, `lifeEpochWouldDecrease` re-checked after any re-read, durability order `log PUT → _ckpt CAS → ack`) is shared and policy-independent.
 
@@ -24,10 +40,10 @@ insert/write-path optimization candidates, and scalability findings from the ful
 - **[write-path stage 1] parallel intra-part blob upload — LANDED (2026-07-24)** — Fanned out a part's blob PUTs/dedup-HEADs (`CasBlobUploadPool`/`fanOutBlobUploads`): CA wide-insert wall 58.41s → 30.26s, CA-vs-plain 3.0x → 1.59x. Residual gap = the serial cross-part commit (stage 2, `{#stage2-concurrent-commitpart-postponed}`, POSTPONED by user decision) plus the CAS-only dedup HEAD/GET traffic (`[B121 / B202 / one-GET-open]` below).
 - **[TXN-ONE-PIPELINE] complete the "staging ops never defer" invariant** — HARD (small, structural) — `DiskObjectStorageTransaction`'s two dispatch pipelines (eager staging ops vs. deferred-to-commit durable ops) caused the `01603` column-TTL abort ordering inversion; the correct invariant is per-state-domain, not a total order. Target shape approved by the user and superseding earlier staged-intents wording: an everything-immediate model with a single `dispatch` funnel (no CA subclass), a two-phase `IDiskTransaction::precommit()`/`commit()` contract (CA precommit = the entire publish; CA commit = durable-intent materialization only), `commit` implicitly running `precommit` when not called (with `CasImplicitPrecommitInCommit` observability), plus a de-patching pass removing accumulated eager-dispatch/read-your-writes workarounds from non-CA files (`docs/superpowers/cas/upstream-patch-inventory.md`). Lands before codecs v3 and the source-layout refactoring.
 - **[B121 / B202 / one-GET-open] read request-count reduction** — DESIRABLE (design pass) — B202 inline-by-size (drop the file-type predicate, inline < ~512 KiB, weigh the wide-part-medium-column regression, `.bin` carve-out) + a per-blob-GET read-cost reduction (B121) + one-GET part open (pack small files). Pure perf/request-count; no safety dimension. Companion to the (landed, opt-in) file-cache disk for re-read-heavy workloads. (An orphaned 2026-08-04-triage finding covers the same class via a measured DownloadPart/relink-fetch dominant read cost — folded in as confirmation.)
-- **[B98] Streaming `putOverwrite` (condemned-displacement)** — DESIRABLE — The rare INV-1 revival/displacement path still materializes the whole body; not a blocker.
-- **[promote-recreate] promote-time in-place recreate of a condemned SOURCED (tokened) blob** — DESIRABLE — The tokened promote gate stays fail-closed `ABORTED`; recreate happens on the retried build via `putBlob` cold-reuse. The tokenless-evidence copy-forward case is DONE. Ideal root-cause fix (writer-triggered synchronous fold-barrier at promote) is blocked by the lack of a writer↔GC synchronous-fold API — deferred behind the landed bounded resurrect.
+- **[B98] ✅ CLOSED by streaming unconditional `publishBlob`; kept for provenance** — Condemned displacement no longer has a separate conditional-overwrite API. Native publication streams the retagged envelope/body and supports ordinary multipart; emulated materialization remains under `[emulated-resurrect-should-spill-to-disk]`.
+- **[promote-recreate] ✅ CLOSED by mandatory `HEAD` plus retagged publication; kept for provenance** — A `Condemned` observation or any subsequent staged publication retags and streams in the same attempt loop. There is no tokened promote gate or writer-triggered fold dependency left to optimize.
 - **[R1/X1] ephemeral reader pin (cross-node GC fence)** — DESIRABLE / VERIFY — Per-server-owned namespaces narrow the window and a live ref resolving to an absent object surfaces `FILE_DOESNT_EXIST` (INV-NO-DANGLE), so for normal MergeTree this is covered by DataPart lifetime; the ephemeral-pin mechanism is design-only. Audit whether any ref-less/cross-node reader path exists before implementing.
-- **[ch128ctx] slot-bound blob-hash middle tier** — DESIRABLE (small spec) — New `BlobHashAlgo` variant: `cityHash128(content) ∥ xxh3_64(part_name, file_name) ∥ size` (256-bit; variable-width `BlobDigest` already supports it). Binds blob identity to its minting slot, so *cross-slot* collisions (the realistic adversarial dedup vector: attacker-crafted content deduped into a victim's future blob) become useless, at ~zero CPU cost over `cityHash128`. Every load-bearing dedup survives: relink/carry-forward are reference-based; retry idempotency, same-name replica writes, and snapshot-upload→TTL-move prepayment are same-slot; only cross-slot content coincidence is lost (an explicit non-goal, `01 §what-it-does-not-buy`). Middle tier of `cityHash128` → `ch128ctx` → `sha256`. Main touch: the hasher interface needs `(part_name, file_name)` context injection into `putBlob`. Origin: backup manifest-reuse discussion, `10-backups.md §multi-disk` (2026-07-14).
+- **[ch128ctx] slot-bound blob-hash middle tier** — DESIRABLE (small spec) — New `BlobHashAlgo` variant: `cityHash128(content) ∥ xxh3_64(part_name, file_name) ∥ size` (256-bit; variable-width `BlobDigest` already supports it). Binds blob identity to its minting slot, so *cross-slot* collisions (the realistic adversarial dedup vector: attacker-crafted content deduped into a victim's future blob) become useless, at ~zero CPU cost over `cityHash128`. Every load-bearing dedup survives: relink/carry-forward are reference-based; retry idempotency, same-name replica writes, and snapshot-upload→TTL-move prepayment are same-slot; only cross-slot content coincidence is lost (an explicit non-goal, `01 §what-it-does-not-buy`). Middle tier of `cityHash128` → `ch128ctx` → `sha256`. Main touch: the staged-blob hasher/request construction needs `(part_name, file_name)` context before `ensureBlobPresent`. Origin: backup manifest-reuse discussion, `10-backups.md §multi-disk` (2026-07-14).
 - **[codex-26] `casAppendObject` needed before any concurrent appender** — LOW (latent) — `CasPlainObjects::casPutObject`'s CAS loop re-reads only the TOKEN on conflict, retrying with the SAME frozen `bytes` payload the caller froze at buffer-open (`ContentAddressedTransaction::writeFile`'s Append branch) — a fresh-token/stale-payload lost-update shape (2026-07-17 codex-review triage, finding №26). Not reachable today: the only production appender is the mutation-entry CSN write (`MergeTreeMutationEntry::writeCSN`), one append per mutation-unique key under the per-table single-writer lease, so there is no second appender to lose. Required before any future concurrent appender lands: a real `casAppendObject` that re-reads the base content (not just the token) inside the retry loop. See the single-appender invariant comment at `casPutObject`.
 
 ## Write-path optimization candidates after stage 1 (2026-07-24) {#writepath-candidates-post-stage1}
@@ -37,11 +53,12 @@ Context: stage 1 (parallel intra-part blob upload) took the wide 10M×30col×500
 `docs/superpowers/reports/2026-07-23-cas-wide-insert-baseline.md` (baseline),
 `docs/superpowers/reports/2026-07-24-cas-wide-insert-stage1-effect.md` (stage-1 effect). The residual
 splits between the serial cross-part commit (stage 2's target, program point 7 — active, NOT a backlog
-item) and the items below. STANDING USER VETO: the `HEAD`-before-`PUT` dedup gate (~12% of wall,
-268.8 `HEAD`/part) and any change to the durable-op protocol are NOT candidates.
+item) and the items below. The older 268.8 `HEAD`/part estimate predates the unconditional-publication
+rewrite. Mandatory blob `HEAD` is now an accepted protocol step; any proposal to remove or weaken it
+requires a new correctness design plus matched measurements, not an opportunistic optimization.
 
 - (1) **Enable S3-native staging on the wide-insert profile and measure** — the feature exists
-  (opt-in, write-once conditional server-side copy; validated e2e). Local staging then upload moves
+  (opt-in, native-only same-store copy on the first absent publication). Local staging then upload moves
   every blob's bytes twice; native staging may cut wall on S3 backends. Zero new code: flip the
   setting in an s41 variant leg and compare. Status: MEASURE.
 - (2) **S3 client concurrency/connection tuning for the upload pool** — with 16-33 threads now
@@ -102,8 +119,9 @@ Path anatomy + hazard inventory (from code reading, 2026-07-24):
   per-task `ProfileEventsScope`, B90 capture discipline. Estimated diff ~100-150 lines. Rejected alternatives:
   commit-only fan-out with caller-side retry queue (async state machine, NOT compact); window-2 pipeline
   (complexity without the win).
-- Expected effect calibration: even a perfect stage 2 does not reach 1.0× — ~12% of wall is the vetoed
-  `HEAD`-before-`PUT` dedup cost; realistic target ~1.2×.
+- Expected effect calibration from the historical profile: even a perfect stage 2 was not expected to
+  reach 1.0× because blob presence checks consumed ~12% of wall. That estimate must be remeasured under
+  the current mandatory-`HEAD` protocol; the target-only report above is not a matched delta.
 
 ## Write-path allocation and ref-table commit-path cost (2026-07-16, TXN-Final campaign) {#writepath-cost-txn-final}
 
@@ -137,7 +155,7 @@ These are real scale/budget findings; most are variants of "O(N) GC / per-op amp
 
 ## New findings from the 2026-08-04 orphaned-open triage {#orphan-triage-2026-08-04}
 
-- **[putblob-uncertainty-exhaustion-abort] uncertainty-exhaustion abort in `putBlob`'s 8-round loop crossing the controller budget** — DESIRABLE — A real timeout-class risk: the 8-round bounded retry loop can exhaust against `CasRequestController`'s budget under sustained ambiguity.
+- **[putblob-uncertainty-exhaustion-abort] publication ambiguity can exhaust `ensureBlobPresent`'s eight attempts** — DESIRABLE — The old controller-coupled shape is gone: blob publication uses ordinary backend retry semantics plus an explicit eight-observation loop. Sustained ambiguous outcomes can still exhaust that loop and surface retry-later; verify the combined wall-time bound and observability under the new path.
 - **[manifest-trust-promote-path] manifest-trust promote path: skip per-leaf `HEAD`/`loadMeta` on adopted leaves** — DESIRABLE — A real perf-lever proposal, not yet confirmed landed; verify against HEAD before scheduling.
 - **[cas-commit-pool-anti-deadlock] CAS commit pool needs bounded worker-loop callbacks or a dedicated pool sized by `cas_commit_concurrency` to avoid deadlock** — DESIRABLE — A concrete anti-deadlock design requirement, plausibly still needed for the parallel-write-path work.
 - **[hot-part-blob-trickle-warmer] optional age-based trickle warmer for hot-part blobs ahead of snapshot** — DESIRABLE — Speculative but well-motivated perf idea (young-merge-window reasoning); borderline vs. not-tracked but the driver is concrete.
@@ -259,10 +277,9 @@ Three separate residuals, all confirmed at HEAD:
   and `:1659` is a correctness gate, not a policy choice — it is what makes append-lane split-brain
   impossible, and a table being written is by construction not evictable. But the pass also never runs
   for tables that HAVE gone idle, because nothing but a cold admission calls it.
-- `ref_table_cache_bytes` is the only cache budget in `PoolConfig` with no `ContentAddressedSettings`
-  entry: `deduplication_cache_bytes` (`ContentAddressedSettings.cpp:70`) and
-  `manifest_decode_cache_bytes` (`:90`) are declared settings and wired in
-  `ContentAddressedMetadataStorage.cpp:759` and `:761`, while `ref_table_cache_bytes` is set nowhere
+- `ref_table_cache_bytes` is a cache budget in `PoolConfig` with no `ContentAddressedSettings`
+  entry. The former blob-presence cache and its setting were deleted; the surviving
+  `manifest_decode_cache_bytes` is declared and wired, while `ref_table_cache_bytes` is set nowhere
   outside gtests — the 256 MiB default is effectively hardcoded in production. There is also no
   `CurrentMetrics` gauge for the ref-table cache (only `ProfileEvents::CASRefTableEvictions`,
   `ProfileEvents.cpp:788`), so an operator can neither size it nor observe it.
@@ -397,41 +414,13 @@ a cache needs the same invalidation edges {#ckpt-read-policy} lists (fence-gener
 remount supersession, `catalog_life_invalidated`) plus the terminal-removal path staying always-exact
 (`Pool/CasRefLedger.cpp:3223-3235`). Not correctness-affecting today; pure request-count/scale cost.
 
-## The dedup presence cache charges 64 B/entry against a real ~176 B (2031-triage CAS-115) {#dedup-cache-weight-constant-64}
+## The dedup presence cache charged 64 B/entry against a real ~176 B (2031-triage CAS-115) {#dedup-cache-weight-constant-64}
 
-`DedupWeight::operator()` returns a constant `64` (`Pool/CasPool.h:1097-1100`) and the cache is built
-with `NO_MAX_COUNT` (`Pool/CasPool.cpp:212-214`), so `deduplication_cache_bytes` (default 64 MiB,
-`ContentAddressedSettings.cpp:78`) is the ONLY bound and it is charged at roughly a third of the real
-per-entry footprint. What one entry actually costs, with `Key = BlobRef` (33 B: `BlobHashAlgo` +
-`std::array<uint8_t,32>`, `Primitives/CasBlobDigest.h:207-214`) and `Mapped = DedupPresent`:
-
-- the `LRUCachePolicy::Cells` node — `std::unordered_map<Key, Cell>` with
-  `Cell{MappedPtr, LRUQueueIterator}` (`src/Common/LRUCachePolicy.h:204-216`): 16 B libc++ node header
-  + 64 B `pair<const BlobRef, Cell>` (33 padded to 40, plus 24) = 80 B;
-- one bucket-array slot: ~8 B;
-- the `LRUQueue` (`std::list<Key>`) node: 16 B links + 33 B key, padded = 56 B;
-- the per-entry `std::make_shared<DedupPresent>()` control block (`Pool/CasPool.cpp:269`): ~32 B.
-
-That is ~176 B, i.e. a 64 MiB budget resolves to 1,048,576 admitted entries holding ~176 MiB. The
-saturation point the audit named (a pool that has written ~1M distinct blobs) is arithmetically right.
-`CurrentMetrics::CASDeduplicationCacheBytes` reports the same fiction the weight does, so an operator
-cannot see the overshoot; the only workaround is to set `deduplication_cache_bytes` to a third of what
-they want.
-
-P3, accounting only: the overshoot is a fixed ~2.7x of a configured cap, not unbounded growth, the
-entries are ordinary tracked allocations, and a dropped entry only costs a HEAD (the cache is a
-presence hint, never an authority — `Pool/CasPool.cpp:245-264`). Owed: charge the structural cost
-(`sizeof` of the node + list node + key, i.e. a constant near 176 rather than 64), or drop the
-`shared_ptr`-per-entry by sharing one `DedupPresent` instance across all entries and charging the rest.
-
-The sibling half of the audit finding — `PartManifestWeight` (`Pool/CasManifestReader.h:81-91`) — does
-NOT belong here: its dominant term is `inline_bytes.size()`, which is exactly the memory that matters,
-and the manifest decode cache additionally carries a `max_count=16384` backstop
-(`Pool/CasManifestReader.cpp:38-40`). Its only inaccuracy is container overhead (96 B charged against a
-112 B `ManifestEntry` plus up to ~1.5x vector-capacity slack and libc++ string-allocation rounding),
-which is a ~1.3-1.8x undercount for path-only manifests and near-exact for the inline-heavy ones that
-actually consume the budget. Not worth a change on its own; if the constant is ever revisited, 176 is
-the honest per-entry figure.
+**✅ CLOSED by deletion of the cache; identifier retained for provenance.** The unconditional
+blob-publication rewrite removed the presence cache, its byte setting, its gauge, and its cache-only
+events. Every decision now performs the authoritative blob `HEAD`, so there is no cache-entry weight
+to correct. The audit's sibling `PartManifestWeight` observation remains a separate low-value
+container-overhead estimate and is not reopened by this closure.
 
 ## Part staging is a linear-scanned vector, so a part costs O(F^2) path compares (2031-triage CAS-116) {#staging-vector-quadratic-path-scans}
 
@@ -484,8 +473,8 @@ is the `.meta` sibling plus the envelope, not a doubling of the whole part. Cont
 across parts and replicas dedup to one body+meta pair.
 
 P3, and the cheap half is already someone else's item. What is owed specifically here: decide whether
-the marker can be folded (e.g. only materialized on condemn/resurrect rather than on every birth), which
-is a protocol-step change and therefore under the standing `HEAD`-before-`PUT` veto — so it needs an
+the marker can be folded (e.g. only materialized when a body becomes `Condemned` rather than on every birth), which
+is a protocol-step change adjacent to mandatory blob `HEAD` and metadata reconciliation — so it needs an
 explicit user decision with a risk analysis, not an opportunistic optimization. Cheap and unblocked in
 the meantime: quantify it, i.e. report the body/`.meta` object split in `SYSTEM CAS FSCK` output so the
 2x LIST cost is visible rather than inferred.

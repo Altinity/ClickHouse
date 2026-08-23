@@ -9,6 +9,13 @@ doc_type: 'guide'
 
 # `freezeRemote` single-transaction branch — Implementation Plan {#cas-freezeremote-plan}
 
+> **Blob-publication supersession (2026-08-23):** this historical plan predates mandatory blob
+> `HEAD` and unconditional publication. Its transaction-boundary fix remains implemented, but its
+> test prose/configuration about an adaptive `HEAD`-first threshold, a presence cache, and a
+> conditional body PUT describes the superseded writer. Current reuse always starts with `HEAD` and
+> records `CASBlobBodyPutAvoided` after a safe present observation; see the
+> [current blob protocol](/antalya/cas/architecture/blob-protocol#conditional-write-sequence).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make cross-disk `ALTER TABLE dst ATTACH PARTITION … FROM src` work when `dst` is on a content-addressed disk, by cloning the part through one CAS transaction instead of one autocommit per file.

@@ -1,5 +1,5 @@
 ---
-description: 'Draft proposal for a provider-neutral conditional object-storage operations layer for CAS'
+description: 'Narrowed proposal for provider-neutral mutable conditional operations, native-token HEAD, and exact deletion for CAS'
 sidebar_label: 'CAS conditional object storage'
 sidebar_position: 2
 slug: /superpowers/specs/cas-object-storage-conditional-operations-proposal
@@ -9,10 +9,19 @@ doc_type: 'design'
 
 # CAS object-storage conditional operations proposal {#cas-object-storage-conditional-operations-proposal}
 
-Status: **draft for discussion**. This document proposes a follow-up refactor. It does not replace
+Status: **narrowed draft for discussion (2026-08-23)**. This document proposes a follow-up refactor. It does not replace
 the nearly implemented GCS request-isolation design in
 `2026-08-20-cas-gcs-request-isolation-design.md`, and it must not interrupt that design's Task 9
 verification or change its wire behavior.
+
+The later
+[unconditional blob-publication design](/superpowers/specs/cas-unconditional-blob-publication-design)
+removed conditional blob PUT/copy and their response tokens from the production contract. This
+proposal now applies only to mutable metadata/control-object writes, native-version `HEAD`, and
+exact-version deletion. Historical API sketches below that mention conditional streaming blob
+writes, write-once blob copy, or `copyObjectConditional` are retained as decision history and must
+not be implemented as current requirements. Unconditional blob transport belongs to
+`Backend::publishBlob`, outside this proposed conditional-operations extension.
 
 The comparison base used while writing this proposal is
 `git merge-base altinity/antalya-26.6 HEAD`, currently
@@ -31,16 +40,17 @@ Azure support another parallel special case.
 
 The proposed follow-up is a provider-neutral conditional-operations extension:
 
-- `IObjectStorageConditionalOperations` defines version-token HEAD, conditional streaming write,
-  exact-token remove, and write-once copy.
+- `IObjectStorageConditionalOperations` defines version-token `HEAD`, small-object conditional
+  write, and exact-token remove.
 - `S3ConditionalOperations` implements that semantic contract for the whole S3 family: ordinary AWS
   S3, other compatible S3 services, and GCS reached through the S3 XML API.
 - `GCSConditionalDialect` remains a GCS-only HTTP wire adapter. It is not owned by, included by, or
   called directly from `S3ConditionalOperations`.
-- A future `AzureConditionalOperations` implements the same semantic contract with Azure Blob SDK
-  conditions and ETags.
+- A future `AzureConditionalOperations` implements the same narrowed semantic contract with Azure
+  Blob SDK conditions and ETags.
 - CAS depends only on the common extension and typed version tokens. Provider-specific retry,
-  multipart, signing, response-token, and error-classification details remain in provider code.
+  signing, response-token, and error-classification details remain in provider code. Blob multipart
+  and native-copy transport remain on the ordinary object-storage path.
 
 This is not expected to make the total fork diff materially smaller. Its value is to move behavior
 out of frequently changed upstream files, remove provider details from CAS, prevent invalid
@@ -126,9 +136,9 @@ plumbing where appropriate.
 
 1. Preserve the user-facing and wire behavior of every non-CAS GCP configuration, including existing
    `gcp_oauth`, `gcs_hmac`, and ordinary S3 HMAC authentication selectors.
-2. Preserve the already implemented CAS-over-GCS semantics, including generation tokens,
-   per-request isolation, exact DELETE, write-once COPY, single-attempt conditional writes, and
-   fail-closed multipart limits.
+2. Preserve the already implemented CAS-over-GCS semantics for mutable operations, including
+   generation tokens, per-request isolation, exact DELETE, single-attempt conditional writes, and
+   fail-closed conditional-write multipart limits.
 3. Give AWS, GCS, and Azure one provider-neutral CAS contract without pretending that their wire
    protocols are identical.
 4. Remove S3 SDK types, S3 exceptions, S3 retry fields, and GCS token decisions from CAS.
@@ -145,7 +155,7 @@ plumbing where appropriate.
 - Adding an empty wire-adapter class for AWS or Azure merely to make the class diagram symmetric.
 - Replacing ordinary `IObjectStorage::writeObject`, `copyObject`, or metadata APIs for non-CAS users.
 - Generalizing all object-storage operations or all concurrency controls in one refactor.
-- Providing a fallback from conditional operations to a HEAD-then-unconditional-write sequence.
+- Owning the blob `HEAD`-then-unconditional-publication state machine or its transport.
 - Claiming that every S3-compatible service supports the same conditional behavior as AWS S3.
 - Changing user-visible names or defaults for non-CAS authentication and object-storage settings.
 

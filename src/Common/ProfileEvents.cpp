@@ -900,12 +900,12 @@ The server successfully detected this situation and will download merged part fr
     M(CASGCCondemnMarkerUnconfirmedCarry, "Number of CAS GC retirements delayed because a durable condemn marker could not be confirmed. A non-zero value indicates marker write or read failures and safely postpone deletion.", ValueType::Number) \
     M(CASGCHeartbeatFenceOuts, "Number of CAS GC operations fenced out for expired mounts. A non-zero value indicates stale mounts or heartbeat delays.", ValueType::Number) \
     M(CASGCMetaWriteAnomaly, "Number of CAS GC metadata operations that failed on the bounded metadata pool. A non-zero value indicates backend or pool pressure and may delay metadata convergence.", ValueType::Number) \
-    M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates blob creation, adoption, or write contention.", ValueType::Number) \
+    M(CASMetaPut,          "Number of conditional CAS blob-metadata create attempts, including lost races. Growth indicates metadata reconciliation or write contention.", ValueType::Number) \
     M(CASMetaCompareSwap,          "Number of conditional CAS blob-metadata rewrites, including lost races. Growing values indicate metadata updates or contention.", ValueType::Number) \
     M(CASMetaDelete,       "Number of exact-token CAS blob-metadata delete attempts. Growth indicates GC or cleanup activity.", ValueType::Number) \
-    M(CASMetaCreateClean,  "Number of clean metadata records created after fresh blob commits. Growth indicates new blob uploads.", ValueType::Number) \
+    M(CASMetaCreateClean,  "Number of clean metadata records created after publication of an absent blob. Growth indicates new blob publications.", ValueType::Number) \
     M(CASMetaAdoptBackfill, "Number of clean metadata records backfilled during blob adoption. A non-zero value indicates missing or legacy metadata.", ValueType::Number) \
-    M(CASMetaResurrectClean, "Number of blob metadata records reset to Clean during resurrection. A non-zero value indicates blob resurrection activity.", ValueType::Number) \
+    M(CASMetaResurrectClean, "Number of blob metadata records reset to Clean after replacing a condemned body. A non-zero value indicates condemned-body replacement activity.", ValueType::Number) \
     M(CASGCMetaOps, "Number of per-hash metadata operations executed by CAS GC. Growing values indicate more GC candidates or metadata work.", ValueType::Number) \
     M(CASGCEnumerationPages, "Number of CAS GC LIST pages fetched while enumerating the object universe. Growing values indicate a larger universe or more frequent scans.", ValueType::Number) \
     M(CASGCRefWalkPlansBuilt, "Number of complete catalog-authoritative CAS ref walk plans constructed by ordinary GC and rebuild. A regular or rebuilding invocation that reaches the post-LIST catalog cut increments this exactly once, including a round that later defers.", ValueType::Number) \

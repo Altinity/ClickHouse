@@ -15,17 +15,24 @@ backend validation, the local/emulated backend, and codec/format items.
 ## Staging / adoption {#staging}
 
 - **[out-of-band staging adoption] adopt bulk-load/backup/external-tooling uploads via verified copy-forward** — HARD (needs spec) — Distinct from the landed (opt-in) S3-native writer staging. Objects uploaded out-of-band land under a staging prefix and are ADOPTED into the pool via the verified hash-then-publish copy-forward path instead of being trusted in place. Scope/semantics to be specced.
-- **[S3-native staging §7] memory fast-path for small blobs** — MINOR (optional) — Buffer sub-single-part blobs in memory and `putIfAbsentStream` (no disk/staging/copy).
+- **[S3-native staging §7] memory fast-path for small blobs** — MINOR (optional) — Buffer sub-single-part blobs in memory and feed the ordinary unconditional `publishBlob` streaming transport directly (no disk staging or native copy). The optimization must not bypass the mandatory blob `HEAD` or the shared `publication_attempted` state.
 
 ## Backends — real-store validation, GCS, LIST consistency {#backends}
 
-- **[GATE #1: Azure] real-store GC validation on Azure** — GATE — AWS + GCS DONE (2026-07-03,
-  live-validated). Azure not started — the last leg of the real-S3 reclaim release gate. Before
+- **[GATE #1: Azure] real-store GC validation on Azure** — GATE — The earlier AWS + GCS exact-delete/GC
+  validation completed on 2026-07-03. Azure has not started and remains the last leg of that reclaim
+  gate. The newer unconditional-publication GCS gate is separate and is still blocked, as recorded in
+  the [2026-08-23 live results](/superpowers/cas/unconditional-blob-publication-live-results). Before
   implementing Azure CAS, decide whether to introduce the provider-neutral conditional-operations
   layer described in the [draft proposal](/superpowers/specs/cas-object-storage-conditional-operations-proposal).
-  The refactor is justified primarily if Azure is the next concrete backend; it must follow completion
-  of the current GCS Task 9 gate.
-- **[GCS production-grade follow-ups]** — DESIRABLE — Compose-based conditional finalize for blobs above `gcs_max_conditional_put_bytes` (multipart silently ignores the precondition on GCS → currently throws `NOT_IMPLEMENTED`); `gcp_oauth` dialect probe validation against live GCS (ADC creds); generation-aware LIST discovery (GC re-reads every shard on GCS since list tokens are disabled — cost only); signed `x-goog-*` `extra_headers` on `gcs_hmac` (currently unsigned).
+  The refactor is justified primarily if Azure is the next concrete backend.
+- **[GCS production-grade follow-ups]** — DESIRABLE / RELEASE GATE — Conditional compose for blob
+  bodies is obsolete: body publication is unconditional and ordinary multipart now handles objects
+  above `gcs_max_conditional_put_bytes`; the setting applies only to mutable conditional writes.
+  Still open: execute every credentialed `gcs_hmac`/`gcp_oauth` group and the TLS ambiguity driver in
+  the [live-results gate](/superpowers/cas/unconditional-blob-publication-live-results), validate the
+  ordinary `test_storage_s3` lane once its historical image is available, generation-aware LIST
+  discovery (current re-listing is cost-only), and signed `x-goog-*` `extra_headers` for `gcs_hmac`.
 - **[LIST consistency on real S3] token-diff discovery under eventual consistency** — {#list-consistency-real-s3} — TEST/GATE — S3's LIST may not reflect a just-PUT key; code handles it conservatively but needs real-S3 testing. Add a LIST-consistency probe in `Cas::Probe` before LIST-derived discovery is trusted on a given store. Also load-bearing for the (moot) registry-removal LIST premise.
 - **[B196] cap `s3_max_connections` to backend permits** — HARD (cheap) — CONFIRMED still open: no CA code caps `s3_max_connections`; prevents 503 + retry storm under high concurrency.
 - **[F2 / rustfs#3231] false-404-under-load + overwrite-leak upstream report + repro** — INFRA — Dominant scale blocker (caps merge-heavy full-scale + 4h chaos soak). Our side is safe (clamp + destruction suppression). Needs a #3231-free/fixed rustfs or the S22 fault-proxy stand; build a repro on the #3231 dir-bloat repro.
@@ -34,21 +41,21 @@ backend validation, the local/emulated backend, and codec/format items.
 
 Collected 2026-07-23 (user direction): every "local backend" story lives HERE, so the class is visible
 as one body of work instead of scattered minors. Common root: `LocalObjectStorage` writes are plain
-`O_TRUNC` file writes — no atomic PUT, no conditional-write enforcement, no torn-read protection —
-while the CAS protocol is designed against S3 atomic/conditional semantics. Nothing in this section
-affects S3/GCS production pools.
+`O_TRUNC` file writes — no atomic PUT and no torn-read protection. Mutable objects still rely on
+conditional operations; blob bodies now use `HEAD` followed by unconditional publication, but require
+complete-object atomic visibility and exact size validation. Nothing in this section affects S3/GCS
+production pools.
 
 - **[disk-error-audit] temp-file + rename in the local blob write path** — HARD — (moved from the
   2026-07-21 disk-error audit) `emuWrite` (`CasObjectStorageBackend.cpp:546-557`) streams through
   `LocalObjectStorage::writeObject`, which opens a plain `WriteBufferFromFile` directly on the final
-  key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write leaves a partial
-  file at the final content-addressed key; the next `putIfAbsent` sees `emuExists == true` and returns
-  `PreconditionFailed` = "already present" (`:776-780`), so the writer dedups against the truncated
-  body. Presence-only admission + non-atomic local write is the ONLY corruption window the disk-error
-  audit found (see also `operability-and-introspection.md`'s disk-error follow-ups). Native/S3 mode is
-  not affected (`If-None-Match` + atomic completion). Fix: write to a sibling temp name and `rename`
-  into place (or fix it inside `LocalObjectStorage`), paired with the dedup-admit size guard as
-  defense-in-depth. Fixing this also closes B66a's torn-read mechanism below.
+  key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write can leave a partial
+  file at the final content-addressed key. The new mandatory `HEAD` plus envelope-adjusted size check
+  refuses that body instead of adopting it, closing the silent-corruption window, but the bad key then
+  blocks progress until repaired. Fix the remaining availability/atomicity debt by writing to a sibling
+  temp name and renaming into place (or by fixing it inside `LocalObjectStorage`). Native S3/GCS mode is
+  not affected because completed object publication is atomically visible. This also closes B66a's
+  torn-read mechanism below.
 - **[B26 / B135] local / NFS / shared-fs as a first-class backend** — DESIRABLE — Unit-tested over
   `LocalObjectStorage`; needs server-level doc + the put-if-absent atomicity caveat (racy multi-writer
   on local/NFS) + multi-mount safety notes. (B66a is the concrete instance of the caveat.)
@@ -111,19 +118,15 @@ generic disk code, so it needs the upstream-consult step
 ([[feedback_upstream_code_consult_first]], [[feedback_cas_upstream_coupling_minimization]]) before
 anyone touches it.
 
-## Write-once probes certify the single-operation path, not the multipart one (2031-triage CAS-031) {#write-once-probe-misses-multipart}
+## Write-once probes and multipart blob publication (2031-triage CAS-031) {#write-once-probe-misses-multipart}
 
-Both write-once CREATE primitives — streaming `putIfAbsentStream` and the server-side
-`promoteStaged`/`probeConditionalCopy` copy — carry `If-None-Match` on
-`CompleteMultipartUpload` for large bodies, while both probe checks exercise only the small
-single-operation path. So the capability battery certifies a path that most blob bytes do not take.
-Exposure is limited to third-party S3-compatible stores: AWS honours the precondition on CMU and GCS
-refuses loudly, so a store that silently ignores it on CMU is the only failing case — hence P2.
-
-Fix: extend the probe to run one multipart-sized write-once attempt (and the conditional-copy
-equivalent) so the certification covers the path the data plane actually uses. Related:
-{#list-consistency-real-s3} (same "probe what is trusted" principle) and, in BACKLOG.md,
-{#gcs-conditional-overwrite-rethink}.
+**CLOSED for blobs by the 2026-08-23 protocol rewrite; identifier kept for provenance.** Blob-body
+PUT/copy no longer carries a destination precondition and therefore no longer asks a small
+write-once probe to certify multipart behavior. Streaming bodies use ordinary multipart; explicit S3
+staging requires native same-store copy and fails closed when that capability is absent. The
+conditional capability battery remains load-bearing for small mutable metadata/control objects,
+native-token `HEAD`, and exact deletion, none of which delegates a blob-body multipart contract to
+the probe. Related LIST trust work remains tracked at {#list-consistency-real-s3}.
 
 ## `skip_access_check` and the decommission open silently skip the whole probe (2031-triage CAS-030) {#skip-access-check-no-signal}
 
@@ -313,13 +316,15 @@ needed for a failing-first test.
 
 An aborted/exception-unwound transaction deliberately leaves its S3 staging objects in place
 (`ContentAddressedTransaction.cpp:174-207` — the local temp file is removed unconditionally, the S3
-object only `else if (committed)`), because a staging object is the sanctioned resurrect source for the
-promote gate and must outlive one failed attempt. That part of the design is settled. What is NOT
+object only `else if (committed)`), because a staging object is a re-readable publication source and
+must outlive one failed attempt. Shared monotonic `publication_attempted` state ensures only the first
+absent publication may use verbatim native copy; condemned and subsequent publications retag and
+stream. That part of the design is settled. What is NOT
 covered is the reclaim side:
 
 - `sweepOwnMountStaging` (`Pool/CasServerRoot.cpp:1473`) has exactly ONE call site, at mount start
-  (`ContentAddressedMetadataStorage.cpp:844`, gated on `staging_backend=s3` + `!read_only` +
-  `conditional_copy_supported`). There is no periodic in-mount reclaim, so under an opt-in
+  (`ContentAddressedMetadataStorage.cpp:824-828`, gated on `staging_backend=s3` + `!read_only` after
+  startup has required `ObjectStorageCopyMode::NativeOnly`). There is no periodic in-mount reclaim, so under an opt-in
   `staging_backend=s3` disk the staged bytes of every killed/cancelled INSERT, failed mutation and
   aborted MOVE accumulate for the WHOLE uptime of the mount and are reclaimed only by the next restart.
 - GC never lists `staging/` (a top-level prefix disjoint from `blobs/`, pinned by
