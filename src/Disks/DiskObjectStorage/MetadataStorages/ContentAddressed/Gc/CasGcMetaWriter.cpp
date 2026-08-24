@@ -28,8 +28,8 @@ namespace
 /// best-effort/idempotent by design. The meta is only a point-read freshness marker for the writer/
 /// promote gate; the ledger retired-set + the exact-token body delete remain the actual safety
 /// core. A lost CAS here is never a correctness problem, only a (rare,
-/// self-healing) staleness window for the NEXT point-reader — with ONE exception (triage 2026-07-17
-/// §3.4): the CONDEMN marker is load-bearing for the delete edge. The exact-token delete argument
+/// self-healing) staleness window for the NEXT point-reader — with ONE exception: the CONDEMN marker
+/// is load-bearing for the delete edge. The exact-token delete argument
 /// below assumes the marker was durably written before the delete fires; a swallowed condemn-marker
 /// write lets a writer observe absent/Clean meta and adopt the SAME token the graduated entry later
 /// deletes (a dangling manifest). Graduation to `delete_pending` is therefore GATED on confirmed
@@ -57,7 +57,7 @@ namespace
 /// Returns whether durable Condemned evidence exists after the call: the conditional write committed,
 /// or an already-Condemned meta was observed. A lost CAS reports false and writes nothing further (the
 /// loser re-reads next time); a thrown backend error propagates (the scheduling wrapper swallows it) —
-/// either way the entry stays UNCONFIRMED and the graduation gate carries it (triage §3.4).
+/// either way the entry stays UNCONFIRMED and the graduation gate carries it.
 bool writeCondemnedMeta(Pool & pool, const BlobRef & ref, uint64_t condemn_round, uint64_t size)
 {
     const auto lm = loadMeta(pool.backend(), pool.layout(), ref);
