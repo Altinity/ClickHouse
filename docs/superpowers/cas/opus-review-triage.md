@@ -90,21 +90,21 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 | m14 | подтверждено | P3 | нет | нет | Инвариант между двумя независимо выставляемыми полями `ClonePartParams` держится только на `chassert`; в release-сборке одновременная установка `keep_metadata_version` и `metadata_version_to_write` молча запишет новую версию. Все 7 call-site'ов действительно непересекающиеся. |
 | m15 | подтверждено | P3 | нет | нет | Асимметрия синтаксиса реальна — `DROP POOL MEMBER` требует строковый литерал и для srid, и для диска, тогда как шесть соседних CAS-verb'ов принимают голый идентификатор; в коде есть обоснование, но оно покрывает только srid-половину. |
 | m16 | дубликат CAS-035 | P2 | нет | [{#fold-edge-run-memory}](BACKLOG/gc.md) | Полный постраничный LIST `cas/ns/stream/` в `defer_decision` подтверждён, но он не «до вердикта зря» — он и ЕСТЬ вход вердикта; стоимость класса уже полностью отслежена как CAS-035, остаточная часть (отставание budgeted cleanup удорожает следующий раунд) записана там же. |
-| m17 | ⏳ | — | — | — | — |
-| m18 | ⏳ | — | — | — | — |
-| m19 | ⏳ | — | — | — | — |
-| m20 | ⏳ | — | — | — | — |
-| m21 | ⏳ | — | — | — | — |
-| m22 | ⏳ | — | — | — | — |
-| m23 | ⏳ | — | — | — | — |
-| m24 | ⏳ | — | — | — | — |
-| m25 | ⏳ | — | — | — | — |
-| m26 | ⏳ | — | — | — | — |
-| m27 | ⏳ | — | — | — | — |
-| m28 | ⏳ | — | — | — | — |
-| m29 | ⏳ | — | — | — | — |
-| m30 | ⏳ | — | — | — | — |
-| m31 | ⏳ | — | — | — | — |
+| m17 | by-design | — | нет | — (смежное: `docs/superpowers/cas/BACKLOG/replication.md:82`; доказательная база — `docs/sup… | Обязательный `HEAD` перед `PUT` тела блоба на HEAD стал БЕЗУСЛОВНЫМ (не «≥1 MiB»), и это защищённый шаг протокола под действующим вето пользователя — менять его нельзя. |
+| m18 | подтверждено | P3 | нет | не отслеживается | `Xxh3Streamer` действительно держит состояние XXH3 в куче (`XXH3_createState`) на каждый блоб вместо встраивания по значению; путь берётся только при `blob_hash = 'xxh3-128'`. |
+| m19 | подтверждено | P3 | нет | не отслеживается отдельным пунктом (смежно упомянуто в `docs/superpowers/cas/BACKLOG/replica… | CA-ветка `clonePart` по-прежнему копирует файлы части последовательно через одну транзакцию, и это самопризнанная в коде отложенная оптимизация. |
+| m20 | частично | P3 | нет | смежное — `docs/superpowers/cas/BACKLOG/operability-and-introspection.md:467` {#gc-health-ze… | Асинхронной (скрейпимой как gauge) метрики здоровья продления mount-lease действительно нет — но ProfileEvent'ов по продлению семь; вторая половина находки (гейджи `CASBlobUploadPool*` не упомянуты ни в одной доке) подтверждается дословно. |
+| m21 | дубликат fable n7 | P3 | нет | — (уже разобрано в `docs/superpowers/cas/fable-review-triage.md:66,594` и `docs/superpowers/… | Комментарий «Optional (off by default)» в `ContentAddressedLog.h` устарел — обе CAS-таблицы поставляются включёнными; уже адъюдицировано как fable n7. |
+| m22 | дубликат fable {#m12} 12b | P2 | нет | — (адъюдицировано в `docs/superpowers/cas/fable-review-triage.md:443-483`, подпункт 12b на `… | `configuration.md` по-прежнему не содержит ни одной из десяти перечисленных GC-бюджетных настроек — подтверждено, но это уже разобранный подпункт 12b. |
+| m23 | частично | P3 | нет | не отслеживается | `mounts-and-leases.md` действительно единственная из 22 CAS-страниц без H1, но «renders with no title» не доказано — frontmatter `title` у страницы есть. |
+| m24 | подтверждено | P3 | нет | не отслеживается | `design-history.md` — инженерный журнал «дороги, которые не выбрали» в публичной доке; аналога у других фич в `docs/en/` нет, но страница интегрирована штатно, так что это стилистический вопрос, а не дефект. |
+| m25 | дубликат fable m6 (расширенный третьей таблицей) | P3 | нет | — (fable m6, `docs/superpowers/cas/fable-review-triage.md:49`) | Три CAS-таблицы действительно типизируют закрытые словари тремя разными способами — `Enum8`, `LowCardinality(String)`, голый `String`; fable m6 покрывал первые две, третья добавляется здесь. |
+| m26 | подтверждено | P2 | да | смежное и более узкое — `docs/superpowers/cas/BACKLOG/docs-and-cleanup.md:76` [CHANGELOG-unk… | На ветке нет ни одной changelog-строки про content-addressed storage — при том что книга называет её headline-фичей; это релиз-гигиена, которую нужно закрыть до релиза. |
+| m27 | подтверждено | P3 | нет | не отслеживается | Заголовок тестов действительно огромен и тянется почти во все CAS-тестовые TU, но затрагивает только время сборки тестов и соответствует общей конвенции кодовой базы. |
+| m28 | дубликат T8 | P3 | нет | не отслеживается (T8 прямо это фиксирует) | `cas_blob_upload_pool_size = 0` действительно валит старт любого сервера, но это документированный fail-loud; уже адъюдицировано как T8. |
+| m29 | частично | P3 | нет | не отслеживается | Проверки «`enum_count` укладывается в окно» по-прежнему нет, но и код, и число устарели: специализация теперь пришла из `antalya-26.6` (чужой коммит), а окно расширено до 512, не 255. |
+| m30 | дубликат fable m1 | P3 | нет | — (fable m1, `docs/superpowers/cas/fable-review-triage.md:44,522`; смежная секция `BACKLOG/o… | Доменные находки CAS-команд `clickhouse-disks` по-прежнему летят кодом `BAD_ARGUMENTS`, из-за чего перед диагностикой печатается справка по опциям; уже адъюдицировано как fable m1. |
+| m31 | подтверждено | P2 | да | не отслеживается | CI действительно закреплён на бета-образе `rustfs/rustfs:1.0.0-beta.12`, и пин шире заявленного — он же в стейтлес-лейне и во всех compose-файлах soak. |
 
 ## Needs verification NV-1…NV-14 {#needs-verification}
 
@@ -1549,3 +1549,65 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 ### m16 (дубликат CAS-035, P2) {#m16}
 
 `Gc/CasGc.cpp:506-511`: внутри `GcPhaseTimer t(phase_sink, "defer_decision")` идёт `walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)))`, и только затем `changed = walk_plan->changedRows()` кормит `shouldDeferRound(...)` — то есть перенести LIST «после вердикта» нельзя без другой схемы обнаружения изменений. Ровно эта же пара (полное перечисление префикса с удержанием ключей + связь с отставанием `cleanupRefObjects`) уже зафиксирована в `2031-triage.md` {#cas-035} и в его же заметке к CAS-034 (`2031-triage.md:1648-1652`).
+
+## Minor m17-m31 — детали {#minor-2-details}
+
+### m17 (by-design, —) {#m17}
+
+На HEAD `PartWriteTxn::ensureBlobPresent` открывает каждую попытку публикации строкой `const HeadResult head = store->backend().head(key);` (`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.cpp:331`) — никакого порога по размеру в коде нет вовсе; порог 1 MiB — это `INLINE_CAP` на входе (мелкие файлы вообще не становятся блобами), поэтому формулировка обзора «для каждого блоба ≥1 MiB» фактически совпадает с «для каждого блоба». Сам код называет шаг «mandatory `HEAD`» и строит на нём наблюдение fence-поколения, adopt-backfill и различение `Absent`/`Condemned` (`:360`, `:380`, `:455-456`), то есть это не оптимизация дедупа, а линеаризующая точка протокола. Замер от 2026-08-23 подтверждает поставленную семантику дословно: «Every fan-out task issued exactly one blob `HEAD`» (`docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md:18-19`), и там же зафиксировано, что изолированная стоимость этого `HEAD` не измерена. Вердикт — by-design под СТОЯЩИМ ВЕТО (правки шага протокола как «дешёвой оптимизации» не предлагаются и не планируются).
+
+### m18 (подтверждено, P3) {#m18}
+
+Конструктор — `Xxh3Streamer() : state(XXH3_createState()) { XXH3_128bits_reset(state); }`, деструктор — `XXH3_freeState(state)`, член — `XXH3_state_t * state;` (`src/Disks/.../ContentAddressed/Primitives/CasXxh3Streamer.h:44,47,71`), то есть форма кода из обзора не менялась. Единственный потребитель — `Xxh3128BlobHashingWriteBuffer`, который держит `Xxh3Streamer state;` как член (`Primitives/CasBlobHashingWriteBuffer.cpp:133`) и создаётся по одному на публикуемый блоб, так что это одна дополнительная аллокация ~576 байт на блоб — величина, тонущая на фоне самого PUT. Дефолт остаётся `cityhash128`, эта ветка не берётся вовсе; чинится встраиванием `XXH3_state_t` по значению с `alignas(64)`, но выгода в пределах шума.
+
+### m19 (подтверждено, P3) {#m19}
+
+`DataPartStorageOnDiskBase::clonePart` при `dst_disk->isContentAddressed()` гонит весь клон через одну транзакцию приёмника — `copyDirectoryContentIntoTransaction(...); clone_transaction->commit();` (`src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:800-813`), а сама функция — обычный `for` по `iterateDirectory` с `readFile`/`writeFile`/`copyData` на файл (`:645-663`). Комментарий над ней прямо фиксирует и причину, и статус: «Sequential, not the parallel copyThroughBuffers thread pool: a content-addressed transaction batches every file into ONE eventual manifest, and its staging map is not mutex-guarded … parallelizing this remains a deferred optimization whose cost is now visible to a waiting statement rather than only to a background operation» (`:632-636`). Не-CA ветка уходит в `src_disk->copyDirectoryContent(...)` (`:820`), где работает пул `IDisk::copyDirectoryContent` — то есть асимметрия реальна; заметим, что при этом уже есть пул фан-аута блобов на пути INSERT (`cas_blob_upload_pool_size`), которого этот путь не использует.
+
+### m20 (частично, P3) {#m20}
+
+В `ServerAsynchronousMetrics.cpp:385-391` живут ровно четыре CAS-метрики, все про GC (`CASGCIsLeader_*`, `CASGCPendingReclaim_*`, `CASGCLastSuccessAgeSeconds_*`, `CASGCWedgedNamespaces_*`); ничего про lease там нет. Однако «no scrapeable metric» — преувеличение: `src/Common/ProfileEvents.cpp:928-938` объявляет `CASMountRenewalAttempts/Retries/Resolved/Recovered/DeadlineExceeded`, `CASMountLeaseLost`, `CASMountReleaseSkippedForeignOccupant`, `CASMountExclusivityViolation`, а SQL-поверхность даёт `renewal_sequence`/`expires_at` (`src/Storages/System/StorageSystemContentAddressedMounts.cpp:46,48`), и именно на них ссылается `docs/en/antalya/cas/operations/troubleshooting.md:20`. Отсутствует ровно per-disk async gauge того же семейства, что у GC. Вторая половина верна: `grep -rn CASBlobUploadPool docs/` даёт ноль попаданий вне текста самого обзора, при том что `troubleshooting.md:20` советует оператору понижать `cas_blob_upload_pool_size`, не назвав ни одной метрики, по которой это решение принимается.
+
+### m21 (дубликат fable n7, P3) {#m21}
+
+На HEAD `src/Interpreters/ContentAddressedLog.h:12` по-прежнему пишет «Optional (off by default); enabled for soak/CI», тогда как `programs/server/config.xml:1201-1213` и `:1321-1330` поставляют секции `<cas_log>` и `<cas_gc_log>` включёнными. Ровно это уже зафиксировано как fable n7 (`fable-review-triage.md:594`) и как пункт 3 «что осталось» в разборе M-строки (`opus-review-triage.md:1345`). Правка — одна строка комментария, поведения не меняет.
+
+### m22 (дубликат fable {#m12} 12b, P2) {#m22}
+
+Перепроверка на HEAD: все десять имён (`gc_round_{graduation,redelete,sweep_namespace,sweep_recovery_op,ref_cleanup,prefix_wholesale,handoff_prefix_wholesale,outcome_entry}_budget`, `manifest_sweep_{list,delete}_budget_keys`) дают ноль попаданий и в `docs/en/antalya/cas/configuration.md`, и во всём каталоге `docs/en/antalya/cas/`, при том что они объявлены (напр. `ContentAddressedSettings.cpp:80,82`). Числитель сместился: сейчас `DECLARE(` в `src/Disks/.../ContentAddressed/ContentAddressedSettings.cpp` — 27 штук против 29 на момент обзора, а таблица `configuration.md` даёт 21 строку, так что арифметика «10 из 29» устарела, а сам пропуск — нет. Вердикт fable (P2, не pre-release, операционный риск в инциденте: оператор не найдёт ручки темпа GC) переносится без изменений.
+
+### m23 (частично, P3) {#m23}
+
+Перебор всех `.md` под `docs/en/antalya/cas` даёт ровно один файл с нулём строк `^# ` — `architecture/mounts-and-leases.md`; у всех остальных ровно один H1. При этом её frontmatter содержит `title: 'CAS Architecture — Mounts and Leases'` (`docs/en/antalya/cas/architecture/mounts-and-leases.md:6`), а текст начинается сразу с абзаца «Page 4 of 4 in the CAS architecture set…» (`:11`); Docusaurus в отсутствие H1 подставляет frontmatter-title как заголовок страницы, так что визуальной «страницы без названия», скорее всего, нет. Подтверждается ровно несогласованность с 21 сестринской страницей плюс отсутствие явного якоря вида `{#…}`, требуемого проектным правилом для заголовков; правка — одна строка `# CAS architecture — mounts and leases {#mounts-and-leases}`.
+
+### m24 (подтверждено, P3) {#m24}
+
+Файл на месте, с полным frontmatter и корректным H1-якорем (`docs/en/antalya/cas/architecture/design-history.md:5,10`), содержит секцию «Rejected paths» с таблицей вида «What it was / Why it was abandoned / What replaced it» (`:14-16`). Поиск по `docs/en` вне `antalya/cas` не находит ни одной страницы того же жанра (три попадания на `asynchronous_metrics.md`/`metric_log.md`/`query_metric_log.md` — ложные, там слово «rejected» в другом смысле), так что уникальность жанра обзор описал верно. Смягчение, которого в находке нет: страница не «утекла» — на неё ссылаются три места книги (`docs/en/antalya/cas/index.md:88`, `architecture/index.md:114`, `roadmap.md:105`), а даты 2026-06-01…2026-08-03 в тексте нужны читателю ровно как хронология пивотов. Решение (оставить как публичный reference / убрать даты / перенести в `docs/superpowers`) — редакционное, до релиза не блокирующее.
+
+### m25 (дубликат fable m6 (расширенный третьей таблицей), P3) {#m25}
+
+`system.cas_gc_log` строит `type_enum`/`outcome_enum`/`trigger_enum` как `DataTypeEnum8` (`src/Interpreters/ContentAddressedGarbageCollectionLog.cpp:18,21,25`); `system.cas_log` для того же класса колонок берёт `lc_string` (`src/Interpreters/ContentAddressedLog.cpp:17`, применён к `event_type`, `disk_name` и др.); `system.cas_mounts` отдаёт `state` («live, expired, terminated, fenced or corrupt») и `lifecycle`/`lifecycle_reason` голым `DataTypeString` (`src/Storages/System/StorageSystemContentAddressedMounts.cpp:51,56,57`). Прецедент кодовой базы (`part_log.event_type`, `query_log.type`, `text_log.level`) — `Enum8`, так что расхождение реально; цена — только эргономика фильтров и размер, поведение не затронуто. Вердикт fable m6 (подтверждено, P3, не pre-release) распространяется на все три таблицы.
+
+### m26 (подтверждено, P2) {#m26}
+
+`grep -i "content-addressed\|content_addressed\|metadata_type = cas"` по `CHANGELOG.md` даёт ноль попаданий, и слова «antalya» в файле нет вовсе — то есть `CHANGELOG.md` в дереве это апстримный релизный changelog (26.6/26.7), собираемый из полей «Changelog entry» в описаниях PR, а не файл, который правят руками по фиче. Поэтому буквальная формулировка находки верна, но исполнимая форма фикса — не коммит в `CHANGELOG.md`, а changelog-entry в описании PR (категория «New Feature») плюс релиз-ноты Antalya. Уже есть два известных долга того же класса, которые надо свести в одну запись: строка про отказ на неизвестный ключ CAS-конфига (`BACKLOG/docs-and-cleanup.md:76`) и строка про новую строгость `gcs_hmac` к `x-amz-*` (`fable-review-triage.md:365`). Считаю P2/pre-release: без этого фича уезжает в релиз без единой пользовательской записи.
+
+### m27 (подтверждено, P3) {#m27}
+
+На HEAD `src/Disks/tests/cas_test_helpers.h` — 2214 строк (в обзоре 1994, то есть вырос), включён 105 из 145 `.cpp` в `src/Disks/tests/`; транзитивное замыкание — `Pool/CasPool.h` 1133, `Gc/CasGc.h` 978, `Pool/CasRefProtocol.h` 794 строки (в обзоре 1159/1012/794). Ни PCH, ни unity-сборки в дереве нет, так что каждый TU действительно парсит всё замыкание заново. Продакшн-бинарь это не затрагивает вовсе; сам обзор помечает пункт как «matches existing codebase convention», и раскол хелперов на несколько заголовков — рефактор ради времени сборки, который до релиза не нужен.
+
+### m28 (дубликат T8, P3) {#m28}
+
+`docs/superpowers/cas/opus-review-triage.md:36` и разбор на `:1469` воспроизводят строку дословно: `Pool/CasBlobUploadPool.cpp:36-38` бросает `BAD_ARGUMENTS` на нуле, вызов безусловен из `programs/server/Server.cpp:1735` и `programs/local/LocalServer.cpp:438`. Смягчение оттуда же: описание настройки прямо говорит «Zero is rejected: the pool must have at least one thread» (`src/Core/ServerSettings.cpp:152-156`, та же формулировка была и в дереве обзора), и это отражено в публичной доке (`docs/en/antalya/cas/configuration.md:123`). Достижимость требует, чтобы администратор сам выставил 0 CAS-настройки на не-CAS сервере — P3; отдельного BACKLOG-пункта по-прежнему нет.
+
+### m29 (частично, P3) {#m29}
+
+На HEAD `src/Parsers/ASTSystemQuery.h:288-292` объявляет `enum_range` с `min = 0, max = 512`, тогда как в дереве обзора (`git show 056488b47a0:src/Parsers/ASTSystemQuery.h`) стояло `max = 255` — значит формулировка «следующий контрибьютор за 256 записей» на HEAD неверна, порог теперь 512 при ~138 текущих значениях. Механизм риска сохраняется: `getTypeIndexToTypeName` резервирует `resize(magic_enum::enum_count<...>())` и индексирует по ЗНАЧЕНИЮ элемента (`src/Parsers/ASTSystemQuery.cpp:22,29`), так что выход значения за пределы окна даёт OOB-запись на статической инициализации, и ни `static_assert`, ни тест этого не ловят. Важное для скоупа: строку с `max = 512` принёс `c04e775e939` («fix(Parsers): extend magic_enum range for ASTSystemQuery::Type», Sema Checherinda, 2026-07-10), присутствующий в `remotes/altinity/antalya-26.6` — это уже не изменение CAS-ветки, и по действующему правилу «не править апстримные/общие поверхности без консультации» правка `static_assert` здесь — консультационный пункт, а не задача.
+
+### m30 (дубликат fable m1, P3) {#m30}
+
+`programs/disks/CommandFsck.cpp` использует `BAD_ARGUMENTS` и для CLI-ошибок (`:45`, `:49`, `:53`), и для четырёх integrity-находок (`:147`, `:154`, `:165`, `:176`), а `DisksApp.cpp:239-250` на `code == ErrorCodes::BAD_ARGUMENTS` печатает `command->options_description` (или полный список команд) до текста ошибки. То есть exit-code-контракт не различает «кривой флаг» и «пул повреждён» — ровно вывод fable m1 (`fable-review-triage.md:522`), где фикс назван тривиальным: `CORRUPTED_DATA` на четырёх сайтах. Затрагивает все пять новых команд (`CommandFsck.cpp`, `CommandCaGcRebuild.cpp`, `CommandCaGcDryRun.cpp`, `CommandCaInspect.cpp`, `CommandCaDropMember.cpp`), поведение сервера не меняет.
+
+### m31 (подтверждено, P2) {#m31}
+
+`tests/integration/compose/docker_compose_rustfs.yml:6` — `image: rustfs/rustfs:1.0.0-beta.12`; та же версия зашита константой в стейтлес-обвязке (`ci/jobs/scripts/clickhouse_proc.py:168` `RUSTFS_VERSION = "1.0.0-beta.12"`, скачивается релизный zip с GitHub на `:177-178`) и повторена ещё в восьми `utils/ca-soak/docker-compose*.yml`. Пин по тегу без digest: бета-тег upstream'а может быть перезалит или удалён, и тогда лейн либо тихо меняет бэкенд под собой, либо перестаёт подниматься — это риск воспроизводимости CI, а не корректности продукта (RustFS используется только как S3-совместимый бэкенд тестов, в поставку не входит). Минимальная мера до релиза — единая точка версии плюс пин по `sha256`-digest (digest образа уже зафиксирован в отчёте измерений: `sha256:612a6707053c27c41816e79e5d5d30b5ba8479fb9b500ae4908cd4a723e888fa`, `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md:40`).
