@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasEventDispatcher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -33,6 +34,13 @@
 namespace DB::Cas
 {
 
+
+enum class DetachedDispatchFault
+{
+    None,
+    RefuseLaunch,
+    ThrowBeforeLaunch,
+};
 
 /// Configuration supplied when opening a content-addressed pool. The fields remain flat for the
 /// compatibility of existing wiring and tests, while `refLedgerConfig` and `mountConfig` project
@@ -164,6 +172,15 @@ struct PoolConfig
     bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
+
+    /// TEST SEAM: invoked by a detached task's lease at the exact boundary between releasing its pool
+    /// reference and decrementing the in-flight count.
+    std::function<void()> detached_lease_release_hook_for_test = {};
+
+    /// TEST SEAM: fault injection for the detached dispatch. `ThrowBeforeLaunch` stands in for an
+    /// allocation failure raised before the count is taken; `RefuseLaunch` for a launch that failed
+    /// after it was.
+    DetachedDispatchFault detached_dispatch_fault_for_test = DetachedDispatchFault::None;
 
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
@@ -369,6 +386,11 @@ public:
     /// backend-facing components in their dependency order. Destruction is also the clean-farewell
     /// path for a writable mount, so it must complete before the owning backend is released.
     ~Pool();
+
+    bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
+    bool stopAndDrainDetachedWork(uint64_t deadline_ms);
+    uint64_t detachedWorkInFlightForTest() const;
+    bool detachedWorkStoppingForTest() const;
 
     /// ---- per-server watermark surface ----
     /// process_epoch: random nonzero per Pool (process). GC checks epoch EQUALITY, never ordering.
@@ -1053,6 +1075,8 @@ private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
 
     mutable std::mutex writer_cleanup_mutex;
     std::condition_variable writer_cleanup_cv;

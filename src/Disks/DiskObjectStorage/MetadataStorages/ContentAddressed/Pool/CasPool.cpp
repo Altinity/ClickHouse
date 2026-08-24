@@ -905,6 +905,77 @@ Pool::~Pool()
     mount_runtime.finishTeardown(drained);
 }
 
+bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
+{
+    /// Admission is exception-safe in this order: allocate FIRST, then check-and-count under the
+    /// mutex, then arm. Counting before allocating would strand a count that nothing can decrement,
+    /// and every later drain would then run to its full deadline.
+    DetachedTaskLease lease(shared_from_this(), detached_work, config.detached_lease_release_hook_for_test);
+    DetachedStopToken token(detached_work);
+
+    if (config.detached_dispatch_fault_for_test == DetachedDispatchFault::ThrowBeforeLaunch)
+        throw Exception(ErrorCodes::ABORTED, "CAS detached dispatch: injected pre-admission failure");
+
+    {
+        std::lock_guard lock(detached_work->mutex);
+        if (detached_work->stopping)
+            return false;
+        ++detached_work->in_flight;
+    }
+    lease.arm();
+
+    try
+    {
+        if (config.detached_dispatch_fault_for_test == DetachedDispatchFault::RefuseLaunch)
+            throw Exception(ErrorCodes::ABORTED, "CAS detached dispatch: injected launch failure");
+
+        ThreadFromGlobalPool([lease, token, task]() mutable
+        {
+            task(token);
+        }).detach();
+    }
+    catch (...)
+    {
+        /// The launch failed. `lease` is destroyed as this scope unwinds and performs the release in
+        /// order. Log best-effort under a nested guard: `tryLogCurrentException` allocates, and memory
+        /// pressure is one of the conditions that brings us here.
+        try
+        {
+            tryLogCurrentException(getLogger("CasPool"), "CAS detached dispatch failed to launch");
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)
+{
+    {
+        std::lock_guard lock(detached_work->mutex);
+        detached_work->stopping = true;
+    }
+    detached_work->cv.notify_all();
+
+    std::unique_lock lock(detached_work->mutex);
+    return detached_work->cv.wait_for(lock, std::chrono::milliseconds(deadline_ms),
+                                      [this] { return detached_work->in_flight == 0; });
+}
+
+uint64_t Pool::detachedWorkInFlightForTest() const
+{
+    std::lock_guard lock(detached_work->mutex);
+    return detached_work->in_flight;
+}
+
+bool Pool::detachedWorkStoppingForTest() const
+{
+    std::lock_guard lock(detached_work->mutex);
+    return detached_work->stopping;
+}
+
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
 {
     /// Hazard C6: FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
