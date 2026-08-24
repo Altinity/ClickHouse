@@ -1172,7 +1172,8 @@ bool hasUnknownColumn(const QueryTreeNodePtr & node, QueryTreeNodePtr table_expr
 namespace
 {
 
-bool isDeterministicInScopeOfQueryTree(const QueryTreeNodePtr & node)
+template <typename KeepFunction>
+bool walkOrdinaryFunctions(const QueryTreeNodePtr & node, KeepFunction && keep_function)
 {
     QueryTreeNodes stack = {node};
     while (!stack.empty())
@@ -1193,7 +1194,7 @@ bool isDeterministicInScopeOfQueryTree(const QueryTreeNodePtr & node)
             if (function->isOrdinaryFunction())
             {
                 auto function_base = function->getFunction();
-                if (!function_base || !function_base->isDeterministicInScopeOfQuery())
+                if (!function_base || !keep_function(function_base))
                     return false;
             }
         }
@@ -1205,6 +1206,20 @@ bool isDeterministicInScopeOfQueryTree(const QueryTreeNodePtr & node)
         }
     }
     return true;
+}
+
+bool isDeterministicInScopeOfQueryTree(const QueryTreeNodePtr & node)
+{
+    return walkOrdinaryFunctions(
+        node,
+        [](const FunctionBasePtr & function_base) { return function_base->isDeterministicInScopeOfQuery(); });
+}
+
+bool isStatelessInQueryTree(const QueryTreeNodePtr & node)
+{
+    return walkOrdinaryFunctions(
+        node,
+        [](const FunctionBasePtr & function_base) { return !function_base->isStateful(); });
 }
 
 void filterConjunctions(
@@ -1291,6 +1306,16 @@ void removeExpressionsThatAreNotDeterministicInScopeOfQuery(
         return;
 
     filterConjunctions(expression, isDeterministicInScopeOfQueryTree, context);
+}
+
+void removeExpressionsThatAreStateful(
+    QueryTreeNodePtr & expression,
+    const ContextPtr & context)
+{
+    if (!expression)
+        return;
+
+    filterConjunctions(expression, isStatelessInQueryTree, context);
 }
 
 namespace

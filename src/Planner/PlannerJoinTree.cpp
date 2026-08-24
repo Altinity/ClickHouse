@@ -1041,6 +1041,7 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                 auto cloned = predicate->clone();
                 removeExpressionsThatDoNotDependOnTableIdentifiers(cloned, original_table_expression, query_context);
                 removeExpressionsThatAreNotDeterministicInScopeOfQuery(cloned, query_context);
+                removeExpressionsThatAreStateful(cloned, query_context);
                 return cloned;
             };
 
