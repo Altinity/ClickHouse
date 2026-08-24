@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS GC meta-job ownership and mount-claim error classification {#cas-gc-meta-job-ownership-design}
 
-**Status:** DRAFT for review, rev.2 (2026-08-24).
+**Status:** DRAFT for review, rev.3 (2026-08-24).
 
 This specification covers item 9 of `docs/superpowers/cas/final-checks-todo.md` minus its third
 bullet: findings **B1** (`~Gc` versus the `meta_pool` drain) and **B2a**
@@ -27,6 +27,12 @@ altogether rather than left in place beside a shared state object (`{#b1-fix}`),
 `claim` branches plus both fenced-precedence branches get direct tests driven by an explicit backend
 race seam (`{#b2a-testing}`). rev.1's claim that all six branches mean a change *between two
 observations* was also wrong and is corrected in `{#b2a-defect}`.
+
+**What rev.3 changed.** Review found two defects in rev.2's own construction. `GcMetaWriter` cannot be
+a direct member — that would initialize it before `Gc::Gc`'s argument validation and dereference a
+null `store` (`{#b1-fix}`). And rev.2's destruction test deadlocked as sequenced, because the
+destroying thread blocks inside the pool's join and never reaches the latch release
+(`{#b1-testing}`).
 
 ## Decision {#decision}
 
@@ -144,7 +150,19 @@ private:
 ```
 
 `Gc` replaces `meta_pool`, the two counters, the mutex, the set and `scheduleMetaJob` with a single
-`GcMetaWriter meta_writer` member. The call sites change mechanically:
+`std::unique_ptr<GcMetaWriter> meta_writer` member.
+
+**It must be a `unique_ptr`, not a direct member**, for the same reason `meta_pool` is one today
+(`Gc/CasGc.h:947-949`): a direct member is initialized before the constructor body runs, and its
+`pool_size` comes from `store->poolConfig()`. `Gc::Gc` validates its arguments in the **body** —
+a null `store`, a zero `gc_id`, and a zero `gc_stuck_removal_rounds` all raise `BAD_ARGUMENTS` there
+(`Gc/CasGc.cpp:343-357`) — so a direct member would dereference a null `store` before the first of
+those checks could fire. That ordering is pinned by `CASGCLease.CtorFailsClosedOnBadArguments`
+(`src/Disks/tests/gtest_cas_gc_round.cpp:459`), which asserts `Gc(nullptr, kGc)` raises
+`BAD_ARGUMENTS`. `meta_writer` is therefore created in the constructor body, after all validation and
+next to where `meta_pool` is created today, and every use goes through `meta_writer->…`.
+
+The call sites change mechanically:
 
 | Today | After |
 |---|---|
@@ -209,9 +227,37 @@ destruction" is the natural and wrong thing for a reader to assume.
   have proven nothing about the production closures, so the test drives the real ones. A backend seam
   blocks *inside* the meta write (a latch in the `.meta`-key branch, extending the existing
   `MetaWriteFaultBackend` pattern in `cas_test_helpers.h:1991`), which makes "the job is in flight"
-  an observed fact rather than a timing hope: the test waits until the backend reports it entered,
-  destroys the `Gc`, then releases the latch. Once for `scheduleCondemnMarkerWrite` and once for
+  an observed fact rather than a timing hope. Once for `scheduleCondemnMarkerWrite` and once for
   `scheduleConfirmedMetaDelete`.
+
+  **The release must not be sequenced after the destruction call.** `~ThreadPoolImpl` calls
+  `finalize`, which joins the workers (`src/Common/ThreadPool.cpp:551`), so a test thread that
+  destroys the `Gc` and only then releases the latch blocks forever inside the join. The release has
+  to happen while destruction is already under way.
+
+  The mechanism is a destruction-ordered release rather than a second thread, which keeps the test
+  single-threaded and removes the handshake entirely. The `Gc` under test is held inside a small
+  harness whose *last-declared* member owns the latch release:
+
+  ```cpp
+  struct Harness
+  {
+      std::unique_ptr<Gc> gc;
+      /// Declared LAST, therefore destroyed FIRST -- strictly before `~Gc` begins and before any
+      /// `Gc` member dies. Releasing here is what puts the in-flight job and member destruction in
+      /// the same window on purpose.
+      struct ReleaseOnTeardown { std::function<void()> release; ~ReleaseOnTeardown() { release(); } };
+      ReleaseOnTeardown releaser;
+  };
+  ```
+
+  Sequence: schedule the real operation; wait until the backend reports the job entered its write;
+  destroy the harness. `~ReleaseOnTeardown` opens the latch, `~Gc` then destroys its members, and the
+  pool's own destructor joins the now-unblocked job. Destruction has provably begun before the job
+  can proceed — which is the property the two-thread version was reaching for — and the deadlock is
+  structurally impossible: the release is sequenced *before* the join on the same thread, rather than
+  after it.
+
   This test does **not** go red before the change — for the reason given in `{#b1-why-not-ordering}`,
   no sanitizer reports the pre-change behaviour — and the plan must say so rather than stage a false
   red step. Its value is as a pin under ASan and TSan for every later change, and the enforcement of
