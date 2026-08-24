@@ -88,9 +88,16 @@ struct MountConfig
     /// Deterministic test interposition after the parked renewal predicate has sampled terminal false,
     /// immediately before the condition-variable wait atomically releases `driver_mutex`.
     std::function<void()> renewal_parked_predicate_false_hook_for_test = {};
-    /// Deterministic test interposition immediately before a terminal publisher waits for
-    /// `driver_mutex`. It lets tests distinguish serialized publication from a lost notification.
+    /// Deterministic test interposition immediately before a terminal publisher attempts to acquire
+    /// `driver_mutex`.
     std::function<void()> terminal_publication_waiting_for_driver_lock_hook_for_test = {};
+    /// Deterministic test interposition after the terminal publisher has observed `driver_mutex`
+    /// contention, but before it blocks acquiring the mutex.
+    std::function<void()> terminal_publication_driver_lock_contended_hook_for_test = {};
+    /// Deterministic test interposition immediately after a terminal publisher acquires `driver_mutex`.
+    std::function<void()> terminal_publication_driver_lock_acquired_hook_for_test = {};
+    /// Deterministic failure injection at the vanished-reason preparation boundary.
+    std::function<void()> vanished_reason_prepare_hook_for_test = {};
     /// Test-only override for exact pre/post-send controller gate interleavings.
     std::function<CasOverwriteStopCause()> renewal_stop_cause_for_test = {};
 };
@@ -387,6 +394,7 @@ private:
     CasOverwriteStopCause renewalStopCause(bool worker_call) const;
     bool waitForRetry(uint64_t wait_ms, bool worker_call);
     void tripFenceWithoutOperationalLoss();
+    std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
     /// observer thread must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
@@ -480,8 +488,9 @@ private:
     std::atomic<bool> vanished_intent{false};
     /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from
     /// `vanished_intent`: FORGET publishes that intent latch at step 1, so it can no longer serve as the
-    /// "state transition already done" flag. The FIRST `enterVanished` to win this exchange stores the
-    /// state, records `vanished_reason`, and logs; every later call returns early.
+    /// "state transition already done" flag. Published last, after the no-throw reason move and terminal
+    /// stores complete under `driver_mutex`; a preparation exception therefore leaves it clear so a later
+    /// `enterVanished` can retry the whole transition.
     std::atomic<bool> terminal_state_published{false};
     /// The reason recorded by the winning `enterVanished` (see `vanishedReason`). Written once, BEFORE the
     /// `pool_lifecycle` release-store, and immutable thereafter — so a reader that acquire-observes a

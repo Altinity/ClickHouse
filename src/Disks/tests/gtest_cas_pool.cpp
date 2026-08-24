@@ -2501,7 +2501,11 @@ TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
         std::once_flag pause_renewal_once;
         std::latch parked_predicate_sampled_false{1};
         std::latch release_parked_predicate{1};
+        std::latch terminal_pre_lock_reached{1};
+        std::latch terminal_post_lock_reached{1};
         std::once_flag release_once;
+        std::atomic<bool> renewal_holds_driver_mutex{false};
+        std::atomic<bool> terminal_reached_post_lock_while_renewal_held{false};
         const auto release_parked = [&]
         {
             std::call_once(release_once, [&] { release_parked_predicate.count_down(); });
@@ -2537,12 +2541,25 @@ TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
                 },
                 .renewal_parked_predicate_false_hook_for_test = [&]
                 {
+                    renewal_holds_driver_mutex.store(true, std::memory_order_release);
                     parked_predicate_sampled_false.count_down();
                     release_parked_predicate.wait();
+                    renewal_holds_driver_mutex.store(false, std::memory_order_release);
                 },
                 .terminal_publication_waiting_for_driver_lock_hook_for_test = [&]
                 {
+                    terminal_pre_lock_reached.count_down();
+                },
+                .terminal_publication_driver_lock_contended_hook_for_test = [&]
+                {
                     release_parked();
+                },
+                .terminal_publication_driver_lock_acquired_hook_for_test = [&]
+                {
+                    if (renewal_holds_driver_mutex.load(std::memory_order_acquire))
+                        terminal_reached_post_lock_while_renewal_held.store(true, std::memory_order_release);
+                    release_parked();
+                    terminal_post_lock_reached.count_down();
                 }},
             "test", sink, runtimeRenewBudget(), [&]
             {
@@ -2565,12 +2582,77 @@ TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
         renewal_before_driver_lock.wait();
         runtime.tripMountLost();
         runtime.scheduleRemount();
-        const bool both_exited_without_stop = exits.waitForAtLeast(2);
+        terminal_pre_lock_reached.wait();
+        terminal_post_lock_reached.wait();
+        const bool violated_serialization
+            = terminal_reached_post_lock_while_renewal_held.load(std::memory_order_acquire);
+        const bool both_exited_without_stop = violated_serialization ? false : exits.waitForAtLeast(2);
         runtime.stopBackgroundWorkers();
+        EXPECT_FALSE(violated_serialization);
         EXPECT_TRUE(both_exited_without_stop);
         EXPECT_EQ(exits.count(), 2u);
         runtime.finishTeardown(false);
     }
+}
+
+TEST(CASPoolRemount, VanishedReasonPreparationFailureLeavesTerminalTransitionRetryable)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout("runtime-vanished-reason-preparation");
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*backend, layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+    WorkerExitLatch exits;
+    RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+    {
+        return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+        {
+            body();
+            exits.recordExit();
+        });
+    };
+    std::atomic<uint64_t> preparation_calls{0};
+    CasEventSink sink;
+    CasMountRuntime runtime(
+        backend, layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .background_watermark = true,
+            .boot_ms_fn = [&] { return boot_ms; },
+            .worker_factory = factory,
+            .vanished_reason_prepare_hook_for_test = [&]
+            {
+                if (preparation_calls.fetch_add(1) == 0)
+                    throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected vanished-reason preparation failure");
+            }},
+        "test", sink, runtimeRenewBudget(), [] { return false; });
+    runtime.installKeeper(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startKeeper();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+    runtime.startBackgroundWorkers(std::chrono::hours(1));
+    runtime.tripMountLost();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        runtime.enterVanished(PoolLifecycle::VanishedReplaced, "must-not-publish");
+    });
+    EXPECT_FALSE(runtime.vanishedIntentPublished());
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
+    EXPECT_TRUE(runtime.vanishedReason().empty());
+
+    runtime.enterVanished(PoolLifecycle::VanishedReplaced, "retry-completed");
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::VanishedReplaced);
+    EXPECT_EQ(runtime.vanishedReason(), "retry-completed");
+    runtime.enterVanished(PoolLifecycle::VanishedForgotten, "must-remain-ignored");
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::VanishedReplaced);
+    EXPECT_EQ(runtime.vanishedReason(), "retry-completed");
+    const bool both_exited_without_stop = exits.waitForAtLeast(2);
+    runtime.stopBackgroundWorkers();
+    EXPECT_TRUE(both_exited_without_stop);
+    EXPECT_EQ(exits.count(), 2u);
+    EXPECT_EQ(preparation_calls.load(), 2u);
+    runtime.finishTeardown(false);
 }
 
 TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)

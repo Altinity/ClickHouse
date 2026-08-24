@@ -8,6 +8,7 @@
 #include <chrono>
 #include <ctime>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace DB
@@ -837,6 +838,24 @@ void CasMountRuntime::noteRemounted()
     }
 }
 
+std::unique_lock<std::mutex> CasMountRuntime::lockTerminalPublication()
+{
+    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
+        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
+
+    std::unique_lock lock(driver_mutex, std::try_to_lock);
+    if (!lock.owns_lock())
+    {
+        if (config.terminal_publication_driver_lock_contended_hook_for_test)
+            config.terminal_publication_driver_lock_contended_hook_for_test();
+        lock.lock();
+    }
+
+    if (config.terminal_publication_driver_lock_acquired_hook_for_test)
+        config.terminal_publication_driver_lock_acquired_hook_for_test();
+    return lock;
+}
+
 void CasMountRuntime::enterIdentityLost()
 {
     /// `TransientNotLive -> IdentityLost`, one way. The compare-exchange FROM `TransientNotLive` gives
@@ -855,12 +874,9 @@ void CasMountRuntime::enterIdentityLost()
     /// `TransientNotLive` under `Pool::remount_mutex` (a `Vanished` pool bailed at the caller's
     /// `isVanished()` gate and the caller guards `!= IdentityLost`), so the CAS wins deterministically and
     /// the stamp can never land on a state we did not transition.
-    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
-        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
-
     bool transitioned = false;
     {
-        std::lock_guard lock(driver_mutex);
+        auto lock = lockTerminalPublication();
         lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
 
         PoolLifecycle expected = PoolLifecycle::TransientNotLive;
@@ -900,39 +916,46 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
                 "CasMountRuntime::enterVanished called with a non-terminal lifecycle value");
     }
 
-    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
-        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
+    if (terminal_state_published.load(std::memory_order_acquire))
+        return;
+
+    if (config.vanished_reason_prepare_hook_for_test)
+        config.vanished_reason_prepare_hook_for_test();
+    String prepared_reason = reason;
+    const int64_t prepared_since_wall_s = wallClockNowSeconds();
+    static_assert(std::is_nothrow_move_assignable_v<String>);
 
     bool transitioned = false;
+    /// The guard is published LAST. Reason preparation above is the only potentially-throwing step;
+    /// once this block begins, the statically-proven-noexcept move and atomic stores either publish
+    /// one complete terminal transition or observe that an earlier transition already completed.
     {
-        std::lock_guard lock(driver_mutex);
-        /// Publish the terminal-intent latch (spec §3). For a natural transition this is the FIRST
-        /// publish; for FORGET, `publishVanishedIntent` already set it at step 1. Either way it is
-        /// published before the state store below and while holding the mutex used by every
-        /// `driver_cv` terminal predicate.
-        vanished_intent.store(true, std::memory_order_release);
-
-        /// Idempotency guard for the STATE transition, keyed on a dedicated latch rather than
-        /// `vanished_intent` (which FORGET publishes early): the FIRST winner stores the state, records
-        /// the reason, and logs; a later call leaves the locked region without re-storing or re-logging.
-        if (!terminal_state_published.exchange(true, std::memory_order_acq_rel))
+        auto lock = lockTerminalPublication();
+        if (!terminal_state_published.load(std::memory_order_acquire))
         {
             transitioned = true;
+
+            /// Publish the terminal-intent latch (spec §3). For a natural transition this is the FIRST
+            /// publish; for FORGET, `publishVanishedIntent` already set it at step 1. Either way it is
+            /// published before the state store below and while holding the mutex used by every
+            /// `driver_cv` terminal predicate.
+            vanished_intent.store(true, std::memory_order_release);
 
             /// Record the reason BEFORE the state's release-store, so a reader that acquire-observes the
             /// terminal state (e.g. `Pool::throwIfLifecycleTerminal`) also observes this string. Written
             /// exactly once.
-            vanished_reason = reason;
+            vanished_reason = std::move(prepared_reason);
 
             /// The `since` the lifecycle snapshot reports for the `vanished` row — the wall-clock instant
             /// of the terminal transition. Written before the `pool_lifecycle` release-store below, same
             /// as the reason, so an acquire-observer of the terminal state also observes it.
-            lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+            lifecycle_since_wall_s.store(prepared_since_wall_s, std::memory_order_release);
 
-            /// An unconditional store is safe now: the guard above serializes terminal transitions, and
-            /// no non-terminal transition can move a `Vanished` state (their compare-exchanges are keyed
-            /// on `Live`/`TransientNotLive`), so this value is absorbing.
+            /// The driver mutex serializes terminal transitions, and no non-terminal transition can move
+            /// a `Vanished` state (their compare-exchanges are keyed on `Live`/`TransientNotLive`), so this
+            /// value is absorbing.
             pool_lifecycle.store(which, std::memory_order_release);
+            terminal_state_published.store(true, std::memory_order_release);
         }
     }
 
@@ -954,10 +977,8 @@ void CasMountRuntime::publishVanishedIntent()
     /// this stops new remount scheduling and makes an in-flight remount loop bail at its next step —
     /// bounding FORGET's subsequent joins to one step + one backend timeout. The state store + WARN follow
     /// in `enterVanished` (step 6). Idempotent.
-    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
-        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
     {
-        std::lock_guard lock(driver_mutex);
+        auto lock = lockTerminalPublication();
         vanished_intent.store(true, std::memory_order_release);
     }
     driver_cv.notify_all();
