@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS GC meta-job ownership and mount-claim error classification {#cas-gc-meta-job-ownership-design}
 
-**Status:** DRAFT for review, rev.3 (2026-08-24).
+**Status:** DRAFT for review, rev.4 (2026-08-24).
 
 This specification covers item 9 of `docs/superpowers/cas/final-checks-todo.md` minus its third
 bullet: findings **B1** (`~Gc` versus the `meta_pool` drain) and **B2a**
@@ -28,11 +28,13 @@ altogether rather than left in place beside a shared state object (`{#b1-fix}`),
 race seam (`{#b2a-testing}`). rev.1's claim that all six branches mean a change *between two
 observations* was also wrong and is corrected in `{#b2a-defect}`.
 
-**What rev.3 changed.** Review found two defects in rev.2's own construction. `GcMetaWriter` cannot be
+**What rev.3 and rev.4 changed.** Review found two defects in rev.2's own construction. `GcMetaWriter` cannot be
 a direct member — that would initialize it before `Gc::Gc`'s argument validation and dereference a
 null `store` (`{#b1-fix}`). And rev.2's destruction test deadlocked as sequenced, because the
-destroying thread blocks inside the pool's join and never reaches the latch release
-(`{#b1-testing}`).
+destroying thread blocks inside the pool's join and never reaches the latch release. rev.3's own
+replacement for it was unsound in turn — a destruction-ordered release does not keep the worker from
+finishing before `~Gc` runs — so rev.4 withdraws the determinism claim entirely and states what the
+test does and does not establish (`{#b1-testing}`).
 
 ## Decision {#decision}
 
@@ -223,45 +225,36 @@ destruction" is the natural and wrong thing for a reader to assume.
 - **Round-exit drain — failing-first, deterministic.** A round is made to throw after its condemn
   markers are scheduled; after the throw propagates, the round's scheduled and completed job counts
   are equal. Red today, green after the scope guard.
-- **Both real jobs, in flight across `Gc` destruction.** Per review, the synthetic job of rev.1 would
+- **Both real jobs, exercised against `Gc` destruction — functional coverage, not failing-first.**
+  Per review, the synthetic job of rev.1 would
   have proven nothing about the production closures, so the test drives the real ones. A backend seam
   blocks *inside* the meta write (a latch in the `.meta`-key branch, extending the existing
   `MetaWriteFaultBackend` pattern in `cas_test_helpers.h:1991`), which makes "the job is in flight"
   an observed fact rather than a timing hope. Once for `scheduleCondemnMarkerWrite` and once for
   `scheduleConfirmedMetaDelete`.
 
-  **The release must not be sequenced after the destruction call.** `~ThreadPoolImpl` calls
-  `finalize`, which joins the workers (`src/Common/ThreadPool.cpp:551`), so a test thread that
-  destroys the `Gc` and only then releases the latch blocks forever inside the join. The release has
-  to happen while destruction is already under way.
+  **This is functional coverage, not a lifetime detector.** The distinction matters enough to state in
+  the source comment, because a later reader will otherwise take this test for the guard it is not.
 
-  The mechanism is a destruction-ordered release rather than a second thread, which keeps the test
-  single-threaded and removes the handshake entirely. The `Gc` under test is held inside a small
-  harness whose *last-declared* member owns the latch release:
+  Two facts bound what any runtime test here can establish. First, `~ThreadPoolImpl` calls `finalize`,
+  which joins the workers (`src/Common/ThreadPool.cpp:551`), so a test thread that destroys the `Gc`
+  and only then releases the latch blocks forever inside the join — the release has to come from
+  somewhere else. Second, and decisively, even a perfectly interleaved run cannot fail on the
+  pre-change code, for the reason in `{#b1-why-not-ordering}`: the members are
+  destructed-but-still-allocated and no sanitizer reports the access.
 
-  ```cpp
-  struct Harness
-  {
-      std::unique_ptr<Gc> gc;
-      /// Declared LAST, therefore destroyed FIRST -- strictly before `~Gc` begins and before any
-      /// `Gc` member dies. Releasing here is what puts the in-flight job and member destruction in
-      /// the same window on purpose.
-      struct ReleaseOnTeardown { std::function<void()> release; ~ReleaseOnTeardown() { release(); } };
-      ReleaseOnTeardown releaser;
-  };
-  ```
+  So the test schedules the real operation, waits until the backend reports the job entered its write,
+  releases the latch from a separate thread, and destroys the `Gc` — exercising the join against an
+  in-flight job and asserting the write landed and the registry recorded it. It makes **no** claim
+  about ordering against `~Gc`: the release may land before, during, or after destruction begins, and
+  the test is sound under all three. An earlier revision of this document claimed a
+  destruction-ordered release made the interleaving deterministic; it does not — the released worker
+  may finish before the `Gc` is destroyed at all — and the claim is withdrawn rather than patched.
 
-  Sequence: schedule the real operation; wait until the backend reports the job entered its write;
-  destroy the harness. `~ReleaseOnTeardown` opens the latch, `~Gc` then destroys its members, and the
-  pool's own destructor joins the now-unblocked job. Destruction has provably begun before the job
-  can proceed — which is the property the two-thread version was reaching for — and the deadlock is
-  structurally impossible: the release is sequenced *before* the join on the same thread, rather than
-  after it.
-
-  This test does **not** go red before the change — for the reason given in `{#b1-why-not-ordering}`,
-  no sanitizer reports the pre-change behaviour — and the plan must say so rather than stage a false
-  red step. Its value is as a pin under ASan and TSan for every later change, and the enforcement of
-  the boundary itself is the compile-level one: the API that would allow a bad job no longer exists.
+  **The regression guard for the lifetime property is the compile-level one**, and only that: after
+  this change there is no entry point onto the pool that accepts a caller-supplied callable, so a job
+  capturing `this` is not expressible. That property is checked by reading the class's public surface
+  — one grep — not by running anything.
 - **Regression guard on the existing premise.** `gtest_cas_gc_ack_floor.cpp:1242-1277` reasons
   explicitly that the confirmation registry "dies with" its `Gc`, so a new `Gc` under the same
   identity starts empty and falls back to a synchronous `loadMeta` re-check. That premise survives —
@@ -332,8 +325,10 @@ different-epoch branch, and the two other tests rev.1 cited
 (`gtest_cas_pool.cpp:1824`, `gtest_cas_heartbeat.cpp:373`) exercise the **renewal** path, which this
 change does not touch. Five branches and both precedence rules could regress with that gate green.
 
-Coverage is therefore direct and per branch. Four of the eight branches need a state change inside a
-window `claim` holds open, which today's helpers cannot produce, so the tests get one seam:
+Coverage is therefore direct and per branch. Five of the eight branches need a state change inside a
+window `claim` holds open — appeared, vanished after `head`, changed during adoption, vanished during
+adoption, and fenced during adoption — which today's helpers cannot produce, so the tests get one
+seam:
 
 ```cpp
 /// Runs a caller-supplied action ONCE, immediately before the named backend call, so a test can make
