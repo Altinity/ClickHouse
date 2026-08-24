@@ -39,10 +39,12 @@ Three step templates, referenced by name from every task. Each occurrence names 
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
-ninja -C build_debug unit_tests_dbms > build_debug/<log> 2>&1; echo "NINJA_EXIT=$?"
+ninja -C build_debug unit_tests_dbms > build_debug/<log> 2>&1
 ```
 
-Read the printed `NINJA_EXIT`. Anything other than `0` means the next step is the analysis, not the test run.
+**No `; echo "$?"` after it.** Appending an `echo` makes the *command's* exit status that of the
+`echo` — always `0` — so a failed build reports success to anything that gates on exit status. Let the
+command's own status stand. A nonzero status means the next step is the analysis, never the test run.
 
 **ANALYZE(`<log>`)** — dispatch a subagent with this prompt, and do not read the log yourself:
 
@@ -54,8 +56,11 @@ This applies to **test** logs as well as build logs, not only to build logs.
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
-./build_debug/unit_tests_dbms --gtest_filter='<filter>' > build_debug/<log> 2>&1; echo "TEST_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='<filter>' > build_debug/<log> 2>&1
 ```
+
+Same rule: no trailing `echo`. A nonzero status means the run failed, and the next step is the
+analysis — never the commit.
 
 **COMMIT(`<paths>`, `<message>`)**
 
@@ -79,8 +84,17 @@ Read the `git log -1 --stat` output and confirm it lists exactly `<paths>` and n
 | `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h` / `.cpp` (modify) | Teardown sequencing, idempotent helper, new destructor, weak `Context` member and sinks. |
 | `src/Interpreters/Context.cpp` (modify) | The two CAS-owned accessors adopt `getZooKeeperLog`'s shape. |
 | `src/Common/ProfileEvents.cpp` (modify) | `M(...)` definitions for the two new counters. |
-| `src/Disks/tests/gtest_cas_detached_work.cpp` (create) | Tasks 1–4 tests. |
-| `src/Disks/tests/gtest_cas_shutdown_context.cpp` (create) | Tasks 5–6 tests, including three subprocess exit tests. |
+| `src/Disks/tests/cas_test_helpers.h` (modify) | `OrderedFaultBackend` moved here from a test file, so more than one suite can fault a publish. |
+| `src/Disks/tests/gtest_cas_detached_work.cpp` (create) | Tasks 1–3 and 5 tests. |
+| `src/Disks/tests/gtest_cas_shutdown_context.cpp` (create) | Tasks 4 and 6 tests, including four subprocess exit tests. |
+
+---
+
+**Task order is a safety property, not a preference.** Task 4 makes `~Pool` unable to terminate the
+process, and Task 5 is what makes explicit teardown the usual place `~Pool` runs. Landing them the
+other way round would leave one intermediate commit in which a throwing teardown phase is reached more
+predictably than before and is still unguarded. They may also be squashed into one commit; they may
+not be reordered.
 
 ---
 
@@ -89,23 +103,27 @@ Read the `git log -1 --stat` output and confirm it lists exactly `<paths>` and n
 **Files:**
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h`
 - Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.cpp`
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h`, `.../Pool/CasPool.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp`
 - Test: `src/Disks/tests/gtest_cas_detached_work.cpp` (create)
 
 **Interfaces — Produces:**
-- `DB::Cas::DetachedRegistryState`, `DB::Cas::DetachedStopToken` (`bool stopping() const`), `DB::Cas::DetachedTaskLease` (copyable, completes once).
+- `DB::Cas::DetachedRegistryState`, `DB::Cas::DetachedStopToken` (`bool stopping() const`), `DB::Cas::DetachedTaskLease` (copyable, completes once, `void arm()`).
+- `DB::Cas::DetachedDispatchFault` — `None`, `RefuseLaunch`, `ThrowBeforeLaunch`.
 - `bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)`.
 - `bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)` — `false` on expiry, idempotent.
-- `uint64_t Pool::detachedWorkInFlightForTest() const`.
-- `PoolConfig::detached_lease_release_hook_for_test` and `PoolConfig::detached_dispatch_fault_for_test`.
+- `uint64_t Pool::detachedWorkInFlightForTest() const`, `bool Pool::detachedWorkStoppingForTest() const`.
+- `PoolConfig::detached_lease_release_hook_for_test`, `PoolConfig::detached_dispatch_fault_for_test`.
 
 **Context.** Two sites detach today, both holding a strong `Pool` reference with nobody waiting: `Pool::reportImpossibleInterference` (captures `shared_from_this`) and `CasRefLedger::dispatchSnapshotPublisher` (calls the injected `pin_owner`, declared `std::function<std::shared_ptr<void>()>`, and captures raw `this`).
 
-Three properties decide correctness here:
+Three properties decide correctness, and each has a test:
 
 1. **Release order.** The lease drops its `PoolPtr` *before* decrementing. A strong reference living in the task's captures would die with the `std::function` — after the count could already have reached zero — so a drain could report zero while `~Pool` still ran on the worker.
 2. **Copyable, completes once.** `startThreadFromGlobalPool` takes `std::function<void()>`, so everything a task captures must be copy-constructible: a move-only lease will not compile, and a naively copyable one would release per copy.
-3. **Exception-safe admission.** All allocation happens *before* the count is incremented. Incrementing and then failing to allocate the completion strands a count that nothing can ever decrement, and every later drain then runs to its deadline.
+3. **Exception-safe admission.** All allocation happens *before* the count is incremented. Incrementing and then failing to allocate strands a count nothing can decrement, and every later drain then runs to its full deadline.
+
+**A note on the tests below.** Two of them must observe "the stop is latched" before releasing a worker. Opening a gate from another thread and hoping the drain got there first is not a test — a correct implementation would record `false` and a broken one would pass. `detachedWorkStoppingForTest` exists for exactly this handshake: the drain runs on its own thread, the test polls the latch with `std::this_thread::yield()`, and only then releases the worker. No sleeps anywhere.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -119,7 +137,9 @@ Create `src/Disks/tests/gtest_cas_detached_work.cpp`:
 
 #include <atomic>
 #include <condition_variable>
+#include <future>
 #include <mutex>
+#include <thread>
 
 using namespace DB::Cas;
 
@@ -145,6 +165,25 @@ struct Gate
     bool open_ = false;
 };
 
+/// Spin until the drain has latched `stopping`. Bounded so a broken implementation fails the test
+/// instead of hanging it.
+void awaitStopLatched(const PoolPtr & store)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!store->detachedWorkStoppingForTest())
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "the drain never latched `stopping`";
+        std::this_thread::yield();
+    }
+}
+
+PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConfig config = {})
+{
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    return Pool::open(backend, config);
+}
+
 }
 
 /// A zero in-flight count must mean no tracked task still holds the pool. The hook fires at the exact
@@ -157,11 +196,11 @@ TEST(CASDetachedWork, LeaseReleasesPoolBeforeDecrementing)
     std::weak_ptr<Pool> weak;
     std::atomic<long> use_count_at_boundary{-1};
 
-    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
+    PoolConfig config;
     config.detached_lease_release_hook_for_test
         = [&use_count_at_boundary, &weak] { use_count_at_boundary.store(weak.use_count()); };
 
-    auto store = Pool::open(backend, config);
+    auto store = openPlainPool(backend, config);
     weak = store;
 
     ASSERT_TRUE(store->tryDispatchDetached([](DetachedStopToken) {}));
@@ -174,56 +213,40 @@ TEST(CASDetachedWork, LeaseReleasesPoolBeforeDecrementing)
     EXPECT_EQ(weak.use_count(), 1L);
 }
 
-/// The drain must not return while a task is still running.
-TEST(CASDetachedWork, DrainWaitsForWorkInFlight)
+/// The drain must not RETURN while a task is still running. Asserted as "the drain is still blocked
+/// while the task is held" -- the only formulation that does not race the task's completion.
+TEST(CASDetachedWork, DrainDoesNotReturnWhileWorkIsInFlight)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = openPlainPool(backend);
 
-    auto gate = std::make_shared<Gate>();
-    std::atomic<bool> finished{false};
-    ASSERT_TRUE(store->tryDispatchDetached([gate, &finished](DetachedStopToken)
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    ASSERT_TRUE(store->tryDispatchDetached([entered, release](DetachedStopToken)
     {
-        gate->wait();
-        finished.store(true);
+        entered->open();
+        release->wait();
     }));
+    entered->wait();
 
-    std::thread opener([gate] { gate->open(); });
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
-    opener.join();
-    EXPECT_TRUE(finished.load());
-}
+    auto drain = std::async(std::launch::async,
+                            [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/60000); });
 
-/// After stopping, no new detached work may be created.
-TEST(CASDetachedWork, DispatchIsRefusedAfterStop)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    awaitStopLatched(store);
+    EXPECT_EQ(drain.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "the drain returned while a tracked task was still in flight";
 
-    ASSERT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
-    EXPECT_FALSE(store->tryDispatchDetached([](DetachedStopToken) {}));
+    release->open();
+    EXPECT_TRUE(drain.get());
     EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
 }
 
-/// A dispatch that cannot allocate must leave the count untouched, not stranded above zero.
-TEST(CASDetachedWork, FailedAdmissionLeavesNoStrandedCount)
+/// A task must see the stop that is already latched. The handshake matters: releasing the task before
+/// the drain latches would make a CORRECT implementation record `false`.
+TEST(CASDetachedWork, TaskObservesStopTokenOnceLatched)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
-    config.detached_dispatch_fault_for_test = DetachedDispatchFault::ThrowBeforeLaunch;
-    auto store = Pool::open(backend, config);
-
-    EXPECT_ANY_THROW(store->tryDispatchDetached([](DetachedStopToken) {}));
-    EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/1000))
-        << "a stranded count makes every later drain run to its deadline";
-}
-
-/// The token a task receives must report the stop that is already under way.
-TEST(CASDetachedWork, TaskObservesStopToken)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = openPlainPool(backend);
 
     auto entered = std::make_shared<Gate>();
     auto release = std::make_shared<Gate>();
@@ -235,22 +258,63 @@ TEST(CASDetachedWork, TaskObservesStopToken)
         release->wait();
         saw_stop.store(token.stopping());
     }));
-
     entered->wait();
-    std::thread opener([release] { release->open(); });
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
-    opener.join();
+
+    auto drain = std::async(std::launch::async,
+                            [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/60000); });
+    awaitStopLatched(store);
+    release->open();
+
+    EXPECT_TRUE(drain.get());
     EXPECT_TRUE(saw_stop.load());
+}
+
+/// After stopping, no new detached work may be created.
+TEST(CASDetachedWork, DispatchIsRefusedAfterStop)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPlainPool(backend);
+
+    ASSERT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/10000));
+    EXPECT_FALSE(store->tryDispatchDetached([](DetachedStopToken) {}));
+    EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
+}
+
+/// A dispatch that cannot allocate must leave the count untouched, not stranded above zero.
+TEST(CASDetachedWork, FailedAdmissionLeavesNoStrandedCount)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    PoolConfig config;
+    config.detached_dispatch_fault_for_test = DetachedDispatchFault::ThrowBeforeLaunch;
+    auto store = openPlainPool(backend, config);
+
+    EXPECT_ANY_THROW(store->tryDispatchDetached([](DetachedStopToken) {}));
+    EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
+    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/1000))
+        << "a stranded count makes every later drain run to its full deadline";
+}
+
+/// A launch that fails after admission must roll the count back, and must not throw at its caller.
+TEST(CASDetachedWork, FailedLaunchRollsBackAndDoesNotThrow)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    PoolConfig config;
+    config.detached_dispatch_fault_for_test = DetachedDispatchFault::RefuseLaunch;
+    auto store = openPlainPool(backend, config);
+
+    EXPECT_NO_THROW(EXPECT_FALSE(store->tryDispatchDetached([](DetachedStopToken) {})));
+    EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
+    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/1000));
 }
 ```
 
 - [ ] **Step 2: BUILD(`build_t1_red.log`)**
 
-Expected: `NINJA_EXIT` is **not** `0`. This task's first red is a **build failure** — `tryDispatchDetached`, `DetachedStopToken`, `DetachedDispatchFault` and the two hooks do not exist yet. There is no test run in this step.
+Expected: the build **fails**. This task's first red is a build failure — none of the six names above exists yet. There is no test run in this step.
 
 - [ ] **Step 3: ANALYZE(`build_t1_red.log`)**
 
-Confirm the errors are exactly "no member named …" / "unknown type name …" for the names above. Any *other* compile error means the test file itself is wrong — fix it before implementing, so the red is for the intended reason.
+Confirm the errors are "no member named …" / "unknown type name …" for exactly those six names. Any *other* compile error means the test file itself is wrong: fix it before implementing, so the red is for the intended reason.
 
 - [ ] **Step 4: Create `CasDetachedWork.h`**
 
@@ -378,19 +442,7 @@ void DetachedTaskLease::arm()
 
 - [ ] **Step 6: Wire `Pool`**
 
-In `CasPool.h`, add to `PoolConfig`:
-
-```cpp
-    /// TEST SEAM: invoked by a detached task's lease at the exact boundary between releasing its pool
-    /// reference and decrementing the in-flight count.
-    std::function<void()> detached_lease_release_hook_for_test = {};
-
-    /// TEST SEAM: fault injection for the detached dispatch. `ThrowBeforeLaunch` stands in for an
-    /// allocation failure raised before the thread exists; `RefuseLaunch` for a launch that failed.
-    DetachedDispatchFault detached_dispatch_fault_for_test = DetachedDispatchFault::None;
-```
-
-with, above `PoolConfig`:
+In `CasPool.h`, above `PoolConfig`:
 
 ```cpp
 enum class DetachedDispatchFault
@@ -401,12 +453,26 @@ enum class DetachedDispatchFault
 };
 ```
 
-and to `Pool`:
+inside `PoolConfig`:
+
+```cpp
+    /// TEST SEAM: invoked by a detached task's lease at the exact boundary between releasing its pool
+    /// reference and decrementing the in-flight count.
+    std::function<void()> detached_lease_release_hook_for_test = {};
+
+    /// TEST SEAM: fault injection for the detached dispatch. `ThrowBeforeLaunch` stands in for an
+    /// allocation failure raised before the count is taken; `RefuseLaunch` for a launch that failed
+    /// after it was.
+    DetachedDispatchFault detached_dispatch_fault_for_test = DetachedDispatchFault::None;
+```
+
+and on `Pool`:
 
 ```cpp
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
     uint64_t detachedWorkInFlightForTest() const;
+    bool detachedWorkStoppingForTest() const;
 
 private:
     std::shared_ptr<DetachedRegistryState> detached_work = std::make_shared<DetachedRegistryState>();
@@ -424,7 +490,7 @@ bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
     DetachedStopToken token(detached_work);
 
     if (config.detached_dispatch_fault_for_test == DetachedDispatchFault::ThrowBeforeLaunch)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS detached dispatch: injected pre-launch failure");
+        throw Exception(ErrorCodes::ABORTED, "CAS detached dispatch: injected pre-admission failure");
 
     {
         std::lock_guard lock(detached_work->mutex);
@@ -437,15 +503,15 @@ bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
     try
     {
         if (config.detached_dispatch_fault_for_test == DetachedDispatchFault::RefuseLaunch)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS detached dispatch: injected launch failure");
+            throw Exception(ErrorCodes::ABORTED, "CAS detached dispatch: injected launch failure");
 
         ThreadFromGlobalPool([lease, token, task]() mutable { task(token); }).detach();
     }
     catch (...)
     {
-        /// The launch failed: the lease's own destruction (this scope) performs the release, in order.
-        /// Log best-effort under a nested guard -- `tryLogCurrentException` allocates, and memory
-        /// pressure is one of the conditions that brought us here.
+        /// The launch failed. `lease` is destroyed as this scope unwinds and performs the release in
+        /// order. Log best-effort under a nested guard: `tryLogCurrentException` allocates, and memory
+        /// pressure is one of the conditions that brings us here.
         try
         {
             tryLogCurrentException(getLogger("CasPool"), "CAS detached dispatch failed to launch");
@@ -472,15 +538,13 @@ bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)
 }
 ```
 
-Note the `lease` capture is by value into the `std::function` — which is exactly why it had to be copyable — and that `ThrowBeforeLaunch` is raised *before* the count is taken, so the test asserting an untouched count is meaningful.
+The `lease` capture is by value into the `std::function` — which is why it had to be copyable — and `ThrowBeforeLaunch` is raised *before* the count is taken, so the test asserting an untouched count is meaningful. `ABORTED` is used rather than `LOGICAL_ERROR`: this is an injected environmental failure, and `LOGICAL_ERROR` aborts the process on debug and sanitizer builds.
 
-`ErrorCodes::LOGICAL_ERROR` here is a test-seam-only throw on a path no input can reach; if the surrounding file has no `LOGICAL_ERROR` extern yet, add one rather than reusing an unrelated code.
-
-- [ ] **Step 7: BUILD(`build_t1_green.log`)** — then **ANALYZE(`build_t1_green.log`)**. Expected `NINJA_EXIT=0`.
-
-- [ ] **Step 8: TEST(`CASDetachedWork.*`, `test_t1.log`)** — then **ANALYZE(`test_t1.log`)**. Expected `TEST_EXIT=0`, five tests passing.
-
-- [ ] **Step 9: COMMIT**
+- [ ] **Step 7: BUILD(`build_t1_green.log`)**
+- [ ] **Step 8: ANALYZE(`build_t1_green.log`)**
+- [ ] **Step 9: TEST(`CASDetachedWork.*`, `test_t1.log`)**
+- [ ] **Step 10: ANALYZE(`test_t1.log`)** — six tests, all passing.
+- [ ] **Step 11: COMMIT**
 
 ```
 paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h
@@ -491,54 +555,63 @@ paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasD
 message: fix: track CAS detached work through one dispatcher
 ```
 
----
+- [ ] **Step 12: Verify the commit** — `git log -1 --stat` lists exactly those five paths.
 
+---
 ### Task 2: Route both dispatch sites through it {#task-2-rewire-dispatch}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp` (`reportImpossibleInterference`)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h` (the `pin_owner` member and its constructor parameter), `.../Pool/CasRefLedger.cpp` (`dispatchSnapshotPublisher`, `settleSnapshotPublish`)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h` (one more test hook)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp` (`reportImpossibleInterference`, the ledger's construction)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp`
+- Modify: `src/Disks/tests/cas_test_helpers.h`
 - Test: `src/Disks/tests/gtest_cas_detached_work.cpp`
 
-**Interfaces — Consumes** Task 1's dispatcher. **Produces** `PoolConfig::publish_error_handler_hook_for_test`.
+**Interfaces — Consumes** Task 1's dispatcher. **Produces** two injected `CasRefLedger` constructor callbacks, `dispatch_detached` and `publish_error_hook`, and a shared `OrderedFaultBackend`.
 
 **Context.** The publisher carries a single-flight reservation: `admitSnapshotPublishUnderStateLock` increments `pending_snapshot_publishes` under `state_mutex` *before* the dispatch, and only `settleSnapshotPublish` decrements it — under one lock hold that also re-admits, so observers never see a transient zero. Therefore:
 
-- the reservation rollback must fire **only** when no task was launched. A guard that also fired for a launched task would double-decrement, or erase a reservation a re-admission had just taken;
-- settlement inside a launched task must be **unconditional**. It is reached today by a bare call after a handler that calls `tryLogCurrentException`, which allocates and can itself throw; the reservation is then stranded forever and `quiesceRefTablesForRemount` and `dropNamespace` wait on a count that never reaches zero;
+- the rollback must fire **only** when no task was launched. A guard that also fired for a launched task would double-decrement, or erase a reservation a re-admission had just taken;
+- settlement inside a launched task must be **unconditional**. It is reached today by a bare call after a handler that calls `tryLogCurrentException`, which allocates and can itself throw; the reservation is then stranded forever, and `quiesceRefTablesForRemount` and `dropNamespace` wait on a count that never reaches zero;
 - the diagnostic dispatch has no reservation and needs no rollback guard, but it keeps its caller-side `try`: it runs on a fail-closed path, and an allocation failure while building the task must not replace the exception the caller was already raising.
 
-- [ ] **Step 1: Write the failing tests**
+**Two decisions this task makes rather than leaves open.**
 
-Append to `src/Disks/tests/gtest_cas_detached_work.cpp`. The fixture that makes any mutation publish a snapshot is `snapshot_log_count_threshold = 0`; `publishRef` below is the same shape as the one in `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp:174-187`.
+1. **The error hook is a ledger constructor callback, not a `PoolConfig` field.** `CasRefLedger`'s own `config` member is a `RefLedgerConfig`, not a `PoolConfig`, so a `PoolConfig` hook is simply not reachable from the publisher task. It is injected the same way `pin_owner` is today.
+2. **The publish must be *made* to fail.** With a plain `InMemoryBackend` the publish succeeds, the `catch` is never entered, and a test of the throwing handler would pass without exercising anything. `OrderedFaultBackend` — today file-local in `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp` (its class and the `openPool` helper are at lines 120–172) — moves **verbatim** into `src/Disks/tests/cas_test_helpers.h`, next to the other fault backends, and that file keeps using it from there. This is a move, not a rewrite: do not adjust its behaviour, and re-run its original suite afterwards.
+
+- [ ] **Step 1: Move `OrderedFaultBackend` into the shared header**
+
+Cut the class from `gtest_cas_ref_snapshot_publish_ordering.cpp` into `src/Disks/tests/cas_test_helpers.h` inside `namespace DB::Cas::tests`, add whatever includes it needs, and leave a `using` or fully-qualified references behind so the original file compiles unchanged in behaviour.
+
+- [ ] **Step 2: BUILD(`build_t2_move.log`)**
+- [ ] **Step 3: ANALYZE(`build_t2_move.log`)**
+- [ ] **Step 4: TEST(`CASRefSnapshot*`, `test_t2_move.log`)**
+- [ ] **Step 5: ANALYZE(`test_t2_move.log`)** — the moved backend's original suite must be unchanged and green before anything is built on top of it.
+
+- [ ] **Step 6: Write the failing tests**
+
+Append to `src/Disks/tests/gtest_cas_detached_work.cpp`. `publishRef` is the same shape as the one at `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp:174-187`; copy it verbatim into the anonymous namespace.
 
 ```cpp
 namespace
 {
 
-PoolPtr openPublishingPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConfig config = {})
+/// A pool where any nonempty tail is over-threshold, so every mutation auto-dispatches a publish.
+PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBackend> & backend,
+                           PoolConfig config = {})
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
-    config.snapshot_log_count_threshold = 0;          /// any nonempty tail is over-threshold
+    config.snapshot_log_count_threshold = 0;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
+    /// One attempt, so a faulted PUT resolves to a definite non-committed outcome with no internal
+    /// retry loop and no wall-clock wait -- the same budget the snapshot-ordering suite uses.
+    config.cas_request_budget.max_attempts = 1;
+    config.cas_request_budget.attempt_timeout_ms = 100;
+    config.cas_request_budget.operation_deadline_ms = 5000;
+    config.cas_request_budget.lease_safety_margin_ms = 100;
     return Pool::open(backend, config);
-}
-
-RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const String & ref, uint64_t ordinal)
-{
-    return store->appendRefOps(ns, MutationScope::ref(ref),
-        [&ref, ordinal](const RefTableState & state)
-        {
-            std::vector<RefOp> ops;
-            if (state.getLifecycle() != RefLifecycle::Live)
-                ops.push_back(namespaceBirthOp());
-            for (const RefOp & op : publishCommittedOps(ref, ManifestRef{1, ordinal, 1}))
-                ops.push_back(op);
-            return ops;
-        },
-        RootMutationOrigin::Writer, RootMutationKind::Publish);
 }
 
 }
@@ -547,7 +620,7 @@ RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const Strin
 /// publisher's single-flight reservation.
 TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
     PoolConfig config;
     config.detached_dispatch_fault_for_test = DetachedDispatchFault::ThrowBeforeLaunch;
     auto store = openPublishingPool(backend, config);
@@ -561,14 +634,21 @@ TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
 
 /// Settlement must survive a throwing error handler. Today it is a bare call after the handler, so a
 /// handler that throws skips it and strands the reservation for the life of the process.
+///
+/// The publish is FAULTED deliberately: with a healthy backend it would succeed, the handler would
+/// never run, and this test would pass while exercising nothing.
 TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
     PoolConfig config;
-    config.publish_error_handler_hook_for_test
+    config.publish_error_hook_for_test
         = [] { throw std::runtime_error("injected: the error handler itself throws"); };
     auto store = openPublishingPool(backend, config);
     const RootNamespace ns{"srv1/handler_throws"};
+
+    /// Arm the fault so the publisher's own PUT fails and its `catch` is entered. Use the same arming
+    /// call the snapshot-ordering suite uses against this backend.
+    backend->armSnapshotPutFault();
 
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
@@ -576,17 +656,18 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
 }
 ```
 
-For the handler hook to be reachable, the publisher task's `catch` must invoke it before logging — added in Step 4. To make the publish itself throw, the hook is invoked from the `catch` only; if the publish succeeds in this fixture, drive a faulted publish instead, using the `OrderedFaultBackend` idiom in `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp:164-172`.
+`armSnapshotPutFault` stands for whatever the moved backend's own arming API is; read it while moving the class in Step 1 and use its real name here. `publish_error_hook_for_test` is a `PoolConfig` field that `Pool` forwards into the ledger's constructor — a `PoolConfig` field is fine as the *source*; what is impossible is reading it from inside the ledger.
 
-Reconcile `appendRefOps`, `MutationScope::ref`, `namespaceBirthOp`, `publishCommittedOps`, `ManifestRef`, `RootMutationOrigin` and `RootMutationKind` against that same file before compiling; they are used there verbatim.
+- [ ] **Step 7: BUILD(`build_t2_red.log`)**
+- [ ] **Step 8: ANALYZE(`build_t2_red.log`)** — expected: a build failure naming `publish_error_hook_for_test`.
 
-- [ ] **Step 2: BUILD(`build_t2_red.log`)** — then **ANALYZE(`build_t2_red.log`)**. Expected: a build failure naming `publish_error_handler_hook_for_test`.
+- [ ] **Step 9: Rewire the diagnostic dispatch**
 
-- [ ] **Step 3: Rewire the diagnostic dispatch**
-
-In `Pool::reportImpossibleInterference`, delete the `auto self = shared_from_this();` capture — the lease owns the reference now — and dispatch through `tryDispatchDetached`, capturing raw `this`, with the token checked before the `GET`:
+In `Pool::reportImpossibleInterference`, delete the `auto self = shared_from_this();` capture — the lease owns the reference now — and dispatch through `tryDispatchDetached`, capturing raw `this`:
 
 ```cpp
+    /// The lease owns the pool reference for this task's lifetime; capturing one here as well would
+    /// put it outside the lease's release ordering.
     const bool dispatched = tryDispatchDetached([this, key](DetachedStopToken token)
     {
         setThreadName(ThreadName::CAS_ANOMALY_DIAG);
@@ -597,25 +678,33 @@ In `Pool::reportImpossibleInterference`, delete the `auto self = shared_from_thi
     (void)dispatched;   /// best-effort: a refused diagnostic is not an error for the caller
 ```
 
-Keep the surrounding `try`/`catch`. It is not redundant: this runs on a fail-closed path, and an allocation failure while building the task must not replace the exception the caller is already raising.
+Keep the surrounding `try`/`catch`: this runs on a fail-closed path, and an allocation failure while building the task must not replace the exception the caller is already raising.
 
-- [ ] **Step 4: Rewire the publisher dispatch**
+- [ ] **Step 10: Rewire the publisher dispatch**
 
-In `CasRefLedger.h`, replace the `std::function<std::shared_ptr<void>()> pin_owner` member and its constructor parameter with:
+In `CasRefLedger.h`, replace the `std::function<std::shared_ptr<void>()> pin_owner` member and its constructor parameter with two injected callbacks:
 
 ```cpp
+    /// Launch one tracked detached task through the owning pool. Returns false when the dispatch was
+    /// refused or failed -- never throws out of the launch itself.
     std::function<bool(std::function<void(DetachedStopToken)>)> dispatch_detached;
+
+    /// TEST SEAM: invoked inside the publisher task's error handler, before its logging, so a test can
+    /// make the handler itself throw. Empty in production.
+    std::function<void()> publish_error_hook;
 ```
 
-wired at construction to `Pool::tryDispatchDetached`. In `dispatchSnapshotPublisher`:
+`Pool` wires the first to `tryDispatchDetached` and the second from `PoolConfig::publish_error_hook_for_test` where it constructs the ledger.
+
+In `dispatchSnapshotPublisher`:
 
 ```cpp
     ProfileEvents::increment(ProfileEvents::CASRefSnapshotPublishDispatched);
 
     /// The reservation was taken under `state_mutex` before this call, and only a LAUNCHED task's
     /// settlement retires it. This guard therefore covers exactly the paths on which no task runs --
-    /// including an allocation failure while constructing the task, which happens in this expression,
-    /// before the dispatcher's own body.
+    /// including an allocation failure while constructing the task, which happens in the expression
+    /// below, before the dispatcher's own body is entered.
     bool launched = false;
     SCOPE_EXIT({
         if (launched)
@@ -632,8 +721,8 @@ wired at construction to `Pool::tryDispatchDetached`. In `dispatchSnapshotPublis
         launched = dispatch_detached([this, ns, rt](DetachedStopToken token)
         {
             setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
-            /// Settlement runs on EVERY exit: a handler that throws must not be able to strand the
-            /// reservation, which nothing would ever report.
+            /// Settlement runs on EVERY exit. A handler that throws must not be able to strand the
+            /// reservation -- nothing would ever report that, and quiescence would wait forever.
             SCOPE_EXIT({ settleSnapshotPublish(ns, rt, token); });
             try
             {
@@ -641,8 +730,8 @@ wired at construction to `Pool::tryDispatchDetached`. In `dispatchSnapshotPublis
             }
             catch (...)
             {
-                if (config.publish_error_handler_hook_for_test)
-                    config.publish_error_handler_hook_for_test();
+                if (publish_error_hook)
+                    publish_error_hook();
                 try
                 {
                     tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
@@ -665,95 +754,118 @@ wired at construction to `Pool::tryDispatchDetached`. In `dispatchSnapshotPublis
     }
 ```
 
-The old hand-written `catch` that decremented and notified is deleted: the guard now covers that path and every sibling. In `settleSnapshotPublish`, take the token and skip the re-admission when it reports stopping — the decrement still happens under the same single lock hold, so no observer sees a transient zero.
+Delete the old hand-written `catch` that decremented and notified: the guard now covers that path and its siblings. In `settleSnapshotPublish`, take the token and skip the re-admission when it reports stopping — the decrement still happens under the same single lock hold, so no observer sees a transient zero.
 
-`config` here must be reachable from the ledger; if it is not, pass the hook in at construction the way `pin_owner` was.
-
-- [ ] **Step 5: BUILD(`build_t2_green.log`)** — then **ANALYZE(`build_t2_green.log`)**.
-
-- [ ] **Step 6: TEST(`CASDetachedWork.*`, `test_t2.log`)** — then **ANALYZE(`test_t2.log`)**.
-
-- [ ] **Step 7: TEST(`CASRef*`, `test_t2_ref.log`)** — then **ANALYZE(`test_t2_ref.log`)**. The publisher's own suites must stay green: this step changed how every snapshot publish is dispatched.
-
-- [ ] **Step 8: COMMIT**
+- [ ] **Step 11: BUILD(`build_t2_green.log`)**
+- [ ] **Step 12: ANALYZE(`build_t2_green.log`)**
+- [ ] **Step 13: TEST(`CASDetachedWork.*`, `test_t2.log`)**
+- [ ] **Step 14: ANALYZE(`test_t2.log`)**
+- [ ] **Step 15: TEST(`CASRef*`, `test_t2_ref.log`)**
+- [ ] **Step 16: ANALYZE(`test_t2_ref.log`)** — this step changed how *every* snapshot publish is dispatched; the publisher's own suites must stay green.
+- [ ] **Step 17: COMMIT**
 
 ```
 paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h
          src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp
          src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h
          src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp
+         src/Disks/tests/cas_test_helpers.h
+         src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp
          src/Disks/tests/gtest_cas_detached_work.cpp
 message: fix: dispatch CAS detached work through the tracked entry point
 ```
+
+- [ ] **Step 18: Verify the commit**
 
 ---
 
 ### Task 3: The stop token reaches into recovery {#task-3-recovery-stop-token}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h` (the `ensureRefTableRecovered` declaration, `recovery_retry_sleep_fn`'s signature), `.../Pool/CasRefLedger.cpp`
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h` (one test hook)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp`
 - Test: `src/Disks/tests/gtest_cas_detached_work.cpp`
 
-**Interfaces — Produces** `PoolConfig::recovery_pre_first_request_hook_for_test`.
+**Interfaces — Produces** `PoolConfig::recovery_pre_first_request_hook_for_test` and `Pool::setRefRecoveryRetrySleepForTest`.
 
-**Context.** `tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` calls `ensureRefTableRecovered` **before** it constructs `runtime_still_admitted`, so a publisher whose runtime needs recovery sits below every checkpoint Task 2 added. Four places must observe the token, and two of them are above all the others:
+**Context.** `tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` calls `ensureRefTableRecovered` **before** it constructs `runtime_still_admitted`, so a publisher whose runtime needs recovery sits below every checkpoint Task 2 added.
+
+The token must be observed at **every** point recovery can park or start new I/O:
 
 | Place | Why the others do not cover it |
 |---|---|
 | the wait for a concurrent recovery | `rt.recovery_cv.wait(lock)` is called with **no predicate and no deadline** while `recovery_in_progress`; a second publisher parks there without reaching any I/O |
 | before the walk's **first** backend request | a fresh recovery reads the checkpoint before its first admission check |
-| the per-attempt I/O and retry checkpoints | the ordinary case |
+| `checkRecoveryStillAdmitted` and every I/O boundary inside `runRecoveryWalkOnce` | the walk issues **more** requests after the first check; a stop observed only once still lets the next request start |
 | the slice loop of `recovery_retry_sleep_fn` | it slices at 200 ms but exits early only on `!fence_ok_fn()`, and a terminal shutdown does not drop the mount fence; with `recovery_retry_max_backoff_ms` at 30 s against a deadline of seconds, this alone expires the drain |
+| the retry loop's fail-closed condition | a token-stopped attempt must be **terminal**, not reclassified as transient by `isTransientRecoveryError` and re-driven |
 
-**Two mechanics that are easy to get wrong:**
+**Three mechanics that are easy to get wrong.**
 
-1. **A predicate does not wake anyone.** `stopAndDrainDetachedWork` notifies the *registry's* condition variable; a thread parked on `rt.recovery_cv` never sees it. The concurrent-recovery wait therefore becomes a **bounded slice wait** — `wait_for` in 200 ms slices, re-checking the token each time — mirroring the sliced backoff that already exists a few lines away. Do not try to notify every runtime's `recovery_cv` from the registry: that would make the pool-level registry reach into ledger internals for no gain.
-2. **Token-stop must be terminal for the retry loop.** The loop's existing terminal latch is `cancelled`, which belongs to remount cancellation. Add a separate local terminal condition for the token so `isTransientRecoveryError` cannot re-drive the walk: a token-stopped attempt rethrows and does **not** retry.
+1. **A predicate does not wake anyone.** `stopAndDrainDetachedWork` notifies the *registry's* condition variable; a thread parked on `rt.recovery_cv` never sees it. The concurrent-recovery wait therefore becomes a bounded slice wait — `wait_for` in 200 ms slices, re-checking the token — mirroring the sliced backoff that already exists nearby. Do not notify every runtime's `recovery_cv` from the registry: that would make a pool-level registry reach into ledger internals for no gain.
+2. **The existing sleep seam is shared and cannot simply be reused.** `Pool::setCasRetrySleepForTest` takes `std::function<void(uint64_t)>` and feeds *both* the request controller and recovery, with a dozen call sites. Recovery gets its **own**, token-aware seam — `setRefRecoveryRetrySleepForTest(std::function<void(uint64_t, const std::optional<DetachedStopToken> &)>)`, forwarded from `Pool` to the ledger — and the existing single-parameter setter keeps working unchanged for everyone else.
+3. **Existing callers must be unaffected.** `ensureRefTableRecovered` has many non-publisher callers, so the parameter is `std::optional<DetachedStopToken>` defaulting to `std::nullopt`, meaning "no detached-work stop applies". Thread it onward through `runRecoveryWalkOnce` and `checkRecoveryStillAdmitted`, which already takes a `bool & cancelled` and is the natural place for it.
 
-`ensureRefTableRecovered` gains a token parameter. It has many callers that are not detached work, so the parameter is `std::optional<DetachedStopToken>`, and `std::nullopt` means "no detached-work stop applies" — the existing behaviour, unchanged, for every non-publisher caller.
+- [ ] **Step 1: Add the seams only, with no behaviour change**
 
-- [ ] **Step 1: Write the failing tests**
+Add `PoolConfig::recovery_pre_first_request_hook_for_test` (`std::function<void()>`, invoked immediately before the walk's first backend request), the new `setRefRecoveryRetrySleepForTest` on both `CasRefLedger` and `Pool`, and the token parameters — all defaulted, so nothing observable changes yet.
 
-Append three tests. Each asserts that `stopAndDrainDetachedWork` **returns true** well inside a short deadline. Do not assert `CASDetachedWorkDrainTimeouts` here: that counter is introduced in Task 4, by the caller that consumes this return value.
+- [ ] **Step 2: BUILD(`build_t3_seam.log`)**
+- [ ] **Step 3: ANALYZE(`build_t3_seam.log`)** — this must be **green**. The behaviour tests come next, and a red build here would make their red unreadable.
+
+- [ ] **Step 4: Write the failing tests**
 
 ```cpp
 /// A publisher asleep in recovery backoff must be woken by the stop, not waited out. The injected
 /// sleep stands in for a long backoff without spending wall-clock time.
 TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
 {
-    auto backend = std::make_shared<InMemoryBackend>();
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
     auto store = openPublishingPool(backend);
     const RootNamespace ns{"srv1/backoff"};
 
     auto sleeping = std::make_shared<Gate>();
-    store->setRecoveryRetrySleepForTest([sleeping](uint64_t, const std::optional<DetachedStopToken> & token)
-    {
-        sleeping->open();
-        while (!(token && token->stopping()))
-            std::this_thread::yield();
-    });
+    store->setRefRecoveryRetrySleepForTest(
+        [sleeping](uint64_t, const std::optional<DetachedStopToken> & token)
+        {
+            sleeping->open();
+            while (!(token && token->stopping()))
+                std::this_thread::yield();
+        });
 
-    /// Drive a publish whose recovery fails transiently, so the loop enters its backoff.
-    ...   /// see Step 2 for the fault fixture
+    ...   /// drive a publish whose recovery fails transiently, so the loop enters its backoff
     sleeping->wait();
 
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/2000));
+    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/5000));
 }
 
 /// A publisher parked behind another runtime's in-flight recovery is below every I/O checkpoint.
 TEST(CASDetachedWork, StopWakesAConcurrentRecoveryWaiter)
 {
-    ...   /// hold one recovery in flight, poll `recoveryWaitersForTest(ns)` until it reports 1
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/2000));
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    auto store = openPublishingPool(backend);
+    const RootNamespace ns{"srv1/concurrent_recovery"};
+
+    ...   /// hold one recovery in flight against `ns`
+    /// Wait until a SECOND caller has provably reached the wait, rather than assuming it has.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (store->refRecoveryWaitersForTest(ns) == 0)
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "no second caller reached the wait";
+        std::this_thread::yield();
+    }
+
+    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/5000));
 }
 
-/// The token is checked BEFORE the walk's first backend request, so a stop that arrives while the
-/// publisher is at that boundary means the request is never issued at all.
+/// The token is checked BEFORE the walk's first backend request, so a stop latched while the
+/// publisher is at that boundary means the request is never issued.
 ///
 /// Note what this does NOT claim: a request already in flight is not interrupted. That case is a
-/// bounded drain timeout by design, not a bug -- so the test parks the publisher at the pre-request
-/// hook rather than inside a stalled GET.
+/// bounded drain timeout by design, so the publisher is parked at the pre-request hook -- not inside a
+/// stalled GET -- and the drain is latched before the hook is released.
 TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -766,103 +878,387 @@ TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
         at_boundary->open();
         release->wait();
     };
-    auto store = openPublishingPool(backend, config);
-    ...   /// drive a publish that needs recovery
+    ...   /// open a publishing pool over `backend` with this config and drive a publish that recovers
 
     at_boundary->wait();
     const uint64_t gets_before = backend->getTotal();
-    std::thread opener([release] { release->open(); });
-    EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/2000));
-    opener.join();
+
+    auto drain = std::async(std::launch::async,
+                            [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/5000); });
+    awaitStopLatched(store);
+    release->open();
+
+    EXPECT_TRUE(drain.get());
     EXPECT_EQ(backend->getTotal(), gets_before)
         << "the walk issued its first request after the stop was already latched";
 }
 ```
 
-The three `...` markers are fixture bodies, not logic: each needs a runtime driven into `NeedsRecovery`. Copy the fault fixture from `src/Disks/tests/gtest_cas_ref_snapshot_publish_ordering.cpp:164-172` (`OrderedFaultBackend` plus `budget.max_attempts = 1`) and the recovery-driving setup from the nearest test in `src/Disks/tests/gtest_cas_ref_writer.cpp` that reaches `RefLaneState::NeedsRecovery`. `CountingBackend` and its `getTotal` are in `src/Disks/tests/cas_test_helpers.h:1440`; confirm the accessor's exact name there before use.
+The three `...` markers are the same fixture in three shapes: a runtime driven into `NeedsRecovery`. Take the fault arming from the moved `OrderedFaultBackend` (Task 2 Step 1) and the recovery-driving setup from the nearest test in `src/Disks/tests/gtest_cas_ref_writer.cpp` that reaches `RefLaneState::NeedsRecovery`. `CountingBackend` and `getTotal` are at `src/Disks/tests/cas_test_helpers.h:1440` and `:1611`; `refRecoveryWaitersForTest` is `Pool`'s, at `CasPool.h:997`.
 
-- [ ] **Step 2: BUILD(`build_t3_red.log`)**, **ANALYZE**, then **TEST(`CASDetachedWork.Stop*`, `test_t3_red.log`)**, **ANALYZE**
+- [ ] **Step 5: BUILD(`build_t3_red.log`)**
+- [ ] **Step 6: ANALYZE(`build_t3_red.log`)** — must be green: the seams exist from Step 1.
+- [ ] **Step 7: TEST(`CASDetachedWork.Stop*`, `test_t3_red.log`)**
+- [ ] **Step 8: ANALYZE(`test_t3_red.log`)** — expected: all three fail because the drain returns `false`, its deadline expired. A failure of any other shape means the fixture never reached recovery; fix the fixture before implementing.
 
-Expected: all three fail by returning `false` from the drain — the deadline expires. A failure of any other shape means the fixture did not reach recovery; fix the fixture before implementing.
+- [ ] **Step 9: Thread the token through**
 
-- [ ] **Step 3: Thread the token through**
-
-- `void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt, const std::optional<DetachedStopToken> & token = std::nullopt);` — every existing caller keeps its current behaviour by omitting the argument; the publisher passes its token.
-- `recovery_retry_sleep_fn` becomes `std::function<void(uint64_t, const std::optional<DetachedStopToken> &)>`, and its default implementation adds the token to the slice loop's condition:
-  `while (slept < total_ms && fence_ok_fn() && !(token && token->stopping()))`.
-- The concurrent-recovery wait becomes a bounded slice wait:
+- `ensureRefTableRecovered(ns, rt, token = std::nullopt)`; the publisher passes its token, every other caller keeps its current behaviour.
+- The concurrent-recovery wait becomes a bounded slice wait, because nothing notifies `recovery_cv` when the token flips:
   ```cpp
   while (rt.recovery_in_progress)
   {
       if (token && token->stopping())
-          throw Exception(ErrorCodes::ABORTED, "CAS ref recovery: teardown began while waiting for a concurrent recovery");
+          throw Exception(ErrorCodes::ABORTED,
+              "CAS ref recovery: teardown began while waiting for a concurrent recovery");
       ++rt.recovery_waiters_for_test;
       rt.recovery_cv.wait_for(lock, std::chrono::milliseconds(200));
       --rt.recovery_waiters_for_test;
   }
   ```
-  A predicate alone would not help: nothing notifies `recovery_cv` when the token flips.
-- Immediately before the walk's first backend request, invoke `config.recovery_pre_first_request_hook_for_test` if set, then check the token and throw `ABORTED` if stopping.
-- In the retry loop's fail-closed condition, add the token beside `cancelled` so a token-stopped attempt is **terminal** and is never reclassified as transient.
+- Immediately before the walk's first backend request: invoke `recovery_pre_first_request_hook_for_test` if set, then check the token and throw `ABORTED` if stopping.
+- Pass the token into `runRecoveryWalkOnce` and `checkRecoveryStillAdmitted`, and check it at **every** I/O boundary inside the walk, not only the first: the walk issues further requests after the first check.
+- The default `recovery_retry_sleep_fn` gains the token in its slice condition:
+  `while (slept < total_ms && fence_ok_fn() && !(token && token->stopping()))`.
+- In the retry loop's fail-closed condition, put the token beside `cancelled` so a token-stopped attempt is terminal and is never reclassified as transient.
 
-- [ ] **Step 4: BUILD(`build_t3_green.log`)** → **ANALYZE** → **TEST(`CASDetachedWork.*`, `test_t3.log`)** → **ANALYZE** → **TEST(`CASRef*`, `test_t3_ref.log`)** → **ANALYZE**
-
-- [ ] **Step 5: COMMIT**
+- [ ] **Step 10: BUILD(`build_t3_green.log`)**
+- [ ] **Step 11: ANALYZE(`build_t3_green.log`)**
+- [ ] **Step 12: TEST(`CASDetachedWork.*`, `test_t3.log`)**
+- [ ] **Step 13: ANALYZE(`test_t3.log`)**
+- [ ] **Step 14: TEST(`CASRef*`, `test_t3_ref.log`)**
+- [ ] **Step 15: ANALYZE(`test_t3_ref.log`)**
+- [ ] **Step 16: COMMIT**
 
 ```
 paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h
+         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp
          src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h
          src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp
          src/Disks/tests/gtest_cas_detached_work.cpp
 message: fix: let CAS teardown interrupt ref-table recovery
 ```
 
----
+- [ ] **Step 17: Verify the commit**
 
-### Task 4: Teardown sequencing and the destructor {#task-4-teardown-sequencing}
+---
+### Task 4: A destructor boundary that cannot terminate {#task-4-failsoft-destructor}
+
+**This task lands BEFORE Task 5, deliberately.** Task 5 makes explicit teardown the usual place `~Pool`
+runs. Landing it first would leave an intermediate commit in which a throwing teardown phase is reached
+more predictably than before and is still unguarded — moving a crash rather than fixing one. The two
+may be squashed; they may not be swapped.
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`, `.../ContentAddressedMetadataStorage.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp`
+- Test: `src/Disks/tests/gtest_cas_shutdown_context.cpp` (create)
+
+**Interfaces — Produces** `PoolConfig::teardown_phase1_throw_for_test`, `…phase2…`, `…phase3…`.
+
+**Context.** `~Pool` has three phases, and only the keeper's `release` inside
+`CasMountRuntime::finishTeardown` is guarded today:
+
+1. `mount_runtime.stopBackgroundWorkers()`
+2. the ref-lane drain, from which `drained` is computed together with `writerCleanupDutiesPending`
+3. `mount_runtime.finishTeardown(drained)` — which calls `stopBackgroundWorkers` **again**, the
+   belt-and-suspenders re-join, so guarding only phase 1 leaves that same call unguarded on its second
+   invocation
+
+`drained` must be **initialized to `false`** before phase 2 rather than assigned from it, and a throw in
+phase 2 must still reach phase 3. That default is load-bearing: `finishTeardown(true)` writes the
+clean-release marker, which a successor reads as proof that no in-flight conditional `PUT` from this
+incarnation can still land. A guard that swallowed a throw while leaving `drained` at a partial value
+could forge that proof.
+
+Each guard's own logging goes in a nested `try`/`catch(...)`: `tryLogCurrentException` allocates, and
+memory pressure is exactly when a teardown phase throws.
+
+- [ ] **Step 1: Add the three hooks** to `PoolConfig` — `teardown_phase1_throw_for_test`,
+      `teardown_phase2_throw_for_test`, `teardown_phase3_throw_for_test`, each `std::function<void()>`,
+      invoked at the top of its phase in `~Pool`.
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `src/Disks/tests/gtest_cas_shutdown_context.cpp`. These must run in a subprocess: pre-change a
+throwing phase terminates the process, and an in-process assertion would take the whole binary down and
+hide every test behind it. The post-change expectation is a **clean exit**, which `EXPECT_DEATH` cannot
+express — it expects abnormal termination — so this is an `EXPECT_EXIT` test.
+
+```cpp
+#include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
+#include <Disks/tests/cas_test_helpers.h>
+
+#include <cstdlib>
+
+using namespace DB::Cas;
+
+namespace
+{
+
+/// Open a pool, arm one teardown phase to throw, destroy it, and report whether the clean-release
+/// marker was written. Runs inside the subprocess of each exit test below.
+[[noreturn]] void tearDownWithThrowingPhase(int phase)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    PoolConfig config;
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    auto thrower = [] { throw std::runtime_error("injected teardown phase failure"); };
+    if (phase == 1)
+        config.teardown_phase1_throw_for_test = thrower;
+    else if (phase == 2)
+        config.teardown_phase2_throw_for_test = thrower;
+    else
+        config.teardown_phase3_throw_for_test = thrower;
+
+    {
+        auto store = Pool::open(backend, config);
+        (void)store;
+    }   /// ~Pool runs here
+
+    /// Report what the teardown left behind, so the parent asserts on the MARKER and not merely on the
+    /// exit code: a guard that survived the throw but forged the marker would pass an exit-code-only
+    /// assertion, and forging it is the worse of the two failures.
+    std::exit(...);   /// see below
+}
+
+}
+```
+
+For the marker check, read the mount object from `backend` after destruction and decide from its
+contents whether a clean release was recorded; the accessor and the decoded field are the ones
+`src/Disks/tests/gtest_cas_mount.cpp` already uses when it asserts a clean versus unclean end. Exit `0`
+only when the process survived **and** the marker is absent; exit `1` otherwise, so the parent's
+`ExitedWithCode(0)` carries both facts.
+
+```cpp
+TEST(CASShutdownExitTest, TeardownPhase1ThrowExitsCleanly)
+{
+    EXPECT_EXIT(tearDownWithThrowingPhase(1), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(CASShutdownExitTest, TeardownPhase2ThrowExitsCleanlyAndSkipsTheMarker)
+{
+    EXPECT_EXIT(tearDownWithThrowingPhase(2), ::testing::ExitedWithCode(0), "");
+}
+
+TEST(CASShutdownExitTest, TeardownPhase3ThrowExitsCleanly)
+{
+    EXPECT_EXIT(tearDownWithThrowingPhase(3), ::testing::ExitedWithCode(0), "");
+}
+```
+
+- [ ] **Step 3: BUILD(`build_t4_red.log`)**
+- [ ] **Step 4: ANALYZE(`build_t4_red.log`)**
+- [ ] **Step 5: TEST(`CASShutdownExitTest.*`, `test_t4_red.log`)**
+- [ ] **Step 6: ANALYZE(`test_t4_red.log`)** — expected: the subprocesses terminate abnormally rather than exiting `0`.
+
+- [ ] **Step 7: Guard all three phases**
+
+```cpp
+Pool::~Pool()
+{
+    /// Nothing here may escape: a destructor is `noexcept` by default, so ANY throw is
+    /// `std::terminate` -- on the path explicit teardown is about to make routine. Each phase is
+    /// guarded separately, because `finishTeardown` re-enters `stopBackgroundWorkers` and a single
+    /// guard around the first call would leave the second one bare.
+    const auto guarded = [](auto && phase, const char * what)
+    {
+        try
+        {
+            phase();
+        }
+        catch (...)
+        {
+            /// `tryLogCurrentException` allocates; under memory pressure -- one of the conditions that
+            /// brought us here -- it can throw on the way to reporting the throw.
+            try
+            {
+                tryLogCurrentException(getLogger("CasPool"), what);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+            }
+        }
+    };
+
+    guarded([this] { ... phase 1 ... }, "CAS pool teardown: stopping background workers");
+
+    /// FALSE by default, not assigned from the drain: `finishTeardown(true)` writes the clean-release
+    /// marker, which a successor reads as proof that no in-flight conditional PUT from this
+    /// incarnation can still land. A swallowed drain failure must never be able to forge that proof.
+    bool drained = false;
+    guarded([this, &drained] { ... phase 2, assigning `drained` only on success ... },
+            "CAS pool teardown: draining ref lanes");
+
+    guarded([this, drained] { mount_runtime.finishTeardown(drained); },
+            "CAS pool teardown: finishing mount teardown");
+}
+```
+
+- [ ] **Step 8: BUILD(`build_t4_green.log`)**
+- [ ] **Step 9: ANALYZE(`build_t4_green.log`)**
+- [ ] **Step 10: TEST(`CASShutdownExitTest.*`, `test_t4.log`)**
+- [ ] **Step 11: ANALYZE(`test_t4.log`)**
+- [ ] **Step 12: COMMIT**
+
+```
+paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h
+         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp
+         src/Disks/tests/gtest_cas_shutdown_context.cpp
+message: fix: no CAS teardown phase can terminate the process
+```
+
+- [ ] **Step 13: Verify the commit**
+
+---
+
+### Task 5: Teardown sequencing and the destructor {#task-5-teardown-sequencing}
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp`
 - Modify: `src/Common/ProfileEvents.cpp`
 - Test: `src/Disks/tests/gtest_cas_detached_work.cpp`
 
-**Interfaces — Produces** the `ProfileEvent` `CASDetachedWorkDrainTimeouts`.
+**Interfaces — Produces** the `ProfileEvent` `CASDetachedWorkDrainTimeouts` and
+`Cas::PoolPtr ContentAddressedMetadataStorage::poolForTest() const`.
 
-**Context.** `poolAccess` copies `cas_store` into a strong `PoolPtr` under `pointer_mutex`, so a drain that runs while the member still holds the pool proves nothing: a caller can take a fresh reference right after the wait succeeds. And `ContentAddressedMetadataStorage` has no destructor today, so an instance destroyed without `shutdown` drops its pool with no drain at all.
+**Context.** `poolAccess` copies `cas_store` into a strong `PoolPtr` under `pointer_mutex`, so a drain
+that runs while the member still holds the pool proves nothing: a caller can take a fresh reference
+right after the wait succeeds. And `ContentAddressedMetadataStorage` has no destructor today, so an
+instance destroyed without `shutdown` drops its pool with no drain at all.
 
-The production deadline is `config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms` — the same one `CasRefLedger::drainRefLanesForShutdown` already uses.
+The production deadline is
+`cas_request_budget.attempt_timeout_ms + cas_request_budget.lease_safety_margin_ms` — the one
+`CasRefLedger::drainRefLanesForShutdown` already uses.
 
-- [ ] **Step 1: Add the counter**
+The tests build a storage the way `openGateStorage` does at
+`src/Disks/tests/gtest_cas_operation_gate.cpp:49-58` — `Cas::tests::makeSettingsForTest`,
+`Cas::tests::makeLocalObjectStorageForTest`, then
+`ContentAddressedMetadataStorage(object_storage, "pool", "srv1", "", nullptr, settings)` and
+`startup()`. They reach its pool through the new `poolForTest` accessor, which belongs beside the
+several `*ForTest` members the class already carries.
 
-In `src/Common/ProfileEvents.cpp`, beside the other `CAS…` entries:
+- [ ] **Step 1: Add the counter** — the `M(...)` line in `src/Common/ProfileEvents.cpp`:
 
 ```cpp
-    M(CASDetachedWorkDrainTimeouts, "Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but the guarantee that no tracked task still holds the pool could not be established for that teardown. Expected to stay at zero.", ValueType::Number) \
+    M(CASDetachedWorkDrainTimeouts, "Counts CAS storage teardowns whose bounded wait for detached background work expired with work still in flight. The teardown proceeds, but for that teardown it could not be established that no tracked task still holds the pool. Expected to stay at zero.", ValueType::Number) \
 ```
 
-and an `extern const Event CASDetachedWorkDrainTimeouts;` in `ContentAddressedMetadataStorage.cpp`'s `ProfileEvents` block.
+plus `extern const Event CASDetachedWorkDrainTimeouts;` in `ContentAddressedMetadataStorage.cpp`.
 
 - [ ] **Step 2: Write the failing tests**
 
 ```cpp
-/// `shutdown` must not return while tracked detached work is in flight.
-TEST(CASDetachedWork, ShutdownWaitsForDetachedWork) { ... }
+/// `shutdown` must not RETURN while tracked detached work is in flight.
+TEST(CASDetachedWork, ShutdownDoesNotReturnWhileWorkIsInFlight)
+{
+    auto storage = openTestStorage();          /// the `openGateStorage` shape, see above
+    auto pool = storage->poolForTest();
 
-/// A storage destroyed WITHOUT `shutdown` must still drain: nothing today prevents that path.
-TEST(CASDetachedWork, ImplicitDestructionDrains) { ... }
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+    }));
+    entered->wait();
 
-/// And a storage destroyed AFTER `shutdown` must find nothing to do, rather than waiting a second
-/// deadline on a pool that is already gone.
-TEST(CASDetachedWork, TeardownHelperIsIdempotent) { ... }
+    auto done = std::async(std::launch::async, [&storage] { storage->shutdown(); });
+    awaitStopLatched(pool);
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "shutdown returned while tracked detached work was still in flight";
+
+    release->open();
+    done.get();
+}
+
+/// A storage destroyed WITHOUT `shutdown` must still drain: nothing prevents that path today.
+TEST(CASDetachedWork, ImplicitDestructionDrains)
+{
+    auto storage = openTestStorage();
+    auto pool = storage->poolForTest();
+
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    std::atomic<bool> finished{false};
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release, &finished](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+        finished.store(true);
+    }));
+    entered->wait();
+
+    auto destroyed = std::async(std::launch::async, [&storage] { storage.reset(); });
+    awaitStopLatched(pool);
+    release->open();
+    destroyed.get();
+
+    EXPECT_TRUE(finished.load());
+    EXPECT_EQ(pool->detachedWorkInFlightForTest(), 0u);
+}
+
+/// A storage destroyed AFTER `shutdown` must find nothing to do rather than waiting a second deadline.
+TEST(CASDetachedWork, TeardownHelperIsIdempotent)
+{
+    auto storage = openTestStorage();
+    storage->shutdown();
+
+    const auto started = std::chrono::steady_clock::now();
+    storage.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1))
+        << "the second teardown repeated the wait instead of finding nothing to do";
+}
+
+/// The timeout path must be OBSERVABLE. Without this the increment could be missing entirely and every
+/// other test here would stay green, because they all exercise successful drains.
+TEST(CASDetachedWork, ExpiredDrainIncrementsTheTimeoutCounter)
+{
+    auto storage = openTestStorage(/*tiny_budget=*/true);
+    auto pool = storage->poolForTest();
+
+    /// A task that deliberately IGNORES its token, standing in for work that cannot be interrupted.
+    auto release = std::make_shared<Gate>();
+    auto entered = std::make_shared<Gate>();
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+    }));
+    entered->wait();
+
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
+                            .load(std::memory_order_relaxed);
+    storage->shutdown();                       /// expires: the task is still held
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
+                           .load(std::memory_order_relaxed);
+    EXPECT_EQ(after - before, 1u);
+
+    release->open();
+}
 ```
 
-Each needs a `ContentAddressedMetadataStorage` rather than a bare `Pool`. Build it the way `src/Disks/tests/gtest_cas_pool.cpp` builds one — read that file for the construction idiom and the arguments its constructor takes — and use the `detached_lease_release_hook_for_test` gate from Task 1 to hold a task in flight. For idempotence, assert the second teardown returns promptly by measuring against a deliberately long configured deadline.
+`openTestStorage(bool tiny_budget = false)` is a local helper: the `openGateStorage` body above, with
+the request-budget settings set small when `tiny_budget` is true so the drain expires in well under a
+second. Read the budget field names in `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h`
+and the settings they are populated from in `Cas::tests::makeSettingsForTest`
+(`src/Disks/tests/cas_test_helpers.h:134`).
 
-- [ ] **Step 3: BUILD(`build_t4_red.log`)** → **ANALYZE** → **TEST(`CASDetachedWork.*`, `test_t4_red.log`)** → **ANALYZE**
+Confirm the `ProfileEvents::global_counters` access idiom against an existing CAS test that asserts a
+counter delta before copying it.
 
-- [ ] **Step 4: Implement the sequencing**
+- [ ] **Step 3: BUILD(`build_t5_red.log`)**
+- [ ] **Step 4: ANALYZE(`build_t5_red.log`)**
+- [ ] **Step 5: TEST(`CASDetachedWork.*`, `test_t5_red.log`)**
+- [ ] **Step 6: ANALYZE(`test_t5_red.log`)**
 
-Extract a private, idempotent helper on `ContentAddressedMetadataStorage`:
+- [ ] **Step 7: Implement the sequencing**
 
 ```cpp
 void ContentAddressedMetadataStorage::stopAndDrainForTeardown() noexcept
@@ -879,48 +1275,63 @@ void ContentAddressedMetadataStorage::stopAndDrainForTeardown() noexcept
         old_pool = std::move(cas_store);
         cas_store.reset();
     }
-    /// Everything below runs OUTSIDE `pointer_mutex`. That is required, not incidental: waiting under
-    /// it would block snapshot readers for the whole wait, and it is also what keeps a `~Pool`
-    /// triggered by the last local reference from running under that mutex.
-    try
-    {
-        if (old_scheduler)
-            old_scheduler->stop();
-        old_part_access.reset();
-        if (old_pool)
-        {
-            const uint64_t deadline_ms = old_pool->poolConfig().cas_request_budget.attempt_timeout_ms
-                + old_pool->poolConfig().cas_request_budget.lease_safety_margin_ms;
-            if (!old_pool->stopAndDrainDetachedWork(deadline_ms))
-            {
-                ProfileEvents::increment(ProfileEvents::CASDetachedWorkDrainTimeouts);
-                LOG_WARNING(log, "CAS storage teardown: {} detached background task(s) still in flight "
-                                 "after {} ms; proceeding",
-                            old_pool->detachedWorkInFlightForTest(), deadline_ms);
-            }
-        }
-    }
-    catch (...)
+    /// Everything below runs OUTSIDE `pointer_mutex`. Required, not incidental: waiting under it would
+    /// block snapshot readers for the whole wait, and it is also what keeps a `~Pool` triggered by the
+    /// last local reference from running under that mutex.
+    ///
+    /// Each phase is guarded SEPARATELY. One `try` around all of them would let a throw from stopping
+    /// the scheduler skip the part-access release and the drain itself -- the two steps this function
+    /// exists for.
+    const auto guarded = [this](auto && phase, const char * what)
     {
         try
         {
-            tryLogCurrentException(log, "CAS storage teardown");
+            phase();
         }
-        catch (...) // NOLINT(bugprone-empty-catch)
+        catch (...)
         {
+            try
+            {
+                tryLogCurrentException(log, what);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+            }
         }
-    }
+    };
+
+    guarded([&] { if (old_scheduler) old_scheduler->stop(); }, "CAS storage teardown: stopping GC");
+    guarded([&] { old_part_access.reset(); }, "CAS storage teardown: releasing part access");
+    guarded([&]
+    {
+        if (!old_pool)
+            return;
+        const auto & budget = old_pool->poolConfig().cas_request_budget;
+        const uint64_t deadline_ms = budget.attempt_timeout_ms + budget.lease_safety_margin_ms;
+        if (old_pool->stopAndDrainDetachedWork(deadline_ms))
+            return;
+        ProfileEvents::increment(ProfileEvents::CASDetachedWorkDrainTimeouts);
+        LOG_WARNING(log, "CAS storage teardown: {} detached background task(s) still in flight after "
+                         "{} ms; proceeding",
+                    old_pool->detachedWorkInFlightForTest(), deadline_ms);
+    }, "CAS storage teardown: draining detached work");
     /// `old_pool` is released here, at the end of the function and outside every lock.
 }
 ```
 
-`shutdown` keeps its `gc_scheduler_mutex` round lock and its `shutdown_called` latch, then calls this helper in place of its current body. Add `~ContentAddressedMetadataStorage()` that calls it too. Idempotence follows from the members already being empty on a second call — assert that in a comment rather than adding a second flag.
+`shutdown` keeps its `gc_scheduler_mutex` round lock and its `shutdown_called` latch, then calls this
+helper in place of its current body. Add `~ContentAddressedMetadataStorage()` calling it too.
+Idempotence needs no second flag: a second call finds the members already empty and the local
+`old_pool` null, so it does no waiting.
 
-The `…ForTest` accessor is used in a warning message here; if that is objectionable, add a non-test-named accessor and use it in both places rather than duplicating the counter.
+If `detachedWorkInFlightForTest` reads oddly in a production warning, add a non-test-named accessor and
+use it in both places rather than duplicating the count.
 
-- [ ] **Step 5: BUILD(`build_t4_green.log`)** → **ANALYZE** → **TEST(`CASDetachedWork.*`, `test_t4.log`)** → **ANALYZE**
-
-- [ ] **Step 6: COMMIT**
+- [ ] **Step 8: BUILD(`build_t5_green.log`)**
+- [ ] **Step 9: ANALYZE(`build_t5_green.log`)**
+- [ ] **Step 10: TEST(`CASDetachedWork.*`, `test_t5.log`)**
+- [ ] **Step 11: ANALYZE(`test_t5.log`)**
+- [ ] **Step 12: COMMIT**
 
 ```
 paths:   src/Common/ProfileEvents.cpp
@@ -930,23 +1341,37 @@ paths:   src/Common/ProfileEvents.cpp
 message: fix: drain CAS detached work before the pool is released
 ```
 
----
+- [ ] **Step 13: Verify the commit**
 
-### Task 5: The weak `Context` and null-safe accessors {#task-5-weak-context}
+---
+### Task 6: The weak `Context` and null-safe accessors {#task-6-weak-context}
 
 **Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h` (the `context` member), `.cpp` (`startup`, both sink builders)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.cpp`
 - Modify: `src/Interpreters/Context.cpp`
 - Modify: `src/Common/ProfileEvents.cpp`
-- Test: `src/Disks/tests/gtest_cas_shutdown_context.cpp` (create)
+- Test: `src/Disks/tests/gtest_cas_shutdown_context.cpp`
 
 **Interfaces — Produces** the `ProfileEvent` `CASEventDroppedContextExpired`.
 
-**Context.** The member is the only long-lived strong `ContextPtr` in `src/Disks`, read in four places: two nullness checks in `startup` and the two sink builders. It becomes `std::optional<std::weak_ptr<const Context>>`: `nullopt` means the integration is deliberately off; an engaged-but-expired reference during `startup` is an **error**, not the disabled path.
+**Context.** The member is the only long-lived strong `ContextPtr` in `src/Disks`, read in four places:
+two nullness checks in `startup` and the two sink builders. It becomes
+`std::optional<std::weak_ptr<const Context>>`, derived in the constructor from the `ContextPtr`
+parameter: a null argument gives `nullopt`.
 
-`startup` resolves it **once**, at the top, and holds the strong pointer through the single publish step, deriving both decisions from that one local — two separate resolutions could straddle an expiry and leave a half-configured mount. The sinks capture the **weak** reference, never that local.
+That default already has users. `openGateStorage`
+(`src/Disks/tests/gtest_cas_operation_gate.cpp:49-58`) constructs the storage with `nullptr` for the
+context, so "the integration is deliberately off" is the existing behaviour of several suites and must
+not change.
 
-Three outcomes stay distinct and only the first is counted:
+`startup` resolves the reference **once**, at the top, and holds the strong pointer through the single
+publish step, deriving both decisions from that one local — two separate resolutions could straddle an
+expiry and leave a half-configured mount. An engaged-but-expired reference at `startup` is an **error**,
+not the disabled path: throwing there turns a lifetime bug into a loud failure instead of a silently
+missing feature. The sinks capture the **weak** reference, never that local.
+
+Three outcomes stay distinct, and only the first is counted:
 
 | State | What the sink sees | Counted |
 |---|---|---|
@@ -954,41 +1379,108 @@ Three outcomes stay distinct and only the first is counted:
 | `resetSharedContext` ran, `Context` still referenced | `lock` succeeds; the accessor returns nothing | no |
 | no system log configured | the accessor returns nothing | no |
 
-The accessors adopt `Context::getZooKeeperLog`'s shape — `mutex_shared_context` held from the `shared` test through the nested `shared->mutex` and the `shared_ptr` copy. A bare `shared ? … : nullptr` would leave the race it appears to remove.
+The second and third are indistinguishable at the sink, and the third is the normal state of any server
+that has not enabled the CAS logs; counting them would make the counter fire constantly and mean
+nothing.
 
-- [ ] **Step 1: Add the counter** — the `M(...)` line in `src/Common/ProfileEvents.cpp` plus an `extern const Event` in `ContentAddressedMetadataStorage.cpp`.
+The accessors adopt `Context::getZooKeeperLog`'s shape — `mutex_shared_context` held from the `shared`
+test through the nested `shared->mutex` and the `shared_ptr` copy:
+
+```cpp
+std::lock_guard lock(mutex_shared_context);
+if (!shared)
+    return {};
+SharedLockGuard lock2(shared->mutex);
+if (!shared->system_logs)
+    return {};
+return shared->system_logs-><the log>;
+```
+
+A `shared ? … : nullptr` that released the mutex before dereferencing would leave exactly the race it
+appears to remove.
+
+- [ ] **Step 1: Add the counter** — the `M(...)` line in `src/Common/ProfileEvents.cpp` plus an
+      `extern const Event` in `ContentAddressedMetadataStorage.cpp`.
 
 - [ ] **Step 2: Write the failing tests**
 
-Create `src/Disks/tests/gtest_cas_shutdown_context.cpp`. Suite `CASShutdownContext`, plus one exit-test suite `CASShutdownContextExitTest`.
+Append to `src/Disks/tests/gtest_cas_shutdown_context.cpp`.
 
-- **subprocess exit test** — emit after `resetSharedContext` on a still-referenced `Context`. Pre-change this dereferences a null `shared` and takes the whole binary down, so it cannot be an ordinary in-process test:
+The reset-context case is a **subprocess exit test** for the same reason as Task 4's: pre-change the
+emit dereferences a null `shared` and takes the whole binary down, so running the red in-process would
+hide every test behind it.
 
 ```cpp
-TEST(CASShutdownContextExitTest, EmitAfterResetSharedContextExitsCleanly)
+/// `Server.cpp` calls `resetSharedContext` immediately before releasing the context. An event emitted
+/// in that window must be skipped safely, not dereference a null `shared`.
+TEST(CASShutdownExitTest, EmitAfterResetSharedContextExitsCleanly)
 {
     EXPECT_EXIT(
         {
-            ...   /// build a storage with a context, resetSharedContext, emit one event
+            ...   /// build a storage WITH a real context, emit one event to prove the sink works,
+                  /// call `resetSharedContext` on that still-referenced context, emit again
             std::exit(0);
         },
         ::testing::ExitedWithCode(0), "");
 }
+
+/// An EXPIRED weak reference is the one case that is counted.
+TEST(CASShutdownContext, ExpiredContextDropsTheEventAndCountsIt)
+{
+    ...   /// build a storage with a context, release every other reference to it, emit
+    EXPECT_EQ(after - before, 1u);
+}
+
+/// `nullptr` at construction means the integration is off. Nothing is emitted and NOTHING is counted --
+/// several existing suites construct the storage this way.
+TEST(CASShutdownContext, DisabledIntegrationCountsNothing)
+{
+    auto storage = openTestStorage();          /// context argument `nullptr`
+    ...   /// drive an operation that would emit
+    EXPECT_EQ(after - before, 0u);
+}
+
+/// A live context whose system log is not configured is ordinary steady state: no emit, no count.
+TEST(CASShutdownContext, MissingSystemLogCountsNothing)
+{
+    ...
+    EXPECT_EQ(after - before, 0u);
+}
+
+/// The storage must no longer keep the context alive. This is the property `Server.cpp` relies on when
+/// it destroys the context explicitly.
+TEST(CASShutdownContext, StorageDoesNotExtendContextLifetime)
+{
+    ...   /// build a storage with a context, take a weak_ptr, release every other strong reference
+    EXPECT_EQ(weak_context.use_count(), 0L);
+}
+
+/// An expired reference supplied at `startup` is an error, not the disabled path.
+TEST(CASShutdownContext, ExpiredContextAtStartupFails)
+{
+    ...   /// construct with a context, release it before calling `startup`
+    EXPECT_ANY_THROW(storage->startup());
+}
 ```
 
-- an expired weak reference advances `CASEventDroppedContextExpired`;
-- `nullopt` (integration off) emits nothing and advances **no** counter;
-- a context whose system log is not configured emits nothing and advances **no** counter;
-- holding the storage does not keep the `Context` alive: release every other reference, assert it was destroyed;
-- an expired reference supplied at `startup` fails startup with an exception rather than taking the disabled path.
+The `...` markers are context construction, which the CAS test tree does not do today — every existing
+suite passes `nullptr`. Build a minimal `Context` the way `src/Interpreters/tests/` does, or use
+`Context::createGlobal` with a `ContextSharedPart`; read one existing `src/Interpreters` gtest for the
+exact idiom before writing these, and put the shared construction into one local helper used by all six.
 
-- [ ] **Step 3: BUILD(`build_t5_red.log`)** → **ANALYZE** → **TEST(`CASShutdownContext*`, `test_t5_red.log`)** → **ANALYZE**
+- [ ] **Step 3: BUILD(`build_t6_red.log`)**
+- [ ] **Step 4: ANALYZE(`build_t6_red.log`)**
+- [ ] **Step 5: TEST(`CASShutdown*`, `test_t6_red.log`)**
+- [ ] **Step 6: ANALYZE(`test_t6_red.log`)**
 
-- [ ] **Step 4: Implement** the member change, the single `startup` resolution, the two sinks, and the two accessors.
+- [ ] **Step 7: Implement** the member change, the single `startup` resolution, both sinks, and the two
+      accessors.
 
-- [ ] **Step 5: BUILD(`build_t5_green.log`)** → **ANALYZE** → **TEST(`CASShutdownContext*`, `test_t5.log`)** → **ANALYZE**
-
-- [ ] **Step 6: COMMIT**
+- [ ] **Step 8: BUILD(`build_t6_green.log`)**
+- [ ] **Step 9: ANALYZE(`build_t6_green.log`)**
+- [ ] **Step 10: TEST(`CASShutdown*`, `test_t6.log`)**
+- [ ] **Step 11: ANALYZE(`test_t6.log`)**
+- [ ] **Step 12: COMMIT**
 
 ```
 paths:   src/Common/ProfileEvents.cpp
@@ -998,7 +1490,7 @@ paths:   src/Common/ProfileEvents.cpp
          src/Disks/tests/gtest_cas_shutdown_context.cpp
 ```
 
-with this commit message body, because a reviewer scanning the diff will see a shared upstream file:
+with this message, because a reviewer scanning the diff will see a shared upstream file:
 
 ```
 fix: CAS event sinks survive a released Context
@@ -1010,58 +1502,7 @@ absent from `master` -- so this changes no upstream contract. They adopt
 to remove.
 ```
 
----
-
-### Task 6: A destructor boundary that cannot terminate {#task-6-failsoft-destructor}
-
-**Files:**
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp` (`~Pool`)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h` (three test hooks)
-- Test: `src/Disks/tests/gtest_cas_shutdown_context.cpp`
-
-**Context.** `~Pool` has three phases and only the keeper's `release` inside `CasMountRuntime::finishTeardown` is guarded today:
-
-1. `mount_runtime.stopBackgroundWorkers()`
-2. the ref-lane drain, from which `drained` is computed with `writerCleanupDutiesPending`
-3. `mount_runtime.finishTeardown(drained)` — which calls `stopBackgroundWorkers` **again**, so guarding only phase 1 leaves that same call unguarded on its second invocation
-
-`drained` must be **initialized to `false`** before phase 2 rather than assigned from it, and a throw in phase 2 must still reach phase 3. That default is load-bearing: `finishTeardown(true)` writes the clean-release marker, which a successor reads as proof that no in-flight conditional `PUT` from this incarnation can still land. A guard that swallowed a throw while leaving `drained` at a partial value could forge that proof.
-
-Each guard's own logging goes in a nested `try`/`catch(...)`: `tryLogCurrentException` allocates, and memory pressure is exactly when a teardown phase throws.
-
-- [ ] **Step 1: Add three hooks** to `PoolConfig` — `teardown_phase1_throw_for_test`, `teardown_phase2_throw_for_test`, `teardown_phase3_throw_for_test`, each `std::function<void()>`, invoked at the top of its phase.
-
-- [ ] **Step 2: Write the failing tests** — three subprocess exit tests, one per phase:
-
-```cpp
-TEST(CASShutdownContextExitTest, PoolTeardownPhase2ThrowExitsCleanlyAndSkipsTheMarker)
-{
-    EXPECT_EXIT(
-        {
-            ...   /// open a pool with `teardown_phase2_throw_for_test` set, destroy it,
-                  /// then assert no clean-release marker was written
-            std::exit(0);
-        },
-        ::testing::ExitedWithCode(0), "");
-}
-```
-
-The marker assertion is the point, not the exit code: a guard that survived the throw but forged the marker would pass an exit-code-only test. For phases 1 and 3, assert the clean exit and that the remaining phases still ran.
-
-- [ ] **Step 3: BUILD(`build_t6_red.log`)** → **ANALYZE** → **TEST(`CASShutdownContextExitTest.Pool*`, `test_t6_red.log`)** → **ANALYZE**. Expected: the subprocess terminates abnormally.
-
-- [ ] **Step 4: Implement** the three guards and the `drained = false` default.
-
-- [ ] **Step 5: BUILD(`build_t6_green.log`)** → **ANALYZE** → **TEST(`CASShutdownContext*`, `test_t6.log`)** → **ANALYZE**
-
-- [ ] **Step 6: COMMIT**
-
-```
-paths:   src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h
-         src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp
-         src/Disks/tests/gtest_cas_shutdown_context.cpp
-message: fix: no CAS teardown phase can terminate the process
-```
+- [ ] **Step 13: Verify the commit**
 
 ---
 
@@ -1076,31 +1517,38 @@ grep -hoE "TEST(_F|_P)?\([A-Za-z0-9_]+" \
     src/Disks/tests/gtest_cas_shutdown_context.cpp | sort -u
 ```
 
-Every printed suite name must begin with `CAS`. One that does not is invisible to the gate, and the fix is renaming the suite — never widening the filter.
+Every printed suite name must begin with `TEST(CAS`. One that does not is invisible to the gate, and the
+fix is renaming the suite — never widening the filter.
 
-- [ ] **Step 2: BUILD(`build_gate10.log`)** → **ANALYZE(`build_gate10.log`)**
+- [ ] **Step 2: BUILD(`build_gate10.log`)**
+- [ ] **Step 3: ANALYZE(`build_gate10.log`)**
+- [ ] **Step 4: TEST(`CAS*`, `test_gate10.log`)**
+- [ ] **Step 5: ANALYZE(`test_gate10.log`)** — the summary must state the build marker: a green suite
+      after a failed build is evidence about a different binary.
 
-- [ ] **Step 3: TEST(`CAS*`, `test_gate10.log`)** → **ANALYZE(`test_gate10.log`)**
-
-The analysis must state the build marker explicitly: a green suite after a failed build is evidence about a different binary.
-
-- [ ] **Step 4: ASan gate**
+- [ ] **Step 6: ASan build**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
-ninja -C build_asan unit_tests_dbms > build_asan/build_gate10.log 2>&1; echo "NINJA_EXIT=$?"
+ninja -C build_asan unit_tests_dbms > build_asan/build_gate10.log 2>&1
 ```
 
-Then, only on `NINJA_EXIT=0`:
+- [ ] **Step 7: ANALYZE** — as above, reading `build_asan/build_gate10.log`.
+
+- [ ] **Step 8: ASan run**
 
 ```bash
-./build_asan/unit_tests_dbms --gtest_filter='CAS*' > build_asan/test_gate10.log 2>&1; echo "TEST_EXIT=$?"
+cd /home/mfilimonov/workspace/ClickHouse/master
+./build_asan/unit_tests_dbms --gtest_filter='CAS*' > build_asan/test_gate10.log 2>&1
 grep -c "ERROR: AddressSanitizer" build_asan/test_gate10.log
 ```
 
-The `grep` must print `0`. Analyze both logs with a subagent as above, reading `build_asan/…` paths.
+The `grep` must print `0`. An exit code of zero alone is not enough: a sanitizer report can accompany a
+passing suite.
 
-- [ ] **Step 5: The real teardown order**
+- [ ] **Step 9: ANALYZE** — reading `build_asan/test_gate10.log`.
+
+- [ ] **Step 10: The real teardown order**
 
 No unit test exercises `Server.cpp`'s actual teardown order, which is where the original defect lives.
 
@@ -1110,16 +1558,16 @@ mkdir -p tmp/shutdown-gate
 ```
 
 Start a server whose default disk is CAS-backed with `content_addressed_log` and
-`content_addressed_garbage_collection_log` enabled — reuse the config the CA-default praktika job
-uses rather than writing a new one; find it under `ci/` and copy it into `tmp/shutdown-gate`. Then:
+`content_addressed_garbage_collection_log` enabled. Reuse the config the CA-default praktika job uses
+rather than writing a new one — find it under `ci/` and copy it into `tmp/shutdown-gate`. Then:
 
 1. run an `INSERT` large enough to produce at least one ref mutation, which auto-dispatches a snapshot publish;
 2. stop the server with `SIGTERM`;
-3. assert the process exit code is `0`;
-4. `grep -c "detached background task(s) still in flight" <server log>` prints `0`;
-5. `grep -ci "Segmentation fault\|Address not mapped" <server log>` prints `0`.
+3. the process exit code is `0`;
+4. `grep -c "detached background task(s) still in flight" tmp/shutdown-gate/clickhouse-server.log` prints `0`;
+5. `grep -ciE "Segmentation fault|Address not mapped" tmp/shutdown-gate/clickhouse-server.log` prints `0`.
 
-- [ ] **Step 6: Confirm the commits**
+- [ ] **Step 11: Confirm the commits**
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
@@ -1127,16 +1575,48 @@ git log --oneline -8
 git log -6 --stat
 ```
 
-Six new commits on `cas-gc-rebuild`, each touching only the paths its task named. This checkout is shared; verify rather than assume. **Do not push.**
+Six new commits on `cas-gc-rebuild`, each touching only the paths its task named. This checkout is
+shared; verify rather than assume. **Do not push.**
 
 ## Self-Review {#self-review}
 
-**Spec coverage.** Task 1 the registry, lease, dispatcher and exception-safe admission; Task 2 the rollback guard, unconditional settlement and both dispatch sites; Task 3 the four recovery observation points; Task 4 sequencing, both teardown paths, the timeout counter and its warning; Task 5 the whole `Context` section including the three-outcome table; Task 6 the destructor boundary; Task 7 the gate, including the server start/stop the spec requires.
+**Spec coverage.** Task 1 the registry, lease, dispatcher and exception-safe admission; Task 2 the
+rollback guard, unconditional settlement and both dispatch sites; Task 3 the five recovery observation
+points; Task 4 the destructor boundary; Task 5 sequencing, both teardown paths, the timeout counter and
+its warning; Task 6 the whole `Context` section including the three-outcome table; Task 7 the gate and
+the server start/stop the spec requires.
 
-**Placeholders.** Four fixture bodies are marked `...` and each names the exact file and line range to copy from: the fault backend and publish driver (`gtest_cas_ref_snapshot_publish_ordering.cpp:164-187`), a `NeedsRecovery` setup (`gtest_cas_ref_writer.cpp`), the storage construction idiom (`gtest_cas_pool.cpp`), and `CountingBackend` (`cas_test_helpers.h:1440`). These are fixtures, not logic: transcribing them here would freeze a copy that goes stale, whereas every assertion, hook and expectation around them is written out in full.
+**Ordering.** Task 4 precedes Task 5 deliberately, and the reason is stated in Task 4's own header:
+Task 5 is what makes `~Pool` routine, so guarding it afterwards would ship one commit that moves a
+crash rather than fixing it. No task asserts a counter another task introduces —
+`CASDetachedWorkDrainTimeouts` appears first in Task 5, where it is also incremented and tested, and
+Task 3 asserts the drain's **return value** instead. Each `ProfileEvents.cpp` edit is in the same commit
+as its first use, so no commit is left with a link error.
 
-**Ordering.** No task asserts a counter another task introduces. `CASDetachedWorkDrainTimeouts` appears first in Task 4, which is also where it is incremented; Task 3 asserts the drain's **return value** instead. Both `ProfileEvents.cpp` edits are in the same commit as their first use, so no commit is left with a link error.
+**Fail-fast.** Every build, analysis, test run and commit is a separate checkbox. No template appends
+`; echo "$?"`, which would mask a failure behind the `echo`'s own success. Test logs are analyzed by a
+subagent exactly as build logs are.
 
-**Fail-fast.** Every build, analysis, test run and commit is a separate step; no step runs a binary after a failed build, and no commit follows a failed run. Test logs are analyzed by a subagent exactly as build logs are.
+**Determinism.** No test opens a gate and hopes the drain got there first. `detachedWorkStoppingForTest`
+and `refRecoveryWaitersForTest` are the two handshakes: the drain runs on its own thread, the test
+polls the observable state with `yield`, and only then releases the worker. "The drain must not return"
+is asserted as a bounded `wait_for` that is expected to time out — the only formulation that does not
+race the work's completion.
 
-**Type consistency.** `DetachedRegistryState`, `DetachedStopToken`, `DetachedTaskLease`, `DetachedDispatchFault`, `tryDispatchDetached`, `stopAndDrainDetachedWork` and `detachedWorkInFlightForTest` are spelled identically in Task 1's header, its tests and every later task. The five test hooks are named `*_for_test`, matching `PoolConfig`'s existing convention.
+**Remaining `...` markers, and why they are not placeholders.** Nine remain, and each is a *fixture*,
+not logic: a runtime driven into `NeedsRecovery` (three shapes, Task 3), the storage-with-a-real-context
+construction (six shapes, Task 6), and the marker read-back in Task 4. Each names the file — and where
+it exists, the line range — that already contains the idiom. Every assertion, hook, handshake and
+expected value around them is written out. Transcribing a 60-line fixture into a plan freezes a copy
+that goes stale; naming its location does not.
+
+**Type consistency.** `DetachedRegistryState`, `DetachedStopToken`, `DetachedTaskLease`,
+`DetachedDispatchFault`, `tryDispatchDetached`, `stopAndDrainDetachedWork`,
+`detachedWorkInFlightForTest` and `detachedWorkStoppingForTest` are spelled identically in Task 1's
+header, its tests and every later task. Symbols this plan reuses from the tree were each read before
+being written down: `refRecoveryWaitersForTest` (`CasPool.h:997`), `setCasRetrySleepForTest`
+(`CasPool.h:983`, single-parameter — which is why Task 3 adds its own), `pendingSnapshotPublishesForTest`
+and `waitForSnapshotPublishSettleForTest` (`CasPool.h:885`, `:889`), `runRecoveryWalkOnce` and
+`checkRecoveryStillAdmitted` (`CasRefLedger.h:1047`, `:1059`), `CountingBackend::getTotal`
+(`cas_test_helpers.h:1611`), and the storage constructor's `ContextPtr` parameter
+(`ContentAddressedMetadataStorage.h:150-157`).
