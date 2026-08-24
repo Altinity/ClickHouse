@@ -20,6 +20,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <unordered_set>
 #include <algorithm>
 #include <limits>
@@ -352,6 +353,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     RoundReport report;
     GcState state;
     Token state_token;
+
+    /// Every exit path leaves this round's meta jobs finished. The `meta_pool_wait` phase below is a
+    /// protocol barrier -- this round's condemns must be durable no later than the ledger they are
+    /// paired with -- and covers only the successful path. A round that throws between the fold and
+    /// that barrier would otherwise leave its jobs running into the NEXT round, where their
+    /// confirmations reach a graduation gate that never scheduled them.
+    SCOPE_EXIT({ meta_writer->drain(); });
+
     /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
     /// are correlated by `round_id` and not by the round number a follower never learns.
     {

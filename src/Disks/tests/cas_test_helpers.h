@@ -2103,6 +2103,33 @@ private:
     bool released = false;
 };
 
+/// Makes a GC round throw at its outcome-log write -- after the round has scheduled its confirmed-meta
+/// delete (`Gc/CasGc.cpp`) and before the round's meta-pool wait. Inherits the `.meta` latch so that
+/// job can be held in flight across the throw. Both the fault and the latch start off.
+class OutcomeLogFaultBackend : public MetaWriteLatchBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::putIfAbsent;
+
+    std::atomic<bool> fail_outcome_logs{false};
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        if (fail_outcome_logs.load() && key.contains("outcomes/"))
+            return DB::Cas::PutResult{.outcome = DB::Cas::PutOutcome::PreconditionFailed, .token = {}};
+        return MetaWriteLatchBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        if (fail_outcome_logs.load() && key.contains("outcomes/"))
+            return std::nullopt;
+        return DB::Cas::InMemoryBackend::get(key, range);
+    }
+};
+
 /// Wait until a latched job has provably reached the backend. A bounded wait that FAILS rather than
 /// hangs: a job that never arrives is a broken fixture, and a test that hangs on it reports nothing.
 inline void awaitLatchEntered(MetaWriteLatchBackend & backend)

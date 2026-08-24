@@ -1,9 +1,12 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 
+#include <chrono>
+#include <future>
 #include <thread>
 
 using namespace DB::Cas;
@@ -93,4 +96,89 @@ TEST(CasGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
 
     EXPECT_FALSE(loadMeta(*backend, store->layout(), ref))
         << "the confirmed-meta delete was lost across owner destruction";
+}
+
+/// A round that throws must not leave its meta jobs running into the next round: their effects would
+/// land in the registry the next round's graduation gate reads, and inside its counter deltas.
+///
+/// The round is made to throw at its outcome-log write, with the confirmed-meta delete it scheduled a
+/// few lines earlier held inside the backend. The round must then BLOCK, draining, until that job is
+/// released -- so the test asserts the round has NOT returned while the job is still held, releases,
+/// and only then joins.
+TEST(CasGcMetaWriter, ThrowingRoundDrainsBeforeReturning)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OutcomeLogFaultBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    /// Fixture: one part written and dropped, then rounds driven until the NEXT round is the one that
+    /// deletes -- the round that both schedules a confirmed-meta delete and writes an outcome log.
+    const RootNamespace ns{"test/tbl"};
+    const String ref_name = "all_0_0_0";
+    const String payload = "round-drain-payload";
+    PartWriteInfo info;
+    info.intended_ref = ns.string() + "/" + ref_name;
+    auto build = store->beginPartWrite(info);
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Blob;
+    entry.ref = DB::Cas::tests::idOf(payload);
+    entry.blob_size = payload.size();
+    const ManifestId manifest_id = build->stageManifest({entry});
+    build->precommitAdd(ns, ref_name, manifest_id);
+    build->putBlob(entry.ref, BlobSource::fromString(payload));
+    build->promote(ns, ref_name, build->buildId(), manifest_id);
+    store->dropRef(ns, ref_name);
+    store->renewWatermarkOnce();
+
+    Gc gc(store, DB::Cas::tests::u128Of(kGcId));
+
+    size_t rounds = 0;
+    while (true)
+    {
+        bool delete_pending = false;
+        for (const auto & entry_to_delete : gc.previewDeletes())
+            delete_pending |= entry_to_delete.reason == "delete_pending";
+        if (delete_pending)
+            break;
+
+        ASSERT_LT(++rounds, 16u) << "no round ever reached a pending delete -- fixture is wrong";
+        ASSERT_NO_THROW(gc.runRegularRound());
+        store->renewWatermarkOnce();
+    }
+
+    const uint64_t scheduled_before = gc.metaWriterForTest().scheduled();
+
+    backend->arm();
+    backend->fail_outcome_logs.store(true);
+
+    /// Return the outcome instead of asserting on the worker thread: a gtest assertion raised off the
+    /// main thread is not reliably reported, and this one distinguishes the two ways the test can go
+    /// wrong, so it must be visible.
+    auto round = std::async(std::launch::async, [&]
+    {
+        try
+        {
+            gc.runRegularRound();
+            return false;
+        }
+        catch (...)
+        {
+            return true;
+        }
+    });
+
+    awaitLatchEntered(*backend);
+    EXPECT_GT(gc.metaWriterForTest().scheduled(), scheduled_before)
+        << "the faulted round scheduled no meta job -- it cannot be the deleting round";
+
+    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "the round returned while a meta job was still in flight -- it did not drain on its "
+           "throwing exit";
+
+    backend->release();
+    EXPECT_TRUE(round.get())
+        << "the round completed normally -- the outcome-log fault never fired, so the timeout above "
+           "was the round blocking in its own `meta_pool_wait`, not in the drain under test";
+
+    EXPECT_EQ(gc.metaWriterForTest().scheduled(), gc.metaWriterForTest().completed());
 }
