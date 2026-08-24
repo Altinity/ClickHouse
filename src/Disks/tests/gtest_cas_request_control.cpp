@@ -925,13 +925,18 @@ TEST(CASRequestController, CompletedWaitCrossingDeadlineSendsNoRetry)
 TEST(CASRequestController, DirectPutCompletingAtDeadlineIsNotAccepted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
+    const PutResult predecessor = backend->InMemoryBackend::putIfAbsent("k", "old-payload");
+    ASSERT_EQ(predecessor.outcome, PutOutcome::Done);
     uint64_t clock = 0;
-    const Token committed_token{"committed", TokenType::Emulated};
-    backend->put_overwrite_handler = [&clock, &committed_token](
-        const String &, const String &, const Token &, const ObjectMeta &) -> PutResult
+    Token landed_token;
+    auto * backend_ptr = backend.get();
+    backend->put_overwrite_handler = [backend_ptr, &clock, &landed_token](
+        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) -> PutResult
     {
+        const PutResult landed = backend_ptr->InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        landed_token = landed.token;
         clock = 100;
-        return {PutOutcome::Done, committed_token};
+        return landed;
     };
 
     CasRequestBudget budget;
@@ -940,11 +945,17 @@ TEST(CASRequestController, DirectPutCompletingAtDeadlineIsNotAccepted)
     const auto result = controller.putOverwriteControlled(
         "k",
         "new-payload",
-        Token{"old", TokenType::Emulated},
+        predecessor.token,
         overwriteContext(100, CasOverwriteDeadlineSource::ExternalLeaseSafety));
 
     EXPECT_EQ(result.outcome, CasOverwriteOutcome::Unresolved);
     EXPECT_TRUE(result.token.empty());
+    ASSERT_FALSE(landed_token.empty());
+    const auto durable = backend->InMemoryBackend::get("k", Range{});
+    ASSERT_TRUE(durable.has_value());
+    EXPECT_EQ(durable->bytes, "new-payload");
+    EXPECT_EQ(durable->token, landed_token);
+    EXPECT_NE(durable->token, predecessor.token);
     EXPECT_EQ(backend->put_overwrite_attempts.load(), 1u);
     EXPECT_EQ(backend->get_attempts.load(), 0u);
     expectOverwriteDiagnostics(
@@ -959,12 +970,23 @@ TEST(CASRequestController, DirectPutCompletingAtDeadlineIsNotAccepted)
 TEST(CASRequestController, ReadProofCompletingAtDeadlineIsNotAccepted)
 {
     auto backend = std::make_shared<ScriptedControllerBackend>();
-    backend->put_overwrite_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    const PutResult predecessor = backend->InMemoryBackend::putIfAbsent("k", "old-payload");
+    ASSERT_EQ(predecessor.outcome, PutOutcome::Done);
     uint64_t clock = 0;
-    backend->get_handler = [&clock](const String &, Range) -> std::optional<GetResult>
+    Token landed_token;
+    auto * backend_ptr = backend.get();
+    backend->put_overwrite_handler = [backend_ptr, &landed_token](
+        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) -> PutResult
     {
+        const PutResult landed = backend_ptr->InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        landed_token = landed.token;
+        throw Poco::TimeoutException("scripted: response lost after overwrite landed");
+    };
+    backend->get_handler = [backend_ptr, &clock](const String & key, Range range) -> std::optional<GetResult>
+    {
+        const auto durable = backend_ptr->InMemoryBackend::get(key, range);
         clock = 100;
-        return resultWithBytes("new-payload");
+        return durable;
     };
 
     CasRequestBudget budget;
@@ -973,11 +995,17 @@ TEST(CASRequestController, ReadProofCompletingAtDeadlineIsNotAccepted)
     const auto result = controller.putOverwriteControlled(
         "k",
         "new-payload",
-        Token{"old", TokenType::Emulated},
+        predecessor.token,
         overwriteContext(100, CasOverwriteDeadlineSource::ExternalLeaseSafety));
 
     EXPECT_EQ(result.outcome, CasOverwriteOutcome::Unresolved);
     EXPECT_TRUE(result.token.empty());
+    ASSERT_FALSE(landed_token.empty());
+    const auto durable = backend->InMemoryBackend::get("k", Range{});
+    ASSERT_TRUE(durable.has_value());
+    EXPECT_EQ(durable->bytes, "new-payload");
+    EXPECT_EQ(durable->token, landed_token);
+    EXPECT_NE(durable->token, predecessor.token);
     EXPECT_EQ(backend->put_overwrite_attempts.load(), 1u);
     EXPECT_EQ(backend->get_attempts.load(), 1u);
     expectOverwriteDiagnostics(
