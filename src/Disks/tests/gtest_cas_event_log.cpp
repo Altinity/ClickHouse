@@ -8,11 +8,77 @@
 #include <Interpreters/ContentAddressedLog.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <Common/typeid_cast.h>
+#include <Common/Exception.h>
+#include <Poco/Exception.h>
+#include <algorithm>
 #include <mutex>
+#include <utility>
 #include <vector>
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
+
+namespace DB::ErrorCodes
+{
+extern const int NETWORK_ERROR;
+}
+
+namespace
+{
+
+class RenewalEventBackend final : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::putOverwrite;
+
+    bool throw_before_next_overwrite = false;
+
+    PutResult putOverwrite(
+        const String & key,
+        const String & bytes,
+        const Token & expected,
+        const ObjectMeta & meta) override
+    {
+        if (std::exchange(throw_before_next_overwrite, false))
+            throw Poco::TimeoutException("injected renewal timeout before commit");
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+};
+
+CasRequestBudget renewalEventBudget()
+{
+    return CasRequestBudget{
+        .attempt_timeout_ms = 10,
+        .operation_deadline_ms = 500,
+        .max_attempts = 2,
+        .lease_safety_margin_ms = 20,
+        .retry_initial_backoff_ms = 0,
+        .retry_max_backoff_ms = 0,
+    };
+}
+
+PoolPtr openRenewalEventPool(const std::shared_ptr<RenewalEventBackend> & backend, uint64_t & boot_ms)
+{
+    return Pool::open(backend, PoolConfig{
+        .pool_prefix = "renewal-events",
+        .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+        .cas_request_budget = renewalEventBudget(),
+        .boot_ms_fn = [&] { return boot_ms; },
+    });
+}
+
+std::vector<CasEvent> watermarkRenewEvents(const std::vector<CasEvent> & events)
+{
+    std::vector<CasEvent> result;
+    std::copy_if(events.begin(), events.end(), std::back_inserter(result), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::WatermarkRenew;
+    });
+    return result;
+}
+
+}
 
 /// Round-B opt §6: `reason` is templated rationale (a handful of distinct strings repeated across
 /// every row), unlike `object_hash`/`token` which are genuinely per-row varied -- it belongs alongside
@@ -62,6 +128,79 @@ TEST(CASEvent, PoolEmitsToSink)
     e2.type = CasEventType::BlobPut;
     s->emitEvent(std::move(e2));
     EXPECT_EQ(seen.size(), 1u);
+}
+
+TEST(CASEvent, FirstAttemptRenewalIsSilent)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    uint64_t boot_ms = 100;
+    std::vector<CasEvent> events;
+    auto store = openRenewalEventPool(backend, boot_ms);
+    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+
+    EXPECT_NO_THROW(store->renewWatermarkOnce());
+    EXPECT_TRUE(watermarkRenewEvents(events).empty());
+}
+
+TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    uint64_t boot_ms = 100;
+    std::vector<CasEvent> events;
+    auto store = openRenewalEventPool(backend, boot_ms);
+    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+
+    backend->throw_before_next_overwrite = true;
+    EXPECT_NO_THROW(store->renewWatermarkOnce());
+
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(events);
+    ASSERT_EQ(renewals.size(), 2u);
+    EXPECT_EQ(renewals[0].outcome, "retrying");
+    EXPECT_EQ(renewals[1].outcome, "recovered");
+    EXPECT_EQ(renewals[0].detail.at("attempts_sent"), "1");
+    EXPECT_EQ(renewals[1].detail.at("attempts_sent"), "2");
+    EXPECT_EQ(renewals[0].detail.at("server_root_id"), "test");
+    EXPECT_EQ(renewals[0].detail.at("writer_epoch"), std::to_string(store->writerEpoch()));
+    EXPECT_EQ(renewals[0].detail.at("seq"), "2");
+    EXPECT_EQ(renewals[0].detail.at("write_attempt_id"), renewals[1].detail.at("write_attempt_id"));
+    EXPECT_FALSE(renewals[0].detail.at("write_attempt_id").empty());
+    EXPECT_LT(renewals[0].detail.at("write_attempt_id").size(), 32u);
+
+    for (const CasEvent & event : renewals)
+    {
+        for (const String & key : {
+                 "server_root_id",
+                 "writer_epoch",
+                 "seq",
+                 "write_attempt_id",
+                 "attempts_sent",
+                 "elapsed_ms",
+                 "remaining_confirmed_budget_ms",
+                 "unresolved_reason",
+                 "deadline_source",
+                 "stop_cause",
+                 "classification"})
+            EXPECT_TRUE(event.detail.contains(key)) << "missing detail key " << key;
+    }
+}
+
+TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    uint64_t boot_ms = 100;
+    auto store = openRenewalEventPool(backend, boot_ms);
+    const String mount_key = store->layout().mountKey("test");
+    const uint64_t seq_before = decodeMountLease(backend->get(mount_key)->bytes).seq;
+    store->setEventSink([](const CasEvent & event)
+    {
+        if (event.type == CasEventType::WatermarkRenew)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected renewal event sink failure");
+    });
+
+    backend->throw_before_next_overwrite = true;
+    EXPECT_NO_THROW(store->renewWatermarkOnce());
+    EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).seq, seq_before + 1);
+    EXPECT_TRUE(store->mayMutate());
 }
 
 /// Round-B opt §6: `emitEvent` takes the event BY VALUE (moved-through, not `const &`), so a

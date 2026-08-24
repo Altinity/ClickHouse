@@ -19,6 +19,7 @@
 #include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <thread>
@@ -42,6 +43,9 @@ namespace ErrorCodes
 namespace ProfileEvents
 {
     extern const Event CASPartFolderManifestGets;
+    extern const Event CASRemountAttempts;
+    extern const Event CASRemountSucceeded;
+    extern const Event CASRemountFailed;
     extern const Event CASRemountHeldTransient;
     extern const Event CASRefBatchFlushes;
     extern const Event CASRefBatchedMutations;
@@ -67,6 +71,8 @@ namespace DB::Cas
 
 namespace
 {
+
+std::atomic<uint64_t> remount_attempt_sequence{0};
 
 /// Validate every writable factory's lease/request/cadence relationship before it can publish
 /// owner, epoch, mount, or probe authority. Decommission forces background renewal before calling
@@ -1002,9 +1008,77 @@ uint64_t Pool::peekNextBuildSeq()
 
 bool Pool::tryRemountOnce()
 {
+    const uint64_t attempt_no = remount_attempt_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    ProfileEvents::increment(ProfileEvents::CASRemountAttempts);
+    const String & srid = config.server_root_id;
+    std::string_view step = "entry";
+    bool succeeded = false;
+    uint64_t result_writer_epoch = 0;
+    String error;
+    SCOPE_EXIT(
+    {
+        if (succeeded)
+            ProfileEvents::increment(ProfileEvents::CASRemountSucceeded);
+        else
+            ProfileEvents::increment(ProfileEvents::CASRemountFailed);
+
+        try
+        {
+            if (hasEventSink())
+            {
+                CasEvent event;
+                event.type = CasEventType::MountRemount;
+                event.outcome = succeeded ? "ok" : "failed";
+                event.reason = succeeded
+                    ? "whole-chain remount restored Live under a fresh mount incarnation"
+                    : "whole-chain remount returned without restoring Live";
+                event.detail = {
+                    {"attempt_no", std::to_string(attempt_no)},
+                    {"step", String{step}},
+                    {"server_root_id", srid},
+                };
+                if (result_writer_epoch != 0)
+                    event.detail["writer_epoch"] = std::to_string(result_writer_epoch);
+                if (!error.empty())
+                    event.detail["error"] = error;
+                emitEvent(std::move(event));
+            }
+        }
+        catch (...)
+        {
+            /// The audit sink cannot alter the already-decided remount result.
+        }
+
+        try
+        {
+            if (succeeded)
+                LOG_INFO(
+                    getLogger("CasPool"),
+                    "CAS whole-chain remount attempt {} succeeded at step '{}' for server_root_id='{}' "
+                    "(writer_epoch={})",
+                    attempt_no,
+                    step,
+                    srid,
+                    result_writer_epoch);
+            else
+                LOG_WARNING(
+                    getLogger("CasPool"),
+                    "CAS whole-chain remount attempt {} failed at step '{}' for server_root_id='{}' ({})",
+                    attempt_no,
+                    step,
+                    srid,
+                    error.empty() ? "step returned without restoring Live" : error);
+        }
+        catch (...)
+        {
+            /// Logging allocation cannot alter the already-decided remount result.
+        }
+    });
+
+    /// The result finalizer above was declared before the lock, so it emits only after serialization
+    /// has been released. No event/log allocation happens while `remount_mutex` is held.
     std::lock_guard serialize(remount_mutex);
 
-    const String & srid = config.server_root_id;
     const UInt128 our_uuid = config.server_id;
     const auto now_ms = []() -> uint64_t
     {
@@ -1015,26 +1089,20 @@ bool Pool::tryRemountOnce()
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
 
-    /// Best-effort round for the MountRemount audit event only (diagnostic, never correctness-relevant):
-    /// `currentGcRound` is a live `gc/state` GET, which may itself fail on the very backend trouble that
-    /// is causing this remount attempt to fail — never let that escalate into an uncaught throw out of
-    /// a function whose contract is "returns bool, never throws".
-    const auto round_for_event = [this]() -> uint64_t
-    {
-        try { return currentGcRound(); } catch (...) { return 0; }
-    };
-
     /// ==== Step 0 (rev.7 §2): pool lifecycle identity gate — BEFORE any claim/allocate/mount write ====
     /// A remount attempt means the lease is presumed lost, so first ensure we are at least transient
     /// (production reaches here already transient via `tripMountLost`; a direct/forced call may still be
     /// `Live`). Then authoritatively probe the pool sentinels and dispatch per the §2 verdict table. Only
     /// `Recover` (a present `_pool_meta` whose identity matches, in a non-`IdentityLost` state) falls
     /// through to the existing recovery below; every other verdict resolves here and returns false.
+    step = "lease_loss_transition";
     mount_runtime.noteLeaseLost();
     /// A fully-terminal `Vanished` pool never probes/claims/writes again.
+    step = "terminal_gate";
     if (mount_runtime.isVanished())
         return false;
     {
+        step = "pool_identity_probe";
         const LifecycleGate gate = probePoolLifecycleGate(
             *pool_backend, pool_layout, config.server_root_id, meta.pool_id, meta.blob_header_len);
         switch (gate.verdict)
@@ -1099,16 +1167,21 @@ bool Pool::tryRemountOnce()
         };
         /// The present-owner/present-epoch fast path would otherwise skip the observer entirely.
         /// Require the catalog before allocating a new epoch or replacing the mount slot.
+        step = "ref_catalog_observe";
         (void)observe_catalog();
+        step = "owner_claim";
         claimOwnerOrThrow(*pool_backend, pool_layout, srid, our_uuid, observe_catalog);
+        step = "writer_epoch_allocate";
         const uint64_t writer_epoch = allocateWriterEpoch(
             *pool_backend, pool_layout, srid, EpochMintPolicy::NormalMount, 0, observe_catalog);
+        result_writer_epoch = writer_epoch;
 
         /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so
         /// unlike the initial `open`, every event fired below reaches the real sink immediately.
         const auto emit_mount_event = [this](CasEvent e) { emitEvent(std::move(e)); };
 
         const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        step = "mount_claim";
         const MountClaimResult claim = claimMountAwaitingExpiry(
             *pool_backend, pool_layout, srid, our_uuid, writer_epoch,
             now_ms, [this] { return bootMsNow(); }, ttl_ms, poll_interval_ms, sleep_ms,
@@ -1147,7 +1220,9 @@ bool Pool::tryRemountOnce()
 
         /// The persistent renewal worker is parked before this callback is entered, so keeper
         /// replacement cannot race any synchronous lease operation.
+        step = "keeper_install";
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
+        step = "keeper_start";
         uint64_t remount_anchor_boot_ms = mount_runtime.startKeeper();
 
         /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence. Order is load-bearing:
@@ -1157,6 +1232,7 @@ bool Pool::tryRemountOnce()
         ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
         ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
         ///    accessors) equal to it.
+        step = "publish_writer_epoch";
         mount_runtime.setLiveWriterEpoch(writer_epoch);
         mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
         /// 2. CANCEL OR JOIN every in-flight ref-table recovery, and BLOCK here until none is left (spec
@@ -1166,9 +1242,11 @@ bool Pool::tryRemountOnce()
         ///    after the incarnation has already changed underneath it. Strictly before the quiesce below
         ///    so a cancelled walk unwinds while its runtime is still attached, and strictly before the
         ///    re-arm so no old-generation write can straddle it.
+        step = "cancel_ref_recovery";
         ref_ledger.cancelRecoveriesAndAwaitQuiescence();
         /// 3. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
         ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
+        step = "quiesce_ref_tables";
         ref_ledger.quiesceRefTablesForRemount();
         if (config.remount_quiesce_hook_for_test)
             config.remount_quiesce_hook_for_test();
@@ -1188,51 +1266,35 @@ bool Pool::tryRemountOnce()
         const bool renewal_window_fits = now_boot_ms <= safe_deadline
             && renewal_window_ms <= safe_deadline - now_boot_ms;
         if (!renewal_window_fits)
+        {
+            step = "keeper_redo";
             remount_anchor_boot_ms = mount_runtime.renewKeeperForRemountOnce();
+        }
 
         /// No-throw commit section: publish the fence and lifecycle only after epoch, keeper, recovery
         /// cancellation, and ref-runtime quiescence are complete.
+        step = "arm_fence";
         mount_runtime.armMountFence(
             our_uuid,
             writer_epoch,
             remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
                 ? std::numeric_limits<uint64_t>::max()
                 : remount_anchor_boot_ms + ttl_ms);
+        step = "publish_live";
         mount_runtime.noteRemounted();
-
-        try
-        {
-            LOG_INFO(getLogger("CasPool"),
-                "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
-                srid, writer_epoch);
-            EventEmitter{*this}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::MountRemount;
-                e.round = round_for_event();
-                e.outcome = "ok";
-                e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
-                e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
-                            {"server_root_id", srid}};
-            });
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger("CasPool"), "CAS self-remount committed; post-commit audit sink failed");
-        }
+        succeeded = true;
         return true;
     }
     catch (...)
     {
-        tryLogCurrentException(getLogger("CasPool"), "CAS self-remount attempt failed; will retry");
-        EventEmitter{*this}.emit([&](CasEvent & e)
+        try
         {
-            e.type = CasEventType::MountRemount;
-            e.round = round_for_event();
-            e.outcome = "failed";
-            e.reason = "self-remount attempt failed; the recovery loop retries with backoff";
-            e.detail = {{"server_root_id", srid},
-                        {"error", getCurrentExceptionMessage(/*with_stacktrace*/ false)}};
-        });
+            error = getCurrentExceptionMessage(/*with_stacktrace*/ false);
+        }
+        catch (...)
+        {
+            /// The final result still names the failed step if formatting the original exception fails.
+        }
         return false;
     }
 }

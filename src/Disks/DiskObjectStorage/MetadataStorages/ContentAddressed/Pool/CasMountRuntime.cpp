@@ -24,10 +24,19 @@ namespace ProfileEvents
     extern const Event CASIdentityLost;
     extern const Event CASDataRootVanished;
     extern const Event CASMountLeaseLost;
+    extern const Event CASMountRenewalAttempts;
+    extern const Event CASMountRenewalRetries;
+    extern const Event CASMountRenewalResolved;
+    extern const Event CASMountRenewalRecovered;
+    extern const Event CASMountRenewalDeadlineExceeded;
 }
 
 namespace DB::Cas
 {
+
+void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void configureMountRenewObservabilityDelivery(bool enabled) noexcept;
 
 namespace
 {
@@ -91,10 +100,8 @@ void CasMountRuntime::tripMountLost()
     /// A durable-effect caller admitted under the incarnation this trip just ended must never conclude
     /// the fence is fine again just because a LATER `armMountFence` happens to re-arm it (rev.7 [C2]).
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
-    /// The lease-loss event is exactly the `Live -> TransientNotLive` transition of the §1 state model.
-    /// Idempotent and terminal-safe (a compare-exchange from `Live` only).
-    if (noteLeaseLost())
-        ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
+    /// `noteLeaseLost` owns the one-per-generation transition metric for every caller.
+    (void)noteLeaseLost();
 }
 
 void CasMountRuntime::tripFenceWithoutOperationalLoss()
@@ -396,7 +403,25 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
                 : renewalStopCause(worker_call);
         },
         .wait_before_retry = [this, worker_call](uint64_t wait_ms) { return waitForRetry(wait_ms, worker_call); },
-        .observe = {},
+        .observe = [](const CasOverwriteProgress & progress)
+        {
+            switch (progress.kind)
+            {
+                case CasOverwriteProgressKind::PutStarted:
+                    ProfileEvents::increment(ProfileEvents::CASMountRenewalAttempts);
+                    break;
+                case CasOverwriteProgressKind::RetryStarted:
+                    ProfileEvents::increment(ProfileEvents::CASMountRenewalRetries);
+                    break;
+                case CasOverwriteProgressKind::ResolvedByGet:
+                    ProfileEvents::increment(ProfileEvents::CASMountRenewalResolved);
+                    break;
+                case CasOverwriteProgressKind::BecameAmbiguous:
+                case CasOverwriteProgressKind::ResolveStarted:
+                    break;
+            }
+            reportMountRenewProgress(progress);
+        },
     };
 }
 
@@ -443,6 +468,18 @@ void CasMountRuntime::consumeRenewResult(
     RenewalDriverState returned_state,
     bool propagate_failure)
 {
+    /// Driver ownership has already been restored by `DriverLease::finish`; this is the single logical
+    /// consumption boundary and it runs without `driver_mutex` or keeper access.
+    if (result.outcome == MountRenewOutcome::Committed
+        && (result.diagnostics.attempts_sent > 1 || result.diagnostics.resolved_by_get))
+        ProfileEvents::increment(ProfileEvents::CASMountRenewalRecovered);
+    if (result.outcome == MountRenewOutcome::Terminal
+        && result.diagnostics.deadline_source == CasOverwriteDeadlineSource::ExternalLeaseSafety
+        && result.diagnostics.stop_cause == CasOverwriteStopCause::Continue
+        && (result.diagnostics.unresolved_reason == CasUnresolvedReason::NoAttemptSent
+            || result.diagnostics.unresolved_reason == CasUnresolvedReason::DeadlineMidWay))
+        ProfileEvents::increment(ProfileEvents::CASMountRenewalDeadlineExceeded);
+
     if (result.outcome == MountRenewOutcome::Committed)
     {
         const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
@@ -450,10 +487,14 @@ void CasMountRuntime::consumeRenewResult(
             result.attempt_start_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
                 ? std::numeric_limits<uint64_t>::max()
                 : result.attempt_start_boot_ms + ttl_ms);
+        reportMountRenewCompletion(result);
         return;
     }
     if (result.outcome == MountRenewOutcome::NotAttempted)
+    {
+        reportMountRenewCompletion(result);
         return;
+    }
 
     if (!result.failure)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: terminal renewal has no failure");
@@ -470,6 +511,8 @@ void CasMountRuntime::consumeRenewResult(
     {
     }
 
+    reportMountRenewCompletion(result);
+
     (void)active_state;
     (void)returned_state;
 
@@ -483,6 +526,10 @@ uint64_t CasMountRuntime::renewKeeperOnce(
     bool propagate_failure,
     bool worker_call)
 {
+    /// A parked redo runs under the whole-chain remount serializer and is represented by that
+    /// attempt's one final result. Keep its physical counters, but suppress renewal event/log delivery
+    /// so no allocation or callback crosses `remount_mutex`.
+    configureMountRenewObservabilityDelivery(active != RenewalDriverState::RemountCall);
     const MountRenewResult result = call.keeper->renew(cas_request_budget, renewalEnvironment(worker_call));
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
@@ -820,6 +867,7 @@ bool CasMountRuntime::noteLeaseLost()
         /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
         /// non-`Live`. Only the winning transition writes it (the guard above), so it is not re-stamped.
         lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+        ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
         return true;
     }
     return false;

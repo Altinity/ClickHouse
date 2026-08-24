@@ -3,11 +3,16 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
+#include <Poco/Exception.h>
+#include <Poco/StreamChannel.h>
 
 #include <chrono>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <string>
+#include <utility>
 
 namespace DB::ErrorCodes
 {
@@ -100,6 +105,134 @@ public:
     bool winner_installed = false;
 };
 
+class RenewalLogBackend final : public InMemoryBackend
+{
+public:
+    using InMemoryBackend::putOverwrite;
+
+    bool throw_before_next_overwrite = false;
+
+    PutResult putOverwrite(
+        const String & key,
+        const String & bytes,
+        const Token & expected,
+        const ObjectMeta & meta) override
+    {
+        if (std::exchange(throw_before_next_overwrite, false))
+            throw Poco::TimeoutException("injected renewal timeout before commit");
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+};
+
+class ScopedRenewalLogCapture
+{
+public:
+    explicit ScopedRenewalLogCapture(const String & level)
+        : logger(getLogger("CasMountLeaseKeeper"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel(level);
+    }
+
+    ~ScopedRenewalLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
+};
+
+size_t countRenewalLogText(const String & haystack, std::string_view needle)
+{
+    size_t count = 0;
+    for (size_t pos = 0; (pos = haystack.find(needle, pos)) != String::npos; pos += needle.size())
+        ++count;
+    return count;
+}
+
+CasRequestBudget renewalLogBudget(uint32_t max_attempts = 2)
+{
+    return CasRequestBudget{
+        .attempt_timeout_ms = 10,
+        .operation_deadline_ms = 500,
+        .max_attempts = max_attempts,
+        .lease_safety_margin_ms = 20,
+        .retry_initial_backoff_ms = 0,
+        .retry_max_backoff_ms = 0,
+    };
+}
+
+}
+
+TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
+{
+    const auto open_store = [](const std::shared_ptr<RenewalLogBackend> & backend, uint64_t & boot_ms, const String & prefix)
+    {
+        return Pool::open(backend, PoolConfig{
+            .pool_prefix = prefix,
+            .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .cas_request_budget = renewalLogBudget(),
+            .boot_ms_fn = [&] { return boot_ms; },
+        });
+    };
+
+    {
+        auto backend = std::make_shared<RenewalLogBackend>();
+        uint64_t boot_ms = 100;
+        auto store = open_store(backend, boot_ms, "renewal-log-silent");
+        ScopedRenewalLogCapture capture("information");
+        EXPECT_NO_THROW(store->renewWatermarkOnce());
+        EXPECT_EQ(countRenewalLogText(capture.captured(), "CAS mount renewal"), 0u);
+    }
+
+    {
+        auto backend = std::make_shared<RenewalLogBackend>();
+        uint64_t boot_ms = 100;
+        auto store = open_store(backend, boot_ms, "renewal-log-recovered");
+        ScopedRenewalLogCapture capture("information");
+        backend->throw_before_next_overwrite = true;
+        EXPECT_NO_THROW(store->renewWatermarkOnce());
+        const String output = capture.captured();
+        EXPECT_EQ(countRenewalLogText(output, "CAS mount renewal"), 2u) << output;
+        EXPECT_EQ(countRenewalLogText(output, "entered retry"), 1u) << output;
+        EXPECT_EQ(countRenewalLogText(output, "recovered"), 1u) << output;
+        EXPECT_EQ(countRenewalLogText(output, "physical retry attempt"), 0u) << output;
+    }
+
+    {
+        auto backend = std::make_shared<RenewalLogBackend>();
+        uint64_t boot_ms = 100;
+        auto store = open_store(backend, boot_ms, "renewal-log-debug");
+        ScopedRenewalLogCapture capture("debug");
+        backend->throw_before_next_overwrite = true;
+        EXPECT_NO_THROW(store->renewWatermarkOnce());
+        EXPECT_EQ(countRenewalLogText(capture.captured(), "physical retry attempt 2"), 1u);
+    }
+
+    {
+        auto backend = std::make_shared<RenewalLogBackend>();
+        uint64_t boot_ms = 100;
+        auto store = open_store(backend, boot_ms, "renewal-log-fenced");
+        ScopedRenewalLogCapture capture("information");
+        boot_ms = 1071;
+        EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+        const String output = capture.captured();
+        EXPECT_EQ(countRenewalLogText(output, "CAS mount renewal"), 1u) << output;
+        EXPECT_EQ(countRenewalLogText(output, "fenced"), 1u) << output;
+        EXPECT_EQ(countRenewalLogText(output, "entered retry"), 0u) << output;
+    }
 }
 
 TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)

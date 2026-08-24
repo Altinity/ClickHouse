@@ -9,7 +9,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 #include <Poco/Exception.h>
+#include <Poco/StreamChannel.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -18,6 +21,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -38,6 +42,9 @@ namespace ProfileEvents
 extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASMountExclusivityViolation;
 extern const Event CASMountLeaseLost;
+extern const Event CASRemountAttempts;
+extern const Event CASRemountSucceeded;
+extern const Event CASRemountFailed;
 }
 
 using namespace DB::Cas;
@@ -1709,6 +1716,68 @@ public:
     }
 };
 
+class RemountStepBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    using DB::Cas::tests::CountingBackend::get;
+
+    void failNextGet(String key)
+    {
+        failed_key = std::move(key);
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        if (!failed_key.empty() && key == failed_key)
+        {
+            failed_key.clear();
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected remount probe failure");
+        }
+        return DB::Cas::tests::CountingBackend::get(key, range);
+    }
+
+private:
+    String failed_key;
+};
+
+class ScopedRemountLogCapture
+{
+public:
+    ScopedRemountLogCapture()
+        : logger(getLogger("CasPool"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("information");
+    }
+
+    ~ScopedRemountLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
+};
+
+size_t countRemountFinalLogs(const String & output)
+{
+    constexpr std::string_view needle = "CAS whole-chain remount attempt";
+    size_t count = 0;
+    for (size_t pos = 0; (pos = output.find(needle, pos)) != String::npos; pos += needle.size())
+        ++count;
+    return count;
+}
+
 class WorkerExitLatch
 {
 public:
@@ -3146,6 +3215,66 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
     expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->renewWatermarkOnce(); });
     EXPECT_FALSE(store->mayMutate());
     EXPECT_EQ(store->scheduleRemountCallCountForTest(), schedules_before + 1);
+}
+
+TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
+{
+    auto backend = std::make_shared<RemountStepBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "remount-observability",
+        .server_root_id = "test",
+    });
+    std::vector<CasEvent> events;
+    store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+    ScopedRemountLogCapture logs;
+
+    store->tripMountLost();
+    backend->failNextGet(store->layout().poolMetaKey());
+    const uint64_t attempts_before = ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts].load();
+    const uint64_t succeeded_before = ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load();
+    const uint64_t failed_before = ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load();
+    EXPECT_FALSE(store->tryRemountOnce());
+
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    EXPECT_TRUE(store->tryRemountOnce());
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountAttempts].load(), attempts_before + 2);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountSucceeded].load(), succeeded_before + 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASRemountFailed].load(), failed_before + 1);
+
+    std::vector<CasEvent> remounts;
+    std::copy_if(events.begin(), events.end(), std::back_inserter(remounts), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::MountRemount;
+    });
+    ASSERT_EQ(remounts.size(), 2u);
+    EXPECT_EQ(remounts[0].outcome, "failed");
+    EXPECT_EQ(remounts[0].detail.at("step"), "pool_identity_probe");
+    EXPECT_EQ(remounts[1].outcome, "ok");
+    EXPECT_EQ(remounts[1].detail.at("step"), "publish_live");
+    const uint64_t first_attempt = std::stoull(remounts[0].detail.at("attempt_no"));
+    const uint64_t second_attempt = std::stoull(remounts[1].detail.at("attempt_no"));
+    EXPECT_EQ(second_attempt, first_attempt + 1);
+    EXPECT_EQ(countRemountFinalLogs(logs.captured()), 2u) << logs.captured();
+}
+
+TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
+{
+    auto backend = std::make_shared<RemountStepBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "lease-loss-owner",
+        .server_root_id = "test",
+    });
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+
+    store->tripMountLost();
+    store->tripMountLost();
+    backend->failNextGet(store->layout().poolMetaKey());
+    EXPECT_FALSE(store->tryRemountOnce());
+    store->beginShutdownForTest();
+    store->tripMountLost();
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
 }
 
 /// Coverage gap (Task 13a): restores the get/exists/remove roundtrip for the mount access-check probe

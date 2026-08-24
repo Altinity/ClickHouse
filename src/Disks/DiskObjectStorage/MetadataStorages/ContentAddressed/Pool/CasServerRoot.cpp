@@ -22,7 +22,6 @@
 
 namespace ProfileEvents
 {
-    extern const Event CASMountLeaseLost;
     extern const Event CASMountReleaseSkippedForeignOccupant;
     extern const Event CASMountExclusivityViolation;
 }
@@ -42,6 +41,10 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
+void configureMountRenewObservabilityDelivery(bool enabled) noexcept;
+
 /// The owner, epoch, and mount-lease wire codecs are implemented in
 /// `Formats/CasServerRootFormats`; this file contains the mount-safety protocol logic that uses
 /// those codecs.
@@ -59,6 +62,155 @@ uint64_t defaultBootMs()
     struct timespec ts{};
     clock_gettime(CLOCK_BOOTTIME, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+}
+
+struct MountRenewObservabilityContext
+{
+    bool active = false;
+    String server_root_id;
+    uint64_t writer_epoch = 0;
+    uint64_t seq = 0;
+    String write_attempt_id;
+    uint64_t observability_start_boot_ms = 0;
+    uint64_t confirmed_deadline_boot_ms = 0;
+    uint64_t initial_confirmed_budget_ms = 0;
+    CasOverwriteDeadlineSource deadline_source = CasOverwriteDeadlineSource::RequestBudget;
+    uint32_t ambiguity_attempt_no = 0;
+    bool delivery_enabled = true;
+    CasEventSink event_sink;
+};
+
+thread_local MountRenewObservabilityContext mount_renew_observability;
+thread_local bool mount_renew_observability_delivery_enabled = true;
+
+void beginMountRenewObservability(
+    const String & server_root_id,
+    uint64_t writer_epoch,
+    uint64_t seq,
+    UInt128 write_attempt_id,
+    uint64_t attempt_start_boot_ms,
+    uint64_t confirmed_deadline_boot_ms,
+    CasOverwriteDeadlineSource deadline_source,
+    const CasEventSink & event_sink) noexcept
+{
+    mount_renew_observability.active = false;
+    try
+    {
+        MountRenewObservabilityContext next{
+            .active = false,
+            .server_root_id = server_root_id,
+            .writer_epoch = writer_epoch,
+            .seq = seq,
+            .write_attempt_id = u128ToHex(write_attempt_id).substr(0, 12),
+            .observability_start_boot_ms = defaultBootMs(),
+            .confirmed_deadline_boot_ms = confirmed_deadline_boot_ms,
+            .initial_confirmed_budget_ms = confirmed_deadline_boot_ms > attempt_start_boot_ms
+                ? confirmed_deadline_boot_ms - attempt_start_boot_ms
+                : 0,
+            .deadline_source = deadline_source,
+            .ambiguity_attempt_no = 0,
+            .delivery_enabled = mount_renew_observability_delivery_enabled,
+            .event_sink = event_sink,
+        };
+        next.active = true;
+        mount_renew_observability = std::move(next);
+    }
+    catch (...)
+    {
+        /// Observability allocation cannot change renewal protocol behavior.
+    }
+}
+
+constexpr std::string_view unresolvedReasonName(CasUnresolvedReason reason)
+{
+    switch (reason)
+    {
+        case CasUnresolvedReason::NotUnresolved: return "not_unresolved";
+        case CasUnresolvedReason::NoAttemptSent: return "no_attempt_sent";
+        case CasUnresolvedReason::FenceLostMidWay: return "fence_lost_mid_way";
+        case CasUnresolvedReason::DeadlineMidWay: return "deadline_mid_way";
+        case CasUnresolvedReason::FenceLostPostWrite: return "fence_lost_post_write";
+        case CasUnresolvedReason::AttemptsExhausted: return "attempts_exhausted";
+        case CasUnresolvedReason::DefiniteFailureAfterAmbiguity: return "definite_failure_after_ambiguity";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view deadlineSourceName(CasOverwriteDeadlineSource source)
+{
+    switch (source)
+    {
+        case CasOverwriteDeadlineSource::RequestBudget: return "request_budget";
+        case CasOverwriteDeadlineSource::ExternalLeaseSafety: return "external_lease_safety";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view stopCauseName(CasOverwriteStopCause cause)
+{
+    switch (cause)
+    {
+        case CasOverwriteStopCause::Continue: return "continue";
+        case CasOverwriteStopCause::Cancelled: return "cancelled";
+        case CasOverwriteStopCause::FenceOrLifecycleLost: return "fence_or_lifecycle_lost";
+    }
+    return "unknown";
+}
+
+uint64_t elapsedSince(uint64_t start_boot_ms, uint64_t now_boot_ms)
+{
+    return now_boot_ms >= start_boot_ms ? now_boot_ms - start_boot_ms : 0;
+}
+
+uint64_t remainingConfirmedBudget(const MountRenewObservabilityContext & context, uint64_t now_boot_ms)
+{
+    const uint64_t elapsed_ms = elapsedSince(context.observability_start_boot_ms, now_boot_ms);
+    return context.initial_confirmed_budget_ms > elapsed_ms
+        ? context.initial_confirmed_budget_ms - elapsed_ms
+        : 0;
+}
+
+void emitMountRenewEvent(
+    const MountRenewObservabilityContext & context,
+    std::string_view outcome,
+    uint32_t attempts_sent,
+    uint64_t now_boot_ms,
+    CasUnresolvedReason unresolved_reason,
+    CasOverwriteDeadlineSource deadline_source,
+    CasOverwriteStopCause stop_cause,
+    std::string_view classification) noexcept
+{
+    if (!context.event_sink)
+        return;
+    try
+    {
+        CasEvent event;
+        event.type = CasEventType::WatermarkRenew;
+        event.outcome = String{outcome};
+        event.reason = outcome == "retrying"
+            ? "CAS mount renewal entered bounded retry after an ambiguous physical attempt"
+            : (outcome == "recovered"
+                ? "CAS mount renewal recovered before its confirmed lease-safety deadline"
+                : "CAS mount renewal ended without retained authority and fenced the mount");
+        event.detail = {
+            {"server_root_id", context.server_root_id},
+            {"writer_epoch", std::to_string(context.writer_epoch)},
+            {"seq", std::to_string(context.seq)},
+            {"write_attempt_id", context.write_attempt_id},
+            {"attempts_sent", std::to_string(attempts_sent)},
+            {"elapsed_ms", std::to_string(elapsedSince(context.observability_start_boot_ms, now_boot_ms))},
+            {"remaining_confirmed_budget_ms", std::to_string(remainingConfirmedBudget(context, now_boot_ms))},
+            {"unresolved_reason", String{unresolvedReasonName(unresolved_reason)}},
+            {"deadline_source", String{deadlineSourceName(deadline_source)}},
+            {"stop_cause", String{stopCauseName(stop_cause)}},
+            {"classification", String{classification}},
+        };
+        context.event_sink(std::move(event));
+    }
+    catch (...)
+    {
+        /// Event construction and sink failures are diagnostic-only.
+    }
 }
 
 /// Forward declaration: defined below (same TU-unique anonymous namespace) — `allocateWriterEpoch`
@@ -85,6 +237,143 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
         "(same manual-recovery pattern as an owner anchor lost over existing data)",
         srid, *owner.retired_at_ms);
 }
+}
+
+void configureMountRenewObservabilityDelivery(bool enabled) noexcept
+{
+    mount_renew_observability_delivery_enabled = enabled;
+}
+
+void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept
+{
+    MountRenewObservabilityContext & context = mount_renew_observability;
+    if (!context.active)
+        return;
+
+    if (progress.kind == CasOverwriteProgressKind::BecameAmbiguous)
+    {
+        /// Retain only POD progress here. Structured delivery happens after the controller has returned
+        /// and runtime ownership has been restored, so a blocking/throwing sink cannot consume retry
+        /// budget or change the protocol result.
+        context.ambiguity_attempt_no = progress.attempt_no;
+    }
+    else if (progress.kind == CasOverwriteProgressKind::RetryStarted && context.delivery_enabled)
+    {
+        try
+        {
+            LOG_DEBUG(
+                getLogger("CasMountLeaseKeeper"),
+                "CAS mount renewal '{}' physical retry attempt {} (writer_epoch={}, seq={})",
+                context.server_root_id,
+                progress.attempt_no,
+                context.writer_epoch,
+                context.seq);
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+void reportMountRenewCompletion(const MountRenewResult & result) noexcept
+{
+    MountRenewObservabilityContext & context = mount_renew_observability;
+    if (!context.active)
+        return;
+    if (!context.delivery_enabled)
+    {
+        context.active = false;
+        return;
+    }
+    const uint64_t now_boot_ms = defaultBootMs();
+
+    if (context.ambiguity_attempt_no != 0)
+    {
+        try
+        {
+            LOG_WARNING(
+                getLogger("CasMountLeaseKeeper"),
+                "CAS mount renewal '{}' entered retry after physical attempt {} (writer_epoch={}, seq={}, "
+                "remaining_confirmed_budget_ms={})",
+                context.server_root_id,
+                context.ambiguity_attempt_no,
+                context.writer_epoch,
+                context.seq,
+                remainingConfirmedBudget(context, now_boot_ms));
+        }
+        catch (...)
+        {
+        }
+        emitMountRenewEvent(
+            context,
+            "retrying",
+            context.ambiguity_attempt_no,
+            now_boot_ms,
+            CasUnresolvedReason::NotUnresolved,
+            context.deadline_source,
+            CasOverwriteStopCause::Continue,
+            "ambiguous");
+    }
+
+    const bool recovered = result.outcome == MountRenewOutcome::Committed
+        && (result.diagnostics.attempts_sent > 1 || result.diagnostics.resolved_by_get);
+    if (recovered)
+    {
+        const std::string_view classification = result.diagnostics.resolved_by_get
+            ? "committed_by_get"
+            : "committed_after_retry";
+        emitMountRenewEvent(
+            context,
+            "recovered",
+            result.diagnostics.attempts_sent,
+            now_boot_ms,
+            result.diagnostics.unresolved_reason,
+            result.diagnostics.deadline_source,
+            result.diagnostics.stop_cause,
+            classification);
+        try
+        {
+            LOG_INFO(
+                getLogger("CasMountLeaseKeeper"),
+                "CAS mount renewal '{}' recovered after {} physical attempts in {} ms "
+                "(classification={}, confirmed_deadline_boot_ms={})",
+                context.server_root_id,
+                result.diagnostics.attempts_sent,
+                elapsedSince(context.observability_start_boot_ms, now_boot_ms),
+                classification,
+                context.confirmed_deadline_boot_ms);
+        }
+        catch (...)
+        {
+        }
+    }
+    else if (result.outcome == MountRenewOutcome::Terminal)
+    {
+        emitMountRenewEvent(
+            context,
+            "failed",
+            result.diagnostics.attempts_sent,
+            now_boot_ms,
+            result.diagnostics.unresolved_reason,
+            result.diagnostics.deadline_source,
+            result.diagnostics.stop_cause,
+            "terminal");
+        try
+        {
+            LOG_WARNING(
+                getLogger("CasMountLeaseKeeper"),
+                "CAS mount renewal '{}' fenced after {} physical attempts in {} ms "
+                "(classification=terminal, confirmed_deadline_boot_ms={})",
+                context.server_root_id,
+                result.diagnostics.attempts_sent,
+                elapsedSince(context.observability_start_boot_ms, now_boot_ms),
+                context.confirmed_deadline_boot_ms);
+        }
+        catch (...)
+        {
+        }
+    }
+    context.active = false;
 }
 
 bool serverRootSubtreeEmpty(
@@ -1126,7 +1415,8 @@ MountRenewResult MountLeaseKeeper::renew(
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_clock();
     const uint64_t next_seq = seq + 1;
-    const String body = encodeBody(next_seq, wall_ms, min_active_fn(), newMountWriteAttemptId());
+    const UInt128 write_attempt_id = newMountWriteAttemptId();
+    const String body = encodeBody(next_seq, wall_ms, min_active_fn(), write_attempt_id);
     const Token expected = last_token;
 
     const uint64_t safety_ms = static_cast<uint64_t>(lease_safety_margin.count());
@@ -1140,6 +1430,16 @@ MountRenewResult MountLeaseKeeper::renew(
     const CasOverwriteDeadlineSource deadline_source = lease_retry_deadline <= request_deadline
         ? CasOverwriteDeadlineSource::ExternalLeaseSafety
         : CasOverwriteDeadlineSource::RequestBudget;
+
+    beginMountRenewObservability(
+        srid,
+        writer_epoch,
+        next_seq,
+        write_attempt_id,
+        attempt_start_boot_ms,
+        confirmed_deadline_boot_ms,
+        deadline_source,
+        event_sink);
 
     CasRequestController controller(backend, budget, boot_clock);
     const CasOverwriteOperationContext context{
