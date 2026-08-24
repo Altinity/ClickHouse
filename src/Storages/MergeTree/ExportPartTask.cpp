@@ -1,5 +1,6 @@
 #include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
@@ -50,6 +51,7 @@ namespace ErrorCodes
 
 namespace FailPoints
 {
+    extern const char export_part_pause_before_schema_validation[];
     /// Throw a non-retryable (denylisted) error from the part-export worker, so the whole
     /// export task transitions to FAILED immediately regardless of any timeout.
     extern const char export_part_non_retryable_throw[];
@@ -119,6 +121,8 @@ namespace
         const IStorage & destination_storage,
         const ContextPtr & local_context)
     {
+        FailPointInjection::pauseFailPoint(FailPoints::export_part_pause_before_schema_validation);
+
         const auto destination_header
             = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
         const auto & destination_columns = destination_header.getColumnsWithTypeAndName();
@@ -131,6 +135,11 @@ namespace
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
+
+        ExportPartitionUtils::checkExportSchemaColumnsCount(
+            source_columns.size(),
+            destination_columns.size(),
+            ignore_extra_source_columns);
 
         if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
         {

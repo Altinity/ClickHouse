@@ -95,6 +95,11 @@ namespace ExportPartitionUtils
         MergeTreePartExportSchemaMatchMode schema_match_mode,
         const StorageID & destination_storage_id);
 
+    void checkExportSchemaColumnsCount(
+        size_t source_columns_count,
+        size_t destination_columns_count,
+        bool ignore_extra_source_columns);
+
     /// Validates that source columns can be exported into the destination with the configured
     /// positional or name-based CAST matching (`export_merge_tree_part_schema_match_mode`) and
     /// unmatched-column policy (`export_merge_tree_part_ignore_extra_source_columns`). Lossy casts are rejected unless

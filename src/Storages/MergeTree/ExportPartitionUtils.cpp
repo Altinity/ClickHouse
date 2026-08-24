@@ -1005,6 +1005,28 @@ namespace
         UNREACHABLE();
     }
 
+    void checkExportSchemaColumnsCount(
+        size_t source_columns_count,
+        size_t destination_columns_count,
+        bool ignore_extra_source_columns)
+    {
+        if (source_columns_count < destination_columns_count)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "destination cannot have more columns than source",
+                source_columns_count,
+                destination_columns_count);
+
+        if (source_columns_count > destination_columns_count && !ignore_extra_source_columns)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "source has extra columns and the `export_merge_tree_part_ignore_extra_source_columns` setting is disabled",
+                source_columns_count,
+                destination_columns_count);
+    }
+
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata,
@@ -1029,21 +1051,10 @@ namespace
         const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
-        if (source_columns.size() < destination_columns.size())
-            throw Exception(
-                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-                "Number of columns doesn't match (source: {} and result: {}): "
-                "destination cannot have more columns than source",
-                source_columns.size(),
-                destination_columns.size());
-
-        if (src_has_extra_columns && !ignore_extra_source_columns)
-            throw Exception(
-                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-                "Number of columns doesn't match (source: {} and result: {}): "
-                "source has extra columns and the `export_merge_tree_part_ignore_extra_source_columns` setting is disabled",
-                source_columns.size(),
-                destination_columns.size());
+        checkExportSchemaColumnsCount(
+            source_columns.size(),
+            destination_columns.size(),
+            ignore_extra_source_columns);
 
         if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
         {

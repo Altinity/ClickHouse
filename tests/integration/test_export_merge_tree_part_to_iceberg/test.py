@@ -1289,6 +1289,79 @@ def test_export_part_runtime_cast_failure_propagates_async(cluster):
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
 
 
+def test_export_part_match_by_name_revalidates_extra_source_columns_in_background_task(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_match_by_name_schema_drift_{sfx}"
+    iceberg = f"iceberg_match_by_name_schema_drift_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32, payload String", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32, payload String", "year")
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+    part = get_part(node, mt, "2020")
+
+    try:
+        node.query("SYSTEM ENABLE FAILPOINT export_part_pause_before_schema_validation")
+        export_part(
+            node,
+            mt,
+            part,
+            iceberg,
+            "export_merge_tree_part_schema_match_mode = 'match_by_name'",
+        )
+        node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
+
+        node.query(
+            f"ALTER TABLE {iceberg} DROP COLUMN payload",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+        node.query("SYSTEM NOTIFY FAILPOINT export_part_pause_before_schema_validation")
+
+        exception = wait_for_failed_export_part(node, mt, part)
+        assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in exception, (
+            f"Expected the background schema check to reject the extra source column, got: {exception}"
+        )
+        assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_pause_before_schema_validation")
+        node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+        node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_match_by_name_uses_source_snapshot_when_source_column_is_added(cluster):
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_match_by_name_source_schema_drift_{sfx}"
+    iceberg = f"iceberg_match_by_name_source_schema_drift_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32, payload String", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32, payload String", "year")
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020, 'foo'), (2, 2020, 'bar')")
+    part = get_part(node, mt, "2020")
+
+    try:
+        node.query("SYSTEM ENABLE FAILPOINT export_part_pause_before_schema_validation")
+        export_part(
+            node,
+            mt,
+            part,
+            iceberg,
+            "export_merge_tree_part_schema_match_mode = 'match_by_name'",
+        )
+        node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
+
+        node.query(f"ALTER TABLE {mt} ADD COLUMN extra String DEFAULT 'new'")
+        node.query("SYSTEM NOTIFY FAILPOINT export_part_pause_before_schema_validation")
+
+        wait_for_export_part(node, mt, part)
+        result = node.query(f"SELECT id, year, payload FROM {iceberg} ORDER BY id").strip()
+        assert result == "1\t2020\tfoo\n2\t2020\tbar", f"Unexpected exported data:\n{result}"
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_part_pause_before_schema_validation")
+        node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+        node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
 def test_export_part_tuple_subcolumn_partition_key_iceberg_rejected(cluster):
     node = cluster.instances["node1"]
     sfx = unique_suffix()
