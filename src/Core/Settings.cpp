@@ -7627,18 +7627,18 @@ Allow `EXPORT PART`/`EXPORT PARTITION` to apply lossy (non-value-preserving) cas
 
 When exporting to Apache Iceberg, the partition value written to the metadata is derived from the source partition columns by casting them to the destination partition-field types and applying the destination partition transform — the same computation the exported data files use, so the metadata stays consistent with the data. A lossy cast on a partition column remains semantically truncating: both the data files and the metadata contain the truncated value, and such casts require this setting to be enabled.
 )", 0) \
-    DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::match_by_position, R"(
+    DECLARE(MergeTreePartExportSchemaMatchMode, export_merge_tree_part_schema_match_mode, MergeTreePartExportSchemaMatchMode::POSITION, R"(
 Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns.
 Possible values:
-- `match_by_position` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
-- `match_by_name` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback.
+- `POSITION` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+- `NAME` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback.
 
 See also `export_merge_tree_part_ignore_extra_source_columns`, which controls whether a source column without a corresponding destination column is dropped or rejected.
 )", 0) \
     DECLARE(Bool, export_merge_tree_part_ignore_extra_source_columns, false, R"(
 Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` columns that have no corresponding destination column.
-- `false` (default) - such a source column is rejected: the source and destination must match exactly (in `export_merge_tree_part_schema_match_mode = 'match_by_position'`, this means the same number of columns; in `'match_by_name'`, the same set of column names). A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
-- `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `match_by_position` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `match_by_name` mode, this allows source columns whose name has no destination counterpart.
+- `false` (default) - such a source column is rejected: the source and destination must match exactly (in `export_merge_tree_part_schema_match_mode = 'POSITION'`, this means the same number of columns; in `'NAME'`, the same set of column names). A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+- `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `POSITION` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `NAME` mode, this allows source columns whose name has no destination counterpart.
 
 Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part.
 )", 0) \

@@ -17,8 +17,8 @@ from helpers.network import PartitionManager
 
 
 EXTRA_SOURCE_COLUMN_MODES = [
-    pytest.param("match_by_position", id="by-position"),
-    pytest.param("match_by_name", id="by-name"),
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
 ]
 
 
@@ -2351,7 +2351,7 @@ def test_export_partition_match_by_name_honored_by_non_initiating_replica(cluste
 
     replica1.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-        f" SETTINGS export_merge_tree_part_schema_match_mode = 'match_by_name',"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME',"
         f" export_merge_tree_part_ignore_extra_source_columns = 1"
     )
 
@@ -2400,7 +2400,7 @@ def test_export_partition_match_by_name_with_equal_column_count_reordered(cluste
 
     replica1.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
-        f" SETTINGS export_merge_tree_part_schema_match_mode = 'match_by_name'"
+        f" SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
     )
 
     wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,

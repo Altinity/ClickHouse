@@ -10,8 +10,8 @@ from helpers.network import PartitionManager
 
 
 EXTRA_SOURCE_COLUMN_MODES = [
-    pytest.param("match_by_position", id="by-position"),
-    pytest.param("match_by_name", id="by-name"),
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
 ]
 
 
@@ -988,8 +988,8 @@ def test_export_part_column_count_mismatch_source_fewer_is_rejected(cluster):
 @pytest.mark.parametrize(
     "schema_match_mode,expected_error",
     [
-        pytest.param("match_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
-        pytest.param("match_by_name", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
+        pytest.param("POSITION", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("NAME", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
     ],
 )
 def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
@@ -1089,7 +1089,7 @@ def test_export_part_match_by_name_with_equal_column_count_reordered(cluster):
 
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_schema_match_mode = 'match_by_name'"
+        f"SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
     )
     wait_for_export_part(node=node, table=mt_table, part="2020_1_1_0")
 
@@ -1123,7 +1123,7 @@ def test_export_part_match_by_name_with_equal_column_count_rejects_unmatched_sou
 
     error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
-        f"SETTINGS export_merge_tree_part_schema_match_mode = 'match_by_name'"
+        f"SETTINGS export_merge_tree_part_schema_match_mode = 'NAME'"
     )
     assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
         f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for an unmatched source column with "

@@ -576,8 +576,8 @@ DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
 
 enum class MergeTreePartExportSchemaMatchMode : uint8_t
 {
-    match_by_position,
-    match_by_name,
+    POSITION,
+    NAME,
 };
 
 DECLARE_SETTING_ENUM(MergeTreePartExportSchemaMatchMode)

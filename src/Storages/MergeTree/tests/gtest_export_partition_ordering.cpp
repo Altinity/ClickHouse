@@ -149,7 +149,7 @@ TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
 TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchModeParsesAsNullopt)
 {
     auto manifest = makeValidManifest();
-    manifest.schema_match_mode = MergeTreePartExportSchemaMatchMode::match_by_name;
+    manifest.schema_match_mode = MergeTreePartExportSchemaMatchMode::NAME;
 
     Poco::JSON::Parser parser;
     auto json = parser.parse(manifest.toJsonString()).extract<Poco::JSON::Object::Ptr>();
@@ -216,7 +216,7 @@ TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchSettingsFallBack
 
     EXPECT_EQ(
         worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
-        MergeTreePartExportSchemaMatchMode::match_by_position);
+        MergeTreePartExportSchemaMatchMode::POSITION);
     EXPECT_EQ(
         worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
         false);
@@ -273,7 +273,7 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMatchMode::match_by_position,
+                MergeTreePartExportSchemaMatchMode::POSITION,
                 destination_storage_id);
         },
         ErrorCodes::INCOMPATIBLE_COLUMNS);
@@ -281,7 +281,7 @@ TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
     EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
         source_columns,
         destination_columns,
-        MergeTreePartExportSchemaMatchMode::match_by_name,
+        MergeTreePartExportSchemaMatchMode::NAME,
         destination_storage_id));
 }
 
@@ -305,7 +305,7 @@ TEST(ExportColumnCastsTest, MatchByNameAcceptsReorderedColumnsWithEqualColumnCou
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 reordered_destination_columns,
-                MergeTreePartExportSchemaMatchMode::match_by_position,
+                MergeTreePartExportSchemaMatchMode::POSITION,
                 destination_storage_id);
         },
         ErrorCodes::INCOMPATIBLE_COLUMNS);
@@ -313,7 +313,7 @@ TEST(ExportColumnCastsTest, MatchByNameAcceptsReorderedColumnsWithEqualColumnCou
     EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
         source_columns,
         reordered_destination_columns,
-        MergeTreePartExportSchemaMatchMode::match_by_name,
+        MergeTreePartExportSchemaMatchMode::NAME,
         destination_storage_id));
 
     const ColumnsWithTypeAndName same_order_destination_columns = {
@@ -322,7 +322,7 @@ TEST(ExportColumnCastsTest, MatchByNameAcceptsReorderedColumnsWithEqualColumnCou
         makeColumn<DataTypeString>("payload"),
     };
 
-    for (const auto mode : {MergeTreePartExportSchemaMatchMode::match_by_position, MergeTreePartExportSchemaMatchMode::match_by_name})
+    for (const auto mode : {MergeTreePartExportSchemaMatchMode::POSITION, MergeTreePartExportSchemaMatchMode::NAME})
         EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
             source_columns, same_order_destination_columns, mode, destination_storage_id));
 }
@@ -343,7 +343,7 @@ TEST(ExportColumnCastsTest, MatchByNameToleratesUnmatchedSourceColumn)
     EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
         source_columns,
         destination_columns,
-        MergeTreePartExportSchemaMatchMode::match_by_name,
+        MergeTreePartExportSchemaMatchMode::NAME,
         destination_storage_id));
 }
 
@@ -365,7 +365,7 @@ TEST(ExportColumnCastsTest, RejectsLossyCastAfterMatchingByName)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMatchMode::match_by_name,
+                MergeTreePartExportSchemaMatchMode::NAME,
                 StorageID{"test", "destination"});
         },
         ErrorCodes::INCOMPATIBLE_COLUMNS);
@@ -389,7 +389,7 @@ TEST(ExportColumnCastsTest, RejectsMissingDestinationColumnAfterMatchingByName)
             ExportPartitionUtils::verifyExportColumnCastsAreSafe(
                 source_columns,
                 destination_columns,
-                MergeTreePartExportSchemaMatchMode::match_by_name,
+                MergeTreePartExportSchemaMatchMode::NAME,
                 StorageID{"test", "destination"});
         },
         ErrorCodes::THERE_IS_NO_COLUMN);

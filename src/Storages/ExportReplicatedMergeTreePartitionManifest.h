@@ -373,7 +373,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         /// Left unset (nullopt) for tasks created before these fields existed - such tasks were
         /// always scheduled under the old, strict column-matching check (a mismatch could never
         /// reach scheduling in the first place), so callers should treat an absent value as
-        /// `match_by_position` with `ignore_extra_source_columns = false`.
+        /// `POSITION` with `ignore_extra_source_columns = false`.
         if (json->has("schema_match_mode"))
         {
             const auto schema_match_mode = magic_enum::enum_cast<MergeTreePartExportSchemaMatchMode>(json->getValue<String>("schema_match_mode"));

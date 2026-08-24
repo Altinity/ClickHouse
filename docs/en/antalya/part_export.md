@@ -49,13 +49,13 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
 
 Source and destination tables must support positional schema conversion. The following differences between the two schemas are allowed:
 
-- **Column names** may differ between source and destination for non-partition-key columns when `export_merge_tree_part_schema_match_mode = 'match_by_position'` (the default) - columns are matched by position, similar to `INSERT INTO dest SELECT * FROM src`, not by name. Set `export_merge_tree_part_schema_match_mode = 'match_by_name'` to match columns by their exact, case-sensitive name instead, allowing destination columns to be declared in a different order than the source.
+- **Column names** may differ between source and destination for non-partition-key columns when `export_merge_tree_part_schema_match_mode = 'POSITION'` (the default) - columns are matched by position, similar to `INSERT INTO dest SELECT * FROM src`, not by name. Set `export_merge_tree_part_schema_match_mode = 'NAME'` to match columns by their exact, case-sensitive name instead, allowing destination columns to be declared in a different order than the source.
 - **Column types** may differ, as long as the source type is safely castable to the destination type. Set `export_merge_tree_part_allow_lossy_cast = 1` to also permit lossy casts.
 - **`Tuple` element names** may differ if either the source or destination declares the tuple without named elements: an unnamed `Tuple` (e.g. `Tuple(Int32, Int32)`) is matched against the destination by element position and type only, not by name. For example, exporting from `t Tuple(Int32, Int32)` to `t Tuple(x Int32, y Int32)` is allowed as long as element types match positionally.
 
 The following requirements apply to the source and destination:
 
-1. **Column count** - by default (`export_merge_tree_part_ignore_extra_source_columns = false`) every source column must have a corresponding destination column: with `export_merge_tree_part_schema_match_mode = 'match_by_position'` (the default) the source and destination must have the same number of columns; with `'match_by_name'` they must have the same set of column names. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Set `export_merge_tree_part_ignore_extra_source_columns = 1` to allow a source table with columns that have no corresponding destination column; such columns are dropped and not exported. The destination having a column absent from the source is always rejected, regardless of this setting.
+1. **Column count** - by default, every source column must have a corresponding destination column, and vice versa; a mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`. Which source column corresponds to which destination column is determined by `export_merge_tree_part_schema_match_mode`. Set `export_merge_tree_part_ignore_extra_source_columns = 1` to relax this in one direction: a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is always rejected, regardless of this setting.
 2. **`PARTITION BY` expressions** - the whole part must land in a single destination partition. Identical expressions always satisfy this; otherwise the destination expression has to be computable from the values the source partition key pins, or be proven single-valued over the part's min/max range. The same requirement applies to the partition fields and transforms of an Apache Iceberg destination. See [Source partition key compatibility](/docs/en/antalya/partition_export.md#source-partition-key-compatibility).
 3. **The position of every column backing the partition key** - it is not enough for the `PARTITION BY` expressions to be textually identical: every top-level column that provides a column or subcolumn used by the source table's partition key must have the same name at the same position in the destination table's schema. If such a column contains a named `Tuple`, its element names must also be declared in the same order (an unnamed `Tuple` on either side is exempt from this, per the allowance above). This comparison is recursive through nested tuples and through container types such as `Array` and `Map`.
 
@@ -139,10 +139,10 @@ In case a table function is used as the destination, the schema can be omitted a
 ### `export_merge_tree_part_schema_match_mode` (Optional)
 
 - **Type**: `MergeTreePartExportSchemaMatchMode`
-- **Default**: `match_by_position`
+- **Default**: `POSITION`
 - **Description**: Controls how `EXPORT PART`/`EXPORT PARTITION` matches source `MergeTree` columns to destination columns. Possible values:
-  - `match_by_position` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
-  - `match_by_name` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source, including when it was renamed, throws `THERE_IS_NO_COLUMN`; there is no positional fallback.
+  - `POSITION` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
+  - `NAME` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source, including when it was renamed, throws `THERE_IS_NO_COLUMN`; there is no positional fallback.
 
   See `export_merge_tree_part_ignore_extra_source_columns` below for how a source column without a corresponding destination column is handled in each mode.
 
@@ -150,18 +150,11 @@ In case a table function is used as the destination, the schema can be omitted a
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` columns that have no corresponding destination column.
-  - `false` (default) - such a source column is rejected: the source and destination must match exactly. With `export_merge_tree_part_schema_match_mode = 'match_by_position'` this means the same number of columns; with `'match_by_name'` this means the same set of column names, so a source table with columns absent from the destination is rejected even if the matched columns would otherwise be compatible. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
-  - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `match_by_position` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `match_by_name` mode, this allows source columns whose name has no destination counterpart, which may occur in any position.
+- **Description**: Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates a source `MergeTree` column that has no corresponding destination column.
+  - `false` (default) - such a source column is rejected: the source and destination must match exactly. A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
+  - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. The destination having a column absent from the source is still always rejected.
 
   Extra source columns are still read and evaluated (including `MATERIALIZED`/`ALIAS` columns, and any column another kept column's `ALIAS`/`MATERIALIZED` expression depends on) before being dropped, so this setting only changes which columns end up in the destination, not what is computed while reading the part. Type conversion and `export_merge_tree_part_allow_lossy_cast` are applied after columns are matched.
-
-  Error behavior:
-
-  - With `export_merge_tree_part_ignore_extra_source_columns = false` (default), a source column without a corresponding destination column throws `NUMBER_OF_COLUMNS_DOESNT_MATCH` - in `match_by_position` mode this means any column-count mismatch, in `match_by_name` mode this means the source and destination column-name sets differ.
-  - In `match_by_position` mode, the destination having more columns than the source always throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`, regardless of `export_merge_tree_part_ignore_extra_source_columns`.
-  - In `match_by_name` mode, a destination column absent from the source (including a renamed one) always throws `THERE_IS_NO_COLUMN`, regardless of `export_merge_tree_part_ignore_extra_source_columns`; there is no positional fallback.
-  - After columns have been matched successfully, a cast rejected by the export type-safety check throws `INCOMPATIBLE_COLUMNS`.
 
 
 ## Examples

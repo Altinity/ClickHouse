@@ -44,7 +44,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},
-            {"export_merge_tree_part_schema_match_mode", "match_by_position", "match_by_position", "New setting to control how EXPORT PART/EXPORT PARTITION matches source columns to destination columns"},
+            {"export_merge_tree_part_schema_match_mode", "POSITION", "POSITION", "New setting to control how EXPORT PART/EXPORT PARTITION matches source columns to destination columns"},
             {"export_merge_tree_part_ignore_extra_source_columns", false, false, "New setting to allow EXPORT PART/EXPORT PARTITION when the source table has columns absent from the destination"},
             {"export_merge_tree_partition_retry_initial_backoff_seconds", 5, 5, "New setting for exponential back-off between failed part export retries in an export partition task"},
             {"export_merge_tree_partition_retry_max_backoff_seconds", 300, 300, "New setting capping the exponential back-off between failed part export retries in an export partition task"},

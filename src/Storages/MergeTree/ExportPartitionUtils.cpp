@@ -220,11 +220,11 @@ namespace ExportPartitionUtils
             context_copy->setSetting("output_format_parquet_row_group_size_bytes", *manifest.parquet_row_group_size_bytes);
         /// Manifests written before these settings existed have no value here; such tasks were always
         /// scheduled under the old, strict column-matching check, so an absent value must resolve to
-        /// `match_by_position` / `false` regardless of the ambient context's settings (which may have
+        /// `POSITION` / `false` regardless of the ambient context's settings (which may have
         /// since been changed).
         context_copy->setSetting(
             "export_merge_tree_part_schema_match_mode",
-            String(magic_enum::enum_name(manifest.schema_match_mode.value_or(MergeTreePartExportSchemaMatchMode::match_by_position))));
+            String(magic_enum::enum_name(manifest.schema_match_mode.value_or(MergeTreePartExportSchemaMatchMode::POSITION))));
         context_copy->setSetting(
             "export_merge_tree_part_ignore_extra_source_columns",
             manifest.ignore_extra_source_columns.value_or(false));
@@ -979,12 +979,12 @@ namespace
     {
         switch (schema_match_mode)
         {
-            case MergeTreePartExportSchemaMatchMode::match_by_position: {
+            case MergeTreePartExportSchemaMatchMode::POSITION: {
                 for (size_t i = 0; i < destination_columns.size(); ++i)
                     verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
                 return;
             }
-            case MergeTreePartExportSchemaMatchMode::match_by_name: {
+            case MergeTreePartExportSchemaMatchMode::NAME: {
                 std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
                 source_columns_by_name.reserve(source_columns.size());
                 for (const auto & source_column : source_columns)
@@ -1048,7 +1048,7 @@ namespace
             context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
             context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
-        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
+        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
         checkExportSchemaColumnsCount(
@@ -1091,7 +1091,7 @@ namespace
 
         switch (schema_match_mode)
         {
-            case MergeTreePartExportSchemaMatchMode::match_by_name:
+            case MergeTreePartExportSchemaMatchMode::NAME:
             {
                 std::unordered_map<String, size_t> source_positions_by_name;
                 source_positions_by_name.reserve(source_columns.size());
@@ -1113,7 +1113,7 @@ namespace
                 }
                 break;
             }
-            case MergeTreePartExportSchemaMatchMode::match_by_position:
+            case MergeTreePartExportSchemaMatchMode::POSITION:
             {
                 const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
                 for (size_t i = 0; i < num_columns; ++i)

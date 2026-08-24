@@ -131,7 +131,7 @@ namespace
             local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
             local_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
-        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
+        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();

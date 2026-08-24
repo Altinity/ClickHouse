@@ -27,8 +27,8 @@ from helpers.network import PartitionManager
 
 
 EXTRA_SOURCE_COLUMN_MODES = [
-    pytest.param("match_by_position", id="by-position"),
-    pytest.param("match_by_name", id="by-name"),
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
 ]
 
 
@@ -1588,8 +1588,8 @@ def test_export_partition_column_count_mismatch_source_fewer_is_rejected(cluster
 def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(cluster, schema_match_mode):
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).
-    With `export_merge_tree_part_schema_match_mode` set to either `match_by_position` or
-    `match_by_name` and `export_merge_tree_part_ignore_extra_source_columns = 1`, the export must succeed: the
+    With `export_merge_tree_part_schema_match_mode` set to either `POSITION` or
+    `NAME` and `export_merge_tree_part_ignore_extra_source_columns = 1`, the export must succeed: the
     trailing `extra` source column is dropped and only `id`/`year` land in the destination.
     """
     node = cluster.instances["replica1"]
@@ -1620,11 +1620,11 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_match_mode": "match_by_position",
+            "export_merge_tree_part_schema_match_mode": "POSITION",
         },
     )
     assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
-        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH with schema_match_mode='match_by_position', got: {error!r}"
+        f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH with schema_match_mode='POSITION', got: {error!r}"
     )
 
     node.query(
@@ -1648,8 +1648,8 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
 @pytest.mark.parametrize(
     "schema_match_mode,expected_error",
     [
-        pytest.param("match_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
-        pytest.param("match_by_name", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
+        pytest.param("POSITION", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("NAME", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
     ],
 )
 def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
@@ -1657,7 +1657,7 @@ def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with
 ):
     """
     Setting `export_merge_tree_part_ignore_extra_source_columns = 1` never relaxes the source-has-fewer-columns
-    direction, in either `match_by_position` or `match_by_name` mode. Source has 2 columns
+    direction, in either `POSITION` or `NAME` mode. Source has 2 columns
     (id, year), destination has 3 (id, year, extra): the destination cannot be filled from the
     source, so this must still be rejected synchronously even with the relaxed setting.
     """
@@ -1894,7 +1894,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_name(cl
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
         settings={
             "allow_insert_into_iceberg": 1,
-            "export_merge_tree_part_schema_match_mode": "match_by_position",
+            "export_merge_tree_part_schema_match_mode": "POSITION",
             "export_merge_tree_part_ignore_extra_source_columns": 1,
         },
     )
@@ -1910,7 +1910,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_name(cl
 @pytest.mark.parametrize("schema_match_mode", EXTRA_SOURCE_COLUMN_MODES)
 def test_export_partition_matches_columns_when_column_counts_are_equal(cluster, schema_match_mode):
     """Source and destination declare the same 2 columns, in the same order and with the same
-    names, so `match_by_position` and `match_by_name` must agree and both succeed identically -
+    names, so `POSITION` and `NAME` must agree and both succeed identically -
     there is no unmatched source column for `export_merge_tree_part_ignore_extra_source_columns` to affect."""
     node = cluster.instances["replica1"]
 
@@ -1951,7 +1951,7 @@ def test_export_partition_column_count_mismatch_into_table_with_existing_data(cl
 
     ignore_extra_settings = {
         "allow_insert_into_iceberg": 1,
-        "export_merge_tree_part_schema_match_mode": "match_by_position",
+        "export_merge_tree_part_schema_match_mode": "POSITION",
         "export_merge_tree_part_ignore_extra_source_columns": 1,
     }
 
@@ -2001,7 +2001,7 @@ def test_export_partition_column_count_mismatch_into_partition_that_already_has_
 
     ignore_extra_settings = {
         "allow_insert_into_iceberg": 1,
-        "export_merge_tree_part_schema_match_mode": "match_by_position",
+        "export_merge_tree_part_schema_match_mode": "POSITION",
         "export_merge_tree_part_ignore_extra_source_columns": 1,
     }
 

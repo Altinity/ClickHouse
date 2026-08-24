@@ -38,8 +38,8 @@ from helpers.iceberg_export_stats import (
 
 
 EXTRA_SOURCE_COLUMN_MODES = [
-    pytest.param("match_by_position", id="by-position"),
-    pytest.param("match_by_name", id="by-name"),
+    pytest.param("POSITION", id="by-position"),
+    pytest.param("NAME", id="by-name"),
 ]
 
 
@@ -781,8 +781,8 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
 @pytest.mark.parametrize(
     "schema_match_mode,expected_error",
     [
-        pytest.param("match_by_position", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
-        pytest.param("match_by_name", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
+        pytest.param("POSITION", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-position"),
+        pytest.param("NAME", "NUMBER_OF_COLUMNS_DOESNT_MATCH", id="by-name"),
     ],
 )
 def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_ignore_extra_setting(
@@ -858,7 +858,7 @@ def test_export_part_ignore_extra_column_breaks_hybrid_over_source_and_destinati
 
     export_part(
         node=node, table=mt, part=part, dest=iceberg,
-        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_position', export_merge_tree_part_ignore_extra_source_columns = 1",
+        extra_settings="export_merge_tree_part_schema_match_mode = 'POSITION', export_merge_tree_part_ignore_extra_source_columns = 1",
     )
     wait_for_export_part(node=node, table=mt, part=part)
 
@@ -1063,7 +1063,7 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
         f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
-        f"export_merge_tree_part_schema_match_mode = 'match_by_position', "
+        f"export_merge_tree_part_schema_match_mode = 'POSITION', "
         f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert "INCOMPATIBLE_COLUMNS" in error, f"Expected positional matching to fail, got: {error!r}"
@@ -1074,7 +1074,7 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
         mt,
         part_2020,
         iceberg,
-        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_name', export_merge_tree_part_ignore_extra_source_columns = 1",
+        extra_settings="export_merge_tree_part_schema_match_mode = 'NAME', export_merge_tree_part_ignore_extra_source_columns = 1",
     )
     wait_for_export_part(node, mt, part_2020)
 
@@ -1109,7 +1109,7 @@ def test_export_part_match_by_name_requires_every_destination_column(cluster):
         f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
-        f"export_merge_tree_part_schema_match_mode = 'match_by_name', "
+        f"export_merge_tree_part_schema_match_mode = 'NAME', "
         f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert "THERE_IS_NO_COLUMN" in error and "renamed_id" in error, (
@@ -1141,7 +1141,7 @@ def test_export_part_match_by_name_rejects_renamed_column_without_extra_source_c
         f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
-        f"export_merge_tree_part_schema_match_mode = 'match_by_name'"
+        f"export_merge_tree_part_schema_match_mode = 'NAME'"
     )
     assert "THERE_IS_NO_COLUMN" in error and "renamed_id" in error, (
         f"Expected name matching to reject missing column `renamed_id` even without an extra "
@@ -1154,7 +1154,7 @@ def test_export_part_match_by_name_rejects_renamed_column_without_extra_source_c
 
 
 def test_export_part_match_by_name_reorders_columns_without_extra_source_columns(cluster):
-    """The scenario `export_merge_tree_part_schema_match_mode = 'match_by_name'` was introduced for:
+    """The scenario `export_merge_tree_part_schema_match_mode = 'NAME'` was introduced for:
     the source and destination have the exact same number of columns, declared in a different order.
     Previously this fell back to positional matching (a no-op for by-name mode); now it is matched
     by name like any other case."""
@@ -1171,7 +1171,7 @@ def test_export_part_match_by_name_reorders_columns_without_extra_source_columns
 
     export_part(
         node, mt, part_2020, iceberg,
-        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_name'",
+        extra_settings="export_merge_tree_part_schema_match_mode = 'NAME'",
     )
     wait_for_export_part(node, mt, part_2020)
 
@@ -1307,7 +1307,7 @@ def test_export_part_match_by_name_revalidates_extra_source_columns_in_backgroun
             mt,
             part,
             iceberg,
-            "export_merge_tree_part_schema_match_mode = 'match_by_name'",
+            "export_merge_tree_part_schema_match_mode = 'NAME'",
         )
         node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
 
@@ -1346,7 +1346,7 @@ def test_export_part_match_by_name_uses_source_snapshot_when_source_column_is_ad
             mt,
             part,
             iceberg,
-            "export_merge_tree_part_schema_match_mode = 'match_by_name'",
+            "export_merge_tree_part_schema_match_mode = 'NAME'",
         )
         node.query("SYSTEM WAIT FAILPOINT export_part_pause_before_schema_validation PAUSE")
 
