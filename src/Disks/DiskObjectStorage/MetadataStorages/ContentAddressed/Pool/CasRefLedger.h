@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCkpt.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCatalog.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasDetachedWork.h>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -76,9 +77,9 @@ enum class ConfirmAnswer : uint8_t { Yes, No, Unknown };
 ///
 /// The ledger receives storage, configuration, event delivery, and retry-budget dependencies directly.
 /// Mount state remains owned by `Pool` and is exposed through callbacks: the live writer epoch, append
-/// fence, clocks, mutation gate, unclean-boundary observation, anomaly reaction, owner lifetime pin, and
-/// cancellation of in-flight builds. The detached snapshot publisher uses the lifetime pin; no
-/// `Pool &` back-reference is retained. `Pool` forwards its existing public operations to this component.
+/// fence, clocks, mutation gate, unclean-boundary observation, anomaly reaction, tracked detached-task
+/// dispatch, and cancellation of in-flight builds. No `Pool &` back-reference is retained. `Pool`
+/// forwards its existing public operations to this component.
 class CasRefLedger
 {
 public:
@@ -114,7 +115,12 @@ public:
         std::function<uint64_t()> boot_ms_now_fn_,
         std::function<bool()> may_mutate_,
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
-        std::function<std::shared_ptr<void>()> pin_owner_,
+        /// Launch one tracked detached task through the owning pool. Returns false when the dispatch was
+        /// refused or failed -- never throws out of the launch itself.
+        std::function<bool(std::function<void(DetachedStopToken)>)> dispatch_detached_,
+        /// TEST SEAM: invoked inside the publisher task's error handler, before its logging, so a test can
+        /// make the handler itself throw. Empty in production.
+        std::function<void()> publish_error_hook_,
         std::function<void(const RootNamespace &)> cancel_inflight_builds_);
 
     /// Recovers `ns` on first access and resolves `ref_name` from the authoritative cached table.
@@ -670,7 +676,8 @@ private:
     std::function<uint64_t()> boot_ms_now_fn;
     std::function<bool()> may_mutate;
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference;
-    std::function<std::shared_ptr<void>()> pin_owner;
+    std::function<bool(std::function<void(DetachedStopToken)>)> dispatch_detached;
+    std::function<void()> publish_error_hook;
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
 
     /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
@@ -867,6 +874,11 @@ private:
     /// publish a same-name successor while settling the predecessor's in-flight accounting.
     bool tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// The detached publisher observes teardown before starting a new attempt; direct callers retain the
+    /// unguarded overload above for their synchronous, caller-owned lifecycle.
+    bool tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, const DetachedStopToken & token);
 
     /// The logical-name cache owns no lifecycle identity. It merely points at the runtime currently
     /// admitted for that name; exact retirement/remount clears this pointer while external holders may
@@ -1202,8 +1214,8 @@ private:
 
     /// Launches one detached publish attempt. Assumes `pending_snapshot_publishes` was already
     /// incremented for this dispatch (by `admitSnapshotPublishUnderStateLock`). The task settles through
-    /// `settleSnapshotPublish`; if the thread cannot even be constructed, the count is undone and the
-    /// settle waiter notified so a leaked in-flight count never wedges shutdown/settle.
+    /// `settleSnapshotPublish`; if no task launches, the count is undone and the settle waiter notified
+    /// so a leaked in-flight count never wedges shutdown/settle.
     void dispatchSnapshotPublisher(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Runs at the end of one detached publish attempt: drops this attempt's in-flight count and, under
@@ -1212,7 +1224,8 @@ private:
     /// in flight) is re-fired instead of lost. Re-admitting under the same lock keeps the in-flight count
     /// from transiently reaching zero across the handoff, so a settle waiter never observes a false
     /// "settled". Notifies the settle condvar only when no follow-up publish is dispatched.
-    void settleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+    void settleSnapshotPublish(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, const DetachedStopToken & token);
 
     /// Advances the exponential delay after a non-durable snapshot publication outcome.
     void advancePublishBackoff(RefTableRuntime & rt);

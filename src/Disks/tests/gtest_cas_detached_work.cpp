@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <future>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 using namespace DB::Cas;
@@ -50,6 +51,40 @@ PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConf
     config.pool_prefix = "p";
     config.server_root_id = "test";
     return Pool::open(backend, config);
+}
+
+/// A pool where any nonempty tail is over-threshold, so every mutation auto-dispatches a publish.
+PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBackend> & backend,
+                           PoolConfig config = {})
+{
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    config.snapshot_log_count_threshold = 0;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    /// One attempt, so a faulted PUT resolves to a definite non-committed outcome with no internal
+    /// retry loop and no wall-clock wait -- the same budget the snapshot-ordering suite uses.
+    config.cas_request_budget.max_attempts = 1;
+    config.cas_request_budget.attempt_timeout_ms = 100;
+    config.cas_request_budget.operation_deadline_ms = 5000;
+    config.cas_request_budget.lease_safety_margin_ms = 100;
+    return Pool::open(backend, config);
+}
+
+/// The same one-transaction publish every other ref suite drives, so a namespace reaches `Live` through
+/// the REAL append lane (which is also what creates its `_ckpt`).
+RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const String & ref, uint64_t ordinal)
+{
+    return store->appendRefOps(ns, MutationScope::ref(ref),
+        [&ref, ordinal](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            for (const RefOp & op : DB::Cas::tests::publishCommittedOps(ref, ManifestRef{1, ordinal, 1}))
+                ops.push_back(op);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Publish);
 }
 
 }
@@ -173,4 +208,43 @@ TEST(CASDetachedWork, FailedLaunchRollsBackAndDoesNotThrow)
     EXPECT_NO_THROW(EXPECT_FALSE(store->tryDispatchDetached([](DetachedStopToken) {})));
     EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
     EXPECT_TRUE(store->stopAndDrainDetachedWork(/*deadline_ms=*/1000));
+}
+
+/// A dispatch that fails must not fail the mutation that triggered it, and must not strand the
+/// publisher's single-flight reservation.
+TEST(CASDetachedWork, FailedPublisherDispatchKeepsMutationAndClearsReservation)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    PoolConfig config;
+    config.detached_dispatch_fault_for_test = DetachedDispatchFault::ThrowBeforeLaunch;
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/dispatch_fail"};
+
+    EXPECT_NO_THROW(publishRef(store, ns, "ref_1", 1))
+        << "a best-effort maintenance dispatch must never fail an otherwise-successful mutation";
+    EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0)
+        << "the reservation was stranded: quiescence and dropNamespace would wait on it forever";
+}
+
+/// Settlement must survive a throwing error handler. Today it is a bare call after the handler, so a
+/// handler that throws skips it and strands the reservation for the life of the process.
+///
+/// The publish is FAULTED deliberately: with a healthy backend it would succeed, the handler would
+/// never run, and this test would pass while exercising nothing.
+TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    PoolConfig config;
+    config.publish_error_hook_for_test
+        = [] { throw std::runtime_error("injected: the error handler itself throws"); };
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/handler_throws"};
+
+    /// Arm the fault so the publisher's own PUT fails and its `catch` is entered. Use the same arming
+    /// call the snapshot-ordering suite uses against this backend.
+    backend->armPutFailure("_snap/", 1);
+
+    ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
 }

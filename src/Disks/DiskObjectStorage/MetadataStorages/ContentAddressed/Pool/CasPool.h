@@ -182,6 +182,11 @@ struct PoolConfig
     /// after it was.
     DetachedDispatchFault detached_dispatch_fault_for_test = DetachedDispatchFault::None;
 
+    /// TEST SEAM: invoked inside the background snapshot publisher's error handler, before logging.
+    /// Empty in production; a test uses it to make the handler itself throw and verify settlement still
+    /// releases the publisher's single-flight reservation.
+    std::function<void()> publish_error_hook_for_test = {};
+
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every

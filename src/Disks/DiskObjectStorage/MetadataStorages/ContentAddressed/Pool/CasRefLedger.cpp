@@ -196,7 +196,8 @@ CasRefLedger::CasRefLedger(
     std::function<uint64_t()> boot_ms_now_fn_,
     std::function<bool()> may_mutate_,
     std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
-    std::function<std::shared_ptr<void>()> pin_owner_,
+    std::function<bool(std::function<void(DetachedStopToken)>)> dispatch_detached_,
+    std::function<void()> publish_error_hook_,
     std::function<void(const RootNamespace &)> cancel_inflight_builds_)
     : backend(*backend_ptr)
     , layout(layout_)
@@ -211,7 +212,8 @@ CasRefLedger::CasRefLedger(
     , boot_ms_now_fn(std::move(boot_ms_now_fn_))
     , may_mutate(std::move(may_mutate_))
     , on_impossible_interference(std::move(on_impossible_interference_))
-    , pin_owner(std::move(pin_owner_))
+    , dispatch_detached(std::move(dispatch_detached_))
+    , publish_error_hook(std::move(publish_error_hook_))
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
 {
     /// The ref-log writer path uses the same retry controller and clock seam as the mount's local
@@ -3989,47 +3991,67 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
     /// `admitSnapshotPublishUnderStateLock` already incremented `pending_snapshot_publishes` for THIS
     /// dispatch. Off the mutation hot path: `tryPublishSnapshotAndAdvanceCheckpointOnce` never touches
     /// the append queue, so dispatching it onto an unrelated global-pool thread can never deadlock a flush leader.
-    /// `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and hence this ledger member --
-    /// alive for the thread's lifetime.
     ProfileEvents::increment(ProfileEvents::CASRefSnapshotPublishDispatched);
-    auto owner = pin_owner();
-    try
-    {
-        ThreadFromGlobalPool([owner, this, ns, rt]
-        {
-            setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
-            try
-            {
-                tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt);
-            }
-            catch (...)
-            {
-                tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
-            }
-            settleSnapshotPublish(ns, rt);
-        }).detach();
-    }
-    catch (...)
-    {
-        /// The `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the count was incremented.
-        /// Undo the count WITHOUT the settlement re-evaluation (else a persistently-failing dispatch could
-        /// re-fire itself in a loop) and SWALLOW the failure: dispatching a background publish is a
-        /// best-effort maintenance trigger and must never fail an otherwise-successful read or mutation.
-        /// The next trigger reschedules.
+
+    /// The reservation was taken under `state_mutex` before this call, and only a LAUNCHED task's
+    /// settlement retires it. This guard therefore covers exactly the paths on which no task runs --
+    /// including an allocation failure while constructing the task, which happens in the expression
+    /// below, before the dispatcher's own body is entered.
+    bool launched = false;
+    SCOPE_EXIT({
+        if (launched)
+            return;
         {
             std::lock_guard lock(rt->state_mutex);
             rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
         }
         rt->publish_settle_cv.notify_all();
-        tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot-publish dispatch failed to launch");
+    });
+
+    try
+    {
+        launched = dispatch_detached([this, ns, rt](DetachedStopToken token)
+        {
+            setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
+            /// Settlement runs on EVERY exit. A handler that throws must not be able to strand the
+            /// reservation -- nothing would ever report that, and quiescence would wait forever.
+            SCOPE_EXIT({ settleSnapshotPublish(ns, rt, token); });
+            try
+            {
+                tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt, token);
+            }
+            catch (...)
+            {
+                if (publish_error_hook)
+                    publish_error_hook();
+                try
+                {
+                    tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
+                }
+                catch (...) // NOLINT(bugprone-empty-catch)
+                {
+                }
+            }
+        });
+    }
+    catch (...)
+    {
+        try
+        {
+            tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot-publish dispatch failed");
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
     }
 }
 
-void CasRefLedger::settleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+void CasRefLedger::settleSnapshotPublish(
+    const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, const DetachedStopToken & token)
 {
     /// Fence re-checked outside `state_mutex` (as in `maybeScheduleSnapshotPublish`): a fence lost
     /// between this publish's dispatch and its settlement must suppress a follow-up.
-    const bool live_mount = may_mutate();
+    const bool live_mount = !token.stopping() && may_mutate();
     bool redispatch = false;
     {
         std::lock_guard lock(rt->state_mutex);
@@ -4426,6 +4448,14 @@ bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         rt->base_snapshot_bytes.store(bytes.size(), std::memory_order_relaxed);
     }
     return true;
+}
+
+bool CasRefLedger::tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
+    const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, const DetachedStopToken & token)
+{
+    if (token.stopping())
+        return false;
+    return tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt);
 }
 
 

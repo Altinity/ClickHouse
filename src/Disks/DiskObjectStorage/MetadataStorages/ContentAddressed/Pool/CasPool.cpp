@@ -223,7 +223,8 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] { return mayMutate(); },
           [this] (const String & key, const String & reason, const std::optional<String> & offending_ns)
               { reportImpossibleInterference(key, reason, offending_ns); },
-          [this] { return std::static_pointer_cast<void>(shared_from_this()); },
+          [this] (std::function<void(DetachedStopToken)> task) { return tryDispatchDetached(std::move(task)); },
+          config.publish_error_hook_for_test,
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); })
     /// Mount / write-fence / build-watermark / self-remount runtime. Injected with
     /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
@@ -1631,17 +1632,18 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
 
     /// Diagnosis off the critical path: a background task may spend a FEW
     /// requests -- never the caller's thread, and never blocking this call's own return.
-    /// `shared_from_this()` keeps the Pool alive for the thread's lifetime (mirrors
-    /// `maybeScheduleSnapshotPublish`'s dispatch).
-    auto self = shared_from_this();
     try
     {
-        ThreadFromGlobalPool([self, key]
+        /// The lease owns the pool reference for this task's lifetime; capturing one here as well would
+        /// put it outside the lease's release ordering.
+        const bool dispatched = tryDispatchDetached([this, key](DetachedStopToken token)
         {
             setThreadName(ThreadName::CAS_ANOMALY_DIAG);
+            if (token.stopping())
+                return;
             try
             {
-                const auto got = self->pool_backend->get(key);
+                const auto got = pool_backend->get(key);
                 if (!got)
                 {
                     LOG_ERROR(getLogger("CasPool"),
@@ -1664,7 +1666,8 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
                 tryLogCurrentException(getLogger("CasPool"),
                     "CAS anomaly diagnostics: background GET failed for '" + key + "'");
             }
-        }).detach();
+        });
+        (void)dispatched;   /// best-effort: a refused diagnostic is not an error for the caller
     }
     catch (...)
     {
