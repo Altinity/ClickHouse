@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -1741,6 +1742,8 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
 
     std::vector<CasEvent> events;
     bool reentered = false;
+    std::optional<PoolLifecycle> reentrant_lifecycle;
+    std::optional<bool> reentrant_may_mutate;
     CasMountRuntime * runtime_ptr = nullptr;
     CasEventSink sink = [&](CasEvent event)
     {
@@ -1752,11 +1755,15 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
         if (behavior == ForeignConflictSinkBehavior::ReenterSameRuntime)
         {
             if (!std::exchange(reentered, true))
-                runtime_ptr->renewWatermarkOnce();
+            {
+                reentrant_lifecycle = runtime_ptr->lifecycle();
+                reentrant_may_mutate = runtime_ptr->mayMutate();
+                throw std::runtime_error("injected reentrant mount diagnostic sink failure");
+            }
         }
         else
         {
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected mount diagnostic sink failure");
+            throw std::runtime_error("injected mount diagnostic sink failure");
         }
     };
     CasMountRuntime runtime(
@@ -1801,6 +1808,18 @@ void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behav
     }
 
     EXPECT_EQ(reentered, behavior == ForeignConflictSinkBehavior::ReenterSameRuntime);
+    if (behavior == ForeignConflictSinkBehavior::ReenterSameRuntime)
+    {
+        ASSERT_TRUE(reentrant_lifecycle.has_value());
+        EXPECT_EQ(*reentrant_lifecycle, PoolLifecycle::Live);
+        ASSERT_TRUE(reentrant_may_mutate.has_value());
+        EXPECT_TRUE(*reentrant_may_mutate);
+    }
+    else
+    {
+        EXPECT_FALSE(reentrant_lifecycle.has_value());
+        EXPECT_FALSE(reentrant_may_mutate.has_value());
+    }
     EXPECT_EQ(failure_code, DB::ErrorCodes::ABORTED) << failure_message;
     EXPECT_NE(failure_message.find("held by a foreign server"), String::npos) << failure_message;
     EXPECT_FALSE(runtime.mayMutate());
