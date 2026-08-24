@@ -93,7 +93,6 @@ namespace ExportPartitionUtils
         const ColumnsWithTypeAndName & source_columns,
         const ColumnsWithTypeAndName & destination_columns,
         MergeTreePartExportSchemaMatchMode schema_match_mode,
-        bool ignore_extra_source_columns,
         const StorageID & destination_storage_id);
 
     /// Validates that source columns can be exported into the destination with the configured

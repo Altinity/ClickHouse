@@ -975,51 +975,34 @@ namespace
         const ColumnsWithTypeAndName & source_columns,
         const ColumnsWithTypeAndName & destination_columns,
         MergeTreePartExportSchemaMatchMode schema_match_mode,
-        bool ignore_extra_source_columns,
         const StorageID & destination_storage_id)
     {
-        if (schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name)
+        switch (schema_match_mode)
         {
-            /// `ignore_extra_source_columns` only excuses the source having MORE columns than the
-            /// destination; a source with fewer columns is always a mismatch.
-            const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
-            if (source_columns.size() != destination_columns.size()
-                && !(ignore_extra_source_columns && src_has_extra_columns))
-                throw Exception(
-                    ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-                    "Number of columns doesn't match (source: {} and result: {})",
-                    source_columns.size(),
-                    destination_columns.size());
-
-            std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
-            source_columns_by_name.reserve(source_columns.size());
-            for (const auto & source_column : source_columns)
-                source_columns_by_name.emplace(source_column.name, &source_column);
-
-            for (const auto & destination_column : destination_columns)
-            {
-                const auto source_it = source_columns_by_name.find(destination_column.name);
-                if (source_it == source_columns_by_name.end())
-                    throw Exception(
-                        ErrorCodes::THERE_IS_NO_COLUMN,
-                        "Cannot find column `{}` in source stream",
-                        destination_column.name);
-
-                verifyExportColumnCastIsSafe(*source_it->second, destination_column, destination_storage_id);
+            case MergeTreePartExportSchemaMatchMode::match_by_position: {
+                for (size_t i = 0; i < destination_columns.size(); ++i)
+                    verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
+                return;
             }
-            return;
+            case MergeTreePartExportSchemaMatchMode::match_by_name: {
+                std::unordered_map<String, const ColumnWithTypeAndName *> source_columns_by_name;
+                source_columns_by_name.reserve(source_columns.size());
+                for (const auto & source_column : source_columns)
+                    source_columns_by_name.emplace(source_column.name, &source_column);
+
+                for (const auto & destination_column : destination_columns)
+                {
+                    const auto source_it = source_columns_by_name.find(destination_column.name);
+                    if (source_it == source_columns_by_name.end())
+                        throw Exception(
+                            ErrorCodes::THERE_IS_NO_COLUMN, "Cannot find column `{}` in source stream", destination_column.name);
+
+                    verifyExportColumnCastIsSafe(*source_it->second, destination_column, destination_storage_id);
+                }
+                return;
+            }
         }
-
-        if (source_columns.size() < destination_columns.size()
-            || (!ignore_extra_source_columns && source_columns.size() != destination_columns.size()))
-            throw Exception(
-                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-                "Number of columns doesn't match (source: {} and result: {})",
-                source_columns.size(),
-                destination_columns.size());
-
-        for (size_t i = 0; i < destination_columns.size(); ++i)
-            verifyExportColumnCastIsSafe(source_columns[i], destination_columns[i], destination_storage_id);
+        UNREACHABLE();
     }
 
     void verifyExportSchemaCastable(
@@ -1046,6 +1029,22 @@ namespace
         const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
+        if (source_columns.size() < destination_columns.size())
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "destination cannot have more columns than source",
+                source_columns.size(),
+                destination_columns.size());
+
+        if (src_has_extra_columns && !ignore_extra_source_columns)
+            throw Exception(
+                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
+                "Number of columns doesn't match (source: {} and result: {}): "
+                "source has extra columns and the `ignore_extra_source_columns` setting is disabled",
+                source_columns.size(),
+                destination_columns.size());
+
         if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartitionUtils"),
@@ -1056,17 +1055,6 @@ namespace
 
             source_columns.resize(destination_columns.size());
         }
-
-        /// `makeConvertingActions` in `Name` mode silently ignores an unreferenced source column, so it must be rejected here explicitly.
-        /// `ignore_extra_source_columns` only excuses the source having MORE columns than the destination;
-        /// a source with fewer columns is always a mismatch.
-        if (match_by_name && source_columns.size() != destination_columns.size()
-            && !(ignore_extra_source_columns && src_has_extra_columns))
-            throw Exception(
-                ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
-                "Number of columns doesn't match (source: {} and result: {})",
-                source_columns.size(),
-                destination_columns.size());
 
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
@@ -1090,34 +1078,39 @@ namespace
 
         const bool allow_lossy_cast = context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
 
-        if (match_by_name)
+        switch (schema_match_mode)
         {
-            std::unordered_map<String, size_t> source_positions_by_name;
-            source_positions_by_name.reserve(source_columns.size());
-            for (size_t i = 0; i < source_columns.size(); ++i)
-                source_positions_by_name.emplace(source_columns[i].name, i);
-
-            for (const auto & destination_column : destination_columns)
+            case MergeTreePartExportSchemaMatchMode::match_by_name:
             {
-                if (!partition_key_owner_columns.contains(destination_column.name))
-                    continue;
+                std::unordered_map<String, size_t> source_positions_by_name;
+                source_positions_by_name.reserve(source_columns.size());
+                for (size_t i = 0; i < source_columns.size(); ++i)
+                    source_positions_by_name.emplace(source_columns[i].name, i);
 
-                const auto source_it = source_positions_by_name.find(destination_column.name);
-                if (source_it == source_positions_by_name.end())
-                    continue;
+                for (const auto & destination_column : destination_columns)
+                {
+                    if (!partition_key_owner_columns.contains(destination_column.name))
+                        continue;
 
-                verifyPartitionKeyColumn(
-                    source_columns[source_it->second], destination_column, source_it->second, destination_storage_id,
-                    /*match_by_name=*/ true);
+                    const auto source_it = source_positions_by_name.find(destination_column.name);
+                    if (source_it == source_positions_by_name.end())
+                        continue;
+
+                    verifyPartitionKeyColumn(
+                        source_columns[source_it->second], destination_column, source_it->second, destination_storage_id,
+                        /*match_by_name=*/ true);
+                }
+                break;
             }
-        }
-        else
-        {
-            const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
-            for (size_t i = 0; i < num_columns; ++i)
-                if (partition_key_owner_columns.contains(source_columns[i].name))
-                    verifyPartitionKeyColumn(source_columns[i], destination_columns[i], i, destination_storage_id,
-                        /*match_by_name=*/ false);
+            case MergeTreePartExportSchemaMatchMode::match_by_position:
+            {
+                const size_t num_columns = std::min(source_columns.size(), destination_columns.size());
+                for (size_t i = 0; i < num_columns; ++i)
+                    if (partition_key_owner_columns.contains(source_columns[i].name))
+                        verifyPartitionKeyColumn(source_columns[i], destination_columns[i], i, destination_storage_id,
+                            /*match_by_name=*/ false);
+                break;
+            }
         }
 
         /// Lossy casts may silently change values, so reject them unless the user opts in.
@@ -1128,7 +1121,6 @@ namespace
             source_columns,
             destination_columns,
             schema_match_mode,
-            ignore_extra_source_columns,
             destination_storage_id);
     }
 }
