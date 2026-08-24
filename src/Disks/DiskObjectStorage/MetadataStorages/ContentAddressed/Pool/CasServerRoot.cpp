@@ -863,29 +863,40 @@ String describeMountHolder(const MountLease & m)
 /// becomes one `system.cas_log` row. `observed` is the CURRENT decoded body at the
 /// point of decision — for a conflict it carries the identity that made us refuse (holder_uuid/
 /// hostname/pid/epoch/seq/expires); null when no body was observed (e.g. a bare CAS race).
-/// No-op when `sink` is unset, so a disabled log does no per-call work.
+/// No-op when `sink` is unset, so a disabled log does no per-call work. This is a diagnostic-only,
+/// non-interfering boundary: allocation while constructing the event and every sink failure are
+/// contained so they cannot replace the protocol decision made at the call site. Branch and reason
+/// are views specifically so literal arguments cannot allocate before entering this boundary.
 void emitMountEvent(const CasEventSink & sink, CasEventType type, const String & srid,
-                    const String & branch, const MountLease * observed, const String & reason)
+                    std::string_view branch, const MountLease * observed, std::string_view reason) noexcept
 {
-    if (!sink)
-        return;
-    CasEvent e;
-    e.type = type;
-    e.object_kind = CasEventObjectKind::None;
-    e.outcome = branch;
-    e.reason = reason;
-    e.detail["server_root_id"] = srid;
-    e.detail["branch"] = branch;
-    if (observed)
+    try
     {
-        e.detail["holder_uuid"] = u128ToHex(observed->server_uuid);
-        e.detail["holder_hostname"] = observed->hostname;
-        e.detail["holder_pid"] = std::to_string(observed->pid);
-        e.detail["holder_epoch"] = std::to_string(observed->writer_epoch);
-        e.detail["holder_seq"] = std::to_string(observed->seq);
-        e.detail["holder_expires_at_ms"] = std::to_string(observed->expires_at_ms);
+        if (!sink)
+            return;
+        CasEvent e;
+        e.type = type;
+        e.object_kind = CasEventObjectKind::None;
+        e.outcome = String{branch};
+        e.reason = String{reason};
+        e.detail["server_root_id"] = srid;
+        e.detail["branch"] = String{branch};
+        if (observed)
+        {
+            e.detail["holder_uuid"] = u128ToHex(observed->server_uuid);
+            e.detail["holder_hostname"] = observed->hostname;
+            e.detail["holder_pid"] = std::to_string(observed->pid);
+            e.detail["holder_epoch"] = std::to_string(observed->writer_epoch);
+            e.detail["holder_seq"] = std::to_string(observed->seq);
+            e.detail["holder_expires_at_ms"] = std::to_string(observed->expires_at_ms);
+        }
+        sink(std::move(e));
     }
-    sink(std::move(e));
+    catch (...)
+    {
+        /// Mount audit delivery is optional. Do not log from this containment path: a logger may
+        /// allocate or recurse through the same diagnostic machinery at a protocol-critical site.
+    }
 }
 }
 

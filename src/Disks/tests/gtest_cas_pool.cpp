@@ -42,6 +42,7 @@ namespace ProfileEvents
 extern const Event CASRefRecoveryEpochSealed;
 extern const Event CASMountExclusivityViolation;
 extern const Event CASMountLeaseLost;
+extern const Event CASMountReleaseSkippedForeignOccupant;
 extern const Event CASRemountAttempts;
 extern const Event CASRemountSucceeded;
 extern const Event CASRemountFailed;
@@ -1715,6 +1716,133 @@ public:
         return result;
     }
 };
+
+CasRequestBudget runtimeRenewBudget(uint32_t max_attempts);
+
+enum class ForeignConflictSinkBehavior : uint8_t
+{
+    ReenterSameRuntime,
+    Throw,
+};
+
+void verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior behavior)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    const Layout layout(
+        behavior == ForeignConflictSinkBehavior::ReenterSameRuntime
+            ? "runtime-reentrant-foreign-conflict"
+            : "runtime-throwing-foreign-conflict");
+    const String server_root_id = "test";
+    const String key = layout.mountKey(server_root_id);
+    uint64_t wall_ms = 1000;
+    uint64_t boot_ms = 100;
+    const UInt128 uuid{1};
+    ASSERT_EQ(claimMount(*backend, layout, server_root_id, uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+
+    std::vector<CasEvent> events;
+    bool reentered = false;
+    CasMountRuntime * runtime_ptr = nullptr;
+    CasEventSink sink = [&](CasEvent event)
+    {
+        const bool foreign_conflict
+            = event.type == CasEventType::MountConflict && event.outcome == "foreign_writer";
+        events.push_back(event);
+        if (!foreign_conflict)
+            return;
+        if (behavior == ForeignConflictSinkBehavior::ReenterSameRuntime)
+        {
+            if (!std::exchange(reentered, true))
+                runtime_ptr->renewWatermarkOnce();
+        }
+        else
+        {
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected mount diagnostic sink failure");
+        }
+    };
+    CasMountRuntime runtime(
+        backend,
+        layout,
+        MountConfig{
+            .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+            .boot_ms_fn = [&] { return boot_ms; },
+        },
+        server_root_id,
+        sink,
+        runtimeRenewBudget(1),
+        [] { return false; });
+    runtime_ptr = &runtime;
+    runtime.installKeeper(uuid, 1, [&] { return wall_ms; });
+    const uint64_t anchor = runtime.startKeeper();
+    runtime.armMountFence(uuid, 1, anchor + 1000);
+
+    auto ours = backend->get(key);
+    ASSERT_TRUE(ours.has_value());
+    MountLease successor = decodeMountLease(ours->bytes);
+    successor.server_uuid = UInt128{2};
+    successor.writer_epoch = 9;
+    successor.seq += 1;
+    ASSERT_EQ(backend->putOverwrite(key, encodeMountLease(successor), ours->token).outcome, PutOutcome::Done);
+    const uint64_t skipped_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+    const uint64_t violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
+
+    int failure_code = 0;
+    String failure_message;
+    try
+    {
+        runtime.renewWatermarkOnce();
+        ADD_FAILURE() << "authoritative foreign successor must terminalize renewal";
+    }
+    catch (const DB::Exception & e)
+    {
+        failure_code = e.code();
+        failure_message = e.message();
+    }
+
+    EXPECT_EQ(reentered, behavior == ForeignConflictSinkBehavior::ReenterSameRuntime);
+    EXPECT_EQ(failure_code, DB::ErrorCodes::ABORTED) << failure_message;
+    EXPECT_NE(failure_message.find("held by a foreign server"), String::npos) << failure_message;
+    EXPECT_FALSE(runtime.mayMutate());
+    EXPECT_EQ(runtime.lifecycle(), PoolLifecycle::TransientNotLive);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+              skipped_before + 1);
+    const auto failed = std::find_if(events.begin(), events.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::WatermarkRenew && event.outcome == "failed";
+    });
+    EXPECT_NE(failed, events.end());
+    if (failed != events.end())
+        EXPECT_EQ(failed->detail.at("classification"), "conflict");
+
+    const auto successor_before_teardown = backend->get(key);
+    ASSERT_TRUE(successor_before_teardown.has_value());
+    const uint64_t heads_before_teardown = backend->headCount(key);
+    const uint64_t gets_before_teardown = backend->getCount(key);
+    const uint64_t writes_before_teardown = backend->putOverwriteCount(key);
+    const uint64_t skipped_before_teardown
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+    runtime.finishTeardown(true);
+    EXPECT_EQ(backend->headCount(key), heads_before_teardown);
+    EXPECT_EQ(backend->getCount(key), gets_before_teardown);
+    EXPECT_EQ(backend->putOverwriteCount(key), writes_before_teardown);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+              skipped_before_teardown);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(), violations_before);
+    const auto successor_after_teardown = backend->get(key);
+    ASSERT_TRUE(successor_after_teardown.has_value());
+    EXPECT_EQ(successor_after_teardown->bytes, successor_before_teardown->bytes);
+}
+
+TEST(CASPoolRemount, SameRuntimeReentrantForeignConflictSinkCannotReplaceTerminalOutcome)
+{
+    verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior::ReenterSameRuntime);
+}
+
+TEST(CASPoolRemount, ThrowingForeignConflictSinkCannotReplaceTerminalOutcome)
+{
+    verifyForeignConflictSinkIsNonInterfering(ForeignConflictSinkBehavior::Throw);
+}
 
 class RemountStepBackend final : public DB::Cas::tests::CountingBackend
 {
