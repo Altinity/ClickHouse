@@ -74,22 +74,22 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 
 | ID | Статус на HEAD | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|----------------|-----------|------------|-------------------|------|
-| m1 | ⏳ | — | — | — | — |
-| m2 | ⏳ | — | — | — | — |
-| m3 | ⏳ | — | — | — | — |
-| m4 | ⏳ | — | — | — | — |
-| m5 | ⏳ | — | — | — | — |
-| m6 | ⏳ | — | — | — | — |
-| m7 | ⏳ | — | — | — | — |
-| m8 | ⏳ | — | — | — | — |
-| m9 | ⏳ | — | — | — | — |
-| m10 | ⏳ | — | — | — | — |
-| m11 | ⏳ | — | — | — | — |
-| m12 | ⏳ | — | — | — | — |
-| m13 | ⏳ | — | — | — | — |
-| m14 | ⏳ | — | — | — | — |
-| m15 | ⏳ | — | — | — | — |
-| m16 | ⏳ | — | — | — | — |
+| m1 | подтверждено | P3 | нет | нет (смежно: `BACKLOG/docs-and-cleanup.md:21` {#refactor-group-g} — вынос `ReadBufferFromFil… | Форма подтверждена: на пути броска bound-check в `seek` `impl` уже переставлен, а учёт вью (`file_offset_of_buffer_end`, рабочий буфер) остаётся старым — рассогласование того же класса, что чинил B115, но живой достижимости «поймал и продолжил» не найдено. |
+| m2 | дубликат CAS-019 | P2 | нет | [{#part-folder-single-flight-manifest-keying}](BACKLOG/ref-protocol.md) | Тот же single-flight по `(ns, ref)` без post-wait проверки manifest id; уже разобрано как CAS-019 («частично»): каждый выданный view внутренне консистентен, эффект — сдвиг на один репойнт на stale-терпимом `CachedForLoad`, а не смешение манифестов. |
+| m3 | частично | P3 | нет | нет (соседняя гонка тех же членов — `BACKLOG/mounts-and-lifecycle.md:107` {#gc-scheduler-sto… | Форма на месте — `start()` идемпотентен по `thread`, и бросок при создании `hb_thread` оставляет раунд-поток жить без heartbeat; но на startup-пути это безвредно (RAII), достижимо только через `SYSTEM CONTENT ADDRESSED GC START`. |
+| m4 | дубликат CAS-050 | P2 | нет | [{#gc-scheduler-stop-join-race}](BACKLOG/mounts-and-lifecycle.md:107) | Гонка данных на `thread`/`hb_thread` между `stop()` (join вне `mutex`) и `requestRoundSoon()` (чтение `joinable()` под `mutex`) уже адъюдицирована как CAS-050 («частично», P2, отслеживается). |
+| m5 | дубликат fable {#m8} | P3 | нет | нет (в `fable-review-triage.md` M8 отмечено: покрытия в BACKLOG/final-checks нет) | На HEAD форма прежняя — `part_access.reset()`/`cas_store.reset()` в `shutdown()` выполняются под `pointer_mutex`, и при выключенном GC там же срабатывает сетевой `~Pool`; уже подробно адъюдицировано как fable M8 («подтверждено», P3). |
+| m6 | частично | P3 | нет | нет | Форма верна — если `snapshotOf` бросит, COW-копия `candidate_state` разрушится при раскрутке вне `state_mutex`, вопреки инварианту, на который явно опирается `RefCowMap::materialize`; но единственный «доменный» бросок отсечён проверкой на входе, так что живой достижимости почти нет. |
+| m7 | исправлено | — | — | — | Класса `SingleWriterSlot` на HEAD больше нет — он ликвидирован рефакторингом владения renewal, вместе с ним ушли и `std::string_view`-члены. |
+| m8 | дубликат fable {#m6} | P2 | нет | нет | На HEAD без изменений — `blobUploadPool()` возвращает `ThreadPool &` после выхода из-под `pool_mutex`, а `shutdownBlobUploadPool()` разрушает `pool_instance`; уже адъюдицировано как fable M6 (там же вторая половина про порядок teardown в `clickhouse-local`). |
+| m9 | подтверждено | P3 | нет | нет | `S3ObjectStorage::supportsRetryProfile` действительно игнорирует параметр и возвращает `true` для любого значения; сегодня безвредно (в enum ровно два значения, оба S3 поддерживает), но контракт fail-closed держится не на коде, а на размере перечисления. |
+| m10 | дубликат fable {#m7} | P3 | нет | нет (в fable отмечено как неотслеживаемое) | Обратный кросс-слойный include на месте: `Primitives/CasTypes.h:3` включает `Formats/CasFormat.h` ради `storedSuffix`, нарушая объявленный в `README.md` порядок `Primitives → Formats`. |
+| m11 | дубликат CAS-091 | P3 | нет | [{#checknamespace-admits-dot-segments}](BACKLOG.md) | Расхождение `Layout::checkNamespace` с `validateServerRootId` по сегментам `.`/`..` уже разобрано как CAS-091 («частично», P3): механизм реален, продовой достижимости нет — все живые источники предварительно санитизированы. |
+| m12 | подтверждено | P3 | нет | нет | Пропуск guard'а подтверждён: у `CAS_DROP_POOL_MEMBER` нет проверки пустого имени диска, которая есть у всех пяти соседних verb'ов; последствие — только худшая диагностика (`getDisk("")` всё равно бросит `UNKNOWN_DISK`), фан-аута нет. |
+| m13 | подтверждено | P3 | нет | нет | Реинтерпретация подтверждена: для CAS-клиента с одной попыткой `expect_continue_min_bytes == 0` трактуется как «не задано» → безусловные 1 MiB, тогда как задокументированная семантика нуля в самом HTTP-слое — «выключено полностью»; выключить `Expect: 100-continue` для CAS-записей невозможно. |
+| m14 | подтверждено | P3 | нет | нет | Инвариант между двумя независимо выставляемыми полями `ClonePartParams` держится только на `chassert`; в release-сборке одновременная установка `keep_metadata_version` и `metadata_version_to_write` молча запишет новую версию. Все 7 call-site'ов действительно непересекающиеся. |
+| m15 | подтверждено | P3 | нет | нет | Асимметрия синтаксиса реальна — `DROP POOL MEMBER` требует строковый литерал и для srid, и для диска, тогда как шесть соседних CAS-verb'ов принимают голый идентификатор; в коде есть обоснование, но оно покрывает только srid-половину. |
+| m16 | дубликат CAS-035 | P2 | нет | [{#fold-edge-run-memory}](BACKLOG/gc.md) | Полный постраничный LIST `cas/ns/stream/` в `defer_decision` подтверждён, но он не «до вердикта зря» — он и ЕСТЬ вход вердикта; стоимость класса уже полностью отслежена как CAS-035, остаточная часть (отставание budgeted cleanup удорожает следующий раунд) записана там же. |
 | m17 | ⏳ | — | — | — | — |
 | m18 | ⏳ | — | — | — | — |
 | m19 | ⏳ | — | — | — | — |
@@ -1483,3 +1483,69 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 ### T12 (исправлено, —) {#t12}
 
 `git diff 4b7cecaa3cf HEAD -- ci/jobs/scripts/check_style/various_checks.sh` пуст, а `git diff 056488b47a0 HEAD` по тому же файлу показывает `26 deletions` — проверку сняли. Коммит `eee9a2b8a11` («ci: drop the triple-quote SQL style check from the shared style script», 2026-08-05) в сообщении прямо объясняет: «It rode into the CAS branch after a CAS test tripped the class it detects, but it is a generic check in a shared upstream file … The check itself is kept aside untracked for a standalone upstream submission». Соответственно риск «упасть на предсуществующих нарушениях в чужих местах дерева» снят полностью, CI-поверхность ветки по этому файлу нулевая.
+
+## Minor m1-m16 — детали {#minor-1-details}
+
+### m1 (подтверждено, P3) {#m1}
+
+На HEAD `src/IO/ReadBufferFromFileView.cpp:117-122` выполняет `impl->seek(new_pos, SEEK_SET)` внутри `executeWithOriginalBuffer` (сам swap уже восстанавливается на исключении, `:143-156`), затем `:124-129` бросают `SEEK_POSITION_OUT_OF_BOUND`, и только `:131-132` делают ребейз `file_offset_of_buffer_end = impl_buffer_end; resizeWorkingBuffer();`. То есть выход по исключению оставляет вью с офсетом до seek при переставленном `impl`, и последующий `read`/`seek(SEEK_CUR)` посчитает `current_position` (`:107`) неверно. Оба потребителя вью — `src/IO/PackedFilesReader.cpp:102` и `src/IO/ReadPipeline.cpp:699` — исключение из `seek` не глушат, так что сегодня это латентно; починка тривиальна (ребейзить до bound-check либо в `catch`).
+
+### m2 (дубликат CAS-019, P2) {#m2}
+
+Полностью совпадает по основанию с `docs/superpowers/cas/2031-triage.md` {#cas-019} (`Parts/PartFolderAccess.cpp`, ключ single-flight `ns+ref`). Отдельной проверки не требует, вердикт и приоритет наследуются.
+
+### m3 (частично, P3) {#m3}
+
+`Gc/CasGcScheduler.cpp:65-73`: `if (thread.joinable()) return; ... thread = ThreadFromGlobalPool(...); hb_thread = ThreadFromGlobalPool(...);` — если вторая конструкция бросит (исчерпание глобального пула), первый поток уже запущен, а повторный `start()` вернётся сразу. На пути монтирования (`ContentAddressedMetadataStorage.cpp:841-848`) вреда нет: `scheduler` там — локальный `shared_ptr`, его деструктор при раскрутке зовёт `stop()` и джойнит оба потока (это прямо задокументировано в комментарии `:834-840`). Остаётся путь `GC START` (`ContentAddressedMetadataStorage.cpp:1029-1040`), где инстанс уже сохранён в члене `gc_scheduler` и переживает бросок; последствие ограничено — heartbeat advisory, а кража lease безопасна по дизайну (разбор TTL/heartbeat — `2031-triage.md:272`).
+
+### m4 (дубликат CAS-050, P2) {#m4}
+
+Ровно то же основание, что в `2031-triage.md` {#cas-050}: `Gc/CasGcScheduler.cpp:77-85` берёт `mutex` только под `stopping`, а `:95-104` читает `thread.joinable()` под `mutex`. Вторая половина находки («joinable-but-dead планировщик») там же признана невоспроизводимой.
+
+### m5 (дубликат fable {#m8}, P3) {#m5}
+
+`ContentAddressedMetadataStorage.cpp:884-895`: внутри `std::lock_guard ptr_lock(pointer_mutex)` делаются `gc_scheduler.reset(); part_access.reset(); cas_store.reset();`, наружу вынесен только `old_scheduler->stop()` (`:896-899`). Правильный образец рядом: `forgetDisk` (`:926-936`) копирует `pool`/`scheduler` под локом и весь протокол ведёт вне него. Починка — та же однострочная (снять указатели в локальные `shared_ptr`, разрушать после выхода из области лока).
+
+### m6 (частично, P3) {#m6}
+
+`Pool/CasRefLedger.cpp:4289` — `const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());` стоит МЕЖДУ захватом копии (`:4245-4263`, под `state_mutex`) и явным разрушением копии под локом (`:4302-4305`, с большим комментарием `:4291-4301`, что каждая межпоточная копия создаётся И разрушается под state-локом). `snapshotOf` (`Pool/CasRefProtocol.cpp:610-615`) бросает `CORRUPTED_DATA` на не-`Live` lifecycle, но этот случай уже отсечён `hasStateBearingSnapshotCandidateUnderStateLock` под тем же локом (`:4256`), поэтому реально остаётся только `bad_alloc` на `reserve`/`push_back` (`:4621-4627`) плюс, формально, бросок из `runtime_still_admitted()` (`:4281`) и тестового хука (`:4274`). Последствие ровно то, от чего защищается комментарий: релиз-декремент `use_count` шаредных баз без happens-before с `materializeCommitted` (TSan-репортабельно). Дешёвая страховка — `SCOPE_EXIT`/`try-catch`, разрушающий `candidate_state` под локом.
+
+### m7 (исправлено, —) {#m7}
+
+На головe `grep -rn "SingleWriterSlot" src` пуст; в `Pool/CasServerRoot.h` единственное упоминание `string_view` — `#include <string_view>` (`:19`). Класс существовал на ревьюируемом коммите (`git show 056488b47a0:.../Pool/CasServerRoot.h`, поля `std::string_view slot_name; std::string_view terminal_verb;`) и удалён коммитом `ecf3d5d7c76` «refactor: centralize CAS mount renewal ownership» (`CasServerRoot.h`: −313/+…, оба `string_view`-члена удалены). Хрупкий по конструкции паттерн исчез вместе с классом.
+
+### m8 (дубликат fable {#m6}, P2) {#m8}
+
+`Pool/CasBlobUploadPool.cpp:51-58` — `ThreadPool & blobUploadPool() { std::lock_guard lock(pool_mutex); if (!pool_instance) throw …; return *pool_instance; }`, `:60-64` — `shutdownBlobUploadPool()` = `pool_instance.reset()`. Единственный продовый потребитель прежний: `ContentAddressedTransaction.cpp:334` — `Cas::fanOutBlobUploads(*st.build, requests, Cas::blobUploadPool());`, ссылка держится на весь submit-and-join. Настоящее закрытие — `shared_ptr`/счётчик использований, как записано в fable M6.
+
+### m9 (подтверждено, P3) {#m9}
+
+`src/Disks/DiskObjectStorage/ObjectStorages/S3/S3ObjectStorage.h:168` — `bool supportsRetryProfile(ObjectStorageRetryProfile) const override { return true; }` (параметр даже не назван), тогда как база фейлит закрыто: `IObjectStorage.h:437` — `return profile == ObjectStorageRetryProfile::Default;`. Перечисление сейчас — `{Default, SingleAttempt}` (`src/IO/WriteSettings.h:17-21`), потребитель один: `Backend/CasObjectStorageBackend.cpp:121-126`. Соседний по смыслу `supportsCopyMode(mode)` в том же классе объявлен с ИМЕНОВАННЫМ параметром и реализован по значению — то есть асимметрия внутри одного файла; правка на один `switch`.
+
+### m10 (дубликат fable {#m7}, P3) {#m10}
+
+На HEAD `Primitives/CasTypes.h:3` — `#include <.../ContentAddressed/Formats/CasFormat.h>`, использование одно: `:160` `fmt::format("{:06}{}", manifest_ordinal, storedSuffix(FormatId::PartManifest))`. Это единственный include из `Primitives/` наружу (проверено по `grep "include.*ContentAddressed" Primitives/*.h`). Основание совпадает с `fable-review-triage.md` {#m7} дословно.
+
+### m11 (дубликат CAS-091, P3) {#m11}
+
+Совпадает по основанию и по оговорке про emulated/local object storage с `2031-triage.md` {#cas-091}. Отдельной проверки не требует.
+
+### m12 (подтверждено, P3) {#m12}
+
+Обработчик `CAS_DROP_POOL_MEMBER` встроен прямо в `switch` (`src/Interpreters/InterpreterSystemQuery.cpp:1087-1100`) и сразу делает `getContext()->getDisk(query.disk)` без `if (disk_name.empty()) throw`. У соседей guard явно оформлен как «fail-closed backstop for a directly-constructed AST»: `runContentAddressedGcRebuild` (`:2574-2578`), `runContentAddressedFsck` (`:2613-2616`), `contentAddressedForget` (`:2648-2650`), `contentAddressedGcStop` (`:2673-2675`), `contentAddressedGcStart` (`:2696-2698`). Парсер требует диск синтаксически (`ParserSystemQuery.cpp:517-521`), так что дефект чисто в глубине защиты/сообщении.
+
+### m13 (подтверждено, P3) {#m13}
+
+`ObjectStorages/S3/S3ObjectStorage.cpp:960-963` — комментарий «Respect the disk's configured expect_continue_min_bytes; if unset, use the established 1 MiB floor» и `if (cfg.expect_continue_min_bytes == 0) cfg.expect_continue_min_bytes = 1024*1024;`. А `src/IO/S3/PocoHTTPClient.cpp:639-641` прямо пишет: «`0` (the default, carried by every non-CAS S3 client) DISABLES it entirely». Дефолт настройки действительно `0` (`src/IO/S3Defines.h:42`, `src/IO/S3AuthSettings.cpp:28` — причём с ПУСТЫМ описанием), то есть «выключено» и «не задано» в конфиге неразличимы, и явное `expect_continue_min_bytes = 0` у CAS-диска молча не срабатывает. Вреда нет (порог сознательный, B118), дефект — в отсутствии выключателя и в противоречии описания.
+
+### m14 (подтверждено, P3) {#m14}
+
+Два места: `src/Storages/MergeTree/DataPartStorageOnDiskBase.cpp:585-586` (`if (params.metadata_version_to_write.has_value()) { chassert(!params.keep_metadata_version); … }`) и `src/Storages/MergeTree/MergeTreeData.cpp:10081-10082` (та же пара). Поля объявлены рядом и независимо: `src/Storages/MergeTree/IDataPartStorage.h:273,276`. Разделение call-site'ов перепроверено на HEAD: `metadata_version_to_write` ставят только `StorageReplicatedMergeTree.cpp:3455/9782/10073`, `keep_metadata_version = true` — только `StorageReplicatedMergeTree.cpp:5792`, `IMergeTreeDataPart.cpp:2552`, `MutateTask.cpp:3388`. Поле — не наше (пришло из upstream ещё в 2023, `296f9968c04`), так что превращение `chassert` в бросок затрагивает общий MergeTree-код и по политике требует консультации, а не «мелкой правки».
+
+### m15 (подтверждено, P3) {#m15}
+
+`src/Parsers/ParserSystemQuery.cpp:504-525`: команда не идёт через `parseQueryWithOnClusterAndTarget(..., SystemQueryTargetType::Disk)` (как соседи, напр. `:500`), а парсит `ParserStringLiteral` дважды — `:512` (srid) и `:519` (диск). Комментарий `:506-510` объясняет только srid («an opaque server-root path (may contain '/'), not the bare identifier»); для имени диска такого основания нет, и `SYSTEM CAS DROP POOL MEMBER 'srv1' FROM DISK cas_disk` сегодня — синтаксическая ошибка. Расширение до «идентификатор ИЛИ литерал» обратно совместимо, поэтому не блокирует релиз.
+
+### m16 (дубликат CAS-035, P2) {#m16}
+
+`Gc/CasGc.cpp:506-511`: внутри `GcPhaseTimer t(phase_sink, "defer_decision")` идёт `walk_plan.emplace(buildRefWalkPlan(listRefPrefix(state)))`, и только затем `changed = walk_plan->changedRows()` кормит `shouldDeferRound(...)` — то есть перенести LIST «после вердикта» нельзя без другой схемы обнаружения изменений. Ровно эта же пара (полное перечисление префикса с удержанием ключей + связь с отставанием `cleanupRefObjects`) уже зафиксирована в `2031-triage.md` {#cas-035} и в его же заметке к CAS-034 (`2031-triage.md:1648-1652`).
