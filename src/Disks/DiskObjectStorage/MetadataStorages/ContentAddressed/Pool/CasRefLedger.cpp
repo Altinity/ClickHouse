@@ -4012,10 +4012,10 @@ void CasRefLedger::dispatchSnapshotPublisher(const RootNamespace & ns, const std
     {
         launched = dispatch_detached([this, ns, rt](DetachedStopToken token)
         {
-            setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
             /// Settlement runs on EVERY exit. A handler that throws must not be able to strand the
             /// reservation -- nothing would ever report that, and quiescence would wait forever.
             SCOPE_EXIT({ settleSnapshotPublish(ns, rt, token); });
+            setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
             try
             {
                 tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(ns, rt, token);
