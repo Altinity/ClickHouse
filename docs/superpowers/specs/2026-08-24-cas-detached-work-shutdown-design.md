@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS detached work outliving `Context` {#cas-detached-work-shutdown-design}
 
-**Status:** DRAFT for review, rev.4 (2026-08-24).
+**Status:** DRAFT for review, rev.5 (2026-08-24).
 
 This specification covers item 10 of `docs/superpowers/cas/final-checks-todo.md`: findings B3 and B4
 of the second 2026-08-05 umbrella review. It also covers the third recommendation triage made and the
@@ -28,9 +28,9 @@ objects are torn down and what a teardown is allowed to write.
 One coupled change with three parts, none of which is sufficient alone.
 
 1. **Sequencing and draining.** `ContentAddressedMetadataStorage` unpublishes its pool before waiting
-   on anything, then stops and bounded-waits the detached CAS dispatches it now tracks. The stop
-   closes the whole re-admission chain, not just its entry point, so the wait normally completes
-   immediately.
+   on anything, then stops and bounded-waits the detached CAS dispatches, which now go through a
+   single tracked entry point on `Pool`. The stop closes the whole re-admission chain — including the
+   recovery loop that sits below every other checkpoint — so the wait normally completes immediately.
 2. **Emission that survives a reset `Context`.** The metadata storage stops holding a strong
    `ContextPtr`, its two event sinks resolve a weak reference per event, and the two CAS-owned
    accessors in `Interpreters/Context.cpp` stop dereferencing a null `shared`.
@@ -121,73 +121,83 @@ Explicit teardown accordingly becomes the *usual* place where the last reference
 guaranteed one. Parts 2 and 3 of the decision cover the exceptions, which is the honest reason they
 are not optional.
 
-## Tracked dispatch: the pin, the counters, the stop {#tracking}
+## Tracked dispatch: one entry point, a reservation guard, a stop token {#tracking}
 
-### The pin must be copyable {#pin}
+### Why a rollback exists at all {#why-rollback}
 
-`ThreadFromGlobalPool` passes its callable through `std::function<void()>`
-(`startThreadFromGlobalPool` in `src/Common/ThreadPool.h`), so **the captured pin must be
-copy-constructible**. A move-only RAII guard does not compile here, and specifying one would have sent
-the implementer into a wall.
+The snapshot publisher holds a single-flight reservation: `admitSnapshotPublishUnderStateLock`
+increments `pending_snapshot_publishes` **under `state_mutex`**, because a reservation taken after the
+launch would let a second caller start a second publisher in the gap. So the reservation necessarily
+precedes a **fallible** launch — `ThreadFromGlobalPool` throws on pool exhaustion — and a reservation
+taken before a fallible action always requires compensation. That is a property of the single-flight
+gate, not of this design, and no ordering removes it.
 
-The pin is therefore a copyable, single-release guard. Two names change, and they are different
-things:
+What this design must avoid is compensation *spread out*: a tracker whose primitives leak into
+`CasRefLedger` turns one obligation into several hand-written branches, each able to be forgotten
+independently. The API below keeps the obligation in one place.
 
-- `Pool` gains two methods: `tryPinDetachedWork`, and a read-only `detachedWorkStopping`.
-- `CasRefLedger`'s injected callback member `pin_owner`, declared
-  `std::function<std::shared_ptr<void>()>`, is renamed `try_pin_detached_work` and is wired to
-  `tryPinDetachedWork`. Its existing return type already expresses the contract: an **empty**
-  `shared_ptr` means stopping has begun and the dispatch must not be made.
-- The ledger gains a **second, read-only** injected callback, `is_detached_work_stopping`, wired to
-  `detachedWorkStopping`. Two of the four checkpoints below — inside `runtime_still_admitted` and in
-  `settleSnapshotPublish` — must ask whether stopping has begun *without* taking a pin; with only the
-  pin callback available they have nothing to call, and taking a pin merely to read a flag would
-  create the very in-flight work the caller is trying to avoid.
+### One entry point {#dispatcher}
 
-A non-empty return is a guard whose control block owns a strong `Pool` reference and, when its
-**last** copy is destroyed, decrements the in-flight count and notifies the waiter exactly once. An
-aliasing `shared_ptr` gives this directly: the stored pointer is the `Pool`, the owned block is the
-token that releases both.
+`Pool` gains a single method:
 
-**Admission must be exception-safe in this order:** build the token — allocation included — while it
-is still *unarmed*, then under the registry mutex check the stopping flag, increment the count, and
-arm the token. Incrementing first and allocating afterwards leaks a count on an allocation failure,
-and a leaked count is not a benign one: it makes every later drain run to its full deadline and then
-report a timeout that never resolves.
+```cpp
+/// Launch one tracked detached task. Refuses after teardown has begun. Never throws: a launch that
+/// fails is a best-effort maintenance trigger that did not fire, not an error for the caller.
+bool Pool::tryDispatchDetached(DetachedTask task);
+```
 
-One object then does both jobs — it accounts for the work and keeps the `Pool` alive — so the
-publisher's raw `this` capture, which is a `Pool` subobject, stays valid without a second,
-separately-reasoned reference.
+It does all of the following, so that no caller has to:
 
-The pin is taken **before** the thread is created, because the `ThreadFromGlobalPool` constructor can
-throw on pool exhaustion; the guard then releases the count on unwind with no hand-written path.
+- atomically refuses, returning `false`, once stopping has begun;
+- takes a strong `Pool` reference for the task's whole life, which is what keeps a raw `this` capture
+  into a `Pool` subobject valid;
+- increments the in-flight count before launching and decrements it, notifying the waiter, on **every**
+  completion path — normal, throwing, or never-started;
+- creates the `ThreadFromGlobalPool` and hands the task a **stop token**;
+- on a launch failure, rolls back its own count, logs best-effort, and returns `false` without
+  throwing.
 
-**A refused or failed pin must roll back the publisher's admission.**
-`admitSnapshotPublishUnderStateLock` increments `pending_snapshot_publishes` *before*
-`dispatchSnapshotPublisher` is called, and only `settleSnapshotPublish` — which runs on the dispatched
-thread — decrements it. Any path that returns without launching a thread therefore strands that count
-forever, and its waiters are not cosmetic: remount quiescence, the ref-table cache budget and
-`dropNamespace` all block on `publish_settle_cv` reaching zero. Both new paths do exactly what the
-existing thread-construction `catch` already does — decrement and notify:
+`CasRefLedger`'s injected callback member `pin_owner` — declared
+`std::function<std::shared_ptr<void>()>` — is replaced by one wired to this method. The
+`ThreadFromGlobalPool` callable is passed through `std::function<void()>`
+(`startThreadFromGlobalPool` in `src/Common/ThreadPool.h`), so **everything the task captures must be
+copy-constructible**; a move-only guard does not compile here, and the stop token and reservation
+guard are specified accordingly.
 
-| Path | Rollback |
-|---|---|
-| the pin is refused (stopping has begun) | decrement `pending_snapshot_publishes`, notify `publish_settle_cv`, return |
-| the pin throws (allocation failure) | the same, then let the exception propagate out of the mutation |
+There is deliberately **no** second, read-only "is stopping" accessor. Both checkpoints that would
+have needed one run inside a dispatched task and read its stop token instead.
 
-Neither may be left to the guard: the guard releases the *new* registry count, which was never taken
-on these paths, and knows nothing about the per-runtime one.
+### The publisher's reservation becomes a guard {#reservation-guard}
 
-### Two counters, not one {#counters}
+The per-runtime reservation stays exactly where it is and keeps its own accounting — the two counters
+answer different questions ("may this runtime be dropped or its cache trimmed" versus "does any
+detached work still hold the pool") and different callers wait on them. What changes is that the
+reservation is represented by a small copyable RAII guard whose release path is
+`decrement pending_snapshot_publishes; notify publish_settle_cv`, performed once, by whichever copy
+dies last.
 
-The pin releases the **new** registry count and nothing else. The publisher's existing per-runtime
-accounting stays exactly as it is: on the dispatch-failure path, `pending_snapshot_publishes` must
-still be decremented and `publish_settle_cv` notified, as `dispatchSnapshotPublisher`'s current
-`catch` does.
+`dispatchSnapshotPublisher` then reads:
 
-The two counters answer different questions — "may this runtime be dropped or its cache trimmed"
-versus "does any detached work still hold the pool" — and different callers wait on them. The
-diagnostic dispatch has no such existing accounting at all and gains only the pin.
+- the reservation guard is constructed from the already-taken admission;
+- `tryDispatchDetached` is called with a task that owns the guard;
+- **`true`** — the task owns the reservation until `settleSnapshotPublish` runs;
+- **`false`** — the task was never launched, its copy of the guard dies with it, and the guard's
+  destructor performs exactly the rollback the current hand-written `catch` performs today.
+
+Refusal after stop, allocation failure, and launch failure therefore share one path. There is no
+branch that can forget to notify `publish_settle_cv`, and the waiters on it — remount quiescence, the
+ref-table cache budget, `dropNamespace` — cannot be stranded by any of the three.
+
+**A failed dispatch must never fail its caller.** `dispatchSnapshotPublisher` is reached from
+read-side maintenance and from `settleSnapshotPublish`'s re-dispatch, not only from mutations, and the
+existing `catch` states the contract verbatim: a background publish is "a best-effort maintenance
+trigger and must never fail an otherwise-successful read or mutation". Propagating an allocation
+failure would break a successful read because optional maintenance could not start, and on the
+re-dispatch path it would escape inside a detached thread. Every failure mode is rolled back, logged
+best-effort, and swallowed.
+
+The diagnostic dispatch has no reservation of its own and gains only the tracking that
+`tryDispatchDetached` provides.
 
 ### Where the stop is observed {#stop-checkpoints}
 
@@ -197,40 +207,50 @@ A stop checked only at the entry point stops nothing, because the publisher re-a
 when it succeeds. Left alone, that chain outruns a bounded wait and makes expiry the normal outcome
 rather than the anomaly.
 
-The stopping flag is therefore observed at four points:
+| Point | Reads | Effect |
+|---|---|---|
+| `Pool::tryDispatchDetached` | the registry's own flag | the dispatch is not made and the caller's reservation guard rolls it back |
+| `runtime_still_admitted`, inside the publisher | the task's stop token | an in-flight publish stops at its next checkpoint |
+| before the `GET` in `Pool::reportImpossibleInterference` | the task's stop token | the diagnostic is abandoned |
+| `CasRefLedger::settleSnapshotPublish`, before re-dispatch | the task's stop token | the self-re-admission chain terminates |
 
-| Point | Effect |
-|---|---|
-| `Pool::tryPinDetachedWork`, via `try_pin_detached_work` | the dispatch is not made |
-| `runtime_still_admitted`, inside the publisher | an in-flight publish stops at its next checkpoint |
-| before the `GET` in `Pool::reportImpossibleInterference` | the diagnostic is abandoned |
-| `CasRefLedger::settleSnapshotPublish`, before re-dispatch | the self-re-admission chain terminates |
+### Recovery cancellation, latch-only {#recovery-cancellation}
 
-**The stop must also cancel in-flight recovery, or the deadline is unreachable.**
-`tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` calls `ensureRefTableRecovered` *before* it even
+`tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` calls `ensureRefTableRecovered` *before* it
 constructs `runtime_still_admitted`, so a publisher whose runtime entered `NeedsRecovery` is parked
-below the checkpoint above. That recovery loop retries transient failures until
+below every checkpoint above. That loop retries transient failures until
 `cas_request_budget.recovery_retry_budget_ms` is spent — **120 seconds by default** — and its
 fail-closed conditions examine the fence, a supersede-by-remount, the admitted generation and a
-latched cancellation, but nothing about detached-work stopping. Against a drain deadline measured in
-seconds, that path times out every time.
+latched cancellation, but nothing about detached-work stopping.
 
-The mechanism already exists and must be reused rather than duplicated: the per-runtime
-`recovery_cancel_requested`, driven by `cancelRecoveriesAndAwaitQuiescence`, which self-remount
-already uses for the same purpose. Stop-and-drain requests the same cancellation. One difference is
-load-bearing: self-remount **clears** the flag once the runtimes are quiescent, because it intends
-work to resume under the fresh incarnation. Shutdown is terminal, so its cancellation must stay
-latched — clearing it would re-open the door the stop just closed.
+The existing per-runtime `recovery_cancel_requested` is the right latch and must be reused rather than
+duplicated. **`cancelRecoveriesAndAwaitQuiescence` itself must NOT be called from the drain**, for two
+independent reasons, both of which would break the deadline this design advertises:
 
-A backend request already in flight is **not** interrupted, and what that costs differs by dispatch:
+- it waits on `recovery_cv` with **no deadline**, so shutdown could block arbitrarily *before* reaching
+  the bounded wait — and therefore before the timeout warning and counter could ever fire;
+- it **clears** the flag once the runtimes are quiescent, which is correct for a remount that intends
+  work to resume under a fresh incarnation and wrong for a terminal shutdown.
 
-- the snapshot publisher's writes go through the CAS request budget, so an outstanding attempt is
-  bounded by it and the drain deadline covers one such attempt resolving. The deadline is the one its
-  neighbour `CasRefLedger::drainRefLanesForShutdown` already uses,
-  `attempt_timeout_ms + lease_safety_margin_ms`;
-- the diagnostic path issues a raw backend `GET` that is **not** budget-controlled. For it the drain
-  deadline is insurance, not a derived bound: it caps how long shutdown waits, but nothing caps the
-  `GET` itself.
+Publishing the cancellation is therefore factored out of that function into an operation both callers
+share. Shutdown uses the latch-only form: it sets the flags and leaves them **latched**, and does no
+waiting of its own — the single bounded wait in the detached-work registry is the only wait on this
+path. Self-remount keeps its existing behaviour: same publish, then its unbounded quiescence wait,
+then the clear.
+
+### What the deadline does and does not bound {#deadline}
+
+A request already in flight is not interrupted, and what that costs differs by path:
+
+- the publisher's **writes** go through the CAS request budget, so an outstanding attempt is bounded by
+  it, and the drain deadline — `attempt_timeout_ms + lease_safety_margin_ms`, the one
+  `CasRefLedger::drainRefLanesForShutdown` already uses — covers one such attempt resolving;
+- **recovery reads** inside `ensureRefTableRecovered` are direct backend `LIST`/`GET` calls, not
+  request-controller operations, so the budget does not bound them either. The latched cancellation is
+  what stops the retry loop; the deadline is what stops shutdown waiting for it;
+- the diagnostic path issues a raw backend `GET` that is likewise not budget-controlled. For it the
+  drain deadline is insurance, not a derived bound: it caps how long shutdown waits, but nothing caps
+  the `GET`.
 
 ### On expiry {#expiry}
 
@@ -395,12 +415,25 @@ re-admitting: with the stop observed only at the entry point the bounded wait ex
 observed at settlement the chain terminates. Assert `CASDetachedWorkDrainTimeouts` is zero — the
 counter is the assertion, not the wall clock.
 
-**The emit under a reset `Context` — failing-first.** "The context was destroyed before the emit" is
-**not** reachable today: the strong sink is exactly what prevents that destruction. The red scenario
-is `resetSharedContext` on a `Context` that is still alive and still referenced — what `Server.cpp`
-does — followed by an emit. Today that dereferences a null `shared`; afterwards the event is skipped
-safely. Assert the skip, **not** a counter: per
-[the outcome table](#context-outcomes), this path is not counted.
+**Terminal cancellation unparks a publisher inside recovery — failing-first.** The critical new
+branch, and the one nothing else covers: drive a publisher into `ensureRefTableRecovered` — that is,
+past the point where its runtime entered `NeedsRecovery` and before `runtime_still_admitted` exists —
+then begin shutdown. With the latched terminal cancellation, recovery aborts and the drain completes
+inside its deadline; without it, the retry loop runs to `recovery_retry_budget_ms` and the drain
+times out. Assert `CASDetachedWorkDrainTimeouts` is zero, and that the drain returned well inside its
+deadline.
+
+**The emit under a reset `Context` — failing-first, and in a subprocess.** "The context was destroyed
+before the emit" is **not** reachable today: the strong sink is exactly what prevents that
+destruction. The red scenario is `resetSharedContext` on a `Context` that is still alive and still
+referenced — what `Server.cpp` does — followed by an emit.
+
+Pre-change that dereferences a null `shared` and takes the whole test binary down, so it cannot be an
+ordinary in-process failing-first test: running the red would hide every test behind it. Use the same
+subprocess form as the destructor test below — `EXPECT_EXIT` with a predicate for a clean exit —
+asserting that after the change the emit is **skipped safely** and the subprocess exits normally.
+Assert the skip, **not** a counter: per [the outcome table](#context-outcomes), this path is not
+counted.
 
 **An expired weak context is counted.** A separate test, for the separate claim: release the context
 entirely, emit, assert `CASEventDroppedContextExpired` advanced.
@@ -436,9 +469,14 @@ anything above.
 
 ## Verification gate {#gate}
 
-`unit_tests_dbms --gtest_filter=Cas*:CA*` in a debug build and in an ASan build, plus a server
+`unit_tests_dbms --gtest_filter='CAS*'` in a debug build and in an ASan build, plus a server
 start/stop cycle on a CAS-backed disk with the CAS logs enabled — the crash this specification removes
 is a shutdown-path crash, and no unit test exercises the real `Server.cpp` teardown order.
+
+The filter is exactly `CAS*` — the strict form the CAS naming policy requires. Every suite this
+specification adds, death-test and exit-test variants included, must therefore be named `CAS…`.
+Widening the filter to `Cas*` or `Ca*` drags in foreign suites such as `CascadeWriteBuffer` and, worse,
+masks a misnamed CAS suite instead of catching it: a suite that escapes `CAS*` escapes the gate.
 
 ## Out of scope {#out-of-scope}
 

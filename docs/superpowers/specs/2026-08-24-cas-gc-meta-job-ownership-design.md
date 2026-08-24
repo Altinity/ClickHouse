@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS GC meta-job ownership and mount-claim error classification {#cas-gc-meta-job-ownership-design}
 
-**Status:** DRAFT for review, rev.4 (2026-08-24).
+**Status:** DRAFT for review, rev.5 (2026-08-24).
 
 This specification covers item 9 of `docs/superpowers/cas/final-checks-todo.md` minus its third
 bullet: findings **B1** (`~Gc` versus the `meta_pool` drain) and **B2a**
@@ -20,21 +20,6 @@ scope**: it is a privilege-model decision with cross-tenant consequences and nee
 
 There is no persisted-data compatibility question anywhere in this document. Nothing here changes a
 durable format, a key shape, or a protocol step.
-
-**What rev.2 changed.** Review found that rev.1's ownership boundary was not enforceable and that its
-B2a coverage was nominal. Both are corrected here: the generic job-accepting API is removed
-altogether rather than left in place beside a shared state object (`{#b1-fix}`), and all six changed
-`claim` branches plus both fenced-precedence branches get direct tests driven by an explicit backend
-race seam (`{#b2a-testing}`). rev.1's claim that all six branches mean a change *between two
-observations* was also wrong and is corrected in `{#b2a-defect}`.
-
-**What rev.3 and rev.4 changed.** Review found two defects in rev.2's own construction. `GcMetaWriter` cannot be
-a direct member — that would initialize it before `Gc::Gc`'s argument validation and dereference a
-null `store` (`{#b1-fix}`). And rev.2's destruction test deadlocked as sequenced, because the
-destroying thread blocks inside the pool's join and never reaches the latch release. rev.3's own
-replacement for it was unsound in turn — a destruction-ordered release does not keep the worker from
-finishing before `~Gc` runs — so rev.4 withdraws the determinism claim entirely and states what the
-test does and does not establish (`{#b1-testing}`).
 
 ## Decision {#decision}
 
@@ -379,7 +364,7 @@ coverage of this change.
 
 ## Verification gate {#gate}
 
-`unit_tests_dbms --gtest_filter=Cas*:CA*` in a **debug** build and in an **ASan** build. Both are
+`unit_tests_dbms --gtest_filter='CAS*'` in a **debug** build and in an **ASan** build. Both are
 required: B2a is specifically about behaviour that differs on sanitizer lanes, so a release-only run
 says nothing about it.
 
