@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS detached work outliving `Context` {#cas-detached-work-shutdown-design}
 
-**Status:** DRAFT for review, rev.3 (2026-08-24).
+**Status:** DRAFT for review, rev.4 (2026-08-24).
 
 This specification covers item 10 of `docs/superpowers/cas/final-checks-todo.md`: findings B3 and B4
 of the second 2026-08-05 umbrella review. It also covers the third recommendation triage made and the
@@ -131,13 +131,18 @@ copy-constructible**. A move-only RAII guard does not compile here, and specifyi
 the implementer into a wall.
 
 The pin is therefore a copyable, single-release guard. Two names change, and they are different
-things — rev.2 conflated them:
+things:
 
-- `Pool` gains a method `tryPinDetachedWork`.
+- `Pool` gains two methods: `tryPinDetachedWork`, and a read-only `detachedWorkStopping`.
 - `CasRefLedger`'s injected callback member `pin_owner`, declared
-  `std::function<std::shared_ptr<void>()>`, is renamed `try_pin_detached_work` and is wired to that
-  method. Its existing return type already expresses the contract: an **empty** `shared_ptr` means
-  stopping has begun and the dispatch must not be made.
+  `std::function<std::shared_ptr<void>()>`, is renamed `try_pin_detached_work` and is wired to
+  `tryPinDetachedWork`. Its existing return type already expresses the contract: an **empty**
+  `shared_ptr` means stopping has begun and the dispatch must not be made.
+- The ledger gains a **second, read-only** injected callback, `is_detached_work_stopping`, wired to
+  `detachedWorkStopping`. Two of the four checkpoints below — inside `runtime_still_admitted` and in
+  `settleSnapshotPublish` — must ask whether stopping has begun *without* taking a pin; with only the
+  pin callback available they have nothing to call, and taking a pin merely to read a flag would
+  create the very in-flight work the caller is trying to avoid.
 
 A non-empty return is a guard whose control block owns a strong `Pool` reference and, when its
 **last** copy is destroyed, decrements the in-flight count and notifies the waiter exactly once. An
@@ -156,6 +161,22 @@ separately-reasoned reference.
 
 The pin is taken **before** the thread is created, because the `ThreadFromGlobalPool` constructor can
 throw on pool exhaustion; the guard then releases the count on unwind with no hand-written path.
+
+**A refused or failed pin must roll back the publisher's admission.**
+`admitSnapshotPublishUnderStateLock` increments `pending_snapshot_publishes` *before*
+`dispatchSnapshotPublisher` is called, and only `settleSnapshotPublish` — which runs on the dispatched
+thread — decrements it. Any path that returns without launching a thread therefore strands that count
+forever, and its waiters are not cosmetic: remount quiescence, the ref-table cache budget and
+`dropNamespace` all block on `publish_settle_cv` reaching zero. Both new paths do exactly what the
+existing thread-construction `catch` already does — decrement and notify:
+
+| Path | Rollback |
+|---|---|
+| the pin is refused (stopping has begun) | decrement `pending_snapshot_publishes`, notify `publish_settle_cv`, return |
+| the pin throws (allocation failure) | the same, then let the exception propagate out of the mutation |
+
+Neither may be left to the guard: the guard releases the *new* registry count, which was never taken
+on these paths, and knows nothing about the per-runtime one.
 
 ### Two counters, not one {#counters}
 
@@ -180,23 +201,44 @@ The stopping flag is therefore observed at four points:
 
 | Point | Effect |
 |---|---|
-| `Pool::try_pin_detached_work` | the dispatch is not made |
+| `Pool::tryPinDetachedWork`, via `try_pin_detached_work` | the dispatch is not made |
 | `runtime_still_admitted`, inside the publisher | an in-flight publish stops at its next checkpoint |
 | before the `GET` in `Pool::reportImpossibleInterference` | the diagnostic is abandoned |
 | `CasRefLedger::settleSnapshotPublish`, before re-dispatch | the self-re-admission chain terminates |
 
-A backend request already in flight is **not** interrupted. That is deliberate, and it is what the
-bounded deadline is for: the wait covers one outstanding attempt resolving, not a retry cycle. The
-deadline is the one its neighbour `CasRefLedger::drainRefLanesForShutdown` already uses,
-`attempt_timeout_ms + lease_safety_margin_ms`.
+**The stop must also cancel in-flight recovery, or the deadline is unreachable.**
+`tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime` calls `ensureRefTableRecovered` *before* it even
+constructs `runtime_still_admitted`, so a publisher whose runtime entered `NeedsRecovery` is parked
+below the checkpoint above. That recovery loop retries transient failures until
+`cas_request_budget.recovery_retry_budget_ms` is spent — **120 seconds by default** — and its
+fail-closed conditions examine the fence, a supersede-by-remount, the admitted generation and a
+latched cancellation, but nothing about detached-work stopping. Against a drain deadline measured in
+seconds, that path times out every time.
+
+The mechanism already exists and must be reused rather than duplicated: the per-runtime
+`recovery_cancel_requested`, driven by `cancelRecoveriesAndAwaitQuiescence`, which self-remount
+already uses for the same purpose. Stop-and-drain requests the same cancellation. One difference is
+load-bearing: self-remount **clears** the flag once the runtimes are quiescent, because it intends
+work to resume under the fresh incarnation. Shutdown is terminal, so its cancellation must stay
+latched — clearing it would re-open the door the stop just closed.
+
+A backend request already in flight is **not** interrupted, and what that costs differs by dispatch:
+
+- the snapshot publisher's writes go through the CAS request budget, so an outstanding attempt is
+  bounded by it and the drain deadline covers one such attempt resolving. The deadline is the one its
+  neighbour `CasRefLedger::drainRefLanesForShutdown` already uses,
+  `attempt_timeout_ms + lease_safety_margin_ms`;
+- the diagnostic path issues a raw backend `GET` that is **not** budget-controlled. For it the drain
+  deadline is insurance, not a derived bound: it caps how long shutdown waits, but nothing caps the
+  `GET` itself.
 
 ### On expiry {#expiry}
 
 Log a warning, increment a counter, proceed. Nothing is forced or cancelled harder.
 
-This is not a fallback hiding a defect: no mechanism can make the guarantee absolute (see
-[the guarantee](#guarantee)), so the design states what expiry means and makes it observable instead
-of pretending it cannot happen. The counter turns "this occasionally goes wrong" into a number an
+This is not a fallback hiding a defect: this bounded design deliberately does not make the guarantee
+absolute (see [the guarantee](#guarantee)), so it states what expiry means and makes it observable
+instead of pretending it cannot happen. The counter turns "this occasionally goes wrong" into a number an
 operator can watch, and the stop checkpoints are what keep it at zero in normal operation.
 
 ## Emission that survives a reset `Context` {#context}
@@ -216,6 +258,20 @@ The member is therefore `std::optional<std::weak_ptr<const Context>>`:
   silently degrade into the disabled path: that would be a fallback converting a lifetime bug into a
   missing feature.
 - Each sink resolves the reference per event; an expired one drops the event and counts it.
+
+**`startup` resolves the reference exactly once, and holds the result.** The member is consulted at
+two separate points today, and resolving it twice would let the context expire between them, so that
+`background_watermark` is configured one way and the GC scheduler decided another — a partially
+disabled mount, which is worse than either outcome and would be invisible. The sequence is therefore:
+
+1. at the top of `startup`, if the member is engaged, `lock` it once;
+2. if that fails, throw immediately — before `Pool::open`, so nothing has been mounted;
+3. hold the resulting strong `ContextPtr` as a local through the single publish step, and derive
+   **both** decisions from that one local;
+4. release it when `startup` returns.
+
+The sinks capture the **weak** reference, not this local: the local exists only to make `startup`
+internally consistent, and a sink holding a strong reference is the original defect.
 
 This also lets the shutdown sequence do what it says it does: with no long-lived strong reference left
 in `src/Disks`, `global_context.reset()` destroys the `Context` object rather than merely dropping one
@@ -248,7 +304,7 @@ means no future caller can crash on one, which is a different and durable proper
 
 ### Three distinct outcomes, only two of them counted {#context-outcomes}
 
-These must not be collapsed, and rev.1 collapsed them:
+These three must not be collapsed:
 
 | State | What the sink sees | Counted? |
 |---|---|---|
@@ -293,6 +349,13 @@ swallowed a throw from phase 2 while leaving `drained` at whatever a partial com
 could forge that proof. With the default, a failed drain takes the fail-closed arm: no marker, and a
 logged warning that the next mount must treat this end as unclean. A throw from phase 2 must therefore
 still reach phase 3 — a failed drain is precisely when the terminal bookkeeping matters most.
+
+**The guards must guard their own logging.** `tryLogCurrentException` is not `noexcept` and allocates
+— it builds a `String` and calls `getLogger`, as its own comment in `src/Common/Exception.cpp` notes.
+Under memory pressure, which is one of the conditions likeliest to make a teardown phase throw in the
+first place, the handler can throw on the way to reporting the throw. Every `catch` on this boundary
+therefore wraps its logging in a nested `try`/`catch(...)` that does nothing, as other `noexcept` CAS
+paths already do. A promise that nothing escapes is worth exactly as much as its least-guarded line.
 
 The metadata-storage destructor is subject to the same rule: it calls the teardown helper, and no
 exception may escape it. A destructor that throws while draining merely relocates `std::terminate` one
@@ -360,6 +423,16 @@ the post-change expectation directly instead of asserting the absence of one par
 Inside that subprocess, assert the **absence of the clean-release marker** as well as the clean exit:
 a guard that survived the throw but forged the marker would pass an exit-code-only assertion, and
 forging it is the worse of the two failures.
+
+**The implicit destruction path.** `ContentAddressedMetadataStorage` destroyed **without** `shutdown`
+having been called, with tracked detached work in flight: the drain must still happen. This is a named
+defect in [what is wrong today](#defect) and the reason the destructor is added at all, so it needs its
+own test — otherwise an implementation that fixes only `shutdown` passes everything else in this list.
+
+**Helper idempotence.** The same storage destroyed **after** an explicit `shutdown`: the second
+teardown must find nothing to do rather than repeat the wait. Without this, an implementation that
+drains twice — or that waits a second full deadline on a pool that is already gone — is not caught by
+anything above.
 
 ## Verification gate {#gate}
 
