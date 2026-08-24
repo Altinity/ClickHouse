@@ -567,6 +567,12 @@ TEST(CASHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
 
 TEST(CASHeartbeat, KeeperStateAllowsOnlyActiveReleaseOrTerminal)
 {
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+#define EXPECT_KEEPER_STATE_REJECTION(statement) EXPECT_DEATH({ statement; }, "allowed only in")
+#else
+#define EXPECT_KEEPER_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
+#endif
+
     Layout layout("pool");
     const UInt128 uuid{0x1234};
 
@@ -580,16 +586,16 @@ TEST(CASHeartbeat, KeeperStateAllowsOnlyActiveReleaseOrTerminal)
             [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::New);
-        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
-        EXPECT_THROW(keeper.release(), DB::Exception);
+        EXPECT_KEEPER_STATE_REJECTION(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)));
+        EXPECT_KEEPER_STATE_REJECTION(keeper.release());
         EXPECT_EQ(keeper.start(), 100u);
-        EXPECT_THROW(keeper.start(), DB::Exception);
+        EXPECT_KEEPER_STATE_REJECTION(keeper.start());
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::Active);
         keeper.release();
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::Released);
-        EXPECT_THROW(keeper.start(), DB::Exception);
-        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
-        EXPECT_THROW(keeper.release(), DB::Exception);
+        EXPECT_KEEPER_STATE_REJECTION(keeper.start());
+        EXPECT_KEEPER_STATE_REJECTION(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)));
+        EXPECT_KEEPER_STATE_REJECTION(keeper.release());
     }
 
     {
@@ -607,10 +613,12 @@ TEST(CASHeartbeat, KeeperStateAllowsOnlyActiveReleaseOrTerminal)
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_NE(result.failure, nullptr);
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::RenewalTerminal);
-        EXPECT_THROW(keeper.start(), DB::Exception);
-        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
-        EXPECT_THROW(keeper.release(), DB::Exception);
+        EXPECT_KEEPER_STATE_REJECTION(keeper.start());
+        EXPECT_KEEPER_STATE_REJECTION(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)));
+        EXPECT_KEEPER_STATE_REJECTION(keeper.release());
     }
+
+#undef EXPECT_KEEPER_STATE_REJECTION
 }
 
 TEST(CASHeartbeat, RenewalRetriesOneImmutableBodyAndAdoptsLostResponse)
