@@ -110,20 +110,20 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 
 | ID | Статус на HEAD | Приоритет | До релиза? | Где отслеживается | Суть |
 |----|----------------|-----------|------------|-------------------|------|
-| NV-1 | ⏳ | — | — | — | — |
-| NV-2 | ⏳ | — | — | — | — |
-| NV-3 | ⏳ | — | — | — | — |
-| NV-4 | ⏳ | — | — | — | — |
-| NV-5 | ⏳ | — | — | — | — |
-| NV-6 | ⏳ | — | — | — | — |
-| NV-7 | ⏳ | — | — | — | — |
-| NV-8 | ⏳ | — | — | — | — |
-| NV-9 | ⏳ | — | — | — | — |
-| NV-10 | ⏳ | — | — | — | — |
-| NV-11 | ⏳ | — | — | — | — |
-| NV-12 | ⏳ | — | — | — | — |
-| NV-13 | ⏳ | — | — | — | — |
-| NV-14 | ⏳ | — | — | — | — |
+| NV-1 | частично | P2 | да (дешёвая страховка `repoint_old == expected`, а не блокер) | не отслеживается (смежное — `docs/superpowers/cas/BACKLOG/performance.md:328-357` про стоимо… | Есть ли у `repointRef` предусловие «старый манифест такой, каким я его прочитал»? — Нет, предусловия действительно нет (подтверждено по коду), но достижимость двух конкурентных standalone-записей в один и тот же закоммиченный ref на одном сервере доказать не удалось: все найденные MergeTree-сайты сериализованы. |
+| NV-2 | не подтвердилось | P3 | нет | не отслеживается (нужно только косметическое: лишний `LOG_ERROR` на корректном пути — см. ниже) | Может ли `abort()` хендла отменить promote, который на самом деле приземлился (Unresolved)? — Нет: удаление типизировано как `RemovePrecommit` и физически не может тронуть committed-строку, плюс есть явная проверка отсутствия. |
+| NV-3 | частично | P2 | да (только в части «завести регрессионный тест в репозитории») | перечисление — `docs/superpowers/cas/fable-review-triage.md:76,651-659` (V1); тестовая часть… | Просили (а) исчерпывающее перечисление durable-записей, достижимых под `Live`, и (б) SIGSTOP-тест фенсинга — перечисление УЖЕ сделано (ровно один незафенсенный сайт), а SIGSTOP-класс покрыт только soak-харнессом, не CI-тестом. |
+| NV-4 | не подтвердилось | P2 | да (но как правка устаревшего утверждения в исходнике, не как исправление механизма) | якорь `{#list-as-journal-dataloss-2026-07-25}` в живом BACKLOG отсутствует (grep по `BACKLOG… | Жив ли самозаявленный TLA+-пробел `_sab_holeylist` (confirmed relink может повиснуть на висячем blob'е)? — На HEAD дефект закрыт: интейк GC стал арифметическим, LIST понижен до подсказки; живы только устаревший комментарий в исходнике и мёртвая ссылка на BACKLOG. |
+| NV-5 | подтверждено | P2 | да (правка на две строки) | не отслеживается | Правда ли, что `noexcept`-`dropRefIfMatches` вызывает `eraseView` вне `try`, и правда ли `eraseView` может бросить? — Правда и то и другое: `eraseView` аллоцирует БЕЗУСЛОВНО (строит `String`-ключ), поэтому `bad_alloc` на откате даёт `std::terminate`. |
+| NV-6 | частично (по существу дубликат уже отслеживаемых CAS-118 и CAS-055) | P3 (чтение) / P2 (hardlink-путь) | нет | `docs/superpowers/cas/BACKLOG/performance.md:482-501` `{#read-path-repeated-view-lookup-per-… | `getView`/`readManifestShared` — раз на часть за запрос или раз на открытие каждого файла? — Раз на КАЖДУЮ пофайловую операцию (то есть больший множитель), но дорогая половина (`readManifestShared` = HEAD+GET) на пути ЧТЕНИЯ амортизируется тёплым view-кэшем; не амортизируется она на пути `createHardLink`. |
+| NV-7 | не подтвердилось | P3 | — | не отслеживается (и не нужно) | Может ли путь, оканчивающийся на `deduplication_logs`, быть неверно классифицирован, раз цикл `i + 1 < p.size()` его не ловит? — Нет: fallback-ветка выдаёт БАЙТ-В-БАЙТ тот же `TableFilePath`, что выдала бы зарезервированная ветка, и функция действительно вызывается с голым путём-каталогом — и работает. |
+| NV-8 | частично | P3 | нет | не отслеживается | Появляется ли в серверном логе строка, когда ref-lane заклинило или исчерпан бюджет conditional-write внутри фонового мержа? — Да, появляется: лог живёт не на месте вызова, а в фабрике исключения (`logCasWriteRetryLater`); частичность — в глобальном троттле 1 сообщение / 30 с на весь класс. |
+| NV-9 | подтверждено (дубликат B4 в части последствия) | P1 | да | — по существу не отслеживается; отслеживается как B4, `docs/superpowers/cas/opus-review-tria… | Ждёт ли `drainRefLanesForShutdown` обнуления `pending_snapshot_publishes` по каждому `RefTableRuntime`? — Нет, не ждёт; такое ожидание есть в двух ДРУГИХ местах, так что фикс — перенос уже написанного кода. |
+| NV-10 | не подтвердилось (подтверждаю RESOLVED, как и записало само ревью) | — | нет | — | Может ли соединение с неотправленным заявленным телом (после отказа на `Expect: 100-continue`) вернуться в пул? — Не может: гейт возврата в пул стоит на HEAD и опирается на `isCompleted()`. |
+| NV-11 | не разрешено (по существу — вне кода) | P3 | нет | — | Переживёт ли политика «recreate only, no migration» первый отгруженный релиз? — Это продуктовое/саппортное решение; из кода не выводится, и код тут не изменился — только счётчик поколений вырос. |
+| NV-12 | не подтвердилось (подтверждаю RESOLVED, как и записало само ревью) | — | нет | — | Может ли повторный fetch зациклиться на том же источнике? — Нет: выбор реплики-источника перемешивается равномерно на всех путях. |
+| NV-13 | не подтвердилось | P3 | нет | остаток совпадает с NV-1 (отсутствующее expected-old предусловие repoint'а) | Даёт ли per-ref-путь CAS ту атомарность/видимость, которая нужна MVCC, раз `supportTransaction` теперь принимает CAS через `supportsTransactionalMutableFiles`? — Даёт: никакого «sidecar» больше нет, `txn_version.txt` — обычная запись дерева манифеста, публикуемая ОДНОЙ ref-log транзакцией, и view инвалидируется сразу после неё. |
+| NV-14 | частично подтверждено | P3 | нет | не отслеживается; смежное и уже адъюдицированное — T11, `docs/superpowers/cas/opus-review-tr… | Верно ли, что fan-out-сайты не разворачивают прокси, и оправдывает ли это доктрина хелпера? — Сайты действительно не разворачивают (и их не три, а четыре), доктрина их НЕ покрывает (это не query paths), но последствия от безобидных до одного ослабления защиты в `SYSTEM DROP REPLICA … FROM ZKPATH`. |
 
 ---
 
@@ -1611,3 +1611,429 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 ### m31 (подтверждено, P2) {#m31}
 
 `tests/integration/compose/docker_compose_rustfs.yml:6` — `image: rustfs/rustfs:1.0.0-beta.12`; та же версия зашита константой в стейтлес-обвязке (`ci/jobs/scripts/clickhouse_proc.py:168` `RUSTFS_VERSION = "1.0.0-beta.12"`, скачивается релизный zip с GitHub на `:177-178`) и повторена ещё в восьми `utils/ca-soak/docker-compose*.yml`. Пин по тегу без digest: бета-тег upstream'а может быть перезалит или удалён, и тогда лейн либо тихо меняет бэкенд под собой, либо перестаёт подниматься — это риск воспроизводимости CI, а не корректности продукта (RustFS используется только как S3-совместимый бэкенд тестов, в поставку не входит). Минимальная мера до релиза — единая точка версии плюс пин по `sha256`-digest (digest образа уже зафиксирован в отчёте измерений: `sha256:612a6707053c27c41816e79e5d5d30b5ba8479fb9b500ae4908cd4a723e888fa`, `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md:40`).
+
+## Needs verification — детали {#nv-details}
+
+### NV-1 (частично, P2) {#nv-1}
+
+**Структурная часть находки подтверждается полностью и на HEAD.**
+
+1. `merged` считается из view, взятого ДО загрузки блобов:
+   `ContentAddressedTransaction.cpp:363` — `if (auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh))`,
+   затем `:379-381` (`stageManifest` + `precommitAdd` + `uploadPendingBlobs(st)`),
+   и только потом `:384-390` строит `merged` из `view->manifest()->entries` — то есть из снимка,
+   взятого до всей загрузки. Окно ровно такое, как описано в находке (и на S3 оно длинное).
+2. `repointRef`'s собственный `resolve(key, Freshness::ForceFresh)` (`Parts/PartFolderAccess.cpp:555`)
+   используется ИСКЛЮЧИТЕЛЬНО для побайтового short-circuit (`:565-567`); при несовпадении
+   результат `resolved` больше нигде не участвует, кроме выбора уровня лога (`:574-587`).
+3. `promote(allow_repoint=true)` ретайрит то, что закоммичено СЕЙЧАС, без сравнения с ожидаемым:
+   `Pool/CasPartWriteTxn.cpp:876-882` — `if (const auto it = state.getCommitted().find(final_ref_name); it != ... && !(it->second.manifest_ref == id.ref)) { if (!allow_repoint) throw...; repoint_old = it->second.manifest_ref; }`.
+   `repoint_old` берётся из текущего состояния, а не из ожидаемого — это и есть отсутствующее CAS-предусловие.
+4. Внутрипроцессной сериализации по ref нет: в `CachedPartFolderAccess` два мьютекса —
+   `inflight_mutex` (`Parts/PartFolderAccess.h:383`, только single-flight ЧТЕНИЯ, `.cpp:276-292`)
+   и `explain_mutex` (`:401`, диагностика). Пишущего per-ref мьютекса нет.
+
+**Часть про достижимость — не подтвердилась при обходе MergeTree-сайтов.**
+Standalone-записи/удаления по УЖЕ закоммиченной части на одном сервере, найденные в дереве:
+- `txn_version.txt` (MVCC): единственный писатель — `VersionMetadataOnDisk::storeInfo`
+  (`src/Interpreters/MergeTreeTransaction/VersionMetadataOnDisk.cpp:280-283`), который берёт
+  `std::lock_guard lock_storing_version{persisted_info_mutex}` и вдобавок имеет оптимистическую
+  проверку `expected_storing_version != new_info.storing_version → TOO_OLD_VERSION` (`:224-231`).
+  То есть по одной части записи в `txn_version.txt` сериализованы, а расхождение версий ловится.
+- `metadata_version.txt`: `IMergeTreeDataPart::writeMetadataVersion` (`IMergeTreeDataPart.cpp:1756`)
+  на HEAD не имеет НИ ОДНОГО вызывающего (`grep -rn writeMetadataVersion src/` даёт только
+  объявление и определение) — сайт мёртв.
+- `checksums.txt`/`columns.txt`: `writeChecksums`/`writeColumns` вызываются только из
+  `IMergeTreeDataPart.cpp:1906` и `:2206` (одноразовые фиксапы при загрузке части) и из
+  `StorageMergeTree.cpp:3375` (`CHECK TABLE`-репарация). Загрузочные фиксапы происходят до того,
+  как часть становится активной.
+- Поток удаления части (`delete_tmp_*`, per-file unlink) работает по обречённой части эксклюзивно
+  (`BACKLOG/gc.md:42` PART-REMOVAL-REPOINT — 17707 repoint'ов, ВСЕ на `delete_tmp_*`).
+
+**Вывод.** Data-loss я НЕ смог сконструировать: не нашёл пары конкурентных standalone-писателей в
+один закоммиченный ref. Но «недостижимо» здесь держится на перечислении сайтов, а не на инварианте
+(ср. `feedback_impossibility_claims_need_their_discriminator`): любой новый сайт, пишущий файл в
+закоммиченную часть вне `persisted_info_mutex`, немедленно откроет lost update, и он будет ТИХИМ.
+Поэтому рекомендация ревью («`repoint_old == expected` — дешёвая страховка») в силе: передавать в
+`repointRef`/`promote` ожидаемый `ManifestRef` (тот, из которого построен `merged`) и падать
+fail-closed при несовпадении. Это превращает тихую потерю в отказ. Приоритет P2, не блокер:
+поднять до P1 только если найдётся живой конкурентный сайт.
+
+### NV-2 (не подтвердилось, P3) {#nv-2}
+
+Заявление таксономии («abandon отвергается state-machine'ой, если promote всё-таки приземлился»)
+проверено в Pool-слое и держится ДВУМЯ независимыми уровнями:
+
+1. **Типизация формы.** `PartWriteTxn::abandon` формирует ровно один op с
+   `op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest}` и без
+   `new_binding` (`Pool/CasPartWriteTxn.cpp:1051-1056`). Классификатор формы даёт
+   `OwnerTransitionShape::RemovePrecommit`, чья ветка в `RefTableState::applyOwnerTransition`
+   работает ТОЛЬКО с картой `precommits` (`Pool/CasRefProtocol.cpp:268-279`). Карту `committed`
+   она не трогает вообще — снести опубликованный ref такой op не может физически.
+2. **Явная проверка отсутствия.** `if (precommits.erase({b.ref_name, b.manifest_ref}) == 0) throw
+   Exception(CORRUPTED_DATA, "RefTableState: exact precommit binding '{}' to remove is absent")`
+   (`Pool/CasRefProtocol.cpp:271-273`). Приземлившийся promote уже перенёс биндинг из `precommits`
+   в `committed` (`OwnerTransitionShape::Promote`, `:302-306`), значит `erase` даёт 0 → отказ.
+
+Дополнительно проверено, что на пути landed-but-`Unresolved` НЕ включается послабление
+`tolerate_absent`: оно ставится только при `precommit_state == Uncertain`
+(`Pool/CasPartWriteTxn.cpp:1041-1046`), а `promote` переводит `precommit_state` в `Settled` только
+ПОСЛЕ успешного `appendRefOps` (`:930`); при неоднозначном append он остаётся `Durable`, то есть
+берётся строгая форма. Но даже под `tolerate_absent` результат был бы тот же (пустой список op'ов),
+так что оба ветвления безопасны.
+
+Цепочка вызовов на этом пути: `PreparedPartWrite::promote` ловит бросок, `terminal` уже НЕ выставлен
+(он ставится внутри allocation-free региона `promoteBuild`, `Parts/PartFolderAccess.cpp:341-348`),
+идёт `abandonBuildBestEffort` (`:452`), который ловит CORRUPTED_DATA и возвращает `false`;
+`PreparedRelinkOverPartWrite::promote` затем видит `write.commitIsUnresolved()` и возвращает
+`CaRelinkPromote::Unresolved` (`ContentAddressedMetadataStorage.cpp:2147-2155`) — то есть «повторить
+весь fetch позже, байты НЕ тянуть». `SCOPE_EXIT`-`abort()` (`:2171-2186`) снова упирается в тот же
+отказ и глушит его через `tryLogCurrentException` — `noexcept` соблюдён.
+
+**Остаточное (косметика, P3).** На корректном landed-but-`Unresolved` пути хендл остаётся
+не-terminal, и деструктор `~PreparedPartWrite` печатает `LOG_ERROR` «was destroyed while still owing
+its terminal operation» (`Parts/PartFolderAccess.cpp:406-415`) плюс ещё один залогированный
+`CORRUPTED_DATA`. Это ложная ERROR-тревога на пути, где всё сработало правильно; для оператора
+выглядит как повреждение. Стоит понизить/различить этот случай, но на безопасность не влияет.
+
+### NV-3 (частично, P2) {#nv-3}
+
+**(а) Перечисление — сделано, и оно исчерпывающее.** `fable-review-triage.md` V1
+(`docs/superpowers/cas/fable-review-triage.md:76` и разбор `:651-659`) — обход ВСЕХ durable/
+conditional write-сайтов CAS-дерева (~40 сайтов, ~19 групп). Результат: ровно ОДИН сайт
+writer-плоскости без `checkFenceOrThrow` — `createNamespaceStep1` (`Pool/CasRefCatalog.cpp:200-230`),
+единственный вызывающий `casUpdateImpl`, который не исполняет «the fence obligation» из
+`Pool/CasRefCatalog.h:84-95`; его же вызывающий `createNamespace` (`:543-596`) держит и
+`admitted_generation`, и `check_fence_or_throw` в области видимости и передаёт их в шаг 3. Фикс
+тривиален и симметричен четырём другим вызывающим. Остальные сайты либо зафенсены напрямую
+(`Pool/CasPartWriteTxn.cpp:362,371,383,392,445,447,464`; `ContentAddressedTransaction.cpp:926`;
+`Pool/CasPool.cpp:201,221`), либо принадлежат другой плоскости с явно названным собственным гейтом.
+То есть запрошенная ревью работа не «missing» — она выполнена другой полосой того же дня.
+
+**(б) SIGSTOP-тест.** В `tests/integration` и `tests/queries` такого теста НЕТ (`grep -rn SIGSTOP
+tests/integration` даёт только `test_hedged_requests` и хелперы). Но SIGSTOP-эквивалент существует и
+РЕГУЛЯРНО исполняется в soak-харнессе: `utils/ca-soak/soak/chaos.py:15-21,79-85,129-137` —
+`FaultAction.FREEZE_LONG` = `docker pause` (cgroup freezer = SIGSTOP для всех задач контейнера)
+ровно одной CH-реплики, удерживаемый дольше `ttl(30s) + margin(ttl/2=15s)`, с последующим `unpause`
+(= SIGCONT); инвариант закреплён юнит-тестом расписания `utils/ca-soak/tests/test_chaos_schedule.py:45-53`.
+И главное — **живое наблюдение ровно того, что просило ревью**:
+`utils/ca-soak/scenarios/BACKLOG.md:1487-1492` (2026-07-09, 83-секундный FREEZE_LONG ch1) —
+размороженная реплика попыталась писать и получила `Code 236 ... CAS mount lost / lease expired —
+refusing to mutate ref shard for server_root 'ca_soak_ch1'`; запись фенсенной стороны была
+ОТКЛОНЕНА. Запись в BACKLOG прямо говорит: «The CA server behaved CORRECTLY (fail-closed ABORTED — a
+fenced replica must not mutate); the WORKLOAD retry logic was at fault» — чинили харнесс, не сервер.
+Смежное: сценарий `utils/ca-soak/scenarios/cards/s39_lease_fault_tolerance.py` (потеря аренды +
+remount-восстановление), `s45_decommission_hidden_removing.py:44,110` (тот же fence-margin).
+
+**Что остаётся.** Ни один из этих прогонов не идёт в CI: FREEZE_LONG вероятностный (~1/6 upgrade,
+`chaos.py:35`), карточка SIGSTOP-ack-floor в `scenarios/BACKLOG.md:674` до сих пор «proposed».
+Оценка «60/100 — thinnest» справедлива именно как оценка РЕГРЕССИОННОГО покрытия, а не как «не
+проверялось никогда». Закрывается детерминированным тестом (integration, `test_cas_shared_pool`):
+`docker pause` держателя аренды сверх TTL, взятие аренды пиром, `unpause`, ассерт на код 236 у
+in-flight записи размороженного + ассерт `CASMountLeaseLost`/`CASRemountSucceeded`.
+
+### NV-4 (не подтвердилось, P2) {#nv-4}
+
+Дефект, который воспроизводит `_sab_holeylist`, сформулирован в
+`docs/superpowers/models/README.md:386-392`: «GC discovers ref-log transactions by a paginated LIST
+with no completeness proof… the omitted `+1` sinks below its namespace cursor and is never folded
+again, so GC deletes a deduplicated blob a confirmed, promoted manifest references».
+
+**На HEAD этой предпосылки больше нет.** `Gc/CasGc.cpp:1836-1856`:
+«records within one `(namespace, writer_epoch)` are dense `1..T`, so the next record's id is
+computable and **the round never asks the listing what to read**… **THE LISTING IS A HINT**, and
+demoting it is the point of this loop. It used to be the source of truth… **Under arithmetic intake
+such an omission is a NON-EVENT: the exact GET finds the record anyway**». За подсказкой остались
+ровно две роли: genesis не-фолдившегося namespace и witness-множество, делающее отсутствие
+ожидаемого-следующего разрешимым (`:1849-1855`); пропущенный id выше ожидаемого HOLD'ит namespace с
+неподвинутым курсором, а не проглатывается. Переход эпох идёт только через consumed `EpochSeal`
+(INV-2) по обратной цепочке `prev_epoch_seal` (`:1858-1863`), то есть эпоху, которую LIST потерял
+целиком, всё равно обходят. Механика в коде: `chainLinkFor`/`makeEpochSealTxn`
+(`Pool/CasRefLedger.cpp:123,136-150`), приземление зафиксировано в
+`docs/superpowers/cas/BACKLOG/ref-protocol.md:17`.
+
+Формальная сторона тоже уже адъюдицирована и НЕ требует переспора:
+`docs/superpowers/models/CaRelinkConfirmCore_RESULTS.md:233-266` — модель сознательно не
+переписывалась, `_sab_holeylist` оставлен КРАСНЫМ как исторический свидетель pre-v9, а регрессионную
+пару образуют `CaRefTableSnapshotLogCore_sab_scanistruth` (RED, свойство не вакуумно) и
+`CaRefDeltaIntakeCore_v9_hintomission` (GREEN, под v9 та же пропажа безвредна). Там же прямо
+написано: красный `_sab_holeylist` «says nothing about v9 and must not be read as a v9 failure».
+Смежное settled-решение по доверию к LIST: `docs/superpowers/cas/2026-08-03-list-trust-verdict.md`
+(консолидирован в `docs/en/antalya/cas/architecture/*`, см.
+`docs/superpowers/cas/consolidation-2026-08/COVERAGE-MATRIX.md:272`).
+
+**Что действительно остаётся — это прозаический дефект, и он в отгружаемом исходнике.**
+`src/Storages/MergeTree/DataPartsExchange.cpp:1383-1387` до сих пор утверждает: «`_sab_holeylist`
+shows that with every confirm rule intact and one incomplete listing page permitted,
+`ConfirmedRelinkNeverDangles` still breaks (BACKLOG `{#list-as-journal-dataloss-2026-07-25}`). A
+confirmed relink is therefore NOT proven dangle-free». Утверждение описывает pre-v9 состояние, а
+якорь BACKLOG мёртв. Читатель кода получит из него неверный вывод о текущих гарантиях. Правка:
+переписать абзац под арифметический интейк (сослаться на `CasGc.cpp:1844-1863` и на пару
+scanistruth/hintomission), а не удалять — оговорка про «`yes` означает только, что источник прямо
+сейчас держит именно этот манифест» остаётся верной. Тот же устаревший тезис продублирован в
+`docs/superpowers/cas/2031-triage.md:1172,1186` — исторический снимок, править не нужно.
+
+### NV-5 (подтверждено, P2) {#nv-5}
+
+**Форма подтверждена дословно.** `Parts/PartFolderAccess.cpp:646` —
+`bool CachedPartFolderAccess::dropRefIfMatches(...) noexcept`; `try` закрывается на `:702`, а
+`eraseView(key)` стоит на `:705`, ЗА пределами `catch (...)`. Тот же дефект в соседней функции:
+`dropRefBestEffort(...) noexcept` (`:627`) — `try/catch` до `:640`, `eraseView(key)` на `:644`.
+
+**Ответ на вопрос «allocation-free ли `recordDecision`/`CacheBase::remove` для уже присутствующего
+ключа»: он не тот, который решает дело — аллокация происходит РАНЬШЕ и БЕЗУСЛОВНО.**
+`eraseView` первой же строкой делает `const String cache_key = key.cacheKey();`
+(`Parts/PartFolderAccess.cpp:308`), а `cacheKey()` — это
+`return ns.string() + '\0' + ref;` (`Parts/PartFolderAccess.h:34`), то есть две конкатенации
+`std::string` = как минимум одна куча-аллокация на КАЖДЫЙ вызов, независимо от состояния кэша,
+независимо от `explain_enabled` и независимо от того, включена ли retention (`view_cache` может быть
+`nullptr` — ключ всё равно построен). Под `MEMORY_LIMIT_EXCEEDED`/`bad_alloc` это бросок из
+`noexcept`-функции → `std::terminate`. Именно на пути отката при нехватке памяти, как и написано в
+находке.
+
+Дополнительно (второстепенно, но подтверждает): `recordDecision` при `params.explain_enabled`
+(`Parts/PartFolderAccess.h:239`, по умолчанию `false`) делает `explain_map[cache_key]`
+(`.cpp:728`) — `operator[]` на `unordered_map` ВСТАВЛЯЕТ отсутствующий ключ, то есть аллоцирует узел
+и копию строки; для инвалидации ключ вполне может быть новым. `CacheBase::remove(key)`
+(`src/Common/CacheBase.h:281-285`) — `lock_guard` + `cache_policy->remove`, аллокаций не видно.
+
+**Фикс.** Либо занести `eraseView(key)` внутрь существующего `try` (сохранив «инвалидируем в любом
+случае» через второй `catch`), либо обернуть его собственным
+`try { eraseView(key); } catch (...) { tryLogCurrentException(...); }`. Второй вариант точнее
+сохраняет намерение комментария на `:703-704`. То же — для `dropRefBestEffort`.
+
+### NV-6 (частично (по существу дубликат уже отслеживаемых CAS-118 и CAS-055), P3 (чтение) / P2 (hardlink-путь)) {#nv-6}
+
+**Множитель — пофайловый.** Каждая read-side точка входа метаданных сама парсит путь и берёт view:
+`ContentAddressedMetadataStorage.cpp:1846` (`getStorageObjects`), `:1883`
+(`tryGetStorageObjects`), `:1923`, `:1966` — все они начинаются с `parsePartFilePath(path)` +
+`route(*p)` и требуют непустого `p->file`, то есть вызываются ИМЕННО на файл, а не на часть. Никакого
+короткого замыкания через уже загруженные в память `checksums`/список колонок
+`IMergeTreeDataPart` тут нет: `MergeTreeReaderStream` открывает каждый файл колонки через
+`readFile`/`getFileSize`, и каждый такой вызов заходит в metadata storage.
+
+**Но стоимость одного повтора — не запрос к объектному хранилищу.** `getView`
+(`Parts/PartFolderAccess.cpp:160-191`) сначала делает `resolve(key, freshness)` →
+`store->resolveRef(..., allow_stale = (freshness == CachedForLoad))`, что для read-пути является
+чисто in-memory поиском в `RefTableState`, затем при совпадении `manifestId()` отдаёт удержанный view
+(`:176-190`, `CASPartFolderViewHits`) — `readManifestShared` не вызывается. То есть backend-цена
+остаётся O(частей), а не O(частей × файлов).
+
+Это ровно то, что уже записано в BACKLOG как CAS-118
+(`BACKLOG/performance.md:484-500`): «One `DiskObjectStorage::readFile` on a blob-backed part file
+walks that chain twice… and a third time whenever the caller sized the file first through
+`getFileSize`… **This is CPU and lock traffic only, not requests**: `resolveRef` is a pure in-memory
+lookup… and a warm `CachedForLoad` view hit returns without touching `readManifestShared`». Остаток —
+взятие `pointer_mutex` пула + `state_mutex` ref-таблицы + лок view-кэша + одна `String`-аллокация
+`cacheKey()` на каждый проход, умноженные на число файлов широкой части.
+
+**Где множитель действительно дорогой — не на чтении, а на `createHardLink`** (CAS-055,
+`BACKLOG/performance.md:304-320`): там `ForceFresh` при отгружаемом дефолте
+`part_folder_validate = always` никогда не отдаёт удержанный view (короткое замыкание на
+`Parts/PartFolderAccess.cpp:197` гейтится на `validate.mode != Always`), поэтому каждый вызов
+доходит до `buildView` → `readManifestShared` с ОБЯЗАТЕЛЬНЫМ `HEAD`. `FREEZE`/clone или
+`ALTER … UPDATE` хардлинкают каждый неизменённый файл части — один `HEAD` на файл. Фикс уже
+существует в соседней функции (`unlinkFile` мемоизирует доказательство per `(transaction, ref)` в
+`force_fresh_validated_refs`, `ContentAddressedTransaction.cpp:1595-1603`).
+
+Итог по M7: множитель — «на открытие файла», как и опасалось ревью, но последствие на read-пути —
+CPU/локи, а не запросы; отдельный пункт заводить не нужно, оба сегмента уже в BACKLOG.
+
+### NV-7 (не подтвердилось, P3) {#nv-7}
+
+Цикл действительно не может сматчиться, когда `deduplication_logs` — последний компонент:
+`Parts/PartPathParser.cpp:358` — `for (size_t i = 1; i + 1 < p.size(); ++i)`. Но следствие,
+которого опасается находка («misclassified as a file with that name»), наблюдаемых последствий не
+имеет, потому что оба пути дают ОДИН И ТОТ ЖЕ результат:
+- зарезервированная ветка при `i == p.size()-1` дала бы
+  `table_uuid = joinTableId(p, 0, i)` и `tail = joinTableId(p, i, p.size())` (`:360-365`);
+- fallback даёт `table_uuid = joinTableId(p, 0, p.size() - 1)` и `tail = p.back()` (`:369-372`).
+При `i == p.size()-1` это тождественно: тот же префикс и тот же единственный хвостовой компонент
+`"deduplication_logs"`. Для Atomic-раскладки вопрос вообще не встаёт — там `tail` есть всё после
+uuid одной строкой (`:339-347`).
+
+**Функция ДЕЙСТВИТЕЛЬНО вызывается с голым путём-каталогом, и это штатный путь.**
+`ContentAddressedTransaction.cpp:1149-1163` — ветка `removeDirectory` «Table-level SUBDIRECTORY
+(deduplication_logs/): remove every verbatim file under it» использует `tf->tail + "/"` как префикс
+для `listNamespaceFiles`; при `tail == "deduplication_logs"` префикс получается ровно
+`"deduplication_logs/"` — правильный. Аналогично `ContentAddressedMetadataStorage.cpp:1471-1477`
+классифицирует форму как `DirShape::TableSubdir`.
+
+Остаток чисто стилистический: цикл нужен ТОЛЬКО для непоследнего вхождения (путь вида
+`data/db/tbl/deduplication_logs/<file>`, где fallback свернул бы подкаталог в table id) — там он
+обязателен и работает. Дефекта нет.
+
+### NV-8 (частично, P3) {#nv-8}
+
+Ревью искало `LOG_*` рядом с `complete_error` и не нашло — но лог стоит уровнем ниже, внутри самой
+конструкции исключения:
+- `Backend/CasRequestControl.cpp:237-242` — `makeCasWriteRetryLaterExceptionPtr(why)` ПЕРВОЙ строкой
+  вызывает `logCasWriteRetryLater(why)` и только потом делает `std::make_exception_ptr`;
+- `:232-236` — `throwCasWriteRetryLater(why)` делает то же самое перед броском;
+- `:223-228` — сам `logCasWriteRetryLater`: `LOG_WARNING(log, "CAS write could not be committed
+  ({}); retrying later", why)`.
+Сайт заклинивания ref-lane использует ровно эту фабрику: `Pool/CasRefLedger.cpp:3926-3934` —
+`ProfileEvents::increment(ProfileEvents::CASRefAppendWedged)` и следом
+`complete_error(chunk_survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format("CAS ref-log append
+for namespace '{}' txn {}-{} is UNCERTAIN ({}) — the append lane is wedged…")))`. Соседний арм
+(отказ ДО отправки запроса) — `:3905-3917`, тот же механизм плюс отдельный счётчик
+`CASRefAppendPreAttemptRefused`. Путь исчерпания бюджета conditional-write
+(`Backend/CasRequestControl.cpp:461`, `:828`) возвращает `Unresolved`, который его вызывающие
+переводят в тот же `throwCasWriteRetryLater`.
+
+Второй, независимый уровень: исключение, вышедшее из фоновой задачи, всегда логируется
+универсальным перехватом исполнителя — `src/Storages/MergeTree/MergeTreeBackgroundExecutor.cpp:201`
+и `:208`, `tryLogCurrentException(log, "Exception while executing background task {…}")`. Отдельно,
+detached-публикатор снапшотов свои падения тоже логирует сам
+(`Pool/CasRefLedger.cpp:4004-4007`, `:4023`).
+
+**Что действительно частично.** `logCasWriteRetryLater` использует
+`LogSeriesLimiter(getLogger("CasWriteRetryLater"), /*allowed_count=*/1, /*interval_s=*/30)`, а
+`LogSeriesLimiter` ключуется ТОЛЬКО по имени логгера (это зафиксировано и в комментарии на
+`:218-222`, и как известная ловушка). Значит на весь класс «CAS write could not be committed»
+печатается одна строка в 30 секунд: под штормом конкретное заклинивание фоновой мутации может
+не напечататься вовсе, и авторитетным сигналом остаются счётчики
+(`CASRefAppendWedged`, `CASRefAppendPreAttemptRefused`) плюс общая строка исполнителя. То есть
+заявленная находка («no adjacent `LOG_*`») не подтверждается, а реальный остаток — агрегирующий
+троттл, и он документирован в самом коде.
+
+### NV-9 (подтверждено (дубликат B4 в части последствия), P1) {#nv-9}
+
+`CasRefLedger::drainRefLanesForShutdown` (`Pool/CasRefLedger.cpp:1847-1905`) выставляет
+`shutting_down`, снимает список runtime'ов и ждёт ровно двух вещей:
+`while (!(rt->pending.empty() && !rt->leader_active))` под `ref_queue_mutex` (`:1874-1886`) и затем
+проверяет `lane_state` на `Writing`/`Wedged` (`:1895-1902`). Ни `pending_snapshot_publishes`, ни
+`publish_settle_cv` в функции не упоминаются вовсе.
+
+Ожидание, которого тут не хватает, в дереве УЖЕ НАПИСАНО дважды:
+- `quiesceRefTablesForRemount`, `:1705-1706` —
+  `rt->publish_settle_cv.wait(slock, [&] { return rt->pending_snapshot_publishes.load(...) == 0; });`
+- `dropNamespaceImpl`, `:5102-5107` — тот же цикл с комментарием «No background publisher may carry
+  the old runtime across the later catalog deletion».
+Плюс тестовый хелпер `:4100`.
+
+Публикатор запускается как `ThreadFromGlobalPool(...).detach()` (`:3998-4013`) и держит
+`auto owner = pin_owner()` — сильную ссылку на `Pool`. Поэтому это НЕ use-after-free, а именно
+отложенный `~Pool`: ровно то, что B4 называет «detached threads that defer `~Pool`», и что делает
+возможным исполнение прощальной долговечной записи и эмита события уже после гашения object storage
+и обнуления `Context` (B3). B4 адъюдицирован как подтверждённый P1 «до релиза»
+(`opus-review-triage.md:49`), так что NV-9 не добавляет нового дефекта — он ОТВЕЧАЕТ на вопрос B4:
+нет, ничто не ограничивает публикатора относительно `shutdown()`, и фикс — добавить в
+`drainRefLanesForShutdown` тот же `publish_settle_cv`-цикл, но с ограничением по общему
+`wait_budget_ms` (в отличие от двух существующих безлимитных ожиданий).
+
+Второе утверждение находки («тогда останется только диагностическая нить
+`reportImpossibleInterference`») подтвердить не удалось и оно не требуется для вывода: даже если
+других detached-нитей нет, публикатор один уже делает предпосылку B4 верной.
+
+### NV-10 (не подтвердилось (подтверждаю RESOLVED, как и записало само ревью), —) {#nv-10}
+
+Механика на HEAD жива дословно: `src/Common/HTTPConnectionPool.cpp:879` —
+`if (!connection.connected() || connection.mustReconnect() || !connection.isCompleted() ||
+connection.buffered())` — соединение не переиспользуется; `isCompleted()` объявлен на `:642`,
+`flushRequest()` переопределён на `:470` с вызовом `Session::flushRequest()` на `:496`. Это
+пред-существующая машинерия, к CAS отношения не имеющая; она же покрывает два ранних выхода
+`DataPartsExchange` с недочитанным телом. Ничего добавлять не нужно; пункт записан ради полноты.
+
+### NV-11 (не разрешено (по существу — вне кода), P3) {#nv-11}
+
+Из кода проверяемо ровно две вещи, и обе подтверждаются:
+1. Явное поколение с рабочим forward-гейтом живо: `Formats/CasFormat.h:62` —
+   `constexpr uint32_t G_BUILD = 10;` (на момент обзора было 9, то есть с тех пор прошёл ещё один
+   бамп — счёт `9 pre-release bumps` устарел на единицу), плюс именованные backward-полы
+   (`:78-95`) и отказ `UNKNOWN_FORMAT_VERSION` для значений выше `G_BUILD` (`:143-147`).
+2. Политика при каждом бампе — та же: «the pool must be recreated; there is **no migration path in
+   the pre-release format**» (`Formats/CasFormat.h:31`, `:78`), и каждое поколение подписано как
+   `recreate-only` (`:81`, `:85`, `:89`, `:92`, `:95`).
+
+Чем закрывается по-настоящему: решением владельца продукта, зафиксированным в
+`docs/en/antalya/cas/` (страница совместимости/поддержки) и в changelog-записи релиза, — «с какой
+версии формат становится стабильным и что мы обещаем при бампе после релиза». Кодовое изменение,
+которое из этого решения следует (если решат поддержать миграцию) — это отдельная работа, а не
+проверка. Смежное: `opus-review-triage.md` m26 (на ветке нет ни одной changelog-строки про CAS,
+P2, до релиза) — именно там это решение и должно проявиться текстом.
+
+### NV-12 (не подтвердилось (подтверждаю RESOLVED, как и записало само ревью), —) {#nv-12}
+
+Пути выбора реплики в `src/Storages/StorageReplicatedMergeTree.cpp` перемешиваются равномерно
+`thread_local_rng`: `:2316`, `:3577`, `:5217`, `:5397`, `:11887` — все пять
+`std::shuffle(replicas.begin(), replicas.end(), thread_local_rng)`. Вывод ревью («цикл relink'а
+недостижим при ≥3 репликах и достижим при 2») из этой формы следует напрямую и на HEAD не изменился.
+Случай двух реплик — это свойство самой топологии, а не дефект выбора.
+
+### NV-13 (не подтвердилось, P3) {#nv-13}
+
+**Обоснование в интерфейсе точное, но описание пути устарело.** `IMetadataStorage.h:373-377`
+говорит про «per-ref sidecar»; в коде отдельного мутабельного sidecar-пути уже НЕТ:
+`ContentAddressedTransaction.cpp:872-878` — «The former mutable-per-part-file branch
+(uuid.txt/metadata_version.txt/txn_version.txt staging directly into a separate mutable payload) is
+**DELETED** here — these three names fall through to the ordinary content path below like any other
+tree file… a standalone write on an already-committed part repoints». Это стоит поправить в
+комментарии интерфейса (мелочь, но именно на неё смотрит следующий читатель).
+
+**Атомарность.** `supportsAtomicFileWrites()` у CAS честно `true`
+(`ContentAddressedMetadataStorage.h:261`), поэтому `VersionMetadataOnDisk::storeInfoToDataPartStorage`
+берёт однократную ветку записи без `tmp`+`replaceFile`
+(`src/Interpreters/MergeTreeTransaction/VersionMetadataOnDisk.cpp:326-336`). Публикация файла на
+закоммиченной части идёт через `publishStaging` → `repointRef` → `promote(allow_repoint=true)`,
+который кладёт в ОДНУ запись ref-лога три op'а — снятие старой committed-привязки, переход
+precommit→committed и `SetPublishedAt` (`Pool/CasPartWriteTxn.cpp:895-925`); внутрирекордного
+промежуточного состояния не наблюдаемо («`applyRefLogTxn`'s whole-record scratch apply makes the
+composition a sound refinement», `:908-911`). Полусостояния файла не существует.
+
+**Видимость.** После долговечного append `promoteBuild` делает `eraseView(key)`
+(`Parts/PartFolderAccess.cpp:358`), так что следующее чтение резолвится заново; `getView`
+дополнительно валидирует удержанный view по `manifestId()` против свежего resolve
+(`:176-181`).
+
+**Конкурентность (то, ради чего вопрос задавался).** Запись `txn_version.txt` по одной части
+сериализована на уровне MergeTree: `VersionMetadataOnDisk::storeInfo` берёт
+`std::lock_guard lock_storing_version{persisted_info_mutex}` (`VersionMetadataOnDisk.cpp:280-283`) и
+дополнительно проверяет `expected_storing_version != new_info.storing_version → TOO_OLD_VERSION`
+(`:224-231`). Двух одновременных писателей этого файла по одной части нет.
+
+Единственный остаток — общий с NV-1: если бы такой второй писатель (по ЛЮБОМУ файлу той же
+закоммиченной части) появился, carry-forward repoint потерял бы его изменение молча. То есть
+гарантия MVCC здесь держится на MergeTree-мьютексе, а не на CAS-предусловии, — что ещё один довод
+за дешёвую страховку из NV-1.
+
+### NV-14 (частично подтверждено, P3) {#nv-14}
+
+**Итератор действительно отдаёт прокси.** `DatabaseOrdinary::loadTableFromMetadataLazy` создаёт
+`std::make_shared<StorageTableProxy>(table_id, std::move(get_nested), std::move(columns))` и
+`attachTable`'ит В КАТАЛОГ именно прокси (`src/Databases/DatabaseOrdinary.cpp:485-488`), поэтому
+`database->getTablesIterator(...)->table()` возвращает `StorageTableProxy`, пока таблица не
+материализована. Значит `dynamic_cast` к реальному движку в fan-out'ах промахивается.
+
+**Доктрина хелпера их не оправдывает.** `unwrapTableProxy`'s комментарий
+(`InterpreterSystemQuery.cpp:278-282`) говорит: «generic **query paths** already materialize on read
+by design and must not go through this helper». Перечисленные сайты — не query paths, а
+`SYSTEM`-глаголы, обходящие каталог; на них аргумент не распространяется.
+
+**Сайты на HEAD (нумерация сместилась; их четыре, а не три):**
+- `:1653` — `SYSTEM RESTART REPLICAS`: `if (dynamic_cast<const StorageReplicatedMergeTree *>(it->table().get()))`.
+  Следствие: не материализованные lazy-реплики молча не попадают в список и не перезапускаются.
+  Этого сайта в списке ревью не было — он найден дополнительно.
+- `:1749` — `SYSTEM DROP REPLICA … FROM ZKPATH`, локальная защитная проверка:
+  `if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(iterator->table().get()))`
+  и сравнение `getReplicaPath() == remote_replica_path`. **Самое существенное следствие:** lazy-таблица
+  не проверяется, и пользователь может снести в ZK реплику живой локальной таблицы. Смягчение —
+  комментарий на `:1743` сам называет проверку избыточной («This check is actually redundant, but it
+  may prevent from some user mistakes»), то есть это деградация защиты в глубину, а не первичной
+  гарантии.
+- `:2248` — обход для обновления набора частей по диску: `dynamic_cast<MergeTreeData *>(it->table().get())`.
+  Здесь итератор берётся с `skip_not_loaded=true` (`:2246`), а само действие — перестроение набора
+  частей, которое материализованная позже таблица сделает сама; следствий нет.
+- `:2747` — `SYSTEM LOAD/UNLOAD PRIMARY KEY` для всех таблиц:
+  `if (auto * merge_tree = dynamic_cast<MergeTreeData *>(it->table().get()))`. Пропуск
+  не материализованной таблицы безвреден: у неё нечего выгружать.
+(Сайт `:2727` в исходном списке ревью — ложное срабатывание: он кастует `table`, полученный уже
+через `unwrapTableProxy` на `:2725`.)
+
+**Область.** Это не CAS: изменение пришло коммитом `3d35dfce282` (табличный прокси-unwrap, Tier B в
+разделе split'а того же ревью — «unrelated to CAS; no reason to be on this branch»). Правильное
+действие — либо развернуть прокси и в fan-out'ах (тогда `SYSTEM RESTART REPLICAS` и защита
+`DROP REPLICA` перестают зависеть от `lazy_load_tables`, ценой материализации каждой таблицы, что
+противоречит смыслу ленивой загрузки), либо честно сузить доктрину в комментарии хелпера, назвав
+fan-out осознанным исключением и его последствие для `DROP REPLICA`. Решение принадлежит владельцу
+upstream-поверхности, не CAS-ветке (см. правило «не менять upstream-поверхности без консультации»).

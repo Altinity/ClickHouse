@@ -156,3 +156,23 @@ debris cleanup all iterate. Also worth deciding while in there: an idempotent re
 already-committed no-op arm at `:961-975`) still leaves `precommit_state == Durable`, so a subsequent
 `abandon` of that build appends a removal for a binding that never existed and fails loudly under the
 strict arm — fail-closed, but noisy for a path the code deliberately supports.
+
+## `noexcept` ref-drop helpers allocate outside their `try` (opus review NV-5) {#noexcept-ref-drop-allocates}
+
+`dropRefIfMatches` and `dropRefBestEffort` are `noexcept` and call `eraseView` OUTSIDE their `try`
+(`Parts/PartFolderAccess.cpp:646/705`, `:627/644`). The review asked whether
+`recordDecision`/`CacheBase::remove` allocate — that is the wrong discriminator: `eraseView`'s FIRST
+line builds `String cache_key = key.cacheKey()` (`:308`; `PartFolderAccess.h:34` — two string
+concatenations), so it allocates unconditionally on every call, whatever the cache or explain state
+is. A `bad_alloc` there terminates the process, and this is the rollback path taken under memory
+pressure — exactly when the allocation is most likely to fail. Two-line fix: move the `eraseView`
+calls inside the existing `try`. P2.
+
+## Shutdown drain ignores pending snapshot publishes (opus review NV-9) {#shutdown-drain-misses-snapshot-publishes}
+
+`drainRefLanesForShutdown` (`Pool/CasRefLedger.cpp:1847-1905`) waits on `pending` and `leader_active`
+only — never on `pending_snapshot_publishes`. This is the mechanical confirmation of the B3+B4 chain
+already queued pre-release ({#detached-pool-outlives-context}, `final-checks-todo.md` item 10): an
+undrained publisher is what lets a detached task be the last `Pool` owner. The needed wait loop
+already exists twice in the same file (`:1705`, `:5102`), so the fix is a transplant with a
+`wait_budget_ms` bound rather than new machinery. P1 as part of that chain.
