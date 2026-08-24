@@ -49,6 +49,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -2027,5 +2028,92 @@ public:
 
     std::atomic<bool> fail_meta_writes{true};
 };
+
+/// Blocks INSIDE a blob-meta mutation until `release` is called, so a test can hold a real meta job in
+/// flight and observe that it got there. `entered` is set before blocking.
+///
+/// STARTS DISARMED, and that is load-bearing: the write path itself writes Clean blob meta
+/// (`Pool/CasPartWriteTxn.cpp:314`), so a latch that blocked from construction would block the test's
+/// own fixture instead of the job under test. Call `arm` only once the fixture is built.
+class MetaWriteLatchBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
+    std::atomic<bool> entered{false};
+
+    void arm()
+    {
+        armed.store(true);
+    }
+
+    void release()
+    {
+        std::lock_guard lock(latch_mutex);
+        released = true;
+        latch_cv.notify_all();
+    }
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    DB::Cas::PutResult putOverwrite(
+        const String & key, const String & bytes, const DB::Cas::Token & expected,
+        const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
+    DB::Cas::CasResult casPut(const String & key, const String & bytes,
+                              const std::optional<DB::Cas::Token> & expected,
+                              const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
+    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::deleteExact(key, token);
+    }
+
+private:
+    void waitIfMeta(const String & key)
+    {
+        if (!armed.load() || !key.ends_with(".meta"))
+            return;
+        entered.store(true);
+        std::unique_lock lock(latch_mutex);
+        latch_cv.wait(lock, [this] { return released; });
+    }
+
+    std::atomic<bool> armed{false};
+    std::mutex latch_mutex;
+    std::condition_variable latch_cv;
+    bool released = false;
+};
+
+/// Wait until a latched job has provably reached the backend. A bounded wait that FAILS rather than
+/// hangs: a job that never arrives is a broken fixture, and a test that hangs on it reports nothing.
+inline void awaitLatchEntered(MetaWriteLatchBackend & backend)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!backend.entered.load())
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "no meta job reached the backend latch -- the fixture never scheduled one";
+        std::this_thread::yield();
+    }
+}
 
 }
