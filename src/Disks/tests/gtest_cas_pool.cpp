@@ -1769,6 +1769,35 @@ private:
     int old_level;
 };
 
+class ScopedParkedRenewalLogCapture
+{
+public:
+    ScopedParkedRenewalLogCapture()
+        : logger(getLogger("CasMountLeaseKeeper"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("information");
+    }
+
+    ~ScopedParkedRenewalLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
+};
+
 size_t countRemountFinalLogs(const String & output)
 {
     constexpr std::string_view needle = "CAS whole-chain remount attempt";
@@ -2980,6 +3009,136 @@ TEST(CASPoolRemount, StaleRemountAnchorPerformsParkedRedo)
     committed.release();
 }
 
+TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    uint64_t fake_boot = 100;
+    std::promise<void> result_observed;
+    std::future<void> result_future = result_observed.get_future();
+    std::atomic<bool> result_published{false};
+    std::mutex events_mutex;
+    std::vector<CasEvent> events;
+    PoolConfig config{
+        .pool_prefix = "parked-redo-recovered-observability",
+        .server_root_id = "test",
+        .background_watermark = true,
+        .event_sink = [&](CasEvent event)
+        {
+            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "ok";
+            {
+                std::lock_guard lock(events_mutex);
+                events.push_back(std::move(event));
+            }
+            if (final_remount && !result_published.exchange(true))
+                result_observed.set_value();
+        },
+        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = runtimeRenewBudget(2),
+        .boot_ms_fn = [&] { return fake_boot; },
+        .remount_quiesce_hook_for_test = [&]
+        {
+            fake_boot += 900;
+            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+        },
+    };
+    auto store = Pool::open(backend, config);
+    ScopedParkedRenewalLogCapture renewal_logs;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->scheduleRemountForTest());
+    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
+
+    std::vector<CasEvent> observed;
+    {
+        std::lock_guard lock(events_mutex);
+        observed = events;
+    }
+    const auto retrying = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::WatermarkRenew && event.outcome == "retrying";
+    });
+    const auto recovered = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::WatermarkRenew && event.outcome == "recovered";
+    });
+    const auto remounted = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::MountRemount && event.outcome == "ok";
+    });
+    ASSERT_NE(retrying, observed.end());
+    ASSERT_NE(recovered, observed.end());
+    ASSERT_NE(remounted, observed.end());
+    EXPECT_LT(std::distance(observed.begin(), retrying), std::distance(observed.begin(), recovered));
+    EXPECT_LT(std::distance(observed.begin(), recovered), std::distance(observed.begin(), remounted));
+    EXPECT_EQ(retrying->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
+    EXPECT_EQ(recovered->detail.at("remount_attempt_no"), remounted->detail.at("attempt_no"));
+    EXPECT_EQ(recovered->detail.at("classification"), "committed_after_retry");
+    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' recovered"), String::npos);
+
+}
+
+TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
+{
+    auto backend = std::make_shared<RuntimeRenewBackend>();
+    uint64_t fake_boot = 100;
+    std::promise<void> result_observed;
+    std::future<void> result_future = result_observed.get_future();
+    std::atomic<bool> result_published{false};
+    std::mutex events_mutex;
+    std::vector<CasEvent> events;
+    PoolConfig config{
+        .pool_prefix = "parked-redo-failed-observability",
+        .server_root_id = "test",
+        .background_watermark = true,
+        .event_sink = [&](CasEvent event)
+        {
+            const bool final_remount = event.type == CasEventType::MountRemount && event.outcome == "failed";
+            {
+                std::lock_guard lock(events_mutex);
+                events.push_back(std::move(event));
+            }
+            if (final_remount && !result_published.exchange(true))
+                result_observed.set_value();
+        },
+        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = runtimeRenewBudget(1),
+        .boot_ms_fn = [&] { return fake_boot; },
+        .remount_quiesce_hook_for_test = [&]
+        {
+            fake_boot += 900;
+            backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
+        },
+    };
+    auto store = Pool::open(backend, config);
+    ScopedParkedRenewalLogCapture renewal_logs;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->scheduleRemountForTest());
+    ASSERT_EQ(result_future.wait_for(std::chrono::seconds(20)), std::future_status::ready);
+
+    std::vector<CasEvent> observed;
+    {
+        std::lock_guard lock(events_mutex);
+        observed = events;
+    }
+    const auto failed_renew = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::WatermarkRenew && event.outcome == "failed";
+    });
+    const auto failed_remount = std::find_if(observed.begin(), observed.end(), [](const CasEvent & event)
+    {
+        return event.type == CasEventType::MountRemount && event.outcome == "failed";
+    });
+    ASSERT_NE(failed_renew, observed.end());
+    ASSERT_NE(failed_remount, observed.end());
+    EXPECT_LT(std::distance(observed.begin(), failed_renew), std::distance(observed.begin(), failed_remount));
+    EXPECT_EQ(failed_renew->detail.at("remount_attempt_no"), failed_remount->detail.at("attempt_no"));
+    EXPECT_EQ(failed_renew->detail.at("attempts_sent"), "1");
+    EXPECT_EQ(failed_renew->detail.at("classification"), "attempts_exhausted");
+    EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' fenced"), String::npos);
+
+}
+
 TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -3275,6 +3434,23 @@ TEST(CASPoolRemount, LeaseLossHasOneOperationalOwner)
     store->tripMountLost();
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before + 1);
+}
+
+TEST(CASPoolRemount, LiveForgetDoesNotCountOperationalLeaseLoss)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "forget-is-not-lease-loss",
+        .server_root_id = "test",
+    });
+    ASSERT_EQ(store->lifecycle(), PoolLifecycle::Live);
+    const uint64_t lost_before = ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load();
+
+    store->forgetDisk([] {}, "deliberate test decommission");
+
+    EXPECT_EQ(store->lifecycle(), PoolLifecycle::VanishedForgotten);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountLeaseLost].load(), lost_before)
+        << "a deliberate terminal decommission is not an operational recovery generation";
 }
 
 /// Coverage gap (Task 13a): restores the get/exists/remove roundtrip for the mount access-check probe

@@ -36,7 +36,8 @@ namespace DB::Cas
 
 void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept;
 void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
-void configureMountRenewObservabilityDelivery(bool enabled) noexcept;
+void configureMountRenewObservability(
+    const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
 
 namespace
 {
@@ -100,8 +101,11 @@ void CasMountRuntime::tripMountLost()
     /// A durable-effect caller admitted under the incarnation this trip just ended must never conclude
     /// the fence is fine again just because a LATER `armMountFence` happens to re-arm it (rev.7 [C2]).
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
-    /// `noteLeaseLost` owns the one-per-generation transition metric for every caller.
-    (void)noteLeaseLost();
+    /// FORGET publishes terminal intent before tripping the fence. That deliberate decommission is not
+    /// an operational loss/recovery generation and must not pass through the transient-loss accounting
+    /// edge. Ordinary external or renewal loss has no terminal intent and retains the single CAS winner.
+    if (!vanishedIntentPublished())
+        (void)noteLeaseLost();
 }
 
 void CasMountRuntime::tripFenceWithoutOperationalLoss()
@@ -526,10 +530,10 @@ uint64_t CasMountRuntime::renewKeeperOnce(
     bool propagate_failure,
     bool worker_call)
 {
-    /// A parked redo runs under the whole-chain remount serializer and is represented by that
-    /// attempt's one final result. Keep its physical counters, but suppress renewal event/log delivery
-    /// so no allocation or callback crosses `remount_mutex`.
-    configureMountRenewObservabilityDelivery(active != RenewalDriverState::RemountCall);
+    /// Configuration is pointer/POD-only. A parked redo retains its completed observation for the
+    /// whole-chain finalizer to deliver after `remount_mutex` is released.
+    configureMountRenewObservability(
+        &server_root_id, &event_sink, active == RenewalDriverState::RemountCall);
     const MountRenewResult result = call.keeper->renew(cas_request_budget, renewalEnvironment(worker_call));
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle

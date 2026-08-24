@@ -20,6 +20,7 @@ using DB::Cas::tests::u128Of;
 
 namespace DB::ErrorCodes
 {
+extern const int BAD_ARGUMENTS;
 extern const int NETWORK_ERROR;
 }
 
@@ -32,6 +33,7 @@ public:
     using InMemoryBackend::putOverwrite;
 
     bool throw_before_next_overwrite = false;
+    bool throw_nonretryable_next_overwrite = false;
 
     PutResult putOverwrite(
         const String & key,
@@ -39,6 +41,8 @@ public:
         const Token & expected,
         const ObjectMeta & meta) override
     {
+        if (std::exchange(throw_nonretryable_next_overwrite, false))
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected deterministic renewal rejection");
         if (std::exchange(throw_before_next_overwrite, false))
             throw Poco::TimeoutException("injected renewal timeout before commit");
         return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
@@ -57,13 +61,17 @@ CasRequestBudget renewalEventBudget()
     };
 }
 
-PoolPtr openRenewalEventPool(const std::shared_ptr<RenewalEventBackend> & backend, uint64_t & boot_ms)
+PoolPtr openRenewalEventPool(
+    const std::shared_ptr<RenewalEventBackend> & backend,
+    uint64_t & boot_ms,
+    CasRequestBudget budget = renewalEventBudget(),
+    String prefix = "renewal-events")
 {
     return Pool::open(backend, PoolConfig{
-        .pool_prefix = "renewal-events",
+        .pool_prefix = std::move(prefix),
         .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
-        .cas_request_budget = renewalEventBudget(),
+        .cas_request_budget = budget,
         .boot_ms_fn = [&] { return boot_ms; },
     });
 }
@@ -201,6 +209,99 @@ TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
     EXPECT_NO_THROW(store->renewWatermarkOnce());
     EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).seq, seq_before + 1);
     EXPECT_TRUE(store->mayMutate());
+}
+
+TEST(CASEvent, TerminalRenewalDetailsPreservePhysicalTruthAndClassification)
+{
+    const auto one_failed_event = [](const std::vector<CasEvent> & events) -> CasEvent
+    {
+        const std::vector<CasEvent> renewals = watermarkRenewEvents(events);
+        const auto failed = std::find_if(renewals.begin(), renewals.end(), [](const CasEvent & event)
+        {
+            return event.outcome == "failed";
+        });
+        EXPECT_NE(failed, renewals.end());
+        return failed == renewals.end() ? CasEvent{} : *failed;
+    };
+
+    {
+        auto backend = std::make_shared<RenewalEventBackend>();
+        uint64_t boot_ms = 100;
+        std::vector<CasEvent> events;
+        auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-deterministic-details");
+        store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+        backend->throw_nonretryable_next_overwrite = true;
+
+        EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+        const CasEvent failed = one_failed_event(events);
+        EXPECT_EQ(failed.detail.at("attempts_sent"), "1");
+        EXPECT_EQ(failed.detail.at("unresolved_reason"), "not_unresolved");
+        EXPECT_EQ(failed.detail.at("stop_cause"), "continue");
+        EXPECT_EQ(failed.detail.at("classification"), "deterministic_failure");
+    }
+
+    {
+        auto backend = std::make_shared<RenewalEventBackend>();
+        uint64_t boot_ms = 100;
+        std::vector<CasEvent> events;
+        CasRequestBudget budget = renewalEventBudget();
+        budget.max_attempts = 1;
+        auto store = openRenewalEventPool(backend, boot_ms, budget, "renewal-exhausted-details");
+        store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+        backend->throw_before_next_overwrite = true;
+
+        EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+        const CasEvent failed = one_failed_event(events);
+        EXPECT_EQ(failed.detail.at("attempts_sent"), "1");
+        EXPECT_EQ(failed.detail.at("unresolved_reason"), "attempts_exhausted");
+        EXPECT_EQ(failed.detail.at("classification"), "attempts_exhausted");
+    }
+
+    {
+        auto backend = std::make_shared<RenewalEventBackend>();
+        uint64_t boot_ms = 100;
+        std::vector<CasEvent> events;
+        auto store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-deadline-details");
+        store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
+        boot_ms = 1071;
+
+        EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
+        const CasEvent failed = one_failed_event(events);
+        EXPECT_EQ(failed.detail.at("attempts_sent"), "0");
+        EXPECT_EQ(failed.detail.at("unresolved_reason"), "no_attempt_sent");
+        EXPECT_EQ(failed.detail.at("deadline_source"), "external_lease_safety");
+        EXPECT_EQ(failed.detail.at("classification"), "external_lease_deadline");
+    }
+}
+
+TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    uint64_t boot_ms = 100;
+    std::vector<CasEvent> events;
+    PoolPtr store = openRenewalEventPool(backend, boot_ms, renewalEventBudget(), "renewal-reentrant-sink");
+    bool reentered = false;
+    store->setEventSink([&](CasEvent event)
+    {
+        if (event.type != CasEventType::WatermarkRenew)
+            return;
+        events.push_back(event);
+        if (event.outcome == "retrying" && !std::exchange(reentered, true))
+            store->renewWatermarkOnce();
+    });
+
+    backend->throw_before_next_overwrite = true;
+    EXPECT_NO_THROW(store->renewWatermarkOnce());
+
+    ASSERT_TRUE(reentered);
+    ASSERT_EQ(events.size(), 2u);
+    EXPECT_EQ(events[0].outcome, "retrying");
+    EXPECT_EQ(events[1].outcome, "recovered");
+    EXPECT_EQ(events[0].detail.at("seq"), "2");
+    EXPECT_EQ(events[1].detail.at("seq"), events[0].detail.at("seq"));
+    EXPECT_EQ(events[1].detail.at("write_attempt_id"), events[0].detail.at("write_attempt_id"));
+    EXPECT_EQ(decodeMountLease(backend->get(store->layout().mountKey("test"))->bytes).seq, 3u)
+        << "the nested first-attempt success must run without replacing the outer observation";
 }
 
 /// Round-B opt §6: `emitEvent` takes the event BY VALUE (moved-through, not `const &`), so a

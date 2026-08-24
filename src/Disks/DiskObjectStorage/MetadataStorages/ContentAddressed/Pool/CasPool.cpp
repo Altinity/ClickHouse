@@ -69,6 +69,8 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
+void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept;
+
 namespace
 {
 
@@ -1017,6 +1019,11 @@ bool Pool::tryRemountOnce()
     String error;
     SCOPE_EXIT(
     {
+        /// A parked redo completed while the whole-chain serializer was held. Drain its POD snapshot
+        /// first, after lock destruction, so renewal recovery/failure precedes and correlates with the
+        /// containing remount result without any callback or allocation under `remount_mutex`.
+        deliverDeferredMountRenewObservability(attempt_no);
+
         if (succeeded)
             ProfileEvents::increment(ProfileEvents::CASRemountSucceeded);
         else

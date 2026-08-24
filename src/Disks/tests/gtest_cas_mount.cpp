@@ -5,9 +5,12 @@
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Poco/Exception.h>
+#include <Poco/Message.h>
 #include <Poco/StreamChannel.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <future>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -26,6 +29,8 @@ namespace ProfileEvents
 {
     extern const Event CASMountLeaseLost;
     extern const Event CASMountExclusivityViolation;
+    extern const Event CASMountRenewalAttempts;
+    extern const Event CASMountRenewalRetries;
 }
 
 using namespace DB::Cas;
@@ -112,16 +117,116 @@ public:
 
     bool throw_before_next_overwrite = false;
 
+    void armBlockedRetry()
+    {
+        std::lock_guard lock(mutex);
+        blocked_retry_armed = true;
+        renewal_puts = 0;
+        second_put_arrived = false;
+        release_second_put = false;
+    }
+
+    bool waitForSecondPut()
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(2), [&] { return second_put_arrived; });
+    }
+
+    void releaseSecondPut()
+    {
+        std::lock_guard lock(mutex);
+        release_second_put = true;
+        cv.notify_all();
+    }
+
     PutResult putOverwrite(
         const String & key,
         const String & bytes,
         const Token & expected,
         const ObjectMeta & meta) override
     {
+        {
+            std::unique_lock lock(mutex);
+            if (blocked_retry_armed)
+            {
+                ++renewal_puts;
+                if (renewal_puts == 1)
+                    throw Poco::TimeoutException("injected renewal timeout before blocked retry");
+                if (renewal_puts == 2)
+                {
+                    second_put_arrived = true;
+                    cv.notify_all();
+                    if (!cv.wait_for(lock, std::chrono::seconds(20), [&] { return release_second_put; }))
+                        throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "blocked renewal retry was not released");
+                    blocked_retry_armed = false;
+                }
+            }
+        }
         if (std::exchange(throw_before_next_overwrite, false))
             throw Poco::TimeoutException("injected renewal timeout before commit");
         return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
     }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool blocked_retry_armed = false;
+    uint32_t renewal_puts = 0;
+    bool second_put_arrived = false;
+    bool release_second_put = false;
+};
+
+class BlockingRenewalDebugChannel final : public Poco::Channel
+{
+public:
+    void log(const Poco::Message & message) override
+    {
+        if (message.getText().find("physical retry attempt") == String::npos)
+            return;
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, std::chrono::seconds(20), [&] { return released; });
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool released = false;
+};
+
+class ScopedBlockingRenewalDebugLog
+{
+public:
+    ScopedBlockingRenewalDebugLog()
+        : logger(getLogger("CasMountLeaseKeeper"))
+        , channel(new BlockingRenewalDebugChannel)
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("debug");
+    }
+
+    ~ScopedBlockingRenewalDebugLog()
+    {
+        channel->release();
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    void release() { channel->release(); }
+
+private:
+    LoggerPtr logger;
+    Poco::AutoPtr<BlockingRenewalDebugChannel> channel;
+    Poco::Channel * old_channel;
+    int old_level;
 };
 
 class ScopedRenewalLogCapture
@@ -233,6 +338,42 @@ TEST(CASMountAudit, RenewalDefaultLogsAreBounded)
         EXPECT_EQ(countRenewalLogText(output, "fenced"), 1u) << output;
         EXPECT_EQ(countRenewalLogText(output, "entered retry"), 0u) << output;
     }
+}
+
+TEST(CASMountAudit, PhysicalRetryCannotBeDelayedByDebugLogging)
+{
+    auto backend = std::make_shared<RenewalLogBackend>();
+    uint64_t boot_ms = 100;
+    auto store = Pool::open(backend, PoolConfig{
+        .pool_prefix = "renewal-debug-order",
+        .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+        .cas_request_budget = renewalLogBudget(),
+        .boot_ms_fn = [&] { return boot_ms; },
+    });
+
+    const uint64_t attempts_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountRenewalAttempts].load();
+    const uint64_t retries_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountRenewalRetries].load();
+    backend->armBlockedRetry();
+    ScopedBlockingRenewalDebugLog blocked_log;
+    auto renewal = std::async(std::launch::async, [&] { store->renewWatermarkOnce(); });
+
+    const bool retry_reached_backend = backend->waitForSecondPut();
+    EXPECT_TRUE(retry_reached_backend)
+        << "diagnostic logging after retry admission must not delay the backend request";
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CASMountRenewalAttempts].load(),
+        attempts_before + 2)
+        << "physical attempt visibility must precede completion of the in-flight retry";
+    EXPECT_EQ(
+        ProfileEvents::global_counters[ProfileEvents::CASMountRenewalRetries].load(),
+        retries_before + 1);
+
+    blocked_log.release();
+    backend->releaseSecondPut();
+    EXPECT_NO_THROW(renewal.get());
 }
 
 TEST(CASServerRootId, ValidationAcceptsCleanPathsRejectsBad)
