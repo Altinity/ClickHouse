@@ -665,9 +665,13 @@ CasOverwriteResult CasRequestController::putOverwriteControlledImpl(
         try
         {
             got = backend->get(key_s);
+            diagnostics.resolve_observation_completed = true;
+            diagnostics.observed_bytes = got ? std::optional<String>{got->bytes} : std::nullopt;
         }
         catch (const std::exception &)
         {
+            diagnostics.resolve_observation_completed = false;
+            diagnostics.observed_bytes.reset();
             got.reset();   /// GET failed: still ambiguous, fall through to retry below.
         }
 

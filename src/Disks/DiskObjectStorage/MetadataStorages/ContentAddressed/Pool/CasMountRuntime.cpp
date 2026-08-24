@@ -92,9 +92,7 @@ void CasMountRuntime::tripMountLost()
     fence_generation.fetch_add(1, std::memory_order_acq_rel);
     /// The lease-loss event is exactly the `Live -> TransientNotLive` transition of the §1 state model.
     /// Idempotent and terminal-safe (a compare-exchange from `Live` only).
-    const PoolLifecycle before = lifecycle();
-    noteLeaseLost();
-    if (before == PoolLifecycle::Live && lifecycle() == PoolLifecycle::TransientNotLive)
+    if (noteLeaseLost())
         ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
 }
 
@@ -171,12 +169,9 @@ uint64_t CasMountRuntime::peekNextBuildSeq()
 
 void CasMountRuntime::renewWatermarkOnce()
 {
-    /// A read-only runtime has no heartbeat to renew. Report that misuse instead of fabricating a keeper
-    /// or silently treating the call as successful.
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Pool");
+    auto call = admitKeeperCall(RenewalDriverState::Dormant, RenewalDriverState::DirectCall);
     (void)renewKeeperOnce(
-        RenewalDriverState::Dormant,
+        std::move(call),
         RenewalDriverState::DirectCall,
         /*propagate_failure=*/true,
         /*worker_call=*/false);
@@ -243,18 +238,10 @@ void CasMountRuntime::setLiveWriterEpoch(uint64_t v)
     live_writer_epoch.store(v, std::memory_order_release);
 }
 
-CasMountRuntime::DriverLease::DriverLease(
-    CasMountRuntime & runtime_, RenewalDriverState required_, RenewalDriverState active_)
+CasMountRuntime::DriverLease::DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_)
     : runtime(runtime_)
     , active(active_)
 {
-    std::lock_guard lock(runtime.driver_mutex);
-    if (runtime.renewal_driver_state != required_)
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "CAS mount runtime: renewal driver is not admitted from the required state");
-    runtime.renewal_driver_state = active;
-    runtime.driver_cv.notify_all();
 }
 
 CasMountRuntime::DriverLease::~DriverLease()
@@ -276,7 +263,9 @@ CasMountRuntime::DriverLease::~DriverLease()
     runtime.driver_cv.notify_all();
 }
 
-RenewalDriverState CasMountRuntime::DriverLease::finish(RenewalDriverState ordinary_destination)
+RenewalDriverState CasMountRuntime::DriverLease::finish(
+    RenewalDriverState ordinary_destination,
+    const MountRenewResult * result)
 {
     std::lock_guard lock(runtime.driver_mutex);
     if (runtime.workers_stop_requested)
@@ -286,9 +275,55 @@ RenewalDriverState CasMountRuntime::DriverLease::finish(RenewalDriverState ordin
         runtime.renewal_driver_state = RenewalDriverState::Parked;
     else
         runtime.renewal_driver_state = ordinary_destination;
+    if (result && result->outcome == MountRenewOutcome::Terminal)
+    {
+        if (runtime.renewal_driver_state == RenewalDriverState::WorkerIdle
+            || active == RenewalDriverState::DirectCall)
+        {
+            runtime.tripMountLost();
+            runtime.schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
+            if (runtime.config.background_watermark
+                && !runtime.workers_stop_requested
+                && !runtime.remountTerminal())
+            {
+                ++runtime.remount_requested_generation;
+                if (active == RenewalDriverState::WorkerCall)
+                    runtime.renewal_driver_state = RenewalDriverState::Parked;
+            }
+        }
+        else if (runtime.renewal_driver_state == RenewalDriverState::Stopping
+                 || active == RenewalDriverState::StartupCall)
+        {
+            runtime.tripFenceWithoutOperationalLoss();
+        }
+    }
     finished = true;
     runtime.driver_cv.notify_all();
     return runtime.renewal_driver_state;
+}
+
+CasMountRuntime::AdmittedKeeperCall CasMountRuntime::admitKeeperCall(
+    RenewalDriverState required,
+    RenewalDriverState active)
+{
+    std::lock_guard lock(driver_mutex);
+    if (active == RenewalDriverState::DirectCall && config.background_watermark)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "CAS mount runtime: direct renewal is disabled when background ownership is configured");
+    if (renewal_driver_state != required)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "CAS mount runtime: renewal driver is not admitted from the required state");
+    if (!mount_keeper)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a keeper");
+    if (mount_keeper->state() != MountLeaseKeeperState::Active)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal requires an Active keeper");
+    MountLeaseKeeper * keeper = mount_keeper.get();
+    auto lease = std::make_unique<DriverLease>(*this, active);
+    renewal_driver_state = active;
+    driver_cv.notify_all();
+    return AdmittedKeeperCall{std::move(lease), keeper};
 }
 
 void CasMountRuntime::installKeeper(
@@ -315,23 +350,22 @@ void CasMountRuntime::installKeeper(
 
 uint64_t CasMountRuntime::startKeeper()
 {
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper without a keeper");
-
-    RenewalDriverState required;
     RenewalDriverState active;
     RenewalDriverState destination;
+    MountLeaseKeeper * keeper;
     {
         std::lock_guard lock(driver_mutex);
+        if (!mount_keeper)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper without a keeper");
+        if (mount_keeper->state() != MountLeaseKeeperState::New)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper requires a New keeper");
         if (renewal_driver_state == RenewalDriverState::Dormant)
         {
-            required = RenewalDriverState::Dormant;
             active = RenewalDriverState::StartupCall;
             destination = RenewalDriverState::Dormant;
         }
         else if (renewal_driver_state == RenewalDriverState::Parked)
         {
-            required = RenewalDriverState::Parked;
             active = RenewalDriverState::RemountCall;
             destination = RenewalDriverState::Parked;
         }
@@ -339,10 +373,13 @@ uint64_t CasMountRuntime::startKeeper()
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: startKeeper is not admitted in the current state");
         }
+        keeper = mount_keeper.get();
+        renewal_driver_state = active;
+        driver_cv.notify_all();
     }
 
-    DriverLease lease(*this, required, active);
-    const uint64_t anchor = mount_keeper->start();
+    DriverLease lease(*this, active);
+    const uint64_t anchor = keeper->start();
     (void)lease.finish(destination);
     return anchor;
 }
@@ -351,7 +388,12 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
 {
     return MountRenewOperationEnvironment{
         .boot_ms = [this] { return bootMsNow(); },
-        .stop_cause = [this, worker_call] { return renewalStopCause(worker_call); },
+        .stop_cause = [this, worker_call]
+        {
+            return config.renewal_stop_cause_for_test
+                ? config.renewal_stop_cause_for_test()
+                : renewalStopCause(worker_call);
+        },
         .wait_before_retry = [this, worker_call](uint64_t wait_ms) { return waitForRetry(wait_ms, worker_call); },
         .observe = {},
     };
@@ -427,48 +469,35 @@ void CasMountRuntime::consumeRenewResult(
     {
     }
 
-    if (returned_state == RenewalDriverState::WorkerIdle
-        || active_state == RenewalDriverState::DirectCall)
-    {
-        tripMountLost();
-        scheduleRemount();
-    }
-    else if (returned_state == RenewalDriverState::Stopping
-             || active_state == RenewalDriverState::StartupCall)
-    {
-        tripFenceWithoutOperationalLoss();
-    }
-    /// A terminal returning to Parked is deposition only. The generation that requested parking owns
-    /// recovery, so there is no duplicate loss count or remount request.
+    (void)active_state;
+    (void)returned_state;
 
     if (propagate_failure)
         std::rethrow_exception(result.failure);
 }
 
 uint64_t CasMountRuntime::renewKeeperOnce(
-    RenewalDriverState required,
+    AdmittedKeeperCall call,
     RenewalDriverState active,
     bool propagate_failure,
     bool worker_call)
 {
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount runtime: renewal without a keeper");
-    DriverLease lease(*this, required, active);
-    const MountRenewResult result = mount_keeper->renew(cas_request_budget, renewalEnvironment(worker_call));
+    const MountRenewResult result = call.keeper->renew(cas_request_budget, renewalEnvironment(worker_call));
     const RenewalDriverState destination = active == RenewalDriverState::WorkerCall
         ? RenewalDriverState::WorkerIdle
         : (active == RenewalDriverState::RemountCall ? RenewalDriverState::Parked : RenewalDriverState::Dormant);
-    const RenewalDriverState returned_state = lease.finish(destination);
+    const RenewalDriverState returned_state = call.lease->finish(destination, &result);
+    if (result.outcome == MountRenewOutcome::Terminal && config.renewal_terminal_deposited_hook_for_test)
+        config.renewal_terminal_deposited_hook_for_test();
     consumeRenewResult(result, active, returned_state, propagate_failure);
-    return result.outcome == MountRenewOutcome::Committed
-        ? result.attempt_start_boot_ms
-        : mount_keeper->lastCommittedAttemptStartBootMs();
+    return result.attempt_start_boot_ms;
 }
 
 uint64_t CasMountRuntime::renewKeeperForStartupOnce()
 {
+    auto call = admitKeeperCall(RenewalDriverState::Dormant, RenewalDriverState::StartupCall);
     return renewKeeperOnce(
-        RenewalDriverState::Dormant,
+        std::move(call),
         RenewalDriverState::StartupCall,
         /*propagate_failure=*/true,
         /*worker_call=*/false);
@@ -476,8 +505,9 @@ uint64_t CasMountRuntime::renewKeeperForStartupOnce()
 
 uint64_t CasMountRuntime::renewKeeperForRemountOnce()
 {
+    auto call = admitKeeperCall(RenewalDriverState::Parked, RenewalDriverState::RemountCall);
     return renewKeeperOnce(
-        RenewalDriverState::Parked,
+        std::move(call),
         RenewalDriverState::RemountCall,
         /*propagate_failure=*/true,
         /*worker_call=*/false);
@@ -569,6 +599,7 @@ void CasMountRuntime::renewalLoop()
 
     while (true)
     {
+        AdmittedKeeperCall call;
         {
             std::unique_lock lock(driver_mutex);
             if (workers_stop_requested)
@@ -604,10 +635,17 @@ void CasMountRuntime::renewalLoop()
                 driver_cv.wait_for(lock, std::chrono::milliseconds(due - now));
                 continue;
             }
+            MountLeaseKeeper * keeper = mount_keeper.get();
+            auto lease = std::make_unique<DriverLease>(*this, RenewalDriverState::WorkerCall);
+            renewal_driver_state = RenewalDriverState::WorkerCall;
+            driver_cv.notify_all();
+            call = AdmittedKeeperCall{std::move(lease), keeper};
         }
 
+        if (config.renewal_admitted_hook_for_test)
+            config.renewal_admitted_hook_for_test();
         (void)renewKeeperOnce(
-            RenewalDriverState::WorkerIdle,
+            std::move(call),
             RenewalDriverState::WorkerCall,
             /*propagate_failure=*/false,
             /*worker_call=*/true);
@@ -748,7 +786,7 @@ void CasMountRuntime::setLifecycleForTest(PoolLifecycle lc)
     }
 }
 
-void CasMountRuntime::noteLeaseLost()
+bool CasMountRuntime::noteLeaseLost()
 {
     /// `Live -> TransientNotLive`, and nothing else. A compare-exchange FROM `Live` leaves every other
     /// state untouched, so a terminal state is never downgraded and a repeated call is a no-op. This is
@@ -760,7 +798,9 @@ void CasMountRuntime::noteLeaseLost()
         /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
         /// non-`Live`. Only the winning transition writes it (the guard above), so it is not re-stamped.
         lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+        return true;
     }
+    return false;
 }
 
 void CasMountRuntime::noteRemounted()

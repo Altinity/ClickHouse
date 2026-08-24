@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <optional>
 #include <string_view>
 
 namespace DB::Cas
@@ -376,6 +377,12 @@ struct CasOverwriteDiagnostics
     CasUnresolvedReason unresolved_reason = CasUnresolvedReason::NotUnresolved;
     CasOverwriteDeadlineSource deadline_source = CasOverwriteDeadlineSource::RequestBudget;
     CasOverwriteStopCause stop_cause = CasOverwriteStopCause::Continue;
+    /// The last exact resolving GET completed by this controller. `resolve_observation_completed`
+    /// distinguishes a confirmed absence (`observed_bytes == nullopt`) from a failed/not-run read.
+    /// Terminal protocol owners use this snapshot instead of starting diagnostic I/O after the
+    /// controller has closed its deadline/cancellation gate.
+    bool resolve_observation_completed = false;
+    std::optional<String> observed_bytes;
 };
 
 /// Result of one `CasRequestController::putOverwriteControlled` operation. `token` is meaningful

@@ -73,6 +73,14 @@ struct MountConfig
     std::function<uint64_t()> boot_ms_fn = {};
     std::function<void(uint64_t)> wait_sleep_fn = {};
     RuntimeWorkerFactory worker_factory = {};
+    /// Deterministic test interposition after a due worker has atomically reserved renewal ownership
+    /// and captured its keeper, but before keeper/backend I/O starts.
+    std::function<void()> renewal_admitted_hook_for_test = {};
+    /// Deterministic test interposition after terminal ownership has been deposited and the keeper is
+    /// no longer reachable by the completed call.
+    std::function<void()> renewal_terminal_deposited_hook_for_test = {};
+    /// Test-only override for exact pre/post-send controller gate interleavings.
+    std::function<CasOverwriteStopCause()> renewal_stop_cause_for_test = {};
 };
 
 /// Local, in-memory write fence. It is deliberately not checked by reading the object store for every
@@ -190,7 +198,8 @@ public:
     /// compare-exchange FROM `Live` only, so it never downgrades a terminal state. `tripMountLost`
     /// calls this (the lease-loss primitive), and the remount loop's identity gate calls it as its
     /// first step so a direct/forced remount attempt has a valid non-terminal predecessor state.
-    void noteLeaseLost();
+    /// Returns true only to the compare-exchange winner, which owns the one-per-loss metric.
+    bool noteLeaseLost();
     /// Non-terminal recovery transition: `TransientNotLive -> Live`. Called after a self-remount
     /// reclaimed a fresh incarnation. A compare-exchange FROM `TransientNotLive` only, so it NEVER
     /// revives `IdentityLost`/`Vanished` ([D3]).
@@ -299,8 +308,6 @@ public:
     void keeperReset();
     void startBackgroundWorkers(std::chrono::milliseconds period);
     void stopBackgroundWorkers();
-    bool hasKeeper() const { return static_cast<bool>(mount_keeper); }
-
     /// Latch a recovery generation. Persistent remount ownership means this never constructs a thread.
     void scheduleRemount();
     bool scheduleRemountForTest();
@@ -332,9 +339,9 @@ private:
     class DriverLease
     {
     public:
-        DriverLease(CasMountRuntime & runtime_, RenewalDriverState required_, RenewalDriverState active_);
+        DriverLease(CasMountRuntime & runtime_, RenewalDriverState active_);
         ~DriverLease();
-        RenewalDriverState finish(RenewalDriverState ordinary_destination);
+        RenewalDriverState finish(RenewalDriverState ordinary_destination, const MountRenewResult * result = nullptr);
 
     private:
         CasMountRuntime & runtime;
@@ -342,8 +349,15 @@ private:
         bool finished = false;
     };
 
+    struct AdmittedKeeperCall
+    {
+        std::unique_ptr<DriverLease> lease;
+        MountLeaseKeeper * keeper = nullptr;
+    };
+
+    AdmittedKeeperCall admitKeeperCall(RenewalDriverState required, RenewalDriverState active);
     uint64_t renewKeeperOnce(
-        RenewalDriverState required,
+        AdmittedKeeperCall call,
         RenewalDriverState active,
         bool propagate_failure,
         bool worker_call);

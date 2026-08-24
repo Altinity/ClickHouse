@@ -64,6 +64,7 @@ public:
     std::deque<Action> actions;
     std::vector<Attempt> attempts;
     std::function<void()> cancel_after_write;
+    uint64_t get_calls = 0;
 
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
     {
@@ -93,6 +94,7 @@ public:
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
+        ++get_calls;
         std::optional<GetResult> result = InMemoryBackend::get(key, range);
         if (pending && pending->key == key)
         {
@@ -578,10 +580,16 @@ TEST(CASHeartbeat, KeeperStateAllowsOnlyActiveReleaseOrTerminal)
             [&] { return wall_ms; }, [] { return uint64_t{7}; }, {}, std::chrono::milliseconds(20),
             [&] { return boot_ms; });
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::New);
+        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
+        EXPECT_THROW(keeper.release(), DB::Exception);
         EXPECT_EQ(keeper.start(), 100u);
+        EXPECT_THROW(keeper.start(), DB::Exception);
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::Active);
         keeper.release();
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::Released);
+        EXPECT_THROW(keeper.start(), DB::Exception);
+        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
+        EXPECT_THROW(keeper.release(), DB::Exception);
     }
 
     {
@@ -599,6 +607,9 @@ TEST(CASHeartbeat, KeeperStateAllowsOnlyActiveReleaseOrTerminal)
         EXPECT_EQ(result.outcome, MountRenewOutcome::Terminal);
         EXPECT_NE(result.failure, nullptr);
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::RenewalTerminal);
+        EXPECT_THROW(keeper.start(), DB::Exception);
+        EXPECT_THROW(keeper.renew(renewalBudget(), renewalEnvironment(boot_ms)), DB::Exception);
+        EXPECT_THROW(keeper.release(), DB::Exception);
     }
 }
 
@@ -651,6 +662,7 @@ TEST(CASHeartbeat, DeadlineBeforeSendTerminalizesWithTypedFailure)
         [&] { return boot_ms; });
     keeper.start();
     backend->attempts.clear();
+    backend->get_calls = 0;
     boot_ms = 180;
     const MountRenewResult result = keeper.renew(renewalBudget(), renewalEnvironment(boot_ms));
     const DB::Exception failure = terminalException(result);
@@ -658,6 +670,7 @@ TEST(CASHeartbeat, DeadlineBeforeSendTerminalizesWithTypedFailure)
     EXPECT_NE(failure.message().find("no attempt was sent"), String::npos) << failure.message();
     EXPECT_EQ(result.diagnostics.unresolved_reason, CasUnresolvedReason::NoAttemptSent);
     EXPECT_TRUE(backend->attempts.empty());
+    EXPECT_EQ(backend->get_calls, 0u) << "a pre-send terminal deadline must perform no diagnostic GET";
 }
 
 TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
@@ -673,6 +686,7 @@ TEST(CASHeartbeat, CancellationBeforeSendIsNotAttemptedAndAllowsRelease)
         [&] { return boot_ms; });
     keeper.start();
     backend->attempts.clear();
+    backend->get_calls = 0;
     const auto cancelled = [] { return CasOverwriteStopCause::Cancelled; };
     const MountRenewResult result = keeper.renew(renewalBudget(), renewalEnvironment(boot_ms, cancelled));
     EXPECT_EQ(result.outcome, MountRenewOutcome::NotAttempted);
@@ -697,6 +711,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
         [&] { return boot_ms; });
     keeper.start();
     backend->attempts.clear();
+    backend->get_calls = 0;
     backend->cancel_after_write = [&] { cancelled = true; };
     backend->actions = {RenewalScriptBackend::Action::ReturnThenCancel};
     const MountRenewResult result = keeper.renew(
@@ -706,6 +721,7 @@ TEST(CASHeartbeat, CancellationAfterSendIsTerminalAndForbidsRelease)
     const DB::Exception failure = terminalException(result);
     EXPECT_EQ(failure.code(), DB::ErrorCodes::NETWORK_ERROR);
     EXPECT_EQ(result.diagnostics.unresolved_reason, CasUnresolvedReason::FenceLostPostWrite);
+    EXPECT_EQ(backend->get_calls, 0u) << "post-write cancellation must not start a diagnostic GET";
     EXPECT_EQ(keeper.state(), MountLeaseKeeperState::RenewalTerminal);
     const String bytes_before = backend->get(layout.mountKey("test"))->bytes;
     EXPECT_FALSE(keeper.canRelease());
@@ -756,10 +772,12 @@ TEST(CASHeartbeat, SamePairTwinAndForeignOrSuccessorStayTerminal)
         ++current.seq;
         ASSERT_EQ(backend->putOverwrite(layout.mountKey("test"), encodeMountLease(current), got->token).outcome,
                   PutOutcome::Done);
+        backend->get_calls = 0;
         const MountRenewResult result = keeper.renew(renewalBudget(), renewalEnvironment(boot_ms));
         const DB::Exception failure = terminalException(result);
         EXPECT_NE(failure.code(), DB::ErrorCodes::LOGICAL_ERROR);
         EXPECT_EQ(keeper.state(), MountLeaseKeeperState::RenewalTerminal);
+        EXPECT_EQ(backend->get_calls, 1u) << "the controller's resolving GET must be the only terminal read";
     };
 
     run_case(UInt128{1}, 9, UInt128{0xAAAA});
@@ -871,12 +889,18 @@ TEST(CASHeartbeat, LateDeliveryAfterTerminalCannotRearmOrOverwriteSuccessor)
         ASSERT_FALSE(backend->attempts.empty());
         const auto delayed = backend->attempts.back();
         auto current = backend->get(delayed.key);
-        MountLease successor = decodeMountLease(current->bytes);
-        successor.writer_epoch = 10;
-        successor.write_attempt_id = UInt128{0xDDDD};
-        ++successor.seq;
-        ASSERT_EQ(backend->InMemoryBackend::putOverwrite(delayed.key, encodeMountLease(successor), current->token, {}).outcome,
+        MountLease fenced = decodeMountLease(current->bytes);
+        fenced.gc_fenced = true;
+        ++fenced.seq;
+        ASSERT_EQ(backend->InMemoryBackend::putOverwrite(delayed.key, encodeMountLease(fenced), current->token, {}).outcome,
                   PutOutcome::Done);
+        ASSERT_EQ(claimMount(*backend, layout, "after-successor", UInt128{1}, 10, wall_ms, 1000).kind,
+                  MountClaimResult::Claimed);
+        MountLeaseKeeper successor(
+            backend, layout, "after-successor", UInt128{1}, 10, std::chrono::milliseconds(1000),
+            [&] { return wall_ms; }, [] { return uint64_t{0}; }, {}, std::chrono::milliseconds(20),
+            [&] { return boot_ms; });
+        successor.start();
         EXPECT_EQ(backend->InMemoryBackend::putOverwrite(delayed.key, delayed.bytes, delayed.expected, {}).outcome,
                   PutOutcome::PreconditionFailed);
         EXPECT_EQ(decodeMountLease(backend->get(delayed.key)->bytes).writer_epoch, 10u);

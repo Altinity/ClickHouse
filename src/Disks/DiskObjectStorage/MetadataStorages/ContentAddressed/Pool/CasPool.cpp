@@ -327,6 +327,31 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
+    if (!config.read_only)
+    {
+        if (config.mount_lease_ttl_ms.count() <= 0 || config.mount_renew_period.count() < 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "CAS mount timing rejected: lease TTL must be positive and renewal period non-negative");
+        const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+        const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
+        validateCasRequestBudget(config.cas_request_budget, ttl_ms, period_ms);
+        if (config.background_watermark)
+        {
+            const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
+            const uint64_t attempt_ms = config.cas_request_budget.attempt_timeout_ms;
+            const bool cadence_fits = safety_ms <= ttl_ms
+                && period_ms <= ttl_ms - safety_ms
+                && attempt_ms <= ttl_ms - safety_ms - period_ms;
+            if (!cadence_fits)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "CAS mount renewal cadence rejected: period ({} ms) + attempt timeout ({} ms) must be "
+                    "at most TTL ({} ms) - safety margin ({} ms) when background renewal is enabled",
+                    period_ms, attempt_ms, ttl_ms, safety_ms);
+        }
+    }
+
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
     /// decorator only delegates and counts; it changes no behavior (read-only opens stay write-free).
@@ -552,14 +577,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     ///    hoisted above.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
 
-    /// CAS request budget: a
-    /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
-    /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
-    /// budget; logs the effective values once on success. The controller gates Pool's ref-mutation
-    /// paths; this validates the config invariant up front, before any attempt runs.
-    validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
-        static_cast<uint64_t>(store->config.mount_renew_period.count()));
-
+    /// `Pool::open` validated the CAS request budget before any writable publication. The controller
+    /// gates Pool's ref-mutation paths; the values below derive observation and publication horizons.
     /// Poll twice per renew period so a live holder's renewal is always observed within the
     /// observation window. Derived from existing config — no new knob.
     const uint64_t poll_interval_ms = std::max<uint64_t>(
@@ -735,10 +754,9 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         : claim_anchor_boot_ms + ttl_ms_u - safety_ms;
     const uint64_t now_boot_ms = store->bootMsNow();
     const uint64_t period_ms = static_cast<uint64_t>(store->config.mount_renew_period.count());
-    const uint64_t renewal_window_ms
-        = period_ms > std::numeric_limits<uint64_t>::max() - store->config.cas_request_budget.attempt_timeout_ms
-        ? std::numeric_limits<uint64_t>::max()
-        : period_ms + store->config.cas_request_budget.attempt_timeout_ms;
+    const uint64_t renewal_window_ms = store->config.background_watermark
+        ? period_ms + store->config.cas_request_budget.attempt_timeout_ms
+        : store->config.cas_request_budget.attempt_timeout_ms;
     /// Preserve one ordinary cadence followed by one physical renewal attempt inside the safe lease
     /// window. If that publication horizon was consumed, re-anchor synchronously before opening the
     /// fence; the keeper independently retains its per-request deadline checks.
@@ -1157,10 +1175,9 @@ bool Pool::tryRemountOnce()
             : remount_anchor_boot_ms + ttl_ms - safety_ms;
         const uint64_t now_boot_ms = mount_runtime.bootMsNow();
         const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
-        const uint64_t renewal_window_ms
-            = period_ms > std::numeric_limits<uint64_t>::max() - config.cas_request_budget.attempt_timeout_ms
-            ? std::numeric_limits<uint64_t>::max()
-            : period_ms + config.cas_request_budget.attempt_timeout_ms;
+        const uint64_t renewal_window_ms = config.background_watermark
+            ? period_ms + config.cas_request_budget.attempt_timeout_ms
+            : config.cas_request_budget.attempt_timeout_ms;
         const bool renewal_window_fits = now_boot_ms <= safe_deadline
             && renewal_window_ms <= safe_deadline - now_boot_ms;
         if (!renewal_window_fits)

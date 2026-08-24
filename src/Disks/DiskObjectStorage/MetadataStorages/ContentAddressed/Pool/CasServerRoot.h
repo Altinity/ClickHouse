@@ -506,7 +506,7 @@ public:
 private:
     String encodeBody(uint64_t seq_, uint64_t wall_ms, uint64_t min_active, UInt128 write_attempt_id) const;
     Token claim(const String & body);
-    [[noreturn]] void throwRenewConflict() const;
+    [[noreturn]] void throwRenewConflict(const CasOverwriteDiagnostics & diagnostics) const;
     MountRenewResult terminalResult(
         uint64_t attempt_start_boot_ms,
         CasOverwriteDiagnostics diagnostics,

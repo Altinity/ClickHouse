@@ -35,6 +35,7 @@ namespace ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
 }
 }
 
@@ -1017,10 +1018,14 @@ uint64_t MountLeaseKeeper::start()
     return attempt_start_boot_ms;
 }
 
-[[noreturn]] void MountLeaseKeeper::throwRenewConflict() const
+[[noreturn]] void MountLeaseKeeper::throwRenewConflict(const CasOverwriteDiagnostics & diagnostics) const
 {
-    const auto got = backend->get(key);
-    if (!got)
+    if (!diagnostics.resolve_observation_completed)
+        throw Exception(
+            ErrorCodes::NETWORK_ERROR,
+            "CAS mount-lease: key '{}' conflicted but the controller has no authoritative resolve observation",
+            key);
+    if (!diagnostics.observed_bytes)
     {
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
@@ -1030,7 +1035,7 @@ uint64_t MountLeaseKeeper::start()
             "CAS mount-lease: key '{}' vanished while renewing -- failing closed", key);
     }
 
-    const MountLease current = decodeMountLease(got->bytes);
+    const MountLease current = decodeMountLease(*diagnostics.observed_bytes);
     if (current.server_uuid == server_uuid && current.gc_fenced)
     {
         emitMountEvent(
@@ -1176,7 +1181,7 @@ MountRenewResult MountLeaseKeeper::renew(
     {
         try
         {
-            throwRenewConflict();
+            throwRenewConflict(controlled.diagnostics);
         }
         catch (...)
         {
@@ -1195,30 +1200,21 @@ MountRenewResult MountLeaseKeeper::renew(
         };
     }
 
-    /// Preserve the mount protocol's typed vanished-slot outcome. The controlled overwrite treats an
-    /// absent resolving `GET` conservatively as unresolved because a transport-ambiguous request may
-    /// still land. That ambiguity cannot restore local authority, but an exact absence observed here
-    /// still identifies the environmental terminal condition for the owning runtime and operator.
-    try
+    /// Preserve the typed vanished-slot outcome only when the controller itself completed an exact
+    /// resolving read. Never start diagnostic backend I/O after its terminal deadline/cancel gate.
+    if (controlled.diagnostics.resolve_observation_completed
+        && !controlled.diagnostics.observed_bytes)
     {
-        if (!backend->get(key))
-        {
-            emitMountEvent(
-                event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
-                "mount slot vanished while renewing -- failing closed");
-            return terminalResult(
-                attempt_start_boot_ms,
-                controlled.diagnostics,
-                std::make_exception_ptr(Exception(
-                    ErrorCodes::FILE_DOESNT_EXIST,
-                    "CAS mount-lease: key '{}' vanished while renewing -- failing closed",
-                    key)));
-        }
-    }
-    catch (...)
-    {
-        /// A failed diagnostic read proves no typed holder state. Retain the controller's unresolved
-        /// classification below instead of replacing it with another incidental backend exception.
+        emitMountEvent(
+            event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
+            "mount slot vanished while renewing -- failing closed");
+        return terminalResult(
+            attempt_start_boot_ms,
+            controlled.diagnostics,
+            std::make_exception_ptr(Exception(
+                ErrorCodes::FILE_DOESNT_EXIST,
+                "CAS mount-lease: key '{}' vanished while renewing -- failing closed",
+                key)));
     }
 
     const String reason = fmt::format(
