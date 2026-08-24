@@ -1589,7 +1589,7 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
     """
     Source has 3 columns (id, year, extra), destination has 2 (id, year).
     With `export_merge_tree_part_schema_match_mode` set to either `match_by_position` or
-    `match_by_name` and `ignore_extra_source_columns = 1`, the export must succeed: the
+    `match_by_name` and `export_merge_tree_part_ignore_extra_source_columns = 1`, the export must succeed: the
     trailing `extra` source column is dropped and only `id`/`year` land in the destination.
     """
     node = cluster.instances["replica1"]
@@ -1632,7 +1632,7 @@ def test_export_partition_source_more_columns_allowed_with_ignore_extra_setting(
         settings={
             "allow_insert_into_iceberg": 1,
             "export_merge_tree_part_schema_match_mode": schema_match_mode,
-            "ignore_extra_source_columns": 1,
+            "export_merge_tree_part_ignore_extra_source_columns": 1,
         },
     )
     wait_for_export_status(node=node, source_table=mt_table, dest_table=iceberg_table,
@@ -1656,7 +1656,7 @@ def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with
     cluster, schema_match_mode, expected_error
 ):
     """
-    Setting `ignore_extra_source_columns = 1` never relaxes the source-has-fewer-columns
+    Setting `export_merge_tree_part_ignore_extra_source_columns = 1` never relaxes the source-has-fewer-columns
     direction, in either `match_by_position` or `match_by_name` mode. Source has 2 columns
     (id, year), destination has 3 (id, year, extra): the destination cannot be filled from the
     source, so this must still be rejected synchronously even with the relaxed setting.
@@ -1679,7 +1679,7 @@ def test_export_partition_column_count_mismatch_source_fewer_still_rejected_with
         settings={
             "allow_insert_into_iceberg": 1,
             "export_merge_tree_part_schema_match_mode": schema_match_mode,
-            "ignore_extra_source_columns": 1,
+            "export_merge_tree_part_ignore_extra_source_columns": 1,
         },
     )
     assert expected_error in error, (
@@ -1831,7 +1831,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_type_re
         settings={
             "allow_insert_into_iceberg": 1,
             "export_merge_tree_part_schema_match_mode": schema_match_mode,
-            "ignore_extra_source_columns": 1,
+            "export_merge_tree_part_ignore_extra_source_columns": 1,
         },
     )
     assert "INCOMPATIBLE_COLUMNS" in error, (
@@ -1864,7 +1864,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_type_su
         settings={
             "allow_insert_into_iceberg": 1,
             "export_merge_tree_part_schema_match_mode": schema_match_mode,
-            "ignore_extra_source_columns": 1,
+            "export_merge_tree_part_ignore_extra_source_columns": 1,
             "export_merge_tree_part_allow_lossy_cast": 1,
         },
     )
@@ -1895,7 +1895,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_name(cl
         settings={
             "allow_insert_into_iceberg": 1,
             "export_merge_tree_part_schema_match_mode": "match_by_position",
-            "ignore_extra_source_columns": 1,
+            "export_merge_tree_part_ignore_extra_source_columns": 1,
         },
     )
     wait_for_export_status(node=node, source_table=mt_table, dest_table=iceberg_table,
@@ -1911,7 +1911,7 @@ def test_export_partition_ignore_extra_setting_prefix_contains_different_name(cl
 def test_export_partition_matches_columns_when_column_counts_are_equal(cluster, schema_match_mode):
     """Source and destination declare the same 2 columns, in the same order and with the same
     names, so `match_by_position` and `match_by_name` must agree and both succeed identically -
-    there is no unmatched source column for `ignore_extra_source_columns` to affect."""
+    there is no unmatched source column for `export_merge_tree_part_ignore_extra_source_columns` to affect."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
@@ -1952,7 +1952,7 @@ def test_export_partition_column_count_mismatch_into_table_with_existing_data(cl
     ignore_extra_settings = {
         "allow_insert_into_iceberg": 1,
         "export_merge_tree_part_schema_match_mode": "match_by_position",
-        "ignore_extra_source_columns": 1,
+        "export_merge_tree_part_ignore_extra_source_columns": 1,
     }
 
     make_rmt(node=node, name=mt_seed_table, columns="id Int32, year Int32, extra String",
@@ -2002,7 +2002,7 @@ def test_export_partition_column_count_mismatch_into_partition_that_already_has_
     ignore_extra_settings = {
         "allow_insert_into_iceberg": 1,
         "export_merge_tree_part_schema_match_mode": "match_by_position",
-        "ignore_extra_source_columns": 1,
+        "export_merge_tree_part_ignore_extra_source_columns": 1,
     }
 
     make_rmt(node=node, name=mt_table, columns="id Int32, year Int32, extra String",

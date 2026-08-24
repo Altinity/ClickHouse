@@ -2296,7 +2296,7 @@ def test_export_partition_schema_match_mode_honored_by_non_initiating_replica(cl
     replica1.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}',"
-        f" ignore_extra_source_columns = 1"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
     )
 
     wait_for_export_status(node=replica1, source_table=mt_table, dest_table=s3_table,
@@ -2352,7 +2352,7 @@ def test_export_partition_match_by_name_honored_by_non_initiating_replica(cluste
     replica1.query(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_part_schema_match_mode = 'match_by_name',"
-        f" ignore_extra_source_columns = 1"
+        f" export_merge_tree_part_ignore_extra_source_columns = 1"
     )
 
     wait_for_export_status(

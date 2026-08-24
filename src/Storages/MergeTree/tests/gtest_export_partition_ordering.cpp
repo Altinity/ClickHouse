@@ -24,7 +24,7 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
-    extern const SettingsBool ignore_extra_source_columns;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace
@@ -218,7 +218,7 @@ TEST_F(ExportPartitionManifestBackCompatTest, MissingSchemaMatchSettingsFallBack
         worker_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value,
         MergeTreePartExportSchemaMatchMode::match_by_position);
     EXPECT_EQ(
-        worker_context->getSettingsRef()[Setting::ignore_extra_source_columns].value,
+        worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
         false);
 }
 
@@ -247,7 +247,7 @@ TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToW
         auto worker_context = ExportPartitionUtils::getContextCopyWithTaskSettings(getContext().context, manifest);
 
         EXPECT_EQ(
-            worker_context->getSettingsRef()[Setting::ignore_extra_source_columns].value,
+            worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
             value) << "value=" << value;
     }
 }

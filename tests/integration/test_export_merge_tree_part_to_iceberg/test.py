@@ -761,7 +761,7 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
         node=node, table=mt, part=part_2020, dest=iceberg,
         extra_settings=(
             f"export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-            f"ignore_extra_source_columns = 1"
+            f"export_merge_tree_part_ignore_extra_source_columns = 1"
         ),
     )
     wait_for_export_part(node=node, table=mt, part=part_2020)
@@ -804,7 +804,7 @@ def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_igno
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
         f"export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-        f"ignore_extra_source_columns = 1"
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert expected_error in error, f"Expected {expected_error} with {schema_match_mode}, got: {error!r}"
 
@@ -858,7 +858,7 @@ def test_export_part_ignore_extra_column_breaks_hybrid_over_source_and_destinati
 
     export_part(
         node=node, table=mt, part=part, dest=iceberg,
-        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_position', ignore_extra_source_columns = 1",
+        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_position', export_merge_tree_part_ignore_extra_source_columns = 1",
     )
     wait_for_export_part(node=node, table=mt, part=part)
 
@@ -953,7 +953,7 @@ def test_export_part_ignore_extra_setting_drops_trailing_alias_column(cluster, s
         node=node, table=mt, part=part_2020, dest=iceberg,
         extra_settings=(
             f"export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-            f"ignore_extra_source_columns = 1"
+            f"export_merge_tree_part_ignore_extra_source_columns = 1"
         ),
     )
     wait_for_export_part(node=node, table=mt, part=part_2020)
@@ -988,7 +988,7 @@ def test_export_part_ignore_extra_setting_kept_alias_depends_on_dropped_column(c
         node=node, table=mt, part=part_2020, dest=iceberg,
         extra_settings=(
             f"export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-            f"ignore_extra_source_columns = 1"
+            f"export_merge_tree_part_ignore_extra_source_columns = 1"
         ),
     )
     wait_for_export_part(node=node, table=mt, part=part_2020)
@@ -1064,7 +1064,7 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
         f"export_merge_tree_part_schema_match_mode = 'match_by_position', "
-        f"ignore_extra_source_columns = 1"
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert "INCOMPATIBLE_COLUMNS" in error, f"Expected positional matching to fail, got: {error!r}"
     assert node.query(f"SELECT count() FROM {iceberg}").strip() == "0"
@@ -1074,7 +1074,7 @@ def test_export_part_reordered_subset_requires_matching_by_name(cluster):
         mt,
         part_2020,
         iceberg,
-        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_name', ignore_extra_source_columns = 1",
+        extra_settings="export_merge_tree_part_schema_match_mode = 'match_by_name', export_merge_tree_part_ignore_extra_source_columns = 1",
     )
     wait_for_export_part(node, mt, part_2020)
 
@@ -1110,7 +1110,7 @@ def test_export_part_match_by_name_requires_every_destination_column(cluster):
         f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
         f"allow_experimental_insert_into_iceberg = 1, "
         f"export_merge_tree_part_schema_match_mode = 'match_by_name', "
-        f"ignore_extra_source_columns = 1"
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert "THERE_IS_NO_COLUMN" in error and "renamed_id" in error, (
         f"Expected name matching to reject missing column `renamed_id`, got: {error!r}"

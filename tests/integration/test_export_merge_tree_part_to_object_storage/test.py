@@ -1017,7 +1017,7 @@ def test_export_part_column_count_mismatch_source_fewer_still_rejected_with_igno
     error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
         f"SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-        f"ignore_extra_source_columns = 1"
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     assert expected_error in error, (
         f"Expected {expected_error} for source<dest column count with {schema_match_mode}, got: {error}"
@@ -1052,7 +1052,7 @@ def test_export_part_source_more_columns_allowed_with_ignore_extra_setting(clust
     node.query(
         f"ALTER TABLE {mt_table} EXPORT PART '2020_1_1_0' TO TABLE {s3_table} "
         f"SETTINGS export_merge_tree_part_schema_match_mode = '{schema_match_mode}', "
-        f"ignore_extra_source_columns = 1"
+        f"export_merge_tree_part_ignore_extra_source_columns = 1"
     )
     wait_for_export_part(node=node, table=mt_table, part="2020_1_1_0")
 
@@ -1101,7 +1101,7 @@ def test_export_part_match_by_name_with_equal_column_count_reordered(cluster):
 
 
 def test_export_part_match_by_name_with_equal_column_count_rejects_unmatched_source_column(cluster):
-    """Test that match_by_name rejects an unmatched source column unless ignore_extra_source_columns is set."""
+    """Test that match_by_name rejects an unmatched source column unless export_merge_tree_part_ignore_extra_source_columns is set."""
     node = cluster.instances["node1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -1127,7 +1127,7 @@ def test_export_part_match_by_name_with_equal_column_count_rejects_unmatched_sou
     )
     assert "NUMBER_OF_COLUMNS_DOESNT_MATCH" in error, (
         f"Expected NUMBER_OF_COLUMNS_DOESNT_MATCH for an unmatched source column with "
-        f"match_by_name and ignore_extra_source_columns = 0, got: {error}"
+        f"match_by_name and export_merge_tree_part_ignore_extra_source_columns = 0, got: {error}"
     )
 
     count = int(node.query(f"SELECT count() FROM {s3_table}").strip())

@@ -7633,9 +7633,9 @@ Possible values:
 - `match_by_position` (default) - columns are matched positionally, like `INSERT INTO dest SELECT * FROM src`. Column names are not otherwise considered.
 - `match_by_name` - every destination column is matched to a source column with the same exact, case-sensitive name, so destination columns may be declared in a different order than the source. A destination column absent from the source throws `THERE_IS_NO_COLUMN`, with no positional fallback.
 
-See also `ignore_extra_source_columns`, which controls whether a source column without a corresponding destination column is dropped or rejected.
+See also `export_merge_tree_part_ignore_extra_source_columns`, which controls whether a source column without a corresponding destination column is dropped or rejected.
 )", 0) \
-    DECLARE(Bool, ignore_extra_source_columns, false, R"(
+    DECLARE(Bool, export_merge_tree_part_ignore_extra_source_columns, false, R"(
 Controls whether `EXPORT PART`/`EXPORT PARTITION` tolerates source `MergeTree` columns that have no corresponding destination column.
 - `false` (default) - such a source column is rejected: the source and destination must match exactly (in `export_merge_tree_part_schema_match_mode = 'match_by_position'`, this means the same number of columns; in `'match_by_name'`, the same set of column names). A mismatch throws `NUMBER_OF_COLUMNS_DOESNT_MATCH`.
 - `true` - a source column without a corresponding destination column is dropped and not exported, instead of throwing. In `match_by_position` mode, this allows a source with extra trailing columns (the destination having more columns than the source is still always rejected). In `match_by_name` mode, this allows source columns whose name has no destination counterpart.

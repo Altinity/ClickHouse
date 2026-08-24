@@ -66,7 +66,7 @@ namespace Setting
     extern const SettingsBool allow_experimental_analyzer;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
-    extern const SettingsBool ignore_extra_source_columns;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace
@@ -126,7 +126,7 @@ namespace
         const auto schema_match_mode =
             local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
-            local_context->getSettingsRef()[Setting::ignore_extra_source_columns];
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
         const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();

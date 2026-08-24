@@ -98,7 +98,7 @@ namespace Setting
     extern const SettingsTimezone iceberg_partition_timezone;
 #endif
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
-    extern const SettingsBool ignore_extra_source_columns;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
 }
 
 namespace FailPoints
@@ -226,7 +226,7 @@ namespace ExportPartitionUtils
             "export_merge_tree_part_schema_match_mode",
             String(magic_enum::enum_name(manifest.schema_match_mode.value_or(MergeTreePartExportSchemaMatchMode::match_by_position))));
         context_copy->setSetting(
-            "ignore_extra_source_columns",
+            "export_merge_tree_part_ignore_extra_source_columns",
             manifest.ignore_extra_source_columns.value_or(false));
 
         context_copy->setSetting("max_threads", manifest.max_threads);
@@ -1025,7 +1025,7 @@ namespace
         const auto schema_match_mode =
             context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
-            context->getSettingsRef()[Setting::ignore_extra_source_columns];
+            context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
         const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::match_by_name;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
@@ -1041,7 +1041,7 @@ namespace
             throw Exception(
                 ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH,
                 "Number of columns doesn't match (source: {} and result: {}): "
-                "source has extra columns and the `ignore_extra_source_columns` setting is disabled",
+                "source has extra columns and the `export_merge_tree_part_ignore_extra_source_columns` setting is disabled",
                 source_columns.size(),
                 destination_columns.size());
 

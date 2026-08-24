@@ -230,7 +230,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
     extern const SettingsMergeTreePartExportSchemaMatchMode export_merge_tree_part_schema_match_mode;
-    extern const SettingsBool ignore_extra_source_columns;
+    extern const SettingsBool export_merge_tree_part_ignore_extra_source_columns;
     extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
@@ -8536,7 +8536,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
     manifest.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
     manifest.schema_match_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
-    manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::ignore_extra_source_columns].value;
+    manifest.ignore_extra_source_columns = query_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value;
 
     if (dest_storage->isDataLake())
     {
