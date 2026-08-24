@@ -45,7 +45,7 @@ void markMountGcFenced(MountSlotRaceBackend & backend, const Layout & layout, co
 
 }
 
-TEST(CasMountClaimConflicts, SlotAppearedBetweenHeadAndPutIfAbsent)
+TEST(CASMountClaimConflicts, SlotAppearedBetweenHeadAndPutIfAbsent)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -62,7 +62,7 @@ TEST(CasMountClaimConflicts, SlotAppearedBetweenHeadAndPutIfAbsent)
         [&] { keeper.start(); });
 }
 
-TEST(CasMountClaimConflicts, SlotVanishedBetweenHeadAndGet)
+TEST(CASMountClaimConflicts, SlotVanishedBetweenHeadAndGet)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -83,7 +83,7 @@ TEST(CasMountClaimConflicts, SlotVanishedBetweenHeadAndGet)
         [&] { keeper.start(); });
 }
 
-TEST(CasMountClaimConflicts, SlotHeldByForeignServer)
+TEST(CASMountClaimConflicts, SlotHeldByForeignServer)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -98,7 +98,7 @@ TEST(CasMountClaimConflicts, SlotHeldByForeignServer)
         [&] { keeper.start(); });
 }
 
-TEST(CasMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
+TEST(CASMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -113,7 +113,7 @@ TEST(CasMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
         [&] { keeper.start(); });
 }
 
-TEST(CasMountClaimConflicts, SlotChangedInsideAdoptionWindow)
+TEST(CASMountClaimConflicts, SlotChangedInsideAdoptionWindow)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -133,7 +133,7 @@ TEST(CasMountClaimConflicts, SlotChangedInsideAdoptionWindow)
         [&] { keeper.start(); });
 }
 
-TEST(CasMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
+TEST(CASMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -157,7 +157,7 @@ TEST(CasMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
 /// The two fenced branches keep their own type, and keep PRECEDENCE over the conflicts above: the
 /// mount-open loop catches `MountFencedException` by type and recovers with a fresh writer epoch, so
 /// a fence reported as a plain conflict would turn a recoverable state into a failed mount.
-TEST(CasMountClaimConflicts, FencedBeforeAdoptionRaisesMountFenced)
+TEST(CASMountClaimConflicts, FencedBeforeAdoptionRaisesMountFenced)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");
@@ -170,7 +170,7 @@ TEST(CasMountClaimConflicts, FencedBeforeAdoptionRaisesMountFenced)
     EXPECT_THROW(keeper.start(), MountFencedException);
 }
 
-TEST(CasMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAborted)
+TEST(CASMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAborted)
 {
     auto backend = std::make_shared<MountSlotRaceBackend>();
     Layout layout("p");

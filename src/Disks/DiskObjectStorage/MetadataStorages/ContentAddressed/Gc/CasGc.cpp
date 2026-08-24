@@ -354,12 +354,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     GcState state;
     Token state_token;
 
-    /// Every exit path leaves this round's meta jobs finished. The `meta_pool_wait` phase below is a
-    /// protocol barrier -- this round's condemns must be durable no later than the ledger they are
-    /// paired with -- and covers only the successful path. A round that throws between the fold and
-    /// that barrier would otherwise leave its jobs running into the NEXT round, where their
-    /// confirmations reach a graduation gate that never scheduled them.
-    SCOPE_EXIT({ meta_writer->drain(); });
+    /// Every exit path waits for this round's meta jobs. The throwing `meta_pool_wait` phase below is
+    /// a protocol barrier -- this round's condemns must be durable no later than the ledger they are
+    /// paired with -- and covers only the successful path. This cleanup copy is explicitly
+    /// nonthrowing so a pool/framework failure cannot replace an exception already unwinding from
+    /// the round. Without it, a round that throws between the fold and the barrier would leave its
+    /// jobs running into the NEXT round, where their confirmations reach a graduation gate that
+    /// never scheduled them.
+    SCOPE_EXIT({ meta_writer->drainOnExitNoThrow(); });
 
     /// PHASE 1/18 `lease`. Also the ONLY phase a `NotALeader` round emits, which is why the phase rows
     /// are correlated by `round_id` and not by the round number a follower never learns.
@@ -874,8 +876,9 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
     /// fold above, spared/redeleted-confirmed during R3 above) BEFORE the round's retired-list publish and
     /// its single gc/state CAS below — the writer's meta point-read gate must see this round's condemns
-    /// durable no later than the ledger it is paired with. `wait()` never throws here: every scheduled job
-    /// already caught its own exception in `GcMetaWriter`.
+    /// durable no later than the ledger it is paired with. Per-hash operation exceptions are caught
+    /// in `GcMetaWriter`, but `ThreadPool::wait` may still rethrow a pool/framework failure. That
+    /// exception must propagate here and prevent the round commit.
     ///
     /// PHASE 12/18 `meta_pool_wait`, AND THE ONE HONEST GAP IN THIS INSTRUMENTATION: the work being
     /// waited on runs on `meta_pool` threads, so none of it appears in this thread's `ProfileEvents`

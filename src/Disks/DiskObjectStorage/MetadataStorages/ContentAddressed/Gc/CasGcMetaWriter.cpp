@@ -94,10 +94,12 @@ GcMetaWriter::GcMetaWriter(PoolPtr store_, LoggerPtr logger_, size_t pool_size)
 
 void GcMetaWriter::submit(std::function<void()> op)
 {
-    /// `run` is safe to invoke either on the pool or inline (the scheduling-failure fallback below)
-    /// and NEVER lets an exception escape: a per-hash meta op is advisory -- the ledger and the
-    /// exact-token body delete are the actual safety core. It captures only `state`, so it stays
-    /// well-defined however long it outlives the writer that scheduled it.
+    /// `run` is safe to invoke either on the pool or inline (the scheduling-failure path below). A
+    /// per-hash meta-operation exception is caught because the ledger and the exact-token body
+    /// delete are the actual safety core. Pool/framework failures, including a failure while
+    /// reporting an operation exception, remain visible to the throwing protocol barrier. The job
+    /// captures only `state`, so it stays well-defined however long it outlives the writer that
+    /// scheduled it.
     auto run = [op, st = state]()
     {
         ProfileEvents::increment(ProfileEvents::CASGCMetaOps);
@@ -123,7 +125,8 @@ void GcMetaWriter::submit(std::function<void()> op)
     catch (...)
     {
         /// Scheduling itself failed (e.g. resource exhaustion under a mass-DROP burst) -- run inline
-        /// rather than silently lose the meta write. `run` still never throws.
+        /// rather than silently lose the meta write. The operation exception remains contained;
+        /// infrastructure or diagnostic failures still propagate.
         ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
         tryLogCurrentException(state->logger,
             "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
@@ -152,6 +155,26 @@ void GcMetaWriter::scheduleConfirmedMetaDelete(const BlobRef & ref)
 void GcMetaWriter::drain()
 {
     pool.wait();
+}
+
+void GcMetaWriter::drainOnExitNoThrow() noexcept
+{
+    try
+    {
+        pool.wait();
+    }
+    catch (...)
+    {
+        try
+        {
+            tryLogCurrentException(state->logger,
+                "CAS gc: meta pool drain failed during round-exit cleanup");
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+            /// Cleanup is `noexcept`; diagnostic logging must not replace the round's exception.
+        }
+    }
 }
 
 uint64_t GcMetaWriter::scheduled() const

@@ -39,8 +39,14 @@ public:
     /// Drop the freshness meta of a blob whose body is confirmed deleted or absent.
     void scheduleConfirmedMetaDelete(const BlobRef & ref);
 
-    /// Wait for every job scheduled so far. Never throws: each job already caught its own exception.
+    /// Successful-path protocol barrier. Wait for every job scheduled so far, propagating any
+    /// pool/framework exception recorded by `ThreadPool`; per-hash operation exceptions are caught
+    /// by the job wrapper.
     void drain();
+
+    /// Round-exit cleanup. Wait for the same pool, but never replace an exception already unwinding
+    /// from the round. A cleanup failure is reported best-effort and cannot escape this method.
+    void drainOnExitNoThrow() noexcept;
 
     uint64_t scheduled() const;
     uint64_t completed() const;
@@ -68,9 +74,10 @@ private:
         void forgetCondemnMarker(const BlobRef & ref, const Token & token);
     };
 
-    /// Wrap one meta op so it can never throw, count it, and put it on the pool -- running it inline
-    /// if scheduling itself fails, rather than silently losing the write. Private, and takes only
-    /// what this class produces: the typed operations above are the sole callers.
+    /// Catch each meta-operation exception, count the job, and put it on the pool -- running it
+    /// inline if scheduling itself fails, rather than silently losing the write. A pool/framework
+    /// failure may still be recorded and rethrown by the successful-path `drain`. Private, and takes
+    /// only what this class produces: the typed operations above are the sole callers.
     void submit(std::function<void()> op);
 
     std::shared_ptr<State> state;

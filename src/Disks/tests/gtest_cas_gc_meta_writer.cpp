@@ -8,6 +8,7 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#include <utility>
 
 using namespace DB::Cas;
 using DB::Cas::tests::MetaWriteLatchBackend;
@@ -16,6 +17,9 @@ using DB::Cas::tests::awaitLatchEntered;
 namespace
 {
 constexpr auto kGcId = "0000000000000000000000000000002a";
+
+static_assert(noexcept(std::declval<GcMetaWriter &>().drainOnExitNoThrow()),
+    "round-exit meta-pool cleanup must not throw from the scope guard");
 }
 
 /// A real condemn-marker job may be in flight when its `Gc` is destroyed. The job holds everything it
@@ -25,7 +29,7 @@ constexpr auto kGcId = "0000000000000000000000000000002a";
 /// This asserts function, not ordering: the release may land before, during or after destruction
 /// begins, and all three are sound. Nothing here detects a job that wrongly captured its owner --
 /// that is prevented by there being no API to write one.
-TEST(CasGcMetaWriter, RealCondemnMarkerJobCompletesAcrossOwnerDestruction)
+TEST(CASGcMetaWriter, RealCondemnMarkerJobCompletesAcrossOwnerDestruction)
 {
     auto backend = std::make_shared<MetaWriteLatchBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -52,7 +56,7 @@ TEST(CasGcMetaWriter, RealCondemnMarkerJobCompletesAcrossOwnerDestruction)
 /// The confirmation registry is written by the pool thread and read by the graduation gate. Assert it
 /// on a `Gc` that is still alive, so the read is possible at all: after destruction there is no
 /// registry left to consult, which is the documented behaviour a fresh leader relies on.
-TEST(CasGcMetaWriter, CondemnMarkerConfirmationIsVisibleAfterDrain)
+TEST(CASGcMetaWriter, CondemnMarkerConfirmationIsVisibleAfterDrain)
 {
     auto backend = std::make_shared<MetaWriteLatchBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -73,7 +77,7 @@ TEST(CasGcMetaWriter, CondemnMarkerConfirmationIsVisibleAfterDrain)
 /// Same lifetime property for the other production job. `deleteConfirmedMeta` RETURNS IMMEDIATELY when
 /// no meta object exists (`Gc/CasGcMetaWriter.cpp`), so the meta must be seeded first -- otherwise the
 /// job never reaches the latch and the wait above is waiting for something that will never happen.
-TEST(CasGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
+TEST(CASGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
 {
     auto backend = std::make_shared<MetaWriteLatchBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -105,7 +109,7 @@ TEST(CasGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
 /// few lines earlier held inside the backend. The round must then BLOCK, draining, until that job is
 /// released -- so the test asserts the round has NOT returned while the job is still held, releases,
 /// and only then joins.
-TEST(CasGcMetaWriter, ThrowingRoundDrainsBeforeReturning)
+TEST(CASGcMetaWriter, ThrowingRoundDrainsBeforeReturning)
 {
     auto backend = std::make_shared<DB::Cas::tests::OutcomeLogFaultBackend>();
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
