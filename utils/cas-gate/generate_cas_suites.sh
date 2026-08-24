@@ -44,7 +44,6 @@ fi
 # not a valid exclusion. An excluded name must also not start with `CAS`, or `CAS*` would run it and
 # the exclusion would be a fiction -- checked below.
 declare -A EXCLUDE_REASONS=(
-    [CountingBackendShape]="generic backend-wrapper shape test (gtest_cas_backend.cpp), no ref/incarnation logic"
     [MemoryWriteBuffer]="generic write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS"
     [TestCascadeWriteBufferWithDisk]="generic cascade write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS"
     [CascadeWriteBuffer]="generic cascade write-buffer infra test (gtest_cascade_and_memory_write_buffer.cpp), unrelated to CAS -- its leading 'Cas' is accidental and no longer matches CAS*"
