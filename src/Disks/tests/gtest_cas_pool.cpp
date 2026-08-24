@@ -3005,6 +3005,7 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchKeeperAfterReplacement)
     uint64_t boot_ms = 100;
     const UInt128 uuid{1};
     ASSERT_EQ(claimMount(*backend, layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+    DB::Cas::tests::ManualBarrier terminal_deposited;
     DB::Cas::tests::ManualBarrier remount;
     std::atomic<bool> replaced{false};
     CasMountRuntime * runtime_ptr = nullptr;
@@ -3021,6 +3022,7 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchKeeperAfterReplacement)
                 runtime_ptr->installKeeper(uuid, 2, [&] { return wall_ms; });
                 runtime_ptr->keeperReset();
                 replaced.store(true, std::memory_order_release);
+                terminal_deposited.arriveAndWait();
             }},
         "test", sink, runtimeRenewBudget(), [&]
         {
@@ -3033,8 +3035,10 @@ TEST(CASPoolRemount, TerminalDepositionDoesNotTouchKeeperAfterReplacement)
     runtime.armMountFence(uuid, 1, anchor + 1000);
     backend->fault = RuntimeRenewBackend::Fault::ThrowBefore;
     runtime.startBackgroundWorkers(std::chrono::milliseconds(0));
-    remount.waitUntilArrived();
+    terminal_deposited.waitUntilArrived();
     EXPECT_TRUE(replaced.load(std::memory_order_acquire));
+    terminal_deposited.release();
+    remount.waitUntilArrived();
     remount.release();
     runtime.stopBackgroundWorkers();
     runtime.finishTeardown(false);
@@ -3544,11 +3548,11 @@ TEST(CASPool, RenewWatermarkOnceRefreshesFenceAndDepositsOneFailure)
 TEST(CASPoolRemount, WholeChainResultsAreNumberedAndStepLabelled)
 {
     auto backend = std::make_shared<RemountStepBackend>();
+    std::vector<CasEvent> events;
     auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "remount-observability",
         .server_root_id = "test",
     });
-    std::vector<CasEvent> events;
     store->setEventSink([&](CasEvent event) { events.push_back(std::move(event)); });
     ScopedRemountLogCapture logs;
 
