@@ -187,7 +187,7 @@ public:
         cv.wait_for(lock, std::chrono::seconds(20), [&] { return released; });
     }
 
-    void release()
+    void unblock()
     {
         std::lock_guard lock(mutex);
         released = true;
@@ -215,12 +215,12 @@ public:
 
     ~ScopedBlockingRenewalDebugLog()
     {
-        channel->release();
+        channel->unblock();
         logger->setChannel(old_channel);
         logger->setLevel(old_level);
     }
 
-    void release() { channel->release(); }
+    void release() { channel->unblock(); }
 
 private:
     LoggerPtr logger;
