@@ -225,7 +225,8 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
               { reportImpossibleInterference(key, reason, offending_ns); },
           [this] (std::function<void(DetachedStopToken)> task) { return tryDispatchDetached(std::move(task)); },
           config.publish_error_hook_for_test,
-          [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); })
+          [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); },
+          config.recovery_pre_first_request_hook_for_test)
     /// Mount / write-fence / build-watermark / self-remount runtime. Injected with
     /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
     /// `cas_request_budget` + the `remount_attempt` callback (== `Pool::tryRemountOnce`, whose claim/
@@ -1789,6 +1790,12 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
 void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     ref_ledger.setCasRetrySleepForTest(std::move(sleep_fn));
+}
+
+void Pool::setRefRecoveryRetrySleepForTest(
+    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn)
+{
+    ref_ledger.setRefRecoveryRetrySleepForTest(std::move(sleep_fn));
 }
 
 std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale, ResolveAudit audit)

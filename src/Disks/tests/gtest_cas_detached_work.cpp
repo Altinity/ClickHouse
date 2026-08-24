@@ -87,6 +87,42 @@ RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const Strin
         RootMutationOrigin::Writer, RootMutationKind::Publish);
 }
 
+/// Leaves the runtime in `NeedsRecovery` while its first background publisher is held after capture.
+/// Releasing that publisher consumes the armed snapshot failure; zero backoff then makes settlement
+/// redispatch the real token-carrying publisher, whose first action is recovery of this exact runtime.
+void preparePendingRecoveryPublisher(
+    const PoolPtr & store,
+    const std::shared_ptr<DB::Cas::tests::OrderedFaultBackend> & backend,
+    const RootNamespace & ns,
+    const std::shared_ptr<Gate> & first_publisher_captured,
+    const std::shared_ptr<Gate> & release_first_publisher,
+    String & ckpt_key)
+{
+    auto capture_calls = std::make_shared<std::atomic<uint64_t>>(0);
+    store->setSnapshotAfterCaptureHookForTest(
+        [capture_calls, first_publisher_captured, release_first_publisher]
+        {
+            if (capture_calls->fetch_add(1) != 0)
+                return;
+            first_publisher_captured->open();
+            release_first_publisher->wait();
+        });
+
+    backend->armPutFailure("_snap/", 1);
+    ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
+    first_publisher_captured->wait();
+
+    const auto life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns);
+    ASSERT_TRUE(life);
+    ckpt_key = store->layout().refCkptKey(*life);
+
+    /// The log lands before the checkpoint conflict, leaving a real unfrontiered durable transaction.
+    backend->armCasConflict(ckpt_key, 100);
+    EXPECT_ANY_THROW(store->dropRef(ns, "ref_1"));
+    backend->armCasConflict(ckpt_key, 0);
+    ASSERT_EQ(store->laneStateForTest(ns), RefLaneState::NeedsRecovery);
+}
+
 }
 
 /// A zero in-flight count must mean no tracked task still holds the pool. The hook fires at the exact
@@ -247,4 +283,139 @@ TEST(CASDetachedWork, SettlementSurvivesAThrowingErrorHandler)
     ASSERT_NO_THROW(publishRef(store, ns, "ref_1", 1));
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
+}
+
+/// A publisher asleep in recovery backoff must be woken by the stop, not waited out. The injected
+/// sleep stands in for a long backoff without spending wall-clock time.
+TEST(CASDetachedWork, StopWakesRecoveryBackoffSleep)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    PoolConfig config;
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/backoff"};
+
+    auto first_publisher_captured = std::make_shared<Gate>();
+    auto release_first_publisher = std::make_shared<Gate>();
+    String ckpt_key;
+    preparePendingRecoveryPublisher(
+        store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
+
+    auto sleeping = std::make_shared<Gate>();
+    auto release_sleep = std::make_shared<std::atomic<bool>>(false);
+    store->setRefRecoveryRetrySleepForTest(
+        [sleeping, release_sleep](uint64_t, const std::optional<DetachedStopToken> & token)
+        {
+            sleeping->open();
+            while (!(token && token->stopping()) && !release_sleep->load())
+                std::this_thread::yield();
+        });
+
+    /// Exhaust one checkpoint publication inside recovery so the outer retry loop enters backoff.
+    backend->armCasConflict(ckpt_key, 100);
+    release_first_publisher->open();
+    sleeping->wait();
+
+    const bool drained = store->stopAndDrainDetachedWork(/*deadline_ms=*/5000);
+    release_sleep->store(true);
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_TRUE(drained);
+}
+
+/// A publisher parked behind another runtime's in-flight recovery is below every I/O checkpoint.
+TEST(CASDetachedWork, StopWakesAConcurrentRecoveryWaiter)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    auto recovery_entered = std::make_shared<Gate>();
+    auto release_recovery = std::make_shared<Gate>();
+    auto recovery_hook_armed = std::make_shared<std::atomic<bool>>(false);
+
+    PoolConfig config;
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    config.recovery_pre_first_request_hook_for_test = [recovery_entered, release_recovery, recovery_hook_armed]
+    {
+        if (!recovery_hook_armed->load())
+            return;
+        recovery_entered->open();
+        release_recovery->wait();
+    };
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/concurrent_recovery"};
+
+    auto first_publisher_captured = std::make_shared<Gate>();
+    auto release_first_publisher = std::make_shared<Gate>();
+    String ckpt_key;
+    preparePendingRecoveryPublisher(
+        store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
+
+    /// A synchronous caller owns the first recovery. It is deliberately not detached work, so the
+    /// drain below waits only for the publisher parked behind it.
+    recovery_hook_armed->store(true);
+    auto first_recovery = std::async(std::launch::async, [&store, &ns] { store->listRefs(ns); });
+    recovery_entered->wait();
+
+    release_first_publisher->open();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (store->refRecoveryWaitersForTest(ns) == 0)
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline) << "no second caller reached the wait";
+        std::this_thread::yield();
+    }
+
+    const bool drained = store->stopAndDrainDetachedWork(/*deadline_ms=*/5000);
+    release_recovery->open();
+    EXPECT_NO_THROW(first_recovery.get());
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_TRUE(drained);
+}
+
+/// The token is checked BEFORE the walk's first backend request, so a stop latched while the
+/// publisher is at that boundary means the request is never issued.
+///
+/// A request already in flight is not interrupted. That case is a bounded drain timeout by design, so
+/// the publisher is parked at the pre-request hook -- not inside a stalled `GET` -- and the drain is
+/// latched before the hook is released.
+TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OrderedFaultBackend>();
+    auto at_boundary = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    auto recovery_hook_armed = std::make_shared<std::atomic<bool>>(false);
+
+    PoolConfig config;
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    config.recovery_pre_first_request_hook_for_test = [at_boundary, release, recovery_hook_armed]
+    {
+        if (!recovery_hook_armed->load())
+            return;
+        at_boundary->open();
+        release->wait();
+    };
+    auto store = openPublishingPool(backend, config);
+    const RootNamespace ns{"srv1/pre_first_request"};
+
+    auto first_publisher_captured = std::make_shared<Gate>();
+    auto release_first_publisher = std::make_shared<Gate>();
+    String ckpt_key;
+    preparePendingRecoveryPublisher(
+        store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
+
+    recovery_hook_armed->store(true);
+    release_first_publisher->open();
+    at_boundary->wait();
+    const uint64_t gets_before = backend->getTotal();
+
+    auto drain = std::async(std::launch::async,
+                            [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/5000); });
+    awaitStopLatched(store);
+    release->open();
+
+    const bool drained = drain.get();
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_TRUE(drained);
+    EXPECT_EQ(backend->getTotal(), gets_before)
+        << "the walk issued its first request after the stop was already latched";
 }

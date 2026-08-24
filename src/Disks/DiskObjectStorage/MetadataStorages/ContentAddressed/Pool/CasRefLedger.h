@@ -121,7 +121,9 @@ public:
         /// TEST SEAM: invoked inside the publisher task's error handler, before its logging, so a test can
         /// make the handler itself throw. Empty in production.
         std::function<void()> publish_error_hook_,
-        std::function<void(const RootNamespace &)> cancel_inflight_builds_);
+        std::function<void(const RootNamespace &)> cancel_inflight_builds_,
+        /// TEST SEAM: invoked immediately before recovery's first backend request.
+        std::function<void()> recovery_pre_first_request_hook_for_test_ = {});
 
     /// Recovers `ns` on first access and resolves `ref_name` from the authoritative cached table.
     /// The optional staleness argument remains for API compatibility; this mounted writer has no
@@ -301,6 +303,10 @@ public:
     /// Replaces the retry controller's delay seam for deterministic tests; production callers leave it
     /// untouched.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
+
+    /// Replaces only ref-table recovery's token-aware retry delay seam for deterministic tests.
+    void setRefRecoveryRetrySleepForTest(
+        std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
 
     /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
     /// The counters expose recovery and publication progress; wedge methods create and inspect the
@@ -679,11 +685,12 @@ private:
     std::function<bool(std::function<void(DetachedStopToken)>)> dispatch_detached;
     std::function<void()> publish_error_hook;
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
+    std::function<void()> recovery_pre_first_request_hook_for_test;
 
     /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
-    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops, e.g. on shutdown/lease loss);
+    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops or detached teardown starts);
     /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
-    std::function<void(uint64_t)> recovery_retry_sleep_fn;
+    std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> recovery_retry_sleep_fn;
 
     /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
     /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
@@ -880,6 +887,10 @@ private:
     bool tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntime(
         const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt, const DetachedStopToken & token);
 
+    bool tryPublishSnapshotAndAdvanceCheckpointOnceOnRuntimeImpl(
+        const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+        const std::optional<DetachedStopToken> & token);
+
     /// The logical-name cache owns no lifecycle identity. It merely points at the runtime currently
     /// admitted for that name; exact retirement/remount clears this pointer while external holders may
     /// continue using the detached predecessor and fail closed against its immutable identity.
@@ -1013,7 +1024,9 @@ private:
     /// exact-key base snapshot -> ARITHMETIC tail -> seal CAS-walk -> `_ckpt` CAS -> install. It does not
     /// expose the table as recovered until every dead epoch it discovered is durably closed; concurrent
     /// callers serialize across the whole unlocked I/O window through `recovery_in_progress`.
-    void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+    void ensureRefTableRecovered(
+        const RootNamespace & ns, RefTableRuntime & rt,
+        const std::optional<DetachedStopToken> & token = std::nullopt);
 
     /// Stage B (spec INV-3, §3): resolves `ns`'s catalog life -- ONCE per table-open, from inside
     /// `ensureRefTableRecovered`'s transient-retry envelope, never from a per-write path (a per-write
@@ -1059,16 +1072,18 @@ private:
     std::optional<RecoveryResult> runRecoveryWalkOnce(
         const RootNamespace & ns, RefTableRuntime & rt, uint64_t admitted_generation, uint64_t live_epoch,
         const std::optional<RefAppendAttempt> & retained_attempt, std::optional<String> & hole_detail,
-        bool & cancelled);
+        bool & cancelled, const std::optional<DetachedStopToken> & token = std::nullopt);
 
-    /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Two independent
-    /// facts, each of which alone disqualifies it -- a self-remount asked it to stop, or a self-remount
-    /// already detached its runtime. Throws; cancellation raises the retry-later class and LATCHES
-    /// through `cancelled` so the caller's transient loop does not re-drive it.
+    /// The I/O-boundary poll of the walk: is this recovery still entitled to continue? Detached
+    /// teardown, self-remount cancellation, and a runtime already detached by self-remount each
+    /// independently disqualify it. Throws; remount cancellation raises the retry-later class and
+    /// LATCHES through `cancelled` so the caller's transient loop does not re-drive it.
     ///
     /// The FENCE is deliberately absent: it gates the three sites that spend it (every `slotOccupy`, the
     /// `_ckpt` CAS, the install), not every read. See the definition for why.
-    void checkRecoveryStillAdmitted(const RootNamespace & ns, RefTableRuntime & rt, bool & cancelled) const;
+    void checkRecoveryStillAdmitted(
+        const RootNamespace & ns, RefTableRuntime & rt, bool & cancelled,
+        const std::optional<DetachedStopToken> & token = std::nullopt) const;
 
     /// Publishes a completed streaming recovery into the runtime in one atomic step: copies EVERY field
     /// `RecoveryResult` carries into `rt` and sets `recovered` LAST, so a waiter woken after this returns

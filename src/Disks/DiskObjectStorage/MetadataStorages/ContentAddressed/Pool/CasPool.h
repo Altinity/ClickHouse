@@ -187,6 +187,9 @@ struct PoolConfig
     /// releases the publisher's single-flight reservation.
     std::function<void()> publish_error_hook_for_test = {};
 
+    /// TEST SEAM: invoked immediately before ref-table recovery issues its first backend request.
+    std::function<void()> recovery_pre_first_request_hook_for_test = {};
+
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
     /// once `this` elapses with no successful renew. The background renewer runs every
@@ -1008,6 +1011,10 @@ public:
     /// `CasRequestController::setSleepFnForTest`). Call before driving traffic; empty restores the
     /// real sleep.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
+
+    /// Test-only: replace only ref-table recovery's token-aware retry delay seam.
+    void setRefRecoveryRetrySleepForTest(
+        std::function<void(uint64_t, const std::optional<DetachedStopToken> &)> sleep_fn);
 
     /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
     /// `appendRefOps` callers are enqueued for `ns` right now.
