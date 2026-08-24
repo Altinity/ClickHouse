@@ -627,13 +627,13 @@ Housekeeping folded in:
 
 ## Issue #2244 (filed by us): lease/remount retry asymmetry — CI RCA of job 96307284077 (2026-08-20) {#issue-2244-lease-retry-asymmetry}
 
-https://github.com/Altinity/ClickHouse/issues/2244 — full RCA in the issue. One-line mechanism: the
-two operations keeping a CAS mount alive are the ONLY S3 ops with no retries (renewal = one 5s-timeout
-PUT per 10s period, no in-period retry, never re-armed after failure; remount claim = SingleAttempt
-inside a ~15-op sequential chain with a 36.5s observation window), so an intermittent-timeout episode
-the data plane rides out on `Attempt 2/501 succeeded` trips the fence and costs ~15 min of full-disk
-write refusal. Field evidence #2 for {#fence-window blast radius} and {#fence-window observability}
-(both got their priority raised by this incident); same lease-resilience work as #2243's fix (2).
+https://github.com/Altinity/ClickHouse/issues/2244 — full RCA in the issue. Before the minimum fix, the
+two operations keeping a CAS mount alive were the only S3 operations without retries: renewal sent
+one 5-second-timeout `PUT` per 10-second period, while remount claim used `SingleAttempt` inside a
+roughly 15-operation sequential chain with a 36.5-second observation window. An intermittent-timeout
+episode that the data plane rode out on `Attempt 2/501 succeeded` therefore tripped the fence and cost
+roughly 15 minutes of full-disk write refusal. This was field evidence #2 for
+{#fence-window blast radius} and {#fence-window observability}.
 
 Fix directions (tracked in the issue, value order): (1) in-period renewal retries while
 `now + margin < confirmed_deadline` — would have prevented this trip outright; (2) per-step retries in
@@ -647,7 +647,9 @@ dimension).
 The minimum pre-release fix is specified in
 `docs/superpowers/specs/2026-08-23-cas-mount-renewal-retry-design.md`: ambiguity-aware in-period
 renewal retries, renewal/remount observability, and the snapshot-refusal backoff hole. It deliberately
-does not change the remount protocol.
+does not change the remount protocol. **Implemented 2026-08-24:** the minimum cut and its focused/full
+TLA+, Release/Debug, proxy-integration, and 15-minute S39 gates are complete. The separately anchored
+per-step remount follow-up below remains open.
 
 ### Issue #2244 follow-up: per-step remount recovery {#issue-2244-remount-retry-follow-up}
 
@@ -819,7 +821,7 @@ No call site intentionally passes an empty expected token: callers either guard 
 empty ETag can still pass the type-only guard in `putOverwrite`, `casPut`, or `deleteExact`. The one
 path that can legitimately produce an empty token on a `Done` write is `tokenFromWriteResult`'s
 `HEAD` fallback, whose value flows into
-`SingleWriterSlot::last_token` (`CasServerRoot.cpp:1291-1295 → :1186/:1337`); reaching it needs two
+`MountLeaseKeeper::last_token` (`CasServerRoot.cpp:1551,1688,1747,1828`); reaching it needs two
 simultaneous store anomalies. Fix: reject an empty ETag token at the conditional-write entry
 (fail-closed `LOGICAL_ERROR`-class throw) so no future call site can turn a fence into a clobber,
 plus a Native-backend unit test. P2 — missing guard, not a demonstrated data-loss path.

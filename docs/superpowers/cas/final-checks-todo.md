@@ -25,15 +25,22 @@ short-lived TODO, not the record.
 - Verified: `05024_cas_freeze_two_roots`, existing self-release guard `05003_cas_freeze`, Release
   and Debug builds, and the full `CAS*:Cas*:CA*` gate (2058 tests).
 
-## 3. Fix #2244 — lease/remount retry asymmetry {#fix-2244}
+## 3. DONE — Minimum #2244 renewal recovery cut {#fix-2244}
 
 - Issue: https://github.com/Altinity/ClickHouse/issues/2244 (filed from the CI RCA of job 96307284077)
 - Full record + fix directions (value order): `docs/superpowers/cas/BACKLOG.md`
   `{#issue-2244-lease-retry-asymmetry}` — (1) in-period renewal retries, (2) per-step remount-chain
   retries + own-ambiguous-claim window-reset check, (3) trip/remount observability + ProfileEvents,
   (4) rate-limit the snapshot-publication refusal loop.
-- Minimum pre-release cut: (1) alone prevents the observed trip class; (3)-(4) are cheap; (2) can
-  follow the release if time runs out.
+- Implemented 2026-08-24: ambiguity-aware in-period renewal retries, exact-`GET` response-loss
+  resolution, immutable `write_attempt_id`, lease-deadline enforcement, bounded renewal/remount
+  observability, runtime-owned persistent workers, and snapshot-publication refusal backoff.
+- Verified: focused renewal TLA+ 17/17, complete mount TLA+ 21/21, Release and Debug full `CAS*`
+  gates, proxy integration 2/2, and the single exact-revision 15-minute S39 campaign (16/16 verdicts,
+  50 recovered short pulses, one successful terminal remount, clean fsck).
+- Deferred deliberately: per-step remount-chain retries, persistent step progress, and
+  own-ambiguous-claim observation. These remain live under
+  `BACKLOG.md` `{#issue-2244-remount-retry-follow-up}` and require a separate focused TLA+ design.
 
 ## 4. Fix CAS disk settings whitelist — valid S3 keys rejected {#fix-s3-key-whitelist}
 

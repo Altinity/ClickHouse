@@ -179,36 +179,15 @@ Owed (small): give the mounts view a row for a slot that has an `owner` (or an `
 instead of a silence. Related: {#decommission-successor-mount-race} (the other end of the same
 retirement tail) and `BACKLOG.md`{#decommission-wrong-predicate}.
 
-## `remount_running` is latched before the recovery thread is spawned, so a failed spawn disables self-remount for the process lifetime (2031-triage CAS-070) {#remount-running-latched-before-spawn}
+## CLOSED — Recovery-thread spawn could permanently disable self-remount (2031-triage CAS-070) {#remount-running-latched-before-spawn}
 
-`CasMountRuntime::scheduleRemount` stores `remount_running = true`
-(`Pool/CasMountRuntime.cpp:451`) and only THEN constructs the recovery thread
-(`:452`). `ThreadFromGlobalPool`'s constructor goes through
-`GlobalThreadPool::scheduleOrThrow`, which throws `CANNOT_SCHEDULE_TASK` on pool
-exhaustion and on injected faults (`Common/ThreadPool.cpp:330`,
-`CannotAllocateThreadFaultInjector` — enabled by
-`tests/config/config.d/cannot_allocate_thread_injection.xml` in the stress lanes). If it
-throws, the only store that clears the flag (`:470`, at the end of the thread body) never
-runs, no thread exists, and every later `scheduleRemount` returns at the
-`remount_running.load()` gate (`:444`/`:447`) forever: the mount stays fenced closed and
-the disk's writes fail loud until the server restarts.
-
-The throw itself is invisible: the arming call sites are the keeper's `on_lost` hook
-(`Pool/CasMountRuntime.cpp:249-254`, reached from
-`SingleWriterSlot::backgroundLoop`'s `onRenewFailed`, whose hook exceptions are swallowed
-by an empty catch at `Pool/CasServerRoot.cpp:1448-1456`) and
-`Pool::reportImpossibleInterference` (`Pool/CasPool.cpp:1472`). Nothing logs the failed
-arming, so the operator sees a permanently fenced disk with no explanation.
-
-Fail-loud, no data loss (the fence is closed, not open), so this is not a release blocker —
-but the fix is small and self-contained: set `remount_running` only after the thread object
-is constructed (or clear it in a catch around the spawn) and log loudly when arming fails.
-The two other legs the finding attached to this shape do NOT hold: the thread body's callback
-`Pool::tryRemountOnce` is contractually non-throwing (its whole body is wrapped, and the
-lifecycle probe classifies rather than throws — `Pool/CasPool.cpp:1011-1018`, `:1083`,
-`:1205-1219`), and `stopRemountThread`'s store-outside-`remount_cv_mutex`
-(`Pool/CasMountRuntime.cpp:496-497`) costs at most one backoff interval (the wait is a
-`wait_for`, `:466`), never a lost wakeup.
+Closed 2026-08-24 by the runtime-ownership work in `ecf3d5d7c76f` and its review fixes. Writable
+startup now constructs both long-lived runtime-owned workers before publishing the pool; a partial
+construction failure joins the created worker, closes the fence, and fails the mount. Incident paths
+only increment a monotonic remount-generation latch and wake the persistent worker, so
+`scheduleRemount` no longer allocates a thread and cannot strand a `remount_running` flag. Teardown
+requests stop and joins both workers. Deterministic construction-failure and generation-latch tests,
+plus the 15-minute S39 remount campaign, cover the replacement contract.
 
 ## The mount-fence clock uses `CLOCK_BOOTTIME` with no portability shim, so the CAS sources do not compile on Darwin (2031-triage CAS-092) {#boottime-not-portable}
 
