@@ -124,8 +124,13 @@ and none of the three was tracked anywhere until now.
   and an event-emit path that tolerates an absent log/context instead of dereferencing it.
 - Pre-release: yes. It is a crash at shutdown on any server that ever mounted a CAS disk.
 
-## 11. Land the GCS request-isolation work (IN PROGRESS in a parallel session) {#gcs-request-isolation}
+## 11. DONE — Land the GCS request-isolation work {#gcs-request-isolation}
 
 - Plan: `docs/superpowers/plans/2026-08-20-cas-gcs-request-isolation.md` (+ its spec in
   `docs/superpowers/specs/` — same date/topic).
-- Owned by the parallel session; before release: confirm it landed (or record its cut-line), gate green.
+- Landed and reviewed on this branch: `faab6678d8f` isolates GCS generation adaptation to explicitly
+  marked CAS requests, `12079eedd47` strengthens deterministic integration coverage, and
+  `2c5a07f1288` applies the final caller-contract corrections. The current full Release and Debug
+  `CAS*` gates are green.
+- The credentialed three-group live-GCS run remains mandatory release-environment evidence; it is an
+  external release gate, not unfinished request-isolation implementation.
