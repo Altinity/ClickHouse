@@ -68,6 +68,34 @@ namespace DB::Cas
 namespace
 {
 
+/// Validate every writable factory's lease/request/cadence relationship before it can publish
+/// owner, epoch, mount, or probe authority. Decommission forces background renewal before calling
+/// this helper, so it is held to the same cadence window as an ordinary production mount.
+void validateWritableMountTiming(const PoolConfig & config)
+{
+    if (config.mount_lease_ttl_ms.count() <= 0 || config.mount_renew_period.count() < 0)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "CAS mount timing rejected: lease TTL must be positive and renewal period non-negative");
+    const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
+    const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
+    validateCasRequestBudget(config.cas_request_budget, ttl_ms, period_ms);
+    if (!config.background_watermark)
+        return;
+
+    const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
+    const uint64_t attempt_ms = config.cas_request_budget.attempt_timeout_ms;
+    const bool cadence_fits = safety_ms <= ttl_ms
+        && period_ms <= ttl_ms - safety_ms
+        && attempt_ms <= ttl_ms - safety_ms - period_ms;
+    if (!cadence_fits)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "CAS mount renewal cadence rejected: period ({} ms) + attempt timeout ({} ms) must be "
+            "at most TTL ({} ms) - safety margin ({} ms) when background renewal is enabled",
+            period_ms, attempt_ms, ttl_ms, safety_ms);
+}
+
 /// The verdict of the pool-lifecycle identity gate (step 0 of `tryRemountOnce`, spec §2). Exactly one
 /// `Recover` path falls through to the existing fresh-incarnation recovery; every other verdict is
 /// resolved by the gate itself (a terminal transition, or staying transient to retry).
@@ -328,29 +356,7 @@ Pool::LifecycleSnapshot Pool::lifecycleSnapshot() const
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
     if (!config.read_only)
-    {
-        if (config.mount_lease_ttl_ms.count() <= 0 || config.mount_renew_period.count() < 0)
-            throw Exception(
-                ErrorCodes::BAD_ARGUMENTS,
-                "CAS mount timing rejected: lease TTL must be positive and renewal period non-negative");
-        const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
-        const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
-        validateCasRequestBudget(config.cas_request_budget, ttl_ms, period_ms);
-        if (config.background_watermark)
-        {
-            const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
-            const uint64_t attempt_ms = config.cas_request_budget.attempt_timeout_ms;
-            const bool cadence_fits = safety_ms <= ttl_ms
-                && period_ms <= ttl_ms - safety_ms
-                && attempt_ms <= ttl_ms - safety_ms - period_ms;
-            if (!cadence_fits)
-                throw Exception(
-                    ErrorCodes::BAD_ARGUMENTS,
-                    "CAS mount renewal cadence rejected: period ({} ms) + attempt timeout ({} ms) must be "
-                    "at most TTL ({} ms) - safety margin ({} ms) when background renewal is enabled",
-                    period_ms, attempt_ms, ttl_ms, safety_ms);
-        }
-    }
+        validateWritableMountTiming(config);
 
     /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
@@ -814,6 +820,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
     /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
     config.background_watermark = true;
+    validateWritableMountTiming(config);
 
     Layout layout(config.pool_prefix);
 

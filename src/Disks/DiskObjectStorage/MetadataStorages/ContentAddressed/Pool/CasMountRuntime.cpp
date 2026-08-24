@@ -593,7 +593,7 @@ void CasMountRuntime::renewalLoop()
     {
         std::unique_lock lock(driver_mutex);
         driver_cv.wait(lock, [this] { return worker_loops_released; });
-        if (workers_stop_requested)
+        if (workers_stop_requested || remountTerminal())
             return;
     }
 
@@ -602,7 +602,7 @@ void CasMountRuntime::renewalLoop()
         AdmittedKeeperCall call;
         {
             std::unique_lock lock(driver_mutex);
-            if (workers_stop_requested)
+            if (workers_stop_requested || remountTerminal())
                 return;
             if (renewal_driver_state == RenewalDriverState::ParkRequested)
             {
@@ -615,8 +615,11 @@ void CasMountRuntime::renewalLoop()
                 driver_cv.wait(lock, [this]
                 {
                     return workers_stop_requested
+                        || remountTerminal()
                         || renewal_driver_state == RenewalDriverState::WorkerIdle;
                 });
+                if (workers_stop_requested || remountTerminal())
+                    return;
                 continue;
             }
 
@@ -658,7 +661,7 @@ void CasMountRuntime::remountLoop()
     {
         std::unique_lock lock(driver_mutex);
         driver_cv.wait(lock, [this] { return worker_loops_released; });
-        if (workers_stop_requested)
+        if (workers_stop_requested || remountTerminal())
             return;
     }
 
@@ -671,6 +674,7 @@ void CasMountRuntime::remountLoop()
             driver_cv.wait(lock, [this]
             {
                 return workers_stop_requested
+                    || remountTerminal()
                     || remount_requested_generation > remount_handled_generation;
             });
             if (workers_stop_requested || remountTerminal())
@@ -684,9 +688,10 @@ void CasMountRuntime::remountLoop()
             driver_cv.notify_all();
             driver_cv.wait(lock, [this]
             {
-                return workers_stop_requested || renewal_driver_state == RenewalDriverState::Parked;
+                return workers_stop_requested || remountTerminal()
+                    || renewal_driver_state == RenewalDriverState::Parked;
             });
-            if (workers_stop_requested)
+            if (workers_stop_requested || remountTerminal())
                 return;
         }
 
@@ -703,10 +708,14 @@ void CasMountRuntime::remountLoop()
         if (!recovered)
         {
             std::unique_lock lock(driver_mutex);
+            if (remountTerminal())
+                return;
             driver_cv.wait_for(lock, std::chrono::milliseconds(backoff_ms), [this]
             {
                 return workers_stop_requested || remountTerminal();
             });
+            if (workers_stop_requested || remountTerminal())
+                return;
             backoff_ms = std::min<uint64_t>(backoff_ms * 2, 30000);
             continue;
         }
@@ -714,6 +723,8 @@ void CasMountRuntime::remountLoop()
         backoff_ms = 1000;
         {
             std::lock_guard lock(driver_mutex);
+            if (workers_stop_requested || remountTerminal())
+                return;
             remount_handled_generation = std::max(remount_handled_generation, snapshot);
             if (remount_requested_generation > remount_handled_generation)
                 continue;
@@ -841,6 +852,8 @@ void CasMountRuntime::enterIdentityLost()
             expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire))
         return;
 
+    driver_cv.notify_all();
+
     ProfileEvents::increment(ProfileEvents::CASIdentityLost);
     LOG_WARNING(getLogger("CasPool"),
         "Content-addressed pool '{}' entered IdentityLost: the pool sentinels (_pool_meta and the owner "
@@ -872,6 +885,7 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
     /// FORGET, `publishVanishedIntent` already set it at step 1. Either way it is published before the state
     /// store below.
     vanished_intent.store(true, std::memory_order_release);
+    driver_cv.notify_all();
 
     /// Idempotency guard for the STATE transition, keyed on a dedicated latch rather than
     /// `vanished_intent` (which FORGET publishes early): the FIRST winner stores the state, records the
@@ -908,6 +922,7 @@ void CasMountRuntime::publishVanishedIntent()
     /// bounding FORGET's subsequent joins to one step + one backend timeout. The state store + WARN follow
     /// in `enterVanished` (step 6). Idempotent.
     vanished_intent.store(true, std::memory_order_release);
+    driver_cv.notify_all();
 }
 
 void CasMountRuntime::scheduleRemount()

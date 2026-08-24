@@ -1707,6 +1707,34 @@ public:
     }
 };
 
+class WorkerExitLatch
+{
+public:
+    void recordExit()
+    {
+        std::lock_guard lock(mutex);
+        ++exits;
+        cv.notify_all();
+    }
+
+    bool waitForAtLeast(uint64_t expected)
+    {
+        std::unique_lock lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(20), [&] { return exits >= expected; });
+    }
+
+    uint64_t count() const
+    {
+        std::lock_guard lock(mutex);
+        return exits;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::condition_variable cv;
+    uint64_t exits = 0;
+};
+
 CasRequestBudget runtimeRenewBudget(uint32_t max_attempts = 1)
 {
     return CasRequestBudget{
@@ -2396,6 +2424,63 @@ TEST(CASPoolRemount, TeardownJoinsBothWorkersBeforeRelease)
               std::numeric_limits<uint64_t>::max());
 }
 
+TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit)
+{
+    for (PoolLifecycle terminal : {PoolLifecycle::IdentityLost, PoolLifecycle::VanishedReplaced})
+    {
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        const Layout layout(terminal == PoolLifecycle::IdentityLost
+            ? "runtime-natural-identity-lost"
+            : "runtime-natural-vanished");
+        uint64_t wall_ms = 1000;
+        uint64_t boot_ms = 100;
+        const UInt128 uuid{1};
+        ASSERT_EQ(claimMount(*backend, layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+        WorkerExitLatch exits;
+        DB::Cas::tests::ManualBarrier transitioned;
+        RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+        {
+            return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+            {
+                body();
+                exits.recordExit();
+            });
+        };
+        CasMountRuntime * runtime_ptr = nullptr;
+        CasEventSink sink;
+        CasMountRuntime runtime(
+            backend, layout,
+            MountConfig{
+                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                .background_watermark = true,
+                .boot_ms_fn = [&] { return boot_ms; },
+                .worker_factory = factory},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                if (terminal == PoolLifecycle::IdentityLost)
+                    runtime_ptr->enterIdentityLost();
+                else
+                    runtime_ptr->enterVanished(PoolLifecycle::VanishedReplaced, "injected natural replacement");
+                transitioned.arriveAndWait();
+                return false;
+            });
+        runtime_ptr = &runtime;
+        runtime.installKeeper(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startKeeper();
+        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        runtime.tripMountLost();
+        runtime.scheduleRemount();
+        transitioned.waitUntilArrived();
+        transitioned.release();
+        const bool both_exited_without_stop = exits.waitForAtLeast(2);
+        runtime.stopBackgroundWorkers();
+        EXPECT_TRUE(both_exited_without_stop);
+        EXPECT_EQ(exits.count(), 2u);
+        runtime.finishTeardown(false);
+    }
+}
+
 TEST(CASPoolRemount, WorkerConstructionRollbackFailsOpenClosed)
 {
     for (uint64_t throw_on : {1u, 2u})
@@ -2786,6 +2871,29 @@ TEST(CASPool, BackgroundCadenceMustFitLeaseBeforeWritablePublication)
         .cas_request_budget = runtimeRenewBudget(),
     };
     EXPECT_THROW((void)Pool::open(backend, config), DB::Exception);
+    EXPECT_EQ(backend->putTotal(), 0u);
+    EXPECT_EQ(backend->putOverwriteTotal(), 0u);
+    EXPECT_EQ(backend->casPutTotal(), 0u);
+}
+
+TEST(CASPool, DecommissionCadenceValidationPrecedesAuthorityWrites)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    {
+        auto victim = Pool::open(backend, PoolConfig{.pool_prefix = "invalid-decommission-cadence", .server_root_id = "victim"});
+    }
+    backend->resetCounts();
+    PoolConfig config{
+        .pool_prefix = "invalid-decommission-cadence",
+        .server_root_id = "admin",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(100),
+        .mount_renew_period = std::chrono::milliseconds(80),
+        .cas_request_budget = runtimeRenewBudget(),
+    };
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        (void)Pool::openForDecommission(backend, config, "victim");
+    });
     EXPECT_EQ(backend->putTotal(), 0u);
     EXPECT_EQ(backend->putOverwriteTotal(), 0u);
     EXPECT_EQ(backend->casPutTotal(), 0u);
