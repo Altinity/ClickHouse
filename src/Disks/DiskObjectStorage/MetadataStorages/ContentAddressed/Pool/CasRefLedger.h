@@ -1214,7 +1214,8 @@ private:
     ///     where the chain now ends.
     CkptPublishOutcome publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
                                                uint64_t admitted_generation,
-                                               const std::function<void(uint64_t)> & check_admission);
+                                               const std::function<void(uint64_t)> & check_admission,
+                                               const std::function<void()> & admit_request = {});
 
     /// Common candidate predicate for scheduler admission and execution after capture. Caller holds
     /// `rt.state_mutex`; an epoch seal is not state-bearing and cannot be snapshotted.

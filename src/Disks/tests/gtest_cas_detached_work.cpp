@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -32,6 +33,174 @@ struct Gate
     std::mutex m;
     std::condition_variable cv;
     bool open_ = false;
+};
+
+/// Completes the watched first `GET`, then withholds its return so teardown can latch before the
+/// helper is able to issue its next raw request.
+class BetweenRecoveryGetsBackend : public DB::Cas::tests::OrderedFaultBackend
+{
+public:
+    using DB::Cas::tests::OrderedFaultBackend::get;
+
+    void armBetweenGets(String first_key_, std::shared_ptr<Gate> first_completed_, std::shared_ptr<Gate> release_first_)
+    {
+        first_key = std::move(first_key_);
+        first_completed = std::move(first_completed_);
+        release_first = std::move(release_first_);
+        armed.store(true);
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        if (key == first_key && armed.exchange(false))
+        {
+            first_completed->open();
+            release_first->wait();
+        }
+        return result;
+    }
+
+private:
+    String first_key;
+    std::shared_ptr<Gate> first_completed;
+    std::shared_ptr<Gate> release_first;
+    std::atomic<bool> armed{false};
+};
+
+/// Identifies recovery's final authority read without changing the recovery implementation: after the
+/// recovered-frontier CAS, its first checkpoint `GET` verifies that contribution and its second is the
+/// final authority read immediately preceding materialization.
+class FinalAuthorityBackend : public DB::Cas::tests::OrderedFaultBackend
+{
+public:
+    using DB::Cas::tests::OrderedFaultBackend::casPut;
+    using DB::Cas::tests::OrderedFaultBackend::get;
+
+    void armFinalAuthorityRead(String checkpoint_key_)
+    {
+        checkpoint_key = std::move(checkpoint_key_);
+        checkpoint_cas_committed.store(false);
+        gets_after_checkpoint_cas.store(0);
+        final_authority_returned.store(false);
+        armed.store(true);
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        auto result = DB::Cas::tests::OrderedFaultBackend::get(key, range);
+        if (armed.load() && checkpoint_cas_committed.load() && key == checkpoint_key
+            && gets_after_checkpoint_cas.fetch_add(1) + 1 == 2)
+            final_authority_returned.store(true);
+        return result;
+    }
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        CasResult result = DB::Cas::tests::OrderedFaultBackend::casPut(key, bytes, expected, meta);
+        if (armed.load() && key == checkpoint_key && result.outcome == CasOutcome::Committed)
+            checkpoint_cas_committed.store(true);
+        return result;
+    }
+
+    bool finalAuthorityReturned() const { return final_authority_returned.load(); }
+
+private:
+    String checkpoint_key;
+    std::atomic<bool> armed{false};
+    std::atomic<bool> checkpoint_cas_committed{false};
+    std::atomic<uint64_t> gets_after_checkpoint_cas{0};
+    std::atomic<bool> final_authority_returned{false};
+};
+
+CasRequestBudget oneAttemptBudget()
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 5000;
+    budget.lease_safety_margin_ms = 100;
+    return budget;
+}
+
+/// A ledger-level fixture keeps the real detached publisher but injects its already-public mount-fence
+/// callback. That callback is the existing deterministic boundary after recovery materialized its
+/// result and before `installRecoveryResult`.
+class ManualDetachedLedger
+{
+public:
+    ManualDetachedLedger()
+        : backend(std::make_shared<FinalAuthorityBackend>())
+        , ledger(
+              backend,
+              layout,
+              RefLedgerConfig{
+                  .server_root_id = "test",
+                  .gc_shards = 1,
+                  .snapshot_log_count_threshold = 0,
+                  .snapshot_log_bytes_threshold = 1ULL << 40,
+                  .snapshot_publish_backoff_initial_ms = 0,
+                  .snapshot_publish_backoff_max_ms = 0},
+              event_sink,
+              oneAttemptBudget(),
+              "test",
+              [] { return uint64_t{0}; },
+              [] { return uint64_t{1}; },
+              [] { return true; },
+              [] { return uint64_t{1}; },
+              [this](uint64_t)
+              {
+                  if (backend->finalAuthorityReturned() && !final_install_gate_claimed.exchange(true))
+                  {
+                      final_install_reached.open();
+                      release_final_install.wait();
+                  }
+              },
+              [] { return uint64_t{0}; },
+              [] { return true; },
+              [](const String &, const String &, const std::optional<String> &) {},
+              [this](std::function<void(DetachedStopToken)> task)
+              {
+                  std::lock_guard lock(tasks_mutex);
+                  tasks.push_back(std::move(task));
+                  return true;
+              },
+              {},
+              [](const RootNamespace &) {})
+    {
+        CasRefCatalog::initializeEmptyForNewPool(*backend, layout);
+    }
+
+    std::function<void(DetachedStopToken)> takeDetachedTask()
+    {
+        std::lock_guard lock(tasks_mutex);
+        if (tasks.empty())
+            throw std::logic_error("ManualDetachedLedger: no queued detached task");
+        auto task = std::move(tasks.front());
+        tasks.pop_front();
+        return task;
+    }
+
+    void latchStop()
+    {
+        std::lock_guard lock(registry->mutex);
+        registry->stopping = true;
+        registry->cv.notify_all();
+    }
+
+    std::shared_ptr<FinalAuthorityBackend> backend;
+    Layout layout{"p"};
+    CasEventSink event_sink;
+    std::shared_ptr<DetachedRegistryState> registry = std::make_shared<DetachedRegistryState>();
+    Gate final_install_reached;
+    Gate release_final_install;
+    CasRefLedger ledger;
+
+private:
+    std::mutex tasks_mutex;
+    std::deque<std::function<void(DetachedStopToken)>> tasks;
+    std::atomic<bool> final_install_gate_claimed{false};
 };
 
 /// Spin until the drain has latched `stopping`. Bounded so a broken implementation fails the test
@@ -75,6 +244,21 @@ PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBac
 RefTxnId publishRef(const PoolPtr & store, const RootNamespace & ns, const String & ref, uint64_t ordinal)
 {
     return store->appendRefOps(ns, MutationScope::ref(ref),
+        [&ref, ordinal](const RefTableState & state)
+        {
+            std::vector<RefOp> ops;
+            if (state.getLifecycle() != RefLifecycle::Live)
+                ops.push_back(DB::Cas::tests::namespaceBirthOp());
+            for (const RefOp & op : DB::Cas::tests::publishCommittedOps(ref, ManifestRef{1, ordinal, 1}))
+                ops.push_back(op);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Publish);
+}
+
+RefTxnId publishRef(CasRefLedger & ledger, const RootNamespace & ns, const String & ref, uint64_t ordinal)
+{
+    return ledger.appendRefOps(ns, MutationScope::ref(ref),
         [&ref, ordinal](const RefTableState & state)
         {
             std::vector<RefOp> ops;
@@ -418,4 +602,112 @@ TEST(CASDetachedWork, StopIsObservedBeforeTheFirstRecoveryRequest)
     EXPECT_TRUE(drained);
     EXPECT_EQ(backend->getTotal(), gets_before)
         << "the walk issued its first request after the stop was already latched";
+}
+
+/// `readCheckpointSnapshotBase` is one recovery boundary but performs several raw requests. Once its
+/// base-log `GET` has completed, a latched stop must prevent the later predecessor-seal `GET` rather
+/// than waiting until the whole helper returns.
+TEST(CASDetachedWork, StopBetweenSnapshotBaseRequestsPreventsThePredecessorGet)
+{
+    auto backend = std::make_shared<BetweenRecoveryGetsBackend>();
+    PoolConfig config;
+    config.snapshot_publish_backoff_initial_ms = 0;
+    config.snapshot_publish_backoff_max_ms = 0;
+    auto store = openPublishingPool(backend, config);
+    store->setLiveWriterEpochForTest(2);
+    const RootNamespace ns{"srv1/between_snapshot_base_requests"};
+    const RefTxnId birth_id{1, 1};
+    const RefTxnId predecessor_seal_id{1, 2};
+    const RefTxnId base_id{2, 1};
+
+    std::vector<RefOp> birth_ops{DB::Cas::tests::namespaceBirthOp()};
+    for (const RefOp & op : DB::Cas::tests::publishCommittedOps("seed_1", ManifestRef{1, 101, 1}))
+        birth_ops.push_back(op);
+    DB::Cas::tests::writeTxnAt(*backend, store->layout(), ns, birth_id, std::move(birth_ops));
+    DB::Cas::tests::writeSealAt(*backend, store->layout(), ns, predecessor_seal_id);
+    DB::Cas::tests::writeTxnAt(
+        *backend,
+        store->layout(),
+        ns,
+        base_id,
+        DB::Cas::tests::publishCommittedOps("seed_2", ManifestRef{2, 101, 1}),
+        predecessor_seal_id);
+    DB::Cas::tests::writeRefSnapshotRaw(
+        *backend,
+        store->layout(),
+        DB::Cas::tests::minimalLiveSnapshot(
+            ns.string(),
+            base_id,
+            {DB::Cas::tests::committedRow("seed_1", ManifestRef{1, 101, 1}),
+             DB::Cas::tests::committedRow("seed_2", ManifestRef{2, 101, 1})}));
+    DB::Cas::tests::writeRecoverableCkptForRawFixture(
+        *backend,
+        store->layout(),
+        ns,
+        RefCkpt{
+            .life_epoch = 1,
+            .committed_through = base_id,
+            .checkpoint_snapshot_id = base_id,
+            .last_epoch_seal = predecessor_seal_id});
+    ASSERT_NO_THROW(store->listRefs(ns));
+
+    auto first_publisher_captured = std::make_shared<Gate>();
+    auto release_first_publisher = std::make_shared<Gate>();
+    String ckpt_key;
+    preparePendingRecoveryPublisher(
+        store, backend, ns, first_publisher_captured, release_first_publisher, ckpt_key);
+
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*backend, store->layout(), ns).value();
+    const String base_log_key = store->layout().refLogKey(life, base_id);
+    const String predecessor_key = store->layout().refLogKey(life, predecessor_seal_id);
+    auto first_get_completed = std::make_shared<Gate>();
+    auto release_first_get = std::make_shared<Gate>();
+    backend->armBetweenGets(base_log_key, first_get_completed, release_first_get);
+    release_first_publisher->open();
+    first_get_completed->wait();
+    const uint64_t predecessor_gets_before = backend->getCount(predecessor_key);
+
+    auto drain = std::async(std::launch::async,
+                            [&store] { return store->stopAndDrainDetachedWork(/*deadline_ms=*/5000); });
+    awaitStopLatched(store);
+    release_first_get->open();
+
+    EXPECT_TRUE(drain.get());
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(backend->getCount(predecessor_key), predecessor_gets_before)
+        << "recovery started the predecessor-seal GET after detached stop was latched";
+}
+
+/// The final fence callback runs only after the final authority read, `finish`, and O(N)
+/// materialization. A stop latched there must leave the still-unrecovered runtime uninstalled.
+TEST(CASDetachedWork, StopAfterRecoveryMaterializationPreventsFinalInstall)
+{
+    ManualDetachedLedger fixture;
+    const RootNamespace ns{"srv1/stop_before_recovery_install"};
+    ASSERT_NO_THROW(publishRef(fixture.ledger, ns, "ref_1", 1));
+
+    const NamespaceLifeId life = CasRefCatalog::lifeIfCataloged(*fixture.backend, fixture.layout, ns).value();
+    const String ckpt_key = fixture.layout.refCkptKey(life);
+    fixture.backend->armCasConflict(ckpt_key, 100);
+    EXPECT_ANY_THROW(fixture.ledger.dropRef(ns, "ref_1"));
+    fixture.backend->armCasConflict(ckpt_key, 0);
+    ASSERT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
+
+    auto detached_publisher = fixture.takeDetachedTask();
+    fixture.backend->armFinalAuthorityRead(ckpt_key);
+    const uint64_t installs_before = fixture.ledger.recoveryInstallCountForTest();
+    auto running = std::async(std::launch::async,
+        [&fixture, task = std::move(detached_publisher)]() mutable
+        {
+            task(DetachedStopToken(fixture.registry));
+        });
+
+    fixture.final_install_reached.wait();
+    fixture.latchStop();
+    fixture.release_final_install.open();
+    EXPECT_NO_THROW(running.get());
+
+    EXPECT_EQ(fixture.ledger.recoveryInstallCountForTest(), installs_before)
+        << "recovery installed a materialized result after detached stop was latched";
+    EXPECT_EQ(fixture.ledger.laneStateForTest(ns), RefLaneState::NeedsRecovery);
 }

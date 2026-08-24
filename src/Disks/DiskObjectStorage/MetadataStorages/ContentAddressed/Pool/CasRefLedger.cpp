@@ -795,7 +795,16 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
         try
         {
             checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-            CheckpointSnapshotBase base = readCheckpointSnapshotBase(backend, layout, life, sampled_ckpt->ckpt);
+            std::function<void()> admit_snapshot_base_request;
+            if (token)
+            {
+                admit_snapshot_base_request = [this, &ns, &rt, &cancelled, &token]
+                {
+                    checkRecoveryStillAdmitted(ns, rt, cancelled, token);
+                };
+            }
+            CheckpointSnapshotBase base = readCheckpointSnapshotBase(
+                backend, layout, life, sampled_ckpt->ckpt, admit_snapshot_base_request);
             base_snapshot = std::move(base.snapshot);
             base_snapshot_bytes = base.bytes;
         }
@@ -858,6 +867,14 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                 "before its checkpoint contribution",
                 rt.life.ns.string(), renderIncarnation(rt.life.incarnation)));
     };
+    std::function<void()> admit_recovery_request;
+    if (token)
+    {
+        admit_recovery_request = [this, &ns, &rt, &cancelled, &token]
+        {
+            checkRecoveryStillAdmitted(ns, rt, cancelled, token);
+        };
+    }
     const auto publish_recovered_frontier = [&](const RefLogTxn & txn)
     {
         const RefCkpt contribution{
@@ -867,7 +884,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
             .last_epoch_seal = refLogTxnIsEpochSeal(txn)
                 ? std::optional<RefTxnId>{txn.txn_id} : txn.prev_epoch_seal};
         checkRecoveryStillAdmitted(ns, rt, cancelled, token);
-        if (publishCkptContribution(life, contribution, admitted_generation, check_recovery_write_admitted)
+        if (publishCkptContribution(
+                life, contribution, admitted_generation, check_recovery_write_admitted, admit_recovery_request)
             == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
@@ -1196,7 +1214,8 @@ std::optional<RecoveryResult> CasRefLedger::runRecoveryWalkOnce(
                                    .committed_through = last_epoch_seal,
                                    .checkpoint_snapshot_id = std::nullopt,
                                    .last_epoch_seal = last_epoch_seal};
-        if (publishCkptContribution(life, contribution, admitted_generation, check_recovery_write_admitted)
+        if (publishCkptContribution(
+                life, contribution, admitted_generation, check_recovery_write_admitted, admit_recovery_request)
             == CkptPublishOutcome::FencedOut)
             throwCasWriteRetryLater(fmt::format(
                 "CAS ref-table recovery for namespace '{}': the mount incarnation moved before the "
@@ -1502,6 +1521,9 @@ void CasRefLedger::ensureRefTableRecovered(
                         "CAS ref-table recovery for namespace '{}': this cached table was superseded by a "
                         "self-remount while the walk was in flight — nothing is installed",
                         ns.string()));
+                if (token && token->stopping())
+                    throw Exception(ErrorCodes::ABORTED,
+                        "CAS ref recovery: teardown began before recovery install");
 
                 /// One atomic publication under `state_mutex`: `installRecoveryResult` copies every seeded
                 /// field from the result and sets `recovered` LAST, so no waiter (woken only by the
@@ -4265,14 +4287,15 @@ void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
 
 CkptPublishOutcome CasRefLedger::publishCkptContribution(const NamespaceLifeId & life, const RefCkpt & contribution,
                                                          uint64_t admitted_generation,
-                                                         const std::function<void(uint64_t)> & check_admission)
+                                                         const std::function<void(uint64_t)> & check_admission,
+                                                         const std::function<void()> & admit_request)
 {
     /// The retry window is the SAME budget every other CAS operation of this ledger rides, measured on
     /// the ledger's own injectable boot clock -- so a test drives the exhaustion arm without sleeping,
     /// and a VM suspend cannot shorten it.
     const CkptDeadline deadline{boot_ms_now_fn, boot_ms_now_fn() + cas_request_budget.operation_deadline_ms};
     const CkptPublishOutcome outcome = publishCkpt(
-        backend, layout, life, contribution, admitted_generation, check_admission, deadline);
+        backend, layout, life, contribution, admitted_generation, check_admission, deadline, admit_request);
     if (outcome == CkptPublishOutcome::Published)
         ProfileEvents::increment(ProfileEvents::CASRefCheckpointPublished);
     else if (outcome == CkptPublishOutcome::IdenticalSkip)
