@@ -9,25 +9,19 @@ doc_type: 'design'
 
 # CAS detached work outliving `Context` {#cas-detached-work-shutdown-design}
 
-**Status:** DRAFT for review, rev.2 (2026-08-24).
+**Status:** DRAFT for review, rev.3 (2026-08-24).
 
 This specification covers item 10 of `docs/superpowers/cas/final-checks-todo.md`: findings B3 and B4
 of the second 2026-08-05 umbrella review. It also covers the third recommendation triage made and the
 item text omits — a `~Pool` that cannot terminate the process — brought into scope deliberately, for
 the reason in [why it is in scope](#failsoft-scope).
 
-**Every claim below was verified against `cas-gc-rebuild` at `57241b3f20b`.** Functions are named
-rather than cited by line, because line numbers in this subtree move weekly and a stale one reads as
-authoritative.
+**Statements about the current code were checked against `cas-gc-rebuild` at `57241b3f20b`.**
+Functions are named rather than cited by line: line numbers in this subtree move weekly, and a stale
+one reads as authoritative.
 
 Nothing here changes a durable format, a key shape, or a protocol step. It changes when in-process
 objects are torn down and what a teardown is allowed to write.
-
-**What rev.2 changed.** Review found six defects in rev.1. The farewell ordering was described
-backwards; the RAII pin as specified could not compile; the counter and its test disagreed; two
-sections contradicted each other about `~Pool`; a fixed defect was listed as out of scope; and the
-weak `Context` could not distinguish "never supplied" from "already released". Each is corrected in
-place below.
 
 ## Decision {#decision}
 
@@ -77,10 +71,12 @@ already durable when the emit crashes. The review's claim that the crash also ea
 described an older tree and does not hold at `57241b3f20b`. The defect is the process dying at
 shutdown — which is enough — and overstating it would misdirect whoever reads this next.
 
-The strong member has a second consequence independent of the crash: while a CAS disk is alive, and
-one lives to the end of the process, `global_context.reset()` does not destroy the `Context`, so the
-comment beside it in `Server.cpp` — "no one could own shared part of Context" — describes a state that
-is not true.
+The strong member has a second consequence independent of the crash. `Context::shared` is a raw
+`ContextSharedPart *`, so a strong `ContextPtr` does not own the shared part and the neighbouring
+comment about who owns it is not what this violates. What it defeats is the surrounding **intent** at
+that call site — "Explicitly destroy Context": while a CAS disk is alive, and one lives to the end of
+the process, `global_context.reset()` leaves the `Context` object itself alive, past
+`resetSharedContext` and past the point the shutdown sequence expects it to be gone.
 
 Finally, `ContentAddressedMetadataStorage` has **no destructor**. An instance destroyed without
 `shutdown` drops its pool from the implicit member destructor with no drain at all. The item text does
@@ -96,7 +92,7 @@ wait proves nothing.
 Teardown therefore becomes, in order:
 
 1. Under `pointer_mutex`, move `gc_scheduler`, `part_access` and `cas_store` into local strong
-   references and leave the members empty. After this point no new caller can obtain either.
+   references and leave the members empty. After this point no new caller can obtain any of them.
 2. Outside `pointer_mutex`: stop the scheduler, which joins its threads; release the local
    `part_access`; stop and drain detached work through the local `PoolPtr`; release the local
    `PoolPtr`.
@@ -117,8 +113,9 @@ This design does **not** promise that `~Pool` runs on the shutdown thread. A `Po
 
 What a successful drain establishes is narrower and checkable: **no tracked detached work holds a
 reference to the `Pool`.** The two dispatches this specification tracks are the ones that hold the
-reference for an unbounded time with no one waiting on them; an ordinary caller's `PoolPtr` is scoped
-to a call that the rest of shutdown already orders against.
+reference for an unbounded time with no one waiting on them. An ordinary caller's `PoolPtr` is scoped
+to one operation and is expected to be short-lived, but nothing here drains those and nothing orders
+them against `shutdown` — they are explicitly outside the guarantee rather than covered by it.
 
 Explicit teardown accordingly becomes the *usual* place where the last reference is released — not the
 guaranteed one. Parts 2 and 3 of the decision cover the exceptions, which is the honest reason they
@@ -133,12 +130,25 @@ are not optional.
 copy-constructible**. A move-only RAII guard does not compile here, and specifying one would have sent
 the implementer into a wall.
 
-The pin is therefore a copyable, single-release guard: `Pool::pin_owner` is renamed
-`Pool::try_pin_detached_work` and returns either an empty `shared_ptr` — meaning stopping has begun
-and the dispatch must not be made — or a `PoolPtr`-shaped guard whose control block owns a strong
-`Pool` reference and, when its **last** copy is destroyed, decrements the in-flight count and notifies
-the waiter exactly once. An aliasing `shared_ptr` gives this directly: the stored pointer is the
-`Pool`, the owned block is the token that releases both.
+The pin is therefore a copyable, single-release guard. Two names change, and they are different
+things — rev.2 conflated them:
+
+- `Pool` gains a method `tryPinDetachedWork`.
+- `CasRefLedger`'s injected callback member `pin_owner`, declared
+  `std::function<std::shared_ptr<void>()>`, is renamed `try_pin_detached_work` and is wired to that
+  method. Its existing return type already expresses the contract: an **empty** `shared_ptr` means
+  stopping has begun and the dispatch must not be made.
+
+A non-empty return is a guard whose control block owns a strong `Pool` reference and, when its
+**last** copy is destroyed, decrements the in-flight count and notifies the waiter exactly once. An
+aliasing `shared_ptr` gives this directly: the stored pointer is the `Pool`, the owned block is the
+token that releases both.
+
+**Admission must be exception-safe in this order:** build the token — allocation included — while it
+is still *unarmed*, then under the registry mutex check the stopping flag, increment the count, and
+arm the token. Incrementing first and allocating afterwards leaks a count on an allocation failure,
+and a leaked count is not a benign one: it makes every later drain run to its full deadline and then
+report a timeout that never resolves.
 
 One object then does both jobs — it accounts for the work and keeps the `Pool` alive — so the
 publisher's raw `this` capture, which is a `Pool` subobject, stays valid without a second,
@@ -207,8 +217,9 @@ The member is therefore `std::optional<std::weak_ptr<const Context>>`:
   missing feature.
 - Each sink resolves the reference per event; an expired one drops the event and counts it.
 
-This also restores the invariant asserted in `Server.cpp`: with no long-lived strong reference left in
-`src/Disks`, `global_context.reset()` destroys the `Context` again.
+This also lets the shutdown sequence do what it says it does: with no long-lived strong reference left
+in `src/Disks`, `global_context.reset()` destroys the `Context` object rather than merely dropping one
+of several references to it.
 
 ### The accessors stop dereferencing a null `shared` {#context-accessors}
 
@@ -254,11 +265,12 @@ is counted, and the test for the reset-context path asserts a safe skip rather t
 
 ### Why it is in scope {#failsoft-scope}
 
-The item text names two halves; triage recommended a third. It belongs here because the drain
-**increases** its exposure: today `~Pool` runs late and only sometimes on the shutdown thread, and
-afterwards explicit teardown becomes the usual place it runs. Destructors are `noexcept` by default,
-so an exception from any phase is `std::terminate`. Fixing the timing without fixing the throw would
-raise the frequency of the crash it is meant to remove.
+The item text names two halves; triage recommended a third. It belongs here because this design
+deliberately moves `~Pool` into managed shutdown: it runs once either way, but afterwards it runs
+where the rest of the shutdown sequence can be reasoned about, and a drain timeout still leaves the
+old late path available. Destructors are `noexcept` by default, so an exception from any phase is
+`std::terminate` — on the very path this design is making routine and predictable. Relocating a
+throwing teardown without guarding it would be moving a crash, not fixing one.
 
 ### All three phases, and `drained` defaulting to false {#failsoft-phases}
 
@@ -292,13 +304,19 @@ Two new counters, named in the CAS convention already used by their neighbours:
 
 | Counter | Incremented when | Read as |
 |---|---|---|
-| `CASDetachedWorkDrainTimeouts` | the bounded stop-and-drain expires with work still in flight | the guarantee in [the guarantee](#guarantee) did not hold for this teardown; expected to stay at zero |
-| `CASEventDroppedContextReleased` | a sink resolves an **expired** weak context | events lost because the context outlived nothing; see [the outcome table](#context-outcomes) |
+| `CASDetachedWorkDrainTimeouts` | the bounded stop-and-drain expires with work still in flight | the guarantee in [the guarantee](#guarantee) could not be **established** for this teardown — it is conditional on a successful drain, so a timeout means unknown, not violated; expected to stay at zero |
+| `CASEventDroppedContextExpired` | a sink resolves an **expired** weak context | events lost because the context was already gone; see [the outcome table](#context-outcomes) |
 
-Two log lines, both at warning level and both on the teardown path, so an operator reading a shutdown
-log sees the same facts the counters carry: one when the drain expires, naming the number of
-dispatches still in flight, and one — already present — when `finishTeardown` skips the clean-release
-marker.
+The two counters are not symmetric in what else they produce, and it is worth being precise about
+that rather than implying a tidy pairing:
+
+- the drain timeout also emits a warning naming how many dispatches were still in flight, so a
+  shutdown log carries the same fact as the counter;
+- an expired context emits **no** log line. By then the logging machinery is exactly what has gone
+  away, and a counter is the only thing that can still record the loss;
+- the existing warning about skipping the clean-release marker belongs to a **different** condition —
+  an undrained ref lane in `~Pool` — and is neither of these. It is named here only so that a reader
+  correlating a shutdown log does not attribute it to the drain.
 
 ## Testing {#testing}
 
@@ -322,21 +340,26 @@ safely. Assert the skip, **not** a counter: per
 [the outcome table](#context-outcomes), this path is not counted.
 
 **An expired weak context is counted.** A separate test, for the separate claim: release the context
-entirely, emit, assert `CASEventDroppedContextReleased` advanced.
+entirely, emit, assert `CASEventDroppedContextExpired` advanced.
 
 **The member no longer extends the context's lifetime.** A separate test again: hold the metadata
-storage, release every other reference to the `Context`, assert it was destroyed. This is what pins
-the `Server.cpp` invariant.
+storage, release every other reference to the `Context`, assert it was destroyed. This pins the
+property `Server.cpp` relies on when it explicitly destroys the context — not an invariant about who
+owns the shared part, which a strong `ContextPtr` never did.
 
 **An expired context supplied at `startup` fails startup.** Asserts the distinction in
 [the member](#context-member) — that an expired supplied reference is an error, not the disabled path.
 
-**The destructor boundary — as a death test.** A `~Pool` whose phase 2 throws terminates the process
-today, so the pre-change behaviour can only be observed in a subprocess; the check belongs in a
-death test rather than an in-process assertion, which would take the whole binary with it and hide
-every test behind it. After the change: logged, survived, and `finishTeardown` still ran with
-`drained == false`. Assert the **absence of the clean-release marker**, not merely the absence of a
-crash — a guard that survived the throw but forged the marker would pass a crash-only assertion.
+**The destructor boundary — a subprocess exit test, not a death test.** A `~Pool` whose phase 2
+throws terminates the process today, so this must run in a subprocess: an in-process assertion would
+take the whole binary with it and hide every test behind it. But the assertion after the change is
+that the subprocess exits **normally**, which is not what `EXPECT_DEATH` expresses — it expects
+abnormal termination. Use `EXPECT_EXIT` with a predicate for a clean exit code, so the test states
+the post-change expectation directly instead of asserting the absence of one particular death.
+
+Inside that subprocess, assert the **absence of the clean-release marker** as well as the clean exit:
+a guard that survived the throw but forged the marker would pass an exit-code-only assertion, and
+forging it is the worse of the two failures.
 
 ## Verification gate {#gate}
 
