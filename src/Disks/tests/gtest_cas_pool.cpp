@@ -14,7 +14,9 @@
 #include <atomic>
 #include <condition_variable>
 #include <future>
+#include <latch>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -2473,6 +2475,96 @@ TEST(CASPoolRemount, NaturalTerminalTransitionMakesBothPersistentWorkersSelfExit
         runtime.scheduleRemount();
         transitioned.waitUntilArrived();
         transitioned.release();
+        const bool both_exited_without_stop = exits.waitForAtLeast(2);
+        runtime.stopBackgroundWorkers();
+        EXPECT_TRUE(both_exited_without_stop);
+        EXPECT_EQ(exits.count(), 2u);
+        runtime.finishTeardown(false);
+    }
+}
+
+TEST(CASPoolRemount, ParkedRenewalCannotMissNaturalTerminalPublication)
+{
+    for (PoolLifecycle terminal : {PoolLifecycle::IdentityLost, PoolLifecycle::VanishedReplaced})
+    {
+        auto backend = std::make_shared<RuntimeRenewBackend>();
+        const Layout layout(terminal == PoolLifecycle::IdentityLost
+            ? "runtime-parked-terminal-identity-lost"
+            : "runtime-parked-terminal-vanished");
+        uint64_t wall_ms = 1000;
+        uint64_t boot_ms = 100;
+        const UInt128 uuid{1};
+        ASSERT_EQ(claimMount(*backend, layout, "test", uuid, 1, wall_ms, 1000).kind, MountClaimResult::Claimed);
+        WorkerExitLatch exits;
+        std::latch renewal_before_driver_lock{1};
+        std::latch release_renewal{1};
+        std::once_flag pause_renewal_once;
+        std::latch parked_predicate_sampled_false{1};
+        std::latch release_parked_predicate{1};
+        std::once_flag release_once;
+        const auto release_parked = [&]
+        {
+            std::call_once(release_once, [&] { release_parked_predicate.count_down(); });
+        };
+        RuntimeWorkerFactory factory = [&](std::function<void()> worker_body)
+        {
+            return ThreadFromGlobalPool([&, body = std::move(worker_body)]
+            {
+                body();
+                exits.recordExit();
+            });
+        };
+        CasMountRuntime * runtime_ptr = nullptr;
+        CasEventSink sink;
+        CasMountRuntime runtime(
+            backend, layout,
+            MountConfig{
+                .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
+                .background_watermark = true,
+                .boot_ms_fn = [&] { return boot_ms; },
+                .worker_factory = factory,
+                .remount_parked_hook_for_test = [&]
+                {
+                    release_renewal.count_down();
+                },
+                .renewal_before_driver_lock_hook_for_test = [&]
+                {
+                    std::call_once(pause_renewal_once, [&]
+                    {
+                        renewal_before_driver_lock.count_down();
+                        release_renewal.wait();
+                    });
+                },
+                .renewal_parked_predicate_false_hook_for_test = [&]
+                {
+                    parked_predicate_sampled_false.count_down();
+                    release_parked_predicate.wait();
+                },
+                .terminal_publication_waiting_for_driver_lock_hook_for_test = [&]
+                {
+                    release_parked();
+                }},
+            "test", sink, runtimeRenewBudget(), [&]
+            {
+                parked_predicate_sampled_false.wait();
+                if (terminal == PoolLifecycle::IdentityLost)
+                    runtime_ptr->enterIdentityLost();
+                else
+                    runtime_ptr->enterVanished(PoolLifecycle::VanishedReplaced, "injected parked-wait replacement");
+                /// Before the fix, terminal publication does not wait for `driver_mutex`, so it reaches
+                /// this release only after its notification has raced ahead of the renewal worker's wait.
+                /// After the fix, the pre-lock hook above releases the waiter before publication blocks.
+                release_parked();
+                return false;
+            });
+        runtime_ptr = &runtime;
+        runtime.installKeeper(uuid, 1, [&] { return wall_ms; });
+        const uint64_t anchor = runtime.startKeeper();
+        runtime.armMountFence(uuid, 1, anchor + 1000);
+        runtime.startBackgroundWorkers(std::chrono::hours(1));
+        renewal_before_driver_lock.wait();
+        runtime.tripMountLost();
+        runtime.scheduleRemount();
         const bool both_exited_without_stop = exits.waitForAtLeast(2);
         runtime.stopBackgroundWorkers();
         EXPECT_TRUE(both_exited_without_stop);

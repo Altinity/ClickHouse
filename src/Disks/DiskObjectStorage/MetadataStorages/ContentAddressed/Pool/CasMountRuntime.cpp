@@ -599,6 +599,9 @@ void CasMountRuntime::renewalLoop()
 
     while (true)
     {
+        if (config.renewal_before_driver_lock_hook_for_test)
+            config.renewal_before_driver_lock_hook_for_test();
+
         AdmittedKeeperCall call;
         {
             std::unique_lock lock(driver_mutex);
@@ -614,8 +617,13 @@ void CasMountRuntime::renewalLoop()
             {
                 driver_cv.wait(lock, [this]
                 {
-                    return workers_stop_requested
-                        || remountTerminal()
+                    const bool terminal = remountTerminal();
+                    if (!workers_stop_requested
+                        && !terminal
+                        && renewal_driver_state != RenewalDriverState::WorkerIdle
+                        && config.renewal_parked_predicate_false_hook_for_test)
+                        config.renewal_parked_predicate_false_hook_for_test();
+                    return workers_stop_requested || terminal
                         || renewal_driver_state == RenewalDriverState::WorkerIdle;
                 });
                 if (workers_stop_requested || remountTerminal())
@@ -693,6 +701,8 @@ void CasMountRuntime::remountLoop()
             });
             if (workers_stop_requested || remountTerminal())
                 return;
+            if (config.remount_parked_hook_for_test)
+                config.remount_parked_hook_for_test();
         }
 
         bool recovered = false;
@@ -845,11 +855,20 @@ void CasMountRuntime::enterIdentityLost()
     /// `TransientNotLive` under `Pool::remount_mutex` (a `Vanished` pool bailed at the caller's
     /// `isVanished()` gate and the caller guards `!= IdentityLost`), so the CAS wins deterministically and
     /// the stamp can never land on a state we did not transition.
-    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
+        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
 
-    PoolLifecycle expected = PoolLifecycle::TransientNotLive;
-    if (!pool_lifecycle.compare_exchange_strong(
-            expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire))
+    bool transitioned = false;
+    {
+        std::lock_guard lock(driver_mutex);
+        lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+
+        PoolLifecycle expected = PoolLifecycle::TransientNotLive;
+        transitioned = pool_lifecycle.compare_exchange_strong(
+            expected, PoolLifecycle::IdentityLost, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    if (!transitioned)
         return;
 
     driver_cv.notify_all();
@@ -881,31 +900,45 @@ void CasMountRuntime::enterVanished(PoolLifecycle which, const String & reason)
                 "CasMountRuntime::enterVanished called with a non-terminal lifecycle value");
     }
 
-    /// Publish the terminal-intent latch (spec §3). For a natural transition this is the FIRST publish; for
-    /// FORGET, `publishVanishedIntent` already set it at step 1. Either way it is published before the state
-    /// store below.
-    vanished_intent.store(true, std::memory_order_release);
+    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
+        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
+
+    bool transitioned = false;
+    {
+        std::lock_guard lock(driver_mutex);
+        /// Publish the terminal-intent latch (spec §3). For a natural transition this is the FIRST
+        /// publish; for FORGET, `publishVanishedIntent` already set it at step 1. Either way it is
+        /// published before the state store below and while holding the mutex used by every
+        /// `driver_cv` terminal predicate.
+        vanished_intent.store(true, std::memory_order_release);
+
+        /// Idempotency guard for the STATE transition, keyed on a dedicated latch rather than
+        /// `vanished_intent` (which FORGET publishes early): the FIRST winner stores the state, records
+        /// the reason, and logs; a later call leaves the locked region without re-storing or re-logging.
+        if (!terminal_state_published.exchange(true, std::memory_order_acq_rel))
+        {
+            transitioned = true;
+
+            /// Record the reason BEFORE the state's release-store, so a reader that acquire-observes the
+            /// terminal state (e.g. `Pool::throwIfLifecycleTerminal`) also observes this string. Written
+            /// exactly once.
+            vanished_reason = reason;
+
+            /// The `since` the lifecycle snapshot reports for the `vanished` row — the wall-clock instant
+            /// of the terminal transition. Written before the `pool_lifecycle` release-store below, same
+            /// as the reason, so an acquire-observer of the terminal state also observes it.
+            lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
+
+            /// An unconditional store is safe now: the guard above serializes terminal transitions, and
+            /// no non-terminal transition can move a `Vanished` state (their compare-exchanges are keyed
+            /// on `Live`/`TransientNotLive`), so this value is absorbing.
+            pool_lifecycle.store(which, std::memory_order_release);
+        }
+    }
+
     driver_cv.notify_all();
-
-    /// Idempotency guard for the STATE transition, keyed on a dedicated latch rather than
-    /// `vanished_intent` (which FORGET publishes early): the FIRST winner stores the state, records the
-    /// reason, and logs; a later call returns here without re-storing or re-logging.
-    if (terminal_state_published.exchange(true, std::memory_order_acq_rel))
+    if (!transitioned)
         return;
-
-    /// Record the reason BEFORE the state's release-store, so a reader that acquire-observes the terminal
-    /// state (e.g. `Pool::throwIfLifecycleTerminal`) also observes this string. Written exactly once.
-    vanished_reason = reason;
-
-    /// The `since` the lifecycle snapshot reports for the `vanished` row — the wall-clock instant of the
-    /// terminal transition. Written before the `pool_lifecycle` release-store below, same as the reason,
-    /// so an acquire-observer of the terminal state also observes it.
-    lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
-
-    /// An unconditional store is safe now: the guard above serializes terminal transitions, and no
-    /// non-terminal transition can move a `Vanished` state (their compare-exchanges are keyed on
-    /// `Live`/`TransientNotLive`), so this value is absorbing.
-    pool_lifecycle.store(which, std::memory_order_release);
 
     ProfileEvents::increment(ProfileEvents::CASDataRootVanished);
     LOG_WARNING(getLogger("CasPool"),
@@ -921,7 +954,12 @@ void CasMountRuntime::publishVanishedIntent()
     /// this stops new remount scheduling and makes an in-flight remount loop bail at its next step —
     /// bounding FORGET's subsequent joins to one step + one backend timeout. The state store + WARN follow
     /// in `enterVanished` (step 6). Idempotent.
-    vanished_intent.store(true, std::memory_order_release);
+    if (config.terminal_publication_waiting_for_driver_lock_hook_for_test)
+        config.terminal_publication_waiting_for_driver_lock_hook_for_test();
+    {
+        std::lock_guard lock(driver_mutex);
+        vanished_intent.store(true, std::memory_order_release);
+    }
     driver_cv.notify_all();
 }
 

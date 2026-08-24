@@ -73,12 +73,24 @@ struct MountConfig
     std::function<uint64_t()> boot_ms_fn = {};
     std::function<void(uint64_t)> wait_sleep_fn = {};
     RuntimeWorkerFactory worker_factory = {};
+    /// Deterministic test interposition after the remount worker has confirmed renewal is parked,
+    /// immediately before it releases `driver_mutex` and begins the real remount callback.
+    std::function<void()> remount_parked_hook_for_test = {};
+    /// Deterministic test interposition at the top of the renewal loop, before it acquires
+    /// `driver_mutex` to inspect cadence or parking state.
+    std::function<void()> renewal_before_driver_lock_hook_for_test = {};
     /// Deterministic test interposition after a due worker has atomically reserved renewal ownership
     /// and captured its keeper, but before keeper/backend I/O starts.
     std::function<void()> renewal_admitted_hook_for_test = {};
     /// Deterministic test interposition after terminal ownership has been deposited and the keeper is
     /// no longer reachable by the completed call.
     std::function<void()> renewal_terminal_deposited_hook_for_test = {};
+    /// Deterministic test interposition after the parked renewal predicate has sampled terminal false,
+    /// immediately before the condition-variable wait atomically releases `driver_mutex`.
+    std::function<void()> renewal_parked_predicate_false_hook_for_test = {};
+    /// Deterministic test interposition immediately before a terminal publisher waits for
+    /// `driver_mutex`. It lets tests distinguish serialized publication from a lost notification.
+    std::function<void()> terminal_publication_waiting_for_driver_lock_hook_for_test = {};
     /// Test-only override for exact pre/post-send controller gate interleavings.
     std::function<CasOverwriteStopCause()> renewal_stop_cause_for_test = {};
 };
@@ -224,7 +236,9 @@ public:
     /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the keeper
     /// callback stop arming remounts and the remount loop bail at its next step boundary, so FORGET's
     /// subsequent thread joins are bounded to one step + one backend timeout. The state store + WARN happen
-    /// later, in `enterVanished` at step 6. Idempotent; lock-free (a single release store). A natural
+    /// later, in `enterVanished` at step 6. Idempotent. Publication is serialized by `driver_mutex` and
+    /// followed by a condition-variable notification, so a worker cannot miss the terminal edge between
+    /// its predicate sample and wait. A natural
     /// terminal transition does NOT call this — its `enterVanished` publishes the latch itself.
     void publishVanishedIntent();
 
@@ -425,7 +439,8 @@ private:
     std::atomic<uint64_t> live_writer_epoch{0};
 
     /// One mutex/condition pair owns driver admission, worker lifecycle, cadence, and the remount
-    /// generation latch. It is never held across keeper/backend calls, remount callbacks, or joins.
+    /// generation latch, and terminal predicates paired with `driver_cv`. It is never held across
+    /// keeper/backend calls, remount callbacks, logging, or joins.
     mutable std::mutex driver_mutex;
     mutable std::condition_variable driver_cv;
     RenewalDriverState renewal_driver_state = RenewalDriverState::Dormant;
@@ -453,9 +468,8 @@ private:
 
     /// The pool lifecycle condition (rev.7 §1). Starts `Live`. Non-terminal transitions
     /// (`noteLeaseLost`/`noteRemounted`) are lock-free compare-exchanges guarded by their exact
-    /// predecessor state; the terminal transitions (`enterIdentityLost`/`enterVanished`) are serialized
-    /// by the caller's `Pool::remount_mutex` and made race-safe against the renewal worker's concurrent
-    /// `noteLeaseLost` by the compare-exchange/latch discipline in the .cpp.
+    /// predecessor state; terminal predicate publication is serialized with worker waits by
+    /// `driver_mutex`, while the caller's `Pool::remount_mutex` serializes the higher-level remount flow.
     std::atomic<PoolLifecycle> pool_lifecycle{PoolLifecycle::Live};
     /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
     /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
