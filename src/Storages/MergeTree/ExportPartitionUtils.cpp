@@ -1048,7 +1048,6 @@ namespace
             context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
             context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
-        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME;
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
 
         checkExportSchemaColumnsCount(
@@ -1056,12 +1055,19 @@ namespace
             destination_columns.size(),
             ignore_extra_source_columns);
 
-        if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
+        const ActionsDAG::MatchColumnsMode mode = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME
+            ? ActionsDAG::MatchColumnsMode::Name
+            : ActionsDAG::MatchColumnsMode::Position;
+
+        // makeConvertingActions with postitional mode requires equal columns count,
+        if (ActionsDAG::MatchColumnsMode::Position == mode && ignore_extra_source_columns && src_has_extra_columns)
         {
-            LOG_DEBUG(getLogger("ExportPartitionUtils"),
+            LOG_DEBUG(
+                getLogger("ExportPartitionUtils"),
                 "Source has {} columns while destination has {} columns, "
                 "the {} extra trailing source column(s) will be ignored",
-                source_columns.size(), destination_columns.size(),
+                source_columns.size(),
+                destination_columns.size(),
                 source_columns.size() - destination_columns.size());
 
             source_columns.resize(destination_columns.size());
@@ -1070,9 +1076,7 @@ namespace
         (void) ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            match_by_name
-                ? ActionsDAG::MatchColumnsMode::Name
-                : ActionsDAG::MatchColumnsMode::Position,
+            mode,
             context);
 
         const auto & source_columns_description = source_metadata->getColumns();

@@ -131,7 +131,6 @@ namespace
             local_context->getSettingsRef()[Setting::export_merge_tree_part_schema_match_mode].value;
         const bool ignore_extra_source_columns =
             local_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns];
-        const bool match_by_name = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME;
 
         auto source_columns = plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName();
         const bool src_has_extra_columns = source_columns.size() > destination_columns.size();
@@ -141,7 +140,12 @@ namespace
             destination_columns.size(),
             ignore_extra_source_columns);
 
-        if (!match_by_name && ignore_extra_source_columns && src_has_extra_columns)
+        const ActionsDAG::MatchColumnsMode mode = schema_match_mode == MergeTreePartExportSchemaMatchMode::NAME
+            ? ActionsDAG::MatchColumnsMode::Name
+            : ActionsDAG::MatchColumnsMode::Position;
+
+        // makeConvertingActions with postitional mode requires equal columns count,
+        if (ActionsDAG::MatchColumnsMode::Position == mode && ignore_extra_source_columns && src_has_extra_columns)
         {
             LOG_DEBUG(getLogger("ExportPartTask"),
                 "Source has {} columns while destination has {} columns, "
@@ -173,9 +177,7 @@ namespace
         auto dag = ActionsDAG::makeConvertingActions(
             source_columns,
             destination_columns,
-            match_by_name
-                ? ActionsDAG::MatchColumnsMode::Name
-                : ActionsDAG::MatchColumnsMode::Position,
+            mode,
             local_context);
 
         auto expression_step = std::make_unique<ExpressionStep>(
