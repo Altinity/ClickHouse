@@ -14,6 +14,7 @@
 
 #include <Common/logger_useful.h>
 #include <Common/Stopwatch.h>
+#include <Common/HostResolvePool.h>
 #include <Common/Throttler.h>
 #include <Common/re2.h>
 #include <IO/Expect404ResponseScope.h>
@@ -645,7 +646,21 @@ void PocoHTTPClient::makeRequestInternalImpl(
 
             if (enable_s3_requests_logging)
                 LOG_TEST(log, "Receiving response...");
+            /// Measure time-to-first-byte: the wait for and read of the response status line and
+            /// headers. This isolates request latency (network RTT + server/backend first-byte
+            /// time) from the connect and body-transfer phases, and is fed back per resolved
+            /// address to drive latency-aware host selection when it is enabled.
+            Stopwatch first_byte_watch;
             auto & response_body_stream = session->receiveResponse(poco_response);
+            const UInt64 first_byte_us = first_byte_watch.elapsedMicroseconds();
+
+            if (HostResolver::latencyAwareSelectionEnabled() && proxy_configuration.isEmpty())
+            {
+                Poco::Net::IPAddress resolved_ip;
+                const std::string resolved_host = session->getResolvedHost();
+                if (!resolved_host.empty() && Poco::Net::IPAddress::tryParse(resolved_host, resolved_ip))
+                    HostResolversPool::instance().getResolver(target_uri.getHost())->reportLatency(resolved_ip, first_byte_us);
+            }
 
             watch.stop();
             addMetric(request, S3MetricType::Microseconds, watch.elapsedMicroseconds());

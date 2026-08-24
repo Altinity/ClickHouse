@@ -21,6 +21,7 @@
 #include <Databases/DataLake/StorageCredentials.h>
 
 #include <base/find_symbols.h>
+#include <boost/algorithm/string.hpp>
 #include <Core/Settings.h>
 #include <Common/escapeForFileName.h>
 #include <Common/threadPoolCallbackRunner.h>

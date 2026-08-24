@@ -15,6 +15,7 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadata.h>
 #include <Databases/DataLake/StorageCredentials.h>
 #include <fmt/ranges.h>
+#include <boost/algorithm/string.hpp>
 
 namespace ProfileEvents
 {

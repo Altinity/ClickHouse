@@ -93,6 +93,7 @@ void insertRowToLogTable(
     std::optional<Iceberg::PruningReturnStatus> pruning_status)
 {
     IcebergMetadataLogLevel set_log_level = local_context->getSettingsRef()[Setting::iceberg_metadata_log_level].value;
+    /// Bail out before building the (potentially expensive) row string when this level is disabled.
     if (set_log_level < row_log_level)
         return;
     timespec spec{};

@@ -59,6 +59,45 @@ ParquetV3BlockInputFormat::ParquetV3BlockInputFormat(
     read_options.min_bytes_for_seek = min_bytes_for_seek;
     read_options.bytes_per_read_task = min_bytes_for_seek * 4;
 
+    /// A data lake (e.g. Iceberg) may have precomputed how much of the file tail to read for the
+    /// footer from its per-file stats; use it to size the initial metadata read (see
+    /// estimateParquetFooterSize). 0/absent keeps the default speculative read.
+    if (object_with_metadata && object_with_metadata->footer_size_hint)
+        read_options.footer_metadata_size_hint = *object_with_metadata->footer_size_hint;
+
+    /// Multipart part boundaries (from GetObjectAttributes via the identity cache), used to align
+    /// coalesced reads to part boundaries. EXPERIMENTAL: for measuring part-aligned reads. Gated by
+    /// input_format_parquet_align_reads_to_multipart_boundaries so it can be A/B-compared; when off,
+    /// the offsets stay empty and the Prefetcher coalesces as usual.
+    if (read_options.format.parquet.align_reads_to_multipart_boundaries
+        && object_with_metadata && object_with_metadata->metadata && !object_with_metadata->metadata->part_offsets.empty())
+        read_options.multipart_part_offsets.assign(
+            object_with_metadata->metadata->part_offsets.begin(),
+            object_with_metadata->metadata->part_offsets.end());
+
+    /// Fixed-grid alignment stride (used when real per-file part offsets are unavailable). Default to
+    /// 16 MiB when unset: it's the S3 multipart part size of ClickHouse's own writer (whose adaptive
+    /// 16/32/64 MiB ramp keeps every part boundary a multiple of 16 MiB) and of Hadoop S3A (64/128),
+    /// so a 16 MiB grid never straddles a real boundary for those (exact for 16 MiB parts, harmless
+    /// over-split for bigger); ~50% fewer straddles for 8 MiB (aws cli). Only misses non-16 sizes
+    /// (e.g. delta-rs 10 MiB) - set input_format_parquet_read_alignment_bytes explicitly for those.
+    read_options.read_alignment_stride = read_options.format.parquet.read_alignment_bytes
+        ? read_options.format.parquet.read_alignment_bytes
+        : (16ul << 20);
+    read_options.read_alignment_min_bytes = read_options.format.parquet.read_alignment_min_bytes;
+
+    /// Split boundary-straddling reads into parallel per-part segments (+ speculative-parallel footer).
+    read_options.split_reads_across_boundaries = read_options.format.parquet.split_reads_across_part_boundaries;
+
+    /// Anti-amplification: cap how much filler coalescing may read to bridge gaps in a sparse column.
+    read_options.read_min_fill_ratio = read_options.format.parquet.read_min_fill_ratio;
+
+    /// Hedged reads (tail-latency mitigation).
+    read_options.hedged_read_threshold_ms = read_options.format.parquet.hedged_read_threshold_ms;
+    read_options.hedged_read_ttfb_threshold_ms = read_options.format.parquet.hedged_read_ttfb_threshold_ms;
+    read_options.hedged_read_max_bytes = read_options.format.parquet.hedged_read_max_bytes;
+    read_options.hedged_read_max_inflight = read_options.format.parquet.hedged_read_max_inflight;
+
     if (!format_filter_info)
         format_filter_info = std::make_shared<FormatFilterInfo>();
 }
@@ -113,11 +152,11 @@ parquet::format::FileMetaData ParquetV3BlockInputFormat::getFileMetadata(Parquet
         String etag = object_with_metadata->metadata->etag;
         ParquetMetadataCacheKey cache_key = ParquetMetadataCache::createKey(file_name, etag);
         return metadata_cache->getOrSetMetadata(
-            cache_key, [&]() { return Parquet::Reader::readFileMetaData(prefetcher); });
+            cache_key, [&]() { return Parquet::Reader::readFileMetaData(prefetcher, read_options.footer_metadata_size_hint); });
     }
     else
     {
-        return Parquet::Reader::readFileMetaData(prefetcher);
+        return Parquet::Reader::readFileMetaData(prefetcher, read_options.footer_metadata_size_hint);
     }
 }
 
@@ -260,7 +299,7 @@ void NativeParquetSchemaReader::initializeIfNeeded()
         return;
     Parquet::Prefetcher prefetcher;
     prefetcher.init(&in, read_options, /*parser_shared_resources_=*/ nullptr);
-    file_metadata = Parquet::Reader::readFileMetaData(prefetcher);
+    file_metadata = Parquet::Reader::readFileMetaData(prefetcher, read_options.footer_metadata_size_hint);
     initialized = true;
 }
 

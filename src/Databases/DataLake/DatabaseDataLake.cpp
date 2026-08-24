@@ -72,6 +72,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
+    extern const DatabaseDataLakeSettingsString namespaces;
     extern const DatabaseDataLakeSettingsString aws_role_arn;
     extern const DatabaseDataLakeSettingsString aws_role_session_name;
     extern const DatabaseDataLakeSettingsString aws_external_id;
@@ -113,6 +114,7 @@ namespace Setting
 namespace DataLakeStorageSetting
 {
     extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
+    extern const DataLakeStorageSettingsString iceberg_metadata_table_uuid;
     extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
 }
 
@@ -682,6 +684,12 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
         (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_location;
     }
+
+    /// Forward the Iceberg table-uuid the catalog already parsed from its LoadTable response (see
+    /// RestCatalog::setTableUUID). It lets the Iceberg metadata layer key its files cache on the
+    /// first (bootstrap) metadata read, avoiding a redundant re-read of the same metadata file.
+    if (auto catalog_table_uuid = table_metadata.getTableUUID(); catalog_table_uuid.has_value())
+        (*storage_settings)[DB::DataLakeStorageSetting::iceberg_metadata_table_uuid] = *catalog_table_uuid;
 
     const auto configuration = getConfiguration(storage_type, storage_settings);
 

@@ -513,7 +513,24 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
 
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     Poco::Dynamic::Var json = parser.parse(metadata_json_str);
-    return json.extract<Poco::JSON::Object::Ptr>();
+    auto metadata_object = json.extract<Poco::JSON::Object::Ptr>();
+
+    /// The very first read of a table's metadata (bootstrap, in initializePersistentTableComponents)
+    /// is issued with no table_uuid - the uuid is only learned by parsing this very file - so it
+    /// takes the uncached branch above and stores nothing. Every later read keys the cache on
+    /// (table_uuid, path) and would therefore miss and re-read the same file. Seed the cache here,
+    /// using the uuid we just parsed, so those later reads hit. Only the top-level table metadata
+    /// carries `table-uuid`; other JSON (e.g. none) is skipped. Immutable per (uuid, path), so this
+    /// is safe and preserves the table-recreate guard (a recreated table has a different uuid).
+    if (metadata_cache && !table_uuid.has_value() && metadata_object->has(f_table_uuid))
+    {
+        auto parsed_uuid = normalizeUuid(metadata_object->getValue<String>(f_table_uuid));
+        metadata_cache->getOrSetTableMetadata(
+            IcebergMetadataFilesCache::getKey(parsed_uuid, metadata_file_path),
+            [&metadata_json_str]() { return metadata_json_str; });
+    }
+
+    return metadata_object;
 }
 
 /// Returns type and required

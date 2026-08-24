@@ -7,6 +7,7 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <IO/HTTPHeaderEntries.h>
+#include <unordered_set>
 #include <Interpreters/Context_fwd.h>
 #include <filesystem>
 #include <Poco/JSON/Object.h>

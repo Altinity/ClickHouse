@@ -6,6 +6,7 @@
 #include <aws/core/auth/AWSCredentials.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Interpreters/Context_fwd.h>
+#include <unordered_set>
 #include <Poco/JSON/Object.h>
 #include <Poco/LRUCache.h>
 

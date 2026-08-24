@@ -3,6 +3,9 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <Formats/FormatSettings.h>
 
+#include <algorithm>
+#include <vector>
+
 namespace DB
 {
 struct FormatParserSharedResources;
@@ -36,7 +39,87 @@ struct ReadOptions
     /// probability becomes very high. E.g. if bloom filter has 1% false positive probability,
     /// searching for 100 elements would have 63% false positive probability.
     size_t bloom_filter_max_set_size = 100;
+
+    /// Hint (in bytes) for how much of the file tail to read when fetching the parquet footer
+    /// (FileMetaData). 0 = unknown -> use the default speculative 64 KiB read. A data lake that
+    /// already knows per-file stats (e.g. Iceberg: column count, row-group count from split_offsets,
+    /// and per-column bound sizes) can set this via estimateParquetFooterSize so the footer is
+    /// captured in a single read for wide / many-row-group files. Only affects read count, never
+    /// correctness: an undershoot falls back to a second read, an overshoot reads a slightly larger
+    /// (already-clamped) tail.
+    size_t footer_metadata_size_hint = 0;
+
+    /// Cumulative start offsets of the object's S3 multipart-upload parts (part i covers
+    /// [multipart_part_offsets[i], multipart_part_offsets[i+1])). Learned from GetObjectAttributes
+    /// (see ObjectStorageIdentityCache) and used to align coalesced read tasks to part boundaries so
+    /// a single read never straddles two parts. Empty = unknown / single-part -> no alignment.
+    /// EXPERIMENTAL: used to measure the effect of part-boundary-aligned reads. Takes precedence over
+    /// read_alignment_stride when non-empty.
+    std::vector<size_t> multipart_part_offsets;
+
+    /// Fixed boundary grid (bytes) for read alignment when the real per-file part layout is unknown:
+    /// no coalesced read straddles a multiple of this. 0 = off. EXPERIMENTAL.
+    size_t read_alignment_stride = 0;
+
+    /// Anti-fragmentation guard: don't cut a read at an alignment boundary if the resulting aligned
+    /// segment would be smaller than this many bytes (allow the straddle instead of a tiny read).
+    size_t read_alignment_min_bytes = 0;
+
+    /// Split a single read that straddles a part boundary into per-part segments read in parallel,
+    /// instead of one straddling GET. Measured on same-region AWS S3: a boundary-crossing ranged GET
+    /// pays ~one extra RTT mid-stream, so two aligned reads fetched concurrently are ~2.5x faster.
+    /// Boundaries come from multipart_part_offsets (preferred) or read_alignment_stride. Also enables
+    /// the speculative-parallel footer read (last 2 MiB + the rest, fired concurrently). 0 = off.
+    /// EXPERIMENTAL. Only helps latency-bound / critical-path reads; hidden by high concurrency.
+    bool split_reads_across_boundaries = false;
+
+    /// Anti-amplification guard for coalescing: don't bridge a gap between two wanted ranges if the
+    /// resulting read task would be less than this fraction "wanted" (i.e. mostly filler bytes).
+    /// Coalescing normally reads through gaps shorter than min_bytes_for_seek to save a seek, but many
+    /// such sub-threshold gaps can accumulate into a task that is almost entirely unwanted bytes -
+    /// e.g. reading a tiny, scattered (RLE/near-constant) column drags in the neighbouring columns and
+    /// amplifies a few KB into hundreds of MB. This caps that: a task can never be more than
+    /// 1/read_min_fill_ratio times its wanted bytes. 0 = off (pure gap-size coalescing). Gaps below a
+    /// small absolute floor are always bridged regardless, so dense reads are unaffected. EXPERIMENTAL.
+    double read_min_fill_ratio = 0;
+
+    /// Hedged reads (tail-latency mitigation): if a read a consumer is blocked on hasn't completed
+    /// within hedged_read_threshold_ms, issue a duplicate read and take whichever returns first.
+    /// 0 = off. Only reads no larger than hedged_read_max_bytes are hedged (latency, not throughput),
+    /// and at most hedged_read_max_inflight hedges run concurrently (cost cap). EXPERIMENTAL.
+    size_t hedged_read_threshold_ms = 0;
+    size_t hedged_read_ttfb_threshold_ms = 0;
+    size_t hedged_read_max_bytes = 0;
+    size_t hedged_read_max_inflight = 0;
 };
+
+/// Estimate the serialized size of a parquet FileMetaData footer, to size the initial tail read.
+///  - num_columns: number of leaf columns,
+///  - num_row_groups: number of row groups,
+///  - bounds_bytes: total bytes of the per-column min+max bounds for one file (e.g. summed from an
+///    Iceberg manifest's lower_bounds + upper_bounds); these repeat per row group in the footer.
+/// The result is clamped to a sane speculative-read range, so it is always safe to use directly as
+/// ReadOptions::footer_metadata_size_hint.
+inline size_t estimateParquetFooterSize(size_t num_columns, size_t num_row_groups, size_t bounds_bytes)
+{
+    /// Rough per-structure sizes of thrift-compact FileMetaData (see the constants' rationale in the
+    /// design notes). Overestimating only costs a marginally larger tail read; underestimating just
+    /// triggers the reader's existing second-read fallback.
+    constexpr size_t fixed_overhead = 4096;      /// schema + file-level key/value metadata
+    constexpr size_t per_row_group = 64;         /// RowGroupMetaData wrapper
+    /// Thrift-compact ColumnMetaData per chunk (offsets, sizes, encodings, short path). Measured
+    /// ~51 B/chunk on a 437-column / 8-row-group / 1 GiB file (large offsets -> ~5 B varints);
+    /// 64 leaves headroom for longer column names. The old 112 overshot the whole footer ~2.2x
+    /// because this term dominates wide/few-stats footers (num_columns * this * num_row_groups).
+    constexpr size_t per_column_chunk = 64;      /// ColumnMetaData fixed fields (offsets, sizes, ...)
+    constexpr size_t floor_size = 64ul << 10;    /// never smaller than the default speculative read
+    constexpr size_t cap_size = 16ul << 20;      /// don't speculatively read an enormous tail
+
+    size_t est = fixed_overhead
+        + num_row_groups * (per_row_group + num_columns * per_column_chunk + bounds_bytes);
+    est += est / 4; /// ~1.25x safety for column names and Iceberg-vs-parquet truncation-length skew
+    return std::clamp(est, floor_size, cap_size);
+}
 
 struct SharedResourcesExt
 {
@@ -50,7 +133,7 @@ struct SharedResourcesExt
         size_t parsing_threads;
     };
 
-    static Limits getLimitsPerReader(const FormatParserSharedResources & parser_shared_resources, double fraction);
+    static Limits getLimitsPerReader(const FormatParserSharedResources & parser_shared_resources, double memory_fraction, double thread_fraction);
 };
 
 
@@ -88,6 +171,10 @@ enum class ReadStage
     ColumnIndexAndOffsetIndex,
 
     OffsetIndex,
+    /// Issues the compressed data-page reads (startPrefetch) but does not decode. Charged to its own
+    /// memory budget so many row groups can have their reads in flight (deep prefetch) while only a
+    /// few are decoded at once (ColumnData). Decouples fetch depth from decode-ahead depth.
+    ColumnDataPrefetch,
     ColumnData,
 
     Deliver,
@@ -186,6 +273,9 @@ public:
         val += amount;
     }
 
+    /// How much memory this token currently charges.
+    size_t charged() const { return val; }
+
 private:
     ReadStage alloc_stage = ReadStage::Deallocated;
     size_t val = 0;
@@ -209,6 +299,8 @@ private:
 public:
     bool check() const;
     void wait();
+    /// Wait up to timeout_ms. Returns true if notified, false on timeout.
+    bool wait_for(UInt64 timeout_ms);
     void notify();
 };
 
@@ -224,6 +316,8 @@ private:
 public:
     bool check() const;
     void wait();
+    /// Wait up to timeout_ms. Returns true if notified, false on timeout.
+    bool wait_for(UInt64 timeout_ms);
     void notify();
 };
 

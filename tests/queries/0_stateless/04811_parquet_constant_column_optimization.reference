@@ -1,0 +1,12 @@
+-- values, optimization on
+42	hello	2020-01-02 03:04:05	7	1000
+-- values, optimization off (must be identical)
+42	hello	2020-01-02 03:04:05	7	1000
+-- the varying column is read correctly (not treated as constant)
+499500	0	999	1000
+-- filters on a constant column still work
+1000
+0
+-- optimization fired only when enabled
+1
+1

@@ -349,6 +349,19 @@ struct FormatSettings
         bool bloom_filter_push_down = true;
         bool page_filter_push_down = true;
         bool use_offset_index = true;
+        bool use_constant_column_optimization = true;
+        bool use_column_index_for_constant_columns = false;
+        bool fill_constant_pages = false;
+        bool align_reads_to_multipart_boundaries = false;
+        UInt64 read_alignment_bytes = 0;
+        UInt64 read_alignment_min_bytes = 1048576;
+        bool split_reads_across_part_boundaries = false;
+        double read_min_fill_ratio = 0;
+        UInt64 hedged_read_threshold_ms = 0;
+        UInt64 hedged_read_ttfb_threshold_ms = 0;
+        UInt64 hedged_read_max_bytes = 4194304;
+        UInt64 hedged_read_max_inflight = 4;
+        double prefetch_bandwidth_hide_seconds = 0;
 
         bool enable_json_parsing = true;
         bool preserve_order = false;

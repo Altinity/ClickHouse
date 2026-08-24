@@ -110,6 +110,10 @@ struct ObjectMetadata
     std::string etag;
     ObjectAttributes tags;
     ObjectAttributes attributes;
+    /// Cumulative start offsets of the object's multipart-upload parts (part i covers
+    /// [part_offsets[i], part_offsets[i+1])). Populated best-effort via GetObjectAttributes; empty
+    /// when unknown or single-PUT. Used to align reads to part boundaries.
+    std::vector<uint64_t> part_offsets;
 };
 
 
@@ -164,6 +168,11 @@ struct RelativePathWithMetadata
     std::optional<DataFileMetaInfoPtr> file_meta_info;
     /// Retry request after short pause
     CommandInTaskResponse command;
+
+    /// Optional per-file hint (bytes) for how much of the file tail to read to get the format's
+    /// footer/metadata. Set by data lakes that already know per-file stats (e.g. Iceberg from the
+    /// manifest) and consumed by the format reader (see Parquet ReadOptions::footer_metadata_size_hint).
+    std::optional<size_t> footer_size_hint;
 
     RelativePathWithMetadata() = default;
 
@@ -266,6 +275,16 @@ public:
 
     /// Get object metadata if supported. It should be possible to receive at least size of object
     virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const = 0;
+
+    /// Same as above, but lets the caller ask for the object's multipart part layout (part_offsets).
+    /// Only S3 populates it, and only on request: it costs a heavier GetObjectAttributes call instead
+    /// of a plain HEAD (both return size + etag; only GetObjectAttributes returns the per-part sizes).
+    /// The default ignores the flag and issues the plain metadata request, so non-S3 storages and
+    /// callers that do not need part-aligned reads pay nothing extra.
+    virtual ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool /*fetch_part_offsets*/) const
+    {
+        return getObjectMetadata(path, with_tags);
+    }
 
     /// Same as getObjectMetadata(), but ignores if object does not exist.
     virtual std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const = 0;

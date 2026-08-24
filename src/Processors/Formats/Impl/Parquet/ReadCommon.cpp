@@ -3,18 +3,22 @@
 #include <Common/futex.h>
 #include <Formats/FormatParserSharedResources.h>
 
+#include <chrono>
+
 namespace DB::Parquet
 {
 
-SharedResourcesExt::Limits SharedResourcesExt::getLimitsPerReader(const FormatParserSharedResources & parser_shared_resources, double fraction)
+SharedResourcesExt::Limits SharedResourcesExt::getLimitsPerReader(const FormatParserSharedResources & parser_shared_resources, double memory_fraction, double thread_fraction)
 {
     const SharedResourcesExt & ext = *static_cast<const SharedResourcesExt *>(parser_shared_resources.opaque.get());
     size_t n = parser_shared_resources.num_streams.load(std::memory_order_relaxed);
-    fraction /= static_cast<double>(std::max(n, size_t(1)));
+    /// Split each budget across the files read in parallel.
+    memory_fraction /= static_cast<double>(std::max(n, size_t(1)));
+    thread_fraction /= static_cast<double>(std::max(n, size_t(1)));
     return Limits {
-        .memory_low_watermark = size_t(ext.total_memory_low_watermark * fraction),
-        .memory_high_watermark = size_t(ext.total_memory_high_watermark * fraction),
-        .parsing_threads = size_t(std::max(std::lround(parser_shared_resources.parsing_runner.getMaxThreads() * fraction + .5), 1l))};
+        .memory_low_watermark = size_t(ext.total_memory_low_watermark * memory_fraction),
+        .memory_high_watermark = size_t(ext.total_memory_high_watermark * memory_fraction),
+        .parsing_threads = size_t(std::max(std::lround(parser_shared_resources.parsing_runner.getMaxThreads() * thread_fraction + .5), 1l))};
 }
 
 #ifdef OS_LINUX
@@ -56,6 +60,35 @@ void CompletionNotification::notify()
         futexWake(&val, INT32_MAX);
 }
 
+bool CompletionNotification::wait_for(UInt64 timeout_ms)
+{
+    UInt32 n = val.load(std::memory_order_acquire);
+    if (n == NOTIFIED)
+        return true;
+    if (n == EMPTY)
+    {
+        if (!val.compare_exchange_strong(n, WAITING))
+        {
+            if (n == NOTIFIED)
+                return true;
+            chassert(n == WAITING);
+        }
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (true)
+    {
+        n = val.load();
+        if (n == NOTIFIED)
+            return true;
+        chassert(n == WAITING);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            return false;
+        const UInt64 remaining_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+        futexTimedWait(&val, WAITING, remaining_ns); // may wake spuriously / on partial timeout; loop re-checks
+    }
+}
+
 #else
 
 bool CompletionNotification::check() const
@@ -73,6 +106,13 @@ void CompletionNotification::notify()
 {
     if (!notified.exchange(true))
         promise.set_value();
+}
+
+bool CompletionNotification::wait_for(UInt64 timeout_ms)
+{
+    if (check())
+        return true;
+    return future.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
 }
 
 #endif

@@ -60,6 +60,7 @@
 #include <Common/FailPoint.h>
 #include <Common/CPUID.h>
 #include <Common/HTTPConnectionPool.h>
+#include <Common/HostResolvePool.h>
 #include <Common/NamedCollections/NamedCollectionsFactory.h>
 #include <Server/createServer.h>
 #include <Server/socketBindListen.h>
@@ -260,6 +261,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 http_connections_warn_limit;
     extern const ServerSettingsUInt64 http_connections_rcvbuf;
     extern const ServerSettingsUInt64 http_connections_sndbuf;
+    extern const ServerSettingsBool http_latency_aware_host_selection;
     extern const ServerSettingsString index_mark_cache_policy;
     extern const ServerSettingsUInt64 index_mark_cache_size;
     extern const ServerSettingsDouble index_mark_cache_size_ratio;
@@ -304,6 +306,9 @@ namespace ServerSetting
     extern const ServerSettingsString mark_cache_policy;
     extern const ServerSettingsUInt64 mark_cache_size;
     extern const ServerSettingsDouble mark_cache_size_ratio;
+    extern const ServerSettingsString object_storage_identity_cache_policy;
+    extern const ServerSettingsUInt64 object_storage_identity_cache_size;
+    extern const ServerSettingsDouble object_storage_identity_cache_size_ratio;
     extern const ServerSettingsString unique_key_index_cache_policy;
     extern const ServerSettingsUInt64 unique_key_index_cache_size_bytes;
     extern const ServerSettingsDouble unique_key_index_cache_size_ratio;
@@ -2179,6 +2184,11 @@ try
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
 
+    global_context->setObjectStorageIdentityCache(
+        server_settings[ServerSetting::object_storage_identity_cache_policy],
+        server_settings[ServerSetting::object_storage_identity_cache_size],
+        server_settings[ServerSetting::object_storage_identity_cache_size_ratio]);
+
     String unique_key_index_cache_policy_name = server_settings[ServerSetting::unique_key_index_cache_policy];
     size_t unique_key_index_cache_size = server_settings[ServerSetting::unique_key_index_cache_size_bytes];
     double unique_key_index_cache_size_ratio = server_settings[ServerSetting::unique_key_index_cache_size_ratio];
@@ -2788,6 +2798,8 @@ try
                     new_server_settings[ServerSetting::http_connections_rcvbuf],
                     new_server_settings[ServerSetting::http_connections_sndbuf],
                 });
+
+            HostResolver::setLatencyAwareSelection(new_server_settings[ServerSetting::http_latency_aware_host_selection]);
 
             DNSResolver::instance().setFilterSettings(new_server_settings[ServerSetting::dns_allow_resolve_names_to_ipv4], new_server_settings[ServerSetting::dns_allow_resolve_names_to_ipv6]);
 

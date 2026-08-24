@@ -1,6 +1,9 @@
 #include <Common/HTTPConnectionPool.h>
 #include <Common/HostResolvePool.h>
 
+#include <limits>
+#include <vector>
+
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
 #include <Common/CurrentMetrics.h>
@@ -714,8 +717,81 @@ public:
 
             if (!stored_connections.empty())
             {
-                reused_connection = stored_connections.top();
-                stored_connections.pop();
+                if (HostResolver::latencyAwareSelectionEnabled())
+                {
+                    /// Latency-aware dispatch: among the pooled connections, hand out the one
+                    /// whose resolved front-end has the lowest observed latency EWMA, instead of
+                    /// the default least-recently-used pick. Because each concurrent caller
+                    /// removes its chosen connection under this lock, a burst of parallel requests
+                    /// spreads across the fastest-available connections rather than all contending
+                    /// for a single one, so parallelism is preserved while slow front-ends are
+                    /// avoided.
+                    std::vector<ConnectionPtr> candidates;
+                    candidates.reserve(stored_connections.size());
+                    while (!stored_connections.empty())
+                    {
+                        candidates.push_back(stored_connections.top());
+                        stored_connections.pop();
+                    }
+
+                    auto resolver = HostResolversPool::instance().getResolver(host);
+                    size_t best = 0;
+                    double best_latency = std::numeric_limits<double>::max();
+                    for (size_t i = 0; i < candidates.size(); ++i)
+                    {
+                        double latency = std::numeric_limits<double>::max();
+                        Poco::Net::IPAddress ip;
+                        if (Poco::Net::IPAddress::tryParse(candidates[i]->getResolvedHost(), ip))
+                        {
+                            const double ewma = resolver->getLatencyMs(ip);
+                            /// Unmeasured (0) is treated as worst so measured-fast connections
+                            /// win; unmeasured ones are still used once the fast ones are handed
+                            /// out (and reporting keeps every served address's EWMA fresh).
+                            if (ewma > 0)
+                                latency = ewma;
+                        }
+                        if (latency < best_latency)
+                        {
+                            best_latency = latency;
+                            best = i;
+                        }
+                    }
+
+                    /// Pool-composition bias: if even the fastest pooled connection's front-end is
+                    /// materially slower than the fastest front-end we know of, prefer opening a
+                    /// fresh connection (selectBest routes it to a fast front-end) over reusing a
+                    /// slow-backend one. Same-region the TCP connect cost is ~1 ms, negligible next
+                    /// to the tens-of-ms backend TTFB gap, so this trades a cheap connect for a big
+                    /// per-request win and shifts the pool's composition toward fast front-ends
+                    /// over time. Gated on the soft limit so it cannot grow the pool without bound.
+                    bool open_fast_instead = false;
+                    if (!group->isSoftLimitReached()
+                        && best_latency != std::numeric_limits<double>::max())
+                    {
+                        const double fleet_min = resolver->getMinLatencyMs();
+                        if (fleet_min > 0 && best_latency > fleet_min * 1.3 && best_latency - fleet_min > 15.0)
+                            open_fast_instead = true;
+                    }
+
+                    if (open_fast_instead)
+                    {
+                        /// Return everything to the pool; a fresh fast connection is opened below.
+                        for (auto & c : candidates)
+                            stored_connections.push(c);
+                    }
+                    else
+                    {
+                        reused_connection = candidates[best];
+                        for (size_t i = 0; i < candidates.size(); ++i)
+                            if (i != best)
+                                stored_connections.push(candidates[i]);
+                    }
+                }
+                else
+                {
+                    reused_connection = stored_connections.top();
+                    stored_connections.pop();
+                }
             }
         }
 

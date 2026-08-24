@@ -565,16 +565,9 @@ void tryMakeDistributedRead(QueryPlan::Node & node, QueryPlan::Nodes & nodes, co
     }
     else if (read_from_object_storage_step)
     {
-#if CLICKHOUSE_CLOUD
-        /// Check if table is big enough for distributed read
-        /// TODO: implement better logic for choosing number of parallel readers
-        if (read_from_object_storage_step->totalRows() <= optimization_settings.distributed_plan_max_rows_to_broadcast)
-            return;
-
+        /// TODO: skip distribution for small tables once a row-count estimate (totalRows) is available
+        /// in the OSS build; for now always distribute object-storage reads.
         read_from_object_storage_step->setDistributedRead(bucket_count);
-#else
-        return;
-#endif
     }
 
     auto & new_read_node = nodes.emplace_back();

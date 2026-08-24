@@ -207,6 +207,45 @@ Skip pages using min/max values from column index.
     DECLARE(Bool, input_format_parquet_use_offset_index, true, R"(
 Minor tweak to how pages are read from parquet file when no page filtering is used.
 )", 0) \
+    DECLARE(Bool, input_format_parquet_use_constant_column_optimization, true, R"(
+When a Parquet column chunk provably holds a single value in every row (according to its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages.
+)", 0) \
+    DECLARE(Bool, input_format_parquet_use_column_index_for_constant_columns, false, R"(
+Load the Parquet Column Index for read columns that have no predicate of their own, so the constant-column optimization can also skip data pages that are single-valued over a row subgroup (not just over a whole column chunk). Costs a small extra read of the (tiny) Column Index; only worthwhile when columns are sorted or low-cardinality. Applies only when `input_format_parquet_use_constant_column_optimization` is enabled.
+)", 0) \
+    DECLARE(Bool, input_format_parquet_fill_constant_pages, false, R"(
+Experimental. When a Parquet column is single-valued over some data pages but not the whole row subgroup, fill those pages' rows from the per-page Column Index statistics instead of reading and decoding them (mixed-topology subgroups). Extends the constant-column optimization below the subgroup granularity. Requires `input_format_parquet_use_constant_column_optimization`; disabled by default.
+)", 0) \
+    DECLARE(Bool, input_format_parquet_align_reads_to_multipart_boundaries, false, R"(
+Experimental. Align coalesced Parquet read requests to the boundaries of the object's S3 multipart-upload parts, so a single read never straddles two parts (an AWS best practice). Requires the per-file multipart layout, learned via GetObjectAttributes and cached (see the object-storage identity cache); has no effect for single-part objects or stores that don't expose part info. Disabled by default.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_read_alignment_bytes, 0, R"(
+Experimental. Align coalesced Parquet read requests to a fixed byte grid of this size, so no read straddles a multiple of it. Set to the writer's multipart part size (e.g. 10Mi for delta-rs, 64Mi for Spark/S3A) to keep reads within single parts without probing per-file layout. 0 disables. When `input_format_parquet_align_reads_to_multipart_boundaries` is enabled and the real per-file part layout is known, that takes precedence over this fixed grid.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_read_alignment_min_bytes, 1048576, R"(
+Experimental. Anti-fragmentation guard for Parquet read alignment (`input_format_parquet_read_alignment_bytes` / `input_format_parquet_align_reads_to_multipart_boundaries`): do not cut a read at a boundary when the resulting aligned segment would be smaller than this many bytes; allow the straddle instead of emitting a tiny extra request. Default 1 MiB.
+)", 0) \
+    DECLARE(Bool, input_format_parquet_split_reads_across_part_boundaries, false, R"(
+Experimental. When a single Parquet read would straddle a part boundary (S3 multipart-upload part, from `input_format_parquet_align_reads_to_multipart_boundaries`, or a fixed grid from `input_format_parquet_read_alignment_bytes`), split it into per-part segments fetched in parallel instead of one boundary-crossing request. Measured on same-region AWS S3: a boundary-straddling ranged GET pays roughly one extra round-trip mid-stream, so aligned parallel reads are up to ~2.5x faster. Also enables a speculative-parallel Parquet footer read (the last 2 MiB and the rest of the hinted tail fired concurrently, avoiding a sequential second round-trip when the footer overflows 2 MiB). Only helps latency-bound / critical-path reads; the per-request win is hidden when concurrency is already saturated. Disabled by default.
+)", 0) \
+    DECLARE(Float, input_format_parquet_read_min_fill_ratio, 0, R"(
+Experimental. Anti-amplification guard for Parquet v3 read coalescing. Coalescing reads through gaps shorter than the seek threshold to save requests, but many such sub-threshold gaps can accumulate into a read task that is almost entirely unwanted filler - e.g. reading a tiny, scattered (RLE / near-constant) column drags in the neighbouring columns and turns a few KB of wanted data into hundreds of MB read. When set above 0, a coalesced task is never allowed to be less than this fraction "wanted" (wanted bytes / total span); extension stops instead of bridging a gap that would dilute it below the ratio. Gaps below a small absolute floor are always bridged, so dense reads (whose fill stays ~1) are unaffected. Range 0..1; 0 disables (pure gap-size coalescing). Trades more, smaller requests for far fewer bytes on sparse reads - beneficial when request concurrency can hide the extra round-trips. Disabled by default.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_hedged_read_threshold_ms, 0, R"(
+Experimental. Tail-latency mitigation for the Parquet v3 reader on remote object storage: if a read a query is blocked on has not completed within this many milliseconds, issue a duplicate (hedged) request and use whichever returns first. Cuts the S3 GET p99 tail at the cost of a few extra requests. 0 disables. Only reads no larger than `input_format_parquet_hedged_read_max_bytes` are hedged, and at most `input_format_parquet_hedged_read_max_inflight` hedges run at once.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_hedged_read_ttfb_threshold_ms, 0, R"(
+Experimental. Time-to-first-byte variant of `input_format_parquet_hedged_read_threshold_ms`: issue a duplicate (hedged) Parquet read when the primary read has not received its first byte within this many milliseconds, rather than when its total time exceeds a budget. Because time-to-first-byte is largely independent of read size, this triggers on a stalled/slow connection without hedging legitimately large transfers that stream normally. When set (> 0) it takes precedence over `input_format_parquet_hedged_read_threshold_ms`. 0 disables. Still bounded by `input_format_parquet_hedged_read_max_bytes` and `input_format_parquet_hedged_read_max_inflight`.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_hedged_read_max_bytes, 4194304, R"(
+Experimental. Only hedge Parquet reads (see `input_format_parquet_hedged_read_threshold_ms`) no larger than this - hedging targets latency of small/critical reads, not throughput of large coalesced reads. 0 = no size limit. Default 4 MiB.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_hedged_read_max_inflight, 4, R"(
+Experimental. Cap on concurrent hedged Parquet reads (see `input_format_parquet_hedged_read_threshold_ms`), so a slow region cannot double all traffic. Default 4.
+)", 0) \
+    DECLARE(Double, input_format_parquet_prefetch_bandwidth_hide_seconds, 0, R"(
+Read back-pressure for the Parquet v3 reader. When greater than zero, stop prefetching more compressed data pages ahead of decoding once the in-flight compressed bytes exceed this many seconds' worth of the measured read throughput (i.e. once the storage link is kept busy). Prevents buffering compressed data far beyond what bandwidth can consume. 0 disables the back-pressure (compressed prefetch is then bounded only by its memory budget).
+)", 0) \
     DECLARE(Bool, input_format_parquet_verify_checksums, true, R"(
 Verify page checksums when reading parquet files.
 )", 0) \

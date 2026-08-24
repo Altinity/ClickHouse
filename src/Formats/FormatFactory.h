@@ -355,6 +355,12 @@ public:
     bool checkIfOutputFormatPrefersLargeBlocks(const String & name) const;
     bool checkIfOutputFormatIsTTYFriendly(const String & name) const;
 
+    /// True for column-oriented input formats that seek back and forth in the file (Parquet, ORC,
+    /// Arrow) - i.e. formats registered via registerRandomAccessInputFormat[WithMetadata]. Such
+    /// formats read the footer at the tail first and drive their own prefetching, so a generic
+    /// read-ahead from the start of the file is usually counter-productive for them.
+    bool checkIfFormatIsRandomAccessInput(const String & name) const;
+
     bool checkParallelizeOutputAfterReading(const String & name, const ContextPtr & context) const;
 
     void registerAdditionalInfoForSchemaCacheGetter(const String & name, AdditionalInfoForSchemaCacheGetter additional_info_for_schema_cache_getter);

@@ -170,7 +170,6 @@ namespace Setting
     extern const SettingsBool serialize_string_in_memory_with_zero_byte;
     extern const SettingsString temporary_files_codec;
     extern const SettingsNonZeroUInt64 temporary_files_buffer_size;
-    extern const SettingsBool use_hive_partitioning;
 }
 
 namespace ServerSetting
@@ -630,11 +629,57 @@ ALWAYS_INLINE void addFilterStep(
 
 template <size_t size>
 ALWAYS_INLINE void addObjectFilterStep(
+    const PlannerContextPtr & planner_context,
     QueryPlan & query_plan,
     FilterAnalysisResult & filter_analysis_result,
     const char (&step_description)[size])
 {
     auto actions = std::move(filter_analysis_result.filter_actions->dag);
+
+    /// The filter DAG's inputs are analyzer column identifiers (e.g. "__table1.date"), but the
+    /// object-storage / Iceberg pruner resolves inputs against physical table schema names ("date").
+    /// On the single-node (FetchColumns) path a "change names to identifiers" ExpressionStep sits
+    /// below the WHERE FilterStep and optimizePrimaryKeyConditionAndLimit merges the filter through
+    /// it, rewriting identifiers back to physical names. On the cluster (WithMergeableState) path that
+    /// step is absent, so the identifiers would reach the pruner verbatim and match no column
+    /// (IcebergMinMaxIndexPrunedFiles stays 0 -> full-table over-read). Rewrite here: build a rename
+    /// DAG whose inputs are physical names aliased to the identifiers, then merge the filter through
+    /// it so the resulting DAG's inputs carry physical column names.
+    std::unordered_map<std::string, std::string> identifier_to_name;
+    for (const auto & [table_expression_node, table_expression_data] : planner_context->getTableExpressionNodeToData())
+        for (const auto & [column_identifier, column_name] : table_expression_data.getColumnIdentifierToColumnName())
+            identifier_to_name.emplace(column_identifier, column_name);
+
+    ActionsDAG rename_dag;
+    ActionsDAG::NodeRawConstPtrs rename_outputs;
+    std::unordered_map<std::string_view, const ActionsDAG::Node *> produced;
+    bool any_renamed = false;
+    for (const auto * input : actions.getInputs())
+    {
+        if (auto it = produced.find(input->result_name); it != produced.end())
+            continue;
+
+        const ActionsDAG::Node * output_node = nullptr;
+        auto name_it = identifier_to_name.find(input->result_name);
+        if (name_it != identifier_to_name.end() && name_it->second != input->result_name)
+        {
+            const auto & physical_input = rename_dag.addInput(name_it->second, input->result_type);
+            output_node = &rename_dag.addAlias(physical_input, input->result_name);
+            any_renamed = true;
+        }
+        else
+        {
+            output_node = &rename_dag.addInput(input->result_name, input->result_type);
+        }
+        produced.emplace(output_node->result_name, output_node);
+        rename_outputs.push_back(output_node);
+    }
+
+    if (any_renamed)
+    {
+        rename_dag.getOutputs() = std::move(rename_outputs);
+        actions = ActionsDAG::merge(std::move(rename_dag), std::move(actions));
+    }
 
     auto where_step = std::make_unique<ObjectFilterStep>(query_plan.getCurrentHeader(),
         std::move(actions),
@@ -2460,13 +2505,20 @@ void Planner::buildPlanForQueryNode()
 
     if (query_processing_info.isSecondStage() || query_processing_info.isFromAggregationState())
     {
-        if (settings[Setting::use_hive_partitioning]
-            && !query_processing_info.isFirstStage()
+        /// Deliver the WHERE predicate to distributed object-storage reads (ReadFromCluster) for
+        /// object/file pruning: Iceberg min/max & partition pruning, Hive partition pruning, etc.
+        /// ObjectFilterStep is prune-only (its updatePipeline is a no-op), so it never filters rows
+        /// on the initiator -- required here because at WithMergeableState the filter columns may not
+        /// exist in the blocks returned by cluster replicas. This must NOT be gated on
+        /// use_hive_partitioning: otherwise a non-hive Iceberg cluster read gets a null filter and
+        /// min/max pruning is silently skipped (IcebergMinMaxIndexPrunedFiles=0 -> full-table
+        /// over-read on selective queries).
+        if (!query_processing_info.isFirstStage()
             && expression_analysis_result.hasWhere())
         {
             if (typeid_cast<ReadFromCluster *>(query_plan.getRootNode()->step.get()))
             {
-                addObjectFilterStep(query_plan, expression_analysis_result.getWhere(), "WHERE");
+                addObjectFilterStep(planner_context, query_plan, expression_analysis_result.getWhere(), "WHERE");
             }
         }
 

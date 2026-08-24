@@ -269,6 +269,7 @@ void HDFSObjectStorage::listObjects(const std::string & path, RelativePathsWithM
                     .etag = {},
                     .tags = {},
                     .attributes = {},
+                    .part_offsets = {},
                 }));
         }
 

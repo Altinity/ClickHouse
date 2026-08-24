@@ -211,6 +211,7 @@ public:
     Model::ListObjectsV2Outcome ListObjectsV2(ListObjectsV2Request & request) const;
     Model::ListObjectsOutcome ListObjects(ListObjectsRequest & request) const;
     Model::GetObjectOutcome GetObject(GetObjectRequest & request) const;
+    Model::GetObjectAttributesOutcome GetObjectAttributes(GetObjectAttributesRequest & request) const;
 
     Model::AbortMultipartUploadOutcome AbortMultipartUpload(AbortMultipartUploadRequest & request) const;
     Model::CreateMultipartUploadOutcome CreateMultipartUpload(CreateMultipartUploadRequest & request) const;
@@ -276,6 +277,7 @@ private:
     using Aws::S3::S3Client::ListObjectsV2;
     using Aws::S3::S3Client::ListObjects;
     using Aws::S3::S3Client::GetObject;
+    using Aws::S3::S3Client::GetObjectAttributes;
 
     using Aws::S3::S3Client::AbortMultipartUpload;
     using Aws::S3::S3Client::CreateMultipartUpload;

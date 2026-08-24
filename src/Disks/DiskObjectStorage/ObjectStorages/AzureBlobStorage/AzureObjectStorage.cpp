@@ -111,6 +111,7 @@ private:
                     .etag = blob.Details.ETag.ToString(),
                     .tags = {},
                     .attributes = {},
+                    .part_offsets = {},
                 }));
         }
 
@@ -280,6 +281,7 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
                     .etag = blob.Details.ETag.ToString(),
                     .tags = {},
                     .attributes = {},
+                    .part_offsets = {},
                 }));
         }
 

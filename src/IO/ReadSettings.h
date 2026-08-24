@@ -141,6 +141,10 @@ struct ReadSettings
     bool use_page_cache_for_object_storage = false;
     PageCacheSettings page_cache_settings;
 
+    /// Fetch S3 multipart part offsets (via GetObjectAttributes) when reading object metadata, for
+    /// part-aligned reads. Off = cheaper HEAD (size + etag only). See Settings docs.
+    bool object_storage_identity_cache_fetch_part_offsets = false;
+
     /// Experimental pipeline read executor (`use_reader_executor`). When set,
     /// `ReadPipeline::build` routes supported reads through `ReaderExecutor`
     /// instead of the legacy matryoshka of read buffers. The executor reads in

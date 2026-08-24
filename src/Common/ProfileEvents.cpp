@@ -784,6 +784,9 @@ The server successfully detected this situation and will download merged part fr
     M(S3ListObjects, "Number of S3 API ListObjects calls.", ValueType::Number) \
     M(S3ListObjectsMicroseconds, "Time of S3 API ListObjects execution.", ValueType::Microseconds) \
     M(S3HeadObject,  "Number of S3 API HeadObject calls.", ValueType::Number) \
+    M(S3GetObjectAttributes, "Number of S3 API GetObjectAttributes calls.", ValueType::Number) \
+    M(ObjectStorageIdentityCacheHits, "Number of object-storage identity (size/etag/part-offsets) cache hits, avoiding a HEAD/GetObjectAttributes.", ValueType::Number) \
+    M(ObjectStorageIdentityCacheMisses, "Number of object-storage identity cache misses that triggered a metadata request.", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3HeadObjectMicroseconds,  "Time of S3 API HeadObject execution.", ValueType::Microseconds) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
@@ -798,6 +801,7 @@ The server successfully detected this situation and will download merged part fr
     M(DiskS3CopyObject, "Number of DiskS3 API CopyObject calls.", ValueType::Number) \
     M(DiskS3ListObjects, "Number of DiskS3 API ListObjects calls.", ValueType::Number) \
     M(DiskS3HeadObject,  "Number of DiskS3 API HeadObject calls.", ValueType::Number) \
+    M(DiskS3GetObjectAttributes, "Number of DiskS3 API GetObjectAttributes calls.", ValueType::Number) \
     M(DiskS3GetObjectTagging, "Number of DiskS3 API GetObjectTagging calls.", ValueType::Number) \
     M(DiskS3CreateMultipartUpload, "Number of DiskS3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(DiskS3UploadPartCopy, "Number of DiskS3 API UploadPartCopy calls.", ValueType::Number) \
@@ -1476,11 +1480,22 @@ The server successfully detected this situation and will download merged part fr
     \
     M(ParquetReadRowGroups, "The total number of row groups read from parquet data", ValueType::Number) \
     M(ParquetPrunedRowGroups, "The total number of row groups pruned from parquet data", ValueType::Number) \
+    M(ParquetConstantColumnChunks, "The total number of parquet column chunks materialized from a single value in their min/max statistics, without reading their data pages", ValueType::Number) \
+    M(ParquetConstantColumnSubchunks, "The total number of parquet column subchunks (per row subgroup) materialized from a single value in their per-page column-index statistics, without decoding their data pages", ValueType::Number) \
     M(ParquetDecodingTasks, "Tasks issued by parquet reader", ValueType::Number) \
     M(ParquetDecodingTaskBatches, "Task groups sent to a thread pool by parquet reader", ValueType::Number) \
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadSeekAndRead, "The total number of reads with ReadMode::SeekAndRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadEntireFile, "The total number of read with ReadMode::EntireFileIsInMemory by DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPrefetcherServedFromRetainedTail, "The number of ranges (e.g. Column/Offset Index) served from the retained footer tail by DB::Parquet::Prefetcher without issuing a read", ValueType::Number) \
+    M(ParquetPrefetcherPartAlignedTasks, "The number of read tasks whose coalescing was constrained to a single S3 multipart-upload part boundary by DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPrefetcherAlignmentSkippedSmall, "The number of times DB::Parquet::Prefetcher skipped read alignment because the aligned segment would be smaller than the configured minimum (anti-fragmentation)", ValueType::Number) \
+    M(ParquetPrefetcherHedgedReads, "The number of hedged (duplicate) reads issued by DB::Parquet::Prefetcher to cut read tail latency", ValueType::Number) \
+    M(ParquetPrefetcherHedgedWins, "The number of hedged reads that produced the result used (beat or replaced the primary read) in DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPrefetcherSplitReadTasks, "The number of read tasks that DB::Parquet::Prefetcher split into per-part-boundary segments read in parallel (to avoid a boundary-straddling GET)", ValueType::Number) \
+    M(ParquetPrefetcherSplitReadSegments, "The total number of parallel segment reads produced by splitting boundary-straddling read tasks in DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPrefetcherFooterSpeculativeParallel, "The number of parquet footers read via a speculative-parallel tail read (last chunk + the rest fired concurrently) by DB::Parquet::Prefetcher", ValueType::Number) \
+    M(ParquetPrefetcherFillRatioLimitedTasks, "The number of times DB::Parquet::Prefetcher stopped extending a coalesced read task because bridging the next gap would make the task mostly unwanted filler bytes (read_min_fill_ratio guard)", ValueType::Number) \
     M(ParquetRowsFilterExpression, "The total number of rows that were passed through filter", ValueType::Number) \
     M(ParquetColumnsFilterExpression, "The total number of columns that were passed through filter", ValueType::Number) \
     M(FilterTransformPassedRows, "Number of rows that passed the filter in the query", ValueType::Number) \

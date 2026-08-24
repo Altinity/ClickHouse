@@ -55,6 +55,8 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/ProxyConfigurationResolverProvider.h>
 
+#include <boost/algorithm/string.hpp>
+
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;

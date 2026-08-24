@@ -254,6 +254,16 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
     const auto record_count = getValueFromRowByName(row_index, c_data_file_record_count, TypeIndex::Int64).safeGet<Int64>();
     const auto file_size_in_bytes = getValueFromRowByName(row_index, c_data_file_file_size_in_bytes, TypeIndex::Int64).safeGet<Int64>();
 
+    /// Optional Parquet row-group split offsets - used only to size the footer tail read.
+    std::vector<Int64> split_offsets;
+    if (hasPath(c_data_file_split_offsets))
+    {
+        Field so = getValueFromRowByName(row_index, c_data_file_split_offsets);
+        if (!so.isNull())
+            for (const auto & off : so.safeGet<Array>())
+                split_offsets.push_back(off.safeGet<Int64>());
+    }
+
     std::optional<Int64> content_offset;
     if (hasPath(c_data_file_content_offset))
     {
@@ -289,7 +299,8 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 /*equality_ids*/ std::nullopt,
                 sort_order_id,
                 record_count,
-                file_size_in_bytes);
+                file_size_in_bytes,
+                std::move(split_offsets));
         }
         case FileContentType::POSITION_DELETE: {
             /// reference_file_path can be absent in schema for some reason, though it is present in specification: https://iceberg.apache.org/spec/#manifests
@@ -354,6 +365,7 @@ ParsedManifestFileEntryPtr AvroForIcebergDeserializer::createParsedManifestFileE
                 /*sort_order_id = */ std::nullopt,
                 record_count,
                 file_size_in_bytes,
+                /*split_offsets = */ std::vector<Int64>{},
                 content_offset,
                 content_size_in_bytes);
         }

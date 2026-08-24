@@ -61,7 +61,7 @@ void ThreadPoolCallbackRunnerFast::startMoreThreadsIfNeeded(size_t active_tasks_
     }
 }
 
-void ThreadPoolCallbackRunnerFast::operator()(std::function<void()> f)
+void ThreadPoolCallbackRunnerFast::operator()(std::function<void()> f, bool front)
 {
     if (mode == Mode::Disabled)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Thread pool runner is not initialized");
@@ -70,7 +70,11 @@ void ThreadPoolCallbackRunnerFast::operator()(std::function<void()> f)
 
     {
         std::unique_lock lock(mutex);
-        queue.push_back(std::move(f));
+        /// Latency-critical tasks jump ahead of already-queued (e.g. prefetch) work.
+        if (front)
+            queue.push_front(std::move(f));
+        else
+            queue.push_back(std::move(f));
 
         startMoreThreadsIfNeeded(active_tasks_, lock);
     }

@@ -63,6 +63,7 @@ DEFINE_ICEBERG_FIELD(added_rows_count);
 DEFINE_ICEBERG_FIELD(existing_rows_count);
 DEFINE_ICEBERG_FIELD(deleted_rows_count);
 DEFINE_ICEBERG_FIELD(record_count);
+DEFINE_ICEBERG_FIELD(split_offsets);
 DEFINE_ICEBERG_FIELD(file_path);
 DEFINE_ICEBERG_FIELD(file_format);
 DEFINE_ICEBERG_FIELD(file_size_in_bytes);
@@ -181,6 +182,7 @@ DEFINE_ICEBERG_FIELD_COMPOUND(data_file, content_offset);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, content_size_in_bytes);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, sort_order_id);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, record_count);
+DEFINE_ICEBERG_FIELD_COMPOUND(data_file, split_offsets);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_size_in_bytes);
 
 /// Fallback defaults for snapshot retention policy when table properties are absent.

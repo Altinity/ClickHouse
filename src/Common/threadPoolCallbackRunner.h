@@ -315,7 +315,10 @@ public:
 
     void shutdown();
 
-    void operator()(std::function<void()> f);
+    /// front=true enqueues at the head of the queue so the task is picked up before already-queued
+    /// tasks. Use for latency-critical work (e.g. a read a consumer is actively blocked on) that
+    /// should jump ahead of speculative/prefetch work.
+    void operator()(std::function<void()> f, bool front = false);
 
     void bulkSchedule(std::vector<std::function<void()>> fs);
 

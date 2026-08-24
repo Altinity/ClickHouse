@@ -1072,11 +1072,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         {
             ProfileEvents::increment(ProfileEvents::ObjectStorageReadObjects);
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
+            const bool format_is_random_access = FormatFactory::instance().checkIfFormatIsRandomAccessInput(format_name);
             read_buf = createReadBuffer(
                 object_info->relative_path_with_metadata,
                 getResolvedStorageFromObjectInfo(object_info, object_storage),
-                context_,
-                log);
+                context_, log,
+                /*read_settings=*/ std::nullopt, format_is_random_access);
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -1394,7 +1395,8 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ObjectStoragePtr & object_storage,
     const ContextPtr & context_,
     const LoggerPtr & log,
-    const std::optional<ReadSettings> & read_settings)
+    const std::optional<ReadSettings> & read_settings,
+    bool format_is_random_access)
 {
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
@@ -1430,7 +1432,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     /// 2. object etag suggests a cache key in case we use filesystem cache
     /// 3. object etag as a cache key for parquet metadata caching
     if (!object_info.metadata)
-        object_info.metadata = object_storage->getObjectMetadata(object_info.getPath(), /*with_tags=*/ false);
+        object_info.metadata = object_storage->getObjectMetadata(
+            object_info.getPath(), /*with_tags=*/ false,
+            /*fetch_part_offsets=*/ effective_read_settings.object_storage_identity_cache_fetch_part_offsets);
 
     if (use_page_cache && object_info.metadata->etag.empty())
     {
@@ -1461,8 +1465,20 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     // Create a read buffer that will prefetch the first ~1 MB of the file.
     // When reading lots of tiny files, this prefetching almost doubles the throughput.
     // For bigger files, parallel reading is more useful.
-    const bool object_too_small = is_size_known
-        && object_size <= 2 * context_->getSettingsRef()[Setting::max_download_buffer_size];
+    //
+    // The prefetch reads from the start of the file. Row/streaming formats (CSV, JSON, ...) consume
+    // from the start, so it is always useful for them. Column-oriented random-access formats
+    // (Parquet/ORC/Arrow) instead read the footer at the *tail* first and drive their own
+    // prefetcher: a from-start read-ahead that does not span the whole file is then dropped and
+    // wasted (an extra object read that transfers bytes nobody consumes). So for those formats only
+    // prefetch when the whole object fits a single download buffer - then it degenerates to one
+    // whole-file read the format serves entirely from memory (footer included). Above that, leave
+    // reading to the format's own tail-first prefetcher.
+    const size_t max_download_buffer_size = context_->getSettingsRef()[Setting::max_download_buffer_size];
+    const size_t prefetch_size_limit = format_is_random_access
+        ? max_download_buffer_size
+        : 2 * max_download_buffer_size;
+    const bool object_too_small = is_size_known && object_size <= prefetch_size_limit;
     const bool use_prefetch = object_too_small
         && modified_read_settings.remote_fs_settings.method == RemoteFSReadMethod::threadpool
         && modified_read_settings.remote_fs_settings.prefetch;

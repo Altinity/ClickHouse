@@ -43,6 +43,7 @@
 #include <Interpreters/Context_fwd.h>
 #include <Server/ServerType.h>
 #include <Storages/MarkCache.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <Storages/MergeTree/UniqueKey/UniqueKeyIndexCache.h>
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
@@ -355,6 +356,7 @@ namespace Setting
     extern const SettingsBool use_page_cache_for_disks_without_file_cache;
     extern const SettingsBool use_page_cache_for_local_disks;
     extern const SettingsBool use_page_cache_for_object_storage;
+    extern const SettingsBool object_storage_identity_cache_fetch_part_offsets;
     extern const SettingsBool use_page_cache_with_distributed_cache;
     extern const SettingsUInt64 use_structure_from_insertion_table_in_table_functions;
     extern const SettingsString workload;
@@ -565,6 +567,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable ResourceManagerPtr resource_manager;
     mutable UncompressedCachePtr uncompressed_cache TSA_GUARDED_BY(mutex);            /// The cache of decompressed blocks.
     mutable MarkCachePtr mark_cache TSA_GUARDED_BY(mutex);                            /// Cache of marks in compressed files.
+    mutable ObjectStorageIdentityCachePtr object_storage_identity_cache TSA_GUARDED_BY(mutex); /// Cache of object-storage identity (size/etag/part-offsets) to avoid per-open HEADs.
     mutable UniqueKeyIndexCachePtr unique_key_index_cache TSA_GUARDED_BY(mutex);               /// RocksDB-compatible block cache over CacheBase for the UNIQUE KEY index (nullptr when RocksDB unavailable or disabled).
     mutable DeleteBitmapCachePtr delete_bitmap_cache TSA_GUARDED_BY(mutex);           /// UNIQUE KEY per-part delete-bitmap cache.
     mutable PrimaryIndexCachePtr primary_index_cache TSA_GUARDED_BY(mutex);
@@ -4129,6 +4132,45 @@ void Context::clearMarkCache() const
         cache->clear();
 
     JemallocCacheArena::purge();
+}
+
+void Context::setObjectStorageIdentityCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (shared->object_storage_identity_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Object storage identity cache has been already created.");
+
+    /// A zero size disables the cache: leave the pointer unset so callers fall back to uncached reads.
+    if (max_size_in_bytes == 0)
+        return;
+
+    shared->object_storage_identity_cache = std::make_shared<ObjectStorageIdentityCache>(cache_policy, max_size_in_bytes, size_ratio);
+}
+
+void Context::updateObjectStorageIdentityCacheConfiguration(const Poco::Util::AbstractConfiguration & config)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (!shared->object_storage_identity_cache)
+        return;
+
+    size_t size = config.getUInt64("object_storage_identity_cache_size", 67108864);
+    shared->object_storage_identity_cache->setMaxSizeInBytes(size);
+}
+
+std::shared_ptr<ObjectStorageIdentityCache> Context::getObjectStorageIdentityCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->object_storage_identity_cache;
+}
+
+void Context::clearObjectStorageIdentityCache() const
+{
+    ObjectStorageIdentityCachePtr cache = getObjectStorageIdentityCache();
+
+    if (cache)
+        cache->clear();
 }
 
 void Context::setUniqueKeyIndexCache(
@@ -8052,6 +8094,7 @@ ReadSettings Context::getReadSettings() const
     res.use_page_cache_with_distributed_cache = settings_ref[Setting::use_page_cache_with_distributed_cache];
     res.use_page_cache_for_local_disks = settings_ref[Setting::use_page_cache_for_local_disks];
     res.use_page_cache_for_object_storage = settings_ref[Setting::use_page_cache_for_object_storage];
+    res.object_storage_identity_cache_fetch_part_offsets = settings_ref[Setting::object_storage_identity_cache_fetch_part_offsets];
     res.use_reader_executor = settings_ref[Setting::use_reader_executor];
     res.page_cache_settings.read_if_exists_otherwise_bypass
         = settings_ref[Setting::read_from_page_cache_if_exists_otherwise_bypass_cache];

@@ -5,13 +5,17 @@
 
 #if USE_AWS_S3
 
+#include <aws/s3/model/ObjectAttributes.h>
+
 namespace ProfileEvents
 {
     extern const Event S3GetObjectTagging;
     extern const Event S3HeadObject;
+    extern const Event S3GetObjectAttributes;
     extern const Event S3HeadObjectMicroseconds;
     extern const Event DiskS3GetObjectTagging;
     extern const Event DiskS3HeadObject;
+    extern const Event DiskS3GetObjectAttributes;
 }
 
 
@@ -39,6 +43,39 @@ namespace
             req.SetVersionId(version_id);
 
         return client.HeadObject(req);
+    }
+
+    Aws::S3::Model::GetObjectAttributesOutcome getObjectAttributes(
+        const S3::Client & client,
+        const String & bucket,
+        const String & key,
+        const String & version_id)
+    {
+        ProfileEvents::increment(ProfileEvents::S3GetObjectAttributes);
+        if (client.isClientForDisk())
+            ProfileEvents::increment(ProfileEvents::DiskS3GetObjectAttributes);
+
+        S3::GetObjectAttributesRequest req;
+        req.SetBucket(bucket);
+        req.SetKey(key);
+        if (!version_id.empty())
+            req.SetVersionId(version_id);
+        req.SetObjectAttributes({
+            Aws::S3::Model::ObjectAttributes::ETag,
+            Aws::S3::Model::ObjectAttributes::ObjectSize,
+            Aws::S3::Model::ObjectAttributes::ObjectParts});
+
+        return client.GetObjectAttributes(req);
+    }
+
+    /// GetObjectAttributes returns the ETag without surrounding quotes, whereas HeadObject returns it
+    /// quoted. Normalize (strip quotes) so identities are consistent regardless of which path produced
+    /// them - important because they are used as cache keys.
+    String stripQuotes(String s)
+    {
+        if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
+            s = s.substr(1, s.size() - 2);
+        return s;
     }
 
     Aws::S3::Model::GetObjectTaggingOutcome getObjectTagging(
@@ -181,6 +218,35 @@ ObjectInfo getObjectInfo(
         error.GetMessage(),
         static_cast<size_t>(error.GetResponseCode()),
         getAuthenticationErrorHint(error.GetErrorType()));
+}
+
+ObjectInfo getObjectIdentity(
+    const S3::Client & client,
+    const String & bucket,
+    const String & key,
+    const String & version_id)
+{
+    {
+        Expect404ResponseScope scope; // a not-found here just falls through to HEAD below
+        auto outcome = getObjectAttributes(client, bucket, key, version_id);
+        if (outcome.IsSuccess())
+        {
+            const auto & result = outcome.GetResult();
+            ObjectInfo object_info;
+            object_info.size = static_cast<size_t>(result.GetObjectSize());
+            object_info.is_size_known = true;
+            object_info.etag = stripQuotes(result.GetETag());
+            for (const auto & part : result.GetObjectParts().GetParts())
+                object_info.part_sizes.push_back(static_cast<size_t>(part.GetSize()));
+            return object_info;
+        }
+        /// GetObjectAttributes unsupported (many S3-compatible stores), denied (distinct IAM action),
+        /// or otherwise failed - fall back to a plain HEAD. Best-effort: we lose part_sizes only.
+    }
+
+    ObjectInfo object_info = getObjectInfo(client, bucket, key, version_id, /*with_metadata=*/ false, /*with_tags=*/ false);
+    object_info.etag = stripQuotes(object_info.etag);
+    return object_info;
 }
 
 size_t getObjectSize(

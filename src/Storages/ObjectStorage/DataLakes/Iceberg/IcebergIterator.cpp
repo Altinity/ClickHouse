@@ -13,6 +13,7 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Common/Exception.h>
 #include <Common/ThreadPool.h>
+#include <Common/getNumberOfCPUCoresToUse.h>
 
 
 #include <Core/NamesAndTypes.h>
@@ -78,6 +79,7 @@ extern const int ICEBERG_SPECIFICATION_VIOLATION;
 namespace Setting
 {
 extern const SettingsBool use_iceberg_partition_pruning;
+extern const SettingsUInt64 iceberg_metadata_processing_threads;
 };
 
 
@@ -155,13 +157,47 @@ std::span<const ProcessedManifestFileEntryPtr> defineDeletesSpan(
 
 }
 
-std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::next()
+ManifestIteratorPtr SingleThreadIcebergKeysIterator::nextManifestFile()
 {
     if (!data_snapshot)
-    {
-        return std::nullopt;
-    }
+        return nullptr;
 
+    /// Find the next manifest file with matching content type and build an iterator over it.
+    /// The cursor is atomic, so concurrent callers each claim a distinct index and the manifest
+    /// fetch below (an S3 read) runs in parallel instead of under a shared advance lock.
+    while (true)
+    {
+        const size_t index = manifest_file_index.fetch_add(1, std::memory_order_relaxed);
+        if (index >= data_snapshot->manifest_list_entries.size())
+            return nullptr;
+        const auto & manifest_list_entry = data_snapshot->manifest_list_entries[index];
+        if (manifest_list_entry.content_type != manifest_file_content_type)
+            continue;
+
+        auto manifest_file_cacheable_part = Iceberg::getManifestFile(
+            object_storage,
+            persistent_components,
+            local_context,
+            log,
+            manifest_list_entry.manifest_file_path,
+            manifest_list_entry.manifest_file_byte_size,
+            *secondary_storages);
+
+        return Iceberg::ManifestFileIterator::create(
+            manifest_file_cacheable_part.deserializer,
+            manifest_list_entry.manifest_file_path,
+            persistent_components.path_resolver,
+            *persistent_components.schema_processor,
+            manifest_list_entry.added_sequence_number,
+            manifest_list_entry.added_snapshot_id,
+            local_context,
+            filter_dag,
+            table_snapshot->schema_id);
+    }
+}
+
+std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::next()
+{
     while (true)
     {
         /// Try to get the next entry from the current manifest file iterator.
@@ -175,35 +211,7 @@ std::optional<ProcessedManifestFileEntryPtr> SingleThreadIcebergKeysIterator::ne
             current_manifest_file_iterator = nullptr;
         }
 
-        /// Find the next manifest file with matching content type.
-        while (manifest_file_index < data_snapshot->manifest_list_entries.size())
-        {
-            const auto & manifest_list_entry = data_snapshot->manifest_list_entries[manifest_file_index++];
-            if (manifest_list_entry.content_type != manifest_file_content_type)
-                continue;
-
-            auto manifest_file_cacheable_part = Iceberg::getManifestFile(
-                object_storage,
-                persistent_components,
-                local_context,
-                log,
-                manifest_list_entry.manifest_file_path,
-                manifest_list_entry.manifest_file_byte_size,
-                *secondary_storages);
-
-            current_manifest_file_iterator = Iceberg::ManifestFileIterator::create(
-                manifest_file_cacheable_part.deserializer,
-                manifest_list_entry.manifest_file_path,
-                persistent_components.path_resolver,
-                *persistent_components.schema_processor,
-                manifest_list_entry.added_sequence_number,
-                manifest_list_entry.added_snapshot_id,
-                local_context,
-                filter_dag,
-                table_snapshot->schema_id);
-            break;
-        }
-
+        current_manifest_file_iterator = nextManifestFile();
         if (!current_manifest_file_iterator)
             return std::nullopt;
     }
@@ -309,39 +317,105 @@ IcebergIterator::IcebergIterator(
     std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
     std::sort(deletion_vector_files.begin(), deletion_vector_files.end());
     std::sort(parquet_position_deletes_files.begin(), parquet_position_deletes_files.end());
-    producer_task = std::make_unique<ThreadFromGlobalPool>(
-        [this, thread_group = CurrentThread::getGroup()]()
-        {
-            DB::ThreadGroupSwitcher switcher(thread_group, DB::ThreadName::ICEBERG_ITERATOR);
-            while (!blocking_queue.isFinished())
+    const size_t configured_threads = local_context_->getSettingsRef()[Setting::iceberg_metadata_processing_threads];
+    const size_t num_producer_threads = configured_threads == 0 ? getNumberOfCPUCoresToUse() : configured_threads;
+
+    if (num_producer_threads <= 1)
+    {
+        producer_task = std::make_unique<ThreadFromGlobalPool>(
+            [this, thread_group = CurrentThread::getGroup()]()
             {
-                std::optional<ProcessedManifestFileEntryPtr> entry;
+                DB::ThreadGroupSwitcher switcher(thread_group, DB::ThreadName::ICEBERG_ITERATOR);
+                while (!blocking_queue.isFinished())
+                {
+                    std::optional<ProcessedManifestFileEntryPtr> entry;
+                    try
+                    {
+                        entry = data_files_iterator.next();
+                    }
+                    catch (...)
+                    {
+                        std::lock_guard lock(exception_mutex);
+                        if (!exception)
+                        {
+                            exception = std::current_exception();
+                        }
+                        blocking_queue.finish();
+                        break;
+                    }
+                    if (!entry.has_value())
+                        break;
+                    while (!blocking_queue.push(std::move(entry.value())))
+                    {
+                        if (blocking_queue.isFinished())
+                        {
+                            break;
+                        }
+                    }
+                }
+                blocking_queue.finish();
+            });
+        return;
+    }
+
+    /// Parallel producers. Each worker pulls a distinct manifest file from `data_files_iterator`
+    /// (thread-safe atomic cursor), then reads and fully drains it on its own. Because the manifest
+    /// fetch (an S3 read) is no longer held under a shared advance lock, up to
+    /// `num_producer_threads` manifest files are read from S3 concurrently - on a cold, cache-empty
+    /// scan of a many-manifest table that turns tens of serialized manifest reads into ceil(N/threads)
+    /// rounds. The heavy per-entry work (deserialize bounds + evaluate min/max pruning) runs in the
+    /// same loop.
+    producers_remaining.store(num_producer_threads);
+    producer_threads.reserve(num_producer_threads);
+    for (size_t i = 0; i < num_producer_threads; ++i)
+    {
+        producer_threads.emplace_back(
+            [this, thread_group = CurrentThread::getGroup()]()
+            {
+                DB::ThreadGroupSwitcher switcher(thread_group, DB::ThreadName::ICEBERG_ITERATOR);
                 try
                 {
-                    entry = data_files_iterator.next();
+                    while (!blocking_queue.isFinished())
+                    {
+                        /// Claim and read the next manifest file (parallel across workers).
+                        ManifestIteratorPtr mfi = data_files_iterator.nextManifestFile();
+                        if (!mfi)
+                            break; /// No manifest files left to process.
+
+                        /// Drain this manifest fully; this worker is its sole owner. next() returns
+                        /// nullptr only when the file is exhausted (skipped/deleted rows consumed
+                        /// internally), never mid-file.
+                        bool stop = false;
+                        while (auto entry = mfi->next())
+                        {
+                            while (!blocking_queue.push(std::move(entry)))
+                            {
+                                if (blocking_queue.isFinished())
+                                {
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                            if (stop)
+                                break;
+                        }
+                        if (stop)
+                            break;
+                    }
                 }
                 catch (...)
                 {
                     std::lock_guard lock(exception_mutex);
                     if (!exception)
-                    {
                         exception = std::current_exception();
-                    }
                     blocking_queue.finish();
-                    break;
                 }
-                if (!entry.has_value())
-                    break;
-                while (!blocking_queue.push(std::move(entry.value())))
-                {
-                    if (blocking_queue.isFinished())
-                    {
-                        break;
-                    }
-                }
-            }
-            blocking_queue.finish();
-        });
+
+                /// The last worker to finish closes the queue so the consumer's next() stops blocking.
+                if (producers_remaining.fetch_sub(1) == 1)
+                    blocking_queue.finish();
+            });
+    }
 }
 
 ObjectInfoPtr IcebergIterator::next(size_t)
@@ -562,6 +636,11 @@ IcebergIterator::~IcebergIterator()
     if (producer_task)
     {
         producer_task->join();
+    }
+    for (auto & thread : producer_threads)
+    {
+        if (thread.joinable())
+            thread.join();
     }
 }
 }

@@ -112,7 +112,11 @@ public:
 
     void tagObjects(const StoredObjects & objects, const std::string & tag_key, const std::string & tag_value) override;
 
-    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
+    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        return getObjectMetadata(path, with_tags, /*fetch_part_offsets=*/ false);
+    }
+    ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets) const override;
 
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
 

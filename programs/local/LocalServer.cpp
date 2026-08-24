@@ -4,6 +4,7 @@
 #include <exception>
 #include <Common/Config/getLocalConfigPath.h>
 #include <Common/CurrentMemoryTracker.h>
+#include <Common/HostResolvePool.h>
 #include <Common/logger_useful.h>
 #include <Common/formatReadable.h>
 #include <Core/Defines.h>
@@ -63,6 +64,7 @@
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <TableFunctions/registerTableFunctions.h>
 #include <Storages/registerStorages.h>
+#include <Processors/QueryPlan/QueryPlanStepRegistry.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
 #include <Formats/registerFormats.h>
@@ -163,6 +165,9 @@ namespace ServerSetting
     extern const ServerSettingsString mark_cache_policy;
     extern const ServerSettingsUInt64 mark_cache_size;
     extern const ServerSettingsDouble mark_cache_size_ratio;
+    extern const ServerSettingsString object_storage_identity_cache_policy;
+    extern const ServerSettingsUInt64 object_storage_identity_cache_size;
+    extern const ServerSettingsDouble object_storage_identity_cache_size_ratio;
     extern const ServerSettingsString unique_key_bitmap_cache_policy;
     extern const ServerSettingsUInt64 unique_key_bitmap_cache_size_bytes;
     extern const ServerSettingsDouble unique_key_bitmap_cache_size_ratio;
@@ -230,6 +235,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_keep_alive_requests;
     extern const ServerSettingsBool asynchronous_metrics_enable_heavy_metrics;
     extern const ServerSettingsUInt32 asynchronous_heavy_metrics_update_period_s;
+    extern const ServerSettingsBool http_latency_aware_host_selection;
 }
 
 namespace ErrorCodes
@@ -429,6 +435,8 @@ void LocalServer::initialize(Poco::Util::Application & self)
         server_settings[ServerSetting::max_format_parsing_thread_pool_size],
         server_settings[ServerSetting::max_format_parsing_thread_pool_free_size],
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
+
+    HostResolver::setLatencyAwareSelection(server_settings[ServerSetting::http_latency_aware_host_selection]);
 }
 
 
@@ -1155,6 +1163,7 @@ try
     registerDictionaries();
     registerDisks(/* global_skip_access_check= */ true);
     registerFormats();
+    QueryPlanStepRegistry::registerPlanSteps();
 
     processConfig();
 
@@ -1431,6 +1440,11 @@ void LocalServer::processConfig()
         LOG_INFO(log, "Lowered mark cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(mark_cache_size));
     }
     global_context->setMarkCache(mark_cache_policy, mark_cache_size, mark_cache_size_ratio);
+
+    global_context->setObjectStorageIdentityCache(
+        server_settings[ServerSetting::object_storage_identity_cache_policy],
+        server_settings[ServerSetting::object_storage_identity_cache_size],
+        server_settings[ServerSetting::object_storage_identity_cache_size_ratio]);
 
     /// UNIQUE KEY delete-bitmap cache. Zero size disables.
     String unique_key_bitmap_cache_policy_name = server_settings[ServerSetting::unique_key_bitmap_cache_policy];

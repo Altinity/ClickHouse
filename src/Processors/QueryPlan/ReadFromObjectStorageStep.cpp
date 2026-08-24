@@ -18,15 +18,110 @@
 #include <Interpreters/Context.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Storages/VirtualColumnUtils.h>
+#include <Parsers/IAST.h>
+#include <Parsers/parseQuery.h>
+#include <Parsers/ExpressionElementParsers.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <TableFunctions/TableFunctionFactory.h>
+#include <TableFunctions/ITableFunction.h>
+#include <Storages/StorageProxy.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/IParameterLookup.h>
+#include <Common/SipHash.h>
 #include <boost/algorithm/string/predicate.hpp>
 
 
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+    extern const int LOGICAL_ERROR;
+}
+
+/// Map a storage engine name to the equivalent table-function name (mirrors
+/// StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded) so the worker can
+/// reconstruct the reader from the serialized args.
+static std::string objectStorageEngineToTableFunction(const StorageObjectStorageConfigurationPtr & configuration)
+{
+    auto engine = configuration->getEngineName();
+    if (engine == "Iceberg")
+    {
+        switch (configuration->getType())
+        {
+            case ObjectStorageType::S3: engine = "IcebergS3"; break;
+            case ObjectStorageType::Azure: engine = "IcebergAzure"; break;
+            case ObjectStorageType::HDFS: engine = "IcebergHDFS"; break;
+            default:
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function for engine {}", engine);
+        }
+    }
+
+    static const std::unordered_map<std::string, std::string> engine_to_function = {
+        {"S3", "s3"}, {"Azure", "azureBlobStorage"}, {"HDFS", "hdfs"},
+        {"Iceberg", "iceberg"}, {"IcebergS3", "icebergS3"}, {"IcebergAzure", "icebergAzure"},
+        {"IcebergHDFS", "icebergHDFS"}, {"IcebergLocal", "icebergLocal"},
+        {"DeltaLake", "deltaLake"}, {"DeltaLakeS3", "deltaLakeS3"}, {"DeltaLakeAzure", "deltaLakeAzure"},
+        {"DeltaLakeLocal", "deltaLakeLocal"}, {"Hudi", "hudi"},
+        {"COSN", "cosn"}, {"GCS", "gcs"}, {"OSS", "oss"},
+    };
+    auto it = engine_to_function.find(engine);
+    if (it == engine_to_function.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function for engine {}", engine);
+    return it->second;
+}
+
 namespace Setting
 {
     extern const SettingsBool parallelize_output_from_storages;
+}
+
+/// Wraps a file iterator so that a distributed_plan worker reads only the files that belong to its
+/// bucket. Bucket membership is a pure function of the file path (`sipHash64(path) % total_buckets`),
+/// which makes the partition deterministic across workers regardless of listing order or thread
+/// scheduling: every file lands in exactly one bucket, so the union over all workers is the full,
+/// non-overlapping file set. Thread-safe: the wrapper is stateless apart from the underlying
+/// iterator, which is already safe to pull concurrently.
+namespace
+{
+class BucketFilterObjectIterator : public IObjectIterator
+{
+public:
+    BucketFilterObjectIterator(ObjectIterator iterator_, size_t bucket_id_, size_t total_buckets_)
+        : iterator(std::move(iterator_)), bucket_id(bucket_id_), total_buckets(total_buckets_)
+    {
+    }
+
+    ObjectInfoPtr next(size_t thread) override
+    {
+        while (auto object_info = iterator->next(thread))
+        {
+            if (sipHash64(object_info->getPath()) % total_buckets == bucket_id)
+                return object_info;
+        }
+        return nullptr;
+    }
+
+    size_t estimatedKeysCount() override
+    {
+        const size_t total = iterator->estimatedKeysCount();
+        return (total + total_buckets - 1) / total_buckets;
+    }
+
+    std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
+
+    void setEmitProfileEvents(bool value) override
+    {
+        emit_profile_events = value;
+        iterator->setEmitProfileEvents(value);
+    }
+
+private:
+    const ObjectIterator iterator;
+    const size_t bucket_id;
+    const size_t total_buckets;
+};
 }
 
 
@@ -93,9 +188,20 @@ void ReadFromObjectStorageStep::updatePrewhereInfo(const PrewhereInfoPtr & prewh
     output_header = std::make_shared<const Block>(info.source_header);
 }
 
-void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+void ReadFromObjectStorageStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & build_settings)
 {
     createIterator();
+
+    /// When this step is part of a distributed query plan, each worker task is given a 'bucket_id'
+    /// and 'total_buckets' parameter; keep only the files that hash to this bucket so the workers
+    /// together read every file exactly once. See BucketFilterObjectIterator.
+    if (distributed_read_bucket_count > 0 && build_settings.parameter_lookup)
+    {
+        const size_t bucket_id = parse<UInt64>(build_settings.parameter_lookup->getParameter("bucket_id").safeGet<String>());
+        const size_t num_buckets = build_settings.parameter_lookup->getParameter("total_buckets").safeGet<UInt64>();
+        if (num_buckets > 1)
+            iterator_wrapper = std::make_shared<BucketFilterObjectIterator>(iterator_wrapper, bucket_id, num_buckets);
+    }
 
     Pipes pipes;
     auto context = getContext();
@@ -190,6 +296,171 @@ bool ReadFromObjectStorageStep::requestReadingInOrder() const
 InputOrderInfoPtr ReadFromObjectStorageStep::getDataOrder() const
 {
     return convertSortingKeyToInputOrder(getStorageMetadata()->getSortingKey());
+}
+
+void ReadFromObjectStorageStep::setDistributedRead(size_t bucket_count)
+{
+    distributed_read_bucket_count = bucket_count;
+}
+
+Strings ReadFromObjectStorageStep::getShardsForDistributedRead() const
+{
+    /// TODO(distributed_plan): return the shard list the coordinator's task iterator distributes to.
+    return {};
+}
+
+void ReadFromObjectStorageStep::serialize(Serialization & ctx) const
+{
+    /// Serialize the object-storage source config faithfully by reusing the table-function args
+    /// (endpoint / credentials / format / schema / iceberg metadata pointer) that
+    /// object_storage_cluster already ships to workers. The worker reconstructs the reader from these.
+    writeStringBinary(objectStorageEngineToTableFunction(configuration), ctx.out);
+
+    auto args = configuration->createArgsWithAccessData();
+    writeStringBinary(args->formatWithSecretsOneLine(), ctx.out);
+
+    auto column_names = getOutputHeader()->getNames();
+    writeVarUInt(column_names.size(), ctx.out);
+    for (const auto & column : column_names)
+        writeStringBinary(column, ctx.out);
+
+    auto prewhere_info = getPrewhereInfo();
+
+    UInt8 flags = 0;
+    if (need_only_count)
+        flags |= 1;
+    if (filter_actions_dag)
+        flags |= 2;
+    if (prewhere_info)
+        flags |= 4;
+    writeIntBinary(flags, ctx.out);
+
+    writeVarUInt(max_block_size, ctx.out);
+    writeVarUInt(num_streams, ctx.out);
+    writeVarUInt(distributed_read_bucket_count, ctx.out);
+
+    if (filter_actions_dag)
+        filter_actions_dag->serialize(ctx.out, ctx.registry);
+
+    /// The optimizer can move the predicate into PREWHERE on the storage step (e.g. for Iceberg),
+    /// in which case it lives here rather than in filter_actions_dag; ship it so the worker filters.
+    if (prewhere_info)
+        prewhere_info->serialize(ctx);
+}
+
+std::unique_ptr<IQueryPlanStep> ReadFromObjectStorageStep::deserialize(Deserialization & ctx)
+{
+    String engine_name;
+    readStringBinary(engine_name, ctx.in);
+    String args_str;
+    readStringBinary(args_str, ctx.in);
+
+    Names column_names;
+    size_t num_columns = 0;
+    readVarUInt(num_columns, ctx.in);
+    column_names.reserve(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+    {
+        String column;
+        readStringBinary(column, ctx.in);
+        column_names.push_back(std::move(column));
+    }
+
+    UInt8 flags = 0;
+    readIntBinary(flags, ctx.in);
+    const bool step_need_only_count = flags & 1;
+    const bool has_filter = flags & 2;
+    const bool has_prewhere = flags & 4;
+
+    size_t step_max_block_size = 0;
+    size_t step_num_streams = 0;
+    size_t bucket_count = 0;
+    readVarUInt(step_max_block_size, ctx.in);
+    readVarUInt(step_num_streams, ctx.in);
+    readVarUInt(bucket_count, ctx.in);
+
+    std::optional<ActionsDAG> filter_dag;
+    if (has_filter)
+        filter_dag = ActionsDAG::deserialize(ctx.in, ctx.registry, ctx.context);
+
+    PrewhereInfoPtr prewhere_info;
+    if (has_prewhere)
+        prewhere_info = std::make_shared<PrewhereInfo>(PrewhereInfo::deserialize(ctx));
+
+    /// Reconstruct the StorageObjectStorage from the serialized table-function form
+    /// (engine + createArgsWithAccessData args) — the same faithful config object_storage_cluster
+    /// ships to workers.
+    const String func_sql = engine_name + "(" + args_str + ")";
+    ParserFunction parser(/*allow_function_parameters_=*/ false);
+    ASTPtr func_ast = parseQuery(parser, func_sql.data(), func_sql.data() + func_sql.size(),
+        "object storage table function", /*max_query_size=*/ 0, /*max_parser_depth=*/ 0, /*max_parser_backtracks=*/ 0);
+
+    auto table_function = TableFunctionFactory::instance().get(func_ast, ctx.context);
+    auto columns_desc = table_function->getActualTableStructureWithAccess(ctx.context, /*is_insert_query=*/ false);
+    StoragePtr storage = table_function->execute(func_ast, ctx.context, table_function->getName(), std::move(columns_desc));
+
+    /// Table functions return the real storage wrapped in a lazy StorageTableFunctionProxy; unwrap it.
+    StoragePtr nested = storage;
+    if (auto * proxy = dynamic_cast<StorageProxy *>(storage.get()))
+        nested = proxy->getNested();
+
+    auto * object_storage_table = dynamic_cast<StorageObjectStorage *>(nested.get());
+    if (!object_storage_table)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Deserialized storage for step {} is not a StorageObjectStorage, got '{}'",
+            STEP_NAME, storage ? storage->getName() : "null");
+
+    auto object_storage = object_storage_table->getObjectStorage();
+    auto configuration = object_storage_table->getObjectStorageConfiguration();
+    auto metadata = object_storage_table->getInMemoryMetadataPtr(ctx.context, /*bypass_metadata_cache=*/ false);
+    auto storage_snapshot = object_storage_table->getStorageSnapshot(metadata, ctx.context);
+
+    SelectQueryInfo query_info;
+    /// Provide a minimal SELECT AST so plan optimizations on the worker (e.g. prewhere's
+    /// SelectQueryInfo::isFinal) don't dereference a null query pointer. The predicate itself
+    /// is carried by filter_actions_dag, not by this AST.
+    query_info.query = make_intrusive<ASTSelectQuery>();
+    auto virtual_columns = metadata->virtuals.getSampleBlock(
+        VirtualsKind::All, VirtualsMaterializationPlace::Reader).getNamesAndTypesList();
+
+    auto read_from_format_info = configuration->prepareReadingFromFormat(
+        object_storage, column_names, storage_snapshot,
+        object_storage_table->supportsSubsetOfColumns(ctx.context),
+        /*supports_tuple_elements=*/ true, ctx.context, PrepareReadingFromFormatHiveParams{});
+
+    auto step = std::make_unique<ReadFromObjectStorageStep>(
+        object_storage_table->getStorageID(),
+        object_storage,
+        configuration,
+        column_names,
+        virtual_columns,
+        query_info,
+        storage_snapshot,
+        std::nullopt,
+        /*distributed_processing=*/ false,
+        std::move(read_from_format_info),
+        step_need_only_count,
+        ctx.context,
+        step_max_block_size,
+        step_num_streams);
+
+    if (filter_dag)
+        step->applyFilters(ActionDAGNodes{.nodes = filter_dag->getOutputs()});
+    /// Re-attach PREWHERE via updatePrewhereInfo so updateFormatPrewhereInfo pulls the prewhere
+    /// input columns back into the read set (the serialized output columns exclude them).
+    if (prewhere_info)
+        step->updatePrewhereInfo(prewhere_info);
+    if (bucket_count)
+        step->setDistributedRead(bucket_count);
+
+    ctx.storage_holders.push_back(storage);
+    return step;
+}
+
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry);
+void registerReadFromObjectStorageStep(QueryPlanStepRegistry & registry)
+{
+    registry.registerStep(ReadFromObjectStorageStep::STEP_NAME, ReadFromObjectStorageStep::deserialize);
 }
 
 }

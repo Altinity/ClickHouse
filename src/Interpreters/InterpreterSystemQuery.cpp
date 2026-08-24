@@ -482,6 +482,10 @@ BlockIO InterpreterSystemQuery::execute()
 #else
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for Parquet");
 #endif
+        case Type::CLEAR_OBJECT_STORAGE_IDENTITY_CACHE:
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_IDENTITY_CACHE);
+            system_context->clearObjectStorageIdentityCache();
+            break;
         case Type::CLEAR_PUFFIN_FILES_CACHE:
             getContext()->checkAccess(AccessType::SYSTEM_DROP_PUFFIN_FILES_CACHE);
             system_context->clearPuffinFilesCache();
@@ -2499,6 +2503,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CLEAR_ICEBERG_METADATA_CACHE:
         case Type::CLEAR_AVRO_SCHEMA_CACHE:
         case Type::CLEAR_PARQUET_METADATA_CACHE:
+        case Type::CLEAR_OBJECT_STORAGE_IDENTITY_CACHE:
         case Type::CLEAR_PUFFIN_FILES_CACHE:
         case Type::CLEAR_PRIMARY_INDEX_CACHE:
         case Type::CLEAR_MMAP_CACHE:

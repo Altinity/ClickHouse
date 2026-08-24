@@ -226,11 +226,24 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
     ContextPtr context_,
     LoggerPtr log)
 {
+    /// A catalog (e.g. Iceberg REST) already knows the table's Iceberg table-uuid from its LoadTable
+    /// response and forwards it as the iceberg_metadata_table_uuid storage setting (see
+    /// DatabaseDataLake / RestCatalog::setTableUUID). When present, use it to key the metadata cache
+    /// on this very first read, so the bootstrap read stores the metadata under (table_uuid, path)
+    /// and the later per-query read hits instead of re-reading the same metadata file. When absent
+    /// (bare-path table function, or Hadoop / version-hint tables with no catalog) the uuid can only
+    /// come from the file itself, so this stays nullopt and getMetadataJSONObject seeds the cache
+    /// after parsing.
+    const auto & data_lake_settings = configuration->getDataLakeSettings();
+    std::optional<String> known_table_uuid;
+    if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_table_uuid].changed)
+        known_table_uuid = normalizeUuid(data_lake_settings[DataLakeStorageSetting::iceberg_metadata_table_uuid].value);
+
     const auto [metadata_version, metadata_file_path, compression_method]
-        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt, CompressionMethod::None, true);
+        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, data_lake_settings, cache_ptr, context_, log.get(), known_table_uuid, CompressionMethod::None, true);
     LOG_DEBUG(log, "Latest metadata file path is {}, version {}", metadata_file_path, metadata_version);
     auto metadata_object
-        = getMetadataJSONObject(metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, std::nullopt);
+        = getMetadataJSONObject(metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, known_table_uuid);
     Int32 format_version = metadata_object->getValue<Int32>(f_format_version);
     String table_location = metadata_object->getValue<String>(f_location);
     std::optional<String> table_uuid = std::nullopt;

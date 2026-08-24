@@ -7,6 +7,8 @@
 
 #include <mutex>
 #include <algorithm>
+#include <cmath>
+#include <vector>
 #include <Poco/Timespan.h>
 
 
@@ -29,6 +31,18 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int DNS_ERROR;
+}
+
+std::atomic<bool> HostResolver::latency_aware_selection{false};
+
+void HostResolver::setLatencyAwareSelection(bool enabled)
+{
+    latency_aware_selection.store(enabled, std::memory_order_relaxed);
+}
+
+bool HostResolver::latencyAwareSelectionEnabled()
+{
+    return latency_aware_selection.load(std::memory_order_relaxed);
 }
 
 HostResolverMetrics HostResolver::getMetrics()
@@ -157,6 +171,51 @@ void HostResolver::setSuccess(const Poco::Net::IPAddress & address)
 
     if (old_weight != new_weight)
         updateWeights();
+}
+
+void HostResolver::reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds)
+{
+    if (microseconds == 0)
+        return;
+
+    std::lock_guard lock(mutex);
+
+    auto it = find(address);
+    if (it == records.end())
+        return;
+
+    it->setLatency(microseconds);
+
+    /// A fresh latency sample shifts the EWMA, which changes the latency-biased weights even
+    /// when the base (usage) weight is unchanged, so recompute when latency-aware selection is on.
+    if (latency_aware_selection.load(std::memory_order_relaxed))
+        updateWeights();
+}
+
+double HostResolver::getLatencyMs(const Poco::Net::IPAddress & address)
+{
+    std::lock_guard lock(mutex);
+
+    auto it = find(address);
+    if (it == records.end())
+        return 0;
+
+    return it->latency_ms_ewma;
+}
+
+double HostResolver::getMinLatencyMs()
+{
+    std::lock_guard lock(mutex);
+
+    double best = 0;
+    for (const auto & rec : records)
+    {
+        if (rec.failed || rec.latency_ms_ewma <= 0)
+            continue;
+        if (best == 0 || rec.latency_ms_ewma < best)
+            best = rec.latency_ms_ewma;
+    }
+    return best;
 }
 
 void HostResolver::setFail(const Poco::Net::IPAddress & address)
@@ -292,11 +351,47 @@ size_t HostResolver::getTotalWeight() const
 
 void HostResolver::updateWeightsImpl()
 {
+    /// When latency-aware selection is on, compute the median latency (TTFB EWMA) across the
+    /// addresses that have a measurement, and bias each address's base weight by how its own
+    /// latency compares to that median. The bias is clamped and floored so that no address is
+    /// starved: even a slow one keeps a weight of at least 1 and is still probed, which keeps
+    /// its EWMA fresh and lets it recover if it speeds up again.
+    double median_latency_ms = 0;
+    const bool latency_aware = latency_aware_selection.load(std::memory_order_relaxed);
+    if (latency_aware)
+    {
+        std::vector<double> measured;
+        measured.reserve(records.size());
+        for (const auto & rec : records)
+            if (rec.latency_ms_ewma > 0)
+                measured.push_back(rec.latency_ms_ewma);
+
+        if (!measured.empty())
+        {
+            auto mid = measured.begin() + measured.size() / 2;
+            std::nth_element(measured.begin(), mid, measured.end());
+            median_latency_ms = *mid;
+        }
+    }
+
     size_t total_weight_next = 0;
 
     for (auto & rec: records)
     {
-        total_weight_next += rec.getWeight();
+        size_t weight = rec.getWeight();
+
+        if (latency_aware && weight > 0 && median_latency_ms > 0 && rec.latency_ms_ewma > 0)
+        {
+            /// ratio > 1 for faster-than-median addresses, < 1 for slower ones. Squared to
+            /// concentrate new-connection opens on the fast front-ends (so the pool composition
+            /// shifts toward them), with a wide clamp and a floor of 1 so slow addresses are
+            /// still probed occasionally and can recover.
+            const double ratio = median_latency_ms / rec.latency_ms_ewma;
+            const double factor = std::clamp(ratio * ratio, 0.1, 16.0);
+            weight = std::max<size_t>(1, static_cast<size_t>(std::lround(static_cast<double>(weight) * factor)));
+        }
+
+        total_weight_next += weight;
         rec.weight_prefix_sum = total_weight_next;
     }
 }

@@ -17,6 +17,7 @@
 #include <IO/WriteBufferFromS3.h>
 #include <IO/ReadBufferFromS3.h>
 #include <IO/S3/getObjectInfo.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIdentityCache.h>
 #include <IO/S3/copyS3File.h>
 #include <IO/S3/deleteFileFromS3.h>
 #include <Interpreters/Context.h>
@@ -207,6 +208,7 @@ private:
                     .etag = object.GetETag(),
                     .tags = {},
                     .attributes = {},
+                    .part_offsets = {},
                 };
                 if (with_tags)
                     metadata.tags = S3::getObjectTags(*client, request->GetBucket(), object.GetKey());
@@ -392,6 +394,7 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
                     .etag = object.GetETag(),
                     .tags = {},
                     .attributes = {},
+                    .part_offsets = {},
                 }));
 
         if (max_keys)
@@ -544,13 +547,62 @@ std::optional<ObjectMetadata> S3ObjectStorage::tryGetObjectMetadata(const std::s
     return result;
 }
 
-ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags) const
+ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool with_tags, bool fetch_part_offsets) const
 {
+    /// When the caller only needs identity (size / etag / part offsets, not tags or user metadata) we
+    /// take a fast path: consult the process-wide identity cache to skip the metadata request entirely
+    /// on repeat opens, and on a miss fetch via GetObjectAttributes (one request for size + etag +
+    /// multipart part sizes, with a HEAD fallback) instead of a plain HEAD. This is what removes the
+    /// per-file HEAD on lake scans. The tags path is unchanged. See ObjectStorageIdentityCache.
+    const bool identity_only = !with_tags;
+    const String identity_key = uri.bucket + "/" + path;
+
+    /// The identity cache is owned by the global Context and sized from server settings. Low-level
+    /// object-storage code can run before/without a global context (e.g. early startup, standalone
+    /// disk use); a null pointer simply means "no cache" and we fall back to an uncached request.
+    ObjectStorageIdentityCachePtr identity_cache;
+    if (identity_only)
+    {
+        if (auto global_context = Context::getGlobalContextInstance())
+            identity_cache = global_context->getObjectStorageIdentityCache();
+
+        if (identity_cache)
+        {
+            if (auto cached = identity_cache->tryGet(identity_key))
+            {
+                ObjectMetadata result;
+                result.size_bytes = cached->size;
+                result.is_size_known = cached->is_size_known;
+                result.etag = cached->etag;
+                result.part_offsets = cached->part_offsets;
+                return result;
+            }
+        }
+    }
+
     auto settings_ptr = s3_settings.get();
+
+    auto fetch = [&](const S3::Client & c) -> S3::ObjectInfo
+    {
+        if (identity_only)
+        {
+            /// Default (fetch_part_offsets = false): a plain HEAD returns size + etag, which is all the
+            /// read path needs (etag keys the page / filesystem / parquet-metadata caches, size drives
+            /// prefetch). Only when the caller wants the multipart layout for part-aligned reads do we
+            /// pay the heavier GetObjectAttributes, which also returns per-part sizes; it falls back to
+            /// a HEAD internally if the API is unsupported or denied. This keeps a cold, cache-empty
+            /// lake scan on the cheap-HEAD path instead of one GetObjectAttributes per file.
+            if (fetch_part_offsets)
+                return S3::getObjectIdentity(c, uri.bucket, path, /*version_id=*/ {});
+            return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ false, /*with_tags=*/ false);
+        }
+        return S3::getObjectInfo(c, uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+    };
+
     S3::ObjectInfo object_info;
     try
     {
-        object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+        object_info = fetch(*client.get());
     }
     catch (DB::Exception & e)
     {
@@ -561,7 +613,7 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
             if (new_client)
             {
                 client.set(std::move(new_client));
-                object_info = S3::getObjectInfo(*client.get(), uri.bucket, path, /*version_id=*/ {}, /*with_metadata=*/ true, /*with_tags=*/ with_tags);
+                object_info = fetch(*client.get());
                 updated = true;
             }
         }
@@ -579,6 +631,23 @@ ObjectMetadata S3ObjectStorage::getObjectMetadata(const std::string & path, bool
     result.etag = object_info.etag;
     result.tags = std::move(object_info.tags);
     result.attributes = object_info.metadata;
+
+    /// GetObjectAttributes returns per-part sizes; convert to cumulative start offsets.
+    if (!object_info.part_sizes.empty())
+    {
+        result.part_offsets.reserve(object_info.part_sizes.size());
+        uint64_t offset = 0;
+        for (size_t part_size : object_info.part_sizes)
+        {
+            result.part_offsets.push_back(offset);
+            offset += part_size;
+        }
+    }
+
+    if (identity_cache)
+        identity_cache->set(
+            identity_key,
+            ObjectStorageIdentity{result.etag, result.size_bytes, result.is_size_known, result.part_offsets});
 
     return result;
 }

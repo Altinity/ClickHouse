@@ -311,6 +311,31 @@ struct Reader
         bool use_column_index = false;
         bool need_null_map = false;
 
+        /// This column chunk provably holds a single repeated value in every row (see
+        /// detectConstantColumn). When set, we skip prefetching and decoding the data pages and
+        /// materialize `constant_value` directly instead. `constant_value` is the already-decoded
+        /// value (not the raw parquet-encoded bytes).
+        bool is_constant = false;
+        Field constant_value;
+        /// Sub-case of `is_constant`: the chunk is provably all-null (null_count == num_values).
+        /// `constant_value` is then `Null` for a Nullable output, or the output default when
+        /// `null_as_default` substitutes nulls for a non-nullable output. formOutputColumn also
+        /// records every row in block_missing_values (the plain constant case has no nulls).
+        bool is_all_null = false;
+
+        /// Per-page constant info from the Column Index (tier 2; see applyColumnIndex and
+        /// detectConstantSubchunk). Populated only when the column index is loaded, indexed by data
+        /// page. `value` is in the output (post-cast) domain. Empty when unavailable. For truncatable
+        /// physical types (BYTE_ARRAY / FIXED_LEN_BYTE_ARRAY) only `all_null` is trusted, never
+        /// `is_const` (the Column Index has no per-page exactness flag).
+        struct PageConstInfo
+        {
+            bool is_const = false; /// page holds a single non-null value
+            bool all_null = false; /// page is entirely null
+            Field value;           /// the value when is_const
+        };
+        std::vector<PageConstInfo> page_const_info;
+
         /// Prefetches.
         /// TODO [parquet]: Check that all handles and tokens are reset after correct stages.
         PrefetchHandle bloom_filter_header_prefetch;
@@ -360,6 +385,15 @@ struct Reader
     {
         /// Primitive column.
         MutableColumnPtr column;
+
+        /// Set by decodePrimitiveColumn when the source column chunk is constant (see
+        /// ColumnChunk::is_constant): `column` is then left empty and formOutputColumn materializes
+        /// `constant_value` directly in the final output type. `constant_value` is in the output
+        /// (post-cast) domain.
+        bool is_constant = false;
+        Field constant_value;
+        /// Mirror of ColumnChunk::is_all_null (see there).
+        bool is_all_null = false;
 
         MutableColumnPtr null_map;
 
@@ -508,7 +542,9 @@ struct Reader
 
     void init(const ReadOptions & options_, const Block & sample_block_, FormatFilterInfoPtr format_filter_info_);
 
-    static parq::FileMetaData readFileMetaData(Prefetcher & prefetcher);
+    /// footer_size_hint: optional hint (bytes) for the initial tail read; 0 = default speculative
+    /// read (see ReadOptions::footer_metadata_size_hint / estimateParquetFooterSize).
+    static parq::FileMetaData readFileMetaData(Prefetcher & prefetcher, size_t footer_size_hint = 0);
     void prefilterAndInitRowGroups(const std::optional<std::unordered_set<UInt64>> & row_groups_to_read);
     void preparePrewhere();
 
@@ -527,12 +563,44 @@ struct Reader
     /// Call after prewhere is done on row subgroup. Un-requests prefetch for fully filtered out pages,
     /// adds pages that need prefetch to `out`. Must be called in order.
     /// May assign dictionary_page_prefetch.
-    void determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & row_subgroup, const RowGroup & row_group, std::vector<PrefetchHandle *> & out);
+    void determinePagesToPrefetch(ColumnChunk & column, const ColumnSubchunk & subchunk, const PrimitiveColumnInfo & column_info, const RowSubgroup & row_subgroup, const RowGroup & row_group, std::vector<PrefetchHandle *> & out);
 
     /// Guess how much memory ColumnSubchunk::{column, arrays_offsets} will use, per row.
     double estimateColumnMemoryBytesPerRow(const ColumnChunk & column, const RowGroup & row_group, const PrimitiveColumnInfo & column_info) const;
 
-    void decodePrimitiveColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info, ColumnSubchunk & subchunk, const RowGroup & row_group, RowSubgroup & row_subgroup);
+    void decodePrimitiveColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info, ColumnSubchunk & subchunk, const RowGroup & row_group, RowSubgroup & row_subgroup, MemoryUsageDiff & diff);
+
+    /// If the column chunk provably holds one repeated value in every row, sets column.is_constant
+    /// and column.constant_value. Two sub-cases, both from column chunk statistics (Tier 1):
+    ///  - a single non-null value in every row (min_value == max_value, no nulls), or
+    ///  - an all-null chunk (null_count == num_values), which also sets column.is_all_null.
+    /// Only applies to flat, top-level primitive columns; see the implementation for the exact
+    /// conditions.
+    void detectConstantColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info) const;
+
+    /// Shared eligibility gate for constant-column materialization (both tiers): the setting is on,
+    /// stats are decodable, and the leaf is a flat top-level primitive output column.
+    bool constColumnMaterializationEligible(const PrimitiveColumnInfo & column_info) const;
+
+    /// Tier 2 (per row subgroup): using the retained per-page Column Index info
+    /// (ColumnChunk::page_const_info), decide whether `column` is constant over the row range
+    /// [start_row, end_row) covered by a subgroup. Returns true and sets out_all_null / out_value
+    /// when every overlapping page is all-null, or every overlapping page holds the same single
+    /// value. row_group_num_rows is the row group's total row count (for the last page's end).
+    bool detectConstantSubchunk(
+        const ColumnChunk & column, const PrimitiveColumnInfo & column_info,
+        size_t start_row, size_t end_row, size_t row_group_num_rows,
+        bool & out_all_null, Field & out_value) const;
+
+    /// Mixed-topology fill (input_format_parquet_fill_constant_pages): true when this subgroup has
+    /// some single-value pages (and no all-null pages) that can be filled from the Column Index
+    /// while the rest is decoded normally. See willFillConstantPages / fillConstantPagesAndDecodeRest.
+    bool willFillConstantPages(
+        const ColumnChunk & column, const PrimitiveColumnInfo & column_info,
+        const RowGroup & row_group, const RowSubgroup & row_subgroup) const;
+    void fillConstantPagesAndDecodeRest(
+        ColumnChunk & column, const PrimitiveColumnInfo & column_info,
+        ColumnSubchunk & subchunk, const RowGroup & row_group, RowSubgroup & row_subgroup);
 
     /// Returns mutable column because some of the recursive calls require it,
     /// e.g. ColumnArray::create does assumeMutable() on the nested columns.

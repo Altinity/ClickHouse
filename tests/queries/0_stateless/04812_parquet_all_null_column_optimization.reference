@@ -1,0 +1,14 @@
+-- all-null column, optimization on
+1	1000
+-- all-null column, optimization off (must be identical)
+1	1000
+-- the varying column is read correctly (not treated as constant)
+499500	0	999	1000
+-- IS NULL / IS NOT NULL filters on an all-null column
+1000
+0
+-- null_as_default: a non-nullable hint substitutes the default (0) for every row
+0	1000
+-- optimization fired only when enabled
+1
+1

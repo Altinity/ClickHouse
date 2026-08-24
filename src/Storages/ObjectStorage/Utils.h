@@ -60,7 +60,11 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const ObjectStoragePtr & object_storage,
     const ContextPtr & context_,
     const LoggerPtr & log,
-    const std::optional<ReadSettings> & read_settings = std::nullopt);
+    const std::optional<ReadSettings> & read_settings = std::nullopt,
+    /// Set when the consuming input format is column-oriented / random-access (Parquet/ORC/Arrow):
+    /// suppresses the generic from-start read-ahead unless the whole object fits one buffer, so the
+    /// format's own tail-first prefetcher is not shadowed by a wasted read. See createReadBuffer.
+    bool format_is_random_access = false);
 
 ASTs::iterator getFirstKeyValueArgument(ASTs & args);
 std::unordered_map<std::string, Field> parseKeyValueArguments(const ASTs & function_args, ContextPtr context);

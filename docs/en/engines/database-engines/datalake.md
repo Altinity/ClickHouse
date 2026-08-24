@@ -84,6 +84,32 @@ SETTINGS
 SHOW TABLES IN database_name;
 SELECT count() from database_name.table_name;
 ```
+
+## Namespace filter {#namespace}
+
+By default, ClickHouse reads tables from all namespaces available in the catalog. You can limit this behavior using the `namespaces` database setting. The value should be a comma‑separated list of namespaces that are allowed to be read.
+
+Supported catalog types are `rest`, `glue` and `unity`.
+
+For example, if the catalog contains three namespaces - `dev`, `stage`, and `prod` - and you want to read data only from dev and stage, set:
+```
+namespaces='dev,stage'
+```
+
+### Nested namespaces {#namespace-nested}
+
+The Iceberg (`rest`) catalog supports nested namespaces. The `namespaces` filter accepts the following patterns:
+
+- `namespace` - includes tables from the specified namespace, but not from its nested namespaces.
+- `namespace.nested` - includes tables from the nested namespace, but not from the parent.
+- `namespace.*` - includes tables from all nested namespaces, but not from the parent.
+
+If you need to include both a namespace and its nested namespaces, specify both explicitly. For example:
+```
+namespaces='namespace,namespace.*'
+```
+
+The default value is '*', which means all namespaces are included.
 To authenticate without sharing a client secret, set `onelake_bearer_token` to a pre-obtained bearer token (scoped to `https://storage.azure.com`) instead of `onelake_client_id`/`onelake_client_secret`. ClickHouse does not refresh the token, so the database must be recreated after it expires.
 
 ## Namespace filter {#namespace}

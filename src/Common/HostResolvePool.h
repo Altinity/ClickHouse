@@ -9,6 +9,7 @@
 
 #include <Poco/Net/IPAddress.h>
 
+#include <atomic>
 #include <mutex>
 #include <memory>
 
@@ -28,6 +29,15 @@
 //    Addresses are resolved through `DB::DNSResolver::instance()`.
 //    Usually it does not happen more often than 3 times in `history_` period.
 //    But also new resolve performed each `setFail()` call.
+// - latency-aware selection (optional, off by default)
+//    When enabled via `setLatencyAwareSelection()`, each address keeps an EWMA of its
+//    observed request latency (time-to-first-byte of read requests, reported via
+//    `setLatency()`). `selectBest()` biases the weighted random choice towards addresses
+//    whose latency is below the median across the resolved set, while every address keeps a
+//    floor of weight so it is still probed occasionally (keeps its EWMA fresh and lets a
+//    recovered address climb back). TTFB is used rather than TCP-connect RTT because the
+//    per-address latency spread is dominated by a stable, steerable backend-path component
+//    that connect RTT does not capture (connect RTT reflects only network proximity).
 
 namespace DB
 {
@@ -107,6 +117,24 @@ public:
     void update();
     void reset();
 
+    /// Enable/disable latency-aware address selection process-wide (all resolvers). Off by default.
+    static void setLatencyAwareSelection(bool enabled);
+    static bool latencyAwareSelectionEnabled();
+
+    /// Report a measured request latency (microseconds, typically time-to-first-byte) for an
+    /// address. Feeds the per-address latency EWMA used by latency-aware selection. Cheap no-op
+    /// when the address is unknown; only recomputes weights when latency-aware selection is on.
+    void reportLatency(const Poco::Net::IPAddress & address, UInt64 microseconds);
+
+    /// Current latency EWMA (milliseconds) for an address, or 0 if unknown/not measured.
+    /// Used to pick the best pooled connection at dispatch time under latency-aware selection.
+    double getLatencyMs(const Poco::Net::IPAddress & address);
+
+    /// Smallest latency EWMA (milliseconds) across all currently-known, non-failed addresses
+    /// that have a measurement, or 0 if none. Used to decide whether reusing a slow pooled
+    /// connection is worse than opening a fresh one to the fastest known front-end.
+    double getMinLatencyMs();
+
     static HostResolverMetrics getMetrics();
 
 protected:
@@ -144,6 +172,10 @@ protected:
         bool failed = false;
         Poco::Timestamp fail_time = 0;
         size_t consecutive_fail_count = 0;
+
+        /// EWMA of observed request latency (time-to-first-byte) in milliseconds. 0 means
+        /// "not measured yet". Only used when latency-aware selection is enabled.
+        double latency_ms_ewma = 0;
 
         size_t weight_prefix_sum{};
 
@@ -196,6 +228,19 @@ protected:
             consecutive_fail_count = 0;
             ++usage;
         }
+
+        void setLatency(UInt64 microseconds)
+        {
+            if (microseconds == 0)
+                return;
+
+            /// Alpha weights the newest sample; small enough to smooth per-request jitter (and the
+            /// per-object backend-fetch variance) but responsive enough to follow a front-end that
+            /// persistently gets slower/faster.
+            static constexpr double alpha = 0.2;
+            const double ms = static_cast<double>(microseconds) / 1000.0;
+            latency_ms_ewma = latency_ms_ewma > 0 ? alpha * ms + (1 - alpha) * latency_ms_ewma : ms;
+        }
     };
 
     using Records = std::vector<Record>;
@@ -222,6 +267,9 @@ protected:
 
     Poco::Timestamp last_resolve_time TSA_GUARDED_BY(mutex) = Poco::Timestamp::TIMEVAL_MIN;
     Records records TSA_GUARDED_BY(mutex);
+
+    /// Process-wide toggle for latency-aware selection. Shared by all resolvers.
+    static std::atomic<bool> latency_aware_selection;
 
     Poco::Logger * log = &Poco::Logger::get("ConnectionPool");
 };

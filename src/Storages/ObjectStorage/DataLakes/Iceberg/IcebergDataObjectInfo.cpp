@@ -19,6 +19,11 @@
 #include <IO/WriteHelpers.h>
 #include <Core/ProtocolDefines.h>
 
+#if USE_PARQUET
+#include <Processors/Formats/Impl/Parquet/ReadCommon.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
+#endif
+
 namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
@@ -73,6 +78,16 @@ String computePartitionId(const Row & partition_key_value)
 
 #if USE_AVRO
 
+#if USE_PARQUET
+/// Rough byte size of a decoded manifest bound value, used only to size the parquet footer read.
+static size_t estimateBoundFieldBytes(const Field & f)
+{
+    if (f.getType() == Field::Types::String)
+        return f.safeGet<String>().size();
+    return 16; /// conservative for numeric / decimal / date / uuid bounds
+}
+#endif
+
 IcebergDataObjectInfo::IcebergDataObjectInfo(
     Iceberg::ProcessedManifestFileEntryPtr data_manifest_file_entry_, const String & metadata_path_, Int32 schema_id_relevant_to_iterator_, ObjectStoragePtr resolved_storage_, const String & resolved_key_)
     : ObjectInfo(RelativePathWithMetadata(resolved_key_.empty() ? metadata_path_ : resolved_key_))
@@ -94,6 +109,38 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
     /// resolved_storage and resolved_key must be provided together or neither must be provided
     /// (default-constructed, meaning the path has not been resolved yet).
     chassert(resolved_key_.empty() == (resolved_storage == nullptr));
+
+    /// Note: object identity (size / etag / multipart part offsets) is intentionally NOT pre-populated
+    /// from the manifest here. It is fetched once via GetObjectAttributes and cached by the
+    /// object-storage identity cache (see S3ObjectStorage::getObjectMetadata / ObjectStorageIdentityCache),
+    /// so all object reads - Iceberg data files included - go through one path that yields the real
+    /// ETag (needed by the filesystem / page / parquet-metadata caches) and the multipart layout
+    /// (needed for read alignment). Pre-populating metadata here would skip that path and lose both.
+#if USE_PARQUET
+    /// Precompute a footer-size hint from the manifest stats so the parquet reader can fetch the
+    /// FileMetaData in a single tail read (see Parquet::estimateParquetFooterSize). Parquet only;
+    /// the hint is ignored by other formats. The row-group count comes from the manifest's
+    /// split_offsets (one per row group) when present - accurate even for byte-split row groups -
+    /// and falls back to a record_count/1M guess otherwise. Only affects read count, never correctness.
+    const auto & entry = *data_manifest_file_entry_->parsed_entry;
+    if (entry.file_format == "PARQUET")
+    {
+        size_t num_columns = std::max(entry.columns_infos.size(), entry.value_bounds.size());
+        if (num_columns > 0)
+        {
+            constexpr size_t rows_per_row_group_guess = 1'000'000;
+            size_t rows = size_t(std::max<Int64>(entry.record_count, 0));
+            size_t num_row_groups = !entry.split_offsets.empty()
+                ? entry.split_offsets.size()
+                : std::max<size_t>(1, (rows + rows_per_row_group_guess - 1) / rows_per_row_group_guess);
+            size_t bounds_bytes = 0;
+            for (const auto & [field_id, bounds] : entry.value_bounds)
+                bounds_bytes += estimateBoundFieldBytes(bounds.first) + estimateBoundFieldBytes(bounds.second);
+            relative_path_with_metadata.footer_size_hint
+                = Parquet::estimateParquetFooterSize(num_columns, num_row_groups, bounds_bytes);
+        }
+    }
+#endif
 }
 
 IcebergDataObjectInfo::IcebergDataObjectInfo(const RelativePathWithMetadata & path_)

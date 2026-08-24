@@ -219,6 +219,19 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.bloom_filter_push_down = settings[Setting::input_format_parquet_bloom_filter_push_down];
     format_settings.parquet.page_filter_push_down = settings[Setting::input_format_parquet_page_filter_push_down];
     format_settings.parquet.use_offset_index = settings[Setting::input_format_parquet_use_offset_index];
+    format_settings.parquet.use_constant_column_optimization = settings[Setting::input_format_parquet_use_constant_column_optimization];
+    format_settings.parquet.use_column_index_for_constant_columns = settings[Setting::input_format_parquet_use_column_index_for_constant_columns];
+    format_settings.parquet.fill_constant_pages = settings[Setting::input_format_parquet_fill_constant_pages];
+    format_settings.parquet.align_reads_to_multipart_boundaries = settings[Setting::input_format_parquet_align_reads_to_multipart_boundaries];
+    format_settings.parquet.read_alignment_bytes = settings[Setting::input_format_parquet_read_alignment_bytes];
+    format_settings.parquet.read_alignment_min_bytes = settings[Setting::input_format_parquet_read_alignment_min_bytes];
+    format_settings.parquet.split_reads_across_part_boundaries = settings[Setting::input_format_parquet_split_reads_across_part_boundaries];
+    format_settings.parquet.read_min_fill_ratio = static_cast<double>(settings[Setting::input_format_parquet_read_min_fill_ratio]);
+    format_settings.parquet.hedged_read_threshold_ms = settings[Setting::input_format_parquet_hedged_read_threshold_ms];
+    format_settings.parquet.hedged_read_ttfb_threshold_ms = settings[Setting::input_format_parquet_hedged_read_ttfb_threshold_ms];
+    format_settings.parquet.hedged_read_max_bytes = settings[Setting::input_format_parquet_hedged_read_max_bytes];
+    format_settings.parquet.hedged_read_max_inflight = settings[Setting::input_format_parquet_hedged_read_max_inflight];
+    format_settings.parquet.prefetch_bandwidth_hide_seconds = settings[Setting::input_format_parquet_prefetch_bandwidth_hide_seconds];
 
     format_settings.parquet.enable_json_parsing = settings[Setting::input_format_parquet_enable_json_parsing];
     format_settings.parquet.memory_low_watermark = settings[Setting::input_format_parquet_memory_low_watermark];
@@ -1118,6 +1131,14 @@ bool FormatFactory::checkIfFormatSupportsSubsetOfColumns(const String & name, co
     const auto & target = getCreators(name);
     auto format_settings = format_settings_ ? *format_settings_ : getFormatSettings(context);
     return target.subset_of_columns_support_checker && target.subset_of_columns_support_checker(format_settings);
+}
+
+bool FormatFactory::checkIfFormatIsRandomAccessInput(const String & name) const
+{
+    if (!exists(name))
+        return false;
+    const auto & target = getCreators(name);
+    return target.random_access_input_creator || target.random_access_input_creator_with_metadata;
 }
 
 void FormatFactory::registerPrewhereSupportChecker(const String & name, PrewhereSupportChecker prewhere_support_checker)
