@@ -134,3 +134,18 @@ and none of the three was tracked anywhere until now.
   `CAS*` gates are green.
 - The credentialed three-group live-GCS run remains mandatory release-environment evidence; it is an
   external release gate, not unfinished request-isolation implementation.
+
+## 12. Release hygiene: CHANGELOG entry and the pinned beta S3 image {#release-hygiene}
+
+Both from the 2026-08-05 opus review, re-verified at HEAD 2026-08-24
+(`docs/superpowers/cas/opus-review-triage.md` `{#m26}`, `{#m31}`).
+
+- **No CHANGELOG entry exists for CAS anywhere on the branch**, for what the docs call a headline
+  feature. Write one (category and wording per `.github/PULL_REQUEST_TEMPLATE.md`), and cover the
+  user-visible upstream side effects this triage surfaced: the `clickhouse-disks --query` exit-code
+  contract change, the `lazy_load_tables` SYSTEM-command behaviour change, and the `cas_log` /
+  `cas_gc_log` tables shipping enabled.
+- **CI pins a beta third-party image**, `rustfs/rustfs:1.0.0-beta.12`, as the S3 backend — wider than
+  the review said: the same beta tag also appears in the stateless lane (`RUSTFS_VERSION`) and in all
+  eight ca-soak compose files. Decide before release: pin a stable tag, or record explicitly that the
+  gate lanes certify against a beta store.
