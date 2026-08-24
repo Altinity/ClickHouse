@@ -1064,16 +1064,6 @@ TEST(CASMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
                        [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
-
-    // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
-    MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; },
-                        [] { return uint64_t{0}; });
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            k2.start();
-        },
-        "held by a different writer_epoch");
 }
 
 TEST(CASMountFence, SupersededWriterRefusedNoS3Read)

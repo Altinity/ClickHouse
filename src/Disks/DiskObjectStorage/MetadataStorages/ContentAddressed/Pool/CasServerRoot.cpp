@@ -1465,7 +1465,7 @@ Token MountLeaseKeeper::claim(const String & body)
         const PutResult result = backend->putIfAbsent(key, body);
         if (result.outcome != PutOutcome::Done)
             throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
+                ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' appeared between head and putIfAbsent", key);
         emitMountEvent(
             event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
@@ -1476,7 +1476,7 @@ Token MountLeaseKeeper::claim(const String & body)
     const auto got = backend->get(key);
     if (!got)
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::ABORTED,
             "CAS mount-lease: key '{}' vanished between head and get while claiming", key);
 
     const MountLease observed = decodeMountLease(got->bytes);
@@ -1486,7 +1486,7 @@ Token MountLeaseKeeper::claim(const String & body)
             event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
             "mount slot is held by a foreign server -- failing closed");
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::ABORTED,
             "CAS mount-lease: key '{}' is held by a foreign server ({}) -- failing closed",
             key, describeMountHolder(observed));
     }
@@ -1496,7 +1496,7 @@ Token MountLeaseKeeper::claim(const String & body)
             event_sink, CasEventType::MountConflict, srid, "adopt", &observed,
             "mount slot is held by a different writer_epoch -- failing closed");
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::ABORTED,
             "CAS mount-lease: key '{}' is held by a different writer_epoch {} rather than ours {} -- failing closed",
             key, observed.writer_epoch, writer_epoch);
     }
@@ -1522,12 +1522,12 @@ Token MountLeaseKeeper::claim(const String & body)
                     "CAS mount-lease: key '{}' was fenced by GC inside the adoption window ({})",
                     key, describeMountHolder(lease)));
             throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
+                ErrorCodes::ABORTED,
                 "CAS mount-lease: key '{}' changed while adopting our own mount slot ({})",
                 key, describeMountHolder(lease));
         }
         throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
+            ErrorCodes::ABORTED,
             "CAS mount-lease: key '{}' vanished while adopting our own mount slot", key);
     }
 

@@ -459,12 +459,10 @@ TEST(CASMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
 
     /// The enriched refusal message must name the OBSERVED holder (X), not the caller (Y).
     const String holder_uuid = u128ToHex(uuid_x);
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            keeper.start();
-        },
-        holder_uuid);
+    DB::Cas::tests::expectThrowsCodeWithMessage(
+        DB::ErrorCodes::ABORTED,
+        holder_uuid,
+        [&] { keeper.start(); });
 }
 
 /// `Pool::open` can fail before/inside `doStart` (e.g. a foreign-conflict refusal, see

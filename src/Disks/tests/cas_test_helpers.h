@@ -44,6 +44,7 @@
 #include <condition_variable>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2140,6 +2141,73 @@ inline void awaitLatchEntered(MetaWriteLatchBackend & backend)
         ASSERT_LT(std::chrono::steady_clock::now(), deadline)
             << "no meta job reached the backend latch -- the fixture never scheduled one";
         std::this_thread::yield();
+    }
+}
+
+/// Runs a caller-supplied action ONCE, immediately before the named backend call, so a test can make
+/// the mount slot change inside a window `MountLeaseKeeper::claim` holds open. Each hook clears
+/// itself after firing.
+class MountSlotRaceBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
+    std::function<void()> before_put_if_absent;
+    std::function<void()> before_get;
+    std::function<void()> before_put_overwrite;
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        fire(before_put_if_absent);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        fire(before_get);
+        return InMemoryBackend::get(key, range);
+    }
+
+    DB::Cas::PutResult putOverwrite(
+        const String & key, const String & bytes, const DB::Cas::Token & expected,
+        const DB::Cas::ObjectMeta & meta) override
+    {
+        fire(before_put_overwrite);
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
+private:
+    static void fire(std::function<void()> & hook)
+    {
+        if (!hook)
+            return;
+        auto once = std::move(hook);
+        hook = nullptr;
+        once();
+    }
+};
+
+/// Expect a DB::Exception with EXACTLY `expected_code` AND a message containing `expected_substring`.
+/// Needed wherever several distinct branches share one code: the code alone does not identify which
+/// one ran, so a test that silently takes the wrong branch would still pass.
+template <typename F>
+void expectThrowsCodeWithMessage(int expected_code, const String & expected_substring, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+        EXPECT_NE(e.message().find(expected_substring), String::npos)
+            << "wrong branch: " << e.message();
     }
 }
 
