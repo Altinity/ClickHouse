@@ -576,9 +576,9 @@ TEST(CASRefContiguousAlloc, RecreationProceedsOnceTheHolderIsTerminal)
 TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// The survivor renews on its own thread, as a real mount does: the renewal loop is what latches the
-    /// write fence when a renewal fails, so a hand-driven `renewWatermarkOnce` would reproduce only the
-    /// failure and not the fencing it causes.
+    /// The survivor uses the runtime-owned renewal worker, as a real mount does: the runtime terminal
+    /// consumer is what latches the write fence when a renewal fails, so a keeper-only call would
+    /// reproduce the failure but not the lifecycle effect it causes.
     PoolConfig survivor_cfg{.pool_prefix = "p", .server_root_id = "test"};
     survivor_cfg.background_watermark = true;
     survivor_cfg.mount_renew_period = std::chrono::milliseconds{50};

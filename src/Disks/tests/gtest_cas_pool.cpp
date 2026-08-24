@@ -1564,8 +1564,8 @@ TEST(CASPoolRemount, ForeignOwnerIsNeverTakenOver)
 TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    /// background_watermark = true so scheduleRemount actually arms a recovery thread in production mode
-    /// (the same gate every background thread checks).
+    /// `background_watermark = true` so `scheduleRemount` can latch a recovery generation for the
+    /// persistent worker in production mode (the same gate both runtime workers check).
     auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
 
@@ -1575,7 +1575,7 @@ TEST(CASPoolRemount, ShutdownGuardRefusesToArmRemount)
     /// A lease-renewal failure firing during teardown re-enters `scheduleRemount`. With the guard it
     /// must refuse to latch another generation after the workers are stopping.
     EXPECT_FALSE(store->scheduleRemountForTest())
-        << "scheduleRemount must not arm a recovery thread once teardown has begun";
+        << "scheduleRemount must not latch recovery work once teardown has begun";
 }
 
 namespace

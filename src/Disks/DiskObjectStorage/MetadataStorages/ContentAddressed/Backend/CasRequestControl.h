@@ -163,8 +163,8 @@ struct CasRequestBudget
     /// so when everything is unreachable the fence deadline freezes at `last_renew + mount_lease_ttl`
     /// and `fence_ok` stops the loop ≈ TTL−attempt_timeout−margin (~23s) after the last successful
     /// renewal — the required fail-closed behavior (never an attempt past the lease), not a
-    /// budget limitation. While renewals DO land (blips, throttling, partial outages — the renewer runs
-    /// on its own background thread and keeps extending the fence deadline), the op is NOT bounded by
+    /// budget limitation. While renewals DO land (blips, throttling, partial outages — the runtime-owned
+    /// renewal worker keeps extending the fence deadline), the op is NOT bounded by
     /// the lease TTL and rides the full deadline here.
     uint64_t operation_deadline_ms = 90000;
     /// Maximum number of controlled attempts for one logical operation (the first attempt counts as 1).

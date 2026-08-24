@@ -918,8 +918,8 @@ void CasMountRuntime::enterIdentityLost()
     /// already `IdentityLost` and its exchange fails), and safety against a concurrent keeper
     /// `noteLeaseLost` (which only ever moves `Live -> TransientNotLive`, never away from it). It does NOT
     /// set `vanished_intent` (that latch is reserved for the `Vanished*` idempotency/FORGET protocol);
-    /// rev.8 makes `IdentityLost` a fail-loud TERMINAL state through `remountTerminal()`, which folds it
-    /// into the observer-exit boundary alongside `vanished_intent`, so the remount/GC observer threads
+    /// rev.8 makes `IdentityLost` a fail-loud TERMINAL state through `remountTerminal`, which folds it
+    /// into the worker-exit boundary alongside `vanished_intent`, so the remount/GC workers
     /// self-exit rather than demote.
     /// `since` for the `identity_lost` snapshot row — the wall-clock instant the observer proved the
     /// sentinels gone. Stamped (release) BEFORE the CAS that publishes `IdentityLost`, so a reader that
@@ -927,7 +927,7 @@ void CasMountRuntime::enterIdentityLost()
     /// release carries this prior store) — the same before-publish ordering `enterVanished` uses. Safe to
     /// stamp before the CAS here, unlike the lock-free `noteLeaseLost`: this runs only from
     /// `TransientNotLive` under `Pool::remount_mutex` (a `Vanished` pool bailed at the caller's
-    /// `isVanished()` gate and the caller guards `!= IdentityLost`), so the CAS wins deterministically and
+    /// `isVanished` gate and the caller guards `!= IdentityLost`), so the CAS wins deterministically and
     /// the stamp can never land on a state we did not transition.
     bool transitioned = false;
     {

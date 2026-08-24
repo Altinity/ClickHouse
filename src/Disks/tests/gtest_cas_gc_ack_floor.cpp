@@ -848,8 +848,8 @@ TEST(CASGCAckFloor, ExpiredMountFencedOutAndExcluded)
     auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
-    // srid2's keeper claims ONE lease via `start()` and is never renewed again — tests never enable
-    // the background renewal thread (`background_watermark` defaults to false), so this alone models a
+    // srid2's keeper claims ONE lease via `start` and is never renewed again — tests never enable
+    // the runtime-owned renewal worker (`background_watermark` defaults to false), so this alone models a
     // crashed process: a body that is live-shaped (not terminated, not fenced) but whose write token
     // never changes again.
     const String srid2 = "stale-server";

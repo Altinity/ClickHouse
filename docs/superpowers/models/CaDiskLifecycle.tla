@@ -93,8 +93,8 @@ VARIABLES
     keeper,         \* "Running" | "StoppedClean" | "StoppedNoFarewell" | "None"
     farewell,       \* the clean-release terminal marker was written
     drained,        \* "Unset" | "Yes" | "No" (drainRefLanesForShutdown outcome)
-    rthread,        \* remount thread: "NotRunning" | "LoopTop" | "InAttempt"
-    rshutdown,      \* remount_shutting_down + remount_stop (stopRemountThread latch)
+    rthread,        \* logical remount work: "NotRunning" | "LoopTop" | "InAttempt"
+    rshutdown,      \* runtime worker-stop request (`stopBackgroundWorkers` latch)
     gcsched,        \* "Running" | "Stopped" | "Destroyed"
     gcstopping,     \* CasGcScheduler.stopping (no new scheduled round)
     round,          \* a GC round is in flight
@@ -135,9 +135,10 @@ Init ==
     /\ naturalWon = FALSE /\ everIL = FALSE /\ everVanished = FALSE
 
 (***************************************************************************)
-(* KEEPER: a failed renewal trips the fence (tripMountLost -> noteLeaseLost*)
-(* Live->Transient) and may arm the remount thread (scheduleRemount checks *)
-(* the shutdown latch, the intent latch, and isVanished).                  *)
+(* RENEWAL: a terminal result trips the fence (tripMountLost ->            *)
+(* noteLeaseLost Live->Transient) and may latch a remount generation.      *)
+(* `rthread=NotRunning` abstracts a persistent worker with no active       *)
+(* request, not the absence of a constructed thread.                      *)
 (***************************************************************************)
 KTrip ==
     /\ keeper = "Running"
@@ -157,7 +158,7 @@ RArm ==
                    naturalWon, everIL, everVanished>>
 
 (***************************************************************************)
-(* REMOUNT THREAD. The loop condition AND the [M1] step-0 bail both check  *)
+(* PERSISTENT REMOUNT WORKER. The loop condition AND the [M1] step-0 bail  *)
 (* intent/vanished, so no attempt BEGINS once the intent is published      *)
 (* (they are adjacent with nothing observable between them -- modeled as   *)
 (* one guard). An attempt already past its bail does NOT re-check intent   *)
@@ -340,7 +341,7 @@ FGcStopJoin ==
                    drained, rthread, rshutdown, gcstopping, round, mutex,
                    naturalWon, everIL, everVanished>>
 
-\* (5a) stopRemountThread: latch the shutdown gate, then join the thread.
+\* (5a) stopBackgroundWorkers: latch the shutdown gate, then join both workers.
 FJoinSignal ==
     /\ fpc = "JoinSignal"
     /\ rshutdown' = TRUE /\ fpc' = "JoinWait"
@@ -356,7 +357,7 @@ FJoinWait ==
                    mutex, naturalWon, everIL, everVanished>>
 
 \* The SECOND tripMountLost: a reclaim that completed inside the join
-\* window re-armed the fence; the thread is now joined, so re-latch.
+\* window re-armed the fence; both runtime workers are now joined, so re-latch.
 FTrip2 ==
     /\ fpc = "Trip2"
     /\ lost' = TRUE

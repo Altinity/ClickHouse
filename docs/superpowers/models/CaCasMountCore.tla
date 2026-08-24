@@ -25,9 +25,10 @@
 (*   - The keeper's adopt is NON-ATOMIC (AdoptRead then AdoptWrite with an *)
 (*     interleaving point) -- the real `MountLeaseKeeper::claim` is        *)
 (*     GET-then-CAS, and the S13 wedge lives in that window.               *)
-(*   - Late renewal: `Renew` may fire after the deadline passed (the       *)
-(*     beat-blocked renewal); on a fenced slot it classifies as            *)
-(*     fenced-by-gc and schedules a remount (new epoch), never a wedge.    *)
+(*   - Permissive atomic renewal: `Renew` may fire after the modeled       *)
+(*     deadline. The current split-phase implementation forbids that with *)
+(*     an absolute BOOTTIME gate; retaining the broader atomic action here *)
+(*     stress-tests fence/remount safety rather than describing cadence.  *)
 (*   - Recovery loop: fenced same-epoch is NOT adoptable/refreshable; the  *)
 (*     actor re-allocates a fresh epoch and reclaims (remount).            *)
 (*                                                                         *)
@@ -469,12 +470,12 @@ RejectForeignOwner(a) ==
 \* exists for this open() attempt (`CasStore.cpp:312-316`'s own "STRICT ORDER: ... claim
 \* owner (identity) -> allocate durable writer_epoch -> claim the mount lease (liveness) ..."
 \* comment), or after the fence-recovery loop has ALREADY reset the previous (now-abandoned)
-\* keeper (`CasStore.cpp:454-455`, `mount_keeper.reset()` before reallocating; the
-\* `FencedSelf` retry at `:413` likewise only fires when our own fresh attempt was ALREADY
-\* fenced). NOTE: this is NOT gated on wall-clock expiry (`mount.deadline`/`clock`) -- `Renew`
-\* is explicitly allowed to fire on a wall-clock-expired-but-unfenced mount ("the beat-blocked
-\* renewal", see its own comment), so mere expiry does not mean the actor has abandoned this
-\* epoch; only a GENUINE FENCE does ("a fence costs an epoch", the model's own P3.1
+\* keeper before reallocating; the `FencedSelf` retry likewise only fires when our own fresh
+\* attempt was ALREADY fenced). NOTE: this atomic model deliberately does NOT gate `Renew` on
+\* modeled wall-clock expiry (`mount.deadline`/`clock`). The current split-phase controller's
+\* absolute BOOTTIME gate is proved by `CaMountRenewRetryCore`; the broader action retained here
+\* is a conservative safety over-approximation, so mere modeled expiry does not mean the actor has
+\* abandoned this epoch; only a GENUINE FENCE does ("a fence costs an epoch", the model's own P3.1
 \* philosophy). A guard keyed on `mount.deadline > clock` still let `AllocEpoch` fire right
 \* at/after the wall-clock deadline while `mount.fenced` was still FALSE, reproducing the
 \* SAME false alarm this round already fixed once (verified via TLC after the first,
@@ -540,8 +541,9 @@ AllocEpoch(a) ==
 \* (`mount.deadline <= clock`, bare wall-clock, deliberately NOT touched this round) looks
 \* like `GcFence`/`ClearExpiredMount`'s pattern but is NOT an observer-side death verdict on
 \* a DIFFERENT still-alive party -- in the honest protocol `ownerOK` forces `mount.uuid = a =
-\* owner` (sticky), so this is `a` examining its OWN prior record, exactly like `Renew`'s
-\* late-renewal (which has NO expiry guard at all). Whatever `expired` decides, `ClaimMount`
+\* owner` (sticky), so this is `a` examining its OWN prior record. The model's deliberately
+\* permissive atomic `Renew` has no expiry guard; the current split-phase implementation's
+\* stricter absolute gate is outside this abstraction. Whatever `expired` decides, `ClaimMount`
 \* always installs a FRESH `fenceUntil` for `a` itself (below), so there is no second party
 \* whose STILL-VALID fence a premature verdict could ignore -- unlike `GcFence`/
 \* `ClearExpiredMount`, which act on a mount whose TRUE holder may be a physically distinct,
@@ -593,8 +595,10 @@ ClaimMount(a) ==
                     obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
     /\ UNCHANGED rgVars
 
-\* The mount holder renews -- possibly LATE (the beat-blocked renewal: no expiry guard,
-\* a renewal may fire after the deadline passed and after a GcFence landed).
+\* The mount holder renews atomically. This action is intentionally more permissive than the
+\* current split-phase implementation: it may fire after the modeled deadline, including after a
+\* `GcFence`. `CaMountRenewRetryCore` owns request/deadline/cadence fidelity; the late atomic action
+\* retained here proves that the mount/fence/remount safety layer tolerates a broader environment.
 \*   own live epoch, not fenced -> extend the deadline (token-guarded write; bumps mtoken)
 \*   own live epoch, FENCED     -> the fence took the token; classify by BODY (fixed
 \*                                 protocol): fenced-by-gc -> schedule remount (localLost;
@@ -604,9 +608,9 @@ ClaimMount(a) ==
 \*                                 installs the successor's new-epoch body, so `mount.epoch #
 \*                                 localEpoch[a]` here IS the reclaim (no `heldToken`
 \*                                 compensating field needed, round 7's mechanism deleted).
-\*                                 Models `renewOnce`'s cached-token CAS failing ->
-\*                                 `onRenewMismatch` classifying "superseded by a newer
-\*                                 incarnation" (`CasServerRoot.cpp:785-792`).
+\*                                 Models `MountLeaseKeeper::renew`'s cached-token CAS failing ->
+\*                                 exact-GET classification as "superseded by a newer
+\*                                 incarnation".
 Renew(a) ==
     /\ ~rejected[a] /\ ~wedged[a]
     /\ mount # None
@@ -718,9 +722,9 @@ AdoptRead(a) ==
 \* `MountLeaseKeeper::claim`, `CasServerRoot.cpp:711-737`, which performs exactly this
 \* re-read-and-classify; see the task report's round-4 section for the product-vs-model
 \* reachability caveat -- this exact interleaving is NOT reachable in the current product
-\* because `state_mutex` serializes `claim()` against `renewOnce()` and the renewal thread
-\* does not exist until AFTER `claim()` returns, `CasStore.cpp:444-473` -- this action still
-\* encodes the target DESIGN semantics the comment above has always documented).
+\* because the synchronous keeper is started before `CasMountRuntime` releases either persistent
+\* worker, and the runtime's single-driver admission prevents concurrent keeper access -- this
+\* action still encodes the target DESIGN semantics the comment above has always documented).
 \* rev.6 round 7 (review M1, stated explicitly): the `selfCaused` branch below is a
 \* PRODUCT-UNREACHABLE branch -- the product's actual behavior for this exact body pattern
 \* ("same uuid, same epoch, unfenced, yet the token moved") is a HARD, FAIL-CLOSED

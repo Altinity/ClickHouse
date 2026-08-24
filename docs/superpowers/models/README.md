@@ -433,6 +433,23 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
   `_witness_*` reachability checks. Run evidence, state counts and traces:
   `CaCasMountCore_RESULTS.md`.
 
+### Mount-renewal model routing {#mount-renewal-model-routing}
+
+`CaMountRenewRetryCore` is the current fidelity model for one split-phase logical mount renewal:
+immutable `write_attempt_id` and bytes, physical retry, exact-`GET` adoption, absolute deadline,
+terminalization, late delivery, and attempt-start cadence. `CaCasMountCore.Renew` remains an atomic,
+deliberately permissive safety abstraction. A focused `Committed` result corresponds to its durable
+body/token plus local-authority postconditions; a focused terminal result enters its fenced/remount
+boundary. There is no claimed refinement, and the atomic action's ability to renew after its modeled
+deadline is an over-approximation rather than current runtime behavior.
+
+`CaDiskLifecycle` models only logical remount activity (`NotRunning` means the persistent worker has
+no active request). Its FORGET/join-window proof is unchanged by moving construction to writable open
+and replacing the running boolean with a generation latch: an attempt already in flight may still
+finish before worker join, and the second fence trip remains load-bearing. GC-leader heartbeats,
+build/debris heartbeats, and the superseded writer-ack-floor mechanisms in the other matching models
+are separate protocols; their current or historical status is recorded in the model entries below.
+
 ### rev.7/rev.8 disk lifecycle: FORGET protocol (+ the excised erasure proof) {#group-rev7-lifecycle}
 
 Gates for the "throw-when-uncertain" disk-lifecycle redesign
@@ -443,7 +460,8 @@ evidence and trace analysis: `.superpowers/sdd/tla-rev7-report.md`.
 - **`CaDiskLifecycle.tla`** — THE Task-15 gate: the v1 lifecycle state machine
   (`Vanished` = `Replaced` | `Forgotten`; `IdentityLost` on authoritative sentinel absence) + the
   as-built `SYSTEM CONTENT ADDRESSED FORGET` step order (`Pool::forgetDisk`), concurrent with
-  keeper trips, the self-remount thread (whose in-flight attempt may complete a full reclaim after
+  renewal terminal results, the persistent self-remount worker (whose in-flight attempt may complete a
+  full reclaim after
   the terminal intent is published — the [M1] step-0 intent-bail stops new attempts, not one
   mid-flight), the natural `Replaced` promotion, the GC scheduler loop with the [C1]
   self-exit-on-Vanished fix, and the `GC STOP`/`GC START` verbs under `lifecycle_mutex`. Proves:

@@ -31,7 +31,7 @@ using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 ///   - `TransientNotLive` — the lease was lost; access is uncertain and a self-remount retries. The §2
 ///                          `Present`+identity-match recovery rule fires only from here (or `Live`).
 ///   - `IdentityLost`     — the pool sentinels are authoritatively absent (both KeyAbsent):
-///                          fail-loud and TERMINAL (rev.8). The remount/GC observer threads self-exit;
+///                          fail-loud and TERMINAL (rev.8). The remount/GC workers self-exit;
 ///                          matching-sentinel reappearance does NOT auto-revive it ([D3]); recovery is a
 ///                          restart or `SYSTEM CAS FORGET`.
 ///   - `Vanished*`        — fully terminal truth: the data root was replaced by a foreign pool, or the
@@ -227,10 +227,10 @@ public:
     /// One-way terminal transition to `IdentityLost`, from `TransientNotLive` only (a compare-exchange
     /// FROM `TransientNotLive`, so it is idempotent and cannot fire from `Live`/`Vanished`). On the
     /// transition it emits ONE WARN and one `CASIdentityLost` ProfileEvent. rev.8: `IdentityLost` is a
-    /// fail-loud TERMINAL state — `remountTerminal()` reports it, so the remount observer thread self-exits
+    /// fail-loud TERMINAL state — `remountTerminal` reports it, so the remount worker self-exits
     /// (and the GC scheduler self-exits, through `Pool`) at its next boundary; there is no demoted observer.
     /// It deliberately does NOT publish the `vanished_intent` latch (which is reserved for the `Vanished*`
-    /// idempotency/FORGET protocol); `remountTerminal()` widens the observer-exit boundary to include it.
+    /// idempotency/FORGET protocol); `remountTerminal` widens the worker-exit boundary to include it.
     /// Must be called under the caller's remount serialization (Pool::remount_mutex).
     void enterIdentityLost();
     /// Test seam: force the lifecycle condition directly to `lc`, bypassing the natural transition
@@ -240,9 +240,9 @@ public:
     void setLifecycleForTest(PoolLifecycle lc);
 
     /// Publish the terminal-intent latch (`vanished_intent`) WITHOUT settling the lifecycle state. This is
-    /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the keeper
-    /// callback stop arming remounts and the remount loop bail at its next step boundary, so FORGET's
-    /// subsequent thread joins are bounded to one step + one backend timeout. The state store + WARN happen
+    /// spec §5 step 1 of `SYSTEM CAS FORGET`: publishing the latch FIRST makes the runtime terminal
+    /// consumer stop latching remount generations and the remount loop bail at its next step boundary, so
+    /// FORGET's subsequent worker joins are bounded to one step + one backend timeout. The state store + WARN happen
     /// later, in `enterVanished` at step 6. Idempotent. Publication is serialized by `driver_mutex` and
     /// followed by a condition-variable notification, so a worker cannot miss the terminal edge between
     /// its predicate sample and wait. A natural
@@ -250,7 +250,7 @@ public:
     void publishVanishedIntent();
 
     /// One-way transition to a fully-terminal `Vanished` value (spec §3). Publishes the terminal-intent
-    /// latch (so the keeper stops scheduling remounts and the remount loop exits at its next step
+    /// latch (so the runtime stops scheduling remount work and the remount loop exits at its next step
     /// boundary) if it is not already published, records `reason`, stores the state, then emits ONE WARN +
     /// one `CASDataRootVanished` ProfileEvent. Idempotent: the first terminal STATE transition wins (a
     /// dedicated latch keyed separately from `vanished_intent`, because FORGET publishes that intent latch
@@ -397,7 +397,7 @@ private:
     std::unique_lock<std::mutex> lockTerminalPublication();
 
     /// TRUE once the pool has reached — or is being driven toward — a state on which the self-remount
-    /// observer thread must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
+    /// worker must stop: a published terminal `Vanished` intent (`vanished_intent` — set early by
     /// FORGET, or by a natural `enterVanished`, and already subsuming every settled `Vanished*` state since
     /// it is published before the state store) OR `IdentityLost` (rev.8: a fail-loud TERMINAL state — no
     /// demoted observer; recovery is restart or FORGET). Consulted by `scheduleRemount` before arming and by
@@ -425,7 +425,7 @@ private:
     /// active_build_seqs holds the seqs of in-flight builds, so `minActive` yields the GC floor. The floor
     /// is published by the merged `mount_keeper`
     /// beat (there is no standalone watermark object anymore). ATOMIC because a self-remount re-stamps it
-    /// (kept equal to `live_writer_epoch`) off the background remount thread while `epoch`/`writerEpoch`
+    /// (kept equal to `live_writer_epoch`) from the runtime-owned remount worker while `epoch`/`writerEpoch`
     /// may observe it; the ref-lane hot readers were moved to `liveWriterEpoch`, so this now backs only
     /// the identity accessors.
     std::atomic<uint64_t> process_epoch{0};
@@ -482,8 +482,8 @@ private:
     /// Terminal-intent latch (spec §3), published before the state store — by `enterVanished` for a
     /// natural transition, or EARLY (step 1) by `publishVanishedIntent` for FORGET. Only the fully-terminal
     /// `Vanished*` transition sets it — `IdentityLost` deliberately does NOT (rev.8 folds IdentityLost into
-    /// the observer-exit boundary via `remountTerminal()` instead). Consulted (with `IdentityLost`) by
-    /// `remountTerminal()`, so a terminal pool's runtime consumer never schedules a remount and the remount
+    /// the worker-exit boundary via `remountTerminal` instead). Consulted (with `IdentityLost`) by
+    /// `remountTerminal`, so a terminal pool's runtime consumer never schedules a remount and the remount
     /// loop bails at its next step boundary — no claim/allocate/write after the pool is (being driven) terminal.
     std::atomic<bool> vanished_intent{false};
     /// Idempotency guard for the terminal STATE transition (`enterVanished`'s body). Distinct from

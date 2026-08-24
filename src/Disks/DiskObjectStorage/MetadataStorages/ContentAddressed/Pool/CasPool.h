@@ -160,7 +160,8 @@ struct PoolConfig
     /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
     /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
     uint64_t gc_meta_pool_size = 16;
-    bool background_watermark = false;       /// tests drive renewOnce explicitly; gates the merged heartbeat's background thread
+    /// Tests drive `renewWatermarkOnce` explicitly; gates both persistent runtime workers.
+    bool background_watermark = false;
     /// Installed on the pool before a writable mount can start its runtime-owned workers.
     CasEventSink event_sink = {};
 
@@ -737,8 +738,8 @@ public:
     /// `reportImpossibleInterference`) actually invoked `scheduleRemount`, as opposed to merely observing
     /// `mayMutate() == false` (which `tripMountLost` alone already accounts for).
     uint64_t scheduleRemountCallCountForTest() const { return mount_runtime.scheduleRemountCallCountForTest(); }
-    /// Test seam: latch `remount_shutting_down` exactly as `~Pool()` does at its top, WITHOUT tearing
-    /// the Pool down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
+    /// Test seam: publish the same worker-stop request as `~Pool` without tearing the pool down, so a
+    /// test can assert `scheduleRemount` refuses to latch work once teardown has begun.
     void beginShutdownForTest();
 
 
@@ -1087,14 +1088,14 @@ private:
     /// AFTER this member), but they capture `Pool` and run only at runtime after the Pool is fully
     /// constructed -- exactly as in the pre-3.5 layout, where the mount raw-members these callbacks reach
     /// were also declared after `ref_ledger`. `~Pool` still calls `ref_ledger.drainRefLanesForShutdown`
-    /// explicitly, sequenced between `mount_runtime.stopRemountThread()` and
-    /// `mount_runtime.finishTeardown()` exactly as before.
+    /// explicitly, sequenced between `mount_runtime.stopBackgroundWorkers` and
+    /// `mount_runtime.finishTeardown` exactly as before.
     CasRefLedger ref_ledger;
     /// The mount / write-fence / build-watermark / self-remount runtime, extracted
     /// from Pool. Owns the `MountLeaseKeeper`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
     /// map, the live-incarnation `live_writer_epoch`, the unclean-epoch high-water-mark, and the
-    /// self-remount recovery thread (with its own thread-lifecycle locks). Injected with backend/layout +
+    /// persistent renewal and remount workers (with one driver mutex/condition pair). Injected with backend/layout
     /// the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool `cas_request_budget`
     /// + a `remount_attempt` callback (== `Pool::tryRemountOnce`, which STAYS on Pool: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).
@@ -1102,7 +1103,7 @@ private:
     /// Declared AFTER `ref_ledger` -- preserving the pre-3.5 relative order VERBATIM (the mount raw-members
     /// this component replaces all sat after `ref_ledger`), so `mount_runtime` is destroyed FIRST and
     /// `ref_ledger` LAST. Both orders were proven equally safe -- `~Pool`
-    /// quiesces both subsystems before ANY member dtor runs (stopRemountThread ->
+    /// quiesces both subsystems before ANY member dtor runs (`stopBackgroundWorkers` ->
     /// ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and the ledger's async paths
     /// pin `Pool::shared_from_this`, so no ledger->mount callback can fire during destruction in either
     /// order. Both safe ⇒ this is a pure behavior-preserving relocation, so the ORIGINAL order is kept and

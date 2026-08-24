@@ -319,7 +319,7 @@ TEST(CASHeartbeat, SupersededTouchIsFailClosedNotFatal)
 ///
 /// This test used to be `ForeignUuidTouchStillDies`, an `EXPECT_DEATH` that pinned the abort. The abort
 /// was the defect: the arm raised `LOGICAL_ERROR`, which aborts at CONSTRUCTION in debug/ASan builds,
-/// and it does so on the keeper's BACKGROUND thread — so an environment-reachable condition (clear the
+/// and the runtime consumes it on its renewal worker — so an environment-reachable condition (clear the
 /// prefix, recreate under a different server id, and the survivor's next renewal lands there; see
 /// `CASRefContiguousAlloc.SurvivingWriterIsFencedByTheRecreatedPoolsMount`, which drives exactly that)
 /// took the whole server down, and took the ASan gate down with it.
@@ -327,7 +327,7 @@ TEST(CASHeartbeat, SupersededTouchIsFailClosedNotFatal)
 /// What must NOT change is the outcome, which is what this test now pins: synchronous renewal returns
 /// a terminal failure that, when propagated, throws; the exception
 /// carries the foreign holder's identity, and it is classified `ABORTED` — the same mount-lost class the
-/// sibling fencing arms use, which the background loop turns into a latched write fence. The
+/// sibling fencing arms use, which the runtime terminal consumer turns into a latched write fence. The
 /// `abort_on_logical_error` arming is deliberately kept: with it ON, a `LOGICAL_ERROR` would still abort,
 /// so reaching the `EXPECT_THROW` at all is the proof that this condition is no longer classified as one.
 TEST(CASHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
@@ -372,7 +372,7 @@ TEST(CASHeartbeat, ForeignUuidTouchFailsClosedWithoutAborting)
     }
     EXPECT_NE(message.find("held by a foreign server"), String::npos) << message;
     EXPECT_EQ(code, DB::ErrorCodes::ABORTED)
-        << "the mount-lost class the background loop latches the write fence on -- and, critically, not "
+        << "the mount-lost class the runtime terminal consumer latches the write fence on -- and, critically, not "
            "LOGICAL_ERROR, which would abort the renewal worker and the whole process with it";
 }
 

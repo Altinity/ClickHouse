@@ -619,9 +619,9 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
 
     /// Mount-slot writer audit (the "foreign writer" instrument): route every mount-slot
     /// write/conflict event through the Pool's own sink. The factory installs the configured sink
-    /// before this mount protocol starts, including before any renewal thread can emit.
-    /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
-    /// `Pool` destroyed before the `Pool` itself.
+    /// before this mount protocol starts, including before either runtime worker can emit.
+    /// `s` outlives the lambda: the runtime-owned keeper and workers are stopped before `Pool`
+    /// destruction reaches the event dispatcher.
     const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
 
     Pool * raw = store.get();
@@ -801,11 +801,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
             ? std::numeric_limits<uint64_t>::max()
             : claim_anchor_boot_ms + ttl_ms_u);
-    /// Gate the background renewer with `background_watermark`: it runs only in production
+    /// Gate the two persistent runtime workers with `background_watermark`: they run only in production
     /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-    /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,
-    /// never on the loop. The keeper itself is still started above (it must claim/adopt the mount +
-    /// arm the fence on every writable open); only the renewal thread is conditional. The merged
+    /// drive `renewWatermarkOnce` explicitly and rely on the armed sub-TTL deadline, never on a loop.
+    /// The synchronous keeper is still started above (it must adopt the mount and arm the fence on
+    /// every writable open); only the worker pair is conditional. The merged
     /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
     if (store->config.background_watermark)
         store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
@@ -960,15 +960,14 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();
 
     /// (3+5c) Retire the merged heartbeat: a clean-release farewell ONLY if the lanes provably drained,
-    /// otherwise stop background renewal with NO terminal marker so the lease expires by observation (never
-    /// an unearned clean farewell). Also does the belt-and-suspenders remount rejoin. Outside `remount_mutex`.
+    /// otherwise publish NO terminal marker so the lease expires by observation (never an unearned
+    /// clean farewell). The workers were already joined above. Outside `remount_mutex`.
     mount_runtime.finishTeardown(drained);
 
     /// The pool object OUTLIVES this FORGET (it stays registered, `Vanished(forgotten)`, until DROP/restart),
     /// so `~Pool` will re-run the same teardown. Drop the keeper now so that later teardown finds none and
-    /// skips it: `MountLeaseKeeper::stop`'s terminal op is single-shot (`doTerminate` throws a `LOGICAL_ERROR`
-    /// on a second call — an ASan-abort at construction), so a keeper that already terminated here must not be
-    /// terminated again. `keeperReset` is safe now: every keeper-touching thread (renewal, remount) is joined.
+    /// skips it: `MountLeaseKeeper::release` is admitted only from `Active`, so a keeper already released
+    /// here must not be released again. `keeperReset` is safe now: both keeper-driving workers are joined.
     mount_runtime.keeperReset();
 
     /// (6) Publish the terminal state + WARN, under remount serialization — matching the natural-transition
@@ -1306,8 +1305,8 @@ bool Pool::tryRemountOnce()
     }
 }
 
-/// The self-remount recovery thread + the merged-heartbeat renew live in `mount_runtime`
-/// (Pool/CasMountRuntime.h); these are thin delegates. `mount_runtime`'s `remount_attempt` callback is
+/// The persistent self-remount and merged-heartbeat renewal workers live in `mount_runtime`
+/// (`Pool/CasMountRuntime.h`); these are thin delegates. `mount_runtime`'s `remount_attempt` callback is
 /// bound to `Pool::tryRemountOnce` (the claim/recovery orchestration that stays on Pool).
 bool Pool::scheduleRemountForTest()
 {
