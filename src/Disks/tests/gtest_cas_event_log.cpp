@@ -11,6 +11,9 @@
 #include <Common/Exception.h>
 #include <Poco/Exception.h>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <future>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -30,10 +33,48 @@ namespace
 class RenewalEventBackend final : public InMemoryBackend
 {
 public:
+    using InMemoryBackend::get;
     using InMemoryBackend::putOverwrite;
 
     bool throw_before_next_overwrite = false;
     bool throw_nonretryable_next_overwrite = false;
+    bool vanish_on_next_overwrite = false;
+
+    void armBlockedResolve()
+    {
+        std::lock_guard lock(resolve_mutex);
+        block_next_get = true;
+        resolve_started = false;
+        release_resolve = false;
+    }
+
+    bool waitForResolveStarted()
+    {
+        std::unique_lock lock(resolve_mutex);
+        return resolve_cv.wait_for(lock, std::chrono::seconds(2), [&] { return resolve_started; });
+    }
+
+    void releaseResolve()
+    {
+        std::lock_guard lock(resolve_mutex);
+        release_resolve = true;
+        resolve_cv.notify_all();
+    }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        {
+            std::unique_lock lock(resolve_mutex);
+            if (block_next_get)
+            {
+                resolve_started = true;
+                resolve_cv.notify_all();
+                resolve_cv.wait_for(lock, std::chrono::seconds(20), [&] { return release_resolve; });
+                block_next_get = false;
+            }
+        }
+        return InMemoryBackend::get(key, range);
+    }
 
     PutResult putOverwrite(
         const String & key,
@@ -41,12 +82,24 @@ public:
         const Token & expected,
         const ObjectMeta & meta) override
     {
+        if (std::exchange(vanish_on_next_overwrite, false))
+        {
+            (void)InMemoryBackend::deleteExact(key, expected);
+            return {PutOutcome::PreconditionFailed, {}};
+        }
         if (std::exchange(throw_nonretryable_next_overwrite, false))
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected deterministic renewal rejection");
         if (std::exchange(throw_before_next_overwrite, false))
             throw Poco::TimeoutException("injected renewal timeout before commit");
         return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
     }
+
+private:
+    std::mutex resolve_mutex;
+    std::condition_variable resolve_cv;
+    bool block_next_get = false;
+    bool resolve_started = false;
+    bool release_resolve = false;
 };
 
 CasRequestBudget renewalEventBudget()
@@ -65,11 +118,12 @@ PoolPtr openRenewalEventPool(
     const std::shared_ptr<RenewalEventBackend> & backend,
     uint64_t & boot_ms,
     CasRequestBudget budget = renewalEventBudget(),
-    String prefix = "renewal-events")
+    String prefix = "renewal-events",
+    String server_root_id = "test")
 {
     return Pool::open(backend, PoolConfig{
         .pool_prefix = std::move(prefix),
-        .server_root_id = "test",
+        .server_root_id = std::move(server_root_id),
         .mount_lease_ttl_ms = std::chrono::milliseconds(1000),
         .cas_request_budget = budget,
         .boot_ms_fn = [&] { return boot_ms; },
@@ -192,6 +246,34 @@ TEST(CASEvent, WatermarkRenewEventsAreBoundedAndComplete)
     }
 }
 
+TEST(CASEvent, FirstAmbiguityIsVisibleWhileResolveIsInFlight)
+{
+    auto backend = std::make_shared<RenewalEventBackend>();
+    uint64_t boot_ms = 100;
+    std::atomic<uint32_t> retrying_events{0};
+    auto store = openRenewalEventPool(
+        backend, boot_ms, renewalEventBudget(), "renewal-inflight-ambiguity");
+    store->setEventSink([&](CasEvent event)
+    {
+        if (event.type == CasEventType::WatermarkRenew && event.outcome == "retrying")
+            retrying_events.fetch_add(1);
+    });
+
+    backend->throw_before_next_overwrite = true;
+    backend->armBlockedResolve();
+    auto renewal = std::async(std::launch::async, [&] { store->renewWatermarkOnce(); });
+
+    const bool resolve_started = backend->waitForResolveStarted();
+    EXPECT_TRUE(resolve_started);
+    const uint32_t observed_before_release = retrying_events.load();
+    backend->releaseResolve();
+    EXPECT_NO_THROW(renewal.get());
+
+    EXPECT_EQ(observed_before_release, 1u)
+        << "first ambiguity must be externally visible before its resolving GET completes";
+    EXPECT_EQ(retrying_events.load(), 1u) << "retrying delivery is bounded to the first ambiguity";
+}
+
 TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)
 {
     auto backend = std::make_shared<RenewalEventBackend>();
@@ -286,7 +368,7 @@ TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
         if (event.type != CasEventType::WatermarkRenew)
             return;
         events.push_back(event);
-        if (event.outcome == "retrying" && !std::exchange(reentered, true))
+        if (event.outcome == "recovered" && !std::exchange(reentered, true))
             store->renewWatermarkOnce();
     });
 
@@ -302,6 +384,42 @@ TEST(CASEvent, ReentrantRenewalSinkPreservesOuterObservationIdentity)
     EXPECT_EQ(events[1].detail.at("write_attempt_id"), events[0].detail.at("write_attempt_id"));
     EXPECT_EQ(decodeMountLease(backend->get(store->layout().mountKey("test"))->bytes).seq, 3u)
         << "the nested first-attempt success must run without replacing the outer observation";
+}
+
+TEST(CASEvent, PreCompletionConflictReentrancyPreservesOuterTerminalObservation)
+{
+    auto inner_backend = std::make_shared<RenewalEventBackend>();
+    uint64_t inner_boot_ms = 100;
+    auto inner = openRenewalEventPool(
+        inner_backend, inner_boot_ms, renewalEventBudget(), "renewal-reentrant-inner", "inner");
+
+    auto outer_backend = std::make_shared<RenewalEventBackend>();
+    uint64_t outer_boot_ms = 100;
+    CasRequestBudget outer_budget = renewalEventBudget();
+    outer_budget.max_attempts = 1;
+    auto outer = openRenewalEventPool(
+        outer_backend, outer_boot_ms, outer_budget, "renewal-reentrant-outer", "outer");
+    std::vector<CasEvent> outer_events;
+    bool reentered = false;
+    outer->setEventSink([&](CasEvent event)
+    {
+        outer_events.push_back(event);
+        if (event.type == CasEventType::MountConflict && !std::exchange(reentered, true))
+            inner->renewWatermarkOnce();
+    });
+
+    outer_backend->vanish_on_next_overwrite = true;
+    EXPECT_THROW(outer->renewWatermarkOnce(), DB::Exception);
+
+    ASSERT_TRUE(reentered);
+    const std::vector<CasEvent> renewals = watermarkRenewEvents(outer_events);
+    ASSERT_EQ(renewals.size(), 2u);
+    EXPECT_EQ(renewals[0].outcome, "retrying");
+    EXPECT_EQ(renewals[1].outcome, "failed");
+    EXPECT_EQ(renewals[0].detail.at("server_root_id"), "outer");
+    EXPECT_EQ(renewals[1].detail.at("server_root_id"), "outer");
+    EXPECT_EQ(renewals[1].detail.at("write_attempt_id"), renewals[0].detail.at("write_attempt_id"));
+    EXPECT_EQ(renewals[1].detail.at("classification"), "vanished");
 }
 
 /// Round-B opt §6: `emitEvent` takes the event BY VALUE (moved-through, not `const &`), so a

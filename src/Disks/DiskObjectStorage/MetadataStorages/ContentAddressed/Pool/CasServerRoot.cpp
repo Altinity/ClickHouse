@@ -14,7 +14,9 @@
 #include <magic_enum.hpp>
 
 #include <algorithm>
+#include <array>
 #include <ctime>
+#include <exception>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -76,8 +78,9 @@ enum class MountRenewTerminalClassification : uint8_t
     Vanished,
 };
 
-/// The controller observer touches only this fixed-size state. In particular, it never logs, invokes
-/// an event sink, formats an ID, or copies a string between the final admission gate and backend I/O.
+/// Retry admission (`RetryStarted`/`PutStarted`) touches only this fixed-size state. First ambiguity
+/// may deliver its one bounded warning/event before the controller's following pre-resolve gate; it
+/// never runs after a pre-request gate.
 struct MountRenewObservabilityContext
 {
     bool active = false;
@@ -99,12 +102,102 @@ struct MountRenewObservabilityContext
     uint32_t attempts_sent = 0;
     uint32_t ambiguity_attempt_no = 0;
     bool resolved_by_get = false;
+    bool retrying_delivered = false;
 };
 
-thread_local MountRenewObservabilityContext mount_renew_observability;
 static_assert(std::is_trivially_copyable_v<MountRenewObservabilityContext>);
 
-void beginMountRenewObservability(
+struct MountRenewObservabilityConfiguration
+{
+    bool configured = false;
+    bool deferred = false;
+    const String * server_root_id = nullptr;
+    const CasEventSink * event_sink = nullptr;
+};
+
+/// Event sinks may synchronously renew another Pool on the same thread. A fixed stack keeps every
+/// outer per-call snapshot stable without allocation, including while a parked redo holds
+/// `remount_mutex`. Overflow suppresses diagnostics for the nested call rather than aliasing an outer
+/// call or changing protocol behavior.
+struct MountRenewObservabilityStack
+{
+    static constexpr size_t capacity = 8;
+    std::array<MountRenewObservabilityContext, capacity> contexts;
+    size_t depth = 0;
+    size_t suppressed_depth = 0;
+    MountRenewObservabilityConfiguration pending;
+};
+
+thread_local MountRenewObservabilityStack mount_renew_observability;
+
+MountRenewObservabilityContext * currentMountRenewObservability() noexcept
+{
+    if (mount_renew_observability.suppressed_depth != 0 || mount_renew_observability.depth == 0)
+        return nullptr;
+    return &mount_renew_observability.contexts[mount_renew_observability.depth - 1];
+}
+
+enum class MountRenewObservabilityRegistration : uint8_t
+{
+    Stack,
+    Suppressed,
+    Ignored,
+};
+
+MountRenewObservabilityRegistration beginMountRenewObservabilityCall() noexcept
+{
+    const MountRenewObservabilityConfiguration configured = std::exchange(
+        mount_renew_observability.pending, MountRenewObservabilityConfiguration{});
+    if (!configured.configured)
+        return MountRenewObservabilityRegistration::Ignored;
+    if (mount_renew_observability.depth == MountRenewObservabilityStack::capacity)
+    {
+        ++mount_renew_observability.suppressed_depth;
+        return MountRenewObservabilityRegistration::Suppressed;
+    }
+
+    mount_renew_observability.contexts[mount_renew_observability.depth++] = MountRenewObservabilityContext{
+        .deferred = configured.deferred,
+        .server_root_id = configured.server_root_id,
+        .event_sink = configured.event_sink,
+    };
+    return MountRenewObservabilityRegistration::Stack;
+}
+
+void abandonMountRenewObservabilityCall() noexcept
+{
+    if (mount_renew_observability.suppressed_depth != 0)
+    {
+        --mount_renew_observability.suppressed_depth;
+        return;
+    }
+    if (mount_renew_observability.depth != 0)
+        --mount_renew_observability.depth;
+}
+
+class MountRenewObservabilityCallGuard
+{
+public:
+    explicit MountRenewObservabilityCallGuard(MountRenewObservabilityRegistration registration_)
+        : registration(registration_)
+        , uncaught_on_entry(std::uncaught_exceptions())
+    {
+    }
+
+    ~MountRenewObservabilityCallGuard()
+    {
+        if (registration == MountRenewObservabilityRegistration::Ignored)
+            return;
+        if (std::uncaught_exceptions() > uncaught_on_entry)
+            abandonMountRenewObservabilityCall();
+    }
+
+private:
+    MountRenewObservabilityRegistration registration;
+    int uncaught_on_entry;
+};
+
+void initializeMountRenewObservability(
     const String & server_root_id,
     uint64_t writer_epoch,
     uint64_t seq,
@@ -114,13 +207,18 @@ void beginMountRenewObservability(
     CasOverwriteDeadlineSource deadline_source,
     const CasEventSink & event_sink) noexcept
 {
-    const MountRenewObservabilityContext configured = mount_renew_observability;
-    mount_renew_observability = MountRenewObservabilityContext{
+    MountRenewObservabilityContext * context = currentMountRenewObservability();
+    if (!context)
+        return;
+    const bool deferred = context->deferred;
+    const String * configured_server_root_id = context->server_root_id;
+    const CasEventSink * configured_event_sink = context->event_sink;
+    *context = MountRenewObservabilityContext{
         .active = true,
         .completed = false,
-        .deferred = configured.deferred,
-        .server_root_id = configured.server_root_id ? configured.server_root_id : &server_root_id,
-        .event_sink = configured.event_sink ? configured.event_sink : &event_sink,
+        .deferred = deferred,
+        .server_root_id = configured_server_root_id ? configured_server_root_id : &server_root_id,
+        .event_sink = configured_event_sink ? configured_event_sink : &event_sink,
         .writer_epoch = writer_epoch,
         .seq = seq,
         .write_attempt_id = write_attempt_id,
@@ -229,6 +327,43 @@ void emitMountRenewEvent(
     }
 }
 
+void deliverMountRenewRetrying(
+    const MountRenewObservabilityContext & context,
+    const String & write_attempt_id,
+    uint64_t now_boot_ms,
+    uint64_t remount_attempt_no) noexcept
+{
+    /// Publish the structured event before the text logger. Either callback may consume recovery
+    /// budget, but this transition is followed by the controller's pre-resolve gate, so it cannot
+    /// start backend I/O after that budget has expired.
+    emitMountRenewEvent(
+        context,
+        write_attempt_id,
+        "retrying",
+        context.ambiguity_attempt_no,
+        now_boot_ms,
+        CasUnresolvedReason::NotUnresolved,
+        context.deadline_source,
+        CasOverwriteStopCause::Continue,
+        "ambiguous",
+        remount_attempt_no);
+    try
+    {
+        LOG_WARNING(
+            getLogger("CasMountLeaseKeeper"),
+            "CAS mount renewal '{}' entered retry after physical attempt {} (writer_epoch={}, seq={}, "
+            "remaining_confirmed_budget_ms={})",
+            *context.server_root_id,
+            context.ambiguity_attempt_no,
+            context.writer_epoch,
+            context.seq,
+            remainingConfirmedBudget(context, now_boot_ms));
+    }
+    catch (...)
+    {
+    }
+}
+
 constexpr std::string_view terminalClassificationName(const MountRenewObservabilityContext & context)
 {
     switch (context.terminal_classification)
@@ -273,35 +408,8 @@ void deliverMountRenewObservability(
         const uint64_t now_boot_ms = defaultBootMs();
         const String write_attempt_id = u128ToHex(context.write_attempt_id).substr(0, 12);
 
-        if (context.ambiguity_attempt_no != 0)
-        {
-            try
-            {
-                LOG_WARNING(
-                    getLogger("CasMountLeaseKeeper"),
-                    "CAS mount renewal '{}' entered retry after physical attempt {} (writer_epoch={}, seq={}, "
-                    "remaining_confirmed_budget_ms={})",
-                    *context.server_root_id,
-                    context.ambiguity_attempt_no,
-                    context.writer_epoch,
-                    context.seq,
-                    remainingConfirmedBudget(context, now_boot_ms));
-            }
-            catch (...)
-            {
-            }
-            emitMountRenewEvent(
-                context,
-                write_attempt_id,
-                "retrying",
-                context.ambiguity_attempt_no,
-                now_boot_ms,
-                CasUnresolvedReason::NotUnresolved,
-                context.deadline_source,
-                CasOverwriteStopCause::Continue,
-                "ambiguous",
-                remount_attempt_no);
-        }
+        if (context.ambiguity_attempt_no != 0 && !context.retrying_delivered)
+            deliverMountRenewRetrying(context, write_attempt_id, now_boot_ms, remount_attempt_no);
 
         for (uint32_t attempt_no = 2; attempt_no <= context.attempts_sent; ++attempt_no)
         {
@@ -420,7 +528,8 @@ void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
 void configureMountRenewObservability(
     const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept
 {
-    mount_renew_observability = MountRenewObservabilityContext{
+    mount_renew_observability.pending = MountRenewObservabilityConfiguration{
+        .configured = true,
         .deferred = deferred,
         .server_root_id = server_root_id,
         .event_sink = event_sink,
@@ -429,18 +538,38 @@ void configureMountRenewObservability(
 
 void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept
 {
-    MountRenewObservabilityContext & context = mount_renew_observability;
-    if (!context.active)
+    MountRenewObservabilityContext * context = currentMountRenewObservability();
+    if (!context || !context->active)
         return;
 
     switch (progress.kind)
     {
         case CasOverwriteProgressKind::PutStarted:
-            context.attempts_sent = std::max(context.attempts_sent, progress.attempt_no);
+            context->attempts_sent = std::max(context->attempts_sent, progress.attempt_no);
             break;
         case CasOverwriteProgressKind::BecameAmbiguous:
-            if (context.ambiguity_attempt_no == 0)
-                context.ambiguity_attempt_no = progress.attempt_no;
+            if (context->ambiguity_attempt_no == 0)
+            {
+                context->ambiguity_attempt_no = progress.attempt_no;
+                if (!context->deferred)
+                {
+                    /// Mark first, because either diagnostic callback may synchronously renew another
+                    /// Pool. The fixed observation stack keeps this outer snapshot stable.
+                    context->retrying_delivered = true;
+                    try
+                    {
+                        const uint64_t now_boot_ms = defaultBootMs();
+                        const String write_attempt_id = u128ToHex(context->write_attempt_id).substr(0, 12);
+                        deliverMountRenewRetrying(
+                            *context, write_attempt_id, now_boot_ms, /*remount_attempt_no=*/0);
+                    }
+                    catch (...)
+                    {
+                        /// First-ambiguity observability is diagnostic-only. The controller now runs
+                        /// its pre-resolve gate before starting any additional backend I/O.
+                    }
+                }
+            }
             break;
         case CasOverwriteProgressKind::RetryStarted:
         case CasOverwriteProgressKind::ResolveStarted:
@@ -451,33 +580,38 @@ void reportMountRenewProgress(const CasOverwriteProgress & progress) noexcept
 
 void reportMountRenewCompletion(const MountRenewResult & result) noexcept
 {
-    MountRenewObservabilityContext & context = mount_renew_observability;
-    if (!context.active)
+    if (mount_renew_observability.suppressed_depth != 0)
+    {
+        --mount_renew_observability.suppressed_depth;
         return;
-    context.completed = true;
-    context.outcome = result.outcome;
-    context.attempts_sent = std::max(context.attempts_sent, result.diagnostics.attempts_sent);
-    context.resolved_by_get = result.diagnostics.resolved_by_get;
-    context.unresolved_reason = result.diagnostics.unresolved_reason;
-    context.deadline_source = result.diagnostics.deadline_source;
-    context.stop_cause = result.diagnostics.stop_cause;
-    if (context.deferred)
+    }
+    MountRenewObservabilityContext * context = currentMountRenewObservability();
+    if (!context || !context->active)
+        return;
+    context->completed = true;
+    context->outcome = result.outcome;
+    context->attempts_sent = std::max(context->attempts_sent, result.diagnostics.attempts_sent);
+    context->resolved_by_get = result.diagnostics.resolved_by_get;
+    context->unresolved_reason = result.diagnostics.unresolved_reason;
+    context->deadline_source = result.diagnostics.deadline_source;
+    context->stop_cause = result.diagnostics.stop_cause;
+    if (context->deferred)
         return;
 
-    /// Clear the thread-local slot before invoking any callback. A reentrant sink may start and finish
-    /// another renewal on this thread without altering the outer snapshot.
-    const MountRenewObservabilityContext completed = std::exchange(
-        mount_renew_observability, MountRenewObservabilityContext{});
+    /// Pop before invoking any callback. A reentrant sink gets a distinct stack slot and cannot alter
+    /// the completed outer snapshot.
+    const MountRenewObservabilityContext completed = *context;
+    --mount_renew_observability.depth;
     deliverMountRenewObservability(completed, /*remount_attempt_no=*/0);
 }
 
 void deliverDeferredMountRenewObservability(uint64_t remount_attempt_no) noexcept
 {
-    MountRenewObservabilityContext & context = mount_renew_observability;
-    if (!context.deferred)
+    MountRenewObservabilityContext * context = currentMountRenewObservability();
+    if (!context || !context->deferred)
         return;
-    const MountRenewObservabilityContext completed = std::exchange(
-        mount_renew_observability, MountRenewObservabilityContext{});
+    const MountRenewObservabilityContext completed = *context;
+    --mount_renew_observability.depth;
     deliverMountRenewObservability(completed, remount_attempt_no);
 }
 
@@ -1503,6 +1637,9 @@ MountRenewResult MountLeaseKeeper::renew(
     const CasRequestBudget & budget,
     const MountRenewOperationEnvironment & environment)
 {
+    const MountRenewObservabilityRegistration observability_registration = beginMountRenewObservabilityCall();
+    const MountRenewObservabilityCallGuard observability_guard(observability_registration);
+
     if (keeper_state != MountLeaseKeeperState::Active)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS mount-lease: renew is allowed only in Active state for key '{}'", key);
 
@@ -1536,15 +1673,18 @@ MountRenewResult MountLeaseKeeper::renew(
         ? CasOverwriteDeadlineSource::ExternalLeaseSafety
         : CasOverwriteDeadlineSource::RequestBudget;
 
-    beginMountRenewObservability(
-        srid,
-        writer_epoch,
-        next_seq,
-        write_attempt_id,
-        attempt_start_boot_ms,
-        confirmed_deadline_boot_ms,
-        deadline_source,
-        event_sink);
+    if (observability_registration != MountRenewObservabilityRegistration::Ignored)
+    {
+        initializeMountRenewObservability(
+            srid,
+            writer_epoch,
+            next_seq,
+            write_attempt_id,
+            attempt_start_boot_ms,
+            confirmed_deadline_boot_ms,
+            deadline_source,
+            event_sink);
+    }
 
     CasRequestController controller(backend, budget, boot_clock);
     const CasOverwriteOperationContext context{
@@ -1566,11 +1706,12 @@ MountRenewResult MountLeaseKeeper::renew(
         /// The controller may propagate a deterministic/non-retryable exception after `PutStarted`.
         /// Preserve the physical observer's already-published truth instead of returning the default
         /// zero-attempt diagnostics from the result object that was never assigned.
-        controlled.diagnostics.attempts_sent = std::max(
-            controlled.diagnostics.attempts_sent, mount_renew_observability.attempts_sent);
+        if (const MountRenewObservabilityContext * observation = currentMountRenewObservability())
+            controlled.diagnostics.attempts_sent = std::max(
+                controlled.diagnostics.attempts_sent, observation->attempts_sent);
         controlled.diagnostics.deadline_source = deadline_source;
-        mount_renew_observability.terminal_classification
-            = MountRenewTerminalClassification::DeterministicFailure;
+        if (MountRenewObservabilityContext * observation = currentMountRenewObservability())
+            observation->terminal_classification = MountRenewTerminalClassification::DeterministicFailure;
         return terminalResult(attempt_start_boot_ms, controlled.diagnostics, std::current_exception());
     }
 
@@ -1593,7 +1734,8 @@ MountRenewResult MountLeaseKeeper::renew(
 
     if (controlled.outcome == CasOverwriteOutcome::Conflict)
     {
-        mount_renew_observability.terminal_classification = MountRenewTerminalClassification::Conflict;
+        if (MountRenewObservabilityContext * observation = currentMountRenewObservability())
+            observation->terminal_classification = MountRenewTerminalClassification::Conflict;
         try
         {
             throwRenewConflict(controlled.diagnostics);
@@ -1620,7 +1762,8 @@ MountRenewResult MountLeaseKeeper::renew(
     if (controlled.diagnostics.resolve_observation_completed
         && !controlled.diagnostics.observed_bytes)
     {
-        mount_renew_observability.terminal_classification = MountRenewTerminalClassification::Vanished;
+        if (MountRenewObservabilityContext * observation = currentMountRenewObservability())
+            observation->terminal_classification = MountRenewTerminalClassification::Vanished;
         emitMountEvent(
             event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
             "mount slot vanished while renewing -- failing closed");

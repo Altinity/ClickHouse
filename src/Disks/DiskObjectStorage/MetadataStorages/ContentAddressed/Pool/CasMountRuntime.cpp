@@ -412,13 +412,13 @@ MountRenewOperationEnvironment CasMountRuntime::renewalEnvironment(bool worker_c
             switch (progress.kind)
             {
                 case CasOverwriteProgressKind::PutStarted:
-                    ProfileEvents::increment(ProfileEvents::CASMountRenewalAttempts);
+                    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalAttempts);
                     break;
                 case CasOverwriteProgressKind::RetryStarted:
-                    ProfileEvents::increment(ProfileEvents::CASMountRenewalRetries);
+                    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRetries);
                     break;
                 case CasOverwriteProgressKind::ResolvedByGet:
-                    ProfileEvents::increment(ProfileEvents::CASMountRenewalResolved);
+                    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalResolved);
                     break;
                 case CasOverwriteProgressKind::BecameAmbiguous:
                 case CasOverwriteProgressKind::ResolveStarted:
@@ -476,13 +476,13 @@ void CasMountRuntime::consumeRenewResult(
     /// consumption boundary and it runs without `driver_mutex` or keeper access.
     if (result.outcome == MountRenewOutcome::Committed
         && (result.diagnostics.attempts_sent > 1 || result.diagnostics.resolved_by_get))
-        ProfileEvents::increment(ProfileEvents::CASMountRenewalRecovered);
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalRecovered);
     if (result.outcome == MountRenewOutcome::Terminal
         && result.diagnostics.deadline_source == CasOverwriteDeadlineSource::ExternalLeaseSafety
         && result.diagnostics.stop_cause == CasOverwriteStopCause::Continue
         && (result.diagnostics.unresolved_reason == CasUnresolvedReason::NoAttemptSent
             || result.diagnostics.unresolved_reason == CasUnresolvedReason::DeadlineMidWay))
-        ProfileEvents::increment(ProfileEvents::CASMountRenewalDeadlineExceeded);
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountRenewalDeadlineExceeded);
 
     if (result.outcome == MountRenewOutcome::Committed)
     {
