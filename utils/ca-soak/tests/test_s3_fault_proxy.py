@@ -5,6 +5,7 @@ import http.server
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import threading
 
 import pytest
@@ -15,6 +16,11 @@ SPEC = importlib.util.spec_from_file_location("s3_fault_proxy_under_test", PROXY
 proxy = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(proxy)
+
+CA_SOAK_PATH = Path(__file__).parents[1]
+if str(CA_SOAK_PATH) not in sys.path:
+    sys.path.insert(0, str(CA_SOAK_PATH))
+s39 = importlib.import_module("scenarios.cards.s39_lease_fault_tolerance")
 
 
 class UpstreamHandler(http.server.BaseHTTPRequestHandler):
@@ -203,3 +209,48 @@ def test_unscoped_configuration_keeps_legacy_seeded_decisions(servers):
     assert statuses == [429, 429, 201, 429, 201, 201, 201, 503]
     assert stats()["faults"] == 4
     assert len(upstream.requests) == 4
+
+
+def test_s39_duration_budget_reserves_long_recovery_write_and_cleanup():
+    helper = getattr(s39, "_duration_budget", None)
+    assert helper is not None, "S39 must derive its schedule from ctx.duration_s"
+
+    assert helper(900, 40, 20) == {
+        "requested_s": 900,
+        "acceptable_min_elapsed_s": 885,
+        "long_fault_s": 40,
+        "short_pulse_budget_s": 100,
+        "mandatory_short_pulses": 2,
+        "mandatory_short_budget_s": 200,
+        "remount_recovery_budget_s": 110,
+        "post_clear_write_budget_s": 90,
+        "final_checks_cleanup_budget_s": 60,
+        "long_and_final_reserve_s": 300,
+        "minimum_duration_s": 500,
+        "short_window_s": 600,
+        "additional_short_window_s": 400,
+    }
+
+
+def test_s39_duration_budget_rejects_unsafe_short_campaign():
+    helper = getattr(s39, "_duration_budget", None)
+    assert helper is not None, "S39 must validate the requested duration"
+
+    with pytest.raises(ValueError, match="requires at least 500s; requested 499s"):
+        helper(499, 40, 20)
+
+
+def test_s39_short_scheduler_waits_only_for_a_sub_pulse_residual():
+    helper = getattr(s39, "_complete_short_pulse_fits", None)
+    assert helper is not None, "S39 must reserve a complete pulse before starting it"
+
+    assert helper(500.0, 600.0)
+    assert not helper(500.001, 600.0)
+
+
+def test_s39_pass_verdict_note_is_empty():
+    helper = getattr(s39, "_failure_note", None)
+    assert helper is not None, "S39 must not display failure explanations on passing verdicts"
+
+    assert helper(True, "failure explanation") == ""
+    assert helper(False, "failure explanation") == "failure explanation"
