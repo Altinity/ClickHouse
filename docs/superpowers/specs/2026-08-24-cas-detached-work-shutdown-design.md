@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS detached work outliving `Context` {#cas-detached-work-shutdown-design}
 
-**Status:** DRAFT for review, rev.6 (2026-08-24).
+**Status:** DRAFT for review, rev.7 (2026-08-24).
 
 This specification covers item 10 of `docs/superpowers/cas/final-checks-todo.md`: findings B3 and B4
 of the second 2026-08-05 umbrella review. It also covers the third recommendation triage made and the
@@ -136,6 +136,19 @@ the lease is load-bearing:**
 2. the lease drops its strong `PoolPtr`;
 3. **only then** does it decrement the count and notify the waiter.
 
+**The lease must be a copyable handle that completes once.** The task travels through
+`std::function<void()>` and is copied, so a move-only lease does not compile and a plainly copyable
+one would release per copy. The form is a copyable handle over a `shared_ptr<DetachedTaskLeaseState>`
+whose single control-block destruction — when the last copy dies — performs the three steps above in
+order.
+
+**And the task body must not hold a strong `Pool` reference of its own.** Today the diagnostic lambda
+captures `self`, its own `shared_from_this`; that capture is destroyed with the `std::function`, i.e.
+outside the lease's control, which is exactly how a released count can coexist with a live reference.
+Both bodies therefore capture raw `this` (or the ledger member) and rely on the lease for the
+lifetime. If a body keeps its own `PoolPtr`, the dispatcher does not control the last strong
+reference and the guarantee below is void.
+
 Without this order the guarantee is false in a way that is easy to miss. If the strong reference lived
 in the callable's captures, it would be released when the `std::function` is destroyed — which happens
 *after* the body ran and can happen after the count already reached zero. Shutdown would observe zero,
@@ -185,12 +198,23 @@ that `startThreadFromGlobalPool`'s `std::function<void()>` imposes on everything
 
 **Normal settlement is untouched, and that is the point.** `settleSnapshotPublish` decrements and
 re-admits under a *single* `state_mutex` hold precisely so that no observer sees a transient zero
-between the two; `waitForSnapshotPublishSettle` would otherwise read a false "settled". A guard that
+between the two; `waitForSnapshotPublishSettleForTest` would otherwise read a false "settled". A guard that
 also decremented on some later destruction would either double-decrement a successful publish or, worse,
 erase the reservation a re-admission had just taken — false quiescence, then a negative count.
 
 So exactly one path owns each decrement: the guard fires **only** when no task was launched; every
 launched task's reservation is retired by settlement alone.
+
+**Which makes settlement in the launched task unconditional.** It is reached today by a bare call
+after a `try`/`catch` whose handler calls `tryLogCurrentException` — which allocates and can itself
+throw under memory pressure. If it does, the settlement call is skipped and that reservation is
+stranded **forever**: `quiesceRefTablesForRemount` and `dropNamespace` then wait on a count that will
+never reach zero, and teardown hangs while joining the remount worker. A stranded reservation is
+strictly worse than the crash this whole specification is about, because nothing reports it.
+
+The task body therefore settles from a scope guard covering every exit, and its error logging is
+itself wrapped in a nested `try`/`catch(...)` — the same rule the destructor boundary follows, for the
+same reason.
 
 **A failed dispatch must never fail its caller.** `dispatchSnapshotPublisher` is reached from
 read-side maintenance and from settlement's own re-dispatch, not only from mutations, and the existing
@@ -198,7 +222,12 @@ read-side maintenance and from settlement's own re-dispatch, not only from mutat
 must never fail an otherwise-successful read or mutation". On the re-dispatch path a propagating
 exception would additionally escape inside a detached thread.
 
-The diagnostic dispatch has no reservation of its own and needs no guard.
+The diagnostic dispatch has no reservation and therefore needs no rollback guard, but its task
+construction and dispatch **remain inside a best-effort `try`/`catch`**. It is called from a
+fail-closed path, and its own existing comment says why: best-effort diagnostics must never block the
+caller's own fail-closed throw. An allocation failure while building the diagnostic task must not
+replace the exception the caller was already raising — the caller would then report the wrong
+problem.
 
 ### Where the stop is observed {#stop-checkpoints}
 
@@ -234,9 +263,18 @@ reasons are structural:
   precisely the test that asserts a zero timeout.
 
 The stop token removes both problems by not sharing a mechanism at all. It is threaded from the
-dispatcher into the publisher and onward into `ensureRefTableRecovered`, which checks it at its
-existing I/O and retry checkpoints **and in the slice loop of its retry sleep** — the loop is already
-built to be interruptible, as its own comment says; it simply polls the wrong predicate for this case.
+dispatcher into the publisher and onward into `ensureRefTableRecovered`.
+
+Inside recovery it must be observed at **four** places, not one, because two of them sit above every
+checkpoint discussed so far:
+
+| Place | Why it is not covered by the others |
+|---|---|
+| the wait for a concurrent recovery | `rt.recovery_cv.wait(lock)` is called with **no predicate and no deadline** while `recovery_in_progress`; a second publisher parks there indefinitely without reaching any I/O at all |
+| before the walk's **first** backend request | a fresh recovery reads the checkpoint before its first admission check, so a stalled first `GET` is not covered either |
+| the existing per-attempt I/O and retry checkpoints | the ordinary case |
+| the slice loop of the retry sleep | the loop is already built to be interruptible, as its own comment says; it simply polls the wrong predicate for this case |
+
 Shutdown therefore never modifies `recovery_cancel_requested`, self-remount keeps it exactly as it is,
 and there is no latch to lose.
 
@@ -432,6 +470,20 @@ that is the one a fence-only predicate misses, and with `recovery_retry_max_back
 it is also the one that blows a deadline measured in seconds. With the token observed in the retry
 sleep, recovery unparks and the drain completes inside its deadline; without it, the drain times out.
 Assert `CASDetachedWorkDrainTimeouts` is zero and that the drain returned well inside its deadline.
+
+**A throwing dispatch strands nothing and hides nothing — failing-first.** With a dispatcher injected
+to throw before launching: the publisher's reservation returns to zero and the mutation that triggered
+it still succeeds; and on the diagnostic path the caller's **original** fail-closed exception is what
+propagates, not the allocation failure. Two assertions, because the two paths fail differently.
+
+**Settlement survives a throwing logger — failing-first.** A publish that throws, with the error
+logger injected to throw as well: the reservation must still reach zero. Today the bare settlement
+call is skipped and the count is stranded for the life of the process.
+
+**Recovery observes the stop in both admission branches — failing-first.** One publisher parked in
+`recovery_cv` behind another's in-flight recovery, and one stalled in the walk's first backend request
+before any admission check. Both must unpark within the drain deadline; neither is covered by the
+retry-checkpoint or backoff cases above.
 
 **The emit under a reset `Context` — failing-first, and in a subprocess.** "The context was destroyed
 before the emit" is **not** reachable today: the strong sink is exactly what prevents that
