@@ -4249,6 +4249,7 @@ TEST(CASRefWriterNamespaceRemoval, PresenceProbeCreatingIsPresentAndRemovalWaits
     dead.writer_epoch = store->liveWriterEpoch();
     dead.gc_fenced = true;
     dead.seq = 1;
+    dead.write_attempt_id = UInt128{1};
     backend->putIfAbsent(layout.mountKey("srv1"), encodeMountLease(dead));
 
     EXPECT_NO_THROW(store->dropNamespace(ns));

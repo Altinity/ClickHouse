@@ -1051,6 +1051,7 @@ inline void setWatermarkMinActive(
     m.writer_epoch = writer_epoch;
     m.min_active = min_active;
     m.seq = 1;
+    m.write_attempt_id = DB::UInt128{1};
     const String key = layout.mountKey(server_root_id);
     const DB::Cas::HeadResult h = backend.head(key);
     if (h.exists)
