@@ -2473,6 +2473,12 @@ TEST(CASPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     EXPECT_EQ(m1->entries[0].path, "data.bin");
 }
 
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+#define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_DEATH({ statement; }, "CAS mount runtime")
+#else
+#define EXPECT_RUNTIME_STATE_REJECTION(statement) EXPECT_THROW(statement, DB::Exception)
+#endif
+
 TEST(CASPoolRemount, DirectRenewCannotRaceWorkerStartOrKeeperReplacement)
 {
     auto backend = std::make_shared<RuntimeRenewBackend>();
@@ -2495,9 +2501,9 @@ TEST(CASPoolRemount, DirectRenewCannotRaceWorkerStartOrKeeperReplacement)
     backend->fault = RuntimeRenewBackend::Fault::BlockThenDelegate;
     auto direct = std::async(std::launch::async, [&] { runtime.renewWatermarkOnce(); });
     barrier.waitUntilArrived();
-    EXPECT_THROW(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)), DB::Exception);
-    EXPECT_THROW(runtime.installKeeper(uuid, 2, [&] { return wall_ms; }), DB::Exception);
-    EXPECT_THROW(runtime.keeperReset(), DB::Exception);
+    EXPECT_RUNTIME_STATE_REJECTION(runtime.startBackgroundWorkers(std::chrono::milliseconds(10)));
+    EXPECT_RUNTIME_STATE_REJECTION(runtime.installKeeper(uuid, 2, [&] { return wall_ms; }));
+    EXPECT_RUNTIME_STATE_REJECTION(runtime.keeperReset());
     barrier.release();
     EXPECT_NO_THROW(direct.get());
     runtime.finishTeardown(true);
@@ -2592,9 +2598,11 @@ TEST(CASPoolRemount, DirectRenewIsRefusedForBackgroundConfiguredRuntimeAfterStop
     runtime.armMountFence(uuid, 1, anchor + 1000);
     runtime.startBackgroundWorkers(std::chrono::hours(1));
     runtime.stopBackgroundWorkers();
-    EXPECT_THROW(runtime.renewWatermarkOnce(), DB::Exception);
+    EXPECT_RUNTIME_STATE_REJECTION(runtime.renewWatermarkOnce());
     runtime.finishTeardown(true);
 }
+
+#undef EXPECT_RUNTIME_STATE_REJECTION
 
 TEST(CASPoolRemount, RemountWaitsForRenewalParkedBeforeReplacement)
 {
