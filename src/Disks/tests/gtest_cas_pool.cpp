@@ -3043,6 +3043,7 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
         },
     };
     auto store = Pool::open(backend, config);
+    std::weak_ptr<Pool> store_lifetime = store;
     ScopedParkedRenewalLogCapture renewal_logs;
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->scheduleRemountForTest());
@@ -3075,6 +3076,10 @@ TEST(CASPoolRemount, ParkedRedoRecoveryObservabilityPrecedesRemountResult)
     EXPECT_EQ(recovered->detail.at("classification"), "committed_after_retry");
     EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' recovered"), String::npos);
 
+    /// `~Pool` stops and joins both persistent runtime workers. Make that quiescence boundary part of
+    /// the test, before any event/log capture state referenced by those workers can leave scope.
+    store.reset();
+    EXPECT_TRUE(store_lifetime.expired());
 }
 
 TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
@@ -3111,6 +3116,7 @@ TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
         },
     };
     auto store = Pool::open(backend, config);
+    std::weak_ptr<Pool> store_lifetime = store;
     ScopedParkedRenewalLogCapture renewal_logs;
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->scheduleRemountForTest());
@@ -3137,6 +3143,10 @@ TEST(CASPoolRemount, ParkedRedoFailureObservabilityPrecedesRemountResult)
     EXPECT_EQ(failed_renew->detail.at("classification"), "attempts_exhausted");
     EXPECT_NE(renewal_logs.captured().find("CAS mount renewal 'test' fenced"), String::npos);
 
+    /// A ready final-result future proves publication order; destruction additionally proves the
+    /// background renewal/remount threads are joined before the fixture's captured state is destroyed.
+    store.reset();
+    EXPECT_TRUE(store_lifetime.expired());
 }
 
 TEST(CASPoolRemount, ThrowingEventSinkAfterCommitLeavesRuntimeLive)

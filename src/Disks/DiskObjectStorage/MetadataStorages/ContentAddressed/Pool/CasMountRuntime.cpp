@@ -871,7 +871,10 @@ bool CasMountRuntime::noteLeaseLost()
         /// The `since` the lifecycle snapshot reports for `not_live` — the wall-clock instant this became
         /// non-`Live`. Only the winning transition writes it (the guard above), so it is not re-stamped.
         lifecycle_since_wall_s.store(wallClockNowSeconds(), std::memory_order_release);
-        ProfileEvents::increment(ProfileEvents::CASMountLeaseLost);
+        /// This transition can be reached while the renewal driver or remount serializer lock is
+        /// held. Trace-profile collection may allocate and enqueue a stack trace, so the lock-safe
+        /// observability path must remain the direct atomic increment.
+        ProfileEvents::incrementNoTrace(ProfileEvents::CASMountLeaseLost);
         return true;
     }
     return false;

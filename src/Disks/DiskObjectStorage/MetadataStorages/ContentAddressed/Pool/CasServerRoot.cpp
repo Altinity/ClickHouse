@@ -116,9 +116,10 @@ struct MountRenewObservabilityConfiguration
 };
 
 /// Event sinks may synchronously renew another Pool on the same thread. A fixed stack keeps every
-/// outer per-call snapshot stable without allocation, including while a parked redo holds
-/// `remount_mutex`. Overflow suppresses diagnostics for the nested call rather than aliasing an outer
-/// call or changing protocol behavior.
+/// registered outer per-call snapshot stable without allocation, including while a parked redo holds
+/// `remount_mutex`. Overflow suppresses rich event/log delivery for the nested call rather than
+/// aliasing an outer call or changing protocol behavior; physical attempt truth is independently
+/// retained by the stack-local observer in `MountLeaseKeeper::renew`.
 struct MountRenewObservabilityStack
 {
     static constexpr size_t capacity = 8;
@@ -1594,6 +1595,11 @@ uint64_t MountLeaseKeeper::start()
             key, describeMountHolder(current));
     }
 
+    /// This decoded authoritative observation is the exact point at which this incarnation learns
+    /// that a foreign successor owns the slot. Terminal teardown intentionally performs no release
+    /// I/O, so account the skipped farewell here, once, before the keeper enters its terminal state.
+    /// The renewal may be parked under `remount_mutex`; keep the increment trace-free.
+    ProfileEvents::incrementNoTrace(ProfileEvents::CASMountReleaseSkippedForeignOccupant);
     emitMountEvent(
         event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
         "mount slot is held by a foreign server -- failing closed");
@@ -1650,9 +1656,18 @@ MountRenewResult MountLeaseKeeper::renew(
     const auto wait_before_retry = environment.wait_before_retry
         ? environment.wait_before_retry
         : [](uint64_t) { return true; };
-    const auto observe = environment.observe
+    const auto downstream_observe = environment.observe
         ? environment.observe
         : [](const CasOverwriteProgress &) {};
+    uint32_t physical_attempts_sent = 0;
+    const auto observe = [&physical_attempts_sent, &downstream_observe](const CasOverwriteProgress & progress)
+    {
+        /// This call-stack-owned value is protocol diagnostic truth even when rich observability is
+        /// intentionally suppressed after deeply reentrant sinks exhaust its bounded TLS slots.
+        if (progress.kind == CasOverwriteProgressKind::PutStarted)
+            physical_attempts_sent = std::max(physical_attempts_sent, progress.attempt_no);
+        downstream_observe(progress);
+    };
 
     const uint64_t wall_ms = now_ms_fn();
     const uint64_t attempt_start_boot_ms = boot_clock();
@@ -1705,10 +1720,10 @@ MountRenewResult MountLeaseKeeper::renew(
     {
         /// The controller may propagate a deterministic/non-retryable exception after `PutStarted`.
         /// Preserve the physical observer's already-published truth instead of returning the default
-        /// zero-attempt diagnostics from the result object that was never assigned.
-        if (const MountRenewObservabilityContext * observation = currentMountRenewObservability())
-            controlled.diagnostics.attempts_sent = std::max(
-                controlled.diagnostics.attempts_sent, observation->attempts_sent);
+        /// zero-attempt diagnostics from the result object that was never assigned. This local is not
+        /// coupled to the bounded rich-event stack and therefore remains truthful at arbitrary nesting.
+        controlled.diagnostics.attempts_sent = std::max(
+            controlled.diagnostics.attempts_sent, physical_attempts_sent);
         controlled.diagnostics.deadline_source = deadline_source;
         if (MountRenewObservabilityContext * observation = currentMountRenewObservability())
             observation->terminal_classification = MountRenewTerminalClassification::DeterministicFailure;

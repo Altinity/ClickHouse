@@ -12,8 +12,6 @@
 #include <Poco/Exception.h>
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
-#include <future>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -25,6 +23,13 @@ namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int NETWORK_ERROR;
+}
+
+namespace DB::Cas
+{
+void configureMountRenewObservability(
+    const String * server_root_id, const CasEventSink * event_sink, bool deferred) noexcept;
+void reportMountRenewCompletion(const MountRenewResult & result) noexcept;
 }
 
 namespace
@@ -40,37 +45,27 @@ public:
     bool throw_nonretryable_next_overwrite = false;
     bool vanish_on_next_overwrite = false;
 
-    void armBlockedResolve()
+    void armResolveProbe()
     {
         std::lock_guard lock(resolve_mutex);
-        block_next_get = true;
+        observe_next_get = true;
         resolve_started = false;
-        release_resolve = false;
     }
 
-    bool waitForResolveStarted()
-    {
-        std::unique_lock lock(resolve_mutex);
-        return resolve_cv.wait_for(lock, std::chrono::seconds(2), [&] { return resolve_started; });
-    }
-
-    void releaseResolve()
+    bool resolveStarted()
     {
         std::lock_guard lock(resolve_mutex);
-        release_resolve = true;
-        resolve_cv.notify_all();
+        return resolve_started;
     }
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
         {
-            std::unique_lock lock(resolve_mutex);
-            if (block_next_get)
+            std::lock_guard lock(resolve_mutex);
+            if (observe_next_get)
             {
                 resolve_started = true;
-                resolve_cv.notify_all();
-                resolve_cv.wait_for(lock, std::chrono::seconds(20), [&] { return release_resolve; });
-                block_next_get = false;
+                observe_next_get = false;
             }
         }
         return InMemoryBackend::get(key, range);
@@ -96,10 +91,8 @@ public:
 
 private:
     std::mutex resolve_mutex;
-    std::condition_variable resolve_cv;
-    bool block_next_get = false;
+    bool observe_next_get = false;
     bool resolve_started = false;
-    bool release_resolve = false;
 };
 
 CasRequestBudget renewalEventBudget()
@@ -256,22 +249,103 @@ TEST(CASEvent, FirstAmbiguityIsVisibleWhileResolveIsInFlight)
     store->setEventSink([&](CasEvent event)
     {
         if (event.type == CasEventType::WatermarkRenew && event.outcome == "retrying")
+        {
             retrying_events.fetch_add(1);
+            /// The diagnostic callback may consume the remaining recovery budget. The controller
+            /// must re-check its absolute deadline before starting the resolving GET.
+            boot_ms = 1081;
+        }
     });
 
     backend->throw_before_next_overwrite = true;
-    backend->armBlockedResolve();
-    auto renewal = std::async(std::launch::async, [&] { store->renewWatermarkOnce(); });
+    backend->armResolveProbe();
+    EXPECT_THROW(store->renewWatermarkOnce(), DB::Exception);
 
-    const bool resolve_started = backend->waitForResolveStarted();
-    EXPECT_TRUE(resolve_started);
-    const uint32_t observed_before_release = retrying_events.load();
-    backend->releaseResolve();
-    EXPECT_NO_THROW(renewal.get());
-
-    EXPECT_EQ(observed_before_release, 1u)
-        << "first ambiguity must be externally visible before its resolving GET completes";
+    EXPECT_EQ(retrying_events.load(), 1u)
+        << "first ambiguity must be externally visible before the pre-resolve deadline gate";
+    EXPECT_FALSE(backend->resolveStarted())
+        << "a diagnostic sink that exhausts the budget must prevent the resolving GET from starting";
     EXPECT_EQ(retrying_events.load(), 1u) << "retrying delivery is bounded to the first ambiguity";
+}
+
+TEST(CASEvent, DeepReentrancyPreservesDeterministicPhysicalAttemptTruth)
+{
+    constexpr size_t depth = 10;
+    std::array<std::shared_ptr<RenewalEventBackend>, depth> backends;
+    std::array<std::unique_ptr<Layout>, depth> layouts;
+    std::array<std::unique_ptr<MountLeaseKeeper>, depth> keepers;
+    std::array<String, depth> server_root_ids;
+    std::array<CasEventSink, depth> sinks;
+    uint64_t wall_ms = 100;
+    uint64_t boot_ms = 100;
+    std::optional<MountRenewResult> deepest_result;
+    std::function<MountRenewResult(size_t)> renew_at;
+
+    renew_at = [&](size_t index)
+    {
+        configureMountRenewObservability(&server_root_ids[index], &sinks[index], /*deferred=*/false);
+        MountRenewResult result = keepers[index]->renew(
+            CasRequestBudget{
+                .attempt_timeout_ms = 10,
+                .operation_deadline_ms = 500,
+                .max_attempts = 1,
+                .lease_safety_margin_ms = 0,
+                .retry_initial_backoff_ms = 0,
+                .retry_max_backoff_ms = 0,
+            },
+            MountRenewOperationEnvironment{});
+        reportMountRenewCompletion(result);
+        return result;
+    };
+
+    for (size_t index = 0; index < depth; ++index)
+    {
+        backends[index] = std::make_shared<RenewalEventBackend>();
+        layouts[index] = std::make_unique<Layout>(fmt::format("deep-renewal-{}", index));
+        server_root_ids[index] = fmt::format("deep-{}", index);
+        sinks[index] = [&, index](CasEvent event)
+        {
+            if (event.type == CasEventType::MountConflict && index + 1 < depth)
+            {
+                MountRenewResult child_result = renew_at(index + 1);
+                if (index + 2 == depth)
+                    deepest_result = std::move(child_result);
+            }
+        };
+        keepers[index] = std::make_unique<MountLeaseKeeper>(
+            backends[index],
+            *layouts[index],
+            server_root_ids[index],
+            UInt128(index + 1),
+            7,
+            std::chrono::milliseconds(1000),
+            [&] { return wall_ms; },
+            [] { return uint64_t{0}; },
+            sinks[index],
+            std::chrono::milliseconds(0),
+            [&] { return boot_ms; });
+        keepers[index]->start();
+
+        if (index + 1 < depth)
+        {
+            const String key = layouts[index]->mountKey(server_root_ids[index]);
+            auto observed = backends[index]->get(key);
+            ASSERT_TRUE(observed.has_value());
+            MountLease foreign = decodeMountLease(observed->bytes);
+            foreign.server_uuid = UInt128(100 + index);
+            ASSERT_EQ(
+                backends[index]->putOverwrite(key, encodeMountLease(foreign), observed->token).outcome,
+                PutOutcome::Done);
+        }
+    }
+    backends.back()->throw_nonretryable_next_overwrite = true;
+
+    const MountRenewResult outer_result = renew_at(0);
+    EXPECT_EQ(outer_result.outcome, MountRenewOutcome::Terminal);
+    ASSERT_TRUE(deepest_result.has_value());
+    EXPECT_EQ(deepest_result->outcome, MountRenewOutcome::Terminal);
+    EXPECT_EQ(deepest_result->diagnostics.attempts_sent, 1u)
+        << "nesting beyond the rich-event stack must not erase physical attempt truth";
 }
 
 TEST(CASEvent, WatermarkRenewSinkFailureCannotChangeOutcome)

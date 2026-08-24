@@ -586,6 +586,10 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     auto survivor = Pool::open(backend, survivor_cfg);
     const RootNamespace ns{"srv1/contig_survivor"};
     ASSERT_EQ(publishRef(survivor, ns, "ref_1", 1), (RefTxnId{survivor->writerEpoch(), 1}));
+    const uint64_t skipped_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
+    const uint64_t violations_before
+        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
 
     /// The prefix is cleared and the pool recreated underneath the still-running survivor.
     ASSERT_GT(eraseKeysContaining(*backend, ""), 0u);
@@ -602,6 +606,9 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     EXPECT_FALSE(survivor->mayMutate())
         << "a survivor whose slot was reclaimed must be fenced closed by its own failing renewal, not "
            "left writing into the new pool";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
+              skipped_before + 1)
+        << "the conclusive foreign-successor observation must be counted when deposition is detected";
     EXPECT_NE(messageOfThrow([&] { publishRef(survivor, ns, "ref_2", 2); }), String())
         << "the survivor's queued write must be refused";
 
@@ -609,26 +616,20 @@ TEST(CASRefContiguousAlloc, SurvivingWriterIsFencedByTheRecreatedPoolsMount)
     EXPECT_EQ(publishRef(recreated, ns, "ref_1", 1), (RefTxnId{recreated->writerEpoch(), 1}));
 
     /// The survivor's TEARDOWN is the other half, and it is asserted here rather than left to the
-    /// destructor at scope exit, because which arm of the release path it takes is exactly what a
-    /// regressed discriminator would get wrong — silently. A deposed writer meeting its successor in the
-    /// slot is the EXPECTED end of a failover (arm A: skip the farewell, leave the successor's slot
-    /// untouched); a writer that still believed it owned the mount meeting a stranger is
-    /// single-writer exclusivity BROKEN (arm B, must-always-be-zero). If `deposition_observed` ever stops
-    /// being set, every ordinary failover in production starts reporting itself as a broken guarantee —
-    /// and without the +0 assertion below, not one test would notice.
+    /// destructor at scope exit. A terminal keeper must skip release without backend I/O: the renewal
+    /// conflict already counted the conclusive foreign successor, and teardown must neither double-count
+    /// it nor stamp a farewell over the successor's slot.
     const String survivor_mount_key = recreated->layout().mountKey("test");
     const auto successor_slot_before = backend->get(survivor_mount_key);
     ASSERT_TRUE(successor_slot_before.has_value());
-    const uint64_t skipped_before
+    const uint64_t skipped_after_deposition
         = ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load();
-    const uint64_t violations_before
-        = ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load();
 
     survivor.reset();
 
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountReleaseSkippedForeignOccupant].load(),
-              skipped_before + 1)
-        << "a deposed writer's release must take the skip-the-farewell arm";
+              skipped_after_deposition)
+        << "terminal teardown must not count the already-observed successor twice";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CASMountExclusivityViolation].load(),
               violations_before)
         << "and must NOT report an exclusivity violation: this is a failover, not a broken guarantee";
