@@ -18,15 +18,21 @@ disarms before the checkpoint.
   rewrite the returned XML to inject a duplicate key, or drop the continuation token — so the CA GC
   discovery/token-diff path must treat the page as ambiguous and re-read (never skip a fold).
 
+Focused tests can additionally restrict S22 faults to a `path_substring` and an atomic
+`remaining_faults` budget. The `drop_after_forward` mode records the upstream result and request
+body digest, then closes the downstream connection so retry recovery can prove response-loss cases.
+
 Control plane (separate port): POST /config {json}, GET /stats, GET /healthz. Deterministic: fault
 decisions are driven by a seeded PRNG keyed per-request-index, so a given (seed, rate) is reproducible.
 """
 
+import hashlib
 import http.client
 import http.server
 import json
 import os
 import random
+import socket
 import socketserver
 import sys
 import threading
@@ -38,17 +44,29 @@ CTL_PORT = int(os.environ.get("S3_PROXY_CTL_PORT", "8474"))
 
 # Runtime-mutable fault config (guarded by _cfg_lock). rate=0 => pure pass-through.
 _cfg_lock = threading.Lock()
-_cfg = {
+_DEFAULT_CFG = {
     "rate": 0.0,                       # fraction of matched requests that get a fault
-    "modes": ["503"],                  # subset of {503,429,slow,reset}
+    "modes": ["503"],                  # subset of {503,429,slow,reset,drop_after_forward}
     "methods": ["GET", "PUT", "HEAD", "POST"],  # HTTP methods eligible for S22 faults
     "slow_ms": 1500,                   # latency for the "slow" mode
     "seed": 1,
+    "path_substring": None,            # optional request-path scope
+    "remaining_faults": None,          # optional exact finite fault budget; None = legacy unlimited
     # S27 list-anomaly config (independent of the S22 fault rate):
     "list_anomaly": None,              # None | "duplicate" | "drop_token"
     "list_prefix": "roots/",           # only LIST calls whose prefix contains this are perturbed
 }
-_stats = {"forwarded": 0, "faults": 0, "list_perturbed": 0, "by_mode": {}}
+_DEFAULT_STATS = {
+    "forwarded": 0,
+    "faults": 0,
+    "list_perturbed": 0,
+    "by_mode": {},
+    "drop_after_forward": [],
+}
+_cfg = dict(_DEFAULT_CFG)
+_stats = dict(_DEFAULT_STATS)
+_stats["by_mode"] = {}
+_stats["drop_after_forward"] = []
 _req_index = [0]
 _idx_lock = threading.Lock()
 
@@ -72,6 +90,32 @@ def _bump(stat, key=None):
             _stats[stat][key] = _stats[stat].get(key, 0) + 1
 
 
+def _record_drop_after_forward(method, path, body, upstream_status, upstream_etag):
+    record = {
+        "method": method,
+        "path": path,
+        "request_body_sha256": hashlib.sha256(body).hexdigest(),
+        "upstream_status": upstream_status,
+        "upstream_etag": upstream_etag,
+    }
+    with _cfg_lock:
+        records = _stats["drop_after_forward"]
+        records.append(record)
+        del records[:-64]
+
+
+def _reset():
+    with _cfg_lock:
+        _cfg.clear()
+        _cfg.update(_DEFAULT_CFG)
+        _stats.clear()
+        _stats.update(_DEFAULT_STATS)
+        _stats["by_mode"] = {}
+        _stats["drop_after_forward"] = []
+        with _idx_lock:
+            _req_index[0] = 0
+
+
 _SLOWDOWN_BODY = (b'<?xml version="1.0" encoding="UTF-8"?>'
                   b'<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message>'
                   b'<Resource>/</Resource><RequestId>fault-proxy</RequestId></Error>')
@@ -85,13 +129,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # --- fault decision -----------------------------------------------------
     def _should_fault(self, cfg):
-        if cfg["rate"] <= 0 or self.command not in cfg["methods"]:
+        # Keep the original unscoped decision path byte-for-byte: existing scenario configs omit
+        # both new fields and therefore retain their request-index/seed behavior.
+        if cfg.get("path_substring") is None and cfg.get("remaining_faults") is None:
+            if cfg["rate"] <= 0 or self.command not in cfg["methods"]:
+                return None
+            idx = _next_index()
+            rng = random.Random(f"{cfg['seed']}:{idx}")
+            if rng.random() < cfg["rate"]:
+                return rng.choice(cfg["modes"]) if cfg["modes"] else None
             return None
-        idx = _next_index()
-        rng = random.Random(f"{cfg['seed']}:{idx}")
-        if rng.random() < cfg["rate"]:
-            return rng.choice(cfg["modes"]) if cfg["modes"] else None
-        return None
+
+        # A scoped finite rule is one atomic decision. In particular, concurrent matching requests
+        # cannot all observe the same positive remaining count and over-consume the configured budget.
+        with _cfg_lock:
+            current = _cfg
+            if current["rate"] <= 0 or self.command not in current["methods"]:
+                return None
+            path_substring = current.get("path_substring")
+            if path_substring is not None and path_substring not in (self.path or ""):
+                return None
+            remaining = current.get("remaining_faults")
+            if remaining is not None and remaining <= 0:
+                return None
+            idx = _next_index()
+            rng = random.Random(f"{current['seed']}:{idx}")
+            if rng.random() >= current["rate"]:
+                return None
+            mode = rng.choice(current["modes"]) if current["modes"] else None
+            if mode is not None and remaining is not None:
+                current["remaining_faults"] = remaining - 1
+            return mode
 
     def _emit_fault(self, mode):
         _bump("faults")
@@ -114,6 +182,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.connection.close()
             except Exception:
                 pass
+        elif mode == "drop_after_forward":
+            self._forward(drop_after_forward=True)
 
     # --- request body -------------------------------------------------------
     def _read_body(self):
@@ -137,7 +207,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return b""
 
     # --- forward to upstream ------------------------------------------------
-    def _forward(self):
+    def _forward(self, drop_after_forward=False):
         body = getattr(self, "_cached_body", None)
         if body is None:
             body = self._read_body()
@@ -179,6 +249,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if os.environ.get("S3_PROXY_DEBUG") and self.command in ("HEAD", "POST"):
             print(f"[dbg-resp] {self.command} {self.path[:50]} -> {resp.status} "
                   f"upstreamCL={resp.getheader('Content-Length')} bodylen={len(data)}", flush=True)
+        if drop_after_forward:
+            _record_drop_after_forward(
+                self.command,
+                self.path,
+                body,
+                resp.status,
+                resp.getheader("ETag") or "",
+            )
+            conn.close()
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.connection.close()
+            return
         self.send_response(resp.status)
         is_head = (self.command == "HEAD")
         for k, v in resp.getheaders():
@@ -257,7 +343,6 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-
 class CtlHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -277,7 +362,10 @@ class CtlHandler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "upstream": UPSTREAM})
         if self.path.startswith("/stats"):
             with _cfg_lock:
-                return self._json(200, dict(_stats))
+                snapshot = dict(_stats)
+                snapshot["by_mode"] = dict(_stats["by_mode"])
+                snapshot["drop_after_forward"] = list(_stats["drop_after_forward"])
+            return self._json(200, snapshot)
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
@@ -288,6 +376,9 @@ class CtlHandler(http.server.BaseHTTPRequestHandler):
             patch = json.loads(self.rfile.read(length) or b"{}")
         except Exception as e:
             return self._json(400, {"error": f"bad json: {e}"})
+        reset = bool(patch.pop("reset", False))
+        if reset:
+            _reset()
         with _cfg_lock:
             _cfg.update(patch)
             snap = dict(_cfg)

@@ -1,38 +1,15 @@
-"""S39: mount-lease resilience under a degraded-but-alive S3 (fix #37 regression, P1).
+"""S39: mount-renewal retries and fail-closed recovery against degraded S3.
 
-Closes the chaos-coverage gap the #37 post-mortem identified: prior soak chaos only faulted
-*nodes* (kill/restart), never a degraded-but-alive object store. Runs on the SAME compose S22
-already proved out (`docker-compose-s3faultproxy.yml`: an HTTP proxy sits between ClickHouse and
-RustFS, `ca` endpoint -> `s3proxy:11121`, faults armed/disarmed via the control port at
-`localhost:8474`) -- `compose_variant = "s3faultproxy"` needed no new plumbing, it already
-generalizes (confirmed by reading `S22`, which uses the identical mechanism and is NOT
-`needs_infra` despite this file's own stale top-of-module docstring saying otherwise).
+The short leg applies two exact, mount-key-only transient faults. Each disruption is bounded to one
+physical renewal response, so data-plane mutations continue while the renewal controller retries
+inside the confirmed lease. The long leg faults that same key continuously for more than one lease
+TTL and requires exactly one lease-loss generation followed by whole-chain remount recovery.
 
-Two legs against the mount lease's `mount_lease_ttl_ms` (compiled default 30000ms; not currently
-overridable via this compose's `storage_conf_faultproxy_*.xml`, so both legs size their fault
-windows off that fixed constant rather than a scenario param):
-
-- SHORT fault (`short_fault_s` < 30s): PUT/POST faulted at rate=1.0 for a window shorter than the
-  lease TTL, with the background mount-lease renewer beating every `mount_renew_period_ms` (10s
-  default) straight into the fault. Asserts fix #37 phase 1 directly via the exact log lines
-  `SingleWriterSlot::backgroundLoop` emits (`CasServerRoot.cpp`): at least one "retrying while the
-  lease is still valid" transient-retry line (proves the fault was actually exercised on the
-  renewal path, or the whole leg is vacuous) and ZERO "stops advancing" fence-trip lines (the mount
-  lease must survive). A post-disarm INSERT must succeed immediately -- nothing was ever fenced.
-- LONG fault (`long_fault_s` > 30s + safety margin): same fault, held past the TTL. The fence
-  SHOULD trip (correct fail-closed, not a bug) -- asserts at least one "stops advancing" line now
-  appears, and that `system.replication_queue` (if anything queued during the outage) shows
-  `last_exception` populated / a postponed entry rather than a silent, backoff-free retry loop
-  (fix #37 phases 2/3: the old ABORTED mapping was invisible here and defeated
-  `ReplicatedMergeTreeQueue`'s backoff). The system must then recover cleanly once the fault
-  clears: a final INSERT succeeds and fsck is clean at quiescence.
-
-Dev scale keeps both fault windows short (developer patience); ci/full widen them, still anchored
-to the same fixed 30s TTL constant.
+The compiled lease TTL and renewal period are currently not XML settings. All time budgets below are
+derived from their 30s/10s defaults and are emitted in the scenario observations.
 """
 
 import json as _json
-import threading
 import time
 import urllib.request
 
@@ -42,224 +19,384 @@ from ..framework.report import Verdict
 from . import _common
 
 _TABLE = "s39_lease"
+_DISK = "ca"
+_SERVER_ROOT_ID = "ca_soak_ch1"
+_MOUNT_PATH = f"/test/soak_pool/gc/server-roots/{_SERVER_ROOT_ID}/mount"
 _CTL = "http://localhost:8474"
 
-# Compiled-in defaults (`CasMountRuntime.h`/`CasPool.h`): not currently exposed as an overridable
-# scenario param -- this compose's storage_conf does not set them, so both legs anchor to these
-# fixed constants rather than a configurable knob that does not actually exist yet.
 _MOUNT_LEASE_TTL_S = 30
 _MOUNT_RENEW_PERIOD_S = 10
+_SHORT_PULSES = 2
+_SHORT_RECOVERY_BUDGET_S = _MOUNT_LEASE_TTL_S - _MOUNT_RENEW_PERIOD_S
+
+_EVENTS = (
+    "CASMountRenewalAttempts",
+    "CASMountRenewalRetries",
+    "CASMountRenewalResolved",
+    "CASMountRenewalRecovered",
+    "CASMountRenewalDeadlineExceeded",
+    "CASMountLeaseLost",
+    "CASRemountAttempts",
+    "CASRemountSucceeded",
+    "CASRemountFailed",
+)
 
 
 def _ctl(path, body=None, timeout=10):
-    """POST/GET against the fault proxy's control port -- same shape as S22's `_ctl`."""
+    """POST/GET against the request-preserving fault proxy control port."""
     url = f"{_CTL}{path}"
     if body is None:
         return _json.loads(urllib.request.urlopen(url, timeout=timeout).read().decode())
-    req = urllib.request.Request(url, data=_json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    return _json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+    request = urllib.request.Request(
+        url,
+        data=_json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    return _json.loads(urllib.request.urlopen(request, timeout=timeout).read().decode())
 
 
-def _text_log_count(node, since: str, needle: str) -> int:
-    """Count `system.text_log` rows containing `needle` (case-insensitive) at/after `since`.
-    Flushes logs first (they buffer in memory) -- mirrors S38's `_text_log_count`. A probe failure
-    returns -1 (distinct from a genuine 0) so the caller can treat it as inconclusive rather than a
-    false "never happened"."""
+def _profile_events(node):
+    rows = node.query(
+        "SELECT event, value FROM system.events WHERE event IN ({}) FORMAT TabSeparated".format(
+            ", ".join("'{}'".format(event) for event in _EVENTS)
+        )
+    )
+    values = {event: 0 for event in _EVENTS}
+    for row in rows.splitlines():
+        event, value = row.split("\t")
+        values[event] = int(value)
+    return values
+
+
+def _event_delta(before, after):
+    return {event: after[event] - before[event] for event in _EVENTS}
+
+
+def _mount_lifecycle(node):
+    row = node.query(
+        f"SELECT lifecycle, state, renewal_sequence FROM system.cas_mounts "
+        f"WHERE disk = '{_DISK}' AND server_root_id = '{_SERVER_ROOT_ID}' "
+        "LIMIT 1 FORMAT TabSeparated"
+    ).strip()
+    if not row:
+        return "missing", "missing", 0
+    lifecycle, state, sequence = row.split("\t")
+    return lifecycle, state, int(sequence)
+
+
+def _renewal_outcomes(node, since):
     try:
         node.command("SYSTEM FLUSH LOGS")
-        v = node.scalar(
-            f"SELECT count() FROM system.text_log WHERE event_time >= '{since}' "
-            f"AND message ILIKE '%{needle}%'")
-        return int(v or 0)
+        rows = node.query(
+            "SELECT outcome, count() FROM system.cas_log "
+            "WHERE event_type = 'watermark_renew' "
+            f"AND disk_name = '{_DISK}' "
+            f"AND detail['server_root_id'] = '{_SERVER_ROOT_ID}' "
+            f"AND event_time_microseconds >= toDateTime64('{since}', 6) "
+            "GROUP BY outcome FORMAT TabSeparated"
+        )
+        return {
+            outcome: int(count)
+            for outcome, count in (row.split("\t") for row in rows.splitlines())
+        }
     except Exception:
-        return -1
+        return {}
+
+
+def _wait_for(probe, timeout):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            last = probe()
+        except Exception as error:
+            last = error
+            time.sleep(0.25)
+            continue
+        if last:
+            return last
+        time.sleep(0.25)
+    return None
 
 
 @register
 class S39(Scenario):
     name = "S39"
-    title = "mount-lease resilience under a degraded-but-alive S3 (fix #37)"
+    title = "mount-renewal retries and fail-closed recovery under degraded S3"
     priority = "P1"
     compose_variant = "s3faultproxy"
-    # INVARIANT (every scale row must keep this, see `_MOUNT_LEASE_TTL_S`/`_MOUNT_RENEW_PERIOD_S`
-    # above and the leg-A/leg-B asserts below): short_fault_s < _MOUNT_RENEW_PERIOD_S (10) and
-    # << _MOUNT_LEASE_TTL_S (30), so the short leg overlaps AT MOST one renewal beat and can never
-    # fence; long_fault_s > _MOUNT_LEASE_TTL_S (30) + a safety margin, so the long leg reliably
-    # fences. The `ci` row previously set short_fault_s=15 (>= the renew period), which violated
-    # this invariant and made leg A's own soundness assert raise.
     param_table = {
-        "dev": {"short_fault_s": 8, "long_fault_s": 40, "settle_s": 20, "rows": 2000, "payload_bytes": 512},
-        "ci": {"short_fault_s": 9, "long_fault_s": 50, "settle_s": 40, "rows": 20000, "payload_bytes": 1024},
-        "full": {"short_fault_s": 20, "long_fault_s": 60, "settle_s": 60, "rows": 100000, "payload_bytes": 2048},
+        "dev": {"long_fault_s": 40, "settle_s": 20, "rows": 2000, "payload_bytes": 512},
+        "ci": {"long_fault_s": 50, "settle_s": 40, "rows": 20000, "payload_bytes": 1024},
+        "full": {"long_fault_s": 60, "settle_s": 60, "rows": 100000, "payload_bytes": 2048},
     }
 
     def run(self, ctx, result):
         cl = ctx.cluster
-        p = ctx.params
         node = cl.nodes()[0]
+        p = ctx.params
         rows = int(p["rows"])
         payload = int(p["payload_bytes"])
 
-        # Disarm first: bring-up must be clean regardless of a prior run's state.
         try:
-            hz = _ctl("/healthz")
-        except Exception as e:
-            result.add(Verdict.inconclusive("fault proxy reachable", "control :8474 up",
-                                            f"unreachable: {e}"))
+            health = _ctl("/healthz")
+        except Exception as error:
+            result.add(
+                Verdict.inconclusive(
+                    "fault proxy reachable", "control :8474 up", f"unreachable: {error}"
+                )
+            )
             return
-        result.observations["proxy"] = {"healthz": hz}
-        _ctl("/config", {"rate": 0.0})
+        _ctl("/config", {"reset": True})
+        result.observations["proxy"] = {"healthz": health}
+        result.observations["fault_window_arithmetic"] = {
+            "lease_ttl_s": _MOUNT_LEASE_TTL_S,
+            "renew_period_s": _MOUNT_RENEW_PERIOD_S,
+            "short_pulses": _SHORT_PULSES,
+            "faults_per_short_pulse": 1,
+            "short_recovery_budget_s": _SHORT_RECOVERY_BUDGET_S,
+            "short_formula": "lease_ttl_s - renew_period_s",
+            "long_minimum_s": _MOUNT_LEASE_TTL_S + _MOUNT_RENEW_PERIOD_S,
+            "long_formula": "lease_ttl_s + renew_period_s",
+        }
 
-        # Create the ReplicatedMergeTree on EVERY node: a replicated table materializes per-replica
-        # (each replica runs its own CREATE against the shared zk path), so creating it only on node1
-        # would leave node2 without the table entirely and the end-of-run replica-agreement check would
-        # see UNKNOWN_TABLE on node2. All the fault/write legs below still drive node1 (`node`) only --
-        # this is a single-writer mount-lease test -- but node2 must exist as a real replica so the
-        # standard replica-agreement / fsck end-checks are meaningful.
-        for n in cl.nodes():
-            sql.create_ca_table(n, _TABLE, columns="id UInt64, payload String", order_by="id", wide=True)
+        for cluster_node in cl.nodes():
+            sql.create_ca_table(
+                cluster_node,
+                _TABLE,
+                columns="id UInt64, payload String",
+                order_by="id",
+                wide=True,
+            )
         sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=0)
 
-        # --- Leg A: SHORT fault (< lease TTL) -- the mount lease must survive ---
-        since_a = node.scalar("SELECT toString(now())")
-        short_s = int(p["short_fault_s"])
-        assert short_s < _MOUNT_LEASE_TTL_S, "leg A's fault window must stay under the lease TTL"
-        assert short_s < _MOUNT_RENEW_PERIOD_S, (
-            "leg A's fault window must be shorter than the renew period so it can overlap AT MOST "
-            "one renewal beat -- a window >= the renew period can fault two consecutive beats and "
-            "(correctly) near the lease deadline, which is leg B's job, not leg A's")
-        # The best-effort write MUST run in a background thread, NOT inline: a blocking insert keeps
-        # retrying under the fault for its whole CAS budget (~20s), which would keep the fault armed
-        # for insert-duration + short_s -- far past the lease TTL -- and the renewer would then
-        # (correctly) fence, defeating the "short fault must NOT fence" assertion. This leg asserts
-        # the RENEWER rides out the window, not that the INSERT succeeds; the write is only here to
-        # put load on the write path while armed. Decoupling it keeps the armed window EXACTLY
-        # short_s, and since short_s < renew_period the window can fault at most one beat -> one
-        # transient retry -> no deadline breach -> no fence, by construction.
-        errs_a: list[str] = []
-        def _bg_write_a():
+        # A finite one-fault pulse can wait at most one renewal period to be consumed. Its retry then
+        # has the remaining TTL-minus-period budget, and the next pulse starts only after recovery.
+        short_since = node.scalar("SELECT toString(now64(6))")
+        short_before = _profile_events(node)
+        mutation_errors = []
+        observed_non_live = False
+        pulse_evidence = []
+        for pulse in range(_SHORT_PULSES):
+            recovered_before = _profile_events(node)["CASMountRenewalRecovered"]
+            _ctl(
+                "/config",
+                {
+                    "rate": 1.0,
+                    "modes": ["503"],
+                    "methods": ["PUT"],
+                    "path_substring": _MOUNT_PATH,
+                    "remaining_faults": 1,
+                    "seed": 3900 + pulse,
+                },
+            )
             try:
-                sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=rows,
-                                  timeout=short_s + 15)
-            except Exception as e:
-                errs_a.append(str(e))
-        _ctl("/config", {"rate": 1.0, "modes": ["503"], "methods": ["PUT", "POST"], "seed": 39})
-        writer_a = threading.Thread(target=_bg_write_a, daemon=True)
-        writer_a.start()
-        time.sleep(short_s)                     # armed window is EXACTLY short_s, write-independent
-        _ctl("/config", {"rate": 0.0})
-        writer_a.join(timeout=30)               # reap the background writer (faulted or completed)
-        if errs_a:
-            ctx.log(f"S39 leg A background INSERT under fault (expected to possibly fail/retry): {errs_a[0]}")
-        time.sleep(_MOUNT_RENEW_PERIOD_S / 2)   # let the post-clear renewal beat land
+                node.command(
+                    f"ALTER TABLE {_TABLE} UPDATE payload = concat(payload, '{pulse}') "
+                    f"WHERE id % {_SHORT_PULSES} = {pulse} SETTINGS mutations_sync = 2",
+                    timeout=60,
+                )
+            except Exception as error:
+                mutation_errors.append(str(error))
 
-        transient_a = _text_log_count(node, since_a,
-                                      "background renewal failed transiently, retrying while the lease is still valid")
-        fenced_a = _text_log_count(node, since_a, "background renewal failed, the mount-lease stops advancing")
-        result.observations["leg_a"] = {"transient_retry_lines": transient_a, "fence_trip_lines": fenced_a}
-        result.add(Verdict.check(
-            "leg A (short fault): the renewer actually hit the fault (not vacuous)",
-            "> 0 transient-retry log lines", f"{transient_a}",
-            transient_a > 0,
-            "" if transient_a > 0 else "0 transient-retry lines -- the fault window may not have "
-                                       "overlapped a renewal beat; widen short_fault_s or shorten "
-                                       "the renew period"))
-        result.add(Verdict.check(
-            "leg A (short fault): mount lease NEVER fenced",
-            "0 fence-trip log lines", f"{fenced_a}", fenced_a == 0,
-            "" if fenced_a == 0 else "the mount lease fenced during a SHORT fault -- fix #37 phase 1 regression"))
+            def pulse_recovered():
+                nonlocal observed_non_live
+                lifecycle, state, sequence = _mount_lifecycle(node)
+                observed_non_live = observed_non_live or lifecycle != "live"
+                events = _profile_events(node)
+                stats = _ctl("/stats")
+                if (
+                    stats["faults"] >= pulse + 1
+                    and events["CASMountRenewalRecovered"] > recovered_before
+                ):
+                    return {
+                        "pulse": pulse,
+                        "faults": stats["faults"],
+                        "sequence": sequence,
+                        "lifecycle": lifecycle,
+                        "state": state,
+                    }
+                return None
 
-        # Post-disarm write must succeed immediately: nothing was ever fenced.
-        sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=2 * rows)
+            evidence = _wait_for(
+                pulse_recovered,
+                _MOUNT_RENEW_PERIOD_S + _SHORT_RECOVERY_BUDGET_S,
+            )
+            pulse_evidence.append(evidence)
+            _ctl("/config", {"rate": 0.0})
 
-        # --- Leg B: LONG fault (> lease TTL) -- the fence SHOULD trip, then recover cleanly ---
-        since_b = node.scalar("SELECT toString(now())")
-        _ctl("/config", {"rate": 1.0, "modes": ["503"], "methods": ["PUT", "POST"], "seed": 40})
-        long_s = int(p["long_fault_s"])
-        assert long_s > _MOUNT_LEASE_TTL_S, "leg B's fault window must exceed the lease TTL"
-        try:
-            sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=3 * rows,
-                              timeout=min(long_s, 30))
-            node.command(f"OPTIMIZE TABLE {_TABLE} FINAL", timeout=min(long_s, 30))
-        except Exception as e:
-            ctx.log(f"S39 leg B write/merge under sustained fault (expected to fail/retry): {e}")
-        time.sleep(long_s)
-        _ctl("/config", {"rate": 0.0})
+        short_after = _profile_events(node)
+        short_delta = _event_delta(short_before, short_after)
+        short_outcomes = _renewal_outcomes(node, short_since)
+        short_stats = _ctl("/stats")
+        short_lifecycle = _mount_lifecycle(node)
+        result.observations["leg_a"] = {
+            "counter_delta": short_delta,
+            "aggregate_outcomes": short_outcomes,
+            "targeted_proxy_faults": short_stats["faults"],
+            "pulse_evidence": pulse_evidence,
+            "mutation_errors": mutation_errors,
+            "final_mount": short_lifecycle,
+            "observed_non_live": observed_non_live,
+        }
+        result.add(
+            Verdict.check(
+                "leg A: repeated targeted renewal faults were exercised",
+                f"{_SHORT_PULSES} targeted faults and {_SHORT_PULSES} recovered pulses",
+                f"faults={short_stats['faults']} pulses={pulse_evidence}",
+                short_stats["faults"] == _SHORT_PULSES and all(pulse_evidence),
+                "a finite mount-key fault was not consumed and recovered within its sub-TTL budget",
+            )
+        )
+        result.add(
+            Verdict.check(
+                "leg A: Task 6 retry/recovery counters and aggregate events are positive",
+                "attempts > pulses, retries/recovered/retrying events >= pulses",
+                f"delta={short_delta} outcomes={short_outcomes}",
+                short_delta["CASMountRenewalAttempts"] > _SHORT_PULSES
+                and short_delta["CASMountRenewalRetries"] >= _SHORT_PULSES
+                and short_delta["CASMountRenewalRecovered"] >= _SHORT_PULSES
+                and short_outcomes.get("retrying", 0) >= _SHORT_PULSES
+                and short_outcomes.get("recovered", 0) >= _SHORT_PULSES,
+                "short faults did not drive the bounded retry/recovery path",
+            )
+        )
+        result.add(
+            Verdict.check(
+                "leg A: no TransientNotLive generation or remount occurred",
+                "lease_lost=0, remount_attempts=0, mount stayed live",
+                f"delta={short_delta} observed_non_live={observed_non_live} mount={short_lifecycle}",
+                short_delta["CASMountLeaseLost"] == 0
+                and short_delta["CASRemountAttempts"] == 0
+                and not observed_non_live
+                and short_lifecycle[0] == "live",
+                "a sub-TTL renewal disruption unexpectedly left Live",
+            )
+        )
+        result.add(
+            Verdict.check(
+                "leg A: mutations continue while renewal faults recover",
+                f"{_SHORT_PULSES} synchronous mutations succeed",
+                f"errors={mutation_errors}",
+                not mutation_errors,
+                "a mutation failed during a targeted mount-renewal disruption",
+            )
+        )
 
-        # Give the queue's backoff + self-remount time to recover.
-        time.sleep(int(p["settle_s"]))
-
-        fenced_b = _text_log_count(node, since_b, "background renewal failed, the mount-lease stops advancing")
-        result.observations["leg_b"] = {"fence_trip_lines": fenced_b}
-        result.add(Verdict.check(
-            "leg B (long fault): the mount lease fenced (correct fail-closed)",
-            "> 0 fence-trip log lines", f"{fenced_b}", fenced_b > 0,
-            "" if fenced_b > 0 else "no fence trip recorded during a fault held past the TTL -- "
-                                    "either the fault window was too short or phase 1's retry rode "
-                                    "out longer than the lease deadline should have allowed"))
-
-        try:
-            queue_rows = node.query(
-                f"SELECT num_postponed, num_tries, last_exception FROM system.replication_queue "
-                f"WHERE table = '{_TABLE}' ORDER BY num_tries DESC LIMIT 5 FORMAT TabSeparated").strip()
-            rows_list = [r.split("\t") for r in queue_rows.splitlines() if r]
-        except Exception:
-            rows_list = None
-        if rows_list is None:
-            result.add(Verdict.inconclusive(
-                "long fault: replication_queue backoff visibility", "populated or empty",
-                "system.replication_queue query failed"))
-        elif not rows_list:
-            # Nothing queued at all during the outage is a legitimate outcome (no merge happened to
-            # collide with the fault window) -- not a failure, just nothing to check here.
-            result.observations["leg_b"]["queue_rows_at_check"] = 0
-        else:
-            any_last_exception_populated = any(r[2].strip() for r in rows_list if len(r) > 2)
-            result.observations["leg_b"]["queue_sample"] = rows_list[:5]
-            result.add(Verdict.check(
-                "long fault: system.replication_queue.last_exception is populated (fixes #37 phases 2/3)",
-                "at least one non-empty last_exception among queued/recent entries", "see observations",
-                any_last_exception_populated,
-                "" if any_last_exception_populated else
-                "queue entries exist but last_exception is empty everywhere -- the OLD ABORTED "
-                "no-visibility defect may have resurfaced"))
-
-        # Post-recovery: a fresh write must succeed once the fault clears and the self-remount lands.
-        # Recovery is ASYNCHRONOUS -- self-remount (~16s per the #37 spec) plus the replication-queue
-        # backoff -- and under load it routinely exceeds `settle_s`, so a single bare INSERT here is
-        # flaky: it throws the (correct, expected) retry-later NETWORK_ERROR while recovery is still in
-        # flight and crashes the leg. POLL instead: retry the write until it lands within a generous
-        # budget. A retry-later NETWORK_ERROR means "not recovered yet", NOT a failure; the verdict is
-        # the whole point of #37 -- writes RESUME after the fault clears, they are not permanently wedged.
-        recovered = False
-        last_err = ""
-        recover_deadline = time.monotonic() + 90
-        while time.monotonic() < recover_deadline:
+        # A continuous mount-key outage held past TTL must fail closed exactly once. All unrelated S3
+        # paths pass through, isolating the lease-loss/remount operational contract.
+        _ctl("/config", {"reset": True})
+        long_since = node.scalar("SELECT toString(now64(6))")
+        long_before = _profile_events(node)
+        long_s = max(int(p["long_fault_s"]), _MOUNT_LEASE_TTL_S + _MOUNT_RENEW_PERIOD_S)
+        result.observations["fault_window_arithmetic"]["long_actual_s"] = long_s
+        _ctl(
+            "/config",
+            {
+                "rate": 1.0,
+                "modes": ["503"],
+                "methods": ["PUT"],
+                "path_substring": _MOUNT_PATH,
+                "remaining_faults": None,
+                "seed": 3940,
+            },
+        )
+        long_deadline = time.monotonic() + long_s
+        saw_not_live = False
+        while time.monotonic() < long_deadline:
             try:
-                sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=4 * rows,
-                                  timeout=30)
-                recovered = True
+                saw_not_live = saw_not_live or _mount_lifecycle(node)[0] == "not_live"
+            except Exception:
+                pass
+            time.sleep(0.5)
+        _ctl("/config", {"rate": 0.0})
+        long_fault_stats = _ctl("/stats")
+
+        def remounted():
+            events = _profile_events(node)
+            lifecycle = _mount_lifecycle(node)
+            if (
+                events["CASRemountSucceeded"] > long_before["CASRemountSucceeded"]
+                and lifecycle[0] == "live"
+            ):
+                return events, lifecycle
+            return None
+
+        recovered_state = _wait_for(remounted, int(p["settle_s"]) + 90)
+        long_after = recovered_state[0] if recovered_state else _profile_events(node)
+        final_lifecycle = recovered_state[1] if recovered_state else _mount_lifecycle(node)
+        long_delta = _event_delta(long_before, long_after)
+        long_outcomes = _renewal_outcomes(node, long_since)
+        result.observations["leg_b"] = {
+            "counter_delta": long_delta,
+            "aggregate_outcomes": long_outcomes,
+            "targeted_proxy_faults": long_fault_stats["faults"],
+            "saw_not_live": saw_not_live,
+            "final_mount": final_lifecycle,
+        }
+        result.add(
+            Verdict.check(
+                "leg B: sustained disruption fails closed in one recovery generation",
+                "lease_lost=1, failed aggregate event>0, targeted faults>0",
+                f"delta={long_delta} outcomes={long_outcomes} faults={long_fault_stats['faults']} "
+                f"saw_not_live={saw_not_live}",
+                long_delta["CASMountLeaseLost"] == 1
+                and long_outcomes.get("failed", 0) > 0
+                and long_fault_stats["faults"] > 0
+                and saw_not_live,
+                "the past-TTL renewal outage did not produce exactly one fail-closed generation",
+            )
+        )
+        result.add(
+            Verdict.check(
+                "leg B: whole-chain remount restores Live",
+                "remount_attempts>=1, remount_succeeded>=1, final lifecycle=live",
+                f"delta={long_delta} mount={final_lifecycle}",
+                long_delta["CASRemountAttempts"] >= 1
+                and long_delta["CASRemountSucceeded"] >= 1
+                and final_lifecycle[0] == "live",
+                "the mount did not recover through the whole-chain remount protocol",
+            )
+        )
+
+        write_recovered = False
+        last_error = ""
+        write_deadline = time.monotonic() + 90
+        while time.monotonic() < write_deadline:
+            try:
+                sql.insert_random(
+                    node,
+                    _TABLE,
+                    rows=rows // 4,
+                    payload_bytes=payload,
+                    op_id=4 * rows,
+                    timeout=30,
+                )
+                write_recovered = True
                 break
-            except Exception as e:
-                last_err = str(e)
+            except Exception as error:
+                last_error = str(error)
                 time.sleep(3)
-        final_count = node.scalar(f"SELECT count() FROM {_TABLE}") if recovered else "0"
-        result.add(Verdict.check(
-            "post-recovery INSERT succeeds within the recovery budget (writes resume, not wedged)",
-            "an INSERT lands within 90s of the fault clearing", f"recovered={recovered} count={final_count}",
-            recovered and int(final_count or 0) > 0,
-            "" if recovered else f"no write succeeded within 90s after the fault cleared -- self-remount "
-                                 f"recovery did not resume writes (last error: {last_err[:200]})"))
+        result.add(
+            Verdict.check(
+                "leg B: a post-clear write succeeds",
+                "write lands within 90s",
+                f"recovered={write_recovered}",
+                write_recovered,
+                f"post-remount write remained unavailable: {last_error[:200]}",
+            )
+        )
 
-        # node2 replicates node1's writes through the same faulted S3; after leg B it may still be
-        # fetching. Sync it deterministically before the agreement check so we compare converged state,
-        # not a mid-catch-up snapshot (the check itself only polls ~8s, too short after a long fault).
-        for n in cl.nodes():
+        for cluster_node in cl.nodes():
             try:
-                n.command(f"SYSTEM SYNC REPLICA {_TABLE}", timeout=120)
-            except Exception as e:
-                ctx.log(f"S39 SYNC REPLICA on a node before agreement check (best-effort): {e}")
-        _common.assert_replicas_agree(result, cl, sql.table_checksum_query(_TABLE),
-                                      name="S39 replica agreement")
+                cluster_node.command(f"SYSTEM SYNC REPLICA {_TABLE}", timeout=120)
+            except Exception as error:
+                ctx.log(f"S39 SYNC REPLICA before agreement check (best-effort): {error}")
+        _common.assert_replicas_agree(
+            result,
+            cl,
+            sql.table_checksum_query(_TABLE),
+            name="S39 replica agreement",
+        )
         _common.standard_end(ctx, result, [_TABLE])
