@@ -1214,7 +1214,9 @@ bool isSafeToDuplicateInQueryTree(const QueryTreeNodePtr & node)
         node,
         [](const FunctionBasePtr & function_base)
         {
-            return function_base->isDeterministicInScopeOfQuery() && !function_base->isStateful();
+            return function_base->isDeterministicInScopeOfQuery()
+                && !function_base->isStateful()
+                && !function_base->isServerConstant();
         });
 }
 
