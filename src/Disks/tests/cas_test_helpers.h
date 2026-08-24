@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -70,6 +71,43 @@ namespace DB::ErrorCodes
 
 namespace DB::Cas::tests
 {
+
+/// Deterministic two-phase barrier for worker-lifecycle tests. The worker calls `arriveAndWait` at
+/// the exact operation boundary under test; the test waits for that arrival and later calls
+/// `release`. The bounded waits are only hang protection -- correctness never depends on elapsed
+/// time or a polling sleep.
+class ManualBarrier
+{
+public:
+    void arriveAndWait()
+    {
+        std::unique_lock lock(mutex);
+        arrived = true;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(20), [this] { return released; }))
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS test barrier timed out waiting for release");
+    }
+
+    void waitUntilArrived()
+    {
+        std::unique_lock lock(mutex);
+        if (!cv.wait_for(lock, std::chrono::seconds(20), [this] { return arrived; }))
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "CAS test barrier timed out waiting for arrival");
+    }
+
+    void release()
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+        cv.notify_all();
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool arrived = false;
+    bool released = false;
+};
 
 /// Bring up the server-wide blob upload pool (stage-1 §1) if it is not already up, so any test that
 /// drives a `ContentAddressedTransaction` commit -- whose `uploadPendingBlobs` fans out on this pool --

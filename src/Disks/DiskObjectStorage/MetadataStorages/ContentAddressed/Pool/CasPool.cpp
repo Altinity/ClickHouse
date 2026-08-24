@@ -667,15 +667,11 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// The mount object now holds OUR live (uuid, epoch) body. `installKeeper` constructs the keeper
         /// -- which ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard --
         /// AND wires its `minActive` build-watermark reader, its event sink, and the fence-coupling
-        /// callbacks (renew-ok refreshes the monotonic deadline; on-lost latches the fence + arms a
-        /// self-remount), all captured on `mount_runtime` (see `CasMountRuntime::installKeeper`).
-        /// `keeperStart` is separate so this claim orchestration can catch `MountFencedException` and
-        /// retry with a fresh epoch.
+        /// runtime-owned synchronous renewal driver, all captured on `mount_runtime`.
         store->mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
-        claim_anchor_boot_ms = store->bootMsNow();   /// pre-I/O anchor of the claim attempt
         try
         {
-            store->mount_runtime.keeperStart();
+            claim_anchor_boot_ms = store->mount_runtime.startKeeper();
         }
         catch (const MountFencedException &)
         {
@@ -733,7 +729,22 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// mutations under a deadline the durable lease never actually backs). From here ordinary ref
     /// mutations (appendRefOps) are fence-gated via mayMutate.
     const uint64_t ttl_ms_u = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
-    if (store->bootMsNow() >= claim_anchor_boot_ms + ttl_ms_u)
+    const uint64_t safety_ms = store->config.cas_request_budget.lease_safety_margin_ms;
+    const uint64_t safe_deadline = claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
+        ? std::numeric_limits<uint64_t>::max() - safety_ms
+        : claim_anchor_boot_ms + ttl_ms_u - safety_ms;
+    const uint64_t now_boot_ms = store->bootMsNow();
+    const uint64_t period_ms = static_cast<uint64_t>(store->config.mount_renew_period.count());
+    const uint64_t renewal_window_ms
+        = period_ms > std::numeric_limits<uint64_t>::max() - store->config.cas_request_budget.attempt_timeout_ms
+        ? std::numeric_limits<uint64_t>::max()
+        : period_ms + store->config.cas_request_budget.attempt_timeout_ms;
+    /// Preserve one ordinary cadence followed by one physical renewal attempt inside the safe lease
+    /// window. If that publication horizon was consumed, re-anchor synchronously before opening the
+    /// fence; the keeper independently retains its per-request deadline checks.
+    const bool renewal_window_fits = now_boot_ms <= safe_deadline
+        && renewal_window_ms <= safe_deadline - now_boot_ms;
+    if (!renewal_window_fits)
     {
         /// The claim path outlived the lease TTL: its anchor can no longer authorize an armed fence (a
         /// successor may have legally started reclaiming). Re-anchor with ONE fresh conditional lease
@@ -741,7 +752,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         /// arm from the new attempt's anchor (rev.4 Phase B, round-3 finding 2).
         ///
         /// The unbounded operator-configured wait this guard was written for (`T_mat`) is gone, so
-        /// reaching it now means the CLAIM ITSELF -- `keeperStart`'s GET+CAS -- outran the whole lease
+        /// reaching it now means the claim's adoption write outran the safe lease window
         /// TTL, which `validateCasRequestBudget` already refuses to configure. It stays because a stalled
         /// socket can still outlive a budget, and its recovery is one conditional write that fails closed;
         /// it is LOUD rather than fatal because a slow open under a healthy protocol is not a reason to
@@ -749,10 +760,15 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         LOG_WARNING(getLogger("CasPool"),
             "Content-addressed mount {}: the mount claim consumed the lease TTL ({} ms) before the write "
             "fence could be armed; re-writing the lease first", srid, ttl_ms_u);
-        claim_anchor_boot_ms = store->bootMsNow();
-        store->mount_runtime.keeperRenewOnce();
+        claim_anchor_boot_ms = store->mount_runtime.renewKeeperForStartupOnce();
     }
-    store->armMountFence(our_uuid, writer_epoch, claim_anchor_boot_ms + ttl_ms_u);
+    store->mount_runtime.setLiveWriterEpoch(writer_epoch);
+    store->armMountFence(
+        our_uuid,
+        writer_epoch,
+        claim_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms_u
+            ? std::numeric_limits<uint64_t>::max()
+            : claim_anchor_boot_ms + ttl_ms_u);
     /// Gate the background renewer with `background_watermark`: it runs only in production
     /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
     /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,
@@ -760,9 +776,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// arm the fence on every writable open); only the renewal thread is conditional. The merged
     /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
     if (store->config.background_watermark)
-        store->mount_runtime.keeperStartBackground(store->config.mount_renew_period);
-
-    store->mount_runtime.setLiveWriterEpoch(writer_epoch);
+        store->mount_runtime.startBackgroundWorkers(store->config.mount_renew_period);
 }
 
 PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
@@ -835,12 +849,10 @@ Pool::~Pool()
     /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (only the
     /// mount/remount mechanics were relocated into `mount_runtime`):
     ///
-    /// 1. Stop + join the self-remount recovery thread FIRST (it may otherwise re-create the keeper
-    ///    below us). `stopRemountThread` latches `remount_shutting_down` under the thread mutex before
-    ///    the join, so a keeper on_lost firing during teardown can never re-arm the thread after we join.
-    mount_runtime.stopRemountThread();
+    /// 1. Stop and join both persistent mount-runtime workers before draining or releasing the keeper.
+    mount_runtime.stopBackgroundWorkers();
 
-    /// 2. The farewell marker the keeper's `stop()` writes is a
+    /// 2. The farewell marker the keeper's `release` writes is a
     /// certificate that no in-flight ref-log conditional PUT from this incarnation can land after it --
     /// a successor treats it as proof of a clean death (`MountPriorState::Clean`, no observation wait
     /// needed). Writing it without an actual drain would be a protocol-safety bug: an uncertain PUT this
@@ -856,13 +868,13 @@ Pool::~Pool()
     /// 3. Retire the merged heartbeat: `finishTeardown` runs the keeper's terminal op on a clean drain
     /// (stamping the lease already-expired + folding in the watermark farewell so a SAME-server reopen
     /// reclaims immediately) or the fail-closed no-terminal-op on an unresolved PUT, then does the
-    /// belt-and-suspenders remount-thread re-join. See `CasMountRuntime::finishTeardown`.
+    /// belt-and-suspenders worker re-join. See `CasMountRuntime::finishTeardown`.
     mount_runtime.finishTeardown(drained);
 }
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)
 {
-    /// Hazard C6: FORGET joins the self-remount thread (and, via `stop_and_join_gc`, the GC threads), so it
+    /// Hazard C6: FORGET joins both mount-runtime workers (and, via `stop_and_join_gc`, the GC threads), so it
     /// MUST run on the admin/query thread — never a pool thread, whose join of itself would deadlock. The
     /// guard is a programming-error assertion (a self-join hangs; it never corrupts), so a chassert is the
     /// right severity, not a release fail-close.
@@ -880,7 +892,7 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     if (mount_runtime.isVanished())
         return;
 
-    /// (1) Publish the terminal-intent latch FIRST (spec §5). The keeper callback stops arming remounts and
+    /// (1) Publish the terminal-intent latch FIRST (spec §5). The runtime stops latching remounts and
     /// the remount loop bails at its next step boundary, so every join below is bounded to one step + one
     /// backend timeout.
     mount_runtime.publishVanishedIntent();
@@ -897,14 +909,12 @@ void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const Stri
     if (stop_and_join_gc)
         stop_and_join_gc();
 
-    /// (5a) Stop + join the self-remount thread. `stopRemountThread` latches the shutdown gate under the
-    /// thread mutex before joining, and the thread is already bailing on the intent latch (step 1) — so the
-    /// join is bounded and a keeper callback racing teardown can never re-arm it. Outside `remount_mutex`.
-    mount_runtime.stopRemountThread();
+    /// (5a) Stop and join both persistent mount-runtime workers outside `remount_mutex`.
+    mount_runtime.stopBackgroundWorkers();
 
     /// A remount attempt already IN FLIGHT when step 1 published the intent completes its current step
     /// before the loop bails (the "one step + one backend timeout" bound of §5), and a successful reclaim in
-    /// that window re-arms the local fence (`lost = false`). Now that the remount thread is JOINED and can
+    /// that window re-arms the local fence (`lost = false`). Now that the remount worker is JOINED and can
     /// never run again, re-latch the fence so the terminal `mayMutate() == false` holds regardless of any
     /// such raced reclaim. Idempotent; the durable mount lease the reclaim wrote is retired by the
     /// `finishTeardown` below (it operates on whatever keeper is current — the reclaimed one).
@@ -1012,7 +1022,7 @@ bool Pool::tryRemountOnce()
                 break;   /// fall through to the existing fresh-incarnation recovery.
             case LifecycleGateVerdict::Replaced:
                 /// NOT while a FORGET is in progress (spec §9 rev.8 item 7). `forgetDisk` publishes the
-                /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount thread;
+                /// terminal-intent latch at step 1 (`publishVanishedIntent`), then joins the remount worker;
                 /// a `tryRemountOnce` already IN FLIGHT — one that passed the step-0 `isVanished()` gate
                 /// BEFORE the intent was published, which that gate therefore cannot catch — could otherwise
                 /// settle `Vanished(replaced)` mid-FORGET, stranding FORGET's own
@@ -1028,7 +1038,7 @@ bool Pool::tryRemountOnce()
             case LifecycleGateVerdict::IdentityLost:
                 /// Both sentinels authoritatively absent. Enter `IdentityLost` once (from `TransientNotLive`);
                 /// a repeat probe while already `IdentityLost` is a no-op. rev.8: `IdentityLost` is a
-                /// fail-loud TERMINAL state — the remount thread self-exits at its next boundary (see
+                /// fail-loud TERMINAL state — the remount worker self-exits at its next boundary (see
                 /// `CasMountRuntime::remountTerminal`), so there is no demoted observer.
                 if (mount_runtime.lifecycle() != PoolLifecycle::IdentityLost)
                     mount_runtime.enterIdentityLost();
@@ -1110,27 +1120,13 @@ bool Pool::tryRemountOnce()
         /// build's own tests the moment someone reuses an epoch across a remount.
         chassert(writer_epoch > mount_runtime.liveWriterEpoch());
 
-        /// Swap the keeper for the new incarnation. The old keeper's renewal loop already stopped on
-        /// its failed renew; never run its terminal op (the slot now belongs to the new claim).
-        /// `installKeeper` re-wires the SAME fence/min-active/event callbacks on `mount_runtime` as the
-        /// initial `open` did -- so the granular mechanics here are the exact same primitives, in the
-        /// exact same order, as `mountWritable`'s.
-        if (mount_runtime.hasKeeper())
-            mount_runtime.keeperStopBackground();
+        /// The persistent renewal worker is parked before this callback is entered, so keeper
+        /// replacement cannot race any synchronous lease operation.
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
-        /// Pre-I/O anchor of this remount's claim attempt (mirrors `mountWritable`'s
-        /// `claim_anchor_boot_ms`, captured at the identical point -- right after `installKeeper`,
-        /// right before the keeper's own adopt write). No wait can land between this anchor and the arm
-        /// below, so no TTL-consumed redo is needed here: the anchor alone suffices (rev.4 Phase B,
-        /// round-3 finding 2; the redo lives in `mountWritable`, which keeps it for a claim that stalls).
-        /// `quiesceRefTablesForRemount` below IS a wait, but a bounded one -- bounded by the same
-        /// `cas_request_budget` that `validateCasRequestBudget` already guarantees fits under `ttl_ms`.
-        const uint64_t remount_anchor_boot_ms = mount_runtime.bootMsNow();
-        mount_runtime.keeperStart();
+        uint64_t remount_anchor_boot_ms = mount_runtime.startKeeper();
 
         /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence. Order is load-bearing:
-        /// `keeperStart` refreshes the lease deadline
-        /// but does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
+        /// Starting the keeper does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
         /// swap.
         /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
         ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
@@ -1149,28 +1145,56 @@ bool Pool::tryRemountOnce()
         /// 3. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
         ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
         ref_ledger.quiesceRefTablesForRemount();
-        /// 4. Re-open the gate. Anchored at the claim attempt's pre-I/O instant (`remount_anchor_boot_ms`),
-        ///    never at response time -- see the comment above `keeperStart()`. From here appends allocate
-        ///    ids under the new epoch and touch fresh runtimes.
-        mount_runtime.armMountFence(our_uuid, writer_epoch, remount_anchor_boot_ms + ttl_ms);
-        if (config.background_watermark)
-            mount_runtime.keeperStartBackground(config.mount_renew_period);
+        if (config.remount_quiesce_hook_for_test)
+            config.remount_quiesce_hook_for_test();
 
-        LOG_INFO(getLogger("CasPool"),
-            "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
-            srid, writer_epoch);
-        EventEmitter{*this}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::MountRemount;
-            e.round = round_for_event();
-            e.outcome = "ok";
-            e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
-            e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
-                        {"server_root_id", srid}};
-        });
-        /// Recovery succeeded: `TransientNotLive -> Live` (never revives a terminal state — but the gate
-        /// above guarantees we only reach here from a non-terminal state anyway).
+        /// Quiescence may consume most of the new lease. The same renewal-window gate used at startup
+        /// admits one synchronous parked redo while at least one physical attempt still fits the old
+        /// authority window and before the fence is armed.
+        const uint64_t safety_ms = config.cas_request_budget.lease_safety_margin_ms;
+        const uint64_t safe_deadline = remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+            ? std::numeric_limits<uint64_t>::max() - safety_ms
+            : remount_anchor_boot_ms + ttl_ms - safety_ms;
+        const uint64_t now_boot_ms = mount_runtime.bootMsNow();
+        const uint64_t period_ms = static_cast<uint64_t>(config.mount_renew_period.count());
+        const uint64_t renewal_window_ms
+            = period_ms > std::numeric_limits<uint64_t>::max() - config.cas_request_budget.attempt_timeout_ms
+            ? std::numeric_limits<uint64_t>::max()
+            : period_ms + config.cas_request_budget.attempt_timeout_ms;
+        const bool renewal_window_fits = now_boot_ms <= safe_deadline
+            && renewal_window_ms <= safe_deadline - now_boot_ms;
+        if (!renewal_window_fits)
+            remount_anchor_boot_ms = mount_runtime.renewKeeperForRemountOnce();
+
+        /// No-throw commit section: publish the fence and lifecycle only after epoch, keeper, recovery
+        /// cancellation, and ref-runtime quiescence are complete.
+        mount_runtime.armMountFence(
+            our_uuid,
+            writer_epoch,
+            remount_anchor_boot_ms > std::numeric_limits<uint64_t>::max() - ttl_ms
+                ? std::numeric_limits<uint64_t>::max()
+                : remount_anchor_boot_ms + ttl_ms);
         mount_runtime.noteRemounted();
+
+        try
+        {
+            LOG_INFO(getLogger("CasPool"),
+                "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
+                srid, writer_epoch);
+            EventEmitter{*this}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::MountRemount;
+                e.round = round_for_event();
+                e.outcome = "ok";
+                e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
+                e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
+                            {"server_root_id", srid}};
+            });
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasPool"), "CAS self-remount committed; post-commit audit sink failed");
+        }
         return true;
     }
     catch (...)
@@ -1437,9 +1461,8 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
         e.detail = {{"key", key}, {"server_root_id", config.server_root_id}};
     });
 
-    /// Incidental-only detection has a fail-closed reaction -- the SAME on_lost
-    /// mechanics a foreign/superseded lease renewal already drives (the keeper's `setFenceCallbacks`
-    /// lambda). The fence + self-remount now live on `mount_runtime`.
+    /// Incidental-only detection has the same fail-closed reaction as a foreign/superseded lease
+    /// renewal. The fence and persistent self-remount ownership live on `mount_runtime`.
     mount_runtime.tripMountLost();
     mount_runtime.scheduleRemount();
 
