@@ -1,4 +1,5 @@
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnMap.h>
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsCommon.h>
@@ -42,6 +43,7 @@ namespace ProfileEvents
 {
     extern const Event ParquetRowsFilterExpression;
     extern const Event ParquetColumnsFilterExpression;
+    extern const Event ParquetConstantColumnChunks;
 }
 
 namespace DB::Parquet
@@ -456,6 +458,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                 column.meta->meta_data.statistics.__isset.null_count &&
                 column.meta->meta_data.statistics.null_count == 0;
             column.need_null_map = is_nullable && !null_count_is_known_to_be_zero;
+
+            detectConstantColumn(column, primitive_columns[column_idx]);
         }
     }
 
@@ -578,7 +582,9 @@ void Reader::initializePrefetches()
 
             /// Dictionary page.
             size_t dict_page_length = 0;
-            if (column.meta->meta_data.__isset.dictionary_page_offset)
+            /// A constant column chunk is materialized without reading any pages (data or
+            /// dictionary), so don't prefetch its dictionary page either.
+            if (column.meta->meta_data.__isset.dictionary_page_offset && !column.is_constant)
             {
                 /// We assume that the dictionary page is immediately followed by the first data page.
                 size_t start = size_t(column.meta->meta_data.dictionary_page_offset);
@@ -626,8 +632,13 @@ void Reader::initializePrefetches()
                     max_header_length, /*likely_to_be_used=*/ true);
             }
 
+            /// A constant column chunk is materialized without reading any of its pages (see
+            /// detectConstantColumn and decodePrimitiveColumn), so it needs neither the offset index
+            /// nor the column index nor the data pages. The row group already passed the key
+            /// condition via its min == max hyperrectangle, so page-level pruning is redundant here.
+
             /// Offset index.
-            if (use_offset_index &&
+            if (use_offset_index && !column.is_constant &&
                 column.meta->__isset.offset_index_offset && column.meta->__isset.offset_index_length)
             {
                 column.offset_index_prefetch = prefetcher.registerRange(
@@ -636,7 +647,8 @@ void Reader::initializePrefetches()
             }
 
             /// Column index.
-            column.use_column_index = primitive_columns[column_idx].column_index_condition
+            column.use_column_index = !column.is_constant
+                && primitive_columns[column_idx].column_index_condition
                 && column.offset_index_prefetch
                 && column.meta->__isset.column_index_offset && column.meta->__isset.column_index_length;
             if (column.use_column_index)
@@ -656,10 +668,11 @@ void Reader::initializePrefetches()
             if (file_metadata.created_by == "parquet-mr" && !column.meta->meta_data.__isset.dictionary_page_offset && !column.meta->__isset.offset_index_offset)
                 data_pages_extra_bytes = std::min(100ul, prefetcher.getFileSize() - size_t(column.meta->meta_data.data_page_offset) - column.data_pages_bytes);
 
-            column.data_pages_prefetch = prefetcher.registerRange(
-                size_t(column.meta->meta_data.data_page_offset),
-                column.data_pages_bytes + data_pages_extra_bytes,
-                /*likely_to_be_used=*/ true);
+            if (!column.is_constant)
+                column.data_pages_prefetch = prefetcher.registerRange(
+                    size_t(column.meta->meta_data.data_page_offset),
+                    column.data_pages_bytes + data_pages_extra_bytes,
+                    /*likely_to_be_used=*/ true);
         }
     }
 
@@ -1224,6 +1237,8 @@ void Reader::decodeOffsetIndex(ColumnChunk & column, const RowGroup & row_group)
 void Reader::determinePagesToPrefetch(ColumnChunk & column, const RowSubgroup & row_subgroup, const RowGroup & row_group, std::vector<PrefetchHandle *> & out)
 {
     chassert(row_subgroup.filter.rows_pass > 0);
+    if (column.is_constant)
+        return; // constant column: data pages are never read
     if (column.offset_index.page_locations.empty())
         return; // no offset index, can't prefetch individual pages
 
@@ -1361,8 +1376,136 @@ double Reader::estimateColumnMemoryBytesPerRow(const ColumnChunk & column, const
     return res;
 }
 
+bool Reader::isConstantColumnCandidate(const PrimitiveColumnInfo & column_info) const
+{
+    if (!options.format.parquet.use_constant_column_optimization)
+        return false;
+    /// We rely on column chunk min/max statistics being both present and decodable.
+    if (!column_info.decoder.allow_stats)
+        return false;
+
+    /// Only flat, top-level primitive columns, so that one parquet value maps 1:1 to one output row
+    /// and formOutputColumn can materialize the value directly. Exclude:
+    ///  - arrays (leaf repetition level > 0, or any array level: max_array_def > 0),
+    ///  - physically-nullable structs read as Nullable(Tuple(...)) (group_nullable),
+    ///  - leaves nested inside a Tuple/Map/Array output column (the output column is not primitive).
+    /// A plain Nullable(T) is fine: it adds a definition level but no repetition, and its output
+    /// column is still primitive; the no-nulls check below and the output_nullable wrap handle it.
+    if (column_info.levels.back().rep != 0 || column_info.max_array_def != 0 || column_info.group_nullable)
+        return false;
+    if (column_info.idx_in_output_block >= sample_block_to_output_columns_idx.size())
+        return false;
+    const auto & output_idx = sample_block_to_output_columns_idx.at(column_info.idx_in_output_block);
+    return output_idx.has_value() && output_columns[output_idx.value()].is_primitive;
+}
+
+void Reader::detectConstantColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info) const
+{
+    if (!isConstantColumnCandidate(column_info))
+        return;
+
+    const auto & meta_data = column.meta->meta_data;
+    if (!meta_data.__isset.statistics)
+        return;
+    const auto & stats = meta_data.statistics;
+    const bool physically_nullable = column_info.levels.back().def > 0;
+
+    /// Case 1 - all-null chunk: every row is null (null_count == num_values). Provable only for a
+    /// physically nullable leaf (a REQUIRED column can have no nulls) whose writer emitted null_count.
+    /// No value is decoded, so this skips the min/max exactness/truncation checks below. Materialize
+    /// Null for a Nullable output, or the output default when null_as_default substitutes nulls for a
+    /// non-nullable output; a non-nullable output without null substitution cannot represent the
+    /// result, so leave the chunk to the normal decode path (which errors on the null).
+    /// formOutputColumn records every row in block_missing_values for this case.
+    if (physically_nullable && stats.__isset.null_count && stats.null_count == meta_data.num_values
+        && meta_data.num_values > 0)
+    {
+        const bool null_as_default = options.format.null_as_default && !column_info.output_nullable;
+        if (column_info.output_nullable)
+            column.constant_value = Null{};
+        else if (null_as_default)
+            column.constant_value = column_info.output_type->getDefault();
+        else
+            return;
+
+        column.is_constant = true;
+        column.is_all_null = true;
+        ProfileEvents::increment(ProfileEvents::ParquetConstantColumnChunks);
+        return;
+    }
+
+    /// Case 2 - single-valued chunk: min == max with no nulls. A physically nullable leaf must prove
+    /// zero nulls via null_count (a REQUIRED leaf, definition level 0, cannot have any, and writers
+    /// commonly omit null_count for it). A chunk mixing the value with nulls has two distinct logical
+    /// values and still needs a null map, so it is not constant.
+    if (physically_nullable && (!stats.__isset.null_count || stats.null_count != 0))
+        return;
+    if (!stats.__isset.min_value || !stats.__isset.max_value || stats.min_value != stats.max_value)
+        return;
+
+    /// A writer may store truncated min/max for variable- or opaque-length physical types (BYTE_ARRAY,
+    /// FIXED_LEN_BYTE_ARRAY), which could make two different values compare equal. Allowlist only the
+    /// fixed-width numeric physical types, whose min/max are never truncated, as unconditionally
+    /// trustworthy; anything else (BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, and any physical type added in the
+    /// future) must present the writer's is_*_value_exact flags before min == max is trusted. Fails
+    /// closed: an unrecognized type is treated as possibly-truncated rather than blindly trusted.
+    const bool never_truncated =
+        meta_data.type == parq::Type::BOOLEAN
+        || meta_data.type == parq::Type::INT32
+        || meta_data.type == parq::Type::INT64
+        || meta_data.type == parq::Type::INT96
+        || meta_data.type == parq::Type::FLOAT
+        || meta_data.type == parq::Type::DOUBLE;
+    /// is_*_value_exact is an optional thrift bool; guard on __isset so an absent flag fails closed
+    /// (treated as not-exact) rather than reading a possibly-uninitialized value and trusting a
+    /// truncated min/max.
+    const bool min_max_marked_exact =
+        stats.__isset.is_min_value_exact && stats.is_min_value_exact
+        && stats.__isset.is_max_value_exact && stats.is_max_value_exact;
+    /// min == max means "single value" only if the compared bytes are the whole value, not a
+    /// truncated stand-in: true when the type is never truncated, or the writer marked both exact.
+    if (!(never_truncated || min_max_marked_exact))
+        return;
+
+    /// Decode the value into the column's input (decoded) domain; formOutputColumn casts it to the
+    /// output type if they differ. decodeField leaves `value` Null when the physical type is
+    /// unsupported for stats, in which case the optimization does not fire.
+    Field value;
+    column_info.decoder.decodeField(stats.min_value, /*is_max=*/ false, value);
+    if (value.isNull())
+        return;
+
+    column.is_constant = true;
+    column.constant_value = std::move(value);
+    ProfileEvents::increment(ProfileEvents::ParquetConstantColumnChunks);
+}
+
 void Reader::decodePrimitiveColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info, ColumnSubchunk & subchunk, const RowGroup & row_group, RowSubgroup & row_subgroup, MemoryUsageDiff & diff)
 {
+    if (column.is_constant)
+    {
+        /// This chunk provably holds a single value in every row (see detectConstantColumn), and its
+        /// data pages were never fetched. Skip all decoding and hand the already-decoded value to
+        /// formOutputColumn, which materializes it directly in the final output type. The value is
+        /// in the output (post-cast) domain, so it must not go through the decoded_type column and
+        /// castColumn path. We still run the per-output-column bookkeeping below so the output column
+        /// is formed once the last of its primitive columns is done.
+        subchunk.is_constant = true;
+        subchunk.constant_value = column.constant_value;
+        subchunk.is_all_null = column.is_all_null;
+
+        OutputColumnState & state = row_subgroup.output.at(column_info.idx_in_output_block);
+        chassert(!state.column);
+        size_t prev_count = state.primitive_columns_remaining.fetch_sub(1);
+        chassert(prev_count > 0);
+        if (prev_count == 1)
+        {
+            const auto & output_idx = sample_block_to_output_columns_idx.at(column_info.idx_in_output_block);
+            state.column = formOutputColumn(row_subgroup, output_idx.value(), row_subgroup.filter.rows_pass);
+        }
+        return;
+    }
+
     /// Allocate columns for values, null map, and array offsets.
 
     size_t output_num_values_estimate = 0;
@@ -2234,6 +2377,44 @@ MutableColumnPtr Reader::formOutputColumn(RowSubgroup & row_subgroup, size_t out
         chassert(output_info.primitive_start + 1 == output_info.primitive_end);
         size_t primitive_idx = output_info.primitive_start;
         ColumnSubchunk & subchunk = row_subgroup.columns.at(primitive_idx);
+
+        if (subchunk.is_constant)
+        {
+            /// Constant column chunk (see detectConstantColumn): materialize the single value as a
+            /// ColumnConst rather than an expanded column. O(1) instead of O(rows), and the const-ness
+            /// propagates downstream: a PREWHERE/WHERE predicate computes its result from the value
+            /// without expanding the stored column, and GROUP BY / aggregation get a const key.
+            ColumnPtr result;
+            if (subchunk.is_all_null)
+            {
+                /// constant_value was synthesized directly in the output domain (Null, or the output
+                /// default under null_as_default), so no cast applies.
+                MutableColumnPtr single_value = output_info.output_type->createColumn();
+                single_value->insert(subchunk.constant_value);
+                result = ColumnConst::create(std::move(single_value), num_rows);
+
+                /// An all-null chunk records every row in block_missing_values, matching the normal
+                /// decode path (which records nulls from the null map); needed for null_as_default.
+                if (output_info.idx_in_output_block.has_value()
+                    && *output_info.idx_in_output_block < row_subgroup.block_missing_values.getNumColumns())
+                    row_subgroup.block_missing_values.setBits(*output_info.idx_in_output_block, num_rows);
+            }
+            else
+            {
+                /// constant_value came from decodeField, i.e. the input (decoded) domain. Build the
+                /// const in input_type and apply the same castColumn the per-row decode path uses when
+                /// the output type differs (e.g. Enum by name, Decimal rescale, LowCardinality).
+                /// Casting a ColumnConst is O(1) and preserves const-ness.
+                MutableColumnPtr single_value = output_info.input_type->createColumn();
+                single_value->insert(subchunk.constant_value);
+                result = ColumnConst::create(std::move(single_value), num_rows);
+                if (output_info.needs_cast)
+                    result = castColumn({result, output_info.input_type, output_info.name}, output_info.output_type);
+            }
+
+            return IColumn::mutate(std::move(result));
+        }
+
         res = std::move(subchunk.column);
 
         if (output_info.idx_in_output_block.has_value() &&

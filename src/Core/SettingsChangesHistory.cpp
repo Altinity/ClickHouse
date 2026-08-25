@@ -42,6 +42,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"input_format_parquet_use_constant_column_optimization", false, true, "New setting: when a Parquet column chunk provably holds a single value in every row (per its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages (reader v3)."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
