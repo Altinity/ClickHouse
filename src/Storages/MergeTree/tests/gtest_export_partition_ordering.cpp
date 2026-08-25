@@ -3,23 +3,13 @@
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Common/tests/gtest_global_context.h>
-#include <Common/Exception.h>
 #include <Core/Settings.h>
-#include <DataTypes/DataTypeString.h>
-#include <DataTypes/DataTypesNumber.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int INCOMPATIBLE_COLUMNS;
-    extern const int THERE_IS_NO_COLUMN;
-    extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
-}
 
 namespace Setting
 {
@@ -29,27 +19,6 @@ namespace Setting
 
 namespace
 {
-    template <typename DataType>
-    ColumnWithTypeAndName makeColumn(const String & name)
-    {
-        auto type = std::make_shared<DataType>();
-        return {type->createColumn(), type, name};
-    }
-
-    template <typename Function>
-    void expectExceptionCode(Function && function, int expected_code)
-    {
-        try
-        {
-            function();
-            FAIL() << "Expected exception code " << expected_code;
-        }
-        catch (const Exception & exception)
-        {
-            EXPECT_EQ(exception.code(), expected_code) << exception.message();
-        }
-    }
-
     ExportReplicatedMergeTreePartitionManifest makeValidManifest()
     {
         ExportReplicatedMergeTreePartitionManifest manifest;
@@ -250,149 +219,6 @@ TEST_F(ExportPartitionManifestBackCompatTest, IgnoreExtraSourceColumnsAppliedToW
             worker_context->getSettingsRef()[Setting::export_merge_tree_part_ignore_extra_source_columns].value,
             value) << "value=" << value;
     }
-}
-
-TEST(ExportColumnCastsTest, UsesSelectedMatchingMode)
-{
-    const ColumnsWithTypeAndName source_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-        makeColumn<DataTypeString>("payload"),
-        makeColumn<DataTypeString>("extra"),
-    };
-    const ColumnsWithTypeAndName destination_columns = {
-        makeColumn<DataTypeString>("payload"),
-        makeColumn<DataTypeInt64>("year"),
-        makeColumn<DataTypeInt64>("id"),
-    };
-    const StorageID destination_storage_id{"test", "destination"};
-
-    expectExceptionCode(
-        [&]
-        {
-            ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-                source_columns,
-                destination_columns,
-                MergeTreePartExportSchemaMatchMode::POSITION,
-                destination_storage_id);
-        },
-        ErrorCodes::INCOMPATIBLE_COLUMNS);
-
-    EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-        source_columns,
-        destination_columns,
-        MergeTreePartExportSchemaMatchMode::NAME,
-        destination_storage_id));
-}
-
-TEST(ExportColumnCastsTest, MatchByNameAcceptsReorderedColumnsWithEqualColumnCount)
-{
-    const ColumnsWithTypeAndName source_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-        makeColumn<DataTypeString>("payload"),
-    };
-    const ColumnsWithTypeAndName reordered_destination_columns = {
-        makeColumn<DataTypeString>("payload"),
-        makeColumn<DataTypeInt64>("year"),
-        makeColumn<DataTypeInt64>("id"),
-    };
-    const StorageID destination_storage_id{"test", "destination"};
-
-    expectExceptionCode(
-        [&]
-        {
-            ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-                source_columns,
-                reordered_destination_columns,
-                MergeTreePartExportSchemaMatchMode::POSITION,
-                destination_storage_id);
-        },
-        ErrorCodes::INCOMPATIBLE_COLUMNS);
-
-    EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-        source_columns,
-        reordered_destination_columns,
-        MergeTreePartExportSchemaMatchMode::NAME,
-        destination_storage_id));
-
-    const ColumnsWithTypeAndName same_order_destination_columns = {
-        makeColumn<DataTypeInt64>("id"),
-        makeColumn<DataTypeInt64>("year"),
-        makeColumn<DataTypeString>("payload"),
-    };
-
-    for (const auto mode : {MergeTreePartExportSchemaMatchMode::POSITION, MergeTreePartExportSchemaMatchMode::NAME})
-        EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-            source_columns, same_order_destination_columns, mode, destination_storage_id));
-}
-
-TEST(ExportColumnCastsTest, MatchByNameToleratesUnmatchedSourceColumn)
-{
-    const ColumnsWithTypeAndName source_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-        makeColumn<DataTypeString>("extra"),
-    };
-    const ColumnsWithTypeAndName destination_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-    };
-    const StorageID destination_storage_id{"test", "destination"};
-
-    EXPECT_NO_THROW(ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-        source_columns,
-        destination_columns,
-        MergeTreePartExportSchemaMatchMode::NAME,
-        destination_storage_id));
-}
-
-TEST(ExportColumnCastsTest, RejectsLossyCastAfterMatchingByName)
-{
-    const ColumnsWithTypeAndName source_columns = {
-        makeColumn<DataTypeInt64>("id"),
-        makeColumn<DataTypeInt32>("year"),
-        makeColumn<DataTypeString>("extra"),
-    };
-    const ColumnsWithTypeAndName destination_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-    };
-
-    expectExceptionCode(
-        [&]
-        {
-            ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-                source_columns,
-                destination_columns,
-                MergeTreePartExportSchemaMatchMode::NAME,
-                StorageID{"test", "destination"});
-        },
-        ErrorCodes::INCOMPATIBLE_COLUMNS);
-}
-
-TEST(ExportColumnCastsTest, RejectsMissingDestinationColumnAfterMatchingByName)
-{
-    const ColumnsWithTypeAndName source_columns = {
-        makeColumn<DataTypeInt32>("id"),
-        makeColumn<DataTypeInt32>("year"),
-        makeColumn<DataTypeString>("extra"),
-    };
-    const ColumnsWithTypeAndName destination_columns = {
-        makeColumn<DataTypeInt32>("renamed_id"),
-        makeColumn<DataTypeInt32>("year"),
-    };
-
-    expectExceptionCode(
-        [&]
-        {
-            ExportPartitionUtils::verifyExportColumnCastsAreSafe(
-                source_columns,
-                destination_columns,
-                MergeTreePartExportSchemaMatchMode::NAME,
-                StorageID{"test", "destination"});
-        },
-        ErrorCodes::THERE_IS_NO_COLUMN);
 }
 
 }

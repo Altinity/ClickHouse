@@ -89,12 +89,6 @@ namespace ExportPartitionUtils
         const StorageMetadataPtr & source_metadata,
         const StorageMetadataPtr & destination_metadata);
 
-    void verifyExportColumnCastsAreSafe(
-        const ColumnsWithTypeAndName & source_columns,
-        const ColumnsWithTypeAndName & destination_columns,
-        MergeTreePartExportSchemaMatchMode schema_match_mode,
-        const StorageID & destination_storage_id);
-
     void checkExportSchemaColumnsCount(
         size_t source_columns_count,
         size_t destination_columns_count,
