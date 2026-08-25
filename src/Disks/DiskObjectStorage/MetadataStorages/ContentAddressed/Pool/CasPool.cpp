@@ -881,30 +881,65 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
 
 Pool::~Pool()
 {
-    /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (only the
-    /// mount/remount mechanics were relocated into `mount_runtime`):
-    ///
+    /// Nothing here may escape: a destructor is `noexcept` by default, so any throw terminates the
+    /// process. Each phase is guarded separately because `finishTeardown` re-enters
+    /// `stopBackgroundWorkers`; guarding only the first call would leave the second one unguarded.
+    const auto guarded = [](auto && phase, const char * what)
+    {
+        try
+        {
+            phase();
+        }
+        catch (...)
+        {
+            /// `tryLogCurrentException` allocates, and can itself throw under the memory pressure that
+            /// caused the teardown failure.
+            try
+            {
+                tryLogCurrentException(getLogger("CasPool"), what);
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+            }
+        }
+    };
+
     /// 1. Stop and join both persistent mount-runtime workers before draining or releasing the keeper.
-    mount_runtime.stopBackgroundWorkers();
+    guarded([this]
+    {
+        if (config.teardown_phase1_throw_for_test)
+            config.teardown_phase1_throw_for_test();
+        mount_runtime.stopBackgroundWorkers();
+    }, "CAS pool teardown: stopping background workers");
 
-    /// 2. The farewell marker the keeper's `release` writes is a
-    /// certificate that no in-flight ref-log conditional PUT from this incarnation can land after it --
-    /// a successor treats it as proof of a clean death (`MountPriorState::Clean`, no observation wait
-    /// needed). Writing it without an actual drain would be a protocol-safety bug: an uncertain PUT this
-    /// incarnation is still resolving could land AFTER the successor already reclaimed and started
-    /// mutating. `drainRefLanesForShutdown` is the drain; bounded by one attempt's worth of budget plus
-    /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded. It
-    /// stays on `Pool` (mediating the mount↔ledger coupling), sequenced between the two mount-runtime
-    /// teardown steps exactly as before.
-    const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
-        config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
-    const bool drained = ref_lanes_drained && !writerCleanupDutiesPending();
+    /// 2. The farewell marker the keeper's `release` writes is a certificate that no in-flight ref-log
+    /// conditional PUT from this incarnation can land after it. A successor treats it as proof of a
+    /// clean death (`MountPriorState::Clean`, no observation wait needed). Writing it without an actual
+    /// drain would be a protocol-safety bug: an uncertain PUT this incarnation is still resolving could
+    /// land after the successor already reclaimed and started mutating. `drainRefLanesForShutdown` is
+    /// bounded by one attempt's worth of budget plus the lease safety margin, and stays on `Pool`
+    /// between the two mount-runtime teardown steps.
+    ///
+    /// False by default, rather than assigned from the drain: swallowing a drain failure must never
+    /// forge the clean-release marker.
+    bool drained = false;
+    guarded([this, &drained]
+    {
+        if (config.teardown_phase2_throw_for_test)
+            config.teardown_phase2_throw_for_test();
+        const bool ref_lanes_drained = ref_ledger.drainRefLanesForShutdown(
+            config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+        drained = ref_lanes_drained && !writerCleanupDutiesPending();
+    }, "CAS pool teardown: draining ref lanes");
 
-    /// 3. Retire the merged heartbeat: `finishTeardown` runs the keeper's terminal op on a clean drain
-    /// (stamping the lease already-expired + folding in the watermark farewell so a SAME-server reopen
-    /// reclaims immediately) or the fail-closed no-terminal-op on an unresolved PUT, then does the
-    /// belt-and-suspenders worker re-join. See `CasMountRuntime::finishTeardown`.
-    mount_runtime.finishTeardown(drained);
+    /// 3. Retire the merged heartbeat. This always runs after phase 2, even when that phase failed, and
+    /// gets the captured fail-closed drain result.
+    guarded([this, drained]
+    {
+        if (config.teardown_phase3_throw_for_test)
+            config.teardown_phase3_throw_for_test();
+        mount_runtime.finishTeardown(drained);
+    }, "CAS pool teardown: finishing mount teardown");
 }
 
 bool Pool::tryDispatchDetached(std::function<void(DetachedStopToken)> task)
