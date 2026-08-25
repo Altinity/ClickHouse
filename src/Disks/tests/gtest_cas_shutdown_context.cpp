@@ -92,7 +92,7 @@ void emitTestEvent(DB::ContentAddressedMetadataStorage & storage)
     const bool clean_release = mount
         && decodeMountLease(mount->bytes).min_active == std::numeric_limits<uint64_t>::max();
     const bool marker_must_be_absent = phase == 2;
-    std::exit(marker_must_be_absent && clean_release ? 1 : 0);
+    std::_Exit(marker_must_be_absent && clean_release ? 1 : 0);
 }
 
 }
