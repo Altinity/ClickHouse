@@ -88,41 +88,40 @@ short-lived TODO, not the record.
 - The upstream `ProjectionsDescription::getDirectoryName` change is unnecessary: the manifest now
   carries arbitrary paths faithfully.
 
-## 9. Fix the three untracked P1s from the 2026-08-05 umbrella review {#fix-umbrella-p1}
+## 9. PARTLY DONE — Fix the three untracked P1s from the 2026-08-05 umbrella review {#fix-umbrella-p1}
 
-Re-verified against HEAD on 2026-08-21 (`docs/superpowers/cas/fable-review-triage.md`): still open,
-and none of the three was tracked anywhere until now.
+Originally re-verified as open against HEAD on 2026-08-21
+(`docs/superpowers/cas/fable-review-triage.md`). Current status follows.
 
-- **B1 — `~Gc` vs `meta_pool` drain (UAF class).** No explicit `~Gc` exists and `meta_pool` is
-  declared BEFORE `condemn_marker_mutex`/`condemn_markers_confirmed`, so members destroy in an order
-  that leaves a live pool worker locking a destroyed mutex when a round throws after scheduling a
-  condemn-marker write. rev.8 made `Gc` destruction a routine event (UNMOUNT, GC STOP), not just
-  shutdown — which widens the window rather than closing it. Fix: explicit destructor that
-  waits `meta_pool` first (or declare it last), plus a drain on the scheduler's exception path.
-- **B2a — `MountLeaseKeeper::claim()` throws `LOGICAL_ERROR`** on four "environment changed under us"
-  branches reachable from the background self-remount thread; in debug/ASan that is `abort()` on the
-  very lanes that certify the feature. The sibling renewal path was already reclassified to
-  `ABORTED`/`MountFencedException`; apply the same to `claim()` and update the death test that pins
-  the current behaviour. (2b, the GC delete-marker site, is tracked separately as
+- **DONE — B1, `~Gc` vs `meta_pool` drain (UAF class).** Implemented 2026-08-24: `7a376f141d3`
+  gives every meta-pool job shared ownership of the state it touches, `e430917bb3c` drains the pool
+  on every throwing round exit, and `683b68606e2` keeps that cleanup nonthrowing while preserving
+  successful-path pool/framework exceptions. Focused lifetime and throwing-exit tests cover both
+  condemn-marker and confirmed-meta-delete jobs.
+- **DONE — B2a, `MountLeaseKeeper::claim` environment-change exceptions.** Implemented 2026-08-24:
+  `98e49683ed4` reclassifies all claim-time slot races and foreign-owner conflicts from
+  `LOGICAL_ERROR` to `ABORTED`, preserves `MountFencedException` for GC fencing, and adds focused
+  coverage for all adoption windows. (2b, the GC delete-marker site, remains tracked separately as
   `{#versioning-enabled-after-mount}`.)
-- **B3 — inline `disk(metadata_type='cas', …)` bypasses the whole `SYSTEM CAS` privilege model.**
+- **OPEN — B3, inline `disk(metadata_type='cas', …)` bypasses the whole `SYSTEM CAS` privilege model.**
   The factory still has no `custom_disk` gate, so any user who can `CREATE TABLE` mints a permanent
   pool member with a pool-wide view of other tenants' namespaces. The ready-made pattern is the
   `use_fake_transaction` rejection one file over. Decide: reject `custom_disk` for pool-joining
   metadata types, or require a dedicated grant.
 
-## 10. Fix the shutdown-path null dereference: detached CAS work outliving `Context` {#fix-detached-pool-context}
+## 10. DONE — Fix the shutdown-path null dereference: detached CAS work outliving `Context` {#fix-detached-pool-context}
 
 - Source: the second 2026-08-05 umbrella review (opus), items B3 + B4, re-verified at HEAD
   2026-08-22; full record in `docs/superpowers/cas/opus-review-triage.md` `{#b3}`/`{#b4}` and BACKLOG
   `{#detached-pool-outlives-context}`. Untracked until now.
-- One coupled chain: `shutdown()` does not drain the detached CAS dispatches, which hold a strong
-  `Pool` reference, so `~Pool`'s durable farewell write and mount-event emit can run arbitrarily late
-  — and CAS logs through a strong `ContextPtr` whose `shared` is already nulled by
-  `resetSharedContext()`. The snapshot publisher is a routine path, so this is not an exotic race.
-- Fix both halves: a tracked drain `shutdown()` waits on (so `~Pool` runs while the world exists),
-  and an event-emit path that tolerates an absent log/context instead of dereferencing it.
-- Pre-release: yes. It is a crash at shutdown on any server that ever mounted a CAS disk.
+- Implemented 2026-08-25 in `e69b4d3c26f..e51affc6206`: all detached CAS work uses one tracked
+  dispatcher; shutdown stops admission, interrupts recovery and drains before releasing the pool;
+  every teardown phase is fail-soft; and CAS event sinks use a weak, null-safe `Context` path.
+  Diagnostic dispatch failure also cannot replace the caller's fail-closed exception.
+- Verified on the final revision: exact Debug `CAS*` gate 2170/2170, exact ASan `CAS*` gate
+  2169/2169 with zero sanitizer reports, plus a real CAS-backed server shutdown after an
+  approximately 18 MiB insert (`SIGTERM=0`, real wait status 0, no remaining process and no detached
+  background-task timeout or fatal teardown diagnostics).
 
 ## 11. DONE — Land the GCS request-isolation work {#gcs-request-isolation}
 
