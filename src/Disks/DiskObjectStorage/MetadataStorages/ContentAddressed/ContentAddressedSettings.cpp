@@ -49,6 +49,9 @@ ConfigKeyName splitRepeatIndex(const std::string & key)
 constexpr std::string_view CAS_KEY_PREFIX = "cas_";
 }
 
+/// The disk configuration element is shared by the object-storage and generic disk layers, as
+/// well as CAS. Only the user-facing CAS keys carry the `cas_` prefix; every other key belongs to
+/// one of the other consumers. The declarations keep their unprefixed internal setting names.
 #define LIST_OF_CONTENT_ADDRESSED_SETTINGS(DECLARE, ALIAS) \
     DECLARE(String, scratch_path, "", "Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path", 0) \
     DECLARE(Bool,   gc_enabled, true, "Run the background GC scheduler on this disk", 0) \

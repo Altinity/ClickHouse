@@ -12,7 +12,7 @@ doc_type: 'reference'
 ## The disk config block {#disk-config}
 
 A `CAS` disk is an `object_storage` disk with `metadata_type` set to `cas` and an explicit
-`server_root_id`. The recommended shape layers a `type=cache` disk in front of it — the local
+`cas_server_root_id`. The recommended shape layers a `type=cache` disk in front of it — the local
 filesystem cache absorbs repeated reads of the same blob, while the `CAS` disk underneath stays the
 single source of truth the pool's other members and GC also read from. The storage policy references
 the **cached** disk, not the raw `CAS` disk directly:
@@ -25,7 +25,7 @@ the **cached** disk, not the raw `CAS` disk directly:
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
                 <metadata_type>cas</metadata_type>
-                <server_root_id>{replica}</server_root_id>
+                <cas_server_root_id>{replica}</cas_server_root_id>
                 <endpoint>https://bucket.s3.amazonaws.com/cas/</endpoint>
                 <access_key_id>...</access_key_id>
                 <secret_access_key>...</secret_access_key>
@@ -56,8 +56,8 @@ cache to the working set of blobs a node reads repeatedly, not to the pool's tot
 `object_storage_type`, `metadata_type`, `endpoint`, `access_key_id`, `secret_access_key`, and the
 other generic object-storage/disk keys (`path`, `name`, `region`, `use_environment_credentials`,
 `readonly`, `use_fake_transaction`, and a handful more) belong to the shared disk layer, not to
-`CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. Every key
-below this line, and every key not in that shared set, is rejected as unknown.
+`CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. The
+`CAS` keys below and this shared set are accepted; every other key is rejected as unknown.
 
 The bare, uncached form — a storage policy pointing directly at the `CAS` disk, as used by
 [quick start](/antalya/cas/quick-start) — remains valid and is the minimal way to try `CAS` out:
@@ -76,34 +76,45 @@ The bare, uncached form — a storage policy pointing directly at the `CAS` disk
 
 ## Disk-level settings {#disk-settings}
 
-None of these keys carry a `cas_`/`ca_` prefix — the disk block already scopes them.
+The disk element is read by several components at once. `CAS` settings carry the `cas_` prefix;
+every other key belongs to the object-storage or generic disk layer.
 
 `CAS` is experimental: any setting below may change semantics, change its default, or disappear
 entirely before release. Treat this table as a snapshot of the current build, not a stable contract.
 
 | Setting | Default | Description |
 |---|---|---|
-| `server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount |
-| `scratch_path` | server data path | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
-| `gc_enabled` | `true` | Run the background GC scheduler on this disk. `false` is a debugging aid, not an operating mode: garbage then accumulates indefinitely and silently — watch `system.cas_gc_log` for round activity if you ever toggle it |
-| `gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
-| `blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
-| `blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
+| `cas_server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount |
+| `cas_scratch_path` | server data path | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
+| `cas_gc_enabled` | `true` | Run the background GC scheduler on this disk. `false` is a debugging aid, not an operating mode: garbage then accumulates indefinitely and silently — watch `system.cas_gc_log` for round activity if you ever toggle it |
+| `cas_gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
+| `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
+| `cas_blob_hash_allow_new` | `false` | Explicit opt-in to admit a new hash algorithm into an existing pool. One-way: once admitted, the pool carries both algorithms permanently |
 | `skip_access_check` | `false` | Skip the boot-time capability probe (start now, fix later). Only the preflight probe is skipped — the conditional-write correctness check still runs on every writable mount. **Not available on a writable generation-token (GCS) disk**, which refuses to mount with it: there, the probe battery is the only proof that a token-exact delete carries its generation precondition. Mount such a disk read-only if you need to defer the check |
-| `gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
-| `gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
+| `cas_gc_snapshot_generations_to_keep` | `3` | GC snapshot generations retained |
+| `cas_gc_shards` | `1` | Blob-hash-prefix reducer shards (≥ 1). Recorded in the pool at creation; a mismatching config is refused at mount |
 | `gcs_max_conditional_put_bytes` | 1 GiB | Largest conditional non-blob `PUT` on a generation-token store, including create-if-absent metadata/control artifacts and conditional replacements. Blob publication is unconditional, uses ordinary multipart, and is not subject to this cap |
-| `part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
-| `part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
-| `part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
-| `part_folder_validate` | `always` | Cache body re-proof policy (`always` \| `never` \| `age <seconds>`). **Leave at `always`**: the other modes trade the fail-closed body-existence check for an optimization — this is a trust decision about unverified data, not a performance knob |
-| `manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
-| `gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
-| `staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
+| `cas_part_folder_cache_bytes` | 64 MiB | Part-folder view cache byte budget (`0` disables retention) |
+| `cas_part_folder_cache_max_entries` | `10000` | Part-folder view cache entry cap |
+| `cas_part_folder_cache_max_entry_bytes` | 16 MiB | Oversized part-folder views bypass retention above this size |
+| `cas_part_folder_validate` | `always` | Cache body re-proof policy (`always` \| `never` \| `age <seconds>`). **Leave at `always`**: the other modes trade the fail-closed body-existence check for an optimization — this is a trust decision about unverified data, not a performance knob |
+| `cas_manifest_decode_cache_bytes` | 128 MiB | Manifest decode cache byte budget (`0` disables) |
+| `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
+| `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
 
-### Choosing `blob_hash` {#choosing-blob-hash}
+## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
-`blob_hash` is fixed at pool creation, so pick it deliberately. `blob_hash_allow_new` is the
+The unprefixed spelling of a `CAS` setting is accepted for now and reported at server startup. It
+will stop being accepted; update configurations to the `cas_` names in the table above.
+
+Two keys deliberately remain unprefixed: `skip_access_check`, shared with the generic disk layer,
+and `gcs_max_conditional_put_bytes`, an S3 client setting. The server-level
+`skip_access_check` flag skips the generic disk access check, while the `CAS` capability probe is
+governed by the disk's own `skip_access_check` key.
+
+### Choosing `cas_blob_hash` {#choosing-blob-hash}
+
+`cas_blob_hash` is fixed at pool creation, so pick it deliberately. `cas_blob_hash_allow_new` is the
 escape hatch — it admits a second algorithm into an existing pool's `algos_used` rather than
 requiring a fresh pool.
 
