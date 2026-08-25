@@ -750,3 +750,23 @@ since `prefixEligible` compares `writer_epoch` first (`Gc/CasOrphanManifestSweep
 Sub-finding: the unclean-farewell WARNING (`Pool/CasMountRuntime.cpp:529-530`) blames "an unresolved
 ref-log PUT" even when the real cause is an undrained cleanup duty — misleading at exactly the moment
 an operator reads it. P2.
+
+## Close the `cas_` config-prefix migration window {#cas-config-prefix-window}
+
+Scheduled removal, not a defect. The CAS disk settings move to a `cas_` config-key prefix
+(`docs/superpowers/specs/2026-08-25-cas-disk-settings-namespace-design.md`), and the unprefixed
+spelling is accepted for a bounded period so that configurations already living in external CI/CD
+scripts keep working across a binary upgrade.
+
+**Trigger:** the CAS configurations in the `clickhouse-regression` suite are on the `cas_` spelling.
+
+**The work:** in `ContentAddressedSettings::loadFromConfig`, replace the migration block — the
+aggregated `WARNING` and the loop that applies legacy values — with a throw that lists every
+unprefixed CAS setting name found and its `cas_` spelling. Detection stays; only the response
+changes. Then rewrite the two tests that pin the open-window behaviour into one that pins
+`UNKNOWN_SETTING`, and drop the deprecation sentence from
+`docs/en/antalya/cas/configuration.md` and `docs/en/operations/storing-data.md`.
+
+**Why it must not be forgotten:** while the window is open, a stale configuration runs with a warning
+nobody reads. Closing it is what turns a silently-stale config into a startup failure that names the
+key.
