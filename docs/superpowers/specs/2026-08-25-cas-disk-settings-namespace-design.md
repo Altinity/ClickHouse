@@ -9,13 +9,15 @@ doc_type: 'design'
 
 # CAS disk settings: which keys the CAS layer owns {#cas-disk-settings-namespace-design}
 
-**Status:** DRAFT for review, rev.2 (2026-08-25).
+**Status:** DRAFT for review, rev.3 (2026-08-25).
 
-rev.2 answers a review of rev.1: the bare-name guard stops being a gate and becomes a
-diagnostic, so the design's own invariant holds literally; upgrade and mixed-version rollout get
-their own section instead of being an implicit consequence; `skip_access_check` is described as
-two policies rather than one value, and the scope question is decided rather than deferred; and
-the home chosen for the GCS cap is recorded as a compromise with its trade named.
+rev.2 answered a review of rev.1: the bare-name guard stopped being a gate, upgrade and rollout got
+their own section, `skip_access_check` became two policies rather than one value, and the home for
+the GCS cap was recorded as a compromise. rev.3 reverses rev.2's no-migration-window decision on the
+owner's instruction — configurations already live in external CI/CD scripts, so the unprefixed
+spelling is accepted for a bounded period and then removed. The loader therefore has three states,
+set out in [the migration window](#migration-window), and the removal has a named trigger and a named
+task rather than a note.
 
 This specification covers item 4 of `docs/superpowers/cas/final-checks-todo.md`
 (`{#fix-s3-key-whitelist}`) and the BACKLOG record `{#cas-disk-s3-key-whitelist-gap}`. The field
@@ -138,12 +140,24 @@ for (const std::string & key : config_keys)
 {
     if (!key.starts_with(CAS_KEY_PREFIX))
     {
-        /// Diagnostics only -- never a reason to refuse the config; see below.
+        /// A key that is not a CAS setting name is never touched, whatever it is. A key that IS
+        /// one is the pre-rename spelling: collected here, handled by the migration window below.
         if (ContentAddressedSettingsImpl::hasBuiltin(key))
             bare_cas_names.push_back(key);
         continue;
     }
     impl->set(key.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+}
+
+/// MIGRATION WINDOW -- delete this loop and its warning when the window closes; nothing else in
+/// the loader changes, and the unprefixed spelling becomes inert rather than rejected.
+for (const std::string & key : bare_cas_names)
+{
+    if (impl->isChanged(key))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "content_addressed disk: both `{}` and `cas_{}` are set; remove the unprefixed one",
+            key, key);
+    impl->set(key, config.getString(config_prefix + "." + key));
 }
 ```
 
@@ -164,43 +178,52 @@ Consequences worth stating:
   per-TU `extern` declarations all keep their present names. The prefix exists only in the config
   spelling, exactly as `s3_` does for `S3RequestSettings`.
 
-### The migration diagnostic, not a gate {#migration-diagnostic}
+### The migration window {#migration-window}
 
-A bare CAS setting name in the block is almost always an unmigrated config, and saying so is worth
-doing. Refusing the config for it is not. A hard rule over bare names would reserve twenty-five names
-in a namespace CAS does not own, and a future backend that adds `scratch_path` or `gc_enabled` would
-make a CAS disk unusable again — the exact failure this design exists to remove. The invariant has to
-hold literally, so bare names feed diagnostics and never a refusal.
+Configurations using the unprefixed spelling already exist outside this repository — the field report
+came from one — so the unprefixed spelling is **accepted for a bounded period** rather than dropped
+at once. The loader therefore has three states, and only the middle one is temporary:
 
-Two paths carry the diagnostic, and neither costs a reservation:
+| | Unprefixed CAS setting name | Foreign key | Unknown `cas_*` |
+|---|---|---|---|
+| Before this change | consumed | **server dies** (`UNKNOWN_SETTING`) | consumed as if valid |
+| Window open | consumed, one `WARNING` | ignored | `UNKNOWN_SETTING` |
+| Window closed | ignored, one `WARNING` | ignored | `UNKNOWN_SETTING` |
 
-- **An unmigrated config already fails on its own.** `server_root_id` is required, so a config that
-  was not migrated has no `cas_server_root_id` and `validate` throws `NO_ELEMENTS_IN_CONFIG` before
-  the disk exists. That error is where the collected bare names go: instead of "Expected
-  `server_root_id` in config for a content-addressed disk", it names what it found — the block
-  carries `server_root_id`, `gc_enabled`, `blob_hash`, and CAS settings are now spelled with the
-  `cas_` prefix. A message on a path that was already throwing can consult any key it likes without
-  reserving anything.
-- **A partially migrated config** — `cas_server_root_id` present, some keys left bare — starts, and
-  logs one `WARNING` naming each ignored key next to its `cas_` spelling. A warning never refuses a
-  config, so a future backend using one of those names still works; the cost is a spurious log line.
+Closing the window is deleting one loop. The warning survives it, with its text changed from
+"deprecated" to "ignored": a warning refuses nothing, so it costs no reservation and stays useful
+for as long as stale configurations exist.
 
-### The residual risk, stated {#residual-risk}
+Two rules hold in every state:
 
-Partial migration is the one case where a value is silently dropped, and two settings make that
-expensive rather than merely wrong:
+- **A foreign key is never inspected for acceptance.** `header[1]`, `<proxy>`, `s3_retry_attempts`,
+  `account_name` and everything a future backend invents pass through untouched. This is the fix.
+- **Ambiguity is never resolved silently.** A block carrying both `gc_interval_sec` and
+  `cas_gc_interval_sec` is rejected with `BAD_ARGUMENTS` rather than one of them quietly winning.
 
-- `blob_hash` is fixed at pool creation: a dropped `sha256` means a pool built with `cityhash128` and
-  no way to change it afterwards. The mitigation is not silence — the pool records its algorithms at
-  creation, and any later mount that *does* carry `cas_blob_hash` fails closed naming the
+An unmigrated configuration is also caught after the window closes without any bare-name rule:
+`server_root_id` is required, so its absence in the `cas_` spelling makes `validate` throw
+`NO_ELEMENTS_IN_CONFIG` before the disk exists. That message names the bare keys the block carried —
+a diagnostic on a path that was already failing, which may consult any key without reserving it.
+
+### What the window costs {#window-cost}
+
+While the window is open CAS does reserve its twenty-five bare names: a backend that added
+`scratch_path` or `gc_enabled` in that period would have its value swallowed by CAS. That is the
+whole reason the window is bounded — a permanent version of this rule would re-open the failure class
+this design exists to close, one name at a time.
+
+After the window closes, one case remains where a value is dropped silently: a partially migrated
+block, `cas_server_root_id` present with some keys left bare. Two settings make that expensive rather
+than merely wrong:
+
+- `blob_hash` is fixed at pool creation, so a dropped `sha256` means a pool built with `cityhash128`
+  and no way to change it afterwards. The mitigation is not silence — the pool records its algorithms
+  at creation, and any later mount that *does* carry `cas_blob_hash` fails closed naming the
   disagreement.
 - `gc_shards` is creation-time-only; on reopen the pool's persisted GC state is authoritative.
 
-The alternative — keep the hard guard and declare the twenty-five bare names permanently reserved —
-is a legitimate call. It trades an unbounded future restriction on every backend for a bounded
-one-time migration risk in a pre-release product; this design takes the bounded risk. What the
-specification must not do is describe a guard as temporary and then never remove it, which is worse
-than either choice.
+The warning is what covers this case, which is why it outlives the window.
 
 ### What stays loud {#stays-loud}
 
@@ -331,30 +354,28 @@ versions, and the field has exactly one producer and one consumer, both in this 
 
 ## Upgrade and mixed-version rollout {#upgrade}
 
-The rename is a breaking configuration change with no alias, and neither direction of a mixed-version
-pair works:
+The window makes the direction that matters work: **a new binary reads an existing unprefixed
+configuration**, so a CI/CD pipeline that pins configuration files separately from binaries keeps
+running across the upgrade, with a warning telling it what to change.
 
-- **Old binary, new configuration** — the old scanner hands `cas_server_root_id` to
-  `BaseSettings::set` and the server dies with `UNKNOWN_SETTING`.
-- **New binary, old configuration** — there is no `cas_server_root_id`, so `validate` throws
-  `NO_ELEMENTS_IN_CONFIG`, with the message naming the bare keys it found.
+The other direction still does not work, and cannot without patching the older binary: an **old
+binary reading a `cas_`-prefixed configuration** hands `cas_server_root_id` to `BaseSettings::set`
+and dies with `UNKNOWN_SETTING`, because the pre-change loader rejects every key it does not know.
+That fixes the rollout order:
 
-So no single configuration starts on both versions. The rollout is therefore: move the binary and the
-configuration together; do not deploy the configuration change ahead of the binaries; and if a binary
-is rolled back, roll the configuration back with it.
+1. Upgrade binaries. Existing configurations keep working; each CAS disk logs one warning.
+2. Migrate configurations to `cas_*`, at whatever pace the pipelines allow.
+3. Close the window in a later change; a configuration still carrying bare names then starts failing
+   on the required `server_root_id`.
 
-**Why that is acceptable here.** CAS is pre-release and its configuration format carries no stability
-promise; the standing project rule is zero compatibility scaffolding while nothing persisted depends
-on it, and the tree already applies that rule to exactly this situation — `gcs_max_conditional_put_bytes`
-was itself renamed with no alias, and `LegacyTokenProducingPutCapNameRejected` exists to pin that the
-superseded spelling stays rejected. Both failure modes above are startup failures: loud, immediate,
-before any data is touched, and reversible by editing a file.
+Do not reverse steps 1 and 2, and roll a configuration back together with any binary rollback.
 
-**The alternative, recorded.** A release in which the new binary accepts bare names with a warning
-would permit "binaries first, configuration second" and would need no intermediate build. It is
-rejected for consistency with the rule and the precedent above: an accepted-with-warning alias is a
-compatibility shim, and a migration window nobody removes is worse than none. If the pre-release
-posture changes before this ships, this is the first decision to revisit.
+**Closing the window is a task, not a note.** It is one deleted loop in `loadFromConfig`, one deleted
+test, and a warning whose text changes from "deprecated" to "ignored". The trigger is external and
+checkable: the CAS configurations in the `clickhouse-regression` suite are on the `cas_` spelling.
+The plan carries it as an explicit follow-up task with that trigger named, and a BACKLOG entry
+mirrors it, because an item that exists only in a ledger is one context loss away from never
+happening.
 
 ## The full rename table {#rename-table}
 
@@ -451,10 +472,15 @@ The existing suite in `gtest_cas_settings.cpp` inverts in an instructive way.
   `<http_keep_alive_timeout>60</http_keep_alive_timeout>` loads.
 - `RemovedCacheSettingsAreRejected`, `LegacyTokenProducingPutCapNameRejected` and `UnknownKeyRejected`
   keep their meaning under the `cas_` spelling, and are the reason Part 1 is one commit.
-- New: an unmigrated block — bare `server_root_id` plus bare `gc_enabled` — throws
-  `NO_ELEMENTS_IN_CONFIG`, and the message names both keys and the `cas_` spelling.
-- New: a partially migrated block — `cas_server_root_id` plus a bare `gc_enabled` — **loads**, with
-  `gc_enabled` left at its default. This is the test that proves the diagnostic is not a gate.
+- New: an entirely unprefixed block loads while the window is open, and the values land — this is
+  the external-CI/CD case, and it is the test deleted when the window closes.
+- New: a block carrying both `gc_interval_sec` and `cas_gc_interval_sec` is rejected with
+  `BAD_ARGUMENTS`.
+- New: a partially migrated block — `cas_server_root_id` plus a bare `gc_enabled` — loads, and
+  `gc_enabled` takes the bare value while the window is open.
+- The post-window behaviour cannot be pinned by a test until the window closes; the task that closes
+  it replaces the first test above with one asserting `NO_ELEMENTS_IN_CONFIG` on an unprefixed
+  block, with the bare names named in the message.
 - New: `<skip_access_check>` lands on the CAS side while `<cas_skip_access_check>` is rejected.
 - New: a duplicated `cas_gc_enabled` element is rejected.
 - Part 3: `conditionalWriteSettings` sets `s3_force_single_part_upload` on a generation-token backend
