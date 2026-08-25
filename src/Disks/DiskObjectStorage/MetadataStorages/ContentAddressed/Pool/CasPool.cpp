@@ -1713,8 +1713,17 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
     }
     catch (...)
     {
-        /// Pool exhaustion: best-effort diagnostics must never block the caller's own fail-closed throw.
-        tryLogCurrentException(getLogger("CasPool"), "CAS anomaly diagnostics dispatch failed to launch for '" + key + "'");
+        /// Pool exhaustion: every part of best-effort logging may allocate and must never replace the
+        /// caller's own fail-closed exception.
+        try
+        {
+            if (config.diagnostic_dispatch_error_hook_for_test)
+                config.diagnostic_dispatch_error_hook_for_test();
+            tryLogCurrentException(getLogger("CasPool"), "CAS anomaly diagnostics dispatch failed to launch for '" + key + "'");
+        }
+        catch (...) // NOLINT(bugprone-empty-catch)
+        {
+        }
     }
 }
 
