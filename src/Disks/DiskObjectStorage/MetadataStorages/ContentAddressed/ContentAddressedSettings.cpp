@@ -192,7 +192,7 @@ void ContentAddressedSettings::loadFromConfig(
     /// Phase 0 (mount safety): macros expand here exactly as in the s3 `endpoint`
     /// (`ObjectStorageFactory`): on a multi-replica stand every replica mounts ONE shared pool
     /// (same endpoint) and must own a DISTINCT subtree, so the natural single-template config is
-    /// `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed, via the
+    /// `<cas_server_root_id>{replica}</cas_server_root_id>`. An unknown macro throws (fail closed, via the
     /// caller-supplied `expand_macros`). Gated on `.changed`: assigning unconditionally would mark the
     /// field changed even when the key was ABSENT from config, defeating `validate`'s `.changed` check
     /// below (the ABSENT-vs-invalid `NO_ELEMENTS_IN_CONFIG`-vs-`BAD_ARGUMENTS` distinction) -- a missing
