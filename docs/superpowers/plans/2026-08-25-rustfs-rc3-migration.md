@@ -34,8 +34,8 @@ historical measurement records remain immutable.
 - Do not change
   `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md`; its `beta.12`
   image is historical evidence.
-- Do not delete or wire `utils/ca-soak/scripts/orphan_reaper.sh`; update its stale description only.
-- Do not add a tracked direct-overwrite test. Runtime probes created by this plan stay under `tmp/`.
+- Do not change the behavior or wiring of `utils/ca-soak/scripts/orphan_reaper.sh`; remove obsolete
+  release- and issue-specific prose only.
 - Redirect every test command to a unique `build/test_rustfs_rc3_*.log` file and dispatch a subagent
   to return a concise analysis of each log before proceeding.
 - Do not rebase or amend. Add new commits only, and never commit unrelated dirty-worktree files.
@@ -182,45 +182,21 @@ git commit -m "ci: update RustFS test backend to rc3"
 
 **Interfaces:**
 
-- Consumes: the verified overwrite result that `beta.12` and `rc.3` retain one live UUID directory,
-  and the narrower finding that `.trash` cleanup was observed at startup only.
-- Produces: active comments that explain why scanner/heal remain disabled, an explicitly legacy and
-  unwired reaper, and release records marking the beta-pin finding closed.
+- Consumes: the current operational decision to keep scanner and heal disabled in the single-disk
+  ephemeral fixture.
+- Produces: concise current comments with obsolete history removed, plus release records
+  marking the beta-pin finding closed.
 
-- [ ] **Step 1: Capture the stale statements before editing**
+- [ ] **Step 1: Simplify `rustfs.env` without changing runtime variables**
 
-```bash
-rg -n \
-  'open, beta\.7\+|wait for the upstream fix|run_24h\.sh instead|pins a beta third-party image|бета-образ' \
-  utils/ca-soak/configs/rustfs.env \
-  utils/ca-soak/scripts/orphan_reaper.sh \
-  utils/ca-soak/docker-compose.yml \
-  utils/ca-soak/docker-compose-tuned.yml \
-  utils/ca-soak/docker-compose-s3faultproxy.yml \
-  docs/superpowers/cas/final-checks-todo.md \
-  docs/superpowers/cas/opus-review-triage.md \
-  > build/test_rustfs_rc3_stale_comments_before.log 2>&1
-test -s build/test_rustfs_rc3_stale_comments_before.log
-```
-
-Expected: the log identifies the obsolete open-issue, reaper-wiring, and beta-pin claims. Dispatch a
-subagent to summarize the categories, not merely the match count.
-
-- [ ] **Step 2: Rewrite `rustfs.env` without changing runtime variables**
-
-Replace its introductory comment with text carrying these exact facts:
+Delete the historical experiment and upstream-issue paragraphs. Leave only this current operational
+comment:
 
 ```text
 # RustFS environment for the CA soak pool.
-#
-# `rustfs/rustfs:1.0.0-rc.3` includes the unversioned-overwrite fix from rustfs/rustfs#3510:
-# replaced bodies no longer remain as live UUID directories. With scanner and heal disabled,
-# `.trash` cleanup was verified on restart, but periodic cleanup in a long-lived process was not.
-#
 # Scanner remains OFF because scanner/auto-heal namespace locks produced multi-minute
 # `503 ServiceUnavailable` bursts in this single-disk ephemeral fixture. Heal remains OFF because
-# the fixture has no redundant disk to repair. The earlier scanner experiment did not reclaim the
-# old pre-fix leaked layout and does not justify re-enabling either component.
+# the fixture has no redundant disk to repair.
 ```
 
 Leave these assignments byte-for-byte unchanged:
@@ -232,26 +208,14 @@ RUSTFS_ACCESS_KEY=clickhouse
 RUSTFS_SECRET_KEY=clickhouse
 ```
 
-- [ ] **Step 3: Mark the reaper as legacy and correct active Compose comments**
+- [ ] **Step 2: Delete obsolete reaper prose without changing behavior**
 
-Change only comments; preserve the reaper implementation. Its header must state:
+Change comments only. In `orphan_reaper.sh`, delete the introductory lines that name the affected
+release or upstream issue; retain the safety contract, usage, and implementation unchanged. In the
+three Compose files, delete the complete orphan-reaper comment blocks. Do not replace deleted text
+with new historical commentary.
 
-```text
-# Legacy CA soak orphan reaper for RustFS releases affected by rustfs/rustfs#3231.
-#
-# The current `1.0.0-rc.3` pin no longer retains overwritten bodies as live UUID directories. This
-# script remains unwired while long-lived periodic `.trash` cleanup is unaudited; it is not part of
-# normal `rc.3` operation.
-```
-
-In the three Compose files, replace the false `run_24h.sh` wiring claim with:
-
-```text
-# The legacy orphan reaper is intentionally not wired into the `rc.3` stack. Startup `.trash`
-# cleanup is verified; periodic cleanup in a long-lived scanner-disabled process is not.
-```
-
-- [ ] **Step 4: Close the beta-pin release-hygiene finding**
+- [ ] **Step 3: Close the beta-pin release-hygiene finding**
 
 In `final-checks-todo.md`, replace the live beta warning with a resolved statement saying that the
 stateless binary, integration Compose service, and all nine soak Compose files use
@@ -264,28 +228,16 @@ In `opus-review-triage.md`:
 - change the release-hygiene summary from an outstanding beta-image concern to a completed
   `1.0.0-rc.3` update;
 - replace the detailed `m31` paragraph with the eleven-pin inventory, the corrected count of nine
-  soak files, and the decision not to introduce a RustFS-only digest or version manifest.
+  soak files, and the current `1.0.0-rc.3` state.
 
-Keep any old tag in that paragraph only when explicitly describing what the finding originally
-reported. Do not touch the historical performance report.
+Do not retain the old tag or the original finding narrative in the replacement paragraph; Git
+history records both. Do not touch the historical performance report.
 
-- [ ] **Step 5: Verify comment accuracy and documentation formatting**
+- [ ] **Step 4: Verify comment accuracy and documentation formatting**
 
 ```bash
 {
-  if rg -n \
-      'open, beta\.7\+|wait for the upstream fix|run_24h\.sh instead|pins a beta third-party image' \
-      utils/ca-soak/configs/rustfs.env \
-      utils/ca-soak/scripts/orphan_reaper.sh \
-      utils/ca-soak/docker-compose.yml \
-      utils/ca-soak/docker-compose-tuned.yml \
-      utils/ca-soak/docker-compose-s3faultproxy.yml \
-      docs/superpowers/cas/final-checks-todo.md
-  then
-    echo 'stale live RustFS statement remains'
-    exit 1
-  fi
-  rg -n '1\.0\.0-rc\.3|startup|periodic|scanner|heal' \
+  rg -n '1\.0\.0-rc\.3|scanner|heal' \
     utils/ca-soak/configs/rustfs.env \
     utils/ca-soak/scripts/orphan_reaper.sh \
     docs/superpowers/cas/final-checks-todo.md \
@@ -301,10 +253,10 @@ reported. Do not touch the historical performance report.
 } > build/test_rustfs_rc3_live_docs.log 2>&1
 ```
 
-Expected: exit code 0, no stale live claim, and no whitespace error. Dispatch a subagent to verify
-that the output distinguishes startup cleanup from unverified periodic cleanup.
+Expected: exit code 0 and no whitespace error. Dispatch a subagent to inspect the complete diff and
+verify that active configuration comments contain only the current scanner/heal rationale.
 
-- [ ] **Step 6: Commit the comments and release records**
+- [ ] **Step 5: Commit the comments and release records**
 
 ```bash
 git add \
@@ -319,21 +271,18 @@ git diff --cached --check
 git commit -m "docs: close the RustFS beta pin finding"
 ```
 
-### Task 3: Validate the native binary and overwrite behavior {#task-3-validate-the-native-binary-and-overwrite-behavior}
+### Task 3: Validate the native binary {#task-3-validate-the-native-binary}
 
 **Files:**
 
 - Create temporarily: `tmp/rustfs-rc3-native-smoke.sh`
-- Create temporarily: `tmp/rustfs-rc3-overwrite-smoke.sh`
 - Test log: `build/test_rustfs_rc3_native_binary.log`
-- Test log: `build/test_rustfs_rc3_overwrite.log`
 
 **Interfaces:**
 
-- Consumes: the same musl release asset URL shape used by `download_rustfs`, the Docker tag changed
-  in Task 1, and local `curl`, `unzip`, Docker, AWS CLI, and `cmp` executables.
-- Produces: evidence that the host-architecture binary starts with scanner/heal disabled and that
-  the Docker image preserves the latest unversioned overwrite with one live UUID directory.
+- Consumes: the same musl release asset URL shape used by `download_rustfs` and local `curl` and
+  `unzip` executables.
+- Produces: evidence that the host-architecture binary starts with scanner and heal disabled.
 
 - [ ] **Step 1: Create the native-binary smoke script under `tmp`**
 
@@ -402,88 +351,6 @@ bash tmp/rustfs-rc3-native-smoke.sh \
 
 Expected: exit code 0 and one `READY version=1.0.0-rc.3` line. Dispatch a subagent to inspect the
 entire log for download, startup, or scanner/heal errors.
-
-- [ ] **Step 3: Create the direct-overwrite smoke script under `tmp`**
-
-Use `apply_patch` to create this untracked script:
-
-```bash
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-readonly VERSION='1.0.0-rc.3'
-readonly PORT='19132'
-readonly CONTAINER="rustfs-rc3-overwrite-$$"
-readonly BUCKET='overwrite-repro'
-readonly KEY='large-object.bin'
-mkdir -p tmp
-readonly WORK_DIR="$(mktemp -d tmp/rustfs-rc3-overwrite.XXXXXX)"
-readonly DATA_DIR="${WORK_DIR}/data"
-readonly PAYLOAD="${WORK_DIR}/payload.bin"
-readonly DOWNLOADED="${WORK_DIR}/downloaded.bin"
-mkdir "${DATA_DIR}"
-chmod 0777 "${DATA_DIR}"
-truncate -s $((512 * 1024)) "${PAYLOAD}"
-
-cleanup()
-{
-    docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT INT TERM
-
-docker run --detach \
-    --name "${CONTAINER}" \
-    --publish "127.0.0.1:${PORT}:11121" \
-    --env RUSTFS_ACCESS_KEY=clickhouse \
-    --env RUSTFS_SECRET_KEY=clickhouse \
-    --env RUSTFS_SCANNER_ENABLED=false \
-    --env RUSTFS_HEAL_ENABLED=false \
-    --volume "${DATA_DIR}:/data" \
-    "rustfs/rustfs:${VERSION}" \
-    server --address 0.0.0.0:11121 /data >/dev/null
-
-for attempt in $(seq 1 120)
-do
-    status="$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:${PORT}/" || true)"
-    [[ "${status}" == '200' || "${status}" == '403' ]] && break
-    sleep 0.25
-done
-[[ "${status}" == '200' || "${status}" == '403' ]]
-
-s3()
-{
-    AWS_ACCESS_KEY_ID=clickhouse \
-    AWS_SECRET_ACCESS_KEY=clickhouse \
-    AWS_DEFAULT_REGION=us-east-1 \
-        aws --no-cli-pager --endpoint-url "http://127.0.0.1:${PORT}" "$@"
-}
-
-s3 s3api create-bucket --bucket "${BUCKET}" >/dev/null
-for iteration in $(seq 1 200)
-do
-    printf 'iteration=%06d\n' "${iteration}" \
-        | dd of="${PAYLOAD}" bs=1 seek=0 conv=notrunc status=none
-    s3 s3api put-object --bucket "${BUCKET}" --key "${KEY}" --body "${PAYLOAD}" >/dev/null
-done
-s3 s3api get-object --bucket "${BUCKET}" --key "${KEY}" "${DOWNLOADED}" >/dev/null
-cmp "${PAYLOAD}" "${DOWNLOADED}"
-docker stop --time 10 "${CONTAINER}" >/dev/null
-
-live_dirs="$(find "${DATA_DIR}/${BUCKET}/${KEY}" -mindepth 1 -maxdepth 1 -type d | wc -l)"
-test "${live_dirs}" -eq 1
-echo "OVERWRITE_OK version=${VERSION} writes=200 live_uuid_directories=${live_dirs} payload=match"
-```
-
-- [ ] **Step 4: Run and analyze the overwrite smoke**
-
-```bash
-bash tmp/rustfs-rc3-overwrite-smoke.sh \
-  > build/test_rustfs_rc3_overwrite.log 2>&1
-```
-
-Expected: exit code 0 and
-`OVERWRITE_OK version=1.0.0-rc.3 writes=200 live_uuid_directories=1 payload=match`. Dispatch a
-subagent to inspect the complete log and confirm that no repro container remains afterward.
 
 ### Task 4: Validate ClickHouse integration and soak consumers {#task-4-validate-clickhouse-integration-and-soak-consumers}
 
@@ -574,18 +441,22 @@ pre-existing `ca-soak` project remained untouched.
     ci/jobs/scripts/clickhouse_proc.py \
     tests/integration/compose/docker_compose_rustfs.yml \
     utils/ca-soak/docker-compose*.yml \
-    docs/superpowers/cas \
+    docs/superpowers/cas/final-checks-todo.md \
+    docs/superpowers/cas/opus-review-triage.md \
     || true
+  rg -n '1\.0\.0-beta\.12' \
+    docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md
   docker ps --format '{{.Names}} {{.Image}} {{.Status}}' \
-    | rg 'rustfs-rc3-(overwrite|soak-smoke)' \
+    | rg 'rustfs-rc3-soak-smoke' \
     && exit 1 \
     || true
 } > build/test_rustfs_rc3_final_verification.log 2>&1
 ```
 
-Expected: eleven active `rc.3` pins, no active `beta.12` pin, only explicitly historical
-`beta.12` prose under `docs/superpowers/cas`, no whitespace error, and no temporary repro container.
-Dispatch a subagent to distinguish allowed historical references from accidental operational pins.
+Expected: eleven active `rc.3` pins, no `beta.12` reference in active configuration or live
+release-hygiene records, the unchanged historical performance-report reference, no whitespace
+error, and no temporary smoke container. Dispatch a subagent to distinguish the allowed historical
+reference from accidental operational pins.
 
 - [ ] **Step 5: Report the completed migration**
 
@@ -594,7 +465,7 @@ Report:
 - the two implementation commit hashes;
 - the eleven updated active pins;
 - the unchanged scanner/heal policy;
-- the native binary, overwrite, integration, and isolated soak results with their build-log paths;
+- the native binary, integration, and isolated soak results with their build-log paths;
 - the intentional historical `beta.12` reference retained in the performance report;
-- the fact that no digest, shared version source, guard-test, tracked overwrite test, or reaper
-  behavior change was introduced.
+- the fact that no digest, shared version source, guard-test, or reaper behavior change was
+  introduced.
