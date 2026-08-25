@@ -104,7 +104,7 @@ Tier 3 = конфигурация и упаковка (T8-T12).
 | m28 | дубликат T8 | P3 | нет | не отслеживается (T8 прямо это фиксирует) | `cas_blob_upload_pool_size = 0` действительно валит старт любого сервера, но это документированный fail-loud; уже адъюдицировано как T8. |
 | m29 | частично | P3 | нет | не отслеживается | Проверки «`enum_count` укладывается в окно» по-прежнему нет, но и код, и число устарели: специализация теперь пришла из `antalya-26.6` (чужой коммит), а окно расширено до 512, не 255. |
 | m30 | дубликат fable m1 | P3 | нет | — (fable m1, `docs/superpowers/cas/fable-review-triage.md:44,522`; смежная секция `BACKLOG/o… | Доменные находки CAS-команд `clickhouse-disks` по-прежнему летят кодом `BAD_ARGUMENTS`, из-за чего перед диагностикой печатается справка по опциям; уже адъюдицировано как fable m1. |
-| m31 | подтверждено | P2 | да | не отслеживается | CI действительно закреплён на бета-образе `rustfs/rustfs:1.0.0-beta.12`, и пин шире заявленного — он же в стейтлес-лейне и во всех compose-файлах soak. |
+| m31 | закрыто миграцией rc.3 | P2 | нет | миграция rc.3 | Все 11 пинов RustFS обновлены до `1.0.0-rc.3`: stateless-бинарь, integration Compose и девять CA soak Compose-файлов. |
 
 ## Needs verification NV-1…NV-14 {#needs-verification}
 
@@ -173,9 +173,9 @@ B3, B4 и NV-9 — это одна цепочка, а не три пункта: 
   `noexcept`-хелперов. То есть `bad_alloc` на пути отката под давлением памяти = `std::terminate`.
 - **T11** — «все одиночные `dynamic_cast` покрыты» больше не верно: `SYSTEM SYNC REPLICA` на ленивом
   materialized view молча не доходит до самого MV.
-- **Релизная гигиена**: записи в CHANGELOG для CAS нет вообще, а бета-образ `rustfs:1.0.0-beta.12`
-  пиньтся не только в интеграционной полосе, но и в stateless-полосе и во всех восьми compose
-  ca-soak — гейты сертифицируют против беты.
+- **Релизная гигиена**: все 11 пинов RustFS обновлены до `1.0.0-rc.3`: stateless-бинарь,
+  integration Compose и девять CA soak Compose-файлов. Литеральные теги сохранены сознательно,
+  согласно существующей практике сторонних образов.
 
 ### Где обзор ошибся {#review-errors}
 
@@ -1669,9 +1669,9 @@ upstream-PR (`{#disks-exit-code-upstream}`) везти фикс усечения
 
 `programs/disks/CommandFsck.cpp` использует `BAD_ARGUMENTS` и для CLI-ошибок (`:45`, `:49`, `:53`), и для четырёх integrity-находок (`:147`, `:154`, `:165`, `:176`), а `DisksApp.cpp:239-250` на `code == ErrorCodes::BAD_ARGUMENTS` печатает `command->options_description` (или полный список команд) до текста ошибки. То есть exit-code-контракт не различает «кривой флаг» и «пул повреждён» — ровно вывод fable m1 (`fable-review-triage.md:522`), где фикс назван тривиальным: `CORRUPTED_DATA` на четырёх сайтах. Затрагивает все пять новых команд (`CommandFsck.cpp`, `CommandCaGcRebuild.cpp`, `CommandCaGcDryRun.cpp`, `CommandCaInspect.cpp`, `CommandCaDropMember.cpp`), поведение сервера не меняет.
 
-### m31 (подтверждено, P2) {#m31}
+### m31 (закрыто миграцией rc.3, P2) {#m31}
 
-`tests/integration/compose/docker_compose_rustfs.yml:6` — `image: rustfs/rustfs:1.0.0-beta.12`; та же версия зашита константой в стейтлес-обвязке (`ci/jobs/scripts/clickhouse_proc.py:168` `RUSTFS_VERSION = "1.0.0-beta.12"`, скачивается релизный zip с GitHub на `:177-178`) и повторена ещё в восьми `utils/ca-soak/docker-compose*.yml`. Пин по тегу без digest: бета-тег upstream'а может быть перезалит или удалён, и тогда лейн либо тихо меняет бэкенд под собой, либо перестаёт подниматься — это риск воспроизводимости CI, а не корректности продукта (RustFS используется только как S3-совместимый бэкенд тестов, в поставку не входит). Минимальная мера до релиза — единая точка версии плюс пин по `sha256`-digest (digest образа уже зафиксирован в отчёте измерений: `sha256:612a6707053c27c41816e79e5d5d30b5ba8479fb9b500ae4908cd4a723e888fa`, `docs/superpowers/cas/2026-08-22-unconditional-blob-publication-performance.md:40`).
+Все 11 пинов RustFS используют `1.0.0-rc.3`: `ci/jobs/scripts/clickhouse_proc.py` (stateless-бинарь), `tests/integration/compose/docker_compose_rustfs.yml` (integration Compose) и девять CA soak Compose-файлов — `utils/ca-soak/docker-compose.yml`, `utils/ca-soak/docker-compose-10replicas.yml`, `utils/ca-soak/docker-compose-gc_shards2.yml`, `utils/ca-soak/docker-compose-gc_shards8.yml`, `utils/ca-soak/docker-compose-multidisk.yml`, `utils/ca-soak/docker-compose-s3faultproxy.yml`, `utils/ca-soak/docker-compose-s38.yml`, `utils/ca-soak/docker-compose-s41.yml` и `utils/ca-soak/docker-compose-tuned.yml`. Литеральные теги сохранены сознательно, согласно существующей практике сторонних образов.
 
 ## Needs verification — детали {#nv-details}
 

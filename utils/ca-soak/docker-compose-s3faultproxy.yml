@@ -29,7 +29,7 @@ services:
     ports:
       - "8474:8474"
   rustfs1:
-    image: rustfs/rustfs:1.0.0-beta.12
+    image: rustfs/rustfs:1.0.0-rc.3
     command: server --address 0.0.0.0:11121
     env_file: configs/rustfs.env
     expose:
@@ -38,11 +38,6 @@ services:
       nofile:
         soft: 262144
         hard: 262144
-    # NOTE (#3): the orphan-reaper is NOT wired as a sidecar here — a shared named volume on rustfs1
-    # destabilized startup (B161). The reaper runs as a host-side `docker exec` loop launched by
-    # run_24h.sh instead (orphan_reaper.sh is committed + filesystem-tested). rustfs keeps its proven
-    # ephemeral storage.
-
   # One-shot: wait for RustFS, then create the `test` bucket the CA pool path lives under.
   createbucket:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
