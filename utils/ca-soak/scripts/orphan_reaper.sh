@@ -1,10 +1,4 @@
 #!/usr/bin/env sh
-# CA soak orphan reaper (test-harness ONLY) — mitigates the RustFS beta overwrite-leak.
-#
-# RustFS 1.0.0-beta.8 does NOT reclaim the previous data dir on an un-versioned overwrite, so each
-# casPut of a roots/<t>/<ns>/<shard> manifest leaks the old <uuid>/ data dir. This reaper reclaims
-# those CONFIRMED-dead orphans, SCOPED TO roots/ (immutable blobs/trees are never touched).
-#
 # Safety (spec 2026-06-15-ca-rustfs-overwrite-leak-mitigation-design.md):
 #   * scoped to roots/ — cannot delete a blob/tree object
 #   * keep xl.meta (never removed) + the single NEWEST <uuid>/ dir (the current incarnation)

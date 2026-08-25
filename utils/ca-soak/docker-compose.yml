@@ -19,11 +19,6 @@ services:
       nofile:
         soft: 262144
         hard: 262144
-    # NOTE (#3): the orphan-reaper is NOT wired as a sidecar here — a shared named volume on rustfs1
-    # destabilized startup (B161). The reaper runs as a host-side `docker exec` loop launched by
-    # run_24h.sh instead (orphan_reaper.sh is committed + filesystem-tested). rustfs keeps its proven
-    # ephemeral storage.
-
   # One-shot: wait for RustFS, then create the `test` bucket the CA pool path lives under.
   createbucket:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
