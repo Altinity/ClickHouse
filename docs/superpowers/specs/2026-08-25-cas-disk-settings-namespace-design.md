@@ -9,7 +9,13 @@ doc_type: 'design'
 
 # CAS disk settings: which keys the CAS layer owns {#cas-disk-settings-namespace-design}
 
-**Status:** DRAFT for review, rev.1 (2026-08-25).
+**Status:** DRAFT for review, rev.2 (2026-08-25).
+
+rev.2 answers a review of rev.1: the bare-name guard stops being a gate and becomes a
+diagnostic, so the design's own invariant holds literally; upgrade and mixed-version rollout get
+their own section instead of being an implicit consequence; `skip_access_check` is described as
+two policies rather than one value, and the scope question is decided rather than deferred; and
+the home chosen for the GCS cap is recorded as a compromise with its trade named.
 
 This specification covers item 4 of `docs/superpowers/cas/final-checks-todo.md`
 (`{#fix-s3-key-whitelist}`) and the BACKLOG record `{#cas-disk-s3-key-whitelist-gap}`. The field
@@ -80,12 +86,37 @@ There is direct evidence in the current skip-list that this is already going wro
 need the `s3_` prefix there); it is the correct spelling for Azure, and it entered the list from an
 Azure-shaped config.
 
+## How this sits with other disk types {#conventions}
+
+There is no single convention to conform to here, and it is worth saying so rather than leaning on
+the `s3_` precedent alone.
+
+A plain disk type does use bare keys, because `type` already supplies the context: `cache` takes
+`path`, `max_size`, `cache_policy`; `encrypted` takes `disk`, `key`, `algorithm`; S3 auth takes
+`endpoint`, `access_key_id`, `connect_timeout_ms`; Azure takes `account_name`, `container_name`.
+
+`object_storage` is not a plain disk type. Its block is read by several independent components at
+once, and the tree already disambiguates them in more than one way: S3 request settings under the
+`s3_` prefix, metadata-layer keys bare (`metadata_path`, `object_metadata_cache_size`), complex
+components as subtrees (`proxy`, `locations`), and some historical auth keys bare. So `cas_*` is
+mildly unusual measured against the *disk-type* habit and entirely ordinary measured against the
+*composite-block* habit — and the composite block is what a CAS disk is.
+
+The closest precedent to the code being replaced is `FileCacheSettings`, which scans its block and
+skips a `non_cache_keys` set of six names (`type`, `disk`, `name`, `data_background_cleanup`,
+`thread_pool_size`, `skip_access_check`). It works there because `cache` is a top-level disk type
+whose foreign key space is small and closed. CAS sits on top of an arbitrary backend, so the same
+pattern inherits an unbounded foreign key space. The pattern did not fail because it was badly
+written; it failed because it was transplanted somewhere its precondition does not hold.
+
 ## Part 1 — CAS owns the `cas_` namespace {#part-1-prefix}
 
 Two properties are wanted, and only one arrangement delivers both:
 
 1. **Any underlying setting must work**, for every backend, now and for backends added later. This
-   requires that CAS never inspect a key it does not own.
+   requires that CAS never *refuse* a configuration over a key it does not own, and never consume
+   one. Reading a foreign key name to phrase a better error, on a path that is already failing, does
+   not violate this; reserving that name does.
 2. **A mis-spelled CAS setting must fail closed.** You can only fail closed over a namespace you
    own; CAS does not own the disk block.
 
@@ -101,15 +132,15 @@ namespace:
 ```cpp
 static constexpr std::string_view CAS_KEY_PREFIX = "cas_";
 
+std::vector<std::string> bare_cas_names;
+
 for (const std::string & key : config_keys)
 {
     if (!key.starts_with(CAS_KEY_PREFIX))
     {
-        /// A bare CAS setting name in the shared disk block is a mis-spelling of the prefixed
-        /// form, never a foreign key: reject it instead of ignoring it.
+        /// Diagnostics only -- never a reason to refuse the config; see below.
         if (ContentAddressedSettingsImpl::hasBuiltin(key))
-            throw Exception(ErrorCodes::UNKNOWN_SETTING,
-                "content_addressed disk: `{}` must be spelled `cas_{}`", key, key);
+            bare_cas_names.push_back(key);
         continue;
     }
     impl->set(key.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
@@ -133,52 +164,80 @@ Consequences worth stating:
   per-TU `extern` declarations all keep their present names. The prefix exists only in the config
   spelling, exactly as `s3_` does for `S3RequestSettings`.
 
-### The bare-name guard {#bare-name-guard}
+### The migration diagnostic, not a gate {#migration-diagnostic}
 
-Without the guard, an operator who writes the pre-rename `<gc_enabled>false</gc_enabled>` gets a
-*silently ignored* key and a GC that keeps running. The guard converts that into a startup error
-naming the correct spelling.
+A bare CAS setting name in the block is almost always an unmigrated config, and saying so is worth
+doing. Refusing the config for it is not. A hard rule over bare names would reserve twenty-five names
+in a namespace CAS does not own, and a future backend that adds `scratch_path` or `gc_enabled` would
+make a CAS disk unusable again — the exact failure this design exists to remove. The invariant has to
+hold literally, so bare names feed diagnostics and never a refusal.
 
-The guard is a permanent rule, not migration scaffolding: a bare CAS setting name inside a CAS disk
-block is never a legitimate foreign key. The CAS names are distinctive enough
-(`gc_round_redelete_budget`, `manifest_sweep_list_budget_keys`) that a future backend colliding with
-one is not a practical risk — and the two plausibly generic names, `skip_access_check` and
-`gcs_max_conditional_put_bytes`, both leave the CAS settings list in Parts 2 and 3, so the guard has
-no exceptions to carve out.
+Two paths carry the diagnostic, and neither costs a reservation:
 
-### What the guard buys {#guard-value}
+- **An unmigrated config already fails on its own.** `server_root_id` is required, so a config that
+  was not migrated has no `cas_server_root_id` and `validate` throws `NO_ELEMENTS_IN_CONFIG` before
+  the disk exists. That error is where the collected bare names go: instead of "Expected
+  `server_root_id` in config for a content-addressed disk", it names what it found — the block
+  carries `server_root_id`, `gc_enabled`, `blob_hash`, and CAS settings are now spelled with the
+  `cas_` prefix. A message on a path that was already throwing can consult any key it likes without
+  reserving anything.
+- **A partially migrated config** — `cas_server_root_id` present, some keys left bare — starts, and
+  logs one `WARNING` naming each ignored key next to its `cas_` spelling. A warning never refuses a
+  config, so a future backend using one of those names still works; the cost is a spurious log line.
 
-CAS carries settings whose silent loss is permanent rather than merely wrong:
+### The residual risk, stated {#residual-risk}
 
-- `blob_hash` is fixed at pool creation. A silently ignored value means a pool built with
-  `cityhash128` when `sha256` was intended, and no way to change it afterwards.
+Partial migration is the one case where a value is silently dropped, and two settings make that
+expensive rather than merely wrong:
+
+- `blob_hash` is fixed at pool creation: a dropped `sha256` means a pool built with `cityhash128` and
+  no way to change it afterwards. The mitigation is not silence — the pool records its algorithms at
+  creation, and any later mount that *does* carry `cas_blob_hash` fails closed naming the
+  disagreement.
 - `gc_shards` is creation-time-only; on reopen the pool's persisted GC state is authoritative.
-- `server_root_id` is required, so a mis-spelling of *that* key already self-detects.
 
-Three existing regression tests pin the loud-rejection posture — `RemovedCacheSettingsAreRejected`,
-`LegacyTokenProducingPutCapNameRejected`, `UnknownKeyRejected` in `gtest_cas_settings.cpp`. This is
-also why the change ships as one commit rather than "stop scanning now, add the prefix later": the
-intermediate state would require deleting those three tests and restoring them afterwards.
+The alternative — keep the hard guard and declare the twenty-five bare names permanently reserved —
+is a legitimate call. It trades an unbounded future restriction on every backend for a bounded
+one-time migration risk in a pre-release product; this design takes the bounded risk. What the
+specification must not do is describe a guard as temporary and then never remove it, which is worse
+than either choice.
+
+### What stays loud {#stays-loud}
+
+Typo detection inside the namespace is unaffected: `cas_gc_shardz` is unknown, and
+`BaseSettings::set` throws `UNKNOWN_SETTING` with hints exactly as today. Three existing regression
+tests pin that posture — `RemovedCacheSettingsAreRejected`, `LegacyTokenProducingPutCapNameRejected`
+and `UnknownKeyRejected` in `gtest_cas_settings.cpp` — and they are also why Part 1 ships as one
+commit rather than "stop scanning now, add the prefix later": the intermediate state would require
+deleting those three tests and restoring them afterwards.
 
 ## Part 2 — `skip_access_check` leaves the settings list {#part-2-skip-access-check}
 
-`skip_access_check` is deliberately shared: `registerDiskObjectStorage` reads it from the same disk
-block and ORs it with the server-level `global_skip_access_check`, and CAS reads it to decide whether
-to run its boot-time capability probe. One key, two consumers, one meaning.
+`skip_access_check` keeps its bare spelling, because prefixing it would split one config key into two
+keys with two meanings: `registerDiskObjectStorage` reads the bare key from the same block for the
+generic access check, and CAS reads it to decide whether to run its boot-time capability probe.
 
-Renaming it to `cas_skip_access_check` would split that into two keys with two meanings, so it keeps
-its bare spelling. To keep the "every CAS config key starts with `cas_`" rule free of exceptions, it
-stops being a `ContentAddressedSettings` entry: it is removed from
-`LIST_OF_CONTENT_ADDRESSED_SETTINGS` and becomes a plain member of `ContentAddressedSettingsImpl`
-alongside `blob_hash_algo_cached`, populated in `loadFromConfig` by reading the unprefixed key
-directly, and exposed through an accessor in the same shape as `blobHashAlgo`.
+**One key, two policies — not one value.** The generic layer computes
+`global_skip_access_check || <the disk key>` and hands the result to `IDisk::startup`, which runs
+`startupImpl` — and therefore `metadata_storage->startup`, and therefore the CAS probe — *before*
+`checkAccess`. CAS reads only the disk-local key. So the server-level override reaches the generic
+access check and never reaches the CAS probe, and the probe runs first.
 
-`ContentAddressedMetadataStorage` keeps its `skip_access_check` member and its use in `PoolConfig`;
-only the source of the value changes. The `extern const ContentAddressedSettingsBool
-skip_access_check;` declaration in that TU goes away with the settings entry.
+**Decision: keep the scopes distinct.** Propagating the server-global flag into CAS would not merely
+widen a skip. `ObjectStorageBackend::checkSkipAccessCheckSupport` throws `NOT_IMPLEMENTED` for
+`skip_access_check=true` on a writable generation-token mount, because the capability battery is what
+proves a token-exact DELETE honours the generation precondition. A server started with the global
+flag would therefore refuse **every** writable CAS-on-GCS mount. The user documentation states the
+split in one sentence: the server-level flag skips the generic disk access check; the CAS capability
+probe is governed by the disk's own key.
 
-After this change `cas_skip_access_check` is rejected as an unknown CAS setting, which is correct:
-it is not one.
+Mechanically, the setting is removed from `LIST_OF_CONTENT_ADDRESSED_SETTINGS` and becomes a plain
+member of `ContentAddressedSettingsImpl` alongside `blob_hash_algo_cached`, populated in
+`loadFromConfig` from the unprefixed key and exposed through an accessor shaped like `blobHashAlgo`.
+`ContentAddressedMetadataStorage` keeps its member and its use in `PoolConfig`; only the source of
+the value changes, and the `extern const ContentAddressedSettingsBool skip_access_check;`
+declaration in that TU goes away with the settings entry. After this, `cas_skip_access_check` is
+rejected as an unknown CAS setting — correct, because it is not one.
 
 ## Part 3 — the GCS conditional-PUT cap leaves CAS {#part-3-gcs-cap}
 
@@ -216,6 +275,24 @@ The struct's name is a poor fit for the knob, but it is a poor fit for what it a
 and auth settings are read from a disk block **unprefixed**, so this placement costs zero config,
 test and documentation edits for this key.
 
+### The trade this makes {#gcs-cap-tradeoff}
+
+This placement is a considered compromise, not a convention. By nature the setting is an
+upload-sizing knob: it directly overrides `max_single_part_upload_size` and `min_upload_part_size`,
+both of which live in `S3RequestSettings`'s `PART_UPLOAD_SETTINGS`. Putting it in `S3AuthSettings`
+adds to a class whose name already fits its contents poorly.
+
+What buys the compromise is the spelling. Client and auth settings are read from a disk block
+unprefixed, so the key keeps the name it already carries in deployed configurations and in published
+documentation, whereas the request-settings home would force `s3_gcs_max_conditional_put_bytes`. A
+change whose entire purpose is to stop breaking existing object-storage configuration should not
+introduce a second, unrelated rename of an object-storage key. If the semantic debt is later paid off
+by splitting a real client-settings struct out of `S3AuthSettings`, this setting moves with its
+neighbours and the config spelling is unaffected either way.
+
+Part 3 is a separate commit inside the same pull request: it changes a serialized shared S3 surface
+and is not part of removing `non_cas_keys`.
+
 ### Code changes {#gcs-cap-changes}
 
 - `S3AuthSettings.cpp`: one `DECLARE(UInt64, gcs_max_conditional_put_bytes, …)` in `CLIENT_SETTINGS`.
@@ -251,6 +328,33 @@ pre-release CAS setting, where there are no compatibility obligations at all.
 
 Deleting a `WriteSettings` field is the safer direction: the struct is not serialized across
 versions, and the field has exactly one producer and one consumer, both in this change.
+
+## Upgrade and mixed-version rollout {#upgrade}
+
+The rename is a breaking configuration change with no alias, and neither direction of a mixed-version
+pair works:
+
+- **Old binary, new configuration** — the old scanner hands `cas_server_root_id` to
+  `BaseSettings::set` and the server dies with `UNKNOWN_SETTING`.
+- **New binary, old configuration** — there is no `cas_server_root_id`, so `validate` throws
+  `NO_ELEMENTS_IN_CONFIG`, with the message naming the bare keys it found.
+
+So no single configuration starts on both versions. The rollout is therefore: move the binary and the
+configuration together; do not deploy the configuration change ahead of the binaries; and if a binary
+is rolled back, roll the configuration back with it.
+
+**Why that is acceptable here.** CAS is pre-release and its configuration format carries no stability
+promise; the standing project rule is zero compatibility scaffolding while nothing persisted depends
+on it, and the tree already applies that rule to exactly this situation — `gcs_max_conditional_put_bytes`
+was itself renamed with no alias, and `LegacyTokenProducingPutCapNameRejected` exists to pin that the
+superseded spelling stays rejected. Both failure modes above are startup failures: loud, immediate,
+before any data is touched, and reversible by editing a file.
+
+**The alternative, recorded.** A release in which the new binary accepts bare names with a warning
+would permit "binaries first, configuration second" and would need no intermediate build. It is
+rejected for consistency with the rule and the precedent above: an accepted-with-warning alias is a
+compatibility shim, and a migration window nobody removes is worse than none. If the pre-release
+posture changes before this ships, this is the first decision to revisit.
 
 ## The full rename table {#rename-table}
 
@@ -347,8 +451,10 @@ The existing suite in `gtest_cas_settings.cpp` inverts in an instructive way.
   `<http_keep_alive_timeout>60</http_keep_alive_timeout>` loads.
 - `RemovedCacheSettingsAreRejected`, `LegacyTokenProducingPutCapNameRejected` and `UnknownKeyRejected`
   keep their meaning under the `cas_` spelling, and are the reason Part 1 is one commit.
-- New: the bare-name guard rejects `<gc_enabled>` with `UNKNOWN_SETTING` and a message naming
-  `cas_gc_enabled`.
+- New: an unmigrated block — bare `server_root_id` plus bare `gc_enabled` — throws
+  `NO_ELEMENTS_IN_CONFIG`, and the message names both keys and the `cas_` spelling.
+- New: a partially migrated block — `cas_server_root_id` plus a bare `gc_enabled` — **loads**, with
+  `gc_enabled` left at its default. This is the test that proves the diagnostic is not a gate.
 - New: `<skip_access_check>` lands on the CAS side while `<cas_skip_access_check>` is rejected.
 - New: a duplicated `cas_gc_enabled` element is rejected.
 - Part 3: `conditionalWriteSettings` sets `s3_force_single_part_upload` on a generation-token backend
@@ -384,5 +490,6 @@ the filter escapes the gate.
 - The unknown-key gate is evaluated only at disk creation, so a typo introduced by a config edit plus
   a reload is not diagnosed until the next restart. Unchanged by this design; tracked in
   `BACKLOG/operability-and-introspection.md`.
-- CAS does not honour the server-level `global_skip_access_check` that the generic disk layer ORs in.
-  Pre-existing, and a behaviour question rather than a config-parsing one.
+- Splitting a real client-settings struct out of `S3AuthSettings`, which would give the GCS cap a
+  home that matches its name. Recorded in [the trade this makes](#gcs-cap-tradeoff); it does not
+  change how any key is spelled in a configuration.
