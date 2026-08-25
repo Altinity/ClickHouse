@@ -1001,7 +1001,7 @@ bool Pool::stopAndDrainDetachedWork(uint64_t deadline_ms)
                                       [this] { return detached_work->in_flight == 0; });
 }
 
-uint64_t Pool::detachedWorkInFlightForTest() const
+uint64_t Pool::detachedWorkInFlight() const
 {
     std::lock_guard lock(detached_work->mutex);
     return detached_work->in_flight;
@@ -1011,6 +1011,12 @@ bool Pool::detachedWorkStoppingForTest() const
 {
     std::lock_guard lock(detached_work->mutex);
     return detached_work->stopping;
+}
+
+void Pool::setDetachedDrainDeadlineBudgetForTest(uint64_t attempt_timeout_ms, uint64_t lease_safety_margin_ms)
+{
+    config.cas_request_budget.attempt_timeout_ms = attempt_timeout_ms;
+    config.cas_request_budget.lease_safety_margin_ms = lease_safety_margin_ms;
 }
 
 void Pool::forgetDisk(const std::function<void()> & stop_and_join_gc, const String & reason)

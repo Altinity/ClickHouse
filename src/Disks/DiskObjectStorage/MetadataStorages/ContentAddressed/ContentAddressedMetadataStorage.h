@@ -155,6 +155,9 @@ public:
         String disk_name_,
         ContextPtr context_,
         const ContentAddressedSettings & settings_);
+    /// Runs the same bounded, fail-soft teardown as explicit `shutdown`, including for callers that
+    /// destroy the storage without first invoking its lifecycle hook.
+    ~ContentAddressedMetadataStorage() override;
 
     /// Parses a `staging_backend` value (`local` | `s3`). Throws `BAD_ARGUMENTS` for an unrecognized
     /// value rather than silently selecting a backend.
@@ -184,6 +187,10 @@ public:
     /// Runs one synchronous GC round for tests and diagnostics. If the scheduler is not running,
     /// this lazily creates one so repeated calls retain the same lease-observation history.
     void runOneGcRoundForTest();
+
+    /// Test-only shared-ownership snapshot of the pool, including during teardown tests that must
+    /// observe the detached-work stop latch without going through the lifecycle gate.
+    Cas::PoolPtr poolForTest() const;
 
     /// Runs one synchronous GC round on the caller's thread and emits Start and Finish rows to
     /// `system.cas_gc_log`. Throws `BAD_ARGUMENTS` when GC is disabled
@@ -699,6 +706,11 @@ private:
     /// calling `store()` and `partAccess()` separately -- otherwise it could straddle a startup/shutdown
     /// that changes `cas_store`/`part_access`.
     PoolAccessSnapshot poolAccess() const;
+
+    /// Atomically unpublishes every pool-owning facade, then stops/releases/drains them in dependency
+    /// order outside `pointer_mutex`. Each phase is independently fail-soft because this is also called
+    /// by the destructor.
+    void stopAndDrainForTeardown() noexcept;
 
     /// Builds and throws the `INVALID_STATE` "disk is not started" exception `poolAccess()`, the gate,
     /// and the synchronous GC round entry points throw when no pool is published -- the storage-level

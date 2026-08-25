@@ -402,8 +402,12 @@ public:
 
     bool tryDispatchDetached(std::function<void(DetachedStopToken)> task);
     bool stopAndDrainDetachedWork(uint64_t deadline_ms);
-    uint64_t detachedWorkInFlightForTest() const;
+    uint64_t detachedWorkInFlight() const;
+    uint64_t detachedWorkInFlightForTest() const { return detachedWorkInFlight(); }
     bool detachedWorkStoppingForTest() const;
+    /// Test-only: shortens the metadata-storage teardown deadline without changing any request path.
+    /// Call before dispatching detached work; production configuration remains immutable after open.
+    void setDetachedDrainDeadlineBudgetForTest(uint64_t attempt_timeout_ms, uint64_t lease_safety_margin_ms);
 
     /// ---- per-server watermark surface ----
     /// process_epoch: random nonzero per Pool (process). GC checks epoch EQUALITY, never ordering.

@@ -1,17 +1,25 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ProfileEvents.h>
 
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <future>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 
 using namespace DB::Cas;
+
+namespace ProfileEvents
+{
+extern const Event CASDetachedWorkDrainTimeouts;
+}
 
 namespace
 {
@@ -222,6 +230,21 @@ PoolPtr openPlainPool(const std::shared_ptr<InMemoryBackend> & backend, PoolConf
     return Pool::open(backend, config);
 }
 
+std::shared_ptr<DB::ContentAddressedMetadataStorage> openTestStorage(bool tiny_budget = false)
+{
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "cas_detached_work_scratch");
+    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+    storage->startup();
+    if (tiny_budget)
+    {
+        storage->poolForTest()->setDetachedDrainDeadlineBudgetForTest(
+            /*attempt_timeout_ms=*/10, /*lease_safety_margin_ms=*/10);
+    }
+    return storage;
+}
+
 /// A pool where any nonempty tail is over-threshold, so every mutation auto-dispatches a publish.
 PoolPtr openPublishingPool(const std::shared_ptr<DB::Cas::tests::OrderedFaultBackend> & backend,
                            PoolConfig config = {})
@@ -362,6 +385,95 @@ TEST(CASDetachedWork, DrainDoesNotReturnWhileWorkIsInFlight)
     release->open();
     EXPECT_TRUE(drain.get());
     EXPECT_EQ(store->detachedWorkInFlightForTest(), 0u);
+}
+
+/// `shutdown` must not RETURN while tracked detached work is in flight.
+TEST(CASDetachedWork, ShutdownDoesNotReturnWhileWorkIsInFlight)
+{
+    auto storage = openTestStorage();
+    auto pool = storage->poolForTest();
+
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+    }));
+    entered->wait();
+
+    auto done = std::async(std::launch::async, [&storage] { storage->shutdown(); });
+    awaitStopLatched(pool);
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "shutdown returned while tracked detached work was still in flight";
+
+    release->open();
+    done.get();
+}
+
+/// A storage destroyed WITHOUT `shutdown` must still drain: nothing prevents that path today.
+TEST(CASDetachedWork, ImplicitDestructionDrains)
+{
+    auto storage = openTestStorage();
+    auto pool = storage->poolForTest();
+
+    auto entered = std::make_shared<Gate>();
+    auto release = std::make_shared<Gate>();
+    std::atomic<bool> finished{false};
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release, &finished](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+        finished.store(true);
+    }));
+    entered->wait();
+
+    auto destroyed = std::async(std::launch::async, [&storage] { storage.reset(); });
+    awaitStopLatched(pool);
+    release->open();
+    destroyed.get();
+
+    EXPECT_TRUE(finished.load());
+    EXPECT_EQ(pool->detachedWorkInFlightForTest(), 0u);
+}
+
+/// A storage destroyed AFTER `shutdown` must find nothing to do rather than waiting a second deadline.
+TEST(CASDetachedWork, TeardownHelperIsIdempotent)
+{
+    auto storage = openTestStorage();
+    storage->shutdown();
+
+    const auto started = std::chrono::steady_clock::now();
+    storage.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1))
+        << "the second teardown repeated the wait instead of finding nothing to do";
+}
+
+/// The timeout path must be OBSERVABLE. Without this the increment could be missing entirely and every
+/// other test here would stay green, because they all exercise successful drains.
+TEST(CASDetachedWork, ExpiredDrainIncrementsTheTimeoutCounter)
+{
+    auto storage = openTestStorage(/*tiny_budget=*/true);
+    auto pool = storage->poolForTest();
+
+    /// A task that deliberately IGNORES its token, standing in for work that cannot be interrupted.
+    auto release = std::make_shared<Gate>();
+    auto entered = std::make_shared<Gate>();
+    ASSERT_TRUE(pool->tryDispatchDetached([entered, release](DetachedStopToken)
+    {
+        entered->open();
+        release->wait();
+    }));
+    entered->wait();
+
+    const auto before = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
+                            .load(std::memory_order_relaxed);
+    storage->shutdown();
+    const auto after = ProfileEvents::global_counters[ProfileEvents::CASDetachedWorkDrainTimeouts]
+                           .load(std::memory_order_relaxed);
+    EXPECT_EQ(after - before, 1u);
+
+    release->open();
 }
 
 /// A task must see the stop that is already latched. The handshake matters: releasing the task before
