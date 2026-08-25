@@ -114,7 +114,7 @@ void ContentAddressedSettings::loadFromConfig(
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_prefix, config_keys);
 
-    auto candidate = std::make_unique<ContentAddressedSettingsImpl>(*impl);
+    ContentAddressedSettings candidate(*this);
     std::vector<std::string> prefixed_names;
     std::vector<std::string> legacy_names;
 
@@ -152,30 +152,19 @@ void ContentAddressedSettings::loadFromConfig(
     {
         const auto base = splitRepeatIndex(key).base;
         if (base.starts_with(CAS_KEY_PREFIX))
-            candidate->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+            candidate.impl->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
     }
 
     for (const std::string & key : legacy_names)
     {
-        candidate->set(key, config.getString(config_prefix + "." + key));
+        candidate.impl->set(key, config.getString(config_prefix + "." + key));
     }
-
-    /// The unprefixed spelling is accepted for a bounded period, because configurations using it
-    /// already exist outside this repository. Deleting this block is what closes that period: an
-    /// unprefixed CAS setting name then throws instead, naming the spelling to use.
-    if (!legacy_names.empty())
-        LOG_WARNING(getLogger("ContentAddressedSettings"),
-            "content_addressed disk `{}`: {} use the superseded unprefixed spelling and are applied "
-            "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
-            "removed.", config_prefix, fmt::join(legacy_names, ", "));
-
-    impl.swap(candidate);
 
     /// Not a CAS setting: the generic disk layer reads this same unprefixed key for its own access
     /// check, so one spelling must serve both.
-    impl->skip_access_check_cached = config.getBool(config_prefix + ".skip_access_check", false);
+    candidate.impl->skip_access_check_cached = config.getBool(config_prefix + ".skip_access_check", false);
 
-    auto & settings = *this;
+    auto & settings = candidate;
 
     /// Server-local scratch dir for the write-buffer spill. Mirrors how other metadata storages
     /// compute their local working dir: a real filesystem path, NEVER the object-storage key
@@ -208,7 +197,18 @@ void ContentAddressedSettings::loadFromConfig(
     if (settings[ContentAddressedSetting::server_root_id].changed)
         settings[ContentAddressedSetting::server_root_id] = expand_macros(settings[ContentAddressedSetting::server_root_id].value);
 
-    validate();
+    candidate.validate();
+
+    /// The unprefixed spelling is accepted for a bounded period, because configurations using it
+    /// already exist outside this repository. Deleting this block is what closes that period: an
+    /// unprefixed CAS setting name then throws instead, naming the spelling to use.
+    if (!legacy_names.empty())
+        LOG_WARNING(getLogger("ContentAddressedSettings"),
+            "content_addressed disk `{}`: {} use the superseded unprefixed spelling and are applied "
+            "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
+            "removed.", config_prefix, fmt::join(legacy_names, ", "));
+
+    impl.swap(candidate.impl);
 }
 
 void ContentAddressedSettings::validate()

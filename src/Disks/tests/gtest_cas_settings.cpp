@@ -307,6 +307,54 @@ TEST(CASContentAddressedSettings, ValidMixedConfigCommitsAfterAllValuesValidate)
     EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].value);
 }
 
+TEST(CASContentAddressedSettings, SemanticInvalidPrefixedKeyDoesNotWarnOrPartiallyApplySettings)
+{
+    auto cfg = makeConfig(
+        "<gc_enabled>0</gc_enabled><cas_gc_shards>0</cas_gc_shards>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+            FAIL() << "expected the semantically invalid prefixed key to be rejected";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        }
+        captured = capture.captured();
+    }
+    EXPECT_EQ(captured.find("are applied"), String::npos);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_shards].changed);
+}
+
+TEST(CASContentAddressedSettings, InvalidEnumDoesNotWarnOrPartiallyApplySettings)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id><gc_enabled>0</gc_enabled>"
+        "<cas_blob_hash>md5</cas_blob_hash>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+            FAIL() << "expected the invalid hash algorithm to be rejected";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        }
+        captured = capture.captured();
+    }
+    EXPECT_EQ(captured.find("are applied"), String::npos);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
+}
+
 /// Poco renders a repeated element as `name`, `name[1]`. A key of ours that appears twice must be
 /// recognized by its base name rather than passed over as foreign, or the first value would silently win.
 TEST(CASContentAddressedSettings, RepeatedKeyRejectedInEitherSpelling)
