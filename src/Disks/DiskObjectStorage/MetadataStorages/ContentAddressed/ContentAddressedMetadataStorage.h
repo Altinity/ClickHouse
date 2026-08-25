@@ -145,8 +145,8 @@ public:
     /// the constructor itself declares none. `server_root_id`/`scratch_path` (the local-scratch
     /// directory used when a write buffer must spill before hashing and upload, independent of the
     /// object-storage key prefix) are read from `settings_` rather than taken as their own parameters. A
-    /// non-null `context_` enables the background GC scheduler on the disk-factory path; tests may pass
-    /// null to disable system-log integration and scheduling. `disk_name_` falls back to
+    /// non-null `context_` enables the background GC scheduler on the disk-factory path and is retained
+    /// only weakly; tests may pass null to disable system-log integration and scheduling. `disk_name_` falls back to
     /// `storage_path_prefix_` when empty, exactly as before this constructor collapsed.
     ContentAddressedMetadataStorage(
         ObjectStoragePtr object_storage_,
@@ -594,7 +594,8 @@ private:
     const std::string server_root_id;
     const std::string disk_name;
     const std::string local_scratch_path;
-    const ContextPtr context;
+    /// `nullopt` means integration was deliberately disabled; an engaged reference may expire.
+    const std::optional<ContextWeakPtr> context;
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
@@ -760,7 +761,7 @@ private:
     /// (`<readonly>`) disk opens with no write probe, no background watermark, and no GC scheduler. Never
     /// touches `cas_store`/`part_access`/`gc_scheduler`/`physical_key_prefix`/`pool_uuid`; `startup`
     /// applies its own result to those members itself, in its single publish step.
-    PoolView openPoolView() const;
+    PoolView openPoolView(bool context_available) const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
@@ -770,12 +771,13 @@ private:
     DirRoute classifyDirectory(const std::string & path) const;
 
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
-    /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
-    /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
+    /// weak `Context` reference, converts the POD GcRoundLogRecord into a
+    /// ContentAddressedGarbageCollectionLogElement, and appends it to the SystemLog (best-effort).
+    /// Returns an empty sink when context is null.
     Cas::GcRoundLogger makeGcRoundLogger() const;
 
     /// Builds the per-event CAS audit sink: the `std::function` the pool calls on every
-    /// content-addressed decision. Captures the ContextPtr, converts the decoupled Core POD
+    /// content-addressed decision. Captures the weak `Context` reference, converts the decoupled Core POD
     /// `Cas::CasEvent` into a ContentAddressedLogElement, and appends it to the SystemLog
     /// (best-effort). Returns an empty sink when context is null (unit tests).
     Cas::CasEventSink makeCasEventSink() const;

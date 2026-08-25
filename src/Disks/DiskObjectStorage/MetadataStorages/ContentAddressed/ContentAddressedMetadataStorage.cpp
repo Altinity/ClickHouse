@@ -40,6 +40,7 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event CASDetachedWorkDrainTimeouts;
+    extern const Event CASEventDroppedContextExpired;
 }
 
 namespace DB
@@ -280,7 +281,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , server_root_id(settings_[ContentAddressedSetting::server_root_id].value)
     , disk_name(!disk_name_.empty() ? disk_name_ : storage_path_prefix)
     , local_scratch_path(settings_[ContentAddressedSetting::scratch_path].value)
-    , context(context_)
+    , context(context_ ? std::optional<ContextWeakPtr>(context_) : std::nullopt)
     , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
     , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
     , gc_snapshot_generations_to_keep(settings_[ContentAddressedSetting::gc_snapshot_generations_to_keep].value)
@@ -495,12 +496,18 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
     /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.
     if (!context)
         return {};
-    auto ctx = context;
+    const ContextWeakPtr weak_context = *context;
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [ctx, disk](const Cas::GcRoundLogRecord & r)
+    return [weak_context, disk](const Cas::GcRoundLogRecord & r)
     {
+        auto ctx = weak_context.lock();
+        if (!ctx)
+        {
+            ProfileEvents::increment(ProfileEvents::CASEventDroppedContextExpired);
+            return;
+        }
         auto log = ctx->getContentAddressedGarbageCollectionLog();
         if (!log)
             return;
@@ -573,12 +580,18 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
     /// Unit tests pass a null context (no system logs); the Pool then runs without a sink.
     if (!context)
         return {};
-    auto ctx = context;
+    const ContextWeakPtr weak_context = *context;
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [ctx, disk](Cas::CasEvent ev)
+    return [weak_context, disk](Cas::CasEvent ev)
     {
+        auto ctx = weak_context.lock();
+        if (!ctx)
+        {
+            ProfileEvents::increment(ProfileEvents::CASEventDroppedContextExpired);
+            return;
+        }
         auto log = ctx->getContentAddressedLog();
         if (!log)
             return;
@@ -691,7 +704,7 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
     return gc.rebuildBaseline(force);
 }
 
-ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView() const
+ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool context_available) const
 {
     /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
@@ -758,7 +771,7 @@ ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openP
     pool_config.server_id = serverIdToU128(server_id);
     pool_config.server_root_id = server_root_id;
     /// A read-only (`<readonly>`) disk opens with no background watermark and no write probe.
-    pool_config.background_watermark = (context != nullptr) && !read_only;
+    pool_config.background_watermark = context_available && !read_only;
     pool_config.read_only = read_only;
     pool_config.skip_access_check = skip_access_check;
     /// The node-local write algorithm: `PoolMeta::createOrValidate` accepts it with no write once
@@ -795,6 +808,17 @@ void ContentAddressedMetadataStorage::startup()
     if (cas_store)
         return;
 
+    ContextPtr startup_context;
+    if (context)
+    {
+        startup_context = context->lock();
+        if (!startup_context)
+            throw Exception(
+                ErrorCodes::INVALID_STATE,
+                "Cannot start content-addressed metadata storage {} because its `Context` has expired",
+                storage_path_full);
+    }
+
     /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
     /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
     read_only = object_storage->isReadOnly();
@@ -816,7 +840,7 @@ void ContentAddressedMetadataStorage::startup()
     /// very end. This makes a mid-startup throw leave the object exactly as unstarted as it was on
     /// entry (the `if (cas_store) return;` head above still sees an empty pool), so a caller can
     /// retry `startup` after a transient failure instead of being stuck with a half-built mount.
-    PoolView view = openPoolView();
+    PoolView view = openPoolView(static_cast<bool>(startup_context));
     physical_key_prefix = view.physical_key_prefix;
     auto pool = std::move(view.pool);
     auto uuid = Cas::u128ToHex(pool->poolMeta().pool_id);
@@ -850,7 +874,7 @@ void ContentAddressedMetadataStorage::startup()
     /// `CasGcScheduler`; its destructor calls `stop()`, which joins both worker threads before the
     /// exception continues propagating. No explicit `SCOPE_EXIT` is needed for that.
     std::shared_ptr<Cas::CasGcScheduler> scheduler;
-    if (context && gc_enabled && !read_only)
+    if (startup_context && gc_enabled && !read_only)
     {
         scheduler = std::make_shared<Cas::CasGcScheduler>(
             pool, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
