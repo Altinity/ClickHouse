@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Common/Exception.h>
-#include <Poco/Util/XMLConfiguration.h>
+#include <Common/logger_useful.h>
 #include <Poco/AutoPtr.h>
+#include <Poco/StreamChannel.h>
+#include <Poco/Util/XMLConfiguration.h>
 #include <sstream>
 
 using namespace DB;
@@ -32,12 +34,50 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> makeConfig(const std::string & inner
     std::istringstream iss("<clickhouse><disk>" + inner + "</disk></clickhouse>");
     return new Poco::Util::XMLConfiguration(iss);
 }
+
 const auto identity_macros = [](const std::string & s) { return s; };
+
+class ScopedCasSettingsLogCapture
+{
+public:
+    ScopedCasSettingsLogCapture()
+        : logger(getLogger("ContentAddressedSettings"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedCasSettingsLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream;
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
+size_t countOccurrences(const String & haystack, const String & needle)
+{
+    size_t n = 0;
+    for (size_t at = haystack.find(needle); at != String::npos; at = haystack.find(needle, at + 1))
+        ++n;
+    return n;
+}
 }
 
 TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
 {
-    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>4</gc_shards>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>4</cas_gc_shards>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/default_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
@@ -50,10 +90,10 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
 {
     for (const std::string & suffix : {"cache_bytes", "head_first_min_bytes"})
     {
-        const std::string setting = "deduplication_" + suffix;
+        const std::string setting = "cas_deduplication_" + suffix;
         SCOPED_TRACE(setting);
         auto cfg = makeConfig(
-            "<server_root_id>srv1</server_root_id><" + setting + ">4096</" + setting + ">");
+            "<cas_server_root_id>srv1</cas_server_root_id><" + setting + ">4096</" + setting + ">");
         ContentAddressedSettings settings;
         try
         {
@@ -69,58 +109,157 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
 
 TEST(CASContentAddressedSettings, UnknownKeyRejected)
 {
-    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shardz>4</gc_shardz>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shardz>4</cas_gc_shardz>");
     ContentAddressedSettings s;
     EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
 }
 
-TEST(CASContentAddressedSettings, ObjectStorageKeysSkipped)
+/// The point of this test is that none of these names appears anywhere in CAS code. It is not an
+/// enumeration to be extended when a backend adds a setting; it samples the classes that a
+/// name-based skip-list provably cannot cover.
+TEST(CASContentAddressedSettings, ForeignKeysAreNeverInspected)
 {
     auto cfg = makeConfig(
-        "<metadata_type>cas</metadata_type><type>object_storage</type>"
-        "<object_storage_type>s3</object_storage_type><endpoint>http://x/y</endpoint>"
-        "<access_key_id>k</access_key_id><secret_access_key>s</secret_access_key>"
-        "<server_root_id>srv1</server_root_id>"
-        /// Regression pin (stateless-lane startup fix): the local-object-storage CAS disk config
-        /// (`tests/config/config.d/cas_storage_policy_for_merge_tree_by_default.xml`)
-        /// sets `path` -- the generic local-object-storage pool root, consumed by
-        /// `ObjectStorageFactory`/`IDisk`, same class as `endpoint`/`access_key_id` above -- and it
-        /// was missing from `non_cas_keys`, which threw `UNKNOWN_SETTING` at server startup.
-        "<path>cas_pool/</path>"
-        /// Regression pin: `name`, read generically by `DiskFromAST` for the inline SQL `disk(...)`
-        /// form used by the `05002`-`05015` CAS stateless tests, was likewise missing and threw
-        /// `UNKNOWN_SETTING` for every one of those tests (only the XML-config `path` gap was fixed
-        /// first; `name` surfaced once the stateless lane actually ran end to end).
-        "<name>cas_test_disk</name>"
-        /// Regression pin: `use_fake_transaction`, validated generically in
-        /// `RegisterDiskObjectStorage.cpp` for every metadata type that needs a real transaction (not
-        /// a CAS-specific check), must reach that check rather than being rejected here as unknown --
-        /// `05015_cas_reject_fake_transaction` depends on it doing so.
-        "<use_fake_transaction>1</use_fake_transaction>"
-        /// Regression pin: `http_client = gcp_oauth` has TWO token sources and `requestBearerToken`
-        /// picks between them, so BOTH key sets must be accepted. The metadata-server triple was
-        /// missing (found by the CAS-over-GCS integration fixture, which had to point the OAuth client
-        /// at a fake metadata server); the ADC triple was missing too, and it is the only way to run
-        /// `gcp_oauth` off a GCE instance. Either omission threw `UNKNOWN_SETTING` at startup.
-        "<http_client>gcp_oauth</http_client>"
-        "<metadata_service>metadata.example.invalid</metadata_service>"
-        "<request_token_path>computeMetadata/v1/instance/service-accounts</request_token_path>"
-        "<service_account>cas@example.invalid</service_account>"
-        "<google_adc_client_id>cas-adc-client</google_adc_client_id>"
-        "<google_adc_client_secret>cas-adc-secret</google_adc_client_secret>"
-        "<google_adc_refresh_token>cas-adc-refresh</google_adc_refresh_token>"
-        "<gcs_max_conditional_put_bytes>4096</gcs_max_conditional_put_bytes>"
-        /// Same class: a generic S3 request setting, not a CAS one.
-        "<max_single_part_upload_size>1073741824</max_single_part_upload_size>");
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<type>object_storage</type><object_storage_type>s3</object_storage_type>"
+        "<metadata_type>cas</metadata_type><endpoint>http://x/y</endpoint>"
+        "<path>cas_pool/</path><name>cas_test_disk</name><use_fake_transaction>1</use_fake_transaction>"
+        "<http_keep_alive_timeout>60</http_keep_alive_timeout>"
+        "<http_keep_alive_max_requests>100</http_keep_alive_max_requests>"
+        "<connect_timeout_ms>1000</connect_timeout_ms><session_token>t</session_token>"
+        "<s3_retry_attempts>7</s3_retry_attempts><s3_max_put_rps>100</s3_max_put_rps>"
+        "<header>X-A: 1</header><header>X-B: 2</header>"
+        "<access_header>X-C: 3</access_header><user_alice>alice</user_alice>"
+        "<proxy><uri>http://proxy:8080</uri></proxy>"
+        "<server_side_encryption_kms_config><key_id>k</key_id></server_side_encryption_kms_config>"
+        "<account_name>acct</account_name><container_name>c</container_name>"
+        "<connection_string>DefaultEndpointsProtocol=http;</connection_string>");
     ContentAddressedSettings s;
     EXPECT_NO_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros));
 }
 
+TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
+{
+    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>4</gc_shards>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
+}
+
+TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<gc_shards>4</gc_shards><gc_interval_sec>7</gc_interval_sec>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        captured = capture.captured();
+    }
+    EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 7u);
+    EXPECT_EQ(countOccurrences(captured, "superseded unprefixed spelling"), 1u);
+    EXPECT_NE(captured.find("gc_shards"), String::npos);
+    EXPECT_NE(captured.find("gc_interval_sec"), String::npos);
+}
+
+TEST(CASContentAddressedSettings, FullyMigratedBlockWarnsAboutNothing)
+{
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>4</cas_gc_shards>");
+    ContentAddressedSettings s;
+    ScopedCasSettingsLogCapture capture;
+    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_EQ(capture.captured().find("superseded"), String::npos);
+}
+
+TEST(CASContentAddressedSettings, BothSpellingsOfOneSettingRejected)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_shards>4</cas_gc_shards><gc_shards>8</gc_shards>");
+    ContentAddressedSettings s;
+    try
+    {
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected the ambiguous pair to be rejected";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+    }
+}
+
+/// Poco renders a repeated element as `name`, `name[1]`. A key of ours that appears twice must be
+/// recognized by its base name rather than passed over as foreign, or the first value would silently win.
+TEST(CASContentAddressedSettings, RepeatedKeyRejectedInEitherSpelling)
+{
+    for (const std::string & spelling : {std::string("gc_shards"), std::string("cas_gc_shards")})
+    {
+        SCOPED_TRACE(spelling);
+        auto cfg = makeConfig(
+            "<cas_server_root_id>srv1</cas_server_root_id>"
+            "<" + spelling + ">4</" + spelling + ">"
+            "<" + spelling + ">8</" + spelling + ">");
+        ContentAddressedSettings s;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+            FAIL() << "expected a repeated key to be rejected";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        }
+    }
+}
+
+TEST(CASContentAddressedSettings, SkipAccessCheckKeepsItsBareSpelling)
+{
+    auto with = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<skip_access_check>1</skip_access_check>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*with, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_TRUE(s.skipAccessCheck());
+
+    auto prefixed = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_skip_access_check>1</cas_skip_access_check>");
+    ContentAddressedSettings rejected;
+    try
+    {
+        rejected.loadFromConfig(*prefixed, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected `cas_skip_access_check` to be unknown";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+    }
+}
+
+TEST(CASContentAddressedSettings, PrefixedGcsCapIsNotACasSetting)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gcs_max_conditional_put_bytes>4096</cas_gcs_max_conditional_put_bytes>");
+    ContentAddressedSettings s;
+    try
+    {
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected the prefixed cap name to be unknown";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+    }
+}
+
 TEST(CASContentAddressedSettings, ValidateFailsClosed)
 {
-    {   /// missing server_root_id: ABSENT key -> typed NO_ELEMENTS_IN_CONFIG (distinct from a
-        /// present-but-invalid value, checked below), mirroring the pre-F4b factory behavior.
-        auto cfg = makeConfig("<gc_shards>1</gc_shards>");
+    {
+        auto cfg = makeConfig("<cas_gc_shards>1</cas_gc_shards>");
         ContentAddressedSettings s;
         try
         {
@@ -132,9 +271,8 @@ TEST(CASContentAddressedSettings, ValidateFailsClosed)
             EXPECT_EQ(e.code(), ErrorCodes::NO_ELEMENTS_IN_CONFIG);
         }
     }
-    {   /// present but invalid (empty) server_root_id -> BAD_ARGUMENTS from
-        /// `Cas::validateServerRootId`, not NO_ELEMENTS_IN_CONFIG.
-        auto cfg = makeConfig("<server_root_id></server_root_id>");
+    {
+        auto cfg = makeConfig("<cas_server_root_id></cas_server_root_id>");
         ContentAddressedSettings s;
         try
         {
@@ -146,13 +284,13 @@ TEST(CASContentAddressedSettings, ValidateFailsClosed)
             EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
         }
     }
-    {   /// zero gc_shards
-        auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>0</gc_shards>");
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>0</cas_gc_shards>");
         ContentAddressedSettings s;
         EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
     }
-    {   /// unknown blob_hash spelling
-        auto cfg = makeConfig("<server_root_id>srv1</server_root_id><blob_hash>md5</blob_hash>");
+    {
+        auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_blob_hash>md5</cas_blob_hash>");
         ContentAddressedSettings s;
         EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
     }
@@ -160,11 +298,7 @@ TEST(CASContentAddressedSettings, ValidateFailsClosed)
 
 TEST(CASContentAddressedSettings, RelativeScratchPathAnchored)
 {
-    /// Reproduces the pre-F4b factory's anchor behavior (review finding, Critical): a relative
-    /// `scratch_path` override is anchored to the SERVER DATA PATH (`scratch_path_anchor_if_relative`)
-    /// -- NOT to `default_scratch_path`, which is itself a per-disk subdirectory
-    /// (`.../disks/<name>/cas_scratch`) that must never leak into an override's resolved path.
-    auto cfg = makeConfig("<server_root_id>srv1</server_root_id><scratch_path>rel/dir</scratch_path>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_scratch_path>rel/dir</cas_scratch_path>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/rel/dir");
@@ -172,9 +306,7 @@ TEST(CASContentAddressedSettings, RelativeScratchPathAnchored)
 
 TEST(CASContentAddressedSettings, AbsentScratchPathUsesDefaultVerbatim)
 {
-    /// Absent key -> `default_scratch_path` verbatim, unaffected by the anchor (the per-disk default
-    /// already lives under the server data path; only an explicit relative OVERRIDE needs anchoring).
-    auto cfg = makeConfig("<server_root_id>srv1</server_root_id>");
+    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id>");
     ContentAddressedSettings s;
     s.loadFromConfig(*cfg, "disk", "/data", "/data/disks/x/cas_scratch", identity_macros);
     EXPECT_EQ(s[ContentAddressedSetting::scratch_path].value, "/data/disks/x/cas_scratch");

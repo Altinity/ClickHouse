@@ -83,7 +83,6 @@ namespace ContentAddressedSetting
     extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
     extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
     extern const ContentAddressedSettingsBool blob_hash_allow_new;
-    extern const ContentAddressedSettingsBool skip_access_check;
 }
 
 namespace
@@ -303,7 +302,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , staging_backend(settings_.stagingBackend())
     , blob_hash_algo(settings_.blobHashAlgo())
     , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
-    , skip_access_check(settings_[ContentAddressedSetting::skip_access_check].value)
+    , skip_access_check(settings_.skipAccessCheck())
     , part_folder_validate(settings_.partFolderValidate())
 {
 }
