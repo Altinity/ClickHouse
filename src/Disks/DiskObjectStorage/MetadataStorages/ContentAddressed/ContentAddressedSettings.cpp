@@ -114,6 +114,7 @@ void ContentAddressedSettings::loadFromConfig(
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_prefix, config_keys);
 
+    auto candidate = std::make_unique<ContentAddressedSettingsImpl>(*impl);
     std::vector<std::string> prefixed_names;
     std::vector<std::string> legacy_names;
 
@@ -147,6 +148,18 @@ void ContentAddressedSettings::loadFromConfig(
                 "one", config_prefix, key, key);
     }
 
+    for (const std::string & key : config_keys)
+    {
+        const auto base = splitRepeatIndex(key).base;
+        if (base.starts_with(CAS_KEY_PREFIX))
+            candidate->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+    }
+
+    for (const std::string & key : legacy_names)
+    {
+        candidate->set(key, config.getString(config_prefix + "." + key));
+    }
+
     /// The unprefixed spelling is accepted for a bounded period, because configurations using it
     /// already exist outside this repository. Deleting this block is what closes that period: an
     /// unprefixed CAS setting name then throws instead, naming the spelling to use.
@@ -156,17 +169,7 @@ void ContentAddressedSettings::loadFromConfig(
             "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
             "removed.", config_prefix, fmt::join(legacy_names, ", "));
 
-    for (const std::string & key : config_keys)
-    {
-        const auto base = splitRepeatIndex(key).base;
-        if (base.starts_with(CAS_KEY_PREFIX))
-            impl->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
-    }
-
-    for (const std::string & key : legacy_names)
-    {
-        impl->set(key, config.getString(config_prefix + "." + key));
-    }
+    impl.swap(candidate);
 
     /// Not a CAS setting: the generic disk layer reads this same unprefixed key for its own access
     /// check, so one spelling must serve both.

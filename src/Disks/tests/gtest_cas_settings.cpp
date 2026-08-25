@@ -22,6 +22,7 @@ namespace DB::ErrorCodes
 /// `ContentAddressedSettings.cpp`, and each consumer TU declares only the ones it references.
 namespace DB::ContentAddressedSetting
 {
+    extern const ContentAddressedSettingsBool gc_enabled;
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
     extern const ContentAddressedSettingsString scratch_path;
@@ -244,6 +245,66 @@ TEST(CASContentAddressedSettings, AmbiguousConfigDoesNotWarnOrPartiallyApplySett
     }
     EXPECT_EQ(captured.find("are applied"), String::npos);
     EXPECT_FALSE(s[ContentAddressedSetting::gc_shards].changed);
+}
+
+TEST(CASContentAddressedSettings, UnknownPrefixedKeyDoesNotWarnOrPartiallyApplySettings)
+{
+    auto cfg = makeConfig(
+        "<cas_gc_shards>3</cas_gc_shards><gc_enabled>0</gc_enabled>"
+        "<cas_gc_shardz>8</cas_gc_shardz>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+            FAIL() << "expected the unknown prefixed key to be rejected";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
+        }
+        captured = capture.captured();
+    }
+    EXPECT_EQ(captured.find("are applied"), String::npos);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_shards].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
+}
+
+TEST(CASContentAddressedSettings, MalformedPrefixedKeyDoesNotWarnOrPartiallyApplySettings)
+{
+    auto cfg = makeConfig(
+        "<cas_gc_shards>3</cas_gc_shards><gc_enabled>0</gc_enabled>"
+        "<cas_gc_interval_sec>not-a-number</cas_gc_interval_sec>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+            FAIL() << "expected the malformed prefixed key to be rejected";
+        }
+        catch (const Exception &)
+        {
+        }
+        captured = capture.captured();
+    }
+    EXPECT_EQ(captured.find("are applied"), String::npos);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_shards].changed);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].changed);
+}
+
+TEST(CASContentAddressedSettings, ValidMixedConfigCommitsAfterAllValuesValidate)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>3</cas_gc_shards>"
+        "<gc_enabled>0</gc_enabled>");
+    ContentAddressedSettings s;
+    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 3u);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_enabled].value);
 }
 
 /// Poco renders a repeated element as `name`, `name[1]`. A key of ours that appears twice must be
