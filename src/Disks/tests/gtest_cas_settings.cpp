@@ -56,7 +56,10 @@ public:
         logger->setLevel(old_level);
     }
 
-    String captured() const { return stream.str(); }
+    String captured() const
+    {
+        return stream.str();
+    }
 
 private:
     LoggerPtr logger;
@@ -189,6 +192,58 @@ TEST(CASContentAddressedSettings, BothSpellingsOfOneSettingRejected)
     {
         EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
     }
+}
+
+TEST(CASContentAddressedSettings, MalformedRepeatedPrefixedKeyIsRejectedBeforeParsing)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_shards>not-a-number</cas_gc_shards><cas_gc_shards>8</cas_gc_shards>");
+    ContentAddressedSettings s;
+    try
+    {
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected the repeated key to be rejected before parsing its value";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        EXPECT_NE(String(e.message()).find("set more than once"), String::npos);
+    }
+}
+
+TEST(CASContentAddressedSettings, MalformedPrefixedValueCannotMaskBothSpellingsConflict)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_shards>not-a-number</cas_gc_shards><gc_shards>8</gc_shards>");
+    ContentAddressedSettings s;
+    try
+    {
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected the ambiguous pair to be rejected before parsing its values";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        EXPECT_NE(String(e.message()).find("both"), String::npos);
+    }
+}
+
+TEST(CASContentAddressedSettings, AmbiguousConfigDoesNotWarnOrPartiallyApplySettings)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id>"
+        "<cas_gc_shards>4</cas_gc_shards><gc_shards>8</gc_shards>");
+    ContentAddressedSettings s;
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
+        captured = capture.captured();
+    }
+    EXPECT_EQ(captured.find("are applied"), String::npos);
+    EXPECT_FALSE(s[ContentAddressedSetting::gc_shards].changed);
 }
 
 /// Poco renders a repeated element as `name`, `name[1]`. A key of ours that appears twice must be

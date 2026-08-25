@@ -7,6 +7,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <algorithm>
 #include <filesystem>
 #include <string_view>
 #include <vector>
@@ -113,6 +114,7 @@ void ContentAddressedSettings::loadFromConfig(
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_prefix, config_keys);
 
+    std::vector<std::string> prefixed_names;
     std::vector<std::string> legacy_names;
 
     for (const std::string & key : config_keys)
@@ -124,7 +126,7 @@ void ContentAddressedSettings::loadFromConfig(
             if (repeated)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "content_addressed disk `{}`: `{}` is set more than once", config_prefix, base);
-            impl->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+            prefixed_names.emplace_back(base.substr(CAS_KEY_PREFIX.size()));
         }
         else if (ContentAddressedSettingsImpl::hasBuiltin(base))
         {
@@ -137,6 +139,14 @@ void ContentAddressedSettings::loadFromConfig(
         /// generic disk layer, the proxy resolver -- and is neither read nor judged here.
     }
 
+    for (const std::string & key : legacy_names)
+    {
+        if (std::find(prefixed_names.begin(), prefixed_names.end(), key) != prefixed_names.end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "content_addressed disk `{}`: both `{}` and `cas_{}` are set; remove the unprefixed "
+                "one", config_prefix, key, key);
+    }
+
     /// The unprefixed spelling is accepted for a bounded period, because configurations using it
     /// already exist outside this repository. Deleting this block is what closes that period: an
     /// unprefixed CAS setting name then throws instead, naming the spelling to use.
@@ -146,12 +156,15 @@ void ContentAddressedSettings::loadFromConfig(
             "for now; write them with the `cas_` prefix. Support for the unprefixed spelling will be "
             "removed.", config_prefix, fmt::join(legacy_names, ", "));
 
+    for (const std::string & key : config_keys)
+    {
+        const auto base = splitRepeatIndex(key).base;
+        if (base.starts_with(CAS_KEY_PREFIX))
+            impl->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+    }
+
     for (const std::string & key : legacy_names)
     {
-        if (impl->isChanged(key))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "content_addressed disk `{}`: both `{}` and `cas_{}` are set; remove the unprefixed "
-                "one", config_prefix, key, key);
         impl->set(key, config.getString(config_prefix + "." + key));
     }
 
