@@ -331,6 +331,11 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                     removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), table_function_node, context);
             }
 
+            if (query_node.getPrewhere())
+                removeExpressionsThatAreUnsafeToDuplicate(query_node.getPrewhere(), context);
+            if (query_node.getWhere())
+                removeExpressionsThatAreUnsafeToDuplicate(query_node.getWhere(), context);
+
             query_node.getOrderByNode() = std::make_shared<ListNode>();
             query_node.getGroupByNode() = std::make_shared<ListNode>();
 

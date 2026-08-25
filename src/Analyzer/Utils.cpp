@@ -35,6 +35,7 @@
 #include <Storages/IStorage.h>
 
 #include <Interpreters/Context.h>
+#include <Interpreters/misc.h>
 
 #include <Analyzer/ArrayJoinNode.h>
 #include <Analyzer/ColumnNode.h>
@@ -1214,9 +1215,12 @@ bool isSafeToDuplicateInQueryTree(const QueryTreeNodePtr & node)
         node,
         [](const FunctionBasePtr & function_base)
         {
-            return function_base->isDeterministicInScopeOfQuery()
+            return function_base->isDeterministic()
+                && function_base->isDeterministicInScopeOfQuery()
                 && !function_base->isStateful()
-                && !function_base->isServerConstant();
+                && !function_base->isServerConstant()
+                && !functionIsDictGet(function_base->getName())
+                && !functionIsJoinGet(function_base->getName());
         });
 }
 
