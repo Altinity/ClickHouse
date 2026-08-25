@@ -56,8 +56,8 @@ cache to the working set of blobs a node reads repeatedly, not to the pool's tot
 `object_storage_type`, `metadata_type`, `endpoint`, `access_key_id`, `secret_access_key`, and the
 other generic object-storage/disk keys (`path`, `name`, `region`, `use_environment_credentials`,
 `readonly`, `use_fake_transaction`, and a handful more) belong to the shared disk layer, not to
-`CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. The
-`CAS` keys below and this shared set are accepted; every other key is rejected as unknown.
+`CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. `CAS`
+validates its `cas_` namespace and leaves every other key to its relevant consumer.
 
 The bare, uncached form — a storage policy pointing directly at the `CAS` disk, as used by
 [quick start](/antalya/cas/quick-start) — remains valid and is the minimal way to try `CAS` out:
@@ -102,6 +102,24 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | `cas_gc_meta_pool_size` | `16` | Bounded pool size for GC per-hash freshness-meta writes |
 | `cas_staging_backend` | `local` | Blob staging backend (`local` \| `s3`); `s3` is opt-in and requires native same-store copy on writable mount |
 
+## Advanced GC pacing settings {#advanced-gc-pacing-settings}
+
+These settings bound individual phases of a `GC` round. The first two accept any `UInt64` value;
+for the remaining caps, `0` means unbounded.
+
+| Setting | Default | Bounds | Description |
+|---|---|---|---|
+| `cas_manifest_sweep_list_budget_keys` | `1000` | `UInt64` | Orphan-manifest sweep `LIST` budget per round |
+| `cas_manifest_sweep_delete_budget_keys` | `100` | `UInt64` | Orphan-manifest sweep `DELETE` budget per round |
+| `cas_gc_round_graduation_budget` | `5000` | `0` = unbounded | Blob-graduation (`condemned` → `delete_pending`) cohort cap per round |
+| `cas_gc_round_redelete_budget` | `5000` | `0` = unbounded | Exact-token re-delete cohort cap for prior `delete_pending` rows per round |
+| `cas_gc_round_sweep_namespace_budget` | `20` | `0` = unbounded | Distinct namespaces per orphan-manifest sweep page whose protection view may be built |
+| `cas_gc_round_sweep_recovery_op_budget` | `5000` | `0` = unbounded | Committed-tail ref-log `GET`/decode operations the orphan-manifest recovery walk may spend per round |
+| `cas_gc_round_ref_cleanup_budget` | `5000` | `0` = unbounded | Ref-object cleanup cap for covered log and snapshot deletes per round |
+| `cas_gc_round_prefix_wholesale_budget` | `20000` | `0` = unbounded | Generation-prefix wholesale-delete object cap during pruning per round |
+| `cas_gc_round_handoff_prefix_wholesale_budget` | `5000` | `0` = unbounded | Post-`CAS` hand-off generation-prefix reclaim cap per round, reserved separately so pruning cannot starve the one-shot hand-off |
+| `cas_gc_round_outcome_entry_budget` | `5000` | `0` = unbounded | `GcOutcomes` entry cap across the re-delete/spared audit log per round |
+
 ## Migration from unprefixed keys {#migration-from-unprefixed-keys}
 
 The unprefixed spelling of a `CAS` setting is accepted for now and reported at server startup. It
@@ -126,8 +144,7 @@ requiring a fresh pool.
 
 ## Server-level settings {#server-settings}
 
-Source: `ServerSettings.cpp`. Unlike the disk-level list, these carry the `cas_` prefix because they
-are process-wide, not scoped to one disk block.
+Source: `ServerSettings.cpp`. This setting is process-wide rather than scoped to one disk block.
 
 | Setting | Default | Description |
 |---|---|---|
