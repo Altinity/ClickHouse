@@ -12,10 +12,10 @@
                 <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
-                <server_root_id>ca_soak_ch1</server_root_id>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id>
                 <!-- Background reachability GC enabled on both servers, running aggressively. -->
-                <gc_enabled>1</gc_enabled>
-                <gc_interval_sec>2</gc_interval_sec>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>2</cas_gc_interval_sec>
                 <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
@@ -23,7 +23,7 @@
                      gc/gen/<gen>/blob_target/0/ or gc/gen/<gen>/blob_target/1/; the two replicas
                      can reduce disjoint shards. One coordinator owns the global fence+seal.
                      Creation-time only (GcState::snap_shards written on first-ever acquire). -->
-                <gc_shards>8</gc_shards>
+                <cas_gc_shards>8</cas_gc_shards>
                 <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
                      blob PUTs >= 64 KiB (not just the default >= 1 MiB). -->
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>

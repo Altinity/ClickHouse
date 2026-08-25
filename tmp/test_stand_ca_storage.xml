@@ -17,7 +17,7 @@
 
         <!-- REQUIRED, no default: the layout subtree this replica owns inside the shared pool.
              Macros expand here like in endpoint, so one config template serves all replicas. -->
-        <server_root_id>{replica}</server_root_id>
+        <cas_server_root_id>{replica}</cas_server_root_id>
 
         <!-- ============================================================================
              All content-addressed settings below are OPTIONAL and shown with their code
@@ -26,10 +26,10 @@
 
         <!-- Background reachability GC on this mount. Every mount can run GC; a shared
              lease dedups leaders, so leaving it on everywhere is safe and recommended. -->
-        <!-- <gc_enabled>1</gc_enabled> -->
+        <!-- <cas_gc_enabled>1</cas_gc_enabled> -->
 
         <!-- How often a mount tries to run a GC round. -->
-        <!-- <gc_interval_sec>60</gc_interval_sec> -->
+        <!-- <cas_gc_interval_sec>60</cas_gc_interval_sec> -->
 
         <!-- CREATION-TIME (persisted in the pool; ignored on reopen): fanout of the mutable
              ref namespace. 32 balances CAS-write batching against per-shard body size. -->
@@ -37,17 +37,17 @@
 
         <!-- CREATION-TIME: blob-target reducer sharding for the GC fold. 1 = single reducer;
              raise only for very large pools (allows concurrent per-shard reduce). -->
-        <!-- <gc_shards>1</gc_shards> -->
+        <!-- <cas_gc_shards>1</cas_gc_shards> -->
 
         <!-- Blob publication has no override setting: every materialization starts with HEAD.
              An absent or condemned body is published unconditionally and may use multipart. -->
 
         <!-- How many sealed GC snapshot generations to retain for introspection/debug. -->
-        <!-- <gc_snapshot_generations_to_keep>3</gc_snapshot_generations_to_keep> -->
+        <!-- <cas_gc_snapshot_generations_to_keep>3</cas_gc_snapshot_generations_to_keep> -->
 
         <!-- Orphan part-manifest sweep budgets per GC round (LIST keys / DELETE keys). -->
-        <!-- <manifest_sweep_list_budget_keys>1000</manifest_sweep_list_budget_keys> -->
-        <!-- <manifest_sweep_delete_budget_keys>100</manifest_sweep_delete_budget_keys> -->
+        <!-- <cas_manifest_sweep_list_budget_keys>1000</cas_manifest_sweep_list_budget_keys> -->
+        <!-- <cas_manifest_sweep_delete_budget_keys>100</cas_manifest_sweep_delete_budget_keys> -->
 
         <!-- Part-manifest (packed small files) size thresholds: soft = start a new manifest,
              hard = refuse to grow; max_delay = how long a writer may batch before flushing. -->
@@ -56,7 +56,7 @@
         <!-- <manifest_max_delay_ms>1000</manifest_max_delay_ms> -->
 
         <!-- Server-local spill dir for in-flight writes (real local path, NOT in the bucket). -->
-        <!-- <scratch_path>/var/lib/clickhouse/disks/s3/cas_scratch/</scratch_path> -->
+        <!-- <cas_scratch_path>/var/lib/clickhouse/disks/s3/cas_scratch/</cas_scratch_path> -->
       </s3>
 
       <!-- FILE CACHE OVER CA: SUPPORTED since 2026-07-08 (was NOT_IMPLEMENTED at startup before).

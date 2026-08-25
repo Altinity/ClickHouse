@@ -15,9 +15,9 @@
                 <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r3/soak_pool/</endpoint>
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
-                <server_root_id>ca_live_{replica}</server_root_id>
-                <gc_enabled>1</gc_enabled>
-                <gc_interval_sec>10</gc_interval_sec>
+                <cas_server_root_id>ca_live_{replica}</cas_server_root_id>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
             </ca>
 
             <!-- Read-only fsck view over the SAME live pool (mirrors storage_conf_ch1.xml). -->
@@ -28,8 +28,8 @@
                 <endpoint>https://test-altinity-support-team.s3.us-east-1.amazonaws.com/ca_live_20260703_r3/soak_pool/</endpoint>
                 <region>us-east-1</region>
                 <use_environment_credentials>1</use_environment_credentials>
-                <server_root_id>ca_live_{replica}</server_root_id>
-                <gc_enabled>0</gc_enabled>
+                <cas_server_root_id>ca_live_{replica}</cas_server_root_id>
+                <cas_gc_enabled>0</cas_gc_enabled>
                 <readonly>true</readonly>
             </ca_ro>
         </disks>

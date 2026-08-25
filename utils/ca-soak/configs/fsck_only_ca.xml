@@ -21,8 +21,8 @@
                 <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
-                <server_root_id>ca_soak_ch1</server_root_id> <!-- literal: clickhouse-disks -C does not load the server macros -->
-                <gc_enabled>0</gc_enabled>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id> <!-- literal: clickhouse-disks -C does not load the server macros -->
+                <cas_gc_enabled>0</cas_gc_enabled>
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <readonly>true</readonly>
             </ca_ro>

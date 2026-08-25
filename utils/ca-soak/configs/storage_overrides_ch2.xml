@@ -2,10 +2,10 @@
     <storage_configuration>
         <disks>
             <ca>
-                <server_root_id>ca_soak_ch2</server_root_id>
+                <cas_server_root_id>ca_soak_ch2</cas_server_root_id>
             </ca>
             <ca_ro>
-                <server_root_id>ca_soak_ch2</server_root_id>
+                <cas_server_root_id>ca_soak_ch2</cas_server_root_id>
             </ca_ro>
         </disks>
     </storage_configuration>

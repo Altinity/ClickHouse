@@ -18,8 +18,8 @@
                      x-goog conditional dialect. Without this the S3-compat surface silently
                      ignores every precondition and the probe refuses the mount (measured). -->
                 <http_client>gcs_hmac</http_client>
-                <server_root_id>ca_live_node1</server_root_id> <!-- literal: clickhouse-disks -C does not load the server macros -->
-                <gc_enabled>0</gc_enabled>
+                <cas_server_root_id>ca_live_node1</cas_server_root_id> <!-- literal: clickhouse-disks -C does not load the server macros -->
+                <cas_gc_enabled>0</cas_gc_enabled>
                 <readonly>true</readonly>
             </ca_ro>
         </disks>

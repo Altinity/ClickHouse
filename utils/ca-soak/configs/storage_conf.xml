@@ -13,8 +13,8 @@
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
                 <!-- Background reachability GC enabled on both servers, running aggressively. -->
-                <gc_enabled>1</gc_enabled>
-                <gc_interval_sec>2</gc_interval_sec>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>2</cas_gc_interval_sec>
                 <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
@@ -37,7 +37,7 @@
                 <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
                 <access_key_id>clickhouse</access_key_id>
                 <secret_access_key>clickhouse</secret_access_key>
-                <gc_enabled>0</gc_enabled>
+                <cas_gc_enabled>0</cas_gc_enabled>
                 <expect_continue_min_bytes>65536</expect_continue_min_bytes>
                 <readonly>true</readonly>
             </ca_ro>
