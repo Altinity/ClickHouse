@@ -22,7 +22,6 @@ namespace DB::ContentAddressedSetting
 {
     extern const ContentAddressedSettingsUInt64 gc_shards;
     extern const ContentAddressedSettingsUInt64 gc_interval_sec;
-    extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
     extern const ContentAddressedSettingsString scratch_path;
 }
 
@@ -68,42 +67,6 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
     }
 }
 
-/// The generation-store single-PUT cap applies to every conditional non-blob write, including
-/// create-if-absent artifacts and conditional replacements. Blob publication remains unconditional.
-TEST(CASContentAddressedSettings, ConditionalPutCapParsesAndDefaults)
-{
-    auto with_override = makeConfig(
-        "<server_root_id>srv1</server_root_id>"
-        "<gcs_max_conditional_put_bytes>4096</gcs_max_conditional_put_bytes>");
-    ContentAddressedSettings s;
-    s.loadFromConfig(*with_override, "disk", "/data", "/data/scratch", identity_macros);
-    EXPECT_EQ(s[ContentAddressedSetting::gcs_max_conditional_put_bytes].value, 4096u);
-
-    auto without = makeConfig("<server_root_id>srv1</server_root_id>");
-    ContentAddressedSettings d;
-    d.loadFromConfig(*without, "disk", "/data", "/data/scratch", identity_macros);
-    EXPECT_EQ(d[ContentAddressedSetting::gcs_max_conditional_put_bytes].value, 1ULL << 30);
-}
-
-/// The cap's pre-release name carries no alias: `CAS` ships no persisted data yet, so a config using
-/// the old key must fail loudly rather than be silently accepted under a compatibility shim.
-TEST(CASContentAddressedSettings, LegacyTokenProducingPutCapNameRejected)
-{
-    auto cfg = makeConfig(
-        "<server_root_id>srv1</server_root_id>"
-        "<gcs_max_token_producing_put_bytes>4096</gcs_max_token_producing_put_bytes>");
-    ContentAddressedSettings s;
-    try
-    {
-        s.loadFromConfig(*cfg, "disk", "/data", "/data/scratch", identity_macros);
-        FAIL() << "expected the legacy cap name to be rejected as unknown";
-    }
-    catch (const Exception & e)
-    {
-        EXPECT_EQ(e.code(), ErrorCodes::UNKNOWN_SETTING);
-    }
-}
-
 TEST(CASContentAddressedSettings, UnknownKeyRejected)
 {
     auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shardz>4</gc_shardz>");
@@ -146,6 +109,7 @@ TEST(CASContentAddressedSettings, ObjectStorageKeysSkipped)
         "<google_adc_client_id>cas-adc-client</google_adc_client_id>"
         "<google_adc_client_secret>cas-adc-secret</google_adc_client_secret>"
         "<google_adc_refresh_token>cas-adc-refresh</google_adc_refresh_token>"
+        "<gcs_max_conditional_put_bytes>4096</gcs_max_conditional_put_bytes>"
         /// Same class: a generic S3 request setting, not a CAS one.
         "<max_single_part_upload_size>1073741824</max_single_part_upload_size>");
     ContentAddressedSettings s;
