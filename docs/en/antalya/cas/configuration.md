@@ -57,7 +57,8 @@ cache to the working set of blobs a node reads repeatedly, not to the pool's tot
 other generic object-storage/disk keys (`path`, `name`, `region`, `use_environment_credentials`,
 `readonly`, `use_fake_transaction`, and a handful more) belong to the shared disk layer, not to
 `CAS` — they are accepted inside the `cas` disk's own block but are not `CAS` settings. `CAS`
-validates its `cas_` namespace and leaves every other key to its relevant consumer.
+validates its `cas_` namespace and leaves every other key, apart from the temporary unprefixed
+aliases described below, to its relevant consumer.
 
 The bare, uncached form — a storage policy pointing directly at the `CAS` disk, as used by
 [quick start](/antalya/cas/quick-start) — remains valid and is the minimal way to try `CAS` out:
@@ -85,7 +86,7 @@ entirely before release. Treat this table as a snapshot of the current build, no
 | Setting | Default | Description |
 |---|---|---|
 | `cas_server_root_id` | — (required) | Explicit layout subtree identity; macros expand as in the `s3` `endpoint`. Anchored in the pool by a write-once owner claim — a colliding identity is refused at mount |
-| `cas_scratch_path` | server data path | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
+| `cas_scratch_path` | `<clickhouse-path>/disks/<disk_name>/cas_scratch/` | Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path |
 | `cas_gc_enabled` | `true` | Run the background GC scheduler on this disk. `false` is a debugging aid, not an operating mode: garbage then accumulates indefinitely and silently — watch `system.cas_gc_log` for round activity if you ever toggle it |
 | `cas_gc_interval_sec` | `60` | Seconds between background GC rounds (≥ 1) |
 | `cas_blob_hash` | `cityhash128` | Pool blob content-hash function (`cityhash128` \| `xxh3-128` \| `sha256`). Recorded in the pool at creation; a mismatching config is refused at mount |
