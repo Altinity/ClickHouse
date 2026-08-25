@@ -29,7 +29,7 @@ services:
     ports:
       - "8474:8474"
   rustfs1:
-    image: rustfs/rustfs:1.0.0-beta.12
+    image: rustfs/rustfs:1.0.0-rc.3
     command: server --address 0.0.0.0:11121
     env_file: configs/rustfs.env
     expose:
