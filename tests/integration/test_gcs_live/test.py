@@ -261,10 +261,10 @@ def _disk_xml(
     if cas:
         lines += [
             "                <metadata_type>cas</metadata_type>",
-            "                <server_root_id>{}</server_root_id>".format(name),
-            "                <gc_interval_sec>3600</gc_interval_sec>",
+            "                <cas_server_root_id>{}</cas_server_root_id>".format(name),
+            "                <cas_gc_interval_sec>3600</cas_gc_interval_sec>",
             "                <gcs_max_conditional_put_bytes>{}</gcs_max_conditional_put_bytes>".format(FORMER_CONDITIONAL_PUT_CAP),
-            "                <staging_backend>{}</staging_backend>".format(staging_backend),
+            "                <cas_staging_backend>{}</cas_staging_backend>".format(staging_backend),
         ]
     lines += [
         "                <endpoint>{}/{}/{}/{}/</endpoint>".format(GCS_ENDPOINT, _xml(bucket or BUCKET), _xml(PREFIX), _xml(subprefix)),

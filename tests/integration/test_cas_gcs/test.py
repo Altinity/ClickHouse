@@ -115,7 +115,7 @@ def start_cluster():
         node.replace_in_config(
             CONFIG_IN_CONTAINER,
             "<http_client>gcs_hmac</http_client>",
-            "<http_client>gcs_hmac</http_client><staging_backend>s3</staging_backend>",
+            "<http_client>gcs_hmac</http_client><cas_staging_backend>s3</cas_staging_backend>",
         )
         # Add the ordinary GOOG4 peer dynamically so Task 9 stays within its four-file scope while
         # exercising the same fake service and signer independently of CAS request marking.
