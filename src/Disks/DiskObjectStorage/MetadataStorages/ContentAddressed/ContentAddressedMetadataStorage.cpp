@@ -319,7 +319,7 @@ Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(const s
     if (value == "s3")
         return Cas::StagingBackend::S3;
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown staging_backend value '{}' (expected 'local' or 's3')", value);
+        "Unknown cas_staging_backend value '{}' (expected 'local' or 's3')", value);
 }
 
 Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
@@ -348,7 +348,7 @@ Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate
             return {PartFolderValidate::Mode::Age, age_seconds};
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
+        "Unknown cas_part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
 }
 
 Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
@@ -829,7 +829,7 @@ void ContentAddressedMetadataStorage::startup()
         && !object_storage->supportsCopyMode(ObjectStorageCopyMode::NativeOnly))
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "staging_backend=s3 requires native-only same-store copy, but object storage {} does not support it",
+            "cas_staging_backend=s3 requires native-only same-store copy, but object storage {} does not support it",
             object_storage->getName());
 
     /// Everything below builds into LOCALS -- nothing is published to `cas_store`/`part_access`/

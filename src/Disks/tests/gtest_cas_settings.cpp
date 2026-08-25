@@ -77,6 +77,22 @@ size_t countOccurrences(const String & haystack, const String & needle)
         ++n;
     return n;
 }
+
+void expectLoadFailureWithExactMessage(const String & config, int code, const String & message)
+{
+    auto cfg = makeConfig(config);
+    ContentAddressedSettings settings;
+    try
+    {
+        settings.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        FAIL() << "expected settings load to fail";
+    }
+    catch (const Exception & e)
+    {
+        EXPECT_EQ(e.code(), code);
+        EXPECT_EQ(e.message(), message);
+    }
+}
 }
 
 TEST(CASContentAddressedSettings, DefaultsAndOverridesLand)
@@ -113,9 +129,42 @@ TEST(CASContentAddressedSettings, RemovedCacheSettingsAreRejected)
 
 TEST(CASContentAddressedSettings, UnknownKeyRejected)
 {
-    auto cfg = makeConfig("<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shardz>4</cas_gc_shardz>");
-    ContentAddressedSettings s;
-    EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros), Exception);
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shardz>4</cas_gc_shardz>",
+        ErrorCodes::UNKNOWN_SETTING,
+        "Unknown setting 'cas_gc_shardz'");
+}
+
+TEST(CASContentAddressedSettings, MissingRequiredSettingNamesExternalConfigKey)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_gc_shards>1</cas_gc_shards>",
+        ErrorCodes::NO_ELEMENTS_IN_CONFIG,
+        "Expected `cas_server_root_id` in config for a content-addressed disk");
+}
+
+TEST(CASContentAddressedSettings, InvalidBoundsDiagnosticNamesExternalConfigKeys)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>0</cas_gc_shards>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "content_addressed disk: cas_gc_interval_sec and cas_gc_shards must be >= 1 (got 60, 0)");
+}
+
+TEST(CASContentAddressedSettings, InvalidEnumDiagnosticsNameExternalConfigKeys)
+{
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_blob_hash>md5</cas_blob_hash>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "parseBlobHashAlgo: unknown cas_blob_hash config value 'md5' (expected one of cityhash128|xxh3-128|sha256)");
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_staging_backend>remote</cas_staging_backend>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "Unknown cas_staging_backend value 'remote' (expected 'local' or 's3')");
+    expectLoadFailureWithExactMessage(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_part_folder_validate>sometimes</cas_part_folder_validate>",
+        ErrorCodes::BAD_ARGUMENTS,
+        "Unknown cas_part_folder_validate value 'sometimes' (expected 'always', 'never', or 'age <non-negative integer seconds>')");
 }
 
 /// The point of this test is that none of these names appears anywhere in CAS code. It is not an

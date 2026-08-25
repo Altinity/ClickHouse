@@ -155,7 +155,12 @@ void ContentAddressedSettings::loadFromConfig(
     {
         const auto base = splitRepeatIndex(key).base;
         if (base.starts_with(CAS_KEY_PREFIX))
-            candidate.impl->set(base.substr(CAS_KEY_PREFIX.size()), config.getString(config_prefix + "." + key));
+        {
+            const auto internal_name = base.substr(CAS_KEY_PREFIX.size());
+            if (!ContentAddressedSettingsImpl::hasBuiltin(internal_name))
+                BaseSettingsHelpers::throwSettingNotFound(base);
+            candidate.impl->set(internal_name, config.getString(config_prefix + "." + key));
+        }
     }
 
     for (const std::string & key : legacy_names)
@@ -220,7 +225,7 @@ void ContentAddressedSettings::validate()
 
     if (settings[ContentAddressedSetting::gc_interval_sec] == 0 || settings[ContentAddressedSetting::gc_shards] == 0)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "content_addressed disk: gc_interval_sec and gc_shards must be >= 1 (got {}, {})",
+            "content_addressed disk: cas_gc_interval_sec and cas_gc_shards must be >= 1 (got {}, {})",
             settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value);
 
     /// The layout subtree identity is explicit and REQUIRED — no default, so an ABSENT key throws a
@@ -230,7 +235,7 @@ void ContentAddressedSettings::validate()
     /// explicitly via the subscript operator); an unset field never reaches here as anything but empty.
     if (!settings[ContentAddressedSetting::server_root_id].changed)
         throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
-            "Expected `server_root_id` in config for a content-addressed disk");
+            "Expected `cas_server_root_id` in config for a content-addressed disk");
 
     Cas::validateServerRootId(settings[ContentAddressedSetting::server_root_id].value);
 
