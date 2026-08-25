@@ -114,8 +114,20 @@ MSG
 git log --oneline -1
 ```
 
-The tree is shared with other sessions. After every commit, confirm `git log --oneline -1` is the
-commit you just made.
+The tree is shared with other sessions. Two things follow, and both have already gone wrong here:
+
+- **Confirm the branch, not only the commit.** After every commit run
+  `git rev-parse --abbrev-ref HEAD` as well as `git log --oneline -1`. Another session checking out
+  its own branch moves this worktree under you, and a commit that looks correct in
+  `git log -1` can land on a branch you never chose.
+- **Record a baseline before the first edit**, because `git status` in this tree is never clean:
+
+  ```bash
+  mkdir -p tmp/sweep
+  git status --porcelain > tmp/sweep/baseline_status.txt
+  ```
+
+  Every later cleanliness check is a diff against that file, not against an empty status.
 
 ## File Structure {#file-structure}
 
@@ -237,14 +249,87 @@ BUILD with `build_task1_green.log`, ANALYZE, then TEST with
 `--gtest_filter='S3AuthSettingsConfig.*'` into `build/test_s3_auth_settings.log` and dispatch the
 analysis subagent. Expected: 1 test, passing.
 
-- [ ] **Step 5: Rewrite the CAS backend assertions to the flag alone**
+- [ ] **Step 5: Move the cap out of the backend constructor in every test that passes it**
 
-In `src/Disks/tests/gtest_cas_backend_generation.cpp`, test
-`CASBackendGeneration.ConditionalWriteSettingsForceSinglePutOnGenerationStores`: drop the
-`/*conditional_single_put_cap=*/123` constructor argument, and delete both
-`s3_single_part_upload_max_bytes_override` assertions. The two surviving assertions on that field's
-neighbours — `s3_force_single_part_upload` true for `Generation` and false for `ETag` — are the
-behaviour this test now pins. Everything else in the test is unchanged.
+`src/Disks/tests/gtest_cas_backend_generation.cpp` has **four** sites handing a cap to the
+constructor, not one. Removing the parameter without converting all four fails to compile.
+
+1. `CASBackendGeneration.ConditionalWriteSettingsForceSinglePutOnGenerationStores` — drop the
+   `/*conditional_single_put_cap=*/123` argument and both
+   `s3_single_part_upload_max_bytes_override` assertions. The surviving assertions —
+   `s3_force_single_part_upload` true for `Generation`, false for `ETag` — are what it pins now.
+2. The `CASBackendGenerationS3` fixture helper `makeBackend(uint64_t cap, TokenType)` — the cap
+   belongs to the object storage now, so the signature becomes
+   `makeBackend(TokenType token_type = TokenType::Generation)` and its seven call sites drop
+   `/*cap=*/1024`, a don't-care in all seven.
+3. `CASBackendGeneration.PublishBlobAboveFormerGenerationCapUsesOrdinaryMultipart` — here the cap is
+   the point (publication must ignore it), so it moves onto the storage rather than disappearing.
+4. `CASBackendGeneration.PublishBlobSucceedsWithoutResponseGeneration` — same, with cap 1.
+
+Give the storage helper a cap parameter:
+
+```cpp
+std::shared_ptr<DB::S3ObjectStorage> makeGenerationS3ObjectStorageForTest(
+    FakeGenerationS3Client *& out_client,
+    bool force_multipart = false,
+    std::optional<UInt64> conditional_put_cap = {})
+{
+    ...
+    if (conditional_put_cap)
+        settings->auth_settings[S3AuthSetting::gcs_max_conditional_put_bytes] = *conditional_put_cap;
+    ...
+}
+```
+
+The `...` lines are the helper's existing body, unchanged. Pass `/*conditional_put_cap=*/16` and
+`/*conditional_put_cap=*/1` at sites 3 and 4, and add the
+`extern const S3AuthSettingsUInt64 gcs_max_conditional_put_bytes;` declaration to the file's
+namespace block.
+
+- [ ] **Step 5b: Add the test the move actually needs**
+
+No test today asserts that the cap is *enforced* on a conditional write. The fixture comment claims
+"single-PUT cap enforcement ... exercised for real", but every test that passes a cap asserts
+something else and passes a don't-care value. The move is the moment to add it, and it is cheap: the
+fixture already builds a real `S3ObjectStorage` over `FakeGenerationS3Client`, so the whole path is
+exercisable — CAS sets the flag, `writeObject` reads the cap from the storage's own settings,
+`WriteBufferFromS3` enforces it.
+
+```cpp
+/// The moved cap, end to end: a conditional write on a generation store stays in ONE PUT up to the
+/// cap the OBJECT STORAGE carries, and refuses rather than silently taking the multipart path above
+/// it -- GCS enforces no precondition on CompleteMultipartUpload.
+TEST(CASBackendGeneration, ConditionalWriteHonoursTheObjectStorageConditionalPutCap)
+{
+    (void)getContext();
+    FakeGenerationS3Client * client = nullptr;
+    auto storage = makeGenerationS3ObjectStorageForTest(
+        client, /*force_multipart=*/false, /*conditional_put_cap=*/64);
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+    backend.setNativeTokenTypeForTest(TokenType::Generation);
+
+    const String small(32, 'a');
+    EXPECT_NO_THROW(backend.casPut("p/gen/under-cap", small, std::nullopt, ObjectMeta{}));
+    EXPECT_EQ(client->put_object_calls, 1u);
+    EXPECT_EQ(client->create_multipart_calls, 0u);
+
+    const String large(4096, 'b');
+    try
+    {
+        backend.casPut("p/gen/over-cap", large, std::nullopt, ObjectMeta{});
+        FAIL() << "a conditional write above the cap must refuse, not go multipart";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NOT_IMPLEMENTED);
+    }
+    EXPECT_EQ(client->create_multipart_calls, 0u);
+}
+```
+
+Read `casPut`'s exact signature in `CasObjectStorageBackend.h` before writing the assertions and use
+the real one — the shape above is the conditional-write entry point as of writing, and the test uses
+what is there, not this sketch.
 
 - [ ] **Step 6: Remove the field and its producer**
 
@@ -424,17 +509,81 @@ TEST(CASContentAddressedSettings, LegacySpellingStillLoadsDuringMigrationWindow)
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
 }
 
-/// A partially migrated block loads, and the warning is the only signal that a key was written in
-/// the superseded spelling -- so the warning is part of the contract, not decoration.
+/// A partially migrated block loads, and the warning is the ONLY signal that a key was written in
+/// the superseded spelling -- so the warning is asserted, not assumed. `ScopedCasGcLogCapture` in
+/// `gtest_cas_ref_catalog.cpp` is the pattern this copies: swap the logger's channel for a
+/// `Poco::StreamChannel` over a string stream, restore it in the destructor.
+namespace
+{
+class ScopedCasSettingsLogCapture
+{
+public:
+    ScopedCasSettingsLogCapture()
+        : logger(getLogger("ContentAddressedSettings"))
+        , channel(new Poco::StreamChannel(stream))
+        , old_channel(logger->getChannel())
+        , old_level(logger->getLevel())
+    {
+        logger->setChannel(channel.get());
+        logger->setLevel("warning");
+    }
+
+    ~ScopedCasSettingsLogCapture()
+    {
+        logger->setChannel(old_channel);
+        logger->setLevel(old_level);
+    }
+
+    String captured() const { return stream.str(); }
+
+private:
+    LoggerPtr logger;
+    std::ostringstream stream;
+    Poco::AutoPtr<Poco::StreamChannel> channel;
+    Poco::AutoPtr<Poco::Channel> old_channel;
+    int old_level;
+};
+
+size_t countOccurrences(const String & haystack, const String & needle)
+{
+    size_t n = 0;
+    for (size_t at = haystack.find(needle); at != String::npos; at = haystack.find(needle, at + 1))
+        ++n;
+    return n;
+}
+}
+
 TEST(CASContentAddressedSettings, PartialMigrationLoadsAndReportsEveryLegacyKey)
 {
     auto cfg = makeConfig(
         "<cas_server_root_id>srv1</cas_server_root_id>"
         "<gc_shards>4</gc_shards><gc_interval_sec>7</gc_interval_sec>");
     ContentAddressedSettings s;
-    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    String captured;
+    {
+        ScopedCasSettingsLogCapture capture;
+        s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+        captured = capture.captured();
+    }
     EXPECT_EQ(s[ContentAddressedSetting::gc_shards].value, 4u);
     EXPECT_EQ(s[ContentAddressedSetting::gc_interval_sec].value, 7u);
+
+    /// ONE aggregated report per disk, naming EVERY superseded key -- not one line per key, and not
+    /// a line that names only the first one found.
+    EXPECT_EQ(countOccurrences(captured, "superseded unprefixed spelling"), 1u);
+    EXPECT_NE(captured.find("gc_shards"), String::npos);
+    EXPECT_NE(captured.find("gc_interval_sec"), String::npos);
+}
+
+/// The negative half. Without it, a warning emitted unconditionally would still pass the test above.
+TEST(CASContentAddressedSettings, FullyMigratedBlockWarnsAboutNothing)
+{
+    auto cfg = makeConfig(
+        "<cas_server_root_id>srv1</cas_server_root_id><cas_gc_shards>4</cas_gc_shards>");
+    ContentAddressedSettings s;
+    ScopedCasSettingsLogCapture capture;
+    s.loadFromConfig(*cfg, "disk", "/scratch", "/scratch", identity_macros);
+    EXPECT_EQ(capture.captured().find("superseded"), String::npos);
 }
 
 TEST(CASContentAddressedSettings, BothSpellingsOfOneSettingRejected)
@@ -563,9 +712,10 @@ confirm the remaining reds are the expected `UNKNOWN_SETTING` / missing-value fa
 
 - [ ] **Step 4: Implement the namespace and the window**
 
-In `ContentAddressedSettings.cpp`, delete `non_cas_keys` and its comment block in full. Add
-`UNKNOWN_SETTING` to the file's `ErrorCodes`, include `<Common/logger_useful.h>`, and add to the
-anonymous namespace:
+In `ContentAddressedSettings.cpp`, delete `non_cas_keys` and its comment block in full. Fix the
+includes in the same edit: the new code needs `<Common/logger_useful.h>`, `<fmt/ranges.h>` for
+`fmt::join`, `<vector>` and `<string_view>`, and `<set>` becomes unused when `non_cas_keys` goes.
+Add `UNKNOWN_SETTING` to the file's `ErrorCodes` block, and add to the anonymous namespace:
 
 ```cpp
 /// Poco renders repeated XML elements as `name`, `name[1]`, `name[2]` -- the convention
@@ -713,10 +863,19 @@ git grep -l "server_root_id" -- '*.xml'
 
 **Interfaces:** consumes Task 2's key contract; produces nothing later tasks read.
 
-- [ ] **Step 1: Rename the twenty-five keys**
+- [ ] **Step 1: Save the file list, then rename the twenty-five keys**
+
+The tree is shared with other sessions and carries untracked artifacts, so every sweep task records
+the files it is going to touch **before** touching them, and stages only that list:
+
+```bash
+mkdir -p tmp/sweep
+git grep -l "server_root_id" -- '*.xml' | sort > tmp/sweep/task3_files.txt
+wc -l tmp/sweep/task3_files.txt
+```
 
 For each of the twenty-five names in the specification's rename table, rewrite `<name>` and
-`</name>` to `<cas_name>` and `</cas_name>` in those files only. Do **not** touch
+`</name>` to `<cas_name>` and `</cas_name>` in the files on that list only. Do **not** touch
 `skip_access_check`, `gcs_max_conditional_put_bytes`, or any generic key (`path`, `name`, `type`,
 `endpoint`, `object_storage_type`, `metadata_type`).
 
@@ -751,7 +910,9 @@ server that fails to start shows up as "Server died" / connection refused, not a
 - [ ] **Step 4: Commit**
 
 ```bash
-git add $(git grep -l "cas_server_root_id" -- '*.xml')
+git status --porcelain -- $(cat tmp/sweep/task3_files.txt)
+git add --pathspec-from-file=tmp/sweep/task3_files.txt
+git status --porcelain --cached
 git commit -F - <<'MSG'
 test: move the XML CAS disk configurations to the `cas_` prefix
 
@@ -768,10 +929,12 @@ Sweep class 2 — 32 files (18 `.sh`, 13 `.sql`, 1 `.py`), ~54 assignment lines.
 multi-line, so the sites are `key = value` lines inside a `disk(` argument list, not a single-line
 pattern.
 
-**Files:** enumerate with
+**Files:** save the list first, as in Task 3:
 
 ```bash
-git grep -lE "metadata_type[[:space:]]*=[[:space:]]*'?cas'?" -- 'tests/*' ':!*.md' ':!*.xml'
+git grep -lE "metadata_type[[:space:]]*=[[:space:]]*'?cas'?" -- 'tests/*' ':!*.md' ':!*.xml' \
+    | sort > tmp/sweep/task4_files.txt
+wc -l tmp/sweep/task4_files.txt
 ```
 
 - [ ] **Step 1: Rename the twenty-five keys in those files**
@@ -790,22 +953,34 @@ git grep -nE "^[[:space:]]*(server_root_id|gc_enabled|gc_interval_sec|gc_shards|
 
 Must print nothing.
 
-- [ ] **Step 3: Run the stateless CAS tests**
+- [ ] **Step 3: Run every stateless test this task touched — derived, not hand-picked**
+
+A hand-written selector list silently under-covers a sweep. Derive it from the files that actually
+changed:
 
 ```bash
-python3 -m ci.praktika run "Stateless tests (arm_binary, parallel)" \
-    --test 04278 04279 04282 04283 04285 04287 04289 05000 05001 05002 05004 05006 05007 05015 \
+SEL=$(grep '^tests/queries/0_stateless/' tmp/sweep/task4_files.txt \
+      | sed -E 's|.*/([0-9]{5})_.*|\1|' | sort -u | tr '\n' ' ')
+echo "selectors: $SEL"
+python3 -m ci.praktika run "Stateless tests (arm_binary, parallel)" --test $SEL \
     > build/test_task4_stateless.log 2>&1
 ```
 
-One `--test` flag, space separated. Dispatch a subagent to read the log and report the
-`Failed: N, Passed: M` tally and every non-OK test. The run is finished only at
-`Run script finished`; per-worker "N tests passed" lines appear mid-run and are not the verdict.
+One `--test` flag, space separated — repeating the flag silently keeps only the last value. If the
+list is long enough to be unwieldy, split it into batches of roughly ten and write each batch to its
+own log file; never drop a selector to shorten the run.
+
+Dispatch a subagent per log to report the `Failed: N, Passed: M` tally and every non-OK test. The run
+is finished only at `Run script finished`; per-worker "N tests passed" lines appear mid-run and are
+not the verdict. Confirm the count of tests actually run matches the number of selectors — a selector
+that matches nothing is a silent gap, not a pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/queries/0_stateless
+git status --porcelain -- $(cat tmp/sweep/task4_files.txt)
+git add --pathspec-from-file=tmp/sweep/task4_files.txt
+git status --porcelain --cached
 git commit -F - <<'MSG'
 test: move the inline CAS disk() stateless tests to the `cas_` prefix
 
@@ -831,7 +1006,9 @@ most likely place for a missed site.
 - `utils/ca-soak/docker-compose*.yml` and `utils/ca-soak/configs/*.xml` if Task 3 did not already
   cover them.
 
-- [ ] **Step 1: Rename in string literals and dictionary keys**
+- [ ] **Step 1: Save the file list, then rename in string literals and dictionary keys**
+
+Record the files the two greps below name, into `tmp/sweep/task5_files.txt`, before editing:
 
 ```bash
 git grep -nE "<(server_root_id|gc_enabled|gc_interval_sec|gc_shards|scratch_path|blob_hash|staging_backend|part_folder_validate|manifest_decode_cache_bytes)>" \
@@ -872,8 +1049,14 @@ verdicts out of the log body rather than trusting the exit code.
 
 - [ ] **Step 4: Commit**
 
+`utils/ca-soak` currently holds another session's edit to `RUN_HISTORY.md` and a pile of untracked
+`.db` and `.yml` run artifacts. Staging the directory would sweep all of it into this commit, so
+stage the recorded list and nothing else:
+
 ```bash
-git add tests/integration utils/ca-soak
+git status --porcelain -- $(cat tmp/sweep/task5_files.txt)
+git add --pathspec-from-file=tmp/sweep/task5_files.txt
+git status --porcelain --cached
 git commit -F - <<'MSG'
 test: move the Python-assembled CAS configurations to the `cas_` prefix
 
@@ -913,7 +1096,11 @@ BUILD with `build_task6.log`, ANALYZE, TEST with `--gtest_filter='CAS*'` into
 - [ ] **Step 3: Commit**
 
 ```bash
-git add src/Disks/tests src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md
+git add src/Disks/tests/gtest_cas_part_folder_access.cpp \
+    src/Disks/tests/gtest_cas_retirement_sweep.cpp \
+    src/Disks/tests/gtest_cas_s3_staging.cpp \
+    src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/README.md
+git status --porcelain --cached
 git commit -F - <<'MSG'
 test: move the CAS config literals in C++ tests to the `cas_` prefix
 
@@ -928,13 +1115,15 @@ git log --oneline -1
 
 18 files under `docs/en`, ~167 occurrences of the twenty-five names.
 
-**Files:** `docs/en/antalya/cas/configuration.md`, `docs/en/operations/storing-data.md`,
-`docs/en/antalya/cas/quick-start.md`, `docs/en/antalya/cas/architecture/*.md`,
-`docs/en/antalya/cas/operations/*.md`, and the rest of
+**Files:** record the list first, as in Task 3:
 
 ```bash
-git grep -lE "server_root_id|gc_interval_sec|part_folder_validate" -- 'docs/en/**'
+git grep -lE "server_root_id|gc_interval_sec|part_folder_validate" -- 'docs/en/**' \
+    | sort > tmp/sweep/task7_files.txt
 ```
+
+It covers `docs/en/antalya/cas/configuration.md`, `docs/en/operations/storing-data.md`,
+`docs/en/antalya/cas/quick-start.md`, and the architecture and operations pages.
 
 - [ ] **Step 1: Rename the keys in prose, tables and examples**
 
@@ -970,7 +1159,10 @@ git grep -n "choosing-blob-hash" -- 'docs/**'
 - [ ] **Step 5: Commit**
 
 ```bash
-git add docs/en src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp
+git status --porcelain -- $(cat tmp/sweep/task7_files.txt)
+git add --pathspec-from-file=tmp/sweep/task7_files.txt \
+    src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp
+git status --porcelain --cached
 git commit -F - <<'MSG'
 docs: document the `cas_` config-key prefix and its migration window
 
@@ -981,155 +1173,121 @@ git log --oneline -1
 
 ---
 
-## Task 8: A CAS-over-Azure smoke {#task-8}
+## Task 8: End-to-end proof on the keys that used to fail {#task-8}
 
-The claim this whole change makes is that any backend's settings now work. No CAS test in the tree
-configures an Azure backend, and that absence is a symptom rather than an oversight: Azure keys are
-read ad-hoc and unprefixed by `AzureBlobStorageCommon`, none of them was in `non_cas_keys`, so a CAS
-disk over Azure could not start. Azure is the case that proves the claim; another S3 test restates it.
+The reachable claim is "CAS no longer rejects a backend's settings", and the field report is its
+concrete case: `<http_keep_alive_timeout>` in a CAS disk block failed server startup. Prove exactly
+that, in a lane that already exists.
+
+**Not Azure.** A CAS pool cannot be hosted on Azure regardless of config parsing: any non-Local
+object storage opens in `Native` mode (`ContentAddressedMetadataStorage::openPoolView`), and Native
+requires enforced conditional operations — `removeObjectIfTokenMatches`, whose base implementation
+throws by design so the capability probe fails closed, and `supportsRetryProfile(SingleAttempt)`,
+whose base implementation returns false. Azure implements neither. "The CAS parser accepts Azure
+keys" and "Azure can host a CAS pool" are different claims, and only the first is true after this
+change. The Azure spellings are covered where they belong — in the unit test of Task 2, which asserts
+they are not inspected.
 
 **Files:**
-- Create: `tests/integration/test_cas_azure/__init__.py`
-- Create: `tests/integration/test_cas_azure/configs/storage_conf.xml`
-- Create: `tests/integration/test_cas_azure/test.py`
+- Modify: `tests/integration/test_cas_s3/configs/storage_conf.xml`
+- Modify: `tests/integration/test_cas_s3/test.py`
 
-**Interfaces:** consumes the `cas_` key contract from Task 2. Produces nothing.
+- [ ] **Step 1: Add the previously rejected keys to the CAS disk block**
 
-- [ ] **Step 1: Write the disk configuration**
-
-`tests/integration/test_cas_azure/configs/storage_conf.xml` — the Azure keys are exactly those
-`tests/config/config.d/azure_storage_conf.xml` uses, and the CAS keys carry the prefix. The point of
-the test is that the two key spaces coexist in one block:
+Into the existing CAS disk element in `tests/integration/test_cas_s3/configs/storage_conf.xml`, and
+nothing else about the disk changes:
 
 ```xml
-<clickhouse>
-    <storage_configuration>
-        <disks>
-            <cas_azure>
-                <type>object_storage</type>
-                <object_storage_type>azure</object_storage_type>
-                <metadata_type>cas</metadata_type>
-                <container_name>cas-tests</container_name>
-                <connection_string>DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite1:10000/devstoreaccount1;</connection_string>
-                <max_single_part_upload_size>33554432</max_single_part_upload_size>
-                <cas_server_root_id>azure-node</cas_server_root_id>
-                <cas_gc_enabled>1</cas_gc_enabled>
-                <cas_gc_interval_sec>5</cas_gc_interval_sec>
-            </cas_azure>
-        </disks>
-        <policies>
-            <cas_azure>
-                <volumes>
-                    <main>
-                        <disk>cas_azure</disk>
-                    </main>
-                </volumes>
-            </cas_azure>
-        </policies>
-    </storage_configuration>
-</clickhouse>
+                <!-- Settings of the underlying object storage, in the same element as the CAS
+                     settings. Each of these used to fail server startup on a CAS disk. -->
+                <http_keep_alive_timeout>60</http_keep_alive_timeout>
+                <http_keep_alive_max_requests>100</http_keep_alive_max_requests>
+                <connect_timeout_ms>5000</connect_timeout_ms>
+                <s3_retry_attempts>7</s3_retry_attempts>
+                <s3_max_single_read_retries>3</s3_max_single_read_retries>
+                <header>X-Cas-Test: 1</header>
 ```
 
-- [ ] **Step 2: Write the test**
+Deliberately **not** included: `<proxy>`, which would route requests through a host that does not
+exist, and any credential key, which would change what the lane authenticates as. The point is keys
+that are parsed and inert, not keys that change behaviour.
 
-`tests/integration/test_cas_azure/test.py`. `with_azurite=True` is how the existing Azure integration
-tests get a backend; `tests/integration/test_azure_blob_storage_plain_rewritable/test.py` is the
-working example to copy the fixture shape from.
+- [ ] **Step 2: Add the test that names what is being proven**
+
+In `tests/integration/test_cas_s3/test.py`:
 
 ```python
-import pytest
+def test_disk_accepts_backend_settings_that_used_to_be_rejected(started_cluster):
+    """The CAS disk block carries settings of its underlying object storage.
 
-from helpers.cluster import ClickHouseCluster
-
-cluster = ClickHouseCluster(__file__)
-
-
-@pytest.fixture(scope="module")
-def started_cluster():
-    try:
-        cluster.add_instance(
-            "node",
-            main_configs=["configs/storage_conf.xml"],
-            with_azurite=True,
-            stay_alive=True,
-        )
-        cluster.start()
-        yield cluster
-    finally:
-        cluster.shutdown()
-
-
-def test_cas_over_azure_round_trip(started_cluster):
-    """A CAS disk over a non-S3 backend starts and round-trips data.
-
-    The backend's own settings (`container_name`, `connection_string`,
-    `max_single_part_upload_size`) sit in the same disk element as the CAS settings and are read by
-    the object storage, not by CAS.
+    Before the `cas_` namespace, the CAS settings scanned the whole disk element and rejected every
+    key they did not recognise, so `http_keep_alive_timeout` -- the mitigation suggested in #2243 --
+    failed server startup. The server having started with the config this module installs is most of
+    the proof; this test states it, and checks the disk is actually usable rather than merely
+    present.
     """
     node = started_cluster.instances["node"]
-    node.query("DROP TABLE IF EXISTS t_cas_azure SYNC")
+    assert node.query(
+        "SELECT count() FROM system.disks WHERE name = 'cas_s3'"
+    ).strip() == "1"
+    node.query("DROP TABLE IF EXISTS t_foreign_settings SYNC")
     node.query(
-        "CREATE TABLE t_cas_azure (a UInt64, s String) ENGINE = MergeTree ORDER BY a "
-        "SETTINGS storage_policy = 'cas_azure'"
+        "CREATE TABLE t_foreign_settings (a UInt64) ENGINE = MergeTree ORDER BY a "
+        "SETTINGS storage_policy = 'cas_s3'"
     )
-    node.query("INSERT INTO t_cas_azure SELECT number, toString(number) FROM numbers(1000)")
-    assert node.query("SELECT count(), sum(a) FROM t_cas_azure").strip() == "1000\t499500"
-
-    node.restart_clickhouse()
-    assert node.query("SELECT count(), sum(a) FROM t_cas_azure").strip() == "1000\t499500"
-    node.query("DROP TABLE t_cas_azure SYNC")
+    node.query("INSERT INTO t_foreign_settings SELECT number FROM numbers(100)")
+    assert node.query("SELECT sum(a) FROM t_foreign_settings").strip() == "4950"
+    node.query("DROP TABLE t_foreign_settings SYNC")
 ```
 
-The restart is the part that matters: it re-reads the configuration and re-mounts the pool, so it
-proves the disk is configurable and not merely creatable.
+Check the instance name, disk name and policy name against the module's own fixture before writing
+them — the names above follow the module's convention but the fixture is the authority.
 
 - [ ] **Step 3: Establish what the test proves, mechanically**
 
-A failing-first run is not available here: the capability did not exist, so there is no prior binary
-to fail against. Establish the claim from the tree instead, which is checkable rather than asserted:
+A failing-first run is not available: there is no prior binary to fail against. Establish the claim
+from history instead, which is checkable rather than asserted:
 
 ```bash
-git show HEAD~4:src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp     | grep -nE "container_name|connection_string|account_name|max_single_part_upload_size"
+git show <commit-before-task-2>:src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.cpp \
+    | sed -n '/non_cas_keys = {/,/};/p'
 ```
 
-Point the revision at the commit before Task 2 — `git log --oneline` to find it. `container_name`,
-`connection_string` and `account_name` must be absent from the `non_cas_keys` set it prints, which is
-what made this configuration impossible: the scanner would have handed each of them to
-`BaseSettings::set`. `max_single_part_upload_size` is the one Azure key that *was* listed, which is
-why it is in the configuration above — the test then covers both halves of the old list, the entry
-that existed and the entries that did not.
+`http_keep_alive_timeout`, `http_keep_alive_max_requests`, `connect_timeout_ms`, `header` and every
+`s3_`-prefixed name must be absent from the set it prints. That absence is what made each of them
+fail server startup, and it is why these particular keys are the ones in the config.
 
-- [ ] **Step 4: Run it**
+- [ ] **Step 4: Run the lane**
 
 ```bash
 ninja -C build clickhouse > build/build_server_task8.log 2>&1
 echo "NINJA_EXIT=$?"
-python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_azure \
-    > build/test_task8_azure.log 2>&1
+strings build/programs/clickhouse | grep -c cas_server_root_id
+python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" --test test_cas_s3 \
+    > build/test_task8.log 2>&1
 ```
 
-Dispatch a subagent to read the pytest summary out of the log body. If the module errors at fixture
-setup with `manifest unknown`, that is the known local docker-image blocker for modules pulling an
-old server image — it does not apply to `with_azurite`, so an error there is a real failure.
+Praktika exits 0 even when integration tests fail; dispatch a subagent to read the pytest summary out
+of the log body.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/integration/test_cas_azure
+git add tests/integration/test_cas_s3/configs/storage_conf.xml tests/integration/test_cas_s3/test.py
+git status --porcelain --cached
 git commit -F - <<'MSG'
-test: add a CAS-over-Azure smoke
+test: pin that a CAS disk carries its backend's own settings
 
-A CAS disk over Azure could not previously be configured: the CAS settings
-rejected every key they did not recognise, and no Azure key was in the
-skip-list. This is the case that proves the disk block now carries an arbitrary
-backend's settings, which another S3 test would only restate.
+`http_keep_alive_timeout` in a CAS disk block used to fail server startup, which
+is what blocked the mitigation suggested in Altinity/ClickHouse#2243. The CAS
+integration disk now carries that key and five more of the same class, so the
+lane fails if the disk block ever stops accepting them.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 MSG
 git log --oneline -1
+git rev-parse --abbrev-ref HEAD
 ```
-
----
 
 ## Task 9: The full gate {#task-9}
 
@@ -1150,62 +1308,117 @@ echo "GTEST_EXIT=$?"
 
 ANALYZE the build log and each test log with its own subagent.
 
-- [ ] **Step 2: Stateless lanes, both backends**
+- [ ] **Step 2: Stateless lanes, both backends, with derived selectors**
 
 ```bash
 ln -sf "$(pwd)/build/programs/clickhouse" ci/tmp/clickhouse
 ninja -C build clickhouse > build/build_gate_server.log 2>&1
 echo "NINJA_EXIT=$?"
-python3 -m ci.praktika run "Stateless tests (arm_binary, parallel)" \
-    --test 04278 04279 04282 04283 04285 04287 04289 05000 05001 05002 05004 05006 05007 05015 \
+SEL=$(grep '^tests/queries/0_stateless/' tmp/sweep/task4_files.txt \
+      | sed -E 's|.*/([0-9]{5})_.*|\1|' | sort -u | tr '\n' ' ')
+echo "selectors: $SEL"
+python3 -m ci.praktika run "Stateless tests (arm_binary, parallel)" --test $SEL \
     > build/gate_stateless_local.log 2>&1
 python3 -m ci.praktika run "Stateless tests (arm_binary, content_addressed s3 storage, parallel)" \
-    --test 04278 04279 05000 05002 05007 \
-    > build/gate_stateless_cas_s3.log 2>&1
+    --test $SEL > build/gate_stateless_cas_s3.log 2>&1
 ```
 
-The CA-s3 lane needs `ci/tmp/rustfs`; if it is missing the server-start step fails with
-"rustfs binary not found". Restore it rather than skipping the lane, and never delete it during
-`ci/tmp` cleanup. Only one praktika job runs per worktree at a time — a second returns
-"Docker container 'praktika_...' is already running".
+The selector list is derived from the recorded sweep list, not hand-picked, and both lanes get the
+same list. Split into batches of about ten if a single invocation is unwieldy, and give each batch
+its own log; never shorten the list.
 
-Some reference diffs on that lane are known false positives unrelated to CAS; treat a diff as real
-only after confirming the test touches a CAS disk.
+The CA-s3 lane needs `ci/tmp/rustfs`; without it the server-start step fails with "rustfs binary not
+found". Restore it rather than skipping the lane, and never delete it during `ci/tmp` cleanup. Only
+one praktika job runs per worktree at a time — a second returns "Docker container 'praktika_...' is
+already running", so these two invocations are sequential, not concurrent.
+
+Some reference diffs on the CA-s3 lane are known false positives unrelated to CAS; treat a diff as
+real only after confirming the test touches a CAS disk.
 
 - [ ] **Step 3: Integration lanes**
 
 ```bash
 python3 -m ci.praktika run "Integration tests (amd_binary, 1/5)" \
-    --test test_cas_s3 test_cas_gc_s3 test_cas_gcs test_cas_gc_sharded test_cas_shared_pool test_cas_azure \
+    --test test_cas_s3 test_cas_gc_s3 test_cas_gcs test_cas_gc_sharded test_cas_shared_pool \
     > build/gate_integration.log 2>&1
 ```
 
 Read the pytest summary from the log body; the exit code is 0 even on failures.
 
-- [ ] **Step 4: Confirm the sweep is complete**
+- [ ] **Step 4: Confirm the sweep is complete — all five classes, not just XML**
+
+An XML-only check passes while an inline `disk(...)`, a Python dictionary key or a string-literal
+fragment is still unprefixed. Run one probe per class. Define the name list once:
 
 ```bash
-git grep -nE "<(server_root_id|gc_enabled|gc_interval_sec|gc_shards|scratch_path|blob_hash|blob_hash_allow_new|staging_backend|part_folder_validate|part_folder_cache_bytes|part_folder_cache_max_entries|part_folder_cache_max_entry_bytes|manifest_decode_cache_bytes|manifest_sweep_list_budget_keys|manifest_sweep_delete_budget_keys|gc_snapshot_generations_to_keep|gc_meta_pool_size|gc_round_graduation_budget|gc_round_redelete_budget|gc_round_sweep_namespace_budget|gc_round_sweep_recovery_op_budget|gc_round_ref_cleanup_budget|gc_round_prefix_wholesale_budget|gc_round_handoff_prefix_wholesale_budget|gc_round_outcome_entry_budget)>" \
-    -- ':!src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats' \
-       ':!src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool' \
-       ':!src/Storages/System' ':!docs/superpowers'
+KEYS='server_root_id|gc_enabled|gc_interval_sec|gc_shards|scratch_path|blob_hash|blob_hash_allow_new|staging_backend|part_folder_validate|part_folder_cache_bytes|part_folder_cache_max_entries|part_folder_cache_max_entry_bytes|manifest_decode_cache_bytes|manifest_sweep_list_budget_keys|manifest_sweep_delete_budget_keys|gc_snapshot_generations_to_keep|gc_meta_pool_size|gc_round_graduation_budget|gc_round_redelete_budget|gc_round_sweep_namespace_budget|gc_round_sweep_recovery_op_budget|gc_round_ref_cleanup_budget|gc_round_prefix_wholesale_budget|gc_round_handoff_prefix_wholesale_budget|gc_round_outcome_entry_budget'
+```
+
+Class 1, XML elements:
+
+```bash
+git grep -nE "<($KEYS)>" -- '*.xml'
+```
+
+Class 2, inline `disk(...)` assignments, inside the files that build one:
+
+```bash
+git grep -nE "^[[:space:]]*($KEYS)[[:space:]]*=" -- $(cat tmp/sweep/task4_files.txt)
+```
+
+Class 3, XML fragments in string literals, and class 4, dictionary keys:
+
+```bash
+git grep -nE "<($KEYS)>" -- 'tests/*' 'utils/*' ':!*.xml' ':!*.md'
+git grep -nE "\"($KEYS)\"[[:space:]]*:" -- 'tests/*' 'utils/*' ':!*.md'
+```
+
+Class 5, C++ string literals, by closing tag so the path placeholders in `Formats/`, `Pool/` and
+`src/Storages/System` do not register:
+
+```bash
+git grep -nE "</($KEYS)>" -- 'src/**'
+```
+
+Documentation:
+
+```bash
+git grep -nE "\`($KEYS)\`" -- 'docs/en/**'
+```
+
+And the double-prefix probe, which catches a sed applied twice:
+
+```bash
 git grep -n "cas_cas_" -- ':!docs/superpowers'
 ```
 
-The first excludes the path-placeholder sites; anything else it prints is a missed sweep site. The
-second must print nothing.
+Every one of these must print nothing except the known path-placeholder sites, which the class-5
+probe already excludes by shape. Anything else is a missed sweep site.
 
-- [ ] **Step 5: Confirm the tree is otherwise clean**
+- [ ] **Step 5: Confirm the tree is otherwise unchanged, against the recorded baseline**
+
+`git status` in this tree is never clean, so compare with the baseline recorded before the first
+edit rather than expecting emptiness:
 
 ```bash
-git status --porcelain -- src tests docs utils
+git status --porcelain > tmp/sweep/final_status.txt
+diff tmp/sweep/baseline_status.txt tmp/sweep/final_status.txt
 ```
 
-After a cross-cutting sweep, check the whole tree, not only the files you meant to touch. This tree
-is shared with other sessions and has large untracked artifact directories; do not stage anything
-this plan did not name.
+The only differences should be files this plan named. Anything else — especially under
+`utils/ca-soak`, which carries another session's edits and untracked run artifacts — is something a
+sweep picked up that it should not have.
 
----
+- [ ] **Step 6: Confirm every commit landed on the intended branch**
+
+```bash
+git rev-parse --abbrev-ref HEAD
+git log --oneline cas-gc-rebuild -12
+```
+
+All commits of this plan must appear on `cas-gc-rebuild`. This worktree is shared: another session
+checking out its own branch moves it, and commits made afterwards land on that branch instead, which
+`git log --oneline -1` alone does not reveal.
 
 ## Task 10: File the window-closing follow-up {#task-10}
 
@@ -1236,7 +1449,9 @@ If Task 2 named things differently from the entry, fix the entry, not the memory
 ## Self-Review {#self-review}
 
 **Specification coverage.** Part 1 is Task 2; Part 2 is Task 2 (it cannot be separate — see the task
-preamble); Part 3 is Task 1. The landing order the specification requires is Task 1 → Task 2, stated
+preamble); Part 3 is Task 1. One specification claim is narrowed by Task 8 and must be narrowed in
+the specification too: a CAS disk accepts any backend's *settings*, which is not the same as CAS
+running on any backend. The landing order the specification requires is Task 1 → Task 2, stated
 in the global constraints and in both task preambles. The five sweep classes map to Tasks 3, 4, 5, 6
 and the documentation class to Task 7. Every gate lane the specification names has a step: unit
 (Tasks 1, 2, 6, 9), `WriteBufferFromS3` (Tasks 1, 9), stateless inline `disk(...)` (Tasks 4, 9),
@@ -1264,20 +1479,36 @@ window-closing task is Task 10.
 | `makeConfig`, `identity_macros` test helpers | `src/Disks/tests/gtest_cas_settings.cpp:31-37` |
 | Poco renders repeats as `name`, `name[1]`, `name[2]` | stated in `src/Storages/StorageURL.cpp:1683` and `src/Dictionaries/HTTPDictionarySource.cpp:254` |
 | `unit_tests_dbms` globs `gtest*.cpp` under `src` with `CONFIGURE_DEPENDS` | `src/CMakeLists.txt:901-908` |
-| `with_azurite=True` fixture shape | `tests/integration/test_azure_blob_storage_plain_rewritable/test.py:99-110` |
 | Azure disk keys as an operator writes them | `tests/config/config.d/azure_storage_conf.xml` |
+| `openPoolView` picks `Native` for any non-Local storage | `.../ContentAddressedMetadataStorage.cpp` |
+| `removeObjectIfTokenMatches` and `supportsRetryProfile` base implementations refuse by design | `src/Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h` |
+| `makeGenerationS3ObjectStorageForTest`, `FakeGenerationS3Client`, `makeBackend` | `src/Disks/tests/gtest_cas_backend_generation.cpp:464-511` |
+| the four sites passing a cap to the backend constructor | same file, lines 269, 508, 519, 547 |
+| `ScopedCasGcLogCapture`, the log-capture pattern | `src/Disks/tests/gtest_cas_ref_catalog.cpp:178-195` |
 
 Three symbols I had used in the design sketch turned out not to exist and are corrected here:
 `loadFromConfig` has no disk name, so the warning identifies the disk by `config_prefix`;
 `ContentAddressedSettingsImpl::hasBuiltin` is the static inherited from `BaseSettings`, not a member
 of the public class; and `splitRepeatIndex` is new code introduced in Task 2, not something to call.
 
-**The one seam without unit coverage.** Task 1 unit-tests that the cap parses from a disk block, and
-that the CAS backend sets only the policy flag. The line in between — `writeObject` raising the two
-request-settings limits when the flag is set — has no unit seam: it needs a live `S3ObjectStorage`
-with a client. It is covered by `test_cas_gcs`, which performs real conditional writes against a
-generation-token backend. Adding a unit seam would mean widening an upstream API for testability, so
-it is deliberately not done here.
+**Corrections carried in from review, so they are not re-derived.**
+
+- An earlier draft claimed the `writeObject` line had no unit seam and would need an upstream API
+  widened to test. That was wrong: `makeGenerationS3ObjectStorageForTest` in
+  `gtest_cas_backend_generation.cpp` already builds a real `S3ObjectStorage` over
+  `FakeGenerationS3Client`, so the whole path is testable today. Step 5b adds that test, and the same
+  fixture turns out to have **four** sites passing the cap into the constructor rather than one, all
+  of which Task 1 must convert or the file stops compiling.
+- An earlier draft proved the change with a CAS-over-Azure round trip. Azure cannot host a CAS pool
+  at all: a non-Local object storage opens in `Native` mode, which requires enforced conditional
+  operations Azure does not implement, and the base implementations refuse by design so the
+  capability probe fails closed. The parser accepting Azure keys and Azure hosting a pool are
+  different claims; only the first is true, and it is proven where it belongs, in a unit test.
+  Task 8 proves the reachable claim end to end instead, on the keys from the field report.
+- The plan's own "stage exact paths" rule was violated by four of its own commit steps
+  (`git add tests/integration utils/ca-soak` and similar). `utils/ca-soak` holds another session's
+  edits and untracked run artifacts, so those steps would have committed foreign changes. Every
+  sweep task now records its file list first and stages from that list.
 
 **Placeholders.** None. The nine code blocks are complete; the sweep tasks give an enumeration
 command instead of a file list because the list is long and must be re-derived at execution time

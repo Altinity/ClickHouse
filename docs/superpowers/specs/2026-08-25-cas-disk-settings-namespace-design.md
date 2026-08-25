@@ -9,7 +9,7 @@ doc_type: 'design'
 
 # CAS disk settings: which keys the CAS layer owns {#cas-disk-settings-namespace-design}
 
-**Status:** DRAFT for review, rev.4 (2026-08-25).
+**Status:** DRAFT for review, rev.5 (2026-08-25).
 
 rev.2 answered a review of rev.1; rev.3 reversed rev.2's no-migration-window decision on the owner's
 instruction, because configurations already live in external CI/CD scripts. rev.4 answers a review of
@@ -68,6 +68,15 @@ What this costs today, on a CAS disk:
 - **Azure in its entirety** — `account_name`, `account_key`, `connection_string`, `container_name`,
   `use_workload_identity`, `endpoint_contains_account_name` are read ad-hoc and unprefixed by
   `AzureBlobStorageCommon`, and none of them is in the skip-list.
+
+**A boundary worth stating before it is misread.** This is a defect in *configuration parsing*, and
+fixing it makes a backend's settings expressible, not a backend supported. Whether a store can host
+a CAS pool is a separate, protocol-level question: any non-Local object storage opens in `Native`
+mode, and Native requires enforced conditional operations — `removeObjectIfTokenMatches`, whose base
+implementation throws precisely so the capability probe fails closed, and
+`supportsRetryProfile(SingleAttempt)`, whose base implementation returns false. Azure implements
+neither, so a CAS pool on Azure is refused at mount regardless of this change. The promise here is
+"CAS never rejects a key belonging to its backend", not "CAS runs on any backend".
 
 ## Why the enumerated skip-list cannot be repaired {#unenumerable}
 
@@ -579,11 +588,15 @@ unit test can see one. The gate is therefore:
 - CAS integration tests over S3 and GCS — `test_cas_s3`, `test_cas_gc_s3`, `test_cas_gcs`,
   `test_cas_gc_sharded`, `test_cas_shared_pool` — which carry the Python-assembled XML fragments and
   the `render_tuned_config` dict keys, sweep classes 3 and 4.
-- **New: a CAS-over-Azure startup smoke.** There is none today — no CAS test in the tree configures
-  an Azure backend, which is itself a symptom of the defect: Azure keys are absent from
-  `non_cas_keys`, so a CAS disk over Azure could not start. The claim this design makes is that any
-  backend's settings now work, and Azure is the case that proves it rather than restates S3. A
-  startup-and-round-trip smoke is enough; it does not need the full CAS battery.
+- **The field report's own case, end to end.** The CAS integration disk carries
+  `http_keep_alive_timeout` and five more keys of the same class — client settings, `s3_`-prefixed
+  request settings, a repeated `<header>` — each of which used to fail server startup. The lane then
+  fails if the disk block ever stops accepting them.
+
+  This replaces an earlier proposal for a CAS-over-Azure smoke. Azure cannot host a CAS pool for the
+  protocol reason given above, so such a test could not pass; the Azure *spellings* are covered in
+  the unit test, which asserts they are never inspected. Conflating the two claims is exactly what
+  the boundary note above exists to prevent.
 
 ## Rejected alternatives {#rejected}
 
