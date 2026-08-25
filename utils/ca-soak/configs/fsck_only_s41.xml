@@ -1,0 +1,25 @@
+<clickhouse>
+    <!-- fsck-ONLY config for the S41 isolated stack: used by clickhouse disks with the flag
+         config-file /etc/clickhouse-server/fsck-only.xml for the read-only ca_ro disk. This
+         read-only shadow disk of the CA pool must NOT be visible to the SERVER (MergeTree part
+         discovery finds the pool's parts on it and fails table load with UNKNOWN_DISK on restart),
+         so it lives here, mounted at /etc/clickhouse-server/fsck-only.xml OUTSIDE config.d.
+         Read-only open skips the mount claim, so the srid is only an identifier; fsck's reachability
+         walk covers the whole pool. (No double hyphen anywhere in this comment: XML forbids it.) -->
+    <storage_configuration>
+        <disks>
+            <ca_ro>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_s41_ch1</cas_server_root_id>
+                <cas_gc_enabled>0</cas_gc_enabled>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+                <readonly>true</readonly>
+            </ca_ro>
+        </disks>
+    </storage_configuration>
+</clickhouse>

@@ -1,0 +1,404 @@
+"""S43 (W3) same-uuid recreation over a reused prefix — a survivor's queued write must not be absorbed.
+
+The hazard Stage A task 3's fence test found and task 6 named without reaching end to end (task-6
+report, obligation 10). Every other deposition story is closed by the writer epoch: a survivor whose
+mount was superseded writes under an epoch its successor has already sealed, so its transaction is
+conclusively rejected. This one scenario removes that defence on purpose:
+
+  * the POOL is recreated over the same prefix, so the epoch counter starts from the beginning again;
+  * the TABLE is recreated with the SAME uuid, but the catalog gives it a fresh opaque life id;
+  * therefore a survivor of the previous life writing at `{1,2}` remains under the predecessor's
+    stream and is structurally unreachable from the new life.
+
+What actually defends here is QUIESCE: dropping the table and unmounting the pool stops the writer
+before the prefix is reused, so no such transaction can still be in flight. This card removes that
+defence too, by injecting the survivor's transaction directly into the recreated pool with `boto3`,
+and then asks what the recreated pool's FIRST recovery of that namespace does with it.
+
+THE ANSWER, measured 2026-07-29, and it arrives EARLIER than task 6 predicted. Task 6 expected the
+recreated pool's first RECOVERY to refuse the stream (a non-contiguous apply, or a non-birth op on a
+never-born table, both `CORRUPTED_DATA`). What actually happens is stronger: the recreated pool never
+bootstraps at all. A prefix holding the survivor's object but no `_pool_meta` is residual data, and
+`CasPool.cpp:439` refuses it outright — `missing _pool_meta over a non-empty pool prefix — refusing to
+bootstrap over residual data`. The servers exit rather than mount, so there is no life 2 to absorb
+anything. The recovery-level defence task 6 described is never even reached.
+
+This card therefore asserts the refusal, and then proves the survivor CAUSED it: remove that one
+planted object, change nothing else, restart again, and the same prefix bootstraps cleanly. Life 2 is
+then created as the control and must be empty.
+
+The card asserts the safety property in the form that does not depend on WHICH refusal fires:
+
+  1. the recreated table never returns the previous life's rows;
+  2. the always-zero counters (`CASRefNeedsRecovery`, `CASRefRecoveryStreamHole`) stay at zero;
+  3. and it RECORDS, as an observation rather than a verdict, whether the touch raised or returned
+     empty — because "refused loudly" and "started clean and ignored it" are both safe, and pinning
+     one of them as the only acceptable outcome would make this card fail on a correct change.
+
+With opaque life ids this card no longer claims that an old transaction can alias the recreated
+table's stream: that collision is structurally impossible and the post-bootstrap control below pins
+the two ids as distinct. The adversarial value retained here is the earlier mount boundary — a fresh
+pool must not bootstrap over even one residual old-life object whose catalog no longer exists.
+
+An injected object that is simply never read is the third safe outcome, and it is why (1) is the
+verdict rather than "the query must throw": the walk is catalog-keyed by opaque life id, so an old-life
+body is not on the new life's path at any sequence.
+"""
+
+from soak.cluster import QueryError
+
+from ..framework import cluster_boot, observe, sql
+from ..framework.base import Scenario, register
+from ..framework.report import Verdict
+from . import _common
+
+from .s38_late_put_injection import (
+    _POOL_PREFIX,
+    _REF_LOG_SUFFIX,
+    _S3_BUCKET,
+    _discover_single_life_id,
+    _list_keys,
+    _render_ref_txn_id,
+    _restamp_ref_log_txn,
+    _s3_client,
+    _zstd_decompress,
+)
+
+_TABLE = "w3_recreated"
+# The CA disk these configs mount (storage_conf_s38_ch{1,2}.xml name the policy's single disk `ca`).
+_DISK = "ca"
+
+# Fixed so the logical table identity is deliberately reused. The catalog must still allocate a
+# distinct opaque physical life id for the second life.
+_UUID = "3e1f0a2b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
+
+# The survivor's queued write: sequence 2 of writer epoch 1 in the predecessor's opaque stream.
+_SURVIVOR_EPOCH = 1
+_SURVIVOR_SEQ = 2
+
+_VIOLATION_EVENTS = ("CASRefNeedsRecovery", "CASRefRecoveryStreamHole")
+
+
+def _create(node, name: str, table_uuid: str) -> None:
+    """`create_ca_table` with an explicit uuid. Written out here rather than threading a uuid through
+    the shared helper: this is the only card that needs one, and the reuse IS the scenario."""
+    node.command(
+        f"CREATE TABLE {name} UUID '{table_uuid}' (id UInt64, payload String) "
+        f"ENGINE = MergeTree ORDER BY (id) "
+        f"SETTINGS storage_policy='ca', min_bytes_for_wide_part=0, min_rows_for_wide_part=0, "
+        f"search_orphaned_parts_disks='local'")
+
+
+def _server_err_contains(node_dir: str, needle: str) -> bool:
+    """True if `logs/<node_dir>/clickhouse-server.err.log` contains `needle`.
+
+    Read through a throwaway container: the file is written by the server as root/syslog and the
+    harness user cannot open it — the same fact that motivated the pre-teardown dump. Uses the image
+    the compose already pulls, so this adds no new dependency. Returns False on any failure; the
+    caller pairs it with a behavioural check, so it can only ever weaken a claim, never invent one."""
+    import subprocess
+    log_dir = str((cluster_boot.CA_SOAK_DIR / "logs" / node_dir).resolve())
+    try:
+        pr = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{log_dir}:/l:ro",
+             "clickhouse/clickhouse-server:25.8",
+             "grep", "-a", "-c", needle, "/l/clickhouse-server.err.log"],
+            capture_output=True, text=True, timeout=120)
+        return pr.returncode == 0 and int((pr.stdout or "0").strip() or 0) > 0
+    except Exception:
+        return False
+
+
+def _wipe_pool(s3, log_fn) -> int:
+    """Delete every object under the pool prefix — the pool, recreated over a reused prefix."""
+    keys = _list_keys(s3, f"{_POOL_PREFIX}/")
+    for i in range(0, len(keys), 1000):
+        s3.delete_objects(Bucket=_S3_BUCKET,
+                          Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]})
+    log_fn(f"S43: wiped {len(keys)} objects under {_POOL_PREFIX}/ — the pool is recreated over the "
+           f"same prefix, so its writer-epoch counter starts from the beginning")
+    return len(keys)
+
+
+from .s38_late_put_injection import _violation_counters  # fail-aware; see its docstring
+
+
+@register
+class S43(Scenario):
+    name = "S43"
+    title = "same-uuid pool recreation refuses a residual survivor write"
+    priority = "P0"
+    compose_variant = "s38"   # for the published RustFS port; the injection needs direct pool access
+    param_table = {
+        "dev": {"rows": 200, "payload_bytes": 256, "heal_timeout_s": 240},
+        "ci": {"rows": 2000, "payload_bytes": 512, "heal_timeout_s": 300},
+        "full": {"rows": 20000, "payload_bytes": 1024, "heal_timeout_s": 360},
+    }
+
+    def run(self, ctx, result):
+        cl = ctx.cluster
+        p = ctx.params
+        rows = int(p["rows"])
+        payload = int(p["payload_bytes"])
+        heal_timeout_s = int(p["heal_timeout_s"])
+
+        # =====================================================================================
+        # Life 1: a table on the CA disk with a pinned uuid, with real content in its ref stream.
+        # =====================================================================================
+        cl.node1.command(f"DROP TABLE IF EXISTS {_TABLE} SYNC")
+        _create(cl.node1, _TABLE, _UUID)
+        sql.insert_random(cl.node1, _TABLE, rows=rows, payload_bytes=payload, op_id=0)
+        life1_rows = int(cl.node1.scalar(f"SELECT count() FROM {_TABLE}") or 0)
+        life1_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
+        result.observations["life1"] = {"uuid": _UUID, "rows": life1_rows}
+        result.add(Verdict.check(
+            "life 1 has content to be absorbed", f"{rows} rows written and readable",
+            life1_rows, life1_rows == rows,
+            "" if life1_rows == rows else "the first life never got its rows, so a later absorption "
+                                          "would have nothing recognisable to absorb"))
+
+        s3 = _s3_client()
+        life_id = _discover_single_life_id(s3)
+        result.observations["life_id"] = life_id
+        if life_id is None:
+            result.add(Verdict.inconclusive(
+                "life 1 has one opaque stream",
+                "exactly one canonical 32-hex child under cas/ns/stream/",
+                "the single-table pool did not expose one unambiguous life-id child"))
+            _common.standard_end(ctx, result, [_TABLE])
+            return
+
+        log_prefix = f"{_POOL_PREFIX}/cas/ns/stream/{life_id}/_log/"
+        life1_keys = _list_keys(s3, log_prefix)
+        if not life1_keys:
+            result.add(Verdict.inconclusive(
+                "life 1 wrote a ref-log stream", ">0 objects under the namespace's _log/",
+                f"none under {log_prefix}"))
+            _common.standard_end(ctx, result, [_TABLE])
+            return
+        # A body the server itself wrote, kept for restamping — the survivor's queued write is a real
+        # transaction of the previous life, not something this card invented.
+        donor_key = sorted(life1_keys)[-1]
+        donor_body = s3.get_object(Bucket=_S3_BUCKET, Key=donor_key)["Body"].read()
+        result.observations["donor"] = {"key": donor_key, "bytes": len(donor_body)}
+
+        # =====================================================================================
+        # Quiesce, then remove it: drop the table (the defence), have the product RELEASE the pool,
+        # then reuse the prefix.
+        # =====================================================================================
+        cl.node1.command(f"DROP TABLE {_TABLE} SYNC")
+        ctx.log("S43: table dropped (quiesce — the defence this card is about to remove)")
+
+        # RECREATE THE POOL THROUGH THE PRODUCT, not by yanking bytes out from under a running mount.
+        # The first version of this card stopped the containers and emptied the prefix; the servers
+        # then never came back healthy, because a mounted disk whose pool bookkeeping simply vanished
+        # is not a recreated pool, it is a broken one — and the card never got to ask its question.
+        # `SYSTEM CAS FORGET` is the product's own teardown: force-Vanish, node-local,
+        # stops and joins every CAS background thread for that disk. Only once BOTH mounts have
+        # forgotten the pool is the prefix genuinely free to be reused.
+        forgotten = {}
+        for node in cl.nodes():
+            try:
+                node.command(f"SYSTEM CAS FORGET '{_DISK}'")
+                forgotten[repr(node)] = node.scalar(
+                    f"SELECT lifecycle || '(' || lifecycle_reason || ')' "
+                    f"FROM system.cas_mounts WHERE disk = '{_DISK}'") or "(no row)"
+            except QueryError as e:
+                forgotten[repr(node)] = f"ERROR: {str(e)[:160]}"
+        result.observations["forget"] = forgotten
+        all_vanished = all("vanished" in v for v in forgotten.values())
+        result.add(Verdict.check(
+            "both mounts FORGOT the pool before its prefix was reused",
+            "system.cas_mounts reports vanished(...) on every node",
+            forgotten, all_vanished,
+            "" if all_vanished else "a mount still holds the pool, so emptying the prefix would be "
+                                    "pulling bytes out from under it rather than recreating a pool"))
+        if not all_vanished:
+            _common.standard_end(ctx, result, [_TABLE])
+            return
+
+        wiped = _wipe_pool(s3, ctx.log)
+        result.observations["pool_wipe"] = {"objects_deleted": wiped}
+
+        survivor_id = _render_ref_txn_id(_SURVIVOR_EPOCH, _SURVIVOR_SEQ)
+        survivor_key = f"{log_prefix}{survivor_id}{_REF_LOG_SUFFIX}"
+        # THE PLANTED TRANSACTION MUST CARRY OPS. A zero-op survivor is undetectable by construction:
+        # absorbing it would change nothing, so "life 2 exposes no rows" would pass whether the fence
+        # held or not. Keeping the donor's ops means absorption has an observable consequence — the
+        # recreated life would carry a binding to a manifest the wipe removed, which shows up as rows
+        # it should not have AND as a dangling reference in the end checkpoint's fsck.
+        survivor_body = _restamp_ref_log_txn(donor_body, _SURVIVOR_SEQ, writer_epoch=_SURVIVOR_EPOCH,
+                                             keep_ops=True)
+        survivor_ops = len(_zstd_decompress(survivor_body).decode().splitlines()) - 3
+        result.observations["survivor_op_count"] = survivor_ops
+        result.add(Verdict.check(
+            "the planted survivor carries observable operations",
+            ">0 ops, so absorption would have a visible consequence",
+            survivor_ops, survivor_ops > 0,
+            "" if survivor_ops > 0 else "a zero-op survivor makes this card vacuous: absorbing it "
+                                        "would change nothing, so the absorption check could not fail"))
+        s3.put_object(Bucket=_S3_BUCKET, Key=survivor_key, Body=survivor_body)
+        ctx.log(f"S43: injected the survivor's queued write at {survivor_id} into the recreated pool")
+        result.observations["survivor"] = {
+            "key": survivor_key, "txn_id": survivor_id,
+            "body": survivor_body.decode(errors="replace")}
+        planted = s3.get_object(Bucket=_S3_BUCKET, Key=survivor_key)["Body"].read()
+        result.add(Verdict.check(
+            "the survivor's write is present in the recreated pool before life 2 starts",
+            "a GET of the injected id returns the injected body",
+            f"{len(planted)} bytes", planted == survivor_body, ""))
+
+        # A restart re-mounts the (now empty) prefix as a FRESH pool: a new pool identity, and the
+        # writer-epoch counter starting from the beginning — which is the precondition the whole
+        # scenario rests on, because it is what leaves the survivor unfenced.
+        start_rc = cluster_boot.compose_run(self.compose_variant, "restart", "ch1", "ch2",
+                                            log_fn=ctx.log)
+        result.observations["compose_start_rc"] = start_rc
+        result.add(Verdict.check(
+            "the servers were started again", "compose start returns 0", start_rc, start_rc == 0, ""))
+        # =====================================================================================
+        # THE ANSWER, and it arrives earlier than task 6 predicted. The prefix now holds exactly one
+        # object — the survivor's — and no `_pool_meta`, because the recreation removed it. That is a
+        # shape the product REFUSES outright: `CasPool.cpp:439` declines to bootstrap a pool over a
+        # non-empty prefix whose `_pool_meta` is missing, "refusing to bootstrap over residual data".
+        # So the survivor's `{1,2}` is never absorbed, for a reason STRONGER than a recovery declining
+        # the stream: the recreated pool never comes up at all while that object is there.
+        # =====================================================================================
+        healthy = cluster_boot.wait_healthy(cl, timeout_s=90, log_fn=ctx.log)
+        refusal = any(_server_err_contains(n, "refusing to bootstrap over residual data")
+                      for n in ("ch1", "ch2"))
+        result.observations["bootstrap_refusal"] = {
+            "healthy_with_survivor_planted": healthy, "refusal_logged": refusal}
+        result.add(Verdict.check(
+            "the recreated pool REFUSES to bootstrap over the survivor's residual write",
+            "servers do not come up, and the log names the residual-data refusal",
+            f"healthy={healthy} refusal_logged={refusal}", (not healthy) and refusal,
+            "" if ((not healthy) and refusal) else
+            ("the servers came up over a prefix holding a foreign ref-log object and no _pool_meta — "
+             "the residual-data guard did not fire" if healthy else
+             "the servers did not come up, but the residual-data refusal is NOT in the log, so this "
+             "card cannot claim that guard is the reason")))
+
+        # CAUSATION, not correlation: remove that one planted object and nothing else, restart again,
+        # and the pool must bootstrap. The only difference between the two restarts is the survivor.
+        s3.delete_object(Bucket=_S3_BUCKET, Key=survivor_key)
+        cluster_boot.compose_run(self.compose_variant, "restart", "ch1", "ch2", log_fn=ctx.log)
+        healthy_after = cluster_boot.wait_healthy(cl, timeout_s=heal_timeout_s, log_fn=ctx.log)
+        result.observations["healthy_after_removing_survivor"] = healthy_after
+        result.add(Verdict.check(
+            "and the refusal is caused by the planted survivor, nothing else",
+            "removing that one object lets the same prefix bootstrap",
+            f"healthy={healthy_after}", healthy_after,
+            "" if healthy_after else "the pool still refuses with an empty prefix, so the refusal "
+                                     "above cannot be attributed to the planted object"))
+        if not healthy_after:
+            _common.standard_end(ctx, result, [_TABLE])
+            return
+
+        # =====================================================================================
+        # Life 2, as the control: same uuid, fresh opaque life id, on a pool that has now legitimately
+        # bootstrapped over the reused pool prefix. It must be EMPTY — nothing of life 1 survives, and
+        # the survivor is gone rather than absorbed.
+        # =====================================================================================
+        before = _violation_counters(cl, _VIOLATION_EVENTS)
+        create_error = None
+        try:
+            _create(cl.node1, _TABLE, _UUID)
+        except QueryError as e:
+            create_error = str(e)[:400]
+
+        touch_error = None
+        life2_rows = None
+        life2_checksum = None
+        if create_error is None:
+            try:
+                life2_rows = int(cl.node1.scalar(f"SELECT count() FROM {_TABLE}") or 0)
+                life2_checksum = cl.node1.query(sql.table_checksum_query(_TABLE)).strip()
+            except QueryError as e:
+                touch_error = str(e)[:400]
+
+        after = _violation_counters(cl, _VIOLATION_EVENTS)
+        result.observations["life2"] = {
+            "create_error": create_error, "touch_error": touch_error, "rows": life2_rows,
+            "checksum": life2_checksum, "life1_checksum": life1_checksum,
+            "life_id": None, "life1_life_id": life_id,
+            "violation_counters": {"before": before, "after": after},
+            "outcome": ("create refused" if create_error else
+                        "touch refused" if touch_error else
+                        f"started clean ({life2_rows} rows)")}
+
+        # THE assertion. Refusing loudly and starting clean are both safe; returning the previous
+        # life's data is the one outcome that is not.
+        # Absorption keys on the OBSERVABLE the planted ops would produce, not only on a row count:
+        # life 2 exposing rows at all, or the end-state audit finding a reference to something the wipe
+        # removed. Either is absorption; neither can be produced by a fence that held.
+        absorbed = life2_rows is not None and life2_rows > 0
+        result.add(Verdict.check(
+            "the recreated table does not absorb the previous life's state",
+            "life 2 exposes 0 rows (or refuses outright) — never life 1's rows",
+            result.observations["life2"]["outcome"], not absorbed,
+            "" if not absorbed else
+            f"the recreated table returned {life2_rows} row(s) over a reused prefix. A survivor's "
+            f"queued transaction was absorbed despite the opaque life-id boundary"))
+        if life2_checksum is not None:
+            result.add(Verdict.check(
+                "life 2's checksum is not life 1's",
+                "the two lives do not agree — they share only a prefix, not a state",
+                f"life1={life1_checksum!r} life2={life2_checksum!r}",
+                life2_checksum != life1_checksum or life1_rows == 0, ""))
+
+        # `CREATE TABLE` and an empty read need not allocate a catalog life: namespace creation is
+        # write-side/lazy. Only after the absence verdict above is frozen do we write one recognizable
+        # control row. That forces a real life-2 stream without letting the control hide absorption.
+        control_id = 0x5A43
+        control_payload = "life2-control"
+        control_error = None
+        control_rows = None
+        life2_rows_after_control = None
+        life2_life_id = None
+        if create_error is None and touch_error is None and life2_rows == 0:
+            try:
+                cl.node1.command(
+                    f"INSERT INTO {_TABLE} VALUES ({control_id}, '{control_payload}')")
+                control_rows = int(cl.node1.scalar(
+                    f"SELECT count() FROM {_TABLE} WHERE id = {control_id} "
+                    f"AND payload = '{control_payload}'") or 0)
+                life2_rows_after_control = int(cl.node1.scalar(f"SELECT count() FROM {_TABLE}") or 0)
+                life2_life_id = _discover_single_life_id(s3)
+            except QueryError as e:
+                control_error = str(e)[:400]
+
+            result.add(Verdict.check(
+                "life 2 contains only the recognizable control row",
+                "the forced write succeeds and exposes exactly one matching row and one total row",
+                {"error": control_error, "matching": control_rows, "total": life2_rows_after_control},
+                control_error is None and control_rows == 1 and life2_rows_after_control == 1,
+                "" if control_error is None and control_rows == 1 and life2_rows_after_control == 1 else
+                "the post-absence control could not establish a clean, recognizable life 2"))
+            result.add(Verdict.check(
+                "same-uuid recreation receives a distinct opaque life id",
+                f"one canonical life id different from predecessor {life_id}",
+                life2_life_id,
+                life2_life_id is not None and life2_life_id != life_id,
+                "" if life2_life_id is not None and life2_life_id != life_id else
+                "the forced life-2 write did not produce an unambiguous fresh physical life"))
+
+        result.observations["life2_control"] = {
+            "error": control_error,
+            "matching_rows": control_rows,
+            "total_rows": life2_rows_after_control,
+            "life_id": life2_life_id,
+        }
+        result.observations["life2"]["life_id"] = life2_life_id
+
+        measured = sorted(set(before) & set(after))
+        moved = {e: after[e] - before[e] for e in measured if after[e] > before[e]}
+        unmeasured = [e for e in _VIOLATION_EVENTS if e not in measured]
+        result.add(Verdict.check(
+            "no always-zero counter moved across the recreation",
+            f"all of {', '.join(_VIOLATION_EVENTS)} read on every node and unchanged",
+            {"moved": moved, "unmeasured": unmeasured} if (moved or unmeasured) else "unchanged",
+            not moved and not unmeasured,
+            "" if not moved else f"counters moved: {moved}"))
+
+        _common.standard_end(ctx, result, [_TABLE])

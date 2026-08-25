@@ -1,0 +1,147 @@
+# CA soak-test cluster: two ClickHouse replicas sharing ONE content-addressed (CA) pool on RustFS,
+# coordinated by a single-node Keeper. Proves a ReplicatedMergeTree over the CA pool replicates
+# node1 -> node2.
+#
+# Image choice: the host-built CA-capable binary (../../build/programs/clickhouse) is mounted over
+# /usr/bin/clickhouse in a stock clickhouse/clickhouse-server image. The host binary needs only
+# GLIBC_2.4 and links just libc/libpthread/librt/libm/libdl, so it runs fine on the stock image's
+# glibc (Ubuntu base). The stock entrypoint and config skeleton are reused; the clickhouse-keeper /
+# clickhouse-server symlinks resolve to the mounted binary.
+
+services:
+  # S22/S27: HTTP proxy between ClickHouse and RustFS. ClickHouse's `ca` endpoint points here
+  # (s3proxy:11121); it forwards verbatim to rustfs1 (Host header preserved so SigV4 stays valid).
+  # Faults are DISARMED by default (pass-through) so bring-up + the CA probe are clean; the scenario
+  # arms/disarms via the control port (8474, published to the host).
+  s3proxy:
+    image: python:3.12-slim
+    command: ["python3", "/app/s3_fault_proxy.py"]
+    environment:
+      RUSTFS_UPSTREAM: "rustfs1:11121"
+      S3_PROXY_PORT: "11121"
+      S3_PROXY_CTL_PORT: "8474"
+    depends_on:
+      - rustfs1
+    volumes:
+      - ./proxy:/app:ro
+    expose:
+      - "11121"
+    ports:
+      - "8474:8474"
+  rustfs1:
+    image: rustfs/rustfs:1.0.0-rc.3
+    command: server --address 0.0.0.0:11121
+    env_file: configs/rustfs.env
+    expose:
+      - "11121"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+  # One-shot: wait for RustFS, then create the `test` bucket the CA pool path lives under.
+  createbucket:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      - rustfs1
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set carustfs http://rustfs1:11121 clickhouse clickhouse; do
+        echo 'waiting for rustfs...'; sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing carustfs/test;
+      until /usr/bin/mc ls carustfs/test >/dev/null 2>&1; do
+        echo 'waiting for bucket to become visible...'; sleep 1;
+      done;
+      echo 'bucket ready';
+      "
+
+  keeper1:
+    image: clickhouse/clickhouse-server:25.8
+    entrypoint: ["/usr/bin/clickhouse", "keeper", "--config-file", "/etc/clickhouse-keeper/keeper.xml"]
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/keeper.xml:/etc/clickhouse-keeper/keeper.xml:ro
+    expose:
+      - "9181"
+
+  ch1:
+    image: clickhouse/clickhouse-server:25.8
+    # Skip the entrypoint's default-user lockdown so the open `default` user keeps network access
+    # (the entrypoint otherwise disables it when no password is set, breaking the HTTP smoke).
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      s3proxy:
+        condition: service_started
+      # Must wait for the bucket to be CREATED, not just for createbucket to start: the CA pool
+      # probes S3 (writes _probe/token) on startup and exits if the bucket is absent. The short-form
+      # list only gated on container start, which raced a fresh `down -v` (wiped rustfs volume → the
+      # bucket had to be recreated) and crashed ch1 with NoSuchBucket. Mirror ch2's gate.
+      createbucket:
+        condition: service_completed_successfully
+    # B165: cap memory so a leak fails CLOSED (ClickHouse throws + logs the consumer) instead of a
+    # kernel OOM-kill. 28g per node x2 + rustfs ~10g + driver ~5g < 91g host. See configs/memory.xml.
+    mem_limit: 28g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_faultproxy_ch1.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/fsck_only_ca.xml:/etc/clickhouse-server/fsck-only.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      # B165: persist server logs to the host so they survive `docker compose down -v` (the soak #7
+      # OOM destroyed all in-container logs). run_24h.sh creates+chmods logs/ch1 before `up`.
+      - ./logs/ch1:/var/log/clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    # ch1 must finish mounting the shared CA pool BEFORE ch2 mounts it. The CA capability probe
+    # writes a fixed key (<pool>/_probe/token); two servers probing the same shared pool
+    # concurrently race on that key and one gets PreconditionFailed and aborts. Gating ch2 on
+    # ch1's health serializes the two mounts and avoids the probe race.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch2:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    depends_on:
+      keeper1:
+        condition: service_started
+      rustfs1:
+        condition: service_started
+      s3proxy:
+        condition: service_started
+      createbucket:
+        condition: service_completed_successfully
+      ch1:
+        condition: service_healthy
+    mem_limit: 28g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_faultproxy_ch2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/fsck_only_ca.xml:/etc/clickhouse-server/fsck-only.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./logs/ch2:/var/log/clickhouse-server
+    ports:
+      - "8124:8123"
+      # Host port 9001 can be occupied by a stray RustFS process; 9002 avoids the collision.
+      # The smoke only uses HTTP (8123/8124); the native port is exposed for convenience.
+      - "9002:9000"

@@ -1,0 +1,42 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <!-- S3-cache-disk case (2026-07-07 empirical re-check): a ClickHouse filesystem
+                 <type>cache</type> disk layered IN FRONT of the content-addressed `ca` disk.
+                 Memory note project-ca-cache-disk-unwired (2026-07-03) recorded this failing at
+                 startup with NOT_IMPLEMENTED (code 48) on the write path (checkAccess ->
+                 DiskObjectStorageTransaction::writeFileImpl -> the CA `notYet("M-W")` stub, because
+                 MetadataStorageFromCacheObjectStorage forwards neither isContentAddressed nor the
+                 CA transaction surface). This config is the live verification harness. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_soak_ch1</cas_server_root_id>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- Filesystem cache wrapping the CA disk. -->
+            <ca_cache>
+                <type>cache</type>
+                <disk>ca</disk>
+                <path>/var/lib/clickhouse/ca_cache/</path>
+                <max_size>1073741824</max_size> <!-- 1 GiB -->
+            </ca_cache>
+        </disks>
+        <policies>
+            <ca_cache>
+                <volumes>
+                    <main>
+                        <disk>ca_cache</disk>
+                    </main>
+                </volumes>
+            </ca_cache>
+        </policies>
+    </storage_configuration>
+</clickhouse>

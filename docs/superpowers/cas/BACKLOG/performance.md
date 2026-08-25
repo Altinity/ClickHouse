@@ -1,0 +1,575 @@
+---
+description: 'Live backlog — read/write path performance, insert/write-path optimization candidates, and scalability findings from the full-scale campaign.'
+sidebar_label: 'Performance'
+sidebar_position: 8
+slug: /superpowers/cas/backlog/performance
+title: 'CAS Backlog — Performance'
+doc_type: 'guide'
+---
+
+# CAS Backlog — Performance {#performance}
+
+Part of the [CAS live backlog](/superpowers/cas/backlog). Topic file for read/write-path performance,
+insert/write-path optimization candidates, and scalability findings from the full-scale campaign.
+
+## Read / write path {#read-write}
+
+### Mandatory blob `HEAD`: accepted protocol cost, performance gate still blocked {#mandatory-blob-head-cost}
+
+The 2026-08-23 design decision accepts one blob `HEAD` before every fresh/adopt publication decision
+because it removes conditional blob creation, provider-specific size cliffs, and the common-path
+metadata GET. Fresh publication then uses ordinary unconditional streaming/multipart or the first
+absent native staged copy; a present candidate reads metadata and avoids the body when safe.
+
+The [target-only performance report](/superpowers/cas/unconditional-blob-publication-performance)
+measured exactly one blob `HEAD` per fan-out task and no pre-publication metadata GET on genuine fresh
+misses. Its small fresh `ca - s3plain` first-leg difference was 71 ms median; the target-only wide
+`ca` first leg was 145.427 s median and its duplicate/adopt second leg 50.948 s. These values include
+all policy and sequence effects and do **not** isolate the new `HEAD`. No matched same-environment
+pre-change binary/artifact exists, and the control-adjusted second/first ratios are not a code-version
+delta. Protocol adoption is settled; performance acceptance remains blocked until a matched
+before/after pair is measured and explicitly accepted by a human.
+
+- **[ckpt-read-policy] Modular `_ckpt` first-attempt view: conservative / cached / prefetch** — DESIRABLE — USER-DIRECTED design shape, 2026-08-03: `_ckpt` handling must be modular/replaceable. Protocol-adjacent (touches the commit path); ships only as an explicit reviewed decision with matched before/after numbers. The blob-publication decision above does not authorize changing this separate mutable-control-object fence.
+
+  Cost being addressed: every committed ref-log chunk pays `GET _ckpt` + token-CAS serially after the log `PUT`, so a lone `INSERT` pays +4 serial RTTs. A pluggable policy chooses only where `publishCkpt`'s first attempt gets its `{body, token}` view — the invariant core (retry-after-conflict always does a whole-body exact re-read, `lifeEpochWouldDecrease` re-checked after any re-read, durability order `log PUT → _ckpt CAS → ack`) is shared and policy-independent.
+
+  Policies: (1) **conservative** = today, fresh GET per publish; (2) **cached** = seed with one GET on first touch, then serve from the writer's own last winning CAS and go straight to PUT-if-match (expected to almost always hit, since lease exclusivity excludes cross-process writers — a miss is a signal, not noise); (3) **prefetch** = one paginated LIST at mount seeds all `_ckpt` views, then memory-only + PUT-if-match (LIST is a pure hint here, correctness still rides the conditional write). Mandatory cache-invalidation edges for (2)/(3): fence-generation change, wedge, remount supersession, `catalog_life_invalidated`. Always-exact-read, out of the policy seam: recovery's `_ckpt` sample and GC-fold's frontier GET.
+
+  Effect: +4 → +2 RTTs per lone insert. MEASUREMENT PRECONDITION: the stage-1 1.59x figure predates `_ckpt` (measured before it landed) — re-run the wide-insert baseline on current HEAD before benching policies against it.
+- **[write-path stage 1] parallel intra-part blob upload — LANDED (2026-07-24)** — Fanned out a part's blob PUTs/dedup-HEADs (`CasBlobUploadPool`/`fanOutBlobUploads`): CA wide-insert wall 58.41s → 30.26s, CA-vs-plain 3.0x → 1.59x. Residual gap = the serial cross-part commit (stage 2, `{#stage2-concurrent-commitpart-postponed}`, POSTPONED by user decision) plus the CAS-only dedup HEAD/GET traffic (`[B121 / B202 / one-GET-open]` below).
+- **[TXN-ONE-PIPELINE] complete the "staging ops never defer" invariant** — HARD (small, structural) — `DiskObjectStorageTransaction`'s two dispatch pipelines (eager staging ops vs. deferred-to-commit durable ops) caused the `01603` column-TTL abort ordering inversion; the correct invariant is per-state-domain, not a total order. Target shape approved by the user and superseding earlier staged-intents wording: an everything-immediate model with a single `dispatch` funnel (no CA subclass), a two-phase `IDiskTransaction::precommit()`/`commit()` contract (CA precommit = the entire publish; CA commit = durable-intent materialization only), `commit` implicitly running `precommit` when not called (with `CasImplicitPrecommitInCommit` observability), plus a de-patching pass removing accumulated eager-dispatch/read-your-writes workarounds from non-CA files (`docs/superpowers/cas/upstream-patch-inventory.md`). Lands before codecs v3 and the source-layout refactoring.
+- **[B121 / B202 / one-GET-open] read request-count reduction** — DESIRABLE (design pass) — B202 inline-by-size (drop the file-type predicate, inline < ~512 KiB, weigh the wide-part-medium-column regression, `.bin` carve-out) + a per-blob-GET read-cost reduction (B121) + one-GET part open (pack small files). Pure perf/request-count; no safety dimension. Companion to the (landed, opt-in) file-cache disk for re-read-heavy workloads. (An orphaned 2026-08-04-triage finding covers the same class via a measured DownloadPart/relink-fetch dominant read cost — folded in as confirmation.)
+- **[B98] ✅ CLOSED by streaming unconditional `publishBlob`; kept for provenance** — Condemned displacement no longer has a separate conditional-overwrite API. Native publication streams the retagged envelope/body and supports ordinary multipart; emulated materialization remains under `[emulated-resurrect-should-spill-to-disk]`.
+- **[promote-recreate] ✅ CLOSED by mandatory `HEAD` plus retagged publication; kept for provenance** — A `Condemned` observation or any subsequent staged publication retags and streams in the same attempt loop. There is no tokened promote gate or writer-triggered fold dependency left to optimize.
+- **[R1/X1] ephemeral reader pin (cross-node GC fence)** — DESIRABLE / VERIFY — Per-server-owned namespaces narrow the window and a live ref resolving to an absent object surfaces `FILE_DOESNT_EXIST` (INV-NO-DANGLE), so for normal MergeTree this is covered by DataPart lifetime; the ephemeral-pin mechanism is design-only. Audit whether any ref-less/cross-node reader path exists before implementing.
+- **[ch128ctx] slot-bound blob-hash middle tier** — DESIRABLE (small spec) — New `BlobHashAlgo` variant: `cityHash128(content) ∥ xxh3_64(part_name, file_name) ∥ size` (256-bit; variable-width `BlobDigest` already supports it). Binds blob identity to its minting slot, so *cross-slot* collisions (the realistic adversarial dedup vector: attacker-crafted content deduped into a victim's future blob) become useless, at ~zero CPU cost over `cityHash128`. Every load-bearing dedup survives: relink/carry-forward are reference-based; retry idempotency, same-name replica writes, and snapshot-upload→TTL-move prepayment are same-slot; only cross-slot content coincidence is lost (an explicit non-goal, `01 §what-it-does-not-buy`). Middle tier of `cityHash128` → `ch128ctx` → `sha256`. Main touch: the staged-blob hasher/request construction needs `(part_name, file_name)` context before `ensureBlobPresent`. Origin: backup manifest-reuse discussion, `10-backups.md §multi-disk` (2026-07-14).
+- **[codex-26] `casAppendObject` needed before any concurrent appender** — LOW (latent) — `CasPlainObjects::casPutObject`'s CAS loop re-reads only the TOKEN on conflict, retrying with the SAME frozen `bytes` payload the caller froze at buffer-open (`ContentAddressedTransaction::writeFile`'s Append branch) — a fresh-token/stale-payload lost-update shape (2026-07-17 codex-review triage, finding №26). Not reachable today: the only production appender is the mutation-entry CSN write (`MergeTreeMutationEntry::writeCSN`), one append per mutation-unique key under the per-table single-writer lease, so there is no second appender to lose. Required before any future concurrent appender lands: a real `casAppendObject` that re-reads the base content (not just the token) inside the retry loop. See the single-appender invariant comment at `casPutObject`.
+
+## Write-path optimization candidates after stage 1 (2026-07-24) {#writepath-candidates-post-stage1}
+
+Context: stage 1 (parallel intra-part blob upload) took the wide 10M×30col×500part CA-S3 `INSERT` from
+58.41 s to 30.26 s (3.0× → 1.59× vs plain S3); the workload is still ~87% network-bound. Reports:
+`docs/superpowers/reports/2026-07-23-cas-wide-insert-baseline.md` (baseline),
+`docs/superpowers/reports/2026-07-24-cas-wide-insert-stage1-effect.md` (stage-1 effect). The residual
+splits between the serial cross-part commit (stage 2's target, program point 7 — active, NOT a backlog
+item) and the items below. The older 268.8 `HEAD`/part estimate predates the unconditional-publication
+rewrite. Mandatory blob `HEAD` is now an accepted protocol step; any proposal to remove or weaken it
+requires a new correctness design plus matched measurements, not an opportunistic optimization.
+
+- (1) **Enable S3-native staging on the wide-insert profile and measure** — the feature exists
+  (opt-in, native-only same-store copy on the first absent publication). Local staging then upload moves
+  every blob's bytes twice; native staging may cut wall on S3 backends. Zero new code: flip the
+  setting in an s41 variant leg and compare. Status: MEASURE.
+- (2) **S3 client concurrency/connection tuning for the upload pool** — with 16-33 threads now
+  issuing PUTs concurrently, client-side limits (connections, per-request concurrency) may cap
+  overlap. Config-level experiment on s41. Status: MEASURE.
+- (3) **Inline-placement threshold tuning** — small part files inline into the manifest
+  (`CaInlinePlacement` machinery). The wide profile pays ~239 `PUT`/part (~8 objects/column);
+  raising the inline threshold could fold the small tail (marks, minor streams) into the manifest.
+  First verify the threshold is a setting (not a pinned format constant), then measure PUT-count and
+  wall deltas on s41. Status: INVESTIGATE THEN MEASURE.
+- (4) **Repoint waste on part removal** — known class (`project_part_removal_repoint_waste`):
+  repoints against `delete_tmp_*` refs ≈ 22% of the writer `PUT` class. Eliminating them changes
+  WHICH ledger ops are issued — protocol-adjacent, needs an explicit user decision with a risk
+  analysis before any work. Status: DECISION NEEDED (present risk analysis to user).
+- (5) **Unconditional manifest `GET` on promote** — part of the 108.7 `GET`/part during insert;
+  separate long-standing item. Verification semantics of the write path → under the spirit of the
+  protocol veto; do not touch without an explicit user go-ahead. Status: DECISION NEEDED (present
+  risk analysis to user).
+
+## Stage 2 (concurrent commitPart) — research notes; POSTPONED by user decision (2026-07-24) {#stage2-concurrent-commitpart-postponed}
+
+USER DECISION: postponed — "слишком сильное / малопредсказуемое влияние на upstream / generic code". Recorded
+here so the research is not lost; revisit only with an explicit user go-ahead.
+
+Three orphaned 2026-08-04-triage findings describe the same postponed parallel-write-path design
+(a `cas_commit_concurrency`-sized worker pool, a `takeTransactionForBatchCommit` seam, and index-addressable
+outcome slots for bounded worker loops) — folded in here as detail on the same postponed design, not new work.
+
+Motivation (measured): after stage 1 the wide CA-S3 `INSERT` residual is 1.59× vs plain S3, dominated by the
+serial cross-part commit (`ReplicatedMergeTreeSink::finishDelayed` iterates partitions one at a time; ref-ledger
+batch size = exactly 1.0, so per-part manifest/ledger round-trips never batch). Stage 2 = bounded concurrent
+dispatch of the per-partition commit; the CAS ledger then batches emergently and blobs multiplex on the stage-1
+pool.
+
+Agreed scoping (before postponement): (a) start with `ReplicatedMergeTreeSink` ONLY (the measured path);
+(b) then re-run s41 with a non-replicated leg; (c) then the `MergeTreeSink` counterpart as a separate follow-up.
+
+Path anatomy + hazard inventory (from code reading, 2026-07-24):
+- Replicated loop body per partition: `finalize` → dedup hashes/block-ids → `commitPart` (Keeper block-number
+  alloc → `renameParts` disk txn [the whole CAS write path lives here] → Keeper multi ~`:995-1011` → rollback
+  machinery) → dedup-conflict retry loop (`deduplicateBlock` filters the block, then `writeNewTempPart`
+  RE-SERIALIZES AND RE-UPLOADS the part, then retries commit) → `resolveQuorum` WAITS inside the iteration →
+  `PartLog::addNewPart`.
+- Concurrency hazards found: `deduplication_async_inserts_cache_version = 0` reset per iteration is a SHARED
+  member (`ReplicatedMergeTreeSink.cpp:455`) — race under fan-out, must become per-task; shared Keeper session
+  via `ZooKeeperWithFaultInjection` (raw client is thread-safe; the fault-injection wrapper needs verification);
+  shared caches `deduplication_hashes_cache` / `async_block_ids_cache` `triggerCacheUpdate` from multiple
+  threads needs verification; quorum ordering semantics change (today partition N+1 does not commit until N's
+  quorum resolves) — recommendation was to force serial when quorum is enabled; a FULL shared-state inventory
+  of `commitPart` (storage counters, rollback checkpoints) was identified as the main design work and was NOT
+  completed.
+- Plain `MergeTreeSink::finishDelayedChunk`: simpler loop (finalize → `deduplication_log->addPart` →
+  `renameTempPartAndAdd` → PartLog); hazards: non-replicated dedup-log append concurrency, too-many-parts
+  delays. Unmeasured (s41 is Replicated).
+- Patch shape (approach 1 of 3, recommended at the time): private `processDelayedPartition(partition)` +
+  bounded `ThreadPoolCallbackRunnerLocal` fan-out + setting `max_concurrent_part_commits_per_insert`
+  DEFAULT 1 (feature dormant = today's serial behavior; minimal fork-rebase risk), all-drain + first-error,
+  per-task `ProfileEventsScope`, B90 capture discipline. Estimated diff ~100-150 lines. Rejected alternatives:
+  commit-only fan-out with caller-side retry queue (async state machine, NOT compact); window-2 pipeline
+  (complexity without the win).
+- Expected effect calibration from the historical profile: even a perfect stage 2 was not expected to
+  reach 1.0× because blob presence checks consumed ~12% of wall. That estimate must be remeasured under
+  the current mandatory-`HEAD` protocol; the target-only report above is not a matched delta.
+
+## Write-path allocation and ref-table commit-path cost (2026-07-16, TXN-Final campaign) {#writepath-cost-txn-final}
+
+- **[write-path-alloc-audit] CA write-path allocation / memory audit** — During the TXN-Final full CA-default stateless run, `system.trace_log` showed the CA write path dominates the Memory (allocation-sampling) trace: `ContentAddressedTransaction::tryCreateWriteBuffer` (~489k samples) + `writeFile` (~488k), then `CaInlineWriteBuffer` (~322k) and `CaContentWriteBuffer` (~165k). CPU was clean (NO CAS symbol in the top-15 CPU stacks) — so this is NOT a CPU or correctness issue, purely an allocation-volume observation. TODO — a deliberate alloc-profile pass on the CA write path: is `tryCreateWriteBuffer` allocating more than necessary per file (write buffer + `std::function` finalize closure + captured `owner shared_ptr<IDiskTransaction>`)? Confirm `CaInlineWriteBuffer` isn't growing its buffer inefficiently; `Cas::ObjectStorageBackend::emuWrite`/`putIfAbsent` take header maps BY VALUE (pass by const-ref, emulated test path only); establish a pre-/post-TXN-ONE-PIPELINE baseline to confirm the write-hook refactor didn't add per-write allocation overhead. Not correctness-blocking.
+- **[ref-table-copy-commit-path] CA ref-table copy on the commit/ref-op path** — The #1 CPU stack in the TXN-Final soak (pure-CA workload) was deep copy-construct + destroy of the whole committed-ref map (`RefTableState`) via `Cas::Store::appendRefOps`/`flushRefBatch` → `ContentAddressedTransaction::commit` → `publishStaging`. Overall CPU is low (I/O-bound), so not a current hog, but a scalability smell: every ref op on the commit path appears to copy the entire ref-table state by value, cost growing ~O(refs) per commit, ~O(refs·commits) over a workload — compounds under insert/mutation-heavy loads. TODO (perf, likely pre-existing ref machinery, not a TXN regression): investigate whether the `RefTableState` snapshot in `appendRefOps`/`flushRefBatch` can be passed by const-ref / diffed incrementally / copy-on-write instead of full-copied per ref batch; confirm pre-existing via git blame; alloc-profile the commit path together with the write-buffer note above. Not correctness-blocking (soak green, dangling=0).
+
+## The pool-wide catalog is a write hot spot, measured on the CA-s3 lane {#ref-catalog-write-hotspot}
+
+Measured 2026-07-31: every table creation in a pool writes the same catalog object
+(`cas/ref_catalog`), so a lane creating thousands of tables serializes them all through one CAS loop
+— 137/250 S3 timeout lines on the CA-s3 stateless lane named this one key. Not evidence the catalog
+design is wrong (it exists because pool `LIST` is unreliable), and the measurement is from a lane
+that creates tables far faster than any real deployment — but a genuine cost the design didn't
+expose before. **Open questions before a fix**: does the write rate come from creation only, or also
+from read-mints; is the retry deadline just too short for the contention it now sees; can the object
+be sharded/batched without giving up the single-object atomicity the GC universe snapshot needs.
+
+## Scalability findings from the full-scale campaign (S3 budget) {#scale-findings}
+
+These are real scale/budget findings; most are variants of "O(N) GC / per-op amplification". Track for the capacity model + a future S3-budget push.
+
+- **[idle-scratch-debris] idle GC leaves scratch files uncollected on an empty pool** — MINOR — S23 (2026-07-18 secondary finding): `scratch_bytes` on local staging grew 1→21 MiB over an idle window with ZERO inserts and an empty pool — idle GC rounds appear to create scratch files and not clean them. Local-disk debris, not tracked memory; needs its own check + cleanup path look.
+- **[scratch=full-part] CAS write spills the whole object to local scratch for hash-before-upload** — DESIRABLE — 100 GiB merge → 93 GiB scratch; a part larger than local free scratch cannot be written. Largely addressed by the (opt-in) S3-native staging; make the local path stream-hash too, or document the staging requirement for very large parts. (An orphaned 2026-08-04-triage finding covers the same cas_scratch spill class, citable across 3 sources — folded in as confirmation.)
+- **[replicated double-spill] shared-pool replica re-merges + re-spills its own full scratch** — DESIRABLE — A replica could adopt the leader's uploaded blob instead of re-merging locally (186 GiB scratch for one deduped 100 GiB blob). (An orphaned 2026-08-04-triage finding covers the same shared-pool `OPTIMIZE FINAL` re-merge/re-spill class — folded in as confirmation.)
+- **[wide-part O(columns)] merge issues O(columns) S3 ops → ephemeral TCP port exhaustion** — DESIRABLE — S07 20000-col `OPTIMIZE FINAL` stalled in an S3 retry storm. (An orphaned 2026-08-04-triage finding covers the same S07 20000-column finding verbatim — folded in as confirmation.)
+- **[partitioned-INSERT O(partitions)] O(partitions) CAS commits per insert** — DESIRABLE — ~10s per 256-partition insert.
+- **[startup O(refs)] server startup S3-op cost scales with #tables/refs** — WATCH — ~152k S3 ops to start a 10k-table server (LISTs/GETs, not blob enumeration); recovery still fast.
+- **[S11 capacity] deferred-GC disk accumulation under delete-churn** — WATCH — GC does not reclaim during the delete phase (interval-driven); same O(N)-GC-lag family.
+- **[Capacity model] GC cadence + snapshot size under typical load** — DOC/DESIRABLE — Estimate GC frequency + per-shard in-degree run / fold-seal sizes at typical production load; validate against a soak's GC log; feeds the `gc_interval_sec` default and trim gates. Live-AWS data point: a round is 30–40s.
+- **[physical-footprint amplification]** — VERIFY — 1h soak: `pool_bytes` ~400× `logical_bytes` (rustfs#3231 overwrite-version retention vs CA debris); should collapse under full GC / a compacting store. Not a safety issue (dangling=0).
+
+## New findings from the 2026-08-04 orphaned-open triage {#orphan-triage-2026-08-04}
+
+- **[putblob-uncertainty-exhaustion-abort] publication ambiguity can exhaust `ensureBlobPresent`'s eight attempts** — DESIRABLE — The old controller-coupled shape is gone: blob publication uses ordinary backend retry semantics plus an explicit eight-observation loop. Sustained ambiguous outcomes can still exhaust that loop and surface retry-later; verify the combined wall-time bound and observability under the new path.
+- **[manifest-trust-promote-path] manifest-trust promote path: skip per-leaf `HEAD`/`loadMeta` on adopted leaves** — DESIRABLE — A real perf-lever proposal, not yet confirmed landed; verify against HEAD before scheduling.
+- **[cas-commit-pool-anti-deadlock] CAS commit pool needs bounded worker-loop callbacks or a dedicated pool sized by `cas_commit_concurrency` to avoid deadlock** — DESIRABLE — A concrete anti-deadlock design requirement, plausibly still needed for the parallel-write-path work.
+- **[hot-part-blob-trickle-warmer] optional age-based trickle warmer for hot-part blobs ahead of snapshot** — DESIRABLE — Speculative but well-motivated perf idea (young-merge-window reasoning); borderline vs. not-tracked but the driver is concrete.
+- **[ca-trycommit-retry-loses-staged-state] `tryCommit` retry can drop staged `writeFile`/`createHardLink` state (B82)** — DESIRABLE — A CA `tryCommit` retry can lose staged state because a reset `metadata_transaction` has no `operations_to_execute` entry to refill in-memory staging maps. Has a bug number already assigned; verify still reproducible against HEAD and file properly if so.
+- **[cache-get-head-token-mismatch] `readManifest`/`get`/`getStream` can cache bytes fetched at one incarnation token under an earlier `HEAD`'s token** — DESIRABLE (correctness) — Independently confirmed still open during the phase-2/3 verdict audit of the docs-consolidation effort itself.
+
+## Suffix allowlist buffers big index files whole in memory (2031-triage CAS-014) {#part-file-suffix-allowlist-memory}
+
+`partFileMustStayBlob` (`ContentAddressedTransaction.cpp:65-71`) is a closed suffix allowlist that
+decides streaming-blob vs whole-file-in-memory buffering. It does not know `primary.cidx` (the
+DEFAULT name — `compress_primary_key=true` makes the listed `primary.idx` branch dead code),
+`.cmrk4` (default `write_marks_for_substreams_in_compact_parts=true`), or any skip-index data file
+(`.idx`, `.pst.idx`, `minmax_*.idx`). Those go through `CaInlineWriteBuffer`, which accumulates the
+whole payload into a `std::string` and only at finalize applies `INLINE_CAP = 1 MiB` (`:98`, `:932`),
+spilling oversized bodies to a blob.
+
+So there is no correctness or manifest-bloat defect (the cap holds), but a vector/text index or a
+large primary key is buffered entirely in memory and then written twice. Fix: add the shipped
+default names to the allowlist, and — the structural half — emit a log/metric when an unknown
+extension takes the buffered path, so the next new MergeTree file name shows up instead of silently
+costing memory. Predicate unchanged since `c623713479f`.
+
+## The part-folder view cache byte budget is inoperative (2031-triage CAS-045) {#part-folder-cache-weight-always-256}
+
+`PartFolderView::estimatedBytes` returns `256 + manifest_size` (`Parts/PartFolderAccess.cpp:136-140`)
+and `manifest_size` comes from `Cas::Resolved` (`Pool/CasRefProtocol.h:126`), which BOTH producers
+hardwire to zero: `CasRefLedger::resolveRef` (`Pool/CasRefLedger.cpp:341-345`) and
+`CasRefLedger::listRefs` (`:373-377`). The field has never been populated since it was introduced in
+`7a640e5ac69`, so every retained view weighs exactly 256 bytes.
+
+Two consequences, both confirmed at HEAD:
+
+- `part_folder_cache_bytes` (default 64 MiB, `ContentAddressedSettings.cpp:86`) is not a byte budget
+  at all — it degenerates to an entry cap of `cache_bytes / 256`, i.e. 262144, far above
+  `part_folder_cache_max_entries` (default 10000, `:87`). The only live bound is the entry count, and
+  what each entry actually pins is the fully decoded `PartManifest` including every `inline_bytes`
+  body (up to the 16 MiB aggregate inline cap per part, see
+  `formats-and-storage.md`{#manifest-inline-budget-no-spill}). 10000 wide-part views with
+  a few hundred KiB of inline `checksums.txt`/`serialization.json`/`primary.cidx` each is gigabytes of
+  memory an operator believes is capped at 64 MiB. `CurrentMetrics::CASPartFolderCacheBytes`
+  (`CurrentMetrics.cpp:233`) reports the same fiction.
+- the oversized-entry bypass at `Parts/PartFolderAccess.cpp:226` compares 256 against
+  `part_folder_cache_max_entry_bytes` (default 16 MiB, `ContentAddressedSettings.cpp:88`), so nothing
+  is ever excluded for being too large and `CASPartFolderViewOversizedBypasses` can only ever be zero.
+  The setting and the metric are both dead.
+
+No correctness impact — this is memory accounting only, and the entry cap keeps the cache finite —
+hence P2. Owed: weigh the view from the decoded body it actually owns (sum of entry path lengths plus
+`inline_bytes` sizes plus a fixed per-entry overhead) and delete `Resolved::manifest_size`, whose only
+consumer is this weight; a `manifest_size` sourced from the ref ledger cannot be made to work because
+the ledger never learns the body size. A gtest should assert a manifest with a large inline body
+weighs more than an empty one (today `gtest_cas_part_folder_view.cpp:50` passes `manifest_size=1000`
+by hand, which is why the unit tests never noticed).
+
+## The DROP/REPLACE PARTITION covering part is published under `DataPartsLock` (2031-triage CAS-048) {#covering-part-publish-under-datapartslock}
+
+P3, narrow. `MergeTreeData::removePartsInRangeFromWorkingSetAndGetPartsToRemoveFromZooKeeper`
+(`src/Storages/MergeTree/MergeTreeData.cpp:5842`) receives the caller's `DataPartsLock` and, on a
+content-addressed disk, creates AND publishes the empty covering part inside it: `createEmptyPart`
+(`:5913`), the tmp→final rename (`:5916`), and the explicit
+`getDataPartStorage().commitTransaction()` at `:5937-5939`. On CA that last call is the whole remote
+publish — `stageManifest` + `precommitAdd` + blob uploads + `promoteBuild` with a ref-log CAS
+(`ContentAddressed/ContentAddressedTransaction.cpp:409-425`) — so the table's exclusive parts lock is
+held across several object-store round trips, including a CAS append that retries under writer
+contention. Callers that reach it: `StorageReplicatedMergeTree.cpp:2987` (`executeDropRange`), `:9343`
+and `:9608` (REPLACE/MOVE PARTITION), and `MergeTreeData.cpp:5766` for plain MergeTree.
+
+Why it is P3 and not a gate: the part is EMPTY (a few small blobs + one manifest + one log append);
+the same lock already spans `createEmptyPart`'s object-store writes on an ordinary object-storage
+disk, so lock-held remote I/O on this path is inherited upstream behaviour rather than a CA
+regression; the trigger is DDL only; and a failure is loud (the exception propagates and the queue
+entry retries) with the per-ref rollback in `commit` preventing a silent partial publish.
+
+Why it was not fixed with the off-lock move: `77484196b0d` moved the disk commit off the parts lock in
+`Transaction::renameParts` (`MergeTreeData.cpp:8995`), but this path deliberately never reaches
+`Transaction::commit` — it rolls the in-memory transaction back so the cover stays `Outdated`
+(`:5942`), which is exactly why the hand-placed `commitTransaction` exists (see the comment at
+`:5921-5936`). Moving it off-lock requires a three-phase restructuring of the caller (compute the
+covering `MergeTreePartInfo` under the lock, release, create+publish, re-acquire and re-validate that
+the range is still the one that was computed) — the re-validation is the hard part, so this is a
+design task, not a code move.
+
+## Background snapshot-publish fan-out is unbounded pool-wide (2031-triage CAS-051) {#snapshot-publish-fanout-unbounded}
+
+The single-in-flight gate on background snapshot publishes is PER TABLE —
+`admitSnapshotPublishUnderStateLock` reads the per-runtime counter (`Pool/CasRefLedger.cpp:3971`, `Pool/CasRefLedger.h:826`) —
+and `dispatchSnapshotPublisher` spawns a fresh detached `ThreadFromGlobalPool` per admitted publish
+(`Pool/CasRefLedger.cpp:4005-4017`). There is no pool-wide counter, semaphore, or dedicated pool. The
+trigger threshold is per namespace and low (`snapshot_log_count_threshold = 256`,
+`snapshot_log_bytes_threshold = 1 MiB` — `Pool/CasPool.h:234-235`), so an ingest wave that crosses it on
+N tables of one pool starts N concurrent whole-namespace re-encodes plus conditional PUTs at once.
+
+Fail-soft, so not a correctness item: a global-pool exhaustion throw is caught, the pending count is
+undone and the publish is retried on the next trigger (`Pool/CasRefLedger.cpp:4019-4032`), and the
+per-table backoff (`:4082-4092`, honoured at `:3974`) suppresses PUT storms after a non-durable publish.
+The bound is "number of CA tables", not infinity. Owed: a pool-wide limiter on concurrent snapshot
+publishes (a configurable max, or a shared `ThreadPool`), keeping the existing per-table single-flight
+gate underneath it.
+
+Note for readers of the same finding: the claimed pending-count leak on a failed dispatch (which would
+hang the untimed waits at `Pool/CasRefLedger.cpp:1710-1713` and `:5106-5111`) does NOT exist — it was
+closed by `829ad698ef6`.
+
+## The ref-table cache budget is enforced only on cache admission, is not operator-tunable, and its running total can underflow (2031-triage CAS-053) {#ref-table-cache-budget-admission-only}
+
+`CasRefLedger::enforceRefTableCacheBudget` (`Pool/CasRefLedger.cpp:1611-1690`) has exactly one call
+site: the tail of `ensureRefTableRecovered` (`:1550`), which is reached only when a recovery actually
+ran — a warm touch returns early at `:1339`. So the whole-table cache budget
+(`ref_table_cache_bytes`, default 256 MiB, `Pool/CasPool.h:265`) is an admission-time check, like an
+LRU that only evicts on insert. It is never re-evaluated when the resident tables GROW in place:
+`tail_bytes_since_snapshot` is incremented by every applied txn (`:2470`, `:3791`) and
+`base_snapshot_bytes` is refreshed on each publish (`:1568`), yet a stable working set that is written
+forever and never re-recovers cold triggers no pass at all. A fixed set of hot tables can therefore sit
+above the configured ceiling indefinitely.
+
+Three separate residuals, all confirmed at HEAD:
+
+- No re-enforcement on in-place growth (above). Partly inherent: the `use_count() == 1` gate at `:1650`
+  and `:1659` is a correctness gate, not a policy choice — it is what makes append-lane split-brain
+  impossible, and a table being written is by construction not evictable. But the pass also never runs
+  for tables that HAVE gone idle, because nothing but a cold admission calls it.
+- `ref_table_cache_bytes` is a cache budget in `PoolConfig` with no `ContentAddressedSettings`
+  entry. The former blob-presence cache and its setting were deleted; the surviving
+  `manifest_decode_cache_bytes` is declared and wired, while `ref_table_cache_bytes` is set nowhere
+  outside gtests — the 256 MiB default is effectively hardcoded in production. There is also no
+  `CurrentMetrics` gauge for the ref-table cache (only `ProfileEvents::CASRefTableEvictions`,
+  `ProfileEvents.cpp:788`), so an operator can neither size it nor observe it.
+- `total -= c.weight` (`Pool/CasRefLedger.cpp:1667`) is an unclamped unsigned subtraction over values
+  read in two different passes of the same critical section: `total` sums `weightOf` for every table
+  (`:1634-1636`) including hot ones whose atomics are mutated under `state_mutex` only, while `c.weight`
+  is captured later (`:1657`). A table that was hot during the `total` loop and idle by the candidate
+  loop can contribute a larger weight than it did to `total`; if that increase exceeds every other
+  table's weight the subtraction underflows, `total <= budget` stays false and every idle `Ready` table
+  is evicted in one pass. `clampedCounterSub` (`:4191-4198`) already exists for exactly this class and
+  is used at `:4423-4424`; this site does not use it.
+
+Why P3 and not a gate: no correctness impact. Eviction is gated on idle + `Ready` + non-wedged
+(`:1650-1660`), an evicted table is re-recovered from the durable snapshot+log on next touch
+(`gtest_cas_ref_writer.cpp:2025` pins this), so the underflow's worst outcome is a burst of extra
+recovery I/O, and the missed enforcement only lets resident memory track the working set's real ref-map
+size rather than the nominal cap. Owed, in increasing cost: clamp the subtraction; expose the budget as
+a `ContentAddressedSettings` entry plus a `CurrentMetrics` gauge; and call the pass from a second,
+growth-driven trigger (for example after a snapshot publish updates `base_snapshot_bytes`) so the cap
+means something for a long-lived stable table set.
+
+## `createHardLink` pays one manifest `HEAD` per file of the source part (2031-triage CAS-055) {#hardlink-per-file-forcefresh-head}
+
+The committed-source carry-forward branch of `ContentAddressedTransaction::createHardLink` resolves the
+source part `ForceFresh` on every call (`ContentAddressedTransaction.cpp:1190`), and with the shipped
+`part_folder_validate = always` default (`ContentAddressedSettings.cpp:89`) `ForceFresh` never serves a
+retained view (`Parts/PartFolderAccess.cpp:197` gates the short-circuit on
+`validate.mode != Always`), so each call reaches `buildView` → `readManifestShared`, whose `HEAD` is
+mandatory even on a decode-cache hit (`Pool/CasManifestReader.cpp:63-65`). A `FREEZE`/clone or an
+`ALTER ... UPDATE` hardlinks every unchanged file of the part through ONE CA transaction
+(`DataPartStorageOnDiskBase.cpp:530-540` self-creates the clone transaction;
+`MutateTask.cpp:3445` opens one for the new part), so a wide part costs one `HEAD` per file for work
+that copies nothing. The manifest decode is served from cache on a token match, so the audit's "full
+view rebuild per file" overstates it — the residual is the `HEAD` round trip, not a re-decode.
+
+The fix already exists one function away and needs no protocol change: `unlinkFile` memoizes the proof
+per `(transaction, ref)` in `force_fresh_validated_refs` and downgrades the rest of the burst to
+`CachedForLoad` (`ContentAddressedTransaction.cpp:1595-1603`), which still revalidates the manifest id
+against a fresh resolve and rebuilds on mismatch (`Parts/PartFolderAccess.cpp:177-186`). Apply the same
+memo to the createHardLink committed-source branch. The `Always` default itself stays — it is the
+fail-closed policy, and relaxing it is the separate, gated `part_folder_validate` question
+(`{#part-folder-validate-never-gating}`).
+
+## A standalone write on a committed part pays a second, throwaway manifest body (2031-triage CAS-056) {#standalone-write-scratch-manifest-cost}
+
+Any effective single-file write on an already-committed part goes through the carry-forward repoint
+branch of `ContentAddressedTransaction::publishStaging`. When the transaction staged content
+(`st.build` is non-null) that branch stages and precommits a SCRATCH manifest over the DELTA entries
+only, purely to hold the EDGE-BEFORE-OBSERVE closure across the upload loop
+(`ContentAddressedTransaction.cpp:356-358`), and then republishes the merged full manifest through
+`repointRef` → `publishEntries` → `prepareEntries`, which stages a SECOND manifest body
+(`Parts/PartFolderAccess.cpp:484`). `stageManifest` durably `PUT`s each body
+(`Pool/CasPartWriteTxn.cpp:854-881`), so the scratch body is a real object; because it was
+precommitted, `abandon` may not writer-delete it and appends an exact precommit-removal instead
+(`Pool/CasPartWriteTxn.cpp:1312-1318`), leaving the body for GC's delete-after-sealed-decrements.
+Per single-file write or unlink on a committed part that costs: 2 manifest `PUT`s, ~4 ledger appends
+(scratch precommit, repoint precommit, promote, scratch removal), the promote-time manifest `GET`
+(`Pool/CasPartWriteTxn.cpp:1035`, the separate `{#writepath-candidates-post-stage1}` item (5)), and
+one GC deletion — for one changed file. A mutation-style version bump that touches every part
+multiplies this by the part count.
+
+Secondary, same call: the promote closure walks the WHOLE merged entry list and, for every
+carried-forward (tokenless, adopted) blob leaf, increments `CASBlobAdoptTrusted` and emits one
+`BlobReuseAdopt` row into `system.content_addressed_log`
+(`Pool/CasPartWriteTxn.cpp:1123-1155`). Fresh-build entries are tokened and skipped, so this is
+specific to repoints: a repoint of a wide part writes one audit row per file of the part. Compounds
+`{#ca-log-tables-restart-cost}` in `gc.md`. `adoptEvidence` itself is a pure in-memory dep insert
+with no backend call (`Pool/CasPartWriteTxn.cpp:766-781`), and `build_ops` runs at most once per item
+(`Pool/CasRefLedger.cpp:2891-2900`), so this is O(entries) per publish, not per CAS retry.
+
+Nothing here is a correctness problem, and the byte-equal short-circuit already makes a genuinely
+no-op repoint zero-mutation on the `repointRef` side (`Parts/PartFolderAccess.cpp:555-568`) — the
+scratch `PUT` still happens on that path. Fix direction (protocol-adjacent, so it needs the same
+explicit go-ahead as items (4)/(5) above): the two-phase `prepareEntries` + `promote` handle already
+exists, so the repoint path could stage the MERGED manifest once, precommit it, upload the pending
+blobs under that edge, then promote — one body instead of two, with no weakening of
+EDGE-BEFORE-OBSERVE. The audit-row volume can be addressed independently (aggregate one
+`BlobReuseAdopt`-class row per publish with a count, keeping the per-leaf `ProfileEvent`).
+
+## A file-cache disk over a CA disk never invalidates entries for GC-reclaimed blobs (2031-triage CAS-084) {#file-cache-stale-after-gc-reclaim}
+
+With the opt-in `<type>cache</type>` disk in front of a content-addressed disk
+(`DiskObjectStorage::wrapWithCache`, `src/Disks/DiskObjectStorage/DiskObjectStorageCache.cpp:14-43`),
+only the object storage is wrapped: the CA metadata storage is reused as-is, and every CA control
+and reclamation call goes through `Cas::ObjectStorageBackend`, which is built over the metadata
+storage's own raw `object_storage`
+(`ContentAddressed/ContentAddressedMetadataStorage.cpp:692`, member at
+`ContentAddressed/ContentAddressedMetadataStorage.h:571`). Blob reads, in contrast, DO ride the
+cached router (`DiskObjectStorage.cpp:842-884`, `storage->prepareRead` adds the filesystem-cache
+stage). Consequence: a blob cached on a read and later reclaimed by GC (`deleteExact` →
+`removeObjectIfTokenMatches`, `Backend/CasObjectStorageBackend.cpp:999-1014`) never reaches
+`CachedObjectStorage::removeCacheIfExists`
+(`ObjectStorages/Cached/CachedObjectStorage.cpp:150-158`), which is the only invalidation hook and
+is called exclusively from that class's own `writeObject`/`removeObject*`.
+
+Not a correctness problem: cache keys are the content-addressed blob keys, so a stale entry can
+only ever return the exact bytes it was admitted with, and no live ref names a reclaimed blob. Not
+an unbounded leak either: a cache disk must declare `max_size` or
+`max_size_ratio_to_total_space` (`src/Interpreters/FileCache/FileCacheSettings.cpp:230-237`), so the
+stale entries are LRU-evicted under pressure. The real residuals are (a) stale entries consume the
+cache budget until evicted, so effective hit rate degrades on a GC-heavy workload, and (b) the
+bytes of a reclaimed blob linger on the node's local disk until eviction, with
+`SYSTEM DROP FILESYSTEM CACHE` as the only operator handle. Fix direction: have the CA reclamation
+path notify the local cache for the deleted key (a `removeCacheIfExists`-style hook reachable
+without routing CA deletes through the cached object storage, which must NOT happen — the control
+plane deliberately bypasses the cache).
+
+## Every committed ref chunk re-GETs and rescans the pool-global ref catalog (2031-triage CAS-112) {#ref-catalog-read-per-commit}
+
+`commitRefChunk` performs a fresh, unconditional whole-object read of `cas/ref_catalog` immediately
+before id allocation for every positive (state-growing) chunk
+(`Pool/CasRefLedger.cpp:3248-3262`, gate `positive_append` at `:3194-3198`).
+`CasRefCatalog::read` is a plain `backend.get` plus a full `decodeRefCatalog` plus a
+`CatalogLifeIndex` build with no caching whatsoever (`Pool/CasRefCatalog.cpp:26-49`), and the row
+lookup is a linear `std::find_if` over all entries (`Pool/CasRefLedger.cpp:3255-3261` at the caller,
+helper `findEntry` at `Pool/CasRefCatalog.cpp:166-172`). A single part publish issues two positive
+appends — the precommit (`Pool/CasPartWriteTxn.cpp:1338`) and the promote
+(`Pool/CasPartWriteTxn.cpp:955`/`:1070`) — so a lone `INSERT` pays at least two full catalog GETs
+whose body size and decode cost scale with the number of namespaces in the pool, entirely unrelated
+to the table being written. Flat combining amortizes this across concurrent appends (one GET per
+committed chunk, not per item), and the warm path does NOT re-read the catalog in
+`namespaceLife`/`acquireMutableRefTableRuntime` (cached runtime, `Pool/CasRefLedger.cpp:620-631`,
+`:4691-4718`) — so the cost is per chunk commit, not per API call.
+
+This is the READ counterpart of {#ref-catalog-write-hotspot} (which is about creation-time CAS
+contention on the same object) and the same shape as {#ckpt-read-policy} (a fresh control-object GET
+per commit): the fix should be considered together with that policy seam, since both are
+"exact-read-per-commit" of a singleton whose only mutators are lifecycle transitions under lease
+exclusivity. Correctness note for any caching design: this read is a deliberate fence — it closes
+the window in which another actor publishes `Removing` after the cached runtime's own admission — so
+a cache needs the same invalidation edges {#ckpt-read-policy} lists (fence-generation change, wedge,
+remount supersession, `catalog_life_invalidated`) plus the terminal-removal path staying always-exact
+(`Pool/CasRefLedger.cpp:3223-3235`). Not correctness-affecting today; pure request-count/scale cost.
+
+## The dedup presence cache charged 64 B/entry against a real ~176 B (2031-triage CAS-115) {#dedup-cache-weight-constant-64}
+
+**✅ CLOSED by deletion of the cache; identifier retained for provenance.** The unconditional
+blob-publication rewrite removed the presence cache, its byte setting, its gauge, and its cache-only
+events. Every decision now performs the authoritative blob `HEAD`, so there is no cache-entry weight
+to correct. The audit's sibling `PartManifestWeight` observation remains a separate low-value
+container-overhead estimate and is not reopened by this closure.
+
+## Part staging is a linear-scanned vector, so a part costs O(F^2) path compares (2031-triage CAS-116) {#staging-vector-quadratic-path-scans}
+
+`PartStaging::entries` is a `std::vector<Cas::ManifestEntry>` (`ContentAddressedTransaction.h:139`) with
+no by-path index, and every mutation upserts by rescanning it: `std::erase_if(st.entries, … e.path ==
+entry.path)` at `ContentAddressedTransaction.cpp:718` (blob stage), `:951` (inline stage), `:1180`,
+`:1201` (`createHardLink`), `:1352` (`moveDirectory` re-key), `:1525` (`moveFile`), `:1550`
+(`replaceFile`), plus the linear `std::find_if` lookups at `:549` (`findStagedEntry`, the
+read-your-writes probe), `:1163`, `:1345`, `:1504`. Staging F files therefore costs ~F^2/2 path
+comparisons before any I/O, and `moveDirectory`'s re-key loop (`:1345-1353`) is a nested scan of the
+destination per source entry (the destination grows inside the loop, so the "destination is freshly
+created" note at `:1327-1329` does not make it linear).
+
+Real shape, small price: the comparisons are `std::string ==` on short names (length check first), so
+even a 3000-file wide-plus-projections part is a few million compares — single-digit milliseconds —
+against 3000 staged temp files and 3000 blob PUTs on the same path. Nothing is quadratic in BYTES and
+nothing is quadratic across parts (each `parts` entry is scanned independently,
+`ContentAddressedTransaction.h:157`). Also note the one place that WAS a real duplicate-membership
+quadratic is already fixed: `uploadPendingBlobs` builds an
+`unordered_set<BlobRef>` of referenced hashes (`ContentAddressedTransaction.cpp:261-264`) and the
+fan-out groups by unique ref.
+
+P3. Owed if the file count per part ever grows an order of magnitude (very wide tables with many
+projections and secondary indexes): keep a `std::unordered_map<std::string, size_t>` path->index
+alongside `entries`, or make `entries` a `std::map<std::string, ManifestEntry>` and drop the sorted-order
+re-derivation in `encodePartManifest`. Not worth touching before there is a measurement showing staging
+CPU on a profile.
+
+## Every blob body has a `.meta` sibling, so the blob namespace holds two objects per part file (2031-triage CAS-117) {#per-blob-meta-sibling-object-count}
+
+Mostly a re-statement of the tracked packing/inlining class ({#read-write} `[B121 / B202 / one-GET-open]`
+and {#writepath-candidates-post-stage1} item (3), which already carries the measured ~239 `PUT`/part /
+~8 objects/column). The one part of that audit finding with no home yet is the freshness marker:
+`Layout::blobMetaKey` is `blobKey(ref) + ".meta"` (`Formats/CasLayout.cpp:41`), every fresh upload
+creates it (`Pool/CasPartWriteTxn.cpp:540-547`, `writeFreshMetaClean` -> `putMetaIfAbsent`) and every
+adopt back-fills it when absent (`:422-423`), so a blob-placement part file costs TWO objects and two
+`PUT`s, not one. Because the sibling shares `blobsPrefix()` (`Tools/CasFsck.cpp:721-726`), every LIST of
+the blob namespace — fsck's physical listing and the GC fold's sweep — enumerates twice the keys, and
+the fsck pairing pass exists only because of it (`:1030-1033`). On top of that each body carries a
+`blob_header_len`-padded envelope (256 B by default, `Pool/CasPool.h:54`, padding at
+`Formats/CasBlobEnvelopeFormat.cpp:153-155`), which for a tiny `.mrk` is a large relative inflation of
+stored bytes; the envelope's own open question is `formats-and-storage.md`{#blob-envelope-never-read-back}.
+
+Scope correction worth keeping: this does NOT apply to "a wide part of small files" generally. Small
+eager metadata files are inlined into the manifest and cost no object at all (`INLINE_CAP` = 1 MiB,
+`ContentAddressedTransaction.cpp:98`, `:932`); only `.bin`, `.mrk*`/`.cmrk*` and `primary.idx` are
+forced to stay blobs (`Cas::partFileMustStayBlob`, declared `ContentAddressedTransaction.h:236-243`).
+For those, a plain object-storage MergeTree also stores one object per file, so CAS's INCREMENTAL cost
+is the `.meta` sibling plus the envelope, not a doubling of the whole part. Content-identical files
+across parts and replicas dedup to one body+meta pair.
+
+P3, and the cheap half is already someone else's item. What is owed specifically here: decide whether
+the marker can be folded (e.g. only materialized when a body becomes `Condemned` rather than on every birth), which
+is a protocol-step change adjacent to mandatory blob `HEAD` and metadata reconciliation — so it needs an
+explicit user decision with a risk analysis, not an opportunistic optimization. Cheap and unblocked in
+the meantime: quantify it, i.e. report the body/`.meta` object split in `SYSTEM CAS FSCK` output so the
+2x LIST cost is visible rather than inferred.
+
+## Opening one part file repeats the whole path-parse + route + view lookup two or three times (2031-triage CAS-118) {#read-path-repeated-view-lookup-per-open}
+
+Every read-side entry point re-derives the same `(ref, file)` from scratch: `parsePartFilePath` →
+`route` → `partAccess()`/`poolAccess()` → `getView` → `findFile`. One `DiskObjectStorage::readFile` on
+a blob-backed part file walks that chain twice — `prepareRead` first calls `prepareInManifestRead` →
+`tryGetInManifestBytes` (`ContentAddressedMetadataStorage.cpp:1962-1971`) and, on the normal
+non-inline outcome, then calls `getBlobViewPlan`, which parses and routes the identical path again
+(`:1999-2010`) — and a third time whenever the caller sized the file first through `getFileSize`
+(`:1656-1664`). Each pass takes the pool pointer lock plus the ref table's `state_mutex`
+(`Pool/CasRefLedger.cpp:311-312`) and the view cache's own lock, so a wide part multiplies the count
+by its file count.
+
+This is CPU and lock traffic only, not requests: `resolveRef` is a pure in-memory lookup on the
+mounted writer's cached `RefTableState` (`Pool/CasRefLedger.cpp:275-289`) and a warm `CachedForLoad`
+view hit returns without touching `readManifestShared` (`Parts/PartFolderAccess.cpp:176-191`), so
+none of the repeats reaches object storage. Fix direction: let `prepareRead` obtain one view (or one
+resolved `Route` + view pair) and pass it to both the in-manifest probe and the blob-window
+computation instead of each callee re-deriving it; the `PoolAccessSnapshot` plumbing that already
+shares one mount generation between `getView` and `locate` is the natural place to hang it. Ordering:
+strictly after the request-count items above, which dominate wall time.
+
+## The conditional-write lane retries on a deterministic backoff grid and sits outside the disk's cross-thread retry pacing (2031-triage CAS-119) {#conditional-write-retry-pacing-and-jitter}
+
+Two small, real residuals of the single-attempt conditional-write design (the design itself is settled —
+RFC `cas-s3-timeout-retry-control`, mount-time fail-closed gate at
+`Backend/CasObjectStorageBackend.cpp:112-127`, profile set at `:867`):
+
+1. **No jitter.** `CasRequestController::backoffBeforeAttempt` is a purely deterministic capped
+   exponential — `initial · 2^(attempt-2)` clamped to the cap, no random factor
+   (`Backend/CasRequestControl.cpp:231-244`), defaults 200 ms → 5 s
+   (`Backend/CasRequestControl.h:187-188`). Every thread that hits the same disruption at the same
+   moment therefore reissues on the same 200/400/800 ms grid. This matters here specifically because
+   the write path deliberately fans a part's blob uploads across 16-33 threads
+   (`fanOutBlobUploads`), so a store-wide 503/`SlowDown` episode produces synchronized reissue waves
+   from one part commit. Cheap fix: multiply the computed sleep by a `[1, 1+f)` factor, the same shape
+   the S3 client already has (`IO/S3/Client.cpp:144-149`).
+
+2. **The lane is excluded from the disk's cross-thread pacing.** `getSingleAttemptClient` clones the
+   disk client with `retry_strategy.max_retries = 0`
+   (`ObjectStorages/S3/S3ObjectStorage.cpp:1032-1051`); the clone is a distinct `Client` object, and
+   `next_time_to_retry_after_retryable_error` is a per-object atomic that the copy constructor does
+   not carry over (`IO/S3/Client.h:355`, `IO/S3/Client.cpp:340-363`). On top of that, the client's own
+   `updateNextTimeToRetryAfterRetryableError` fires only from `attempt_no > 1`
+   (`IO/S3/Client.cpp:836-843`) and `max_attempts` is `max_retries + 1 == 1` here (`:806`), so a
+   throttled conditional write neither observes nor contributes to the shared slowdown window that the
+   rest of the disk's traffic honors before every attempt (`:852`). Direction: seed/share the
+   slowdown state with the parent client for the single-attempt clone, or let the CAS controller
+   consult it.
+
+Neither is a correctness issue — the controller is bounded (16 attempts, 90 s operation deadline,
+`Backend/CasRequestControl.h:168-173`) and every unproven outcome is `Unresolved`, never a false
+`Committed`. Related, already tracked: `{#issue-2244-lease-retry-asymmetry}` (the lease/remount ops
+have the OPPOSITE problem — no retries at all) and `[timeout-retry RFC residuals]` in
+`BACKLOG/ref-protocol.md`.
+
+## Every decoded text-format line is assembled one byte at a time into a fresh `String` (2031-triage CAS-127) {#readline-per-byte-per-record-string}
+
+`Cas::readLine` (`Formats/CasTextFormat.cpp:281-295`) builds each line by `line.push_back(c)` in a
+loop with an `in.eof()` check per character and no `reserve`, returning a freshly-constructed `String`
+by value. It is the single line reader for every v3 text format, and the record-oriented formats call
+it once per record inside their decode loop: `Formats/CasRefSnapshotFormat.cpp:159,194`,
+`Formats/CasRefLogFormat.cpp:324,370`, `Formats/CasPartManifestFormat.cpp:136,173,278`,
+`Formats/CasFoldSealFormat.cpp:335,350`, `Formats/CasRecordStreamFormat.cpp:123,238`,
+`Formats/CasRefCatalogFormat.cpp:174`, `Formats/CasGcOutcomesFormat.cpp:73`.
+
+So a GC round that streams a large ref snapshot, an in-degree run, a fold seal and a pool-global ref
+catalog pays, per record: one heap allocation (the JSON record lines are well past the SSO limit, so
+this is a real `malloc`/`free` pair) plus a per-byte loop where a `memchr` over the already-buffered
+range plus one `append` would do. Pure constant factor — no correctness dimension, no cap change
+(`line_cap` is still enforced, it just moves from per-byte to post-scan) — but it sits on the decode
+side of every GC round and every part-manifest open.
+
+Fix shape: scan the `ReadBuffer`'s pending range for `'\n'` and `append` whole chunks (the same shape
+as `readStringUntilNewlineInto`), and let the caller pass a reusable `String &` so the decode loops
+stop allocating per record. Nothing outside `Formats/` calls `readLine`
+(`Formats/CasTextFormat.h:221` plus `Pool/CasPool.cpp:1435-1436`), so the signature change is local.
+
+Related, already tracked: `{#writepath-cost-txn-final}` covers the WRITE-side allocation audit; this
+is the read/decode side, which that item does not mention.
+
+## Blob-upload pool: raw reference escapes its lock; `clickhouse-local` tears it down first (umbrella review M6) {#blob-upload-pool-teardown-order}
+
+`blobUploadPool()` returns a raw `ThreadPool &` after releasing `pool_mutex`, and the reference is
+held across the whole upload fan-out; `shutdownBlobUploadPool()` simply resets the instance. In
+`clickhouse-local` the shutdown call runs BEFORE `global_context->shutdown()` — the reverse of the
+order in `clickhouse-server` and `clickhouse-disks`. Since `MergeTreeData` starts real background
+merges even under `clickhouse-local`, a merge mid-fan-out at process exit can hold a reference to a
+pool that is already destroyed (use-after-free, or a null-pool throw in sanitizer builds). The
+header's own contract admits the reference is valid only while the pool stays initialized and relies
+on call-order discipline with no assertion.
+
+Fix: move the shutdown call after `global_context->shutdown()` in `LocalServer::cleanup()`; longer
+term hand out a `shared_ptr` (or a use-counter the shutdown drains) so the contract is enforced by
+code. P2. Not the same as the tracked pool-size/backpressure item (2031-triage CAS-047).

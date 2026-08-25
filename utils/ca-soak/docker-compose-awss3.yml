@@ -1,0 +1,96 @@
+# Real-AWS variant of the CA soak cluster (release-gate: real-S3 GC validation).
+# Same two-replica + one-keeper topology as docker-compose.yml, but the CA pool lives in a LIVE
+# AWS S3 bucket (test-altinity-support-team, us-east-1) instead of local RustFS — so there is no
+# rustfs1/createbucket service, and the credentials are injected from the GIT-IGNORED
+# configs/aws.env (use_environment_credentials in storage_conf_awss3_*.xml). No secrets are
+# baked into any committed file.
+#
+# Usage:
+#   1. Fill in configs/aws.env (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY). It is git-ignored.
+#   2. docker compose -f docker-compose-awss3.yml up -d
+#   3. Fresh-run cleanup (the bucket persists between runs, unlike `down -v` on RustFS); each
+#      run uses a UNIQUE prefix (bump the date/rN suffix in storage_conf_awss3_*.xml):
+#        aws s3 rm --recursive s3://test-altinity-support-team/ca_live_20260703_r3/
+#
+# NOTE: the CA capability probe runs on mount and is itself the FIRST validation step here — it
+# demands the store enforce conditional ops (wrong-token DELETE must fail with 412). If AWS
+# rejects the probe, the server logs the exact unsupported operation and refuses the mount.
+#
+# NOTE: /var/lib/clickhouse is a NAMED VOLUME on purpose (production stands keep it on a PVC).
+# The local ClickHouse uuid file there IS this server's CAS identity: the pool's server-root
+# owner anchor stores that uuid, and a recreated container with a fresh uuid is refused as a
+# foreign owner (fail closed; see claimOwnerOrThrow). Plain `down`/`up` keeps the volumes;
+# `down -v` wipes them — then bump the pool prefix (or remove the stale owner objects) first.
+
+services:
+  keeper1:
+    image: clickhouse/clickhouse-server:25.8
+    entrypoint: ["/usr/bin/clickhouse", "keeper", "--config-file", "/etc/clickhouse-keeper/keeper.xml"]
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/keeper.xml:/etc/clickhouse-keeper/keeper.xml:ro
+      - keeper1_data:/var/lib/clickhouse
+    expose:
+      - "9181"
+
+  ch1:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    env_file: configs/aws.env
+    depends_on:
+      keeper1:
+        condition: service_started
+    mem_limit: 28g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_awss3_ch1.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node1.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./logs/ch1:/var/log/clickhouse-server
+      - ch1_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    # Serialize the two shared-pool mounts (same probe race as docker-compose.yml).
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 5s
+
+  ch2:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    env_file: configs/aws.env
+    depends_on:
+      keeper1:
+        condition: service_started
+      ch1:
+        condition: service_healthy
+    mem_limit: 28g
+    volumes:
+      - ../../build/programs/clickhouse:/usr/bin/clickhouse:ro
+      - ./configs/storage_conf_awss3_ch2.xml:/etc/clickhouse-server/config.d/storage_conf.xml:ro
+      - ./configs/keeper_client.xml:/etc/clickhouse-server/config.d/keeper_client.xml:ro
+      - ./configs/macros_node2.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+      - ./configs/memory.xml:/etc/clickhouse-server/config.d/memory.xml:ro
+      - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
+      - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
+      - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./logs/ch2:/var/log/clickhouse-server
+      - ch2_data:/var/lib/clickhouse
+    ports:
+      - "8124:8123"
+      - "9002:9000"
+
+volumes:
+  keeper1_data:
+  ch1_data:
+  ch2_data:

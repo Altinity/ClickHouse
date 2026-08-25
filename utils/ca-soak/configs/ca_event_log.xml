@@ -1,0 +1,8 @@
+<clickhouse>
+    <cas_log>
+        <database>system</database>
+        <table>cas_log</table>
+        <flush_interval_milliseconds>2000</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 3 DAY DELETE</ttl>
+    </cas_log>
+</clickhouse>

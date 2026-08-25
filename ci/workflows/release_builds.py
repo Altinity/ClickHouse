@@ -45,7 +45,7 @@ workflow = Workflow.Config(
         AltinityJobConfigs.source_upload_job,
         *[
             job
-            for job in JobConfigs.functional_tests_jobs
+            for job in AltinityJobConfigs.functional_tests_jobs
             if any(t in job.name for t in ("release", "binary"))
         ],
     ],

@@ -1,0 +1,5 @@
+<clickhouse>
+    <macros>
+        <replica>node6</replica>
+    </macros>
+</clickhouse>

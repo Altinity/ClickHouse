@@ -1,0 +1,1 @@
+database	table	replica_name	position	node_name	type	create_time	required_quorum	source_replica	new_part_name	parts_to_merge	is_detach	is_currently_executing	num_tries	last_exception	last_exception_time	last_attempt_time	num_postponed	postpone_reason	last_postpone_time	merge_type

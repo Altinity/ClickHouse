@@ -1,6 +1,7 @@
 from praktika import Workflow
 
 from ci.defs.defs import DOCKERS, SECRETS, ArtifactConfigs
+from ci.defs.altinity_jobs import AltinityJobConfigs
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
 
@@ -24,7 +25,7 @@ workflow = Workflow.Config(
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_jobs,
         *JobConfigs.compatibility_test_jobs,
-        *[job for job in JobConfigs.functional_tests_jobs if "amd_asan_ubsan" in job.name],
+        *[job for job in AltinityJobConfigs.functional_tests_jobs if "amd_asan_ubsan" in job.name],
         *[
             job
             for job in JobConfigs.unittest_jobs

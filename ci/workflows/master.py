@@ -55,7 +55,7 @@ workflow = Workflow.Config(
         *JobConfigs.compatibility_test_jobs,
         *[
             j
-            for j in JobConfigs.functional_tests_jobs
+            for j in AltinityJobConfigs.functional_tests_jobs
             if "coverage" not in j.name
         ],
         # *JobConfigs.functional_test_llvm_coverage_jobs,

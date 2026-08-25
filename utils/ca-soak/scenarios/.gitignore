@@ -1,0 +1,3 @@
+# Per-run artifacts (logs, metrics, reports, raw extracts, config snapshots).
+runs/
+__pycache__/

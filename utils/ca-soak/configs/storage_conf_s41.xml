@@ -1,0 +1,60 @@
+<clickhouse>
+    <!-- S41 write-path baseline stack (docker-compose-s41.yml, isolated project `ca-s41`). Single
+         ClickHouse node. Defines BOTH the content-addressed disk under test AND a plain S3 disk
+         (standard `metadata_type=local` S3 disk) so the card measures the identical wide INSERT on
+         each and reports the CA-vs-plain slowdown factor. The two disks use DIFFERENT pool prefixes
+         so `cas-fsck` / `pool_shape` (scoped to `soak_pool`) never see the plain-S3 objects. -->
+    <storage_configuration>
+        <disks>
+            <!-- Disk under test: content-addressed over RustFS. Byte-for-byte the same knobs as the
+                 soak's `ca` disk so the baseline exercises the real writer/GC path, not a special
+                 case. Single-node, so background GC on this one server owns reclamation. -->
+            <ca>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>cas</metadata_type>
+                <endpoint>http://rustfs1:11121/test/soak_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <cas_server_root_id>ca_s41_ch1</cas_server_root_id>
+                <cas_gc_enabled>1</cas_gc_enabled>
+                <cas_gc_interval_sec>10</cas_gc_interval_sec>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </ca>
+
+            <!-- Comparison leg: the standard S3 disk (data on S3, part metadata stored locally). A
+                 DIFFERENT pool prefix (`s3plain_pool`) keeps its objects out of the CA pool the
+                 fsck/pool-shape tooling scans. This is the "standard S3 disk" the prior 7.6x finding
+                 compared CAS against. -->
+            <s3plain>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>local</metadata_type>
+                <endpoint>http://rustfs1:11121/test/s3plain_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <expect_continue_min_bytes>65536</expect_continue_min_bytes>
+            </s3plain>
+
+            <!-- ca_ro read-only fsck view intentionally omitted here (see storage_conf_ch1.xml): a
+                 ca_ro over the same pool breaks MergeTree table load with UNKNOWN_DISK on restart.
+                 It lives in fsck_only_s41.xml, mounted OUTSIDE config.d. -->
+        </disks>
+        <policies>
+            <ca>
+                <volumes>
+                    <main>
+                        <disk>ca</disk>
+                    </main>
+                </volumes>
+            </ca>
+            <s3plain>
+                <volumes>
+                    <main>
+                        <disk>s3plain</disk>
+                    </main>
+                </volumes>
+            </s3plain>
+        </policies>
+    </storage_configuration>
+</clickhouse>

@@ -429,6 +429,12 @@ std::optional<ObjectMetadata> tryStatResolvedPath(const std::string & resolved_p
         throw fs::filesystem_error("Got unexpected error while getting last write time", resolved_path, error);
     }
 
+    /// A directory is not an object: fs::file_size would throw "Is a directory". Treat it as a
+    /// missing object (nullopt) so callers probing whether a path is a readable object do not get a raw
+    /// filesystem error -- `system.remote_data_paths` traversal on a content-addressed pool does this.
+    if (fs::is_directory(resolved_path, error))
+        return {};
+
     object_metadata.size_bytes = fs::file_size(resolved_path, error);
     if (error)
     {

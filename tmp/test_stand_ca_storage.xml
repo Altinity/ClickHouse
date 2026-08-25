@@ -1,0 +1,90 @@
+<clickhouse>
+  <storage_configuration>
+    <disks>
+      <!-- Content-addressed shared pool over S3.
+           KEY DIFFERENCE vs the old per-replica layout: the endpoint contains NO {replica} —
+           all replicas of a shard mount the SAME pool (one bucket path = single source of
+           truth, dedup + no fetches). Per-replica identity lives in server_root_id instead.
+           A pool per (cluster, shard) keeps GC universes small; replicas of one shard share
+           identical data, which is where dedup actually pays. -->
+      <s3>
+        <type>object_storage</type>
+        <object_storage_type>s3</object_storage_type>
+        <metadata_type>cas</metadata_type>
+        <endpoint>http://s3.us-west-2.amazonaws.com/tenant-a-eovqf642-chi-clickhouse-data/clickhouse/{cluster}/{shard}/cas_pool/</endpoint>
+        <region>us-west-2</region>
+        <skip_access_check>true</skip_access_check>
+
+        <!-- REQUIRED, no default: the layout subtree this replica owns inside the shared pool.
+             Macros expand here like in endpoint, so one config template serves all replicas. -->
+        <cas_server_root_id>{replica}</cas_server_root_id>
+
+        <!-- ============================================================================
+             All content-addressed settings below are OPTIONAL and shown with their code
+             DEFAULTS (commented out = default behavior). Uncomment to override.
+             ============================================================================ -->
+
+        <!-- Background reachability GC on this mount. Every mount can run GC; a shared
+             lease dedups leaders, so leaving it on everywhere is safe and recommended. -->
+        <!-- <cas_gc_enabled>1</cas_gc_enabled> -->
+
+        <!-- How often a mount tries to run a GC round. -->
+        <!-- <cas_gc_interval_sec>60</cas_gc_interval_sec> -->
+
+        <!-- CREATION-TIME (persisted in the pool; ignored on reopen): fanout of the mutable
+             ref namespace. 32 balances CAS-write batching against per-shard body size. -->
+        <!-- <root_shards>32</root_shards> -->
+
+        <!-- CREATION-TIME: blob-target reducer sharding for the GC fold. 1 = single reducer;
+             raise only for very large pools (allows concurrent per-shard reduce). -->
+        <!-- <cas_gc_shards>1</cas_gc_shards> -->
+
+        <!-- Blob publication has no override setting: every materialization starts with HEAD.
+             An absent or condemned body is published unconditionally and may use multipart. -->
+
+        <!-- How many sealed GC snapshot generations to retain for introspection/debug. -->
+        <!-- <cas_gc_snapshot_generations_to_keep>3</cas_gc_snapshot_generations_to_keep> -->
+
+        <!-- Orphan part-manifest sweep budgets per GC round (LIST keys / DELETE keys). -->
+        <!-- <cas_manifest_sweep_list_budget_keys>1000</cas_manifest_sweep_list_budget_keys> -->
+        <!-- <cas_manifest_sweep_delete_budget_keys>100</cas_manifest_sweep_delete_budget_keys> -->
+
+        <!-- Part-manifest (packed small files) size thresholds: soft = start a new manifest,
+             hard = refuse to grow; max_delay = how long a writer may batch before flushing. -->
+        <!-- <manifest_soft_limit>16777216</manifest_soft_limit> -->
+        <!-- <manifest_hard_limit>67108864</manifest_hard_limit> -->
+        <!-- <manifest_max_delay_ms>1000</manifest_max_delay_ms> -->
+
+        <!-- Server-local spill dir for in-flight writes (real local path, NOT in the bucket). -->
+        <!-- <cas_scratch_path>/var/lib/clickhouse/disks/s3/cas_scratch/</cas_scratch_path> -->
+      </s3>
+
+      <!-- FILE CACHE OVER CA: SUPPORTED since 2026-07-08 (was NOT_IMPLEMENTED at startup before).
+           The cache disk now reuses the CA metadata storage directly and wraps only the object
+           storage, so immutable content-hash blobs cache perfectly (read-through, lazily populated)
+           while the control plane bypasses the cache. To use it, point the policy volume at
+           `s3_cache` instead of `s3`. (Design: docs/superpowers/specs/2026-07-08-cas-file-cache-disk-support-design.md;
+           test: tests/integration/test_cas_file_cache.) -->
+      <s3_cache>
+        <type>cache</type>
+        <disk>s3</disk>
+        <path>/var/lib/clickhouse/disks/s3_cache/</path>
+        <max_size>21474836480</max_size>
+      </s3_cache>
+    </disks>
+
+    <policies>
+      <default>
+        <volumes>
+          <s3>
+            <disk>s3</disk>
+            <!-- NOTE: prefer_not_to_merge is DROPPED from the old config on purpose: with the
+                 CA pool as primary storage merges must run normally (merge churn is exactly
+                 what dedup + GC are built for; suppressing merges piles up small parts). -->
+            <perform_ttl_move_on_insert>false</perform_ttl_move_on_insert>
+          </s3>
+        </volumes>
+      </default>
+    </policies>
+  </storage_configuration>
+</clickhouse>

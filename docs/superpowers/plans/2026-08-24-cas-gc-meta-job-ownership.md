@@ -1,0 +1,1184 @@
+---
+description: 'Implementation plan for CAS GC meta-pool job ownership, the round-exit drain, and the mount-claim error reclassification.'
+sidebar_label: 'CAS GC meta-job ownership plan'
+sidebar_position: 6
+slug: /superpowers/plans/cas-gc-meta-job-ownership
+title: 'CAS GC Meta-Job Ownership Implementation Plan'
+doc_type: 'plan'
+---
+
+# CAS GC meta-job ownership and mount-claim error classification — Implementation Plan {#cas-gc-meta-job-ownership-implementation-plan}
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Close findings B1 and B2a of the 2026-08-05 umbrella review: make the CAS GC meta-pool's jobs own everything they touch, drain that pool on every round exit, and stop `MountLeaseKeeper::claim` from raising `LOGICAL_ERROR` on externally reachable conflicts.
+
+**Architecture:** The bounded meta pool, its two job counters, its condemn-marker confirmation registry and the `PoolPtr` its jobs write through move out of `Gc` into a new `GcMetaWriter` that exposes two typed operations and accepts no caller-supplied callable, so a job capturing `this` becomes inexpressible rather than merely absent. `Gc::runRegularRound` gains a scope guard that drains the pool on the throwing exit as well as the normal one. Independently, six `LOGICAL_ERROR` throws in `MountLeaseKeeper::claim` become `ABORTED`, and each of those branches — plus the two `MountFencedException` branches that must keep precedence over them — gets a direct test driven by a one-shot backend race seam.
+
+**Tech Stack:** C++ (ClickHouse `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed`), gtest via `unit_tests_dbms`, CMake + ninja.
+
+**Spec:** `docs/superpowers/specs/2026-08-24-cas-gc-meta-job-ownership-design.md` (rev.4, approved 2026-08-24)
+
+## Global Constraints {#global-constraints}
+
+- **Branch:** work on the existing `cas-gc-rebuild`. Do **not** create a new branch, do **not** rebase, do **not** amend — add new commits only.
+- **No pushing.** Commit locally; pushing requires a separate, explicit request.
+- **Scope:** item 9's B1 and B2a only. B3 (the `custom_disk` privilege gate) and item 10 (detached work outliving `Context`) are out of scope and must not be touched.
+- **No durable-format, key-shape or protocol-step changes.** Nothing in this plan may alter what is written to object storage, only which in-process object owns the writing.
+- **C++ style:** Allman braces (opening brace on its own line) — enforced by the CI style check.
+- **Comments:** no references to plans, backlogs, reviews or task numbers in source comments. Keep the reason, drop the provenance.
+- **Prose:** write function names as `f`, not `f()`. Wrap SQL identifiers, class and function names, and log-message excerpts in inline code.
+- **Never add a `sleep` to fix a race.** A bounded `wait_for` used to assert that a thread is blocked is a different thing and is used deliberately in Task 2.
+- **Build output goes to a log file** in the build directory, and the log is summarized by a subagent — never pasted wholesale.
+- **No `-j` with ninja**, and do not invoke `nproc`.
+- **Never `git add -A`.** The working tree contains large untracked artifacts; stage named paths only.
+- New `.cpp`/`.h` files under `.../ContentAddressed/Gc/` and new `gtest*.cpp` files under `src/` need **no** CMake edit: both are globbed with `CONFIGURE_DEPENDS` (`cmake/dbms_glob_sources.cmake:1-3`, `src/CMakeLists.txt:903`), so ninja reconfigures on its own.
+
+## File Structure {#file-structure}
+
+| File | Responsibility |
+|---|---|
+| `src/Disks/.../ContentAddressed/Gc/CASGcMetaWriter.h` (create) | Declares `GcMetaWriter`: owns the bounded meta pool and everything its jobs touch; two typed scheduling operations, a drain, counter accessors, and the condemn-marker registry accessors. |
+| `src/Disks/.../ContentAddressed/Gc/CASGcMetaWriter.cpp` (create) | Implements it, including the two meta-write helpers moved out of `CasGc.cpp`. |
+| `src/Disks/.../ContentAddressed/Gc/CasGc.h` (modify) | Drops `meta_pool`, both counters, the mutex, the set, `scheduleMetaJob` and the three registry accessors; gains one `std::unique_ptr<GcMetaWriter> meta_writer`. |
+| `src/Disks/.../ContentAddressed/Gc/CasGc.cpp` (modify) | Constructs `meta_writer` in the constructor body; routes every former call site through it; adds the round-exit drain guard. |
+| `src/Disks/.../ContentAddressed/Pool/CasServerRoot.cpp` (modify) | Six `LOGICAL_ERROR` throws in `claim` become `ABORTED`. |
+| `src/Disks/tests/cas_test_helpers.h` (modify) | Three new test backends — `MetaWriteLatchBackend` (Task 1), `OutcomeLogFaultBackend` (Task 2), `MountSlotRaceBackend` (Task 3) — plus `awaitLatchEntered` and `expectThrowsCodeWithMessage`. |
+| `src/Disks/tests/gtest_cas_gc_meta_writer.cpp` (create) | Task 1 and Task 2 tests: jobs across `Gc` destruction, and the round-exit drain. |
+| `src/Disks/tests/gtest_cas_mount_claim_conflicts.cpp` (create) | Task 3 tests: all six reclassified branches plus both fenced-precedence branches. |
+| `src/Disks/tests/gtest_cas_mount.cpp` (modify) | The existing death test folds into the new file's different-epoch case. |
+
+---
+
+### Task 1: Extract `GcMetaWriter` {#task-1-extract-gcmetawriter}
+
+**Files:**
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.h`
+- Create: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.cpp`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h:882-894`, `:947-968`
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp:127-155`, `:374-378`, `:381-440`, `:867-870`, `:916`, `:965`, `:511`, `:1017-1034`, `:1890-1896`
+- Modify: `src/Disks/tests/cas_test_helpers.h`
+- Test: `src/Disks/tests/gtest_cas_gc_meta_writer.cpp` (create)
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks.
+- Produces, for Task 2 and Task 3:
+  - `DB::Cas::GcMetaWriter`, with `void scheduleCondemnMarkerWrite(const BlobRef &, const Token &, uint64_t condemn_round, uint64_t size)`, `void scheduleConfirmedMetaDelete(const BlobRef &)`, `void drain()`, `uint64_t scheduled() const`, `uint64_t completed() const`, `void noteCondemnMarkerDurable(const BlobRef &, const Token &)`, `bool condemnMarkerConfirmedInProcess(const BlobRef &, const Token &)`, `void forgetCondemnMarker(const BlobRef &, const Token &)`.
+  - On `Gc`, a test seam `GcMetaWriter & metaWriterForTest()`.
+  - In `cas_test_helpers.h`, `DB::Cas::tests::MetaWriteLatchBackend` with `std::atomic<bool> entered{false}`, `void arm()` and `void release()`, plus the free function `void awaitLatchEntered(MetaWriteLatchBackend &)`.
+
+**Context an implementer needs.** `Gc` today owns `std::unique_ptr<ThreadPool> meta_pool` (`CasGc.h:950`), the counters `meta_jobs_scheduled_` / `meta_jobs_completed_` (`:956-957`), and the registry `condemn_marker_mutex` + `condemn_markers_confirmed` (`:967-968`). `Gc::scheduleMetaJob` (`CasGc.cpp:381-440`) wraps a caller's closure so it never throws, counts it, and falls back to running it inline when scheduling fails. Two callers hand it a closure that captures `this`: `scheduleCondemnMarkerWrite` (`:433`) and the delete confirmation (`:867`). Both reach `store` through `this`. The two helpers those jobs call, `writeCondemnedMeta` (`:127`) and `deleteConfirmedMeta` (`:142`), live in the anonymous namespace of `CasGc.cpp` and have no other callers, so they move with the jobs.
+
+`GcMetaWriter` must be held by `std::unique_ptr` and built in the **body** of `Gc::Gc`, not as a direct member: its pool size comes from `store->poolConfig().gc_meta_pool_size`, and `Gc::Gc` validates a null `store` in its body (`CasGc.cpp:350-357`). A direct member would dereference null before that check and break `CASGCLease.CtorFailsClosedOnBadArguments` (`src/Disks/tests/gtest_cas_gc_round.cpp:459`).
+
+- [ ] **Step 1: Create the header**
+
+Create `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.h`:
+
+```cpp
+#pragma once
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Common/ThreadPool.h>
+#include <Common/logger_useful.h>
+
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <set>
+
+namespace DB::Cas
+{
+
+/// Owns the bounded pool for a GC round's per-hash freshness-meta writes (condemn / spare / delete)
+/// AND everything those writes touch.
+///
+/// There is deliberately NO way to hand this class a closure. The only paths onto the pool are the
+/// two typed operations below, and each captures nothing but a `shared_ptr` to `State`. A job
+/// therefore cannot reach anything owned by the enclosing `Gc`, which is what keeps a job that
+/// outlives its owner well-defined instead of dependent on member-declaration order.
+class GcMetaWriter
+{
+public:
+    GcMetaWriter(PoolPtr store_, LoggerPtr logger_, size_t pool_size);
+
+    GcMetaWriter(const GcMetaWriter &) = delete;
+    GcMetaWriter & operator=(const GcMetaWriter &) = delete;
+
+    /// Publish durable Condemned evidence for one (blob, exact incarnation-token) pair. On success the
+    /// pair is recorded in the in-process confirmation registry, which the graduation gate reads. A
+    /// lost CAS or a thrown error leaves the pair UNCONFIRMED: the gate then carries the entry and a
+    /// later round retries the write.
+    void scheduleCondemnMarkerWrite(const BlobRef & ref, const Token & token,
+                                    uint64_t condemn_round, uint64_t size);
+
+    /// Drop the freshness meta of a blob whose body is confirmed deleted or absent.
+    void scheduleConfirmedMetaDelete(const BlobRef & ref);
+
+    /// Wait for every job scheduled so far. Never throws: each job already caught its own exception.
+    void drain();
+
+    uint64_t scheduled() const;
+    uint64_t completed() const;
+
+    /// The in-process condemn-marker confirmation registry, keyed (blob, exact token value). Pool
+    /// completions insert concurrently with the round thread's reads, and the round thread also
+    /// inserts directly when it re-checks a marker synchronously.
+    void noteCondemnMarkerDurable(const BlobRef & ref, const Token & token);
+    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token);
+    void forgetCondemnMarker(const BlobRef & ref, const Token & token);
+
+private:
+    /// Everything a job reaches. Held by `shared_ptr` and captured by value into every job.
+    struct State
+    {
+        PoolPtr store;
+        LoggerPtr logger;
+        std::atomic<uint64_t> scheduled{0};
+        std::atomic<uint64_t> completed{0};
+        std::mutex condemn_marker_mutex;
+        std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
+
+        void noteCondemnMarkerDurable(const BlobRef & ref, const Token & token);
+        bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token);
+        void forgetCondemnMarker(const BlobRef & ref, const Token & token);
+    };
+
+    /// Wrap one meta op so it can never throw, count it, and put it on the pool -- running it inline
+    /// if scheduling itself fails, rather than silently losing the write. Private, and takes only
+    /// what this class produces: the typed operations above are the sole callers.
+    void submit(std::function<void()> op);
+
+    std::shared_ptr<State> state;
+    ThreadPool pool;
+};
+
+}
+```
+
+- [ ] **Step 2: Create the implementation**
+
+Create `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.cpp`. Move `writeCondemnedMeta` (`CasGc.cpp:127-140`) and `deleteConfirmedMeta` (`CasGc.cpp:142-155`) here **verbatim**, including their doc comments at `CasGc.cpp:100-126`, into this file's anonymous namespace. Then:
+
+```cpp
+namespace ProfileEvents
+{
+extern const Event CASGCMetaOps;
+extern const Event CASGCMetaWriteAnomaly;
+}
+
+namespace DB::Cas
+{
+
+GcMetaWriter::GcMetaWriter(PoolPtr store_, LoggerPtr logger_, size_t pool_size)
+    : state(std::make_shared<State>())
+    , pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive,
+           CurrentMetrics::LocalThreadScheduled, std::max<size_t>(1, pool_size))
+{
+    state->store = std::move(store_);
+    state->logger = std::move(logger_);
+}
+
+void GcMetaWriter::submit(std::function<void()> op)
+{
+    /// `run` is safe to invoke either on the pool or inline (the scheduling-failure fallback below)
+    /// and NEVER lets an exception escape: a per-hash meta op is advisory -- the ledger and the
+    /// exact-token body delete are the actual safety core. It captures only `state`, so it stays
+    /// well-defined however long it outlives the writer that scheduled it.
+    auto run = [op, st = state]()
+    {
+        ProfileEvents::increment(ProfileEvents::CASGCMetaOps);
+        try
+        {
+            op();
+        }
+        catch (...)
+        {
+            ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
+            tryLogCurrentException(st->logger,
+                "CAS gc: a per-hash freshness-meta op failed on the bounded pool (advisory-only; "
+                "never wedges the round)");
+        }
+        /// A job that threw still FINISHED: this counter reports drain progress, not success.
+        st->completed.fetch_add(1, std::memory_order_relaxed);
+    };
+    state->scheduled.fetch_add(1, std::memory_order_relaxed);
+    try
+    {
+        pool.scheduleOrThrowOnError(run);
+    }
+    catch (...)
+    {
+        /// Scheduling itself failed (e.g. resource exhaustion under a mass-DROP burst) -- run inline
+        /// rather than silently lose the meta write. `run` still never throws.
+        ProfileEvents::increment(ProfileEvents::CASGCMetaWriteAnomaly);
+        tryLogCurrentException(state->logger,
+            "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
+        run();
+    }
+}
+
+void GcMetaWriter::scheduleCondemnMarkerWrite(const BlobRef & ref, const Token & token,
+                                              uint64_t condemn_round, uint64_t size)
+{
+    submit([st = state, ref, token, condemn_round, size]()
+    {
+        if (writeCondemnedMeta(*st->store, ref, condemn_round, size))
+            st->noteCondemnMarkerDurable(ref, token);
+    });
+}
+
+void GcMetaWriter::scheduleConfirmedMetaDelete(const BlobRef & ref)
+{
+    submit([st = state, ref]()
+    {
+        deleteConfirmedMeta(st->store->backend(), st->store->layout(), ref);
+    });
+}
+
+void GcMetaWriter::drain()
+{
+    pool.wait();
+}
+
+uint64_t GcMetaWriter::scheduled() const
+{
+    return state->scheduled.load(std::memory_order_relaxed);
+}
+
+uint64_t GcMetaWriter::completed() const
+{
+    return state->completed.load(std::memory_order_relaxed);
+}
+
+void GcMetaWriter::State::noteCondemnMarkerDurable(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    condemn_markers_confirmed.emplace(ref, token.value);
+}
+
+bool GcMetaWriter::State::condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    return condemn_markers_confirmed.contains({ref, token.value});
+}
+
+void GcMetaWriter::State::forgetCondemnMarker(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    condemn_markers_confirmed.erase({ref, token.value});
+}
+
+void GcMetaWriter::noteCondemnMarkerDurable(const BlobRef & ref, const Token & token)
+{
+    state->noteCondemnMarkerDurable(ref, token);
+}
+
+bool GcMetaWriter::condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token)
+{
+    return state->condemnMarkerConfirmedInProcess(ref, token);
+}
+
+void GcMetaWriter::forgetCondemnMarker(const BlobRef & ref, const Token & token)
+{
+    state->forgetCondemnMarker(ref, token);
+}
+
+}
+```
+
+Add the `CurrentMetrics` extern block for `LocalThread`, `LocalThreadActive` and `LocalThreadScheduled`, copying the form used at the top of `CasGc.cpp`.
+
+- [ ] **Step 3: Strip the moved state out of `Gc`**
+
+In `CasGc.h`: delete the declarations of `scheduleMetaJob` (`:882`), `noteCondemnMarkerDurable`, `condemnMarkerConfirmedInProcess` and `forgetCondemnMarker` (`:891-894`), `meta_pool` (`:947-950`), `meta_jobs_scheduled_` / `meta_jobs_completed_` (`:952-957`), `condemn_marker_mutex` and `condemn_markers_confirmed` (`:960-968`). Add `#include <.../Gc/CASGcMetaWriter.h>` and, in their place:
+
+```cpp
+    /// Owns the bounded pool for this round's per-hash freshness-meta writes and everything those
+    /// writes touch. A `unique_ptr` because its pool size comes from `store->poolConfig()`, which may
+    /// only be read after the constructor body has validated `store` -- a direct member would be
+    /// initialized before that check.
+    std::unique_ptr<GcMetaWriter> meta_writer;
+```
+
+Add, to the existing `TEST SEAM` block at the end of the class:
+
+```cpp
+    /// TEST SEAM: reach the meta writer so a unit test can schedule a real meta op and read the
+    /// round's job accounting without driving a full round.
+    GcMetaWriter & metaWriterForTest() { return *meta_writer; }
+```
+
+- [ ] **Step 4: Rewire `Gc` in the implementation**
+
+In `CasGc.cpp`:
+
+1. Delete `writeCondemnedMeta`, `deleteConfirmedMeta` and their doc comments (`:100-155`) — they now live in `CASGcMetaWriter.cpp`.
+2. Delete `Gc::scheduleMetaJob` (`:381-440`), `Gc::scheduleCondemnMarkerWrite` (`:430-440`), `Gc::noteCondemnMarkerDurable`, `Gc::condemnMarkerConfirmedInProcess` and `Gc::forgetCondemnMarker` (`:442-458`).
+3. Replace the pool construction in the constructor body (`:374-378`) with:
+
+```cpp
+    /// Build the meta writer here (ctor body), not in a member-initializer, so it can safely read
+    /// `store->poolConfig()` AFTER the null check above.
+    meta_writer = std::make_unique<GcMetaWriter>(
+        store, logger, static_cast<size_t>(store->poolConfig().gc_meta_pool_size));
+```
+
+4. Rewrite each remaining call site:
+
+| Site | Was | Becomes |
+|---|---|---|
+| `:867` | `scheduleMetaJob([this, ref]() { deleteConfirmedMeta(store->backend(), store->layout(), ref); });` | `meta_writer->scheduleConfirmedMetaDelete(ref);` |
+| `:870`, `:916`, `:965` | `forgetCondemnMarker(…)` | `meta_writer->forgetCondemnMarker(…)` |
+| `:964` and the fold's condemn sites | `scheduleCondemnMarkerWrite(…)` | `meta_writer->scheduleCondemnMarkerWrite(…)` |
+| `:511` | `meta_jobs_scheduled_.load(…)` / `meta_jobs_completed_.load(…)` baselines | `meta_writer->scheduled()` / `meta_writer->completed()` |
+| `:1026-1034` | the same loads plus `meta_pool->wait()` | the same accessors plus `meta_writer->drain()` |
+| `:1890` | `condemnMarkerConfirmedInProcess(…)` | `meta_writer->condemnMarkerConfirmedInProcess(…)` |
+| `:1896` | `noteCondemnMarkerDurable(…)` | `meta_writer->noteCondemnMarkerDurable(…)` |
+
+5. Delete the comment at `:386-392` that justifies the raw-pointer counter capture by an `~Gc` that does not exist. Do not rewrite it — the argument it makes is the one this change removes.
+
+- [ ] **Step 5: Verify no callback surface remains**
+
+Run:
+
+```bash
+grep -rn "scheduleMetaJob" src/Disks/
+```
+
+Expected: no output. This grep is the regression guard for the whole task — if it ever prints again, the lifetime boundary has been reopened.
+
+- [ ] **Step 6: Add the latch backend to the test helpers**
+
+Append to `src/Disks/tests/cas_test_helpers.h`, next to `MetaWriteFaultBackend`:
+
+```cpp
+/// Blocks INSIDE a blob-meta mutation until `release` is called, so a test can hold a real meta job in
+/// flight and observe that it got there. `entered` is set before blocking.
+///
+/// STARTS DISARMED, and that is load-bearing: the write path itself writes Clean blob meta
+/// (`Pool/CasPartWriteTxn.cpp:314`), so a latch that blocked from construction would block the test's
+/// own fixture instead of the job under test. Call `arm` only once the fixture is built.
+class MetaWriteLatchBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
+    std::atomic<bool> entered{false};
+
+    void arm()
+    {
+        armed.store(true);
+    }
+
+    void release()
+    {
+        std::lock_guard lock(latch_mutex);
+        released = true;
+        latch_cv.notify_all();
+    }
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    DB::Cas::PutResult putOverwrite(
+        const String & key, const String & bytes, const DB::Cas::Token & expected,
+        const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
+    DB::Cas::CasResult casPut(const String & key, const String & bytes,
+                              const std::optional<DB::Cas::Token> & expected,
+                              const DB::Cas::ObjectMeta & meta) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
+    DB::Cas::DeleteOutcome deleteExact(const String & key, const DB::Cas::Token & token) override
+    {
+        waitIfMeta(key);
+        return InMemoryBackend::deleteExact(key, token);
+    }
+
+private:
+    void waitIfMeta(const String & key)
+    {
+        if (!armed.load() || !key.ends_with(".meta"))
+            return;
+        entered.store(true);
+        std::unique_lock lock(latch_mutex);
+        latch_cv.wait(lock, [this] { return released; });
+    }
+
+    std::atomic<bool> armed{false};
+    std::mutex latch_mutex;
+    std::condition_variable latch_cv;
+    bool released = false;
+};
+
+/// Wait until a latched job has provably reached the backend. A bounded wait that FAILS rather than
+/// hangs: a job that never arrives is a broken fixture, and a test that hangs on it reports nothing.
+inline void awaitLatchEntered(MetaWriteLatchBackend & backend)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!backend.entered.load())
+    {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "no meta job reached the backend latch -- the fixture never scheduled one";
+        std::this_thread::yield();
+    }
+}
+```
+
+- [ ] **Step 7: Write the functional-coverage test**
+
+Create `src/Disks/tests/gtest_cas_gc_meta_writer.cpp`. These tests are **not** failing-first and the
+plan does not pretend otherwise: the pre-change defect is an access to destructed-but-still-allocated
+storage, which no sanitizer reports, so no runtime assertion can distinguish the two trees. Their job
+is to pin the behaviour going forward; the boundary itself is enforced by Step 5's grep.
+
+Each test therefore has to assert that the metadata mutation actually **landed**. Without that, an
+implementation that enters the backend and then loses the operation passes too, and the test measures
+nothing but the absence of a crash.
+
+```cpp
+#include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/tests/cas_test_helpers.h>
+
+#include <thread>
+
+using namespace DB::Cas;
+using DB::Cas::tests::MetaWriteLatchBackend;
+using DB::Cas::tests::awaitLatchEntered;
+
+namespace
+{
+constexpr auto kGcId = "0000000000000000000000000000002a";
+}
+
+/// A real condemn-marker job may be in flight when its `Gc` is destroyed. The job holds everything it
+/// touches, so the pool's join completes it correctly rather than racing member teardown -- and the
+/// marker it was writing is durable afterwards.
+///
+/// This asserts function, not ordering: the release may land before, during or after destruction
+/// begins, and all three are sound. Nothing here detects a job that wrongly captured its owner --
+/// that is prevented by there being no API to write one.
+TEST(CASGcMetaWriter, RealCondemnMarkerJobCompletesAcrossOwnerDestruction)
+{
+    auto backend = std::make_shared<MetaWriteLatchBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const BlobRef ref = DB::Cas::tests::idOf(1);
+    const Token token{"tok-1"};
+
+    auto gc = std::make_unique<Gc>(store, DB::Cas::tests::u128Of(kGcId));
+    backend->arm();
+    gc->metaWriterForTest().scheduleCondemnMarkerWrite(ref, token, /*condemn_round=*/1, /*size=*/128);
+
+    awaitLatchEntered(*backend);
+
+    std::thread releaser([&] { backend->release(); });
+    gc.reset();
+    releaser.join();
+
+    const auto meta = loadMeta(*backend, store->layout(), ref);
+    ASSERT_TRUE(meta) << "the condemn marker was lost across owner destruction";
+    EXPECT_EQ(meta->meta.state, MetaState::Condemned);
+    EXPECT_EQ(meta->meta.condemn_round, 1u);
+}
+
+/// The confirmation registry is written by the pool thread and read by the graduation gate. Assert it
+/// on a `Gc` that is still alive, so the read is possible at all: after destruction there is no
+/// registry left to consult, which is the documented behaviour a fresh leader relies on.
+TEST(CASGcMetaWriter, CondemnMarkerConfirmationIsVisibleAfterDrain)
+{
+    auto backend = std::make_shared<MetaWriteLatchBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const BlobRef ref = DB::Cas::tests::idOf(1);
+    const Token token{"tok-1"};
+
+    Gc gc(store, DB::Cas::tests::u128Of(kGcId));
+    EXPECT_FALSE(gc.metaWriterForTest().condemnMarkerConfirmedInProcess(ref, token));
+
+    gc.metaWriterForTest().scheduleCondemnMarkerWrite(ref, token, /*condemn_round=*/1, /*size=*/128);
+    gc.metaWriterForTest().drain();
+
+    EXPECT_TRUE(gc.metaWriterForTest().condemnMarkerConfirmedInProcess(ref, token));
+    EXPECT_EQ(gc.metaWriterForTest().scheduled(), gc.metaWriterForTest().completed());
+}
+
+/// Same lifetime property for the other production job. `deleteConfirmedMeta` RETURNS IMMEDIATELY when
+/// no meta object exists (`Gc/CasGc.cpp:142-149`), so the meta must be seeded first -- otherwise the
+/// job never reaches the latch and the wait above is waiting for something that will never happen.
+TEST(CASGcMetaWriter, RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction)
+{
+    auto backend = std::make_shared<MetaWriteLatchBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const BlobRef ref = DB::Cas::tests::idOf(2);
+    ASSERT_EQ(
+        putMetaIfAbsent(*store, ref, BlobMeta{.state = MetaState::Condemned, .condemn_round = 1, .size = 64}).outcome,
+        CasOverwriteOutcome::Committed);
+    ASSERT_TRUE(loadMeta(*backend, store->layout(), ref));
+
+    auto gc = std::make_unique<Gc>(store, DB::Cas::tests::u128Of(kGcId));
+    backend->arm();
+    gc->metaWriterForTest().scheduleConfirmedMetaDelete(ref);
+
+    awaitLatchEntered(*backend);
+
+    std::thread releaser([&] { backend->release(); });
+    gc.reset();
+    releaser.join();
+
+    EXPECT_FALSE(loadMeta(*backend, store->layout(), ref))
+        << "the confirmed-meta delete was lost across owner destruction";
+}
+```
+
+Before writing this, read and reconcile against the real signatures:
+`idOf` and `u128Of` in `src/Disks/tests/cas_test_helpers.h` (used the same way at
+`gtest_cas_gc_leak.cpp:34-36`); `loadMeta`, `putMetaIfAbsent`, `BlobMeta` and `MetaState` in
+`Pool/CasBlobMeta.h`; and `Token`'s constructor. The sketch above is written from their call sites in
+`CasGc.cpp:127-149` and may not carry every parameter.
+
+- [ ] **Step 8: Build**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_task1.log 2>&1; echo "NINJA_EXIT=$?"
+```
+
+Expected: `NINJA_EXIT=0`. Dispatch a subagent to read `build_debug/build_task1.log` and report a short summary; do not read the log directly.
+
+- [ ] **Step 9: Run the CAS suite**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+./build_debug/unit_tests_dbms --gtest_filter='CAS*' > build_debug/test_task1.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: `TEST_EXIT=0`. Dispatch a subagent to summarize the log. `CASGCLease.CtorFailsClosedOnBadArguments` and `CASGCAckFloor` (the suite containing `gtest_cas_gc_ack_floor.cpp:1242-1277`, which reasons that the confirmation registry dies with its `Gc`) must both be present and passing — name them explicitly in the summary request rather than accepting an aggregate "all passed".
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CASGcMetaWriter.cpp \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp \
+        src/Disks/tests/cas_test_helpers.h \
+        src/Disks/tests/gtest_cas_gc_meta_writer.cpp
+git commit -m "fix: give CAS GC meta-pool jobs ownership of what they touch"
+```
+
+Verify with `git log -1 --stat` that only those six paths are in the commit — this checkout is shared with other sessions.
+
+---
+
+### Task 2: Drain the meta pool on every round exit {#task-2-drain-the-meta-pool-on-every-round-exit}
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp` (`runRegularRound`, whose body starts at `:461`)
+- Modify: `src/Disks/tests/cas_test_helpers.h`
+- Test: `src/Disks/tests/gtest_cas_gc_meta_writer.cpp`
+
+**Interfaces:**
+- Consumes: `GcMetaWriter::drain`, `GcMetaWriter::scheduled`, `GcMetaWriter::completed`, `Gc::metaWriterForTest`, `MetaWriteLatchBackend` (with `arm`, `release`, `entered`) and `awaitLatchEntered` — all from Task 1.
+- Produces: `DB::Cas::tests::OutcomeLogFaultBackend`, a `MetaWriteLatchBackend` subclass that throws out of the round's outcome-log write.
+
+**Context an implementer needs.** `Cas::Gc gc` is a member of the scheduler (`Gc/CasGcScheduler.h:190`), so one pool and one registry are shared across rounds. The only drain today is the `meta_pool_wait` phase (`CasGc.cpp:1017-1034`), which sits between the pending-deletes phase and the round commit. Meta jobs are scheduled earlier: condemn markers during the fold and in the supersede branch at `:964`, and confirmed-meta deletes at `:867`. A round that throws in between leaves its jobs running while the next round starts; those jobs insert into the registry the next round's graduation gate reads (`:1890`) and land inside its counter deltas, whose baseline is sampled at its own start (`:511`).
+
+The uncaught throw seam is the outcome-log write at `CasGc.cpp:970-984`: a `putIfAbsent` reporting `PreconditionFailed` followed by a `get` returning nothing raises `ABORTED` — "outcome log at {} vanished between putIfAbsent and read".
+
+**Two fixture facts that decide whether this test works at all.** Both were wrong in an earlier draft.
+
+1. **The outcome log is written from SETTLED entries, not from fresh condemns.** `outcomes` is filled at `CasGc.cpp:854` and `:899`, inside the pending-deletes phase's loop over retired entries — so a round that merely condemns a new blob writes no outcome log and the fault never fires. The round the test needs is the one that actually **deletes**: it schedules a confirmed-meta delete at `:867` for the same entry it records an outcome for at `:854`, which is exactly the pairing this test wants — one meta job in flight *and* a non-empty outcome log, in that order.
+2. **The latch must be armed only after the fixture is built.** The write path writes Clean blob meta (`Pool/CasPartWriteTxn.cpp:314`), and the earlier rounds write Condemned meta, so a latch armed from construction blocks the fixture rather than the job under test.
+
+Graduation is round-paced — a blob condemns in one round, graduates in the next, and is deleted in the pass after that (see the fixpoint driver's comment in `gtest_cas_gc_leak.cpp:56-60`). The fixture therefore drives disarmed, unfaulted rounds until `Gc::previewDeletes` — public and write-free — reports a pending delete, and only then arms the latch and the fault for the next round.
+
+- [ ] **Step 1: Add the fault backend**
+
+Append to `src/Disks/tests/cas_test_helpers.h`:
+
+```cpp
+/// Makes a GC round throw at its outcome-log write -- after the round has scheduled its confirmed-meta
+/// delete (`Gc/CasGc.cpp:867`) and before the round's meta-pool wait. Inherits the `.meta` latch so
+/// that job can be held in flight across the throw. Both the fault and the latch start off.
+class OutcomeLogFaultBackend : public MetaWriteLatchBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::putIfAbsent;
+
+    std::atomic<bool> fail_outcome_logs{false};
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        if (fail_outcome_logs.load() && key.contains("outcomes/"))
+            return DB::Cas::PutResult{.outcome = DB::Cas::PutOutcome::PreconditionFailed};
+        return MetaWriteLatchBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        if (fail_outcome_logs.load() && key.contains("outcomes/"))
+            return std::nullopt;
+        return MetaWriteLatchBackend::get(key, range);
+    }
+};
+```
+
+Confirm `PutResult`'s field names and `Range`'s default against `Backend/CasBackend.h:248-283`, and confirm `outcomesKey` still contains the literal `outcomes/` (`Formats/CasLayout.h:359-363`).
+
+- [ ] **Step 2: Write the failing test**
+
+Append to `src/Disks/tests/gtest_cas_gc_meta_writer.cpp`. The assertion is that the round does not **return** while a meta job is still in flight — which is what a drain means, and the only formulation that does not race the job's completion:
+
+```cpp
+/// A round that throws must not leave its meta jobs running into the next round: their effects would
+/// land in the registry the next round's graduation gate reads, and inside its counter deltas.
+///
+/// The round is made to throw at its outcome-log write, with the confirmed-meta delete it scheduled a
+/// few lines earlier held inside the backend. The round must then BLOCK, draining, until that job is
+/// released -- so the test asserts the round has NOT returned while the job is still held, releases,
+/// and only then joins.
+TEST(CASGcMetaWriter, ThrowingRoundDrainsBeforeReturning)
+{
+    auto backend = std::make_shared<DB::Cas::tests::OutcomeLogFaultBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    /// Fixture: one part written and dropped, then rounds driven until the NEXT round is the one that
+    /// deletes -- the round that both schedules a confirmed-meta delete and writes an outcome log.
+    /// Inline the part-write and drop from `gtest_cas_gc_leak.cpp`'s own setup rather than adding a
+    /// helper; read `gtest_cas_gc_leak.cpp:40-100` and its fixpoint driver at `:56-90`.
+    writeAndDropOnePart(store);                       // <-- replace with that file's real setup
+
+    Gc gc(store, DB::Cas::tests::u128Of(kGcId));
+
+    size_t rounds = 0;
+    while (gc.previewDeletes().empty())
+    {
+        ASSERT_LT(++rounds, 16u) << "no round ever reached a pending delete -- fixture is wrong";
+        ASSERT_NO_THROW(gc.runRegularRound());
+        store->renewWatermarkOnce();
+    }
+
+    const uint64_t scheduled_before = gc.metaWriterForTest().scheduled();
+
+    backend->arm();
+    backend->fail_outcome_logs.store(true);
+
+    /// Return the outcome instead of asserting on the worker thread: a gtest assertion raised off the
+    /// main thread is not reliably reported, and this one distinguishes the two ways the test can go
+    /// wrong (see below), so it must be visible.
+    auto round = std::async(std::launch::async, [&]
+    {
+        try
+        {
+            gc.runRegularRound();
+            return false;
+        }
+        catch (...)
+        {
+            return true;
+        }
+    });
+
+    awaitLatchEntered(*backend);
+    EXPECT_GT(gc.metaWriterForTest().scheduled(), scheduled_before)
+        << "the faulted round scheduled no meta job -- it cannot be the deleting round";
+
+    EXPECT_EQ(round.wait_for(std::chrono::seconds(2)), std::future_status::timeout)
+        << "the round returned while a meta job was still in flight -- it did not drain on its "
+           "throwing exit";
+
+    backend->release();
+    EXPECT_TRUE(round.get())
+        << "the round completed normally -- the outcome-log fault never fired, so the timeout above "
+           "was the round blocking in its own `meta_pool_wait`, not in the drain under test";
+
+    EXPECT_EQ(gc.metaWriterForTest().scheduled(), gc.metaWriterForTest().completed());
+}
+```
+
+Add `#include <future>` and `#include <chrono>`.
+
+**The two ways this test can lie, and what catches each.** A timeout on `wait_for` is consistent with
+two different states: the round draining on its throwing exit (what the test is for) and the round
+blocking in the pre-existing `meta_pool_wait` because the fault never fired and it is on its normal
+path. The `EXPECT_TRUE(round.get())` above separates them — a normal completion means the fault
+missed. The `EXPECT_GT` on `scheduled` separates a third case: a faulted round that scheduled nothing,
+which is not the deleting round and so proves nothing either way.
+
+`renewWatermarkOnce` is used by the fixpoint driver in `gtest_cas_gc_leak.cpp` to keep the build-watermark floor and lease current across rounds — check its exact name and whether it is needed for this pool configuration before relying on it.
+
+- [ ] **Step 3: Run it and watch it fail**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_task2_red.log 2>&1; echo "NINJA_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='CASGcMetaWriter.ThrowingRoundDrainsBeforeReturning' \
+    > build_debug/test_task2_red.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: build succeeds, and the test **fails on the `wait_for` assertion** — pre-fix the round
+unwinds straight out of the outcome-log throw without waiting for anything, so `wait_for` reports
+`ready` rather than `timeout`.
+
+Read the failure, do not just accept a red. Three distinguishable outcomes:
+
+| What the log shows | Meaning |
+|---|---|
+| `wait_for` returned `ready` | the intended red — the round returned with a job in flight |
+| `awaitLatchEntered` failed | the faulted round scheduled no meta job; the fixture is not stopping on the deleting round |
+| `round.get()` returned `false` | the fault never fired; the timeout came from the pre-existing `meta_pool_wait` |
+
+Only the first is the red this task is for. Fix the fixture before continuing on either of the others — a red obtained for the wrong reason will read as green after the change for the wrong reason too.
+
+- [ ] **Step 4: Add the drain guard**
+
+In `runRegularRound`, immediately after the round's local state is set up and before any work that can schedule a meta job, add:
+
+```cpp
+    /// Every exit path leaves this round's meta jobs finished. The `meta_pool_wait` phase below is a
+    /// protocol barrier -- this round's condemns must be durable no later than the ledger they are
+    /// paired with -- and covers only the successful path. A round that throws between the fold and
+    /// that barrier would otherwise leave its jobs running into the NEXT round, where their
+    /// confirmations reach a graduation gate that never scheduled them.
+    SCOPE_EXIT({ meta_writer->drain(); });
+```
+
+Add `#include <base/scope_guard.h>` to `CasGc.cpp` if `SCOPE_EXIT` is not already available there — check first, since `CasGcScheduler.cpp:175` already uses it and may pull it in transitively; rely on a direct include rather than a transitive one.
+
+- [ ] **Step 5: Run it and watch it pass**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_task2_green.log 2>&1; echo "NINJA_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='CASGcMetaWriter.*' \
+    > build_debug/test_task2_green.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: `TEST_EXIT=0`, all three `CASGcMetaWriter` tests passing.
+
+- [ ] **Step 6: Run the whole CAS suite**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+./build_debug/unit_tests_dbms --gtest_filter='CAS*' > build_debug/test_task2_full.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: `TEST_EXIT=0`. Summarize via a subagent. Pay particular attention to any test that drives several rounds and asserts timing-sensitive counters — the new guard makes a throwing round slower to return.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp \
+        src/Disks/tests/cas_test_helpers.h \
+        src/Disks/tests/gtest_cas_gc_meta_writer.cpp
+git commit -m "fix: drain the CAS GC meta pool on a round's throwing exit"
+```
+
+---
+
+### Task 3: `MountLeaseKeeper::claim` raises `ABORTED`, with a test per branch {#task-3-mount-claim-raises-aborted}
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp:1460-1537`
+- Modify: `src/Disks/tests/cas_test_helpers.h`
+- Modify: `src/Disks/tests/gtest_cas_mount.cpp:1057-1078`
+- Test: `src/Disks/tests/gtest_cas_mount_claim_conflicts.cpp` (create)
+
+**Interfaces:**
+- Consumes: nothing from Tasks 1 and 2 — this task is independent and may be done first if convenient.
+- Produces: `DB::Cas::tests::MountSlotRaceBackend` with one-shot hooks `before_put_if_absent`, `before_get`, `before_put_overwrite`, and `DB::Cas::tests::expectThrowsCodeWithMessage`.
+
+**Context an implementer needs.** `claim` (`CasServerRoot.cpp:1460-1537`) raises `LOGICAL_ERROR` on six branches and `MountFencedException` on two. Constructing an exception with `LOGICAL_ERROR` calls `handle_error_code` (`src/Common/Exception.cpp`), which aborts the process on any `DEBUG_OR_SANITIZER_BUILD` — and `claim` is reached from the background self-remount thread (`Pool/CasPool.cpp:1233`), so today these are aborts on the lanes that certify the feature. Every one of the six describes a state produced by another process, not a violated invariant of ours; the renewal path already raises `ABORTED` for the same conditions (`:1594`, `:1604`, `:1618`).
+
+The two `MountFencedException` branches (`:1508`, `:1521`) are **not** touched: they are caught by type at `Pool/CasPool.cpp:709`, which turns a GC fence during mount into a bounded epoch-bump retry. Their precedence over the reclassified branches is part of the contract.
+
+- [ ] **Step 1: Add the race seam**
+
+Append to `src/Disks/tests/cas_test_helpers.h`:
+
+```cpp
+/// Runs a caller-supplied action ONCE, immediately before the named backend call, so a test can make
+/// the mount slot change inside a window `MountLeaseKeeper::claim` holds open. Each hook clears
+/// itself after firing.
+class MountSlotRaceBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
+    std::function<void()> before_put_if_absent;
+    std::function<void()> before_get;
+    std::function<void()> before_put_overwrite;
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        fire(before_put_if_absent);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
+    {
+        fire(before_get);
+        return InMemoryBackend::get(key, range);
+    }
+
+    DB::Cas::PutResult putOverwrite(
+        const String & key, const String & bytes, const DB::Cas::Token & expected,
+        const DB::Cas::ObjectMeta & meta) override
+    {
+        fire(before_put_overwrite);
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
+private:
+    static void fire(std::function<void()> & hook)
+    {
+        if (!hook)
+            return;
+        auto once = std::move(hook);
+        hook = nullptr;
+        once();
+    }
+};
+```
+
+A hook that must remove the slot reads its token with `get` and calls `deleteExact` — `Backend` has no unconditional delete (`Backend/CasBackend.h:298`).
+
+Also append the assertion helper these tests need. `expectThrowsCode` (`cas_test_helpers.h:145-156`)
+checks the code and nothing else, and **all six branches now raise the same code**, so on its own it
+cannot tell which branch ran — a test that takes the wrong branch passes. Add a sibling rather than
+changing the existing helper, which has many callers:
+
+```cpp
+/// Expect a DB::Exception with EXACTLY `expected_code` AND a message containing `expected_substring`.
+/// Needed wherever several distinct branches share one code: the code alone does not identify which
+/// one ran, so a test that silently takes the wrong branch would still pass.
+template <typename F>
+void expectThrowsCodeWithMessage(int expected_code, const String & expected_substring, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+        EXPECT_NE(e.message().find(expected_substring), String::npos)
+            << "wrong branch: " << e.message();
+    }
+}
+```
+
+- [ ] **Step 2: Write the failing tests**
+
+Create `src/Disks/tests/gtest_cas_mount_claim_conflicts.cpp` with eight tests. Each builds the slot state, constructs a `MountLeaseKeeper` the way `gtest_cas_mount.cpp:1062-1064` does, calls `start`, and asserts the code **and** a message substring — the substring is what identifies the branch, since all six share one code. Use `expectThrowsCodeWithMessage` from Step 1 for the `ABORTED` cases and `EXPECT_THROW(…, MountFencedException)` for the two fenced ones. Each substring below is copied from the throw site; if the implementation changes any message text, the test must be updated in the same commit, and the two renewal-path tests in Step 7 tell you whether you touched a message you should not have.
+
+```cpp
+#include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <Disks/tests/cas_test_helpers.h>
+
+namespace DB::ErrorCodes
+{
+extern const int ABORTED;
+}
+
+using namespace DB::Cas;
+using DB::Cas::tests::MountSlotRaceBackend;
+using DB::Cas::tests::expectThrowsCodeWithMessage;
+
+namespace
+{
+
+/// One keeper for the mount slot of server-root "r", under (uuid=1, epoch=7) unless overridden.
+MountLeaseKeeper makeKeeper(const std::shared_ptr<MountSlotRaceBackend> & b, uint64_t & now,
+                            DB::UInt128 uuid = DB::UInt128(1), uint64_t epoch = 7)
+{
+    return MountLeaseKeeper(b, Layout("p"), "r", uuid, epoch, std::chrono::milliseconds(100),
+                            [&now] { return now; }, [] { return uint64_t{0}; });
+}
+
+}
+
+TEST(CASMountClaimConflicts, SlotAppearedBetweenHeadAndPutIfAbsent)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    /// Empty at `head`; another process mints it before our `putIfAbsent` lands.
+    b->before_put_if_absent = [&] { claimMount(*b, l, "r", DB::UInt128(2), 1, now, /*ttl*/ 100); };
+    auto k = makeKeeper(b, now);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "appeared between head and putIfAbsent", [&] { k.start(); });
+}
+
+TEST(CASMountClaimConflicts, SlotVanishedBetweenHeadAndGet)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    b->before_get = [&]
+    {
+        const auto got = b->get(l.mountKey("r"));
+        ASSERT_TRUE(got);
+        b->deleteExact(l.mountKey("r"), got->token);
+    };
+    auto k = makeKeeper(b, now);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "vanished between head and get while claiming", [&] { k.start(); });
+}
+
+TEST(CASMountClaimConflicts, SlotHeldByForeignServer)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(2), 1, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    auto k = makeKeeper(b, now);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "held by a foreign server", [&] { k.start(); });
+}
+
+TEST(CASMountClaimConflicts, SlotHeldByDifferentWriterEpoch)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    auto k = makeKeeper(b, now, DB::UInt128(1), /*epoch=*/8);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "held by a different writer_epoch", [&] { k.start(); });
+}
+
+TEST(CASMountClaimConflicts, SlotChangedInsideAdoptionWindow)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    /// Rewrite the slot under a NEW token after our `get`, so our adoption `putOverwrite` conflicts.
+    b->before_put_overwrite = [&] { claimMount(*b, l, "r", DB::UInt128(1), 7, now + 1, /*ttl*/ 100); };
+    auto k = makeKeeper(b, now);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "changed while adopting our own mount slot", [&] { k.start(); });
+}
+
+TEST(CASMountClaimConflicts, SlotVanishedInsideAdoptionWindow)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    b->before_put_overwrite = [&]
+    {
+        const auto got = b->get(l.mountKey("r"));
+        ASSERT_TRUE(got);
+        b->deleteExact(l.mountKey("r"), got->token);
+    };
+    auto k = makeKeeper(b, now);
+    expectThrowsCodeWithMessage(DB::ErrorCodes::ABORTED, "vanished while adopting our own mount slot", [&] { k.start(); });
+}
+
+/// The two fenced branches keep their own type, and keep PRECEDENCE over the conflicts above: the
+/// mount-open loop catches `MountFencedException` by type and recovers with a fresh writer epoch, so
+/// a fence reported as a plain conflict would turn a recoverable state into a failed mount.
+TEST(CASMountClaimConflicts, FencedBeforeAdoptionRaisesMountFenced)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    DB::Cas::tests::markMountGcFenced(*b, l, "r");
+    auto k = makeKeeper(b, now);
+    EXPECT_THROW(k.start(), MountFencedException);
+}
+
+TEST(CASMountClaimConflicts, FencedInsideAdoptionWindowRaisesMountFencedNotAborted)
+{
+    auto b = std::make_shared<MountSlotRaceBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", DB::UInt128(1), 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    /// The slot changes inside the adoption window AND the new body is fenced: the fenced branch must
+    /// win over the "changed while adopting" one.
+    b->before_put_overwrite = [&] { DB::Cas::tests::markMountGcFenced(*b, l, "r"); };
+    auto k = makeKeeper(b, now);
+    EXPECT_THROW(k.start(), MountFencedException);
+}
+```
+
+`markMountGcFenced` does not exist yet: write it in this file's anonymous namespace as a `get` of the mount key, `decodeMountLease`, set `gc_fenced = true`, `encodeMountLease`, `putOverwrite` with the observed token. Read `Pool/CasServerRoot.h` for the exact encode/decode names and the `MountLeaseKeeper` constructor's real parameter list before writing any of this, and correct the sketch above to match — it is written from the call at `gtest_cas_mount.cpp:1062-1064`, which may not carry every parameter.
+
+- [ ] **Step 3: Run them and watch them fail**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_task3_red.log 2>&1; echo "NINJA_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='CASMountClaimConflicts.*' \
+    > build_debug/test_task3_red.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected on a debug build: the six `ABORTED` tests **abort the process**, because `LOGICAL_ERROR` aborts there — the binary dies partway through and the two fenced tests may not run at all. That is the finding, reproduced. Note in the log summary which test aborted first; run the two fenced tests separately with `--gtest_filter='CASMountClaimConflicts.Fenced*'` to confirm they pass **before** the change, since they assert behaviour this task must preserve.
+
+- [ ] **Step 4: Reclassify the six throws**
+
+In `CasServerRoot.cpp`, change `ErrorCodes::LOGICAL_ERROR` to `ErrorCodes::ABORTED` at `:1468`, `:1479`, `:1489`, `:1499`, `:1525` and `:1530`. Leave every message string byte-for-byte unchanged. Do **not** touch `:1508` or `:1521`, and do not touch any other `LOGICAL_ERROR` in the file — `start` at `:1543`, `terminalResult` at `:1629`/`:1643` and `renew` at `:1661` are genuine state-machine invariants and stay as they are.
+
+Confirm `ABORTED` is already in the file's `ErrorCodes` extern block (`:37`) — it is; no new declaration is needed.
+
+- [ ] **Step 5: Run them and watch them pass**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_task3_green.log 2>&1; echo "NINJA_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='CASMountClaimConflicts.*' \
+    > build_debug/test_task3_green.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: `TEST_EXIT=0`, all eight passing, no abort.
+
+- [ ] **Step 6: Retire the death test**
+
+In `gtest_cas_mount.cpp:1069-1078`, delete the `EXPECT_DEATH` block and the `abort_on_logical_error` store that sets up the child process — `CASMountClaimConflicts.SlotHeldByDifferentWriterEpoch` now covers it. Keep the first half of `KeeperStartAdoptsOurOwnClaimNotDoubleStart` (`:1057-1068`), which asserts the successful adoption and is unrelated.
+
+Then sweep the whole file:
+
+```bash
+grep -n "EXPECT_DEATH\|abort_on_logical_error\|EXPECT_THROW\|EXPECT_ANY_THROW" src/Disks/tests/gtest_cas_mount.cpp
+```
+
+For each hit, check the code raised at the site it exercises. A process abort hides every test behind it in the same binary, so a second stale death test would have been invisible while the first one existed.
+
+- [ ] **Step 7: Confirm the untouched renewal tests**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+./build_debug/unit_tests_dbms --gtest_filter='CASMount*:CASHeartbeat*' \
+    > build_debug/test_task3_mount.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: `TEST_EXIT=0`. `gtest_cas_pool.cpp:1824` and `gtest_cas_heartbeat.cpp:373` match on message substrings from the **renewal** path, which this task does not modify; they must pass unchanged. If either fails, a message string was edited — revert that edit.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp \
+        src/Disks/tests/cas_test_helpers.h \
+        src/Disks/tests/gtest_cas_mount_claim_conflicts.cpp \
+        src/Disks/tests/gtest_cas_mount.cpp
+git commit -m "fix: CAS mount claim conflicts raise ABORTED, not LOGICAL_ERROR"
+```
+
+---
+
+### Task 4: Gate both builds {#task-4-gate-both-builds}
+
+**Files:** none — verification only.
+
+**Interfaces:**
+- Consumes: everything from Tasks 1 to 3.
+- Produces: the evidence that the change is done.
+
+**Context an implementer needs.** A debug-only run is not sufficient evidence for Task 3: its whole subject is behaviour that differs between release and sanitizer builds. A release-only run is not sufficient either, for the same reason in reverse.
+
+- [ ] **Step 1: Debug gate**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_debug unit_tests_dbms > build_debug/build_gate.log 2>&1; echo "NINJA_EXIT=$?"
+./build_debug/unit_tests_dbms --gtest_filter='CAS*' > build_debug/test_gate.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: both `0`. Summarize each log with a subagent. The summary must state the build marker explicitly — a green suite after a failed build is evidence about a different binary.
+
+- [ ] **Step 2: ASan gate**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+ninja -C build_asan unit_tests_dbms > build_asan/build_gate.log 2>&1; echo "NINJA_EXIT=$?"
+./build_asan/unit_tests_dbms --gtest_filter='CAS*' > build_asan/test_gate.log 2>&1; echo "TEST_EXIT=$?"
+```
+
+Expected: both `0`, and no sanitizer report anywhere in the test log. Search the log for `ERROR: AddressSanitizer` explicitly rather than trusting the exit code alone.
+
+- [ ] **Step 3: Confirm the boundary holds**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+grep -rn "scheduleMetaJob" src/Disks/
+grep -rn "LOGICAL_ERROR" src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.cpp
+```
+
+Expected: the first prints nothing. The second prints only the state-machine sites at `:1543`, `:1629`, `:1643`, `:1661` and the two catalog-observer sites at `:649` and `:716` — no hit inside `claim` (`:1460-1537`).
+
+- [ ] **Step 4: Confirm the commits**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master
+git log --oneline -4
+git log -3 --stat
+```
+
+Expected: three new commits on `cas-gc-rebuild`, each touching only the paths its task named. This checkout is shared with other sessions, so verify the contents rather than assuming. Do not push.
+
+---
+
+## Self-Review {#self-review}
+
+**Spec coverage.** Every section of the spec maps to a task: `{#b1-fix}` to Task 1, `{#b1-round-drain}` to Task 2, `{#b2a-fix}` and `{#b2a-testing}` to Task 3, `{#gate}` to Task 4. `{#b1-dropped-jobs}` specifies behaviour that is deliberately unchanged and needs no task; it is recorded in the spec so a later reader does not assume otherwise. `{#b2a-audit}` is analysis that justifies Task 3's safety and produces no code.
+
+**Placeholders.** Four steps deliberately tell the implementer to read something before writing:
+Task 1 Step 7 (the `idOf` / `u128Of` / `loadMeta` / `putMetaIfAbsent` signatures), Task 2 Step 1
+(`PutResult`'s fields), Task 2 Step 2 (the part-write-and-drop fixture, taken from
+`gtest_cas_gc_leak.cpp`) and Task 3 Step 2 (the `MountLeaseKeeper` constructor and the mount-lease
+encode/decode names). These are not "figure it out later" — each names the exact file and line to read
+and what to reconcile the sketch against. Inventing those signatures here would be worse than pointing
+at them, because a plausible-but-wrong signature reads as authoritative.
+
+**Type consistency.** `GcMetaWriter`'s methods are named identically in the header (Task 1 Step 1), the
+implementation (Step 2), the call-site table (Step 4) and both later tasks: `scheduleCondemnMarkerWrite`,
+`scheduleConfirmedMetaDelete`, `drain`, `scheduled`, `completed`, `noteCondemnMarkerDurable`,
+`condemnMarkerConfirmedInProcess`, `forgetCondemnMarker`. The test seam is `metaWriterForTest`
+throughout. `MetaWriteLatchBackend` exposes `entered`, `arm` and `release` wherever Tasks 1 and 2 use
+them, and `OutcomeLogFaultBackend` derives from it so Task 2's test drives both the latch and the
+fault through one object.
+
+**What every test actually establishes.** Stated per test, because two of them cannot go red and one
+can time out for the wrong reason:
+
+| Test | Red before the change? | What it proves |
+|---|---|---|
+| `RealCondemnMarkerJobCompletesAcrossOwnerDestruction` | no — the pre-change access is to destructed-but-allocated storage that no sanitizer reports | the job completes and its marker is durable across owner destruction |
+| `CondemnMarkerConfirmationIsVisibleAfterDrain` | no | the registry is written by the pool thread and readable by the round thread after a drain |
+| `RealConfirmedMetaDeleteCompletesAcrossOwnerDestruction` | no | the seeded meta is actually removed, so the job is not merely entered but completed |
+| `ThrowingRoundDrainsBeforeReturning` | **yes** | the round does not return while a meta job is in flight; the two false-green modes are separated by `round.get()` and by the `scheduled` delta |
+| the eight `CASMountClaimConflicts` tests | **yes** — six abort the process on a debug build | each branch raises `ABORTED` with its own message, and the two fenced branches keep both their type and their precedence |
+
+The lifetime boundary itself has no runtime detector and is not claimed to have one: it is enforced by
+the absence of a callback-accepting entry point onto the pool, checked by the grep in Task 1 Step 5 and
+again in Task 4 Step 3.
