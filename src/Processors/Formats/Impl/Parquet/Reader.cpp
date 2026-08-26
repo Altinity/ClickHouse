@@ -1445,17 +1445,24 @@ void Reader::detectConstantColumn(ColumnChunk & column, const PrimitiveColumnInf
 
     /// A writer may store truncated min/max for variable- or opaque-length physical types (BYTE_ARRAY,
     /// FIXED_LEN_BYTE_ARRAY), which could make two different values compare equal. Allowlist only the
-    /// fixed-width numeric physical types, whose min/max are never truncated, as unconditionally
+    /// fixed-width integer physical types, whose min/max are never truncated, as unconditionally
     /// trustworthy; anything else (BYTE_ARRAY, FIXED_LEN_BYTE_ARRAY, and any physical type added in the
     /// future) must present the writer's is_*_value_exact flags before min == max is trusted. Fails
     /// closed: an unrecognized type is treated as possibly-truncated rather than blindly trusted.
+    ///
+    /// FLOAT and DOUBLE are deliberately excluded even though they are fixed-width. parquet.thrift
+    /// says NaN values are not written to min/max ("When looking for NaN values, min and max should
+    /// be ignored"), and both arrow and our own writer drop NaN when computing them, so a chunk like
+    /// [1.0, NaN, 1.0] has min == max == 1.0 with null_count == 0 and is not constant. Also
+    /// "if the min is +0, the row group may contain -0 values as well", and -0.0 is a distinct
+    /// GROUP BY key in ClickHouse. No statistic in the thrift version we ship proves the absence of
+    /// NaN; revisit once `Statistics::nan_count` (parquet-format 2.11) is available: require
+    /// nan_count == 0 and a nonzero decoded value.
     const bool never_truncated =
         meta_data.type == parq::Type::BOOLEAN
         || meta_data.type == parq::Type::INT32
         || meta_data.type == parq::Type::INT64
-        || meta_data.type == parq::Type::INT96
-        || meta_data.type == parq::Type::FLOAT
-        || meta_data.type == parq::Type::DOUBLE;
+        || meta_data.type == parq::Type::INT96;
     /// is_*_value_exact is an optional thrift bool; guard on __isset so an absent flag fails closed
     /// (treated as not-exact) rather than reading a possibly-uninitialized value and trusting a
     /// truncated min/max.

@@ -66,4 +66,20 @@ ${CLICKHOUSE_CLIENT} -q "
     AND query_id = '${qid_off}' AND type = 'QueryFinish' AND current_database = currentDatabase();
 "
 
+echo "-- float chunks are never treated as constant: NaN and -0.0 are invisible to min/max statistics"
+NAN_FILE="${WORKING_DIR}/nan.parquet"
+${CLICKHOUSE_CLIENT} -q "
+  INSERT INTO FUNCTION file('${NAN_FILE}', Parquet)
+  SELECT
+    if(number = 1, nan, 1.0)::Float64 AS f,
+    if(number = 1, -0.0, 0.0)::Float64 AS z,
+    if(number = 1, nan, 1.0)::Float32 AS f32
+  FROM numbers(100)
+  SETTINGS engine_file_truncate_on_insert = 1, output_format_parquet_row_group_size = 100
+"
+${CLICKHOUSE_CLIENT} -q "
+  SELECT countIf(isNaN(f)), countIf(toString(z) = '-0'), countIf(isNaN(f32)), count()
+  FROM file('${NAN_FILE}', Parquet, 'f Float64, z Float64, f32 Float32')
+"
+
 rm -rf "${WORKING_DIR}"

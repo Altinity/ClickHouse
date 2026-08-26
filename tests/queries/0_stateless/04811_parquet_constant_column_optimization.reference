@@ -10,3 +10,5 @@
 -- optimization fired only when enabled
 1
 1
+-- float chunks are never treated as constant: NaN and -0.0 are invisible to min/max statistics
+1	1	1	100
