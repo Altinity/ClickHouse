@@ -261,7 +261,7 @@ jobs:
 """
 
         TEMPLATE_IF_EXPRESSION = """
-    if: ${{{{ !failure() && !cancelled() && !contains(fromJson(needs.{WORKFLOW_CONFIG_JOB_NAME}.outputs.data).cache_success_base64, '{JOB_NAME_BASE64}') }}}}\
+    if: ${{{{ !failure() && !cancelled() && needs.{WORKFLOW_CONFIG_JOB_NAME}.result != 'skipped' && !contains(fromJson(needs.{WORKFLOW_CONFIG_JOB_NAME}.outputs.data).cache_success_base64, '{JOB_NAME_BASE64}') }}}}\
 """
 
         TEMPLATE_IF_EXPRESSION_SKIPPED_OR_SUCCESS = """
@@ -269,7 +269,7 @@ jobs:
 """
 
         TEMPLATE_IF_EXPRESSION_NOT_CANCELLED = """
-    if: ${{ !cancelled() }}\
+    if: ${{ !cancelled() && needs.config_workflow.result != 'skipped' }}\
 """
 
     def __init__(self):

@@ -76,7 +76,7 @@ jobs:
   dockers_build_amd:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -121,7 +121,7 @@ jobs:
   dockers_build_arm:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -166,7 +166,7 @@ jobs:
   build_fuzzers:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGZ1enplcnMp') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGZ1enplcnMp') }}
     name: "Build (fuzzers)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -211,7 +211,7 @@ jobs:
   libfuzzer_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_fuzzers]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'bGliRnV6emVyIHRlc3Rz') }}
+    if: ${{ !failure() && !cancelled() && needs.config_workflow.result != 'skipped' && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'bGliRnV6emVyIHRlc3Rz') }}
     name: "libFuzzer tests"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -256,7 +256,7 @@ jobs:
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_fuzzers, libfuzzer_tests]
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.result != 'skipped' }}
     name: "Finish Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
