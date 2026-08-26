@@ -1412,7 +1412,15 @@ bool Reader::isConstantColumnCandidate(const PrimitiveColumnInfo & column_info) 
     if (column_info.idx_in_output_block >= sample_block_to_output_columns_idx.size())
         return false;
     const auto & output_idx = sample_block_to_output_columns_idx.at(column_info.idx_in_output_block);
-    return output_idx.has_value() && output_columns[output_idx.value()].is_primitive;
+    if (!output_idx.has_value() || !output_columns[output_idx.value()].is_primitive)
+        return false;
+    /// The value comes from decodeField, whose conversions are chosen from the requested type for
+    /// the purpose of comparing against statistics (allow_stats) and are not guaranteed to match
+    /// what decoding a page and then castColumn-ing it to the requested type would produce: e.g.
+    /// FIXED_LEN_BYTE_ARRAY read as String keeps its zero padding in the statistics but not in the
+    /// decoded column, and Date32 read as Enum8 is accepted for statistics but rejected by the cast.
+    /// So only take the shortcut when no cast is involved, i.e. the decoded type is the output type.
+    return !output_columns[output_idx.value()].needs_cast;
 }
 
 Reader::ConstantKind Reader::chooseConstantKind(const PrimitiveColumnInfo & column_info, const DataTypePtr & final_output_type, Int64 num_values, std::optional<Int64> null_count, bool single_value) const
@@ -1507,13 +1515,11 @@ void Reader::detectConstantColumn(ColumnChunk & column, const PrimitiveColumnInf
 
     if (kind != ConstantKind::AllDefault)
     {
-        /// decodeField yields the value in the FINAL output type's domain, not decoded_type's:
-        /// SchemaConverter picks the statistics converter from the type hint (e.g. TIMESTAMP_MILLIS
-        /// read as DateTime decodes to seconds although decoded_type is DateTime64(3)), and sets
-        /// allow_stats only when that conversion is exact. So the value is inserted straight into a
-        /// column of output_info.output_type, bypassing decoded_type and castColumn. decodeField
-        /// leaves `value` Null when the physical type is unsupported for stats, in which case the
-        /// optimization does not fire.
+        /// decodeField yields the value in the requested (output) type's domain, which
+        /// isConstantColumnCandidate guarantees to be the decoded type as well (no cast involved), so
+        /// the value is inserted straight into a column of output_info.output_type. decodeField leaves
+        /// `value` Null when the physical type is unsupported for stats, in which case the optimization
+        /// does not fire.
         Field value;
         column_info.decoder.decodeField(stats.min_value, /*is_max=*/ false, value);
         if (value.isNull())

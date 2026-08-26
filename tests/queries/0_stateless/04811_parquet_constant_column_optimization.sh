@@ -12,8 +12,9 @@ DATA_FILE="${WORKING_DIR}/const.parquet"
 
 # 1000 rows, 100 rows per row group => 10 row groups. `k` varies; the other four columns each hold a
 # single value in every row, so their per-chunk min/max statistics have min == max and no nulls.
-# `c_dt` is written as TIMESTAMP_MILLIS and read back with a DateTime hint, exercising the
-# milliseconds -> seconds stats conversion (the value is in the post-cast output domain).
+# `c_dt` is written as TIMESTAMP_MILLIS and read back with a DateTime hint; that needs a cast from the
+# decoded DateTime64(3), so the optimization deliberately does not apply to it and it goes through the
+# normal decode path (the result must still be identical).
 ${CLICKHOUSE_CLIENT} -q "
   INSERT INTO FUNCTION file('${DATA_FILE}', Parquet)
   SELECT
