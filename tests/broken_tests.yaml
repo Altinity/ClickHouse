@@ -329,6 +329,8 @@
   message: 'Client timed out!'
   check_types:
   - asan
+- name: test_storage_iceberg_multistorage/test.py::test_num_rows_cache_no_collision_across_buckets
+  reason: 'KNOWN - count() optimization uses other way after #2183'
 
 
 # Regex rules should be ordered from most specific to least specific.
