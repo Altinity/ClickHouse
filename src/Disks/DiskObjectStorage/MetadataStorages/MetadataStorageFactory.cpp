@@ -7,9 +7,15 @@
 #endif
 #include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/MetadataStorageFromPlainRewritableObjectStorage.h>
+<<<<<<< HEAD
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromIndexPages.h>
+=======
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromStaticFilesWebServer.h>
 #include <Disks/DiskLocal.h>
+#include <Core/ServerUUID.h>
 #include <Interpreters/Context.h>
 
 
@@ -22,6 +28,12 @@ namespace ErrorCodes
     extern const int UNKNOWN_ELEMENT_IN_CONFIG;
     extern const int INVALID_CONFIG_PARAMETER;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+}
+
+namespace ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString scratch_path;
 }
 
 namespace
@@ -206,6 +218,35 @@ static void registerPlainRewritableMetadataStorage(MetadataStorageFactory & fact
     });
 }
 
+static void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
+{
+    factory.registerMetadataStorageType("cas", [](
+        const std::string & name,
+        const Poco::Util::AbstractConfiguration & config,
+        const std::string & config_prefix,
+        const ClusterConfigurationPtr & cluster,
+        const ObjectStorageRouterPtr & object_storages) -> MetadataStoragePtr
+    {
+        checkSingleLocation(cluster);
+
+        const auto local_object_storage = object_storages->takePointingTo(cluster->getLocalLocation());
+        std::string key_compatibility_prefix = getObjectKeyCompatiblePrefix(local_object_storage, config, config_prefix);
+
+        auto global_context = Context::getGlobalContextInstance();
+        ContentAddressedSettings settings;
+        settings.loadFromConfig(
+            config, config_prefix,
+            /*scratch_path_anchor_if_relative=*/ global_context->getPath(),
+            /*default_scratch_path=*/ fs::path(global_context->getPath()) / "disks" / name / "cas_scratch" / "",
+            [&](const std::string & s) { return global_context->getMacros()->expand(s); });
+        fs::create_directories(settings[ContentAddressedSetting::scratch_path].value);
+
+        return std::make_shared<ContentAddressedMetadataStorage>(
+            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()),
+            name, global_context, settings);
+    });
+}
+
 static void registerMetadataStorageFromStaticFilesWebServer(MetadataStorageFactory & factory)
 {
     factory.registerMetadataStorageType("web", [](
@@ -248,6 +289,7 @@ void registerMetadataStorages()
     registerMetadataStorageFromDisk(factory);
     registerPlainMetadataStorage(factory);
     registerPlainRewritableMetadataStorage(factory);
+    registerContentAddressedMetadataStorage(factory);
     registerMetadataStorageFromStaticFilesWebServer(factory);
     registerMetadataStorageFromIndexPages(factory);
 #if CLICKHOUSE_CLOUD

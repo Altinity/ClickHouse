@@ -5,6 +5,7 @@
 #if USE_AWS_S3
 
 #include <IO/S3Settings.h>
+#include <IO/WriteSettings.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Common/BlobStorageLogWriter.h>
 #include <base/types.h>
@@ -38,6 +39,9 @@ std::unique_ptr<StdStreamFromReadBuffer> createS3UploadBody(
 /// (copyDataToS3File()).
 ///
 /// read_settings - is used for throttling in case of native copy is not possible
+///
+/// `copy_mode = NativeOnly` forbids the client-side read-write fallback. If native copy is disabled
+/// or cannot complete, the failure is propagated instead.
 void copyS3File(
     std::shared_ptr<const S3::Client> src_s3_client,
     const String & src_bucket,
@@ -50,6 +54,7 @@ void copyS3File(
     const ReadSettings & read_settings,
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
+<<<<<<< HEAD
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
 
@@ -75,6 +80,11 @@ void copyS3FileRange(
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer & fallback_file_reader,
     const std::optional<ObjectAttributes> & object_metadata = std::nullopt);
+=======
+    const CreateReadBuffer& fallback_file_reader,
+    const std::optional<ObjectAttributes> & object_metadata = std::nullopt,
+    ObjectStorageCopyMode copy_mode = ObjectStorageCopyMode::Default);
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 /// Copies data from any seekable source to S3.
 /// The same functionality can be done by using the function copyData() and the class WriteBufferFromS3

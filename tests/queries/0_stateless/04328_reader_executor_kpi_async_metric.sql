@@ -1,9 +1,18 @@
+<<<<<<< HEAD
 -- Tags: no-distributed-cache, no-encrypted-storage, no-parallel-replicas
 -- The executor falls back on the distributed cache and decryption (which can't be
 -- disabled from the test), so its metrics would not be emitted there; skip those
 -- configs (as in 04316 / 04327).
 --   no-parallel-replicas: the counters are incremented on whichever replica reads the
 --   mark, so the initiator's `query_log` row does not carry them.
+=======
+-- Tags: no-distributed-cache, no-encrypted-storage, no-cas-storage
+-- The executor falls back on the distributed cache and decryption (which can't be
+-- disabled from the test), so its metrics would not be emitted there; skip those
+-- configs (as in 04316 / 04327). Content-addressed storage always adds a
+-- `file_view` stage (byte window inside a shared blob), which the executor
+-- falls back on the same way -- see `ReadPipeline::tryBuildReaderExecutor`.
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 --
 -- End-to-end check that the modeled-cost KPI asynchronous metric
 -- `ReaderExecutorModeledCostMsPerRequestedMiB` moves when the executor does work.
