@@ -72,7 +72,7 @@ namespace ErrorCodes
     extern const int CHECKSUM_DOESNT_MATCH;
     extern const int INSECURE_PATH;
     extern const int LOGICAL_ERROR;
-    extern const int NETWORK_ERROR;
+    extern const int NO_REPLICA_HAS_PART;
     extern const int S3_ERROR;
     extern const int ZERO_COPY_REPLICATION_ERROR;
 }
@@ -1314,8 +1314,14 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 /// 3. THE CONFIRM DID NOT PROVE THE SOURCE: an `unproven` answer, an absent answer cookie, a transport
 ///    failure, a timeout. All one outcome, deliberately (`CasConfirmAnswer`: only `yes` authorizes).
 ///    `+1`: durable, then released by `abort`. Action: THROW a locally generated retry-later
-///    `NETWORK_ERROR` naming the source and the part -- never `nullptr`, because a byte re-request goes
-///    back to the very source whose state is in doubt.
+///    `NO_REPLICA_HAS_PART` naming the source and the part -- never `nullptr`, because a byte
+///    re-request goes back to the very source whose state is in doubt. That code, deliberately:
+///    both queue executors (`processQueueEntry`, `ReplicatedMergeMutateTaskBase::executeStep`)
+///    demote it to INFO with no stack trace -- a refusal is the designed outcome of racing a source
+///    whose ref moved on, not a network fault (issue #2219 records a multi-hour false triage chasing
+///    that label) -- yet, unlike `ABORTED`, it still records the exception on the queue entry, so a
+///    refusal storm stays visible in `system.replication_queue`. It is also the one fetch-transient
+///    code the stateless corpus already tolerates in `part_log` checks (e.g. `02265_column_ttl`).
 ///    Lose a part? No -- the queue stores the exception, backs off, and re-executes the entry, which
 ///    recomputes the source and the covering-part discovery. The fetch is postponed, not dropped.
 ///    Double-promote? No -- `abort` appends the exact precommit removal and no committed ref exists.
@@ -1339,7 +1345,8 @@ MergeTreeData::MutableDataPartPtr Fetcher::downloadPartToDisk(
 ///    `+1`: still owed -- the handle attempts its abandon, which is REJECTED by the state machine if
 ///    the promote in fact landed (a promoted binding is no longer a precommit), so no committed ref is
 ///    ever undone here.
-///    Action: THROW the retry-later `NETWORK_ERROR`, as row 3 -- returning `nullptr` is the one thing
+///    Action: THROW the retry-later `NO_REPLICA_HAS_PART`, as row 3 -- returning `nullptr` is the
+///    one thing
 ///    that must not happen, because a byte fetch would publish the part a SECOND time over a relink
 ///    that may already be committed.
 ///    Lose a part? No -- retry-later, as row 3. Double-promote? No -- nothing is published on this exit.
@@ -1544,9 +1551,11 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     {
         /// Taxonomy row 3. Locally generated on purpose — nothing here is the source's error to report —
         /// and thrown rather than returned, because the one recovery that is NOT sound after this is a
-        /// byte re-request to the same source. `NETWORK_ERROR` puts it in the retry-later class, so the
-        /// queue stores it, backs off, and re-selects on re-execution.
-        throw Exception(ErrorCodes::NETWORK_ERROR,
+        /// byte re-request to the same source. `NO_REPLICA_HAS_PART` puts it in the retry-later class
+        /// (the queue stores it, backs off, and re-selects on re-execution) and both queue executors
+        /// demote it to INFO without a stack trace -- see the taxonomy, row 3, for why this refusal is
+        /// an ordinary outcome rather than a fault.
+        throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
             "Source {} did not prove it still holds the manifest it offered for part {} by relink; "
             "the relink is abandoned and the fetch will be retried later",
             fetch_uri.getHost(), part_name);
@@ -1565,7 +1574,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
             /// second time over a relink that may already be committed. Thrown in the retry-later class
             /// instead, exactly as an unproven confirm is (row 3) -- the queue stores it, backs off, and
             /// re-executes, by which time the ref lane has resolved the ambiguity one way or the other.
-            throw Exception(ErrorCodes::NETWORK_ERROR,
+            throw Exception(ErrorCodes::NO_REPLICA_HAS_PART,
                 "Relink of part {} from {} could not be resolved: the promotion may or may not have "
                 "committed, so the bytes must NOT be fetched; the fetch will be retried later",
                 part_name, fetch_uri.getHost());
