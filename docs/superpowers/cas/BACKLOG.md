@@ -774,9 +774,18 @@ thrown so the byte-fallback does NOT run); the noise comes from the generic queu
 know this code. `NETWORK_ERROR` is NOT load-bearing on this path — no `e.code()` branch in the queue
 or fetch path tests it; "retry-later" is the default for any stored exception.
 
-Fix (revised per user constraint: NETWORK_ERROR was chosen deliberately as a retriable code
-precisely to avoid touching upstream code, and the fix must keep that property — ZERO generic-code
-changes): reuse `ABORTED`, which is already in the `processQueueEntry` demotion list with the
+FIXED 2026-08-26 (`081c473904e`; branch `cas-relink-refusal-classification` for the antalya-26.6
+PR). The code chosen is `NO_REPLICA_HAS_PART`, not the `ABORTED` this record originally planned: both
+are in the demotion lists of BOTH queue executors (`processQueueEntry` AND
+`ReplicatedMergeMutateTaskBase::executeStep` — the second one matters for merge-entries executed as
+fetch), but `ABORTED` also sets `need_to_save_exception = false`, the exact
+"treated as not an error, no backoff engages" pathology `[merge-progress-reset-mount-fence]`
+documents; `NO_REPLICA_HAS_PART` keeps the exception on the queue entry. It is also the one
+fetch-transient code stateless `part_log` hygiene checks whitelist (`02265_column_ttl` broke in the
+CAS lanes on exactly this: PR #2159 CI, 13/14 reruns under `prefer_fetch_merged_part_size_threshold=1`).
+Verified: the only two `e.code() == NO_REPLICA_HAS_PART` branches in the tree are those demotions;
+`enqueuePartForCheck` keys on `replica.empty()`, not the code. Original plan text follows for
+provenance: reuse `ABORTED`, which is already in the `processQueueEntry` demotion list with the
 comment "Interrupted merge or downloading a part is not an error" → `LOG_INFO`, no stack trace.
 Change only the exception code at the two CA retry-later throw sites in `DataPartsExchange.cpp`
 (taxonomy row 3 and the `CaRelinkPromote::Unresolved` promote); the message text stays

@@ -69,13 +69,21 @@ short-lived TODO, not the record.
   every persisted format — only cheap pre-release, never again.
 - Mechanical sweep: codex dispatch, review here.
 
-## 7. Fix #2219 — relink refusal must not log Error + stack trace {#fix-2219}
+## 7. DONE — Fix #2219 — relink refusal must not log Error + stack trace {#fix-2219}
 
 - Issue: https://github.com/Altinity/ClickHouse/issues/2219 (CONFIRMED, cosmetic; misdirects triage)
 - Full record + fix shape: `docs/superpowers/cas/BACKLOG.md` `{#issue-2219-relink-refusal-log-level}`
-- Plan: switch both relink retry-later throw sites in `DataPartsExchange.cpp` from `NETWORK_ERROR`
-  to `ABORTED` (already in the `processQueueEntry` demotion list → `LOG_INFO`, no stack trace).
-  Zero upstream-code changes (user constraint).
+- Implemented 2026-08-26 (`081c473904e` on this branch; `c5ded159345` on
+  `cas-relink-refusal-classification` off `antalya-26.6`, PR #2159 having merged that morning): both
+  relink retry-later throw sites switched from `NETWORK_ERROR` — but to `NO_REPLICA_HAS_PART`, NOT the
+  planned `ABORTED`. Same demotion list (`LOG_INFO`, no stack trace, zero upstream-code changes), plus
+  two properties `ABORTED` lacks: it keeps `need_to_save_exception` (a refusal storm stays visible in
+  `system.replication_queue` — `ABORTED`'s save-nothing shape is the documented no-backoff pathology,
+  see `[merge-progress-reset-mount-fence]`), and it is the one fetch-transient code the stateless
+  corpus already tolerates in `part_log` checks — which also fixes the reproducible `02265_column_ttl`
+  failure in the CAS lanes on PR #2159 (13/14 reruns under `prefer_fetch_merged_part_size_threshold=1`).
+  `test_confirm_refuses_when_source_dropped_in_window` now pins the classification (failing-first
+  proven against the old binary).
 
 ## 8. DONE — Fix CAS-040 — a newline in a part-file path wedges GC pool-wide {#fix-cas-040}
 
