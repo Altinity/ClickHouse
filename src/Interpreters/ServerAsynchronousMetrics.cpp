@@ -15,7 +15,11 @@
 
 #include <Databases/IDatabase.h>
 
+<<<<<<< HEAD
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+=======
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
 #include <IO/UncompressedCache.h>
 #include <IO/MMappedFileCache.h>
@@ -385,6 +389,7 @@ void ServerAsynchronousMetrics::updateImpl(TimePoint update_time, TimePoint curr
             }
 #endif
 
+<<<<<<< HEAD
             if (auto object_storage_disk = std::dynamic_pointer_cast<DiskObjectStorage>(disk))
             {
                 dead_blobs_queue_estimate[name] = static_cast<double>(object_storage_disk->getDeadBlobsQueueEstimate());
@@ -432,6 +437,38 @@ void ServerAsynchronousMetrics::updateImpl(TimePoint update_time, TimePoint curr
                 "Estimated number of blobs enqueued for removal from the disk object storage (the blob manager dead queue), keyed by the disk name. Disks without blob replication report 0." };
             new_values["MissingBlobsQueueEstimate"] = { "disk", std::move(missing_blobs_queue_estimate),
                 "Estimated number of blobs awaiting replication to other locations of the disk (the blob manager missing queue), keyed by the disk name. Disks without blob replication report 0." };
+=======
+            /// Per-disk CAS GC health, for Prometheus scraping. `tryFromDisk` returns nullptr for a
+            /// disk whose metadata storage is not content-addressed (the common case); `gcHealth()`
+            /// returns nullopt for a content-addressed disk whose GC scheduler has not started yet
+            /// (still opening, read-only, or GC disabled by configuration) -- both are skipped
+            /// silently, same as the DiskUsed_/DiskTotal_ metrics above skip disks that don't report
+            /// space. This runs on every asynchronous-metrics tick for every configured disk and must
+            /// never throw.
+            try
+            {
+                if (auto * ca_storage = ContentAddressedMetadataStorage::tryFromDisk(disk))
+                {
+                    if (auto health = ca_storage->gcHealth())
+                    {
+                        new_values[fmt::format("CASGCIsLeader_{}", name)] = { health->is_leader ? 1 : 0,
+                            "Whether this server currently holds the content-addressed garbage-collection lease for the disk (1) or not (0, e.g. another replica is leading)." };
+                        new_values[fmt::format("CASGCPendingReclaim_{}", name)] = { health->pending_reclaim,
+                            "Cumulative content-addressed objects condemned minus objects physically deleted by this process while it has held the GC lease on the disk. A persistently growing value indicates GC is not keeping up with reclaim." };
+                        new_values[fmt::format("CASGCLastSuccessAgeSeconds_{}", name)] = { health->last_success_age_seconds,
+                            "Seconds since this process last completed a successful content-addressed GC round as leader on the disk (0 if it has never led one)." };
+                        new_values[fmt::format("CASGCWedgedNamespaces_{}", name)] = { health->wedged_namespace_count,
+                            "Number of content-addressed namespaces on the disk currently stuck behind a wedged reference lane, unable to make GC progress." };
+                    }
+                }
+            }
+            catch (...) // NOLINT(bugprone-empty-catch)
+            {
+                /// Sampled on every server tick for every disk; a transient failure here (e.g. a
+                /// store health query hiccup) must never break the rest of asynchronous-metrics
+                /// collection.
+            }
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
         }
     }
 

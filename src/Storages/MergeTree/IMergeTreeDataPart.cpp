@@ -1614,15 +1614,25 @@ MergeTreeDataPartBuilder IMergeTreeDataPart::getProjectionPartBuilder(
     const String & projection_name, ProjectionDescriptionRawPtr projection, PartDirIntent intent, bool is_temp_projection)
 {
     const char * projection_extension = is_temp_projection ? ".tmp_proj" : ".proj";
+    /// On a content-addressed disk a part is one atomic unit, so a temp projection sub-part (written
+    /// during a merge/mutate rebuild under `<proj>.tmp_proj`) must share the PARENT part's whole-part
+    /// transaction -- its files are re-keyed into the parent manifest when `<proj>.tmp_proj` is renamed
+    /// to `<proj>.proj`. On any other disk a temp projection keeps its own sub-transaction, as before.
+    const bool use_parent_transaction = !is_temp_projection || getDataPartStorage().isContentAddressed();
+
     /// The projection storage is stored on the resulting projection part for its lifetime, so create
     /// it in the dedicated arena (this is the part-lifetime projection-storage creation site).
     /// `CreateFresh` takes the non-initializing variant, so nothing is seeded from a nested leftover.
     MutableDataPartStoragePtr projection_storage;
     {
         ScopedJemallocThreadArena mergetree_arena_scope(JemallocMergeTreeArena::getArenaIndex());
+<<<<<<< HEAD
         projection_storage = intent == PartDirIntent::CreateFresh
             ? getDataPartStorage().getProjectionNoInitialize(projection_name + projection_extension, !is_temp_projection)
             : getDataPartStorage().getProjection(projection_name + projection_extension, !is_temp_projection);
+=======
+        projection_storage = getDataPartStorage().getProjection(projection_name + projection_extension, use_parent_transaction);
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
     }
     if (intent == PartDirIntent::CreateFresh && projection_storage->exists())
     {

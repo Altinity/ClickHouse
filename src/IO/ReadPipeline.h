@@ -49,7 +49,8 @@ using FilesystemReadPrefetchesLogPtr = std::shared_ptr<FilesystemReadPrefetchesL
 ///   4. DistributedCache   -- ReadBufferFromDistributedCache (with fallback to Gather)
 ///   5. MemoryCache        -- CachedInMemoryReadBufferFromFile
 ///   6. AsyncPrefetch      -- AsynchronousBoundedReadBuffer
-///   7. Encryption         -- ReadBufferFromEncryptedFile (may have multiple layers)
+///   7. FileView           -- ReadBufferFromFileView (a byte window over the chain)
+///   8. Encryption         -- ReadBufferFromEncryptedFile (may have multiple layers)
 class ReadPipeline
 {
 public:
@@ -160,6 +161,7 @@ public:
     /// read from the encryption header. It must return the decryption key.
     void needDecryption(String path, size_t buffer_size, KeyFinderFunc key_finder);
 
+<<<<<<< HEAD
     /// Let the `ReaderExecutor` path reuse held source connections, bounded by this limit. When it is
     /// not set, the executor uses the stateless one-shot path.
     void needLongConnectionLimit(std::shared_ptr<LongConnectionLimit> limit);
@@ -168,6 +170,16 @@ public:
     /// disks on random-object-key backends (see `DiskEncrypted::prepareRead`). Deterministic-path
     /// backends and url or external reads leave it null, so a reused key cannot serve a stale header.
     void needEncryptionHeaderCache(std::shared_ptr<EncryptionHeaderCache> cache) { encryption_header_cache = std::move(cache); }
+=======
+    /// -- File view stage --
+    /// Exposes ONLY the byte window [left_bound, right_bound) of the underlying chain as a
+    /// standalone file named `file_name` (ReadBufferFromFileView). Used by content-addressed
+    /// blob reads, where a logical file is a payload window inside a shared blob (the blob's
+    /// envelope header occupies [0, left_bound)). Sits outside async prefetch — the window's
+    /// seeks and right bounds are translated and forwarded down the standard chain — but
+    /// inside decryption, which operates on logical-file bytes.
+    void needFileView(String file_name, size_t left_bound, size_t right_bound);
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     /// -- Build the final ReadBuffer chain --
     /// Uses the ReadSettings stored in the source stage.
@@ -221,6 +233,13 @@ private:
         KeyFinderFunc key_finder;
     };
 
+    struct FileViewStage
+    {
+        String file_name;
+        size_t left_bound = 0;
+        size_t right_bound = 0;
+    };
+
 
     struct DistributedCacheStage
     {
@@ -235,8 +254,12 @@ private:
     std::optional<DistributedCacheStage> distributed_cache;
     std::optional<AsyncPrefetchStage> async_prefetch;
     VectorWithMemoryTracking<DecryptionStage> decryption_stages;
+<<<<<<< HEAD
     /// Global encryption-header cache for the executor; null unless a random-object-key disk set it.
     std::shared_ptr<EncryptionHeaderCache> encryption_header_cache;
+=======
+    std::optional<FileViewStage> file_view;
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
 
     LoggerPtr log = getLogger("ReadPipeline");
 
@@ -261,6 +284,7 @@ private:
     std::unique_ptr<ReadBufferFromFileBase> buildSingleObjectStage(const std::string & query_id) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapMemoryCache(std::unique_ptr<ReadBufferFromFileBase> impl) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapAsyncPrefetch(std::unique_ptr<ReadBufferFromFileBase> impl) const;
+    std::unique_ptr<ReadBufferFromFileBase> wrapFileView(std::unique_ptr<ReadBufferFromFileBase> impl) const;
     std::unique_ptr<ReadBufferFromFileBase> wrapDecryption(std::unique_ptr<ReadBufferFromFileBase> impl) const;
 };
 

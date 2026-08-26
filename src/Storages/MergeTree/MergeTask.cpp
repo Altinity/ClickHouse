@@ -594,9 +594,21 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         std::optional<MergeTreeDataPartBuilder> builder;
         if (global_ctx->parent_part)
         {
+<<<<<<< HEAD
             /// Non-initializing, so nothing is seeded from an existing directory.
             auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjectionNoInitialize(local_tmp_part_basename,  /* use parent transaction */ false);
             builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings(), PartDirIntent::CreateFresh);
+=======
+            /// On a content-addressed disk a part is one atomic unit (one manifest + one ref), so the
+            /// projection sub-part must be written through the PARENT part's whole-part transaction --
+            /// mirroring the INSERT path -- for its files to land in the parent manifest and survive a
+            /// reload. On any other disk the projection keeps its own sub-transaction, as before.
+            global_ctx->projection_uses_parent_transaction
+                = global_ctx->parent_part->getDataPartStorage().isContentAddressed();
+            auto data_part_storage = global_ctx->parent_part->getDataPartStorage().getProjection(
+                local_tmp_part_basename, /* use_parent_transaction */ global_ctx->projection_uses_parent_transaction);
+            builder.emplace(*global_ctx->data, global_ctx->future_part->name, data_part_storage, getReadSettings());
+>>>>>>> a49d9ed16df (Merge pull request #2159 from Altinity/feature/antalya-26.6/CAS)
             builder->withParentPart(global_ctx->parent_part);
         }
         else
@@ -618,6 +630,8 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (global_ctx->parent_part && data_part_storage->exists())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Projection merge directory {} already exists", data_part_storage->getFullPath());
 
+    /// A borrowed projection sub-part shares the parent's already-open transaction; the storage makes
+    /// beginTransaction a no-op in that case, so this can be called unconditionally.
     data_part_storage->beginTransaction();
 
     global_ctx->storage_snapshot = std::make_shared<StorageSnapshot>(*global_ctx->data, global_ctx->metadata_snapshot);
@@ -1532,6 +1546,9 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjectionForBlock(
             *global_ctx->data, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
         tmp_part->finalize();
+        /// A borrowed (CA) temp projection sub-part rides the parent's whole-part transaction and is
+        /// committed by the parent's single commit; the storage makes commitTransaction a no-op there,
+        /// so this can be called unconditionally (B58).
         tmp_part->part->getDataPartStorage().commitTransaction();
         ctx->projection_parts[projection.name].emplace_back(std::move(tmp_part->part));
     }
@@ -1574,6 +1591,8 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalizeProjections() const
                 *global_ctx->data, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
             temp_part->finalize();
+            /// See the matching note above: a borrowed (CA) temp projection sub-part rides the parent
+            /// transaction, so commitTransaction is a no-op and can be called unconditionally.
             temp_part->part->getDataPartStorage().commitTransaction();
             ctx->projection_parts[projection.name].emplace_back(std::move(temp_part->part));
         }
