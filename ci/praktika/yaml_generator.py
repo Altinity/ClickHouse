@@ -329,13 +329,21 @@ class PullRequestPushYamlGen:
             )
 
             if_expression = ""
+            # NOTE (strtgbb): cache skip if is also used for PR-config job filtering
             if (
-                self.workflow_config.config.enable_cache
+                (
+                    self.workflow_config.config.enable_cache
+                    or self.workflow_config.name == "Community PR"
+                )
                 and job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
+                )
+            elif self.workflow_config.if_condition:
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
                 )
             if job.run_unless_cancelled:
                 if_expression = (
@@ -438,8 +446,8 @@ class PullRequestPushYamlGen:
                 "EVENT": self.workflow_config.event,
                 "GH_TOKEN_PERMISSIONS": (
                     YamlGenerator.Templates.TEMPLATE_GH_TOKEN_PERMISSIONS
-                    # if not Settings.USE_CUSTOM_GH_AUTH
-                    # else ""
+                    if self.parser.config.secrets
+                    else ""
                 ),
                 "TAGS": f"\n    tags: [{tags_formatted}]" if tags_formatted else "",
             }
@@ -490,7 +498,13 @@ class PullRequestPushYamlGen:
                     VAR_NAME=secret.name
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
-        format_kwargs["ENV_SECRETS"] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+        if self.parser.config.secrets:
+            # Only add global env if there are secrets in workflow config
+            format_kwargs[
+                "ENV_SECRETS"
+            ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+        else:
+            format_kwargs["ENV_SECRETS"] += "  GH_TOKEN: ${{{{ github.token }}}}\n"
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,
