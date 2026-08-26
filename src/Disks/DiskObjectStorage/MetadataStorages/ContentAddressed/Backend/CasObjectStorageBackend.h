@@ -264,7 +264,11 @@ private:
     /// Write a complete blob body to a sibling temporary local object, then atomically replace `key`
     /// and advance any existing same-ETag disambiguator. A failure before the rename leaves the old
     /// destination and its token state untouched and cleans the temporary.
-    void emuPublishBlobAtomically(const String & key, const String & bytes);
+    /// Streams `envelope` + exactly `payload_size` bytes of `payload` into a temporary sibling of
+    /// `key`, then renames it into place -- nothing is visible at the destination until the byte count
+    /// has been validated, and the rename keeps publication atomic. Takes `emu_mutex` itself (for the
+    /// rename + token-state bump only); the caller must NOT hold it.
+    void emuPublishBlobAtomically(const String & key, const String & envelope, ReadBuffer & payload, uint64_t payload_size);
     /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —
     /// does NOT advance the same-etag disambiguator (that only applies to a just-completed write).
     Token emuObserveToken(const String & key);
