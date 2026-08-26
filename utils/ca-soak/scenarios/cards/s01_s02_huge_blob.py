@@ -1,8 +1,9 @@
 """S01 huge single blob + S02 huge duplicate blob (P0).
 
 S01 proves a large part file is not buffered in process memory and uses streaming multipart upload.
-The README flags a known risk: `Build::putBlob` may materialize the staged `BlobSource` into a
-`String` before upload, so peak memory during finalize/upload is the headline measurement.
+The S3-native publication path streams end to end (no whole-body `String` on it -- see the README's
+measurement caveats), so the headline measurement must budget for the workload's own 512 MiB insert
+block and the S3 multipart in-flight window before attributing growth to the CAS write path.
 
 S02 proves a repeated large content blob is not uploaded again (dedup avoids the remote body PUT).
 """

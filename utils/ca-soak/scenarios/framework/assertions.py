@@ -120,12 +120,13 @@ def assert_event_audit(result, ca_events: dict, expect_exception: bool = False):
 
 
 def assert_gc_no_failed(result, gc_summary: dict):
-    """No REAL Error GC finish rows. Benign concurrency-retry aborts (a deposed fold/fence loser that
-    cleanly retries — classified by `observe._gc_error_is_benign`) are EXPECTED under more than one GC
-    leader and are NOT failures. Only real errors fail here — notably the in-degree `merged ... < 0`
-    undercount CORRUPTED_DATA, which is still counted in `failed`. The concurrent-leader RECLAIM
-    property (does the residual actually drain?) is asserted separately by the residual-drain checks,
-    not by counting Error rows.
+    """No REAL Error GC finish rows. Transient aborts — a deposed fold/fence loser that cleanly
+    retries, a backend outage — are EXPECTED under concurrent GC leaders or a flaky store and are NOT
+    failures: newer binaries classify them server-side as outcome='Aborted' (scored benign directly);
+    for older binaries `observe._gc_error_is_benign` falls back to message markers. Any unrecognized
+    Error still counts in `failed` (fail-closed, e.g. LOGICAL_ERROR / CORRUPTED_DATA). The
+    concurrent-leader RECLAIM property (does the residual actually drain?) is asserted separately by
+    the residual-drain checks, not by counting Error rows.
 
     Non-vacuity guard: `observe.gc_log_all` ALWAYS returns a truthy summary dict (every counter
     defaults to 0), so `if not gc_summary` below can never catch "zero rows were actually observed" —

@@ -280,10 +280,14 @@ def container_sample(container: str) -> dict:
                 except (ValueError, IndexError):
                     pass
 
-    # ClickHouse scratch/tmp bytes (hash-before-upload staging). Best-effort du.
+    # ClickHouse scratch/tmp bytes (hash-before-upload staging). Best-effort du. The CAS staging file
+    # lives under the DISK's own scratch dir (`<data path>/disks/*/cas_scratch/`, see
+    # `ContentAddressedSettings`), NOT under /var/lib/clickhouse/tmp -- measuring only tmp+store
+    # reported 0 while a 0.5 GiB blob was being staged (S01 re-audit, issue #2233).
     rc, so, _ = _docker_exec(
         container, ["sh", "-c",
-                    "du -sb /var/lib/clickhouse/tmp /var/lib/clickhouse/store 2>/dev/null | "
+                    "du -sb /var/lib/clickhouse/tmp /var/lib/clickhouse/store "
+                    "/var/lib/clickhouse/disks/*/cas_scratch 2>/dev/null | "
                     "awk '{s+=$1} END {print s+0}'"], timeout_s=30)
     if rc == 0 and so.strip():
         try:
@@ -441,8 +445,10 @@ def gc_log_rows(node, since_event_time: str | None = None, *,
 # during fold / fence / recheck-persist and cleanly ABORTs to retry next round (drain still converges,
 # attempt-scoped generation). Match the general markers, not one exact phrasing — the message varies by
 # phase ("gc/state moved during the fold/fence/recheck ... retry next round", "lease lost", "stolen by").
-# Fail-closed: only these retry markers are downgraded; the undercount CORRUPTED_DATA ("merged in-degree")
-# and any unrecognized error still count as a real failure.
+# Fail-closed: only these retry markers are downgraded; any unrecognized error still counts as a real
+# failure. (The marker list is a FALLBACK for binaries that predate the server-side classification:
+# newer binaries emit outcome='Aborted' with an `error_code` for the transient class, and those rows
+# are scored benign directly, without any message matching.)
 _GC_BENIGN_ERROR_MARKERS = (
     "gc/state moved",           # fold/fence/recheck lost the optimistic CAS to a concurrent leader
     "retry next round",         # explicit benign-retry semantics
@@ -477,7 +483,11 @@ def gc_log_all(cluster, since_event_time: str | None = None) -> dict:
         summary["rows_total"] += len(rows)
         for r in rows:
             oc = r.get("outcome", "")
-            if oc == "Error":
+            if oc == "Aborted":
+                # Server-side classification (error_code named a transient condition): benign by
+                # construction, no message matching involved.
+                summary["failed_benign"] += 1
+            elif oc == "Error":
                 if _gc_error_is_benign(r.get("error", "")):
                     summary["failed_benign"] += 1
                 else:

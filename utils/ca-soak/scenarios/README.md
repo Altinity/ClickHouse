@@ -172,10 +172,18 @@ Expected:
 - The blob is uploaded through multipart operations for large sizes.
 - `fsck` reports `dangling = 0`; forced `GC` does not delete the in-flight blob.
 
-Known risk to confirm:
+Measurement caveats (2026-08-26 re-audit of the S01 FAIL on issue #2233):
 
-- Current `Build::putBlob` materializes the `BlobSource` into a `String` before upload. This scenario is
-  expected to expose a memory blow-up unless that path is changed to stream from the staged temp file.
+- The S3-native publication path streams end to end (staging temp file -> bounded copy ->
+  `WriteBufferFromS3` multipart); no whole-body `String` exists on it. The earlier "known risk" note
+  about `Build::putBlob` materializing the body described a path removed on 2026-08-04 (`BlobSource`
+  became a re-readable reader factory); the class `Build` itself is now `PartWriteTxn`.
+- The RSS oracle must account for the workload itself: `insert_random`'s single 512 MiB
+  incompressible block is ~1x the blob in the query pipeline before CAS sees a byte, and the S3
+  multipart in-flight window adds up to `max_inflight_parts_for_one_file` x `min_upload_part_size`
+  (20 x 16 MiB by default). "RSS growth < blob size" cannot pass with that workload shape.
+- The whole-body materialization that DOES exist is the emulated/local backend's publication (and the
+  uncapped inline-accumulation path for non-blob part files) -- not the configuration this card runs.
 
 ### S02: huge duplicate blob
 
