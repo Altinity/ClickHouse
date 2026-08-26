@@ -769,7 +769,10 @@ def test_confirm_refuses_when_source_dropped_in_window():
     """Task 16 step 1 — the race the confirm exists to lose safely.
 
     Taxonomy row 3: the source cannot prove it still holds the offered manifest, so the receiver aborts
-    its durable `+1` and throws a retry-later `NETWORK_ERROR` INSTEAD of falling back to bytes. The two
+    its durable `+1` and throws a retry-later `NO_REPLICA_HAS_PART` INSTEAD of falling back to bytes.
+    That code is part of the contract (issue #2219): both queue executors demote it to INFO with no
+    stack trace, it stays recorded on the queue entry, and it is the one fetch-transient code the
+    stateless corpus already tolerates in `part_log` checks. The two
     assertions that matter are (a) the queue recovers by re-selecting — here, onto the covering part —
     and (b) NO byte re-request ever went to the source whose state was in doubt. (b) is the entire
     reason row 3 throws where rows 2 and 5 return `nullptr`.
@@ -809,6 +812,31 @@ def test_confirm_refuses_when_source_dropped_in_window():
     )
     assert not log_lines(node2, relink_finished_pattern(table, part))
     assert any_state_part_count(node2, table, part) == 0
+
+    # (c) the refusal's CLASSIFICATION -- the contract pinned after issue #2219. The refusal must reach
+    #     the operator as the tolerated fetch-transient `NO_REPLICA_HAS_PART` (both queue executors
+    #     demote it to INFO, no stack trace; every stateless `part_log` hygiene check that whitelists
+    #     that code -- e.g. `02265_column_ttl` -- stays green), never as an Error-level `NETWORK_ERROR`
+    #     with a stack trace, which reads as a network fault and once cost a multi-hour false triage.
+    refusal_error_pattern = r"<Error>.*did not prove it still holds the manifest"
+    refusal_info_pattern = r"<Information>.*did not prove it still holds the manifest"
+    assert not log_lines(node2, refusal_error_pattern), (
+        "the relink refusal is a designed outcome and must not be logged at Error level"
+    )
+    assert log_lines(node2, refusal_info_pattern), (
+        "the demoted refusal must still be visible at Information level -- silence would be worse than "
+        "the old noise"
+    )
+    node2.query("SYSTEM FLUSH LOGS part_log")
+    stray_codes = node2.query(
+        "SELECT DISTINCT errorCodeToName(error) FROM system.part_log "
+        "WHERE table = '{}' AND error != 0 AND errorCodeToName(error) != 'NO_REPLICA_HAS_PART'".format(
+            table
+        )
+    ).split()
+    assert stray_codes == [], (
+        "a relink refusal must reach part_log only as NO_REPLICA_HAS_PART, got: {}".format(stray_codes)
+    )
 
     drop_everywhere(table)
 
