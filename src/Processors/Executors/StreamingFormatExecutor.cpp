@@ -149,7 +149,13 @@ size_t StreamingFormatExecutor::insertChunk(Chunk chunk, size_t num_bytes)
 
     auto columns = chunk.detachColumns();
     for (size_t i = 0, s = columns.size(); i < s; ++i)
-        result_columns[i]->insertRangeFrom(*columns[i], 0, columns[i]->size());
+    {
+        /// Input formats may produce ColumnConst / ColumnSparse (e.g. the Parquet reader for column
+        /// chunks whose statistics prove a single value or all nulls); insertRangeFrom into the full
+        /// result column requires the concrete column type.
+        auto full_column = columns[i]->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
+        result_columns[i]->insertRangeFrom(*full_column, 0, full_column->size());
+    }
 
     return chunk_rows;
 }

@@ -1414,7 +1414,12 @@ Chunk AsynchronousInsertQueue::processPreprocessedEntries(
 
         auto columns = block_to_insert.getColumns();
         for (size_t i = 0, s = columns.size(); i < s; ++i)
-            result_columns[i]->insertRangeFrom(*columns[i], 0, columns[i]->size());
+        {
+            /// Blocks may carry ColumnConst / ColumnSparse (e.g. from an input format that materializes
+            /// provably-constant column chunks); insertRangeFrom needs the concrete column type.
+            auto full_column = columns[i]->convertToFullColumnIfConst()->convertToFullColumnIfSparse();
+            result_columns[i]->insertRangeFrom(*full_column, 0, full_column->size());
+        }
 
         total_rows += block_to_insert.rows();
 
