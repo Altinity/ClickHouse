@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
             {"input_format_parquet_use_constant_column_optimization", false, true, "New setting: when a Parquet column chunk provably holds a single value in every row (per its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages (reader v3)."},
+            {"input_format_parquet_constant_column_sparse_ratio", 1.0, 0.9375, "New setting: a Parquet column chunk holding a single value plus nulls is materialized as a sparse column when the fraction of nulls is at least this ratio (reader v3)."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

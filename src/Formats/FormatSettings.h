@@ -350,6 +350,7 @@ struct FormatSettings
         bool page_filter_push_down = true;
         bool use_offset_index = true;
         bool use_constant_column_optimization = true;
+        float constant_column_sparse_ratio = 0.9375f;
 
         bool enable_json_parsing = true;
         bool preserve_order = false;

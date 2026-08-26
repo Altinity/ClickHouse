@@ -214,7 +214,10 @@ Skip pages using min/max values from column index.
 Minor tweak to how pages are read from parquet file when no page filtering is used.
 )", 0) \
     DECLARE(Bool, input_format_parquet_use_constant_column_optimization, true, R"(
-When a Parquet column chunk provably holds a single value in every row (according to its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages.
+When a Parquet column chunk provably holds a single value in every row (according to its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages. Also covers chunks that are all null (materialized as a sparse column) and chunks holding a single value plus nulls (only the definition levels are decoded).
+)", 0) \
+    DECLARE(Float, input_format_parquet_constant_column_sparse_ratio, 0.9375, R"(
+For `input_format_parquet_use_constant_column_optimization`: a Parquet column chunk holding a single value plus nulls is materialized as a sparse column (memory proportional to the non-null rows) when the fraction of nulls is at least this ratio, and as a dense `Nullable` column otherwise. `1` disables sparse materialization for such chunks.
 )", 0) \
     DECLARE(Bool, input_format_parquet_verify_checksums, true, R"(
 Verify page checksums when reading parquet files.

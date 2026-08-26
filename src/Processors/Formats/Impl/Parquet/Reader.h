@@ -302,6 +302,39 @@ struct Reader
         MutableColumnPtr indices_column; // if is_dictionary_encoded; ColumnUInt32
     };
 
+    /// How a column chunk whose statistics prove (almost) all of its content is materialized, chosen
+    /// once per chunk by detectConstantColumn from the chunk statistics alone. Each kind maps to an
+    /// existing column representation that every downstream consumer already handles:
+    ///   Const       - ColumnConst: one non-null value in every row (null_count == 0, min == max).
+    ///                 Const-ness propagates to WHERE/GROUP BY. Data pages are not read.
+    ///   AllDefault  - ColumnSparse with no non-default rows: every row is null (null_count ==
+    ///                 num_values), which is the type default (Null for Nullable, or the output type's
+    ///                 default under null_as_default). Data pages are not read. Sparse rather than Const
+    ///                 because a sparse column stays writable (ColumnConst silently drops inserts), which
+    ///                 matters when block_missing_values makes AddingDefaultsTransform mix defaults in.
+    ///   SparseNulls - ColumnSparse: nulls dominate (null_count / num_values >= constant_column_sparse_ratio)
+    ///                 and the non-null rows all hold one value. Data pages are read only for their
+    ///                 definition levels (the null map); values are neither decompressed (DATA_PAGE_V2)
+    ///                 nor decoded. Memory is O(non-null rows).
+    ///   DenseNulls  - ColumnNullable: nulls are present but few; same page handling as SparseNulls,
+    ///                 materialized as a dense column filled with the value plus the decoded null map.
+    /// Invariant: Const <=> a single non-default or default value with no nulls; sparse kinds <=> the
+    /// default (null) dominates; a non-null constant equal to the type default is still Const, since
+    /// const propagation beats sparse there and there is no null map to mix.
+    enum class ConstantKind : UInt8
+    {
+        None,
+        Const,
+        AllDefault,
+        SparseNulls,
+        DenseNulls,
+    };
+
+    /// Kinds for which the chunk's data pages are neither prefetched nor decoded.
+    static bool constantKindSkipsDataPages(ConstantKind kind) { return kind == ConstantKind::Const || kind == ConstantKind::AllDefault; }
+    /// Kinds for which the data pages are read for definition levels only (value decoding skipped).
+    static bool constantKindSkipsValues(ConstantKind kind) { return kind == ConstantKind::SparseNulls || kind == ConstantKind::DenseNulls; }
+
     struct ColumnChunk
     {
         const parq::ColumnChunk * meta{};
@@ -311,17 +344,12 @@ struct Reader
         bool use_column_index = false;
         bool need_null_map = false;
 
-        /// This column chunk provably holds a single repeated value in every row (see
-        /// detectConstantColumn). When set, we skip prefetching and decoding the data pages and
-        /// materialize `constant_value` directly instead. `constant_value` is the already-decoded
-        /// value (not the raw parquet-encoded bytes).
-        bool is_constant = false;
+        /// See ConstantKind and detectConstantColumn. For Const/SparseNulls/DenseNulls,
+        /// `constant_value` is the single non-null value, already decoded (not the raw parquet-encoded
+        /// bytes) and in the FINAL output type's domain (OutputColumnInfo::output_type, not
+        /// decoded_type - see detectConstantColumn). Unused for None/AllDefault.
+        ConstantKind constant_kind = ConstantKind::None;
         Field constant_value;
-        /// Sub-case of is_constant: the chunk is provably all-null (null_count == num_values).
-        /// constant_value is Null for a Nullable output, or the output default under null_as_default;
-        /// formOutputColumn also records every row in block_missing_values (the plain constant case
-        /// has no nulls).
-        bool is_all_null = false;
 
         /// Prefetches.
         /// TODO [parquet]: Check that all handles and tokens are reset after correct stages.
@@ -373,14 +401,13 @@ struct Reader
         /// Primitive column.
         MutableColumnPtr column;
 
-        /// Set by decodePrimitiveColumn when the source column chunk is constant (see
-        /// ColumnChunk::is_constant): `column` is then left empty and formOutputColumn materializes
-        /// `constant_value` directly in the final output type. `constant_value` is in the output
-        /// (post-cast) domain.
-        bool is_constant = false;
+        /// Mirror of ColumnChunk::constant_kind, set by decodePrimitiveColumn. For Const/AllDefault
+        /// `column` is left empty and formOutputColumn materializes the chunk directly from
+        /// `constant_value`. For SparseNulls/DenseNulls `column` is materialized by
+        /// decodePrimitiveColumn directly in the final output type (no cast needed). `constant_value`
+        /// is in the final output type's domain, as in ColumnChunk.
+        ConstantKind constant_kind = ConstantKind::None;
         Field constant_value;
-        /// Mirror of ColumnChunk::is_all_null (see there).
-        bool is_all_null = false;
 
         MutableColumnPtr null_map;
 
@@ -560,11 +587,16 @@ struct Reader
     /// in a Tuple/Map/Array output). Only such a column maps one parquet value 1:1 to one output row.
     bool isConstantColumnCandidate(const PrimitiveColumnInfo & column_info) const;
 
-    /// If the column chunk provably holds one repeated value in every row, sets column.is_constant
-    /// and column.constant_value. Uses column chunk min/max statistics (Tier 1). Only applies to
-    /// flat, top-level primitive columns with no element nulls; see the implementation for the
-    /// exact conditions.
+    /// If the column chunk statistics prove its content (one value, all null, or one value plus
+    /// nulls), sets column.constant_kind and column.constant_value. Uses column chunk min/max and
+    /// null_count statistics (Tier 1). Only applies to flat, top-level primitive columns; see the
+    /// implementation and ConstantKind for the exact conditions and representations.
     void detectConstantColumn(ColumnChunk & column, const PrimitiveColumnInfo & column_info) const;
+
+    /// Pure decision from statistics + output type: which ConstantKind to use for a chunk with
+    /// `num_values` values of which `null_count` are null and whose non-null values are all equal
+    /// (`single_value`). Returns None when nothing applies.
+    ConstantKind chooseConstantKind(const PrimitiveColumnInfo & column_info, const DataTypePtr & final_output_type, Int64 num_values, std::optional<Int64> null_count, bool single_value) const;
 
     /// Returns mutable column because some of the recursive calls require it,
     /// e.g. ColumnArray::create does assumeMutable() on the nested columns.
