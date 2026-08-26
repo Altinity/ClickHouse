@@ -8,6 +8,8 @@
 
 #include <Common/Exception.h>
 
+#include <condition_variable>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,7 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
@@ -289,7 +292,10 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
     ASSERT_EQ(round_rows.size(), 2u) << "a throwing round still emits a Start and a (Aborted) Finish";
     EXPECT_EQ(round_rows[0].event_type, Rec::EventType::Start);
     EXPECT_EQ(round_rows[1].event_type, Rec::EventType::Finish);
-    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed);
+    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Failed)
+        << "BAD_ARGUMENTS is not on the transient list, so the row must read as a real failure";
+    EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::BAD_ARGUMENTS)
+        << "the Finish row must carry the structured exception code, not only the message text";
     EXPECT_FALSE(round_rows[1].error.empty()) << "a failed Finish must carry the exception text";
     EXPECT_EQ(round_rows[1].disk_name, "ca");
     EXPECT_FALSE(round_rows[1].gc_id.empty());
@@ -297,6 +303,209 @@ TEST(CASGCLog, AbortedFinishOnThrowingRound)
     for (const Rec & r : rows)
         EXPECT_EQ(r.round_id, round_rows[0].round_id)
             << "every row of a FAILED round must still correlate through round_id";
+}
+
+/// A round that dies with a TRANSIENT code -- the backend was unreachable, timed out, or another
+/// actor moved shared state -- must be classified `Aborted`, not `Failed`: the next scheduled round
+/// is the retry and nothing durable is wrong. The classifier keys on the exception CODE
+/// (`isTransientGcRoundError`), never on message wording.
+class NetworkThrowingBackend : public InMemoryBackend
+{
+public:
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (arm)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected backend outage");
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+    std::atomic<bool> arm{false};
+};
+
+TEST(CASGCLog, TransientThrowIsClassifiedAborted)
+{
+    auto backend = std::make_shared<NetworkThrowingBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    backend->arm.store(true);
+    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size(), 2u);
+    EXPECT_EQ(round_rows[1].event_type, Rec::EventType::Finish);
+    EXPECT_EQ(round_rows[1].outcome, Rec::Outcome::Aborted)
+        << "NETWORK_ERROR names a transient condition; the row must not read as a GC defect";
+    EXPECT_EQ(round_rows[1].error_code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_FALSE(round_rows[1].error.empty());
+}
+
+/// The classifier itself, pinned direct: the transient list is exact and everything else fails closed.
+TEST(CASGCLog, TransientErrorClassifierFailsClosed)
+{
+    EXPECT_TRUE(DB::Cas::isTransientGcRoundError(DB::ErrorCodes::NETWORK_ERROR));
+    EXPECT_FALSE(DB::Cas::isTransientGcRoundError(DB::ErrorCodes::BAD_ARGUMENTS));
+    EXPECT_FALSE(DB::Cas::isTransientGcRoundError(0));
+    EXPECT_FALSE(DB::Cas::isTransientGcRoundError(-1));
+}
+
+/// A backend that lets the round's FIRST `gc/state` CAS (the lease acquire/renew) through and throws
+/// a transient error on the SECOND (the round-closing commit). The round therefore does all of its
+/// pre-CAS work -- including condemning the dropped part -- and dies at `round_commit`.
+class StateCommitThrowingBackend : public InMemoryBackend
+{
+public:
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        if (arm && key.ends_with("gc/state") && ++state_puts_since_arm >= 2)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected outage on the round-closing CAS");
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+    std::atomic<bool> arm{false};
+    std::atomic<int> state_puts_since_arm{0};
+};
+
+/// The Finish row of a THROWING round must still carry the counters of everything the round did
+/// before it died. Before this existed, the exception path emitted a row with `round = 0` and every
+/// counter zero, so a round that condemned entries and then lost its commit CAS was
+/// indistinguishable from a round that never got past the lease.
+TEST(CASGCLog, AbortedFinishCarriesProgressiveCounters)
+{
+    auto backend = std::make_shared<StateCommitThrowingBackend>();
+    auto store = Pool::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"srv1/tbl"};
+
+    publishPart(store, ns.string(), "all_0_0_0", "hello-progressive-counters");
+    store->dropRef(ns, "all_0_0_0");
+    store->renewWatermarkOnce();
+
+    std::vector<Rec> rows;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r) { rows.push_back(r); });
+
+    backend->arm.store(true);
+    EXPECT_THROW(sched.runOneRoundNow(Rec::Trigger::Manual), DB::Exception);
+
+    const std::vector<Rec> round_rows = roundRowsOnly(rows);
+    ASSERT_EQ(round_rows.size(), 2u);
+    const Rec & fin = round_rows[1];
+    EXPECT_EQ(fin.outcome, Rec::Outcome::Aborted);
+    EXPECT_EQ(fin.error_code, DB::ErrorCodes::NETWORK_ERROR);
+    EXPECT_EQ(fin.round, 0u) << "the commit CAS never landed, so the round number must stay unstamped";
+    EXPECT_GT(fin.candidates_marked + fin.entries_condemned + fin.entries_graduated
+              + fin.entries_redeleted + fin.objects_deleted + fin.fence_outs, 0u)
+        << "the pre-CAS work the round performed must survive into its failure row";
+}
+
+/// The pacing loop drops leadership only on a NON-transient round failure. A transient failure
+/// (backend outage class) keeps `i_am_leader` set, so the advisory heartbeat keeps pulsing and a
+/// live leader blocked on a flaky store is not deposed -- dropping the flag on every failure was
+/// half of the dead-leader signature (`!incumbent_renewed && !hb_alive`) and produced leadership
+/// ping-pong under backend fault windows. A non-transient failure must still clear the flag: a
+/// logic-broken leader has to stay depositable.
+class ModalThrowingBackend : public InMemoryBackend
+{
+public:
+    enum Mode : int { Off = 0, Transient = 1, Logic = 2 };
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        const int m = mode.load();
+        if (m == Transient)
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected backend outage");
+        if (m == Logic)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected logic failure");
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
+                     const ObjectMeta & meta) override
+    {
+        if (key.ends_with("gc/hb"))
+            ++hb_puts;
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+    std::atomic<int> mode{Off};
+    std::atomic<uint64_t> hb_puts{0};
+};
+
+TEST(CASGCScheduler, TransientRoundFailureKeepsLeadershipAndHeartbeat)
+{
+    auto backend = std::make_shared<ModalThrowingBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    std::mutex rows_mutex;
+    std::condition_variable rows_cv;
+    std::vector<Rec> finishes;
+    DB::Cas::CasGcScheduler sched(
+        store, std::chrono::seconds(1), "test::gc", "ca",
+        [&](const Rec & r)
+        {
+            if (r.event_type != Rec::EventType::Finish)
+                return;
+            std::lock_guard g(rows_mutex);
+            finishes.push_back(r);
+            rows_cv.notify_all();
+        });
+
+    const auto wait_for_finish = [&](size_t count) -> Rec
+    {
+        std::unique_lock lock(rows_mutex);
+        const bool ok = rows_cv.wait_for(lock, std::chrono::seconds(30), [&] { return finishes.size() >= count; });
+        EXPECT_TRUE(ok) << "timed out waiting for Finish row #" << count;
+        return finishes.at(count - 1);
+    };
+    /// Bounded poll for an ASYNC flag change. The loop stores `i_am_leader` after `runRoundLogged`
+    /// returns (after the Finish row was emitted), so the row alone is not a happens-before for the
+    /// flag -- poll to the expected value instead of asserting a racy instantaneous read.
+    const auto poll_leader = [&](bool expected) -> bool
+    {
+        for (int i = 0; i < 3000; ++i)
+        {
+            if (sched.gcHealth().is_leader == expected)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return sched.gcHealth().is_leader == expected;
+    };
+
+    sched.start();
+    sched.requestRoundSoon();
+    const Rec first = wait_for_finish(1);
+    EXPECT_TRUE(first.outcome == Rec::Outcome::Success || first.outcome == Rec::Outcome::Deferred)
+        << "outcome=" << static_cast<int>(first.outcome);
+    EXPECT_TRUE(poll_leader(true)) << "a successful round must establish leadership";
+
+    backend->mode.store(ModalThrowingBackend::Transient);
+    sched.requestRoundSoon();
+    const Rec aborted = wait_for_finish(2);
+    EXPECT_EQ(aborted.outcome, Rec::Outcome::Aborted);
+    /// Leadership kept => the advisory heartbeat keeps pulsing. Waiting for a NEW pulse after the
+    /// failed round is the happens-after proof that the flag survived; with the flag dropped the
+    /// heartbeat loop skips every pulse until the next successful round, and this wait times out.
+    const uint64_t hb_before = backend->hb_puts.load();
+    bool pulsed = false;
+    for (int i = 0; i < 3000 && !pulsed; ++i)
+    {
+        pulsed = backend->hb_puts.load() > hb_before;
+        if (!pulsed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(pulsed) << "a transient round failure must not silence the advisory heartbeat";
+    EXPECT_TRUE(sched.gcHealth().is_leader) << "a transient round failure must not drop leadership";
+
+    backend->mode.store(ModalThrowingBackend::Logic);
+    sched.requestRoundSoon();
+    const Rec failed = wait_for_finish(3);
+    EXPECT_EQ(failed.outcome, Rec::Outcome::Failed);
+    EXPECT_TRUE(poll_leader(false)) << "a non-transient round failure must still surrender leadership";
+
+    backend->mode.store(ModalThrowingBackend::Off);
+    sched.stop();
 }
 
 /// Every row of one round -- its Start, each of its Phase rows, and its Finish -- carries the SAME

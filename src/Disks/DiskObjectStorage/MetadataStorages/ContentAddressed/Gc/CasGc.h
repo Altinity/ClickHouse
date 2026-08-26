@@ -429,8 +429,15 @@ public:
     /// `policy` is the destructive gate's universe seam — see `UniversePolicy`. Production passes
     /// nothing; a test whose subject is the suppressed gate passes `StageA_Suppressed` here, which is
     /// the only way to reach that posture.
+    /// `progress` (optional) is the caller's window into a round that THROWS: the round accumulates its
+    /// report directly in `*progress` (reset at entry) as each phase completes, so on an exception the
+    /// caller still sees everything the round durably did before it died -- `round` is stamped only
+    /// after the round's single `gc/state` CAS commits, so `progress->round != 0` on a failed round
+    /// proves the round committed and died in the post-CAS tail. On the success path `*progress` equals
+    /// the returned report.
     RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true,
-                                UniversePolicy policy = UniversePolicy::kDefault);
+                                UniversePolicy policy = UniversePolicy::kDefault,
+                                RoundReport * progress = nullptr);
 
     /// Advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.

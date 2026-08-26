@@ -12,8 +12,34 @@
 #include <algorithm>
 #include <optional>
 
+namespace DB::ErrorCodes
+{
+    extern const int S3_ERROR;
+    extern const int NETWORK_ERROR;
+    extern const int ABORTED;
+    extern const int TIMEOUT_EXCEEDED;
+    extern const int SOCKET_TIMEOUT;
+    extern const int MEMORY_LIMIT_EXCEEDED;
+}
+
 namespace DB::Cas
 {
+
+bool isTransientGcRoundError(int code)
+{
+    /// Codes that name a condition which clears without intervention: the backend refused or timed out
+    /// (`S3_ERROR`, `NETWORK_ERROR`, `TIMEOUT_EXCEEDED`, `SOCKET_TIMEOUT`), another actor legitimately
+    /// moved shared state (`ABORTED` -- the round CAS's own "another leader advanced it"), or memory
+    /// pressure hit a manual round running on a budgeted query thread (`MEMORY_LIMIT_EXCEEDED`).
+    /// Everything else -- notably `LOGICAL_ERROR`, `CORRUPTED_DATA`, `BAD_ARGUMENTS` -- stays
+    /// non-transient BY OMISSION: an unrecognised code must read as a real failure, never as noise.
+    return code == ErrorCodes::S3_ERROR
+        || code == ErrorCodes::NETWORK_ERROR
+        || code == ErrorCodes::ABORTED
+        || code == ErrorCodes::TIMEOUT_EXCEEDED
+        || code == ErrorCodes::SOCKET_TIMEOUT
+        || code == ErrorCodes::MEMORY_LIMIT_EXCEEDED;
+}
 
 namespace
 {
@@ -192,9 +218,29 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
 
     Rec fin = start;
     fin.event_type = Rec::EventType::Finish;
+    /// Lives OUTSIDE the try and is filled progressively by the round (the `progress` out-parameter of
+    /// `runRegularRound`), so the Finish row of a THROWING round still carries everything the round
+    /// durably did before it died -- `round != 0` on such a row proves the round's `gc/state` CAS
+    /// committed and the failure hit the post-CAS tail.
+    Cas::RoundReport rep;
+    const auto fill_counters = [&fin](const Cas::RoundReport & r)
+    {
+        fin.round = r.round;
+        fin.candidates_marked = r.candidates;
+        fin.objects_deleted = r.deleted;
+        fin.objects_absent = r.absent;
+        fin.objects_replaced = r.replaced;
+        fin.objects_spared = r.spared;
+        fin.manifests_deleted = r.manifests_deleted;
+        fin.entries_condemned = r.condemned;
+        fin.entries_graduated = r.graduated;
+        fin.entries_redeleted = r.redeleted;
+        fin.fence_outs = r.fence_outs;
+        fin.anomalies = r.anomalies.size();
+    };
     try
     {
-        const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal);
+        (void)round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal, Cas::UniversePolicy::kDefault, &rep);
         if (rep.acquired_lease)
         {
             /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
@@ -210,18 +256,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         fin.outcome = !rep.acquired_lease ? Rec::Outcome::NotALeader
                     : rep.deferred        ? Rec::Outcome::Deferred
                                            : Rec::Outcome::Success;
-        fin.round = rep.round;
-        fin.candidates_marked = rep.candidates;
-        fin.objects_deleted = rep.deleted;
-        fin.objects_absent = rep.absent;
-        fin.objects_replaced = rep.replaced;
-        fin.objects_spared = rep.spared;
-        fin.manifests_deleted = rep.manifests_deleted;
-        fin.entries_condemned = rep.condemned;
-        fin.entries_graduated = rep.graduated;
-        fin.entries_redeleted = rep.redeleted;
-        fin.fence_outs = rep.fence_outs;
-        fin.anomalies = rep.anomalies.size();
+        fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
@@ -230,8 +265,10 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     }
     catch (...)
     {
-        fin.outcome = Rec::Outcome::Failed;
+        fin.error_code = getCurrentExceptionCode();
+        fin.outcome = isTransientGcRoundError(fin.error_code) ? Rec::Outcome::Aborted : Rec::Outcome::Failed;
         fin.error = getCurrentExceptionMessage(false);
+        fill_counters(rep);
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
         fin.profile_events = collect_profile_events();
@@ -342,8 +379,21 @@ void CasGcScheduler::loop()
         catch (...)
         {
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
-            /// runRoundLogged already emitted the Aborted Finish row before rethrowing.
-            i_am_leader.store(false, std::memory_order_relaxed);
+            /// runRoundLogged already emitted the classified (Aborted/Failed) Finish row before rethrowing.
+            ///
+            /// Leadership is dropped only on a NON-transient failure. Dropping it on every failure
+            /// silenced the advisory heartbeat for a whole interval (`heartbeatLoop` gates its pulses on
+            /// `i_am_leader`), and when the failure was itself a backend outage the durable lease
+            /// `(owner, seq)` was frozen too -- together exactly the two-of-two dead-leader signature
+            /// `acquireOrRenewLease` steals on. A live leader blocked on a flaky store was then deposed,
+            /// and every handover forces the successor into a full fold: more single-attempt conditional
+            /// writes against the same flaky backend, a self-reinforcing loop. Keeping the flag keeps the
+            /// pulses; the lease protocol stays authoritative -- a mounter that really died stops pulsing
+            /// with or without this flag. A non-transient failure still clears it: a logic-broken leader
+            /// must stay depositable, and with the flag held its heartbeat would keep beating and no
+            /// follower could ever steal a lease whose holder cannot complete a round.
+            if (!isTransientGcRoundError(getCurrentExceptionCode()))
+                i_am_leader.store(false, std::memory_order_relaxed);
             tryLogCurrentException(log, "CA GC round failed (will retry next tick)");
         }
     }

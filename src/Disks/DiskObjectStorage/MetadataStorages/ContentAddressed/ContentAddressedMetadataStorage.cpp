@@ -547,6 +547,9 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
             case Cas::GcRoundLogRecord::Outcome::Deferred:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::DEFERRED;
                 break;
+            case Cas::GcRoundLogRecord::Outcome::Aborted:
+                e.outcome = ContentAddressedGarbageCollectionLogElement::ABORTED;
+                break;
         }
         e.round = r.round;
         e.candidates_marked = r.candidates_marked;
@@ -562,6 +565,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
         e.error = r.error;
+        e.error_code = r.error_code;
         e.profile_events = r.profile_events;
         e.round_id = r.round_id;
         e.phase = r.phase;
