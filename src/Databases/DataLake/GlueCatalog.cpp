@@ -652,7 +652,99 @@ void GlueCatalog::createNamespaceIfNotExists(const String & namespace_name) cons
     glue_client->CreateDatabase(create_request);
 }
 
-void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr /*metadata_content*/) const
+/// Converts an Iceberg type (primitive string or complex JSON object) to a
+/// Glue-compatible type string such as "string", "array<int>", "map<string,long>",
+/// or "struct<name:string, age:int>".
+static String icebergTypeToGlueType(const Poco::Dynamic::Var & type_var)
+{
+    if (type_var.isString())
+        return type_var.extract<String>();
+
+    auto type_obj = type_var.extract<Poco::JSON::Object::Ptr>();
+    String type_name = type_obj->getValue<String>(DB::Iceberg::f_type);
+
+    if (type_name == DB::Iceberg::f_list)
+    {
+        auto element_type = icebergTypeToGlueType(type_obj->get(DB::Iceberg::f_element));
+        return "array<" + element_type + ">";
+    }
+
+    if (type_name == DB::Iceberg::f_map)
+    {
+        auto key_type = icebergTypeToGlueType(type_obj->get(DB::Iceberg::f_key));
+        auto value_type = icebergTypeToGlueType(type_obj->get(DB::Iceberg::f_value));
+        return "map<" + key_type + "," + value_type + ">";
+    }
+
+    if (type_name == DB::Iceberg::f_struct)
+    {
+        auto fields = type_obj->getArray(DB::Iceberg::f_fields);
+        String result = "struct<";
+        for (size_t i = 0; i < fields->size(); ++i)
+        {
+            if (i > 0)
+                result += ",";
+            auto field = fields->getObject(static_cast<UInt32>(i));
+            result += field->getValue<String>(DB::Iceberg::f_name) + ":"
+                + icebergTypeToGlueType(field->get(DB::Iceberg::f_type));
+        }
+        result += ">";
+        return result;
+    }
+
+    return type_name;
+}
+
+/// Populates a Glue StorageDescriptor's column list from an Iceberg schema JSON
+/// object (the one with "type": "struct", "fields": [...]).
+static void setGlueColumnsFromIcebergSchema(Aws::Glue::Model::StorageDescriptor & sd, const Poco::JSON::Object::Ptr & iceberg_schema)
+{
+    if (!iceberg_schema || !iceberg_schema->has(DB::Iceberg::f_fields))
+        return;
+
+    auto fields = iceberg_schema->getArray(DB::Iceberg::f_fields);
+    Aws::Vector<Aws::Glue::Model::Column> columns;
+    columns.reserve(fields->size());
+
+    for (size_t i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(static_cast<UInt32>(i));
+        Aws::Glue::Model::Column col;
+        col.SetName(field->getValue<String>(DB::Iceberg::f_name));
+        col.SetType(icebergTypeToGlueType(field->get(DB::Iceberg::f_type)));
+
+        Aws::Map<Aws::String, Aws::String> col_params;
+        bool is_optional = !field->getValue<bool>(DB::Iceberg::f_required);
+        col_params["iceberg.field.optional"] = is_optional ? "true" : "false";
+        col_params["iceberg.field.current"] = "true";
+        col_params["iceberg.field.id"] = std::to_string(field->getValue<Int32>(DB::Iceberg::f_id));
+        col.SetParameters(col_params);
+
+        columns.push_back(std::move(col));
+    }
+
+    sd.SetColumns(std::move(columns));
+}
+
+/// Extracts the current schema from an Iceberg metadata JSON (the top-level
+/// object that contains "current-schema-id" and "schemas").
+static Poco::JSON::Object::Ptr getCurrentSchemaFromMetadata(const Poco::JSON::Object::Ptr & metadata)
+{
+    if (!metadata)
+        return nullptr;
+
+    auto current_schema_id = metadata->getValue<Int32>(DB::Iceberg::f_current_schema_id);
+    auto schemas = metadata->getArray(DB::Iceberg::f_schemas);
+    for (size_t i = schemas->size(); i > 0; --i)
+    {
+        auto candidate = schemas->getObject(static_cast<UInt32>(i - 1));
+        if (candidate->getValue<Int32>(DB::Iceberg::f_schema_id) == current_schema_id)
+            return candidate;
+    }
+    return nullptr;
+}
+
+void GlueCatalog::createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const
 {
     if (!isNamespaceAllowed(namespace_name))
         throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
@@ -674,6 +766,9 @@ void GlueCatalog::createTable(const String & namespace_name, const String & tabl
     fs::path grandparent = parent.parent_path();
 
     sd.SetLocation(grandparent.c_str());
+
+    if (auto schema = getCurrentSchemaFromMetadata(metadata_content))
+        setGlueColumnsFromIcebergSchema(sd, schema);
 
     table_input.SetStorageDescriptor(sd);
     table_input.SetTableType("ICEBERG");
@@ -745,12 +840,50 @@ bool GlueCatalog::updateSchema(
     const String & namespace_name,
     const String & table_name,
     const String & new_metadata_path,
-    Poco::JSON::Object::Ptr /*new_schema*/,
+    Poco::JSON::Object::Ptr new_schema,
     Int32 /*previous_schema_id*/,
     Int32 /*new_last_column_id*/,
     Poco::JSON::Object::Ptr /*metadata*/) const
 {
-    return updateMetadata(namespace_name, table_name, new_metadata_path, nullptr);
+    Aws::Glue::Model::UpdateTableRequest request;
+    request.SetDatabaseName(namespace_name);
+
+    Aws::Glue::Model::TableInput table_input;
+    table_input.SetName(table_name);
+
+    Aws::Glue::Model::StorageDescriptor sd;
+    fs::path original_path = new_metadata_path;
+
+    fs::path parent = original_path.parent_path();
+    fs::path grandparent = parent.parent_path();
+
+    sd.SetLocation(grandparent.c_str());
+
+    setGlueColumnsFromIcebergSchema(sd, new_schema);
+
+    table_input.SetStorageDescriptor(sd);
+    table_input.SetTableType("ICEBERG");
+
+    Aws::Map<Aws::String, Aws::String> parameters;
+    parameters["metadata_location"] = new_metadata_path;
+    parameters["table_type"] = "ICEBERG";
+
+    table_input.SetParameters(parameters);
+
+    request.SetTableInput(table_input);
+
+    Aws::Glue::Model::UpdateTableOutcome response;
+
+    {
+        ProfileEvents::increment(ProfileEvents::DataLakeGlueCatalogUpdateTable);
+        auto timer = DB::CurrentThread::getProfileEvents().timer(ProfileEvents::DataLakeGlueCatalogUpdateTableMicroseconds);
+        response = glue_client->UpdateTable(request);
+    }
+
+    if (!response.IsSuccess())
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Can not update schema in glue catalog {}", response.GetError().GetMessage());
+
+    return true;
 }
 
 void GlueCatalog::dropTable(const String & namespace_name, const String & table_name) const
