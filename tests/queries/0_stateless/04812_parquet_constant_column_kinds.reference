@@ -17,6 +17,8 @@
 0	70	990	6930	990	10
 -- DEFAULT expressions fill the null rows (AddingDefaultsTransform over sparse columns)
 5000	8980	7040	990	10
+-- INSERT ... FORMAT Parquet through the client: sparse columns travel over the Native protocol
+0	70	6930	990	10	1000
 -- LowCardinality output cannot be sparse: falls back to dense / normal decode with the same result
 0	10	10	10	10
 -- profile events: all-null chunks skip pages; single-value-plus-nulls chunks skip values; nothing when disabled

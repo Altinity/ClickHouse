@@ -16,6 +16,12 @@ namespace DB
 
 bool insertNullAsDefaultIfNeeded(ColumnWithTypeAndName & input_column, const ColumnWithTypeAndName & header_column, size_t column_i, BlockMissingValues * block_missing_values)
 {
+    /// Input formats may produce sparse columns (e.g. the Parquet reader for chunks that are all
+    /// null or mostly null), and they survive the Native protocol from the client. The casts below
+    /// expect the concrete Nullable / Array / Tuple / Map columns, so expand first.
+    if (input_column.column->isSparse())
+        input_column.column = input_column.column->convertToFullColumnIfSparse();
+
     if (isArray(input_column.type) && isArray(header_column.type))
     {
         ColumnWithTypeAndName nested_input_column;

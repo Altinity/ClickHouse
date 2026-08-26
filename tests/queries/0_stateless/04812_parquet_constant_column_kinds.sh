@@ -65,6 +65,13 @@ ${CLICKHOUSE_CLIENT} -q "
 ${CLICKHOUSE_CLIENT} -q "SELECT sum(n_all), sum(n_sparse), sum(n_dense), countIf(s_sparse = 'd'), countIf(s_sparse = 'x') FROM t_kinds_file SETTINGS input_format_null_as_default = 1"
 ${CLICKHOUSE_CLIENT} -q "DROP TABLE t_kinds_file"
 
+echo "-- INSERT ... FORMAT Parquet through the client: sparse columns travel over the Native protocol"
+${CLICKHOUSE_CLIENT} -q "DROP TABLE IF EXISTS t_kinds_ins"
+${CLICKHOUSE_CLIENT} -q "CREATE TABLE t_kinds_ins (k UInt64, n_all Int64, n_sparse Int64, n_dense Int64, s_sparse String) ENGINE = Memory"
+${CLICKHOUSE_CLIENT} --input_format_null_as_default=1 -q "INSERT INTO t_kinds_ins FORMAT Parquet" < "${DATA_FILE}"
+${CLICKHOUSE_CLIENT} -q "SELECT sum(n_all), sum(n_sparse), sum(n_dense), countIf(s_sparse = ''), countIf(s_sparse = 'x'), count() FROM t_kinds_ins"
+${CLICKHOUSE_CLIENT} -q "DROP TABLE t_kinds_ins"
+
 echo "-- LowCardinality output cannot be sparse: falls back to dense / normal decode with the same result"
 ${CLICKHOUSE_CLIENT} -q "
   SELECT count(n_all), countIf(n_sparse = 7), count(n_sparse), countIf(s_sparse = 'x'), count(s_sparse)
