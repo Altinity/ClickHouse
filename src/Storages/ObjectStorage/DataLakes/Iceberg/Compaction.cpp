@@ -153,6 +153,7 @@ static bool isCurrentManifestListAboveThreshold(
     Poco::JSON::Object::Ptr metadata_object,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
+    SecondaryStorages & secondary_storages,
     ContextPtr context,
     size_t threshold)
 {
@@ -179,8 +180,16 @@ static bool isCurrentManifestListAboveThreshold(
         return false;
 
     auto filename = IcebergPathFromMetadata::deserialize(current_manifest_list_path);
-    RelativePathWithMetadata object_info(persistent_table_components.path_resolver.resolve(filename));
-    auto manifest_list_buf = createReadBuffer(object_info, object_storage, context, log);
+    /// The manifest list may live outside the table's own storage, so read it from the storage its path resolves to.
+    auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(
+        persistent_table_components.table_location,
+        filename.serialize(),
+        object_storage,
+        secondary_storages,
+        context,
+        persistent_table_components.path_resolver);
+    RelativePathWithMetadata object_info(key_in_storage);
+    auto manifest_list_buf = createReadBuffer(object_info, storage_to_use, context, log);
     AvroForIcebergDeserializer manifest_list_deserializer(
         std::move(manifest_list_buf), filename, getFormatSettings(context));
     return manifest_list_deserializer.rows() > threshold;
@@ -666,8 +675,16 @@ static bool writeConsolidatedManifestFile(
 
         /// A manifest-only rewrite cannot round-trip per-file `key_metadata` (data-file encryption keys), so reject rather than silently dropping it and making an encrypted table unreadable.
         {
-            RelativePathWithMetadata key_metadata_object_info(persistent_table_components.path_resolver.resolve(manifest_file.manifest_file_path));
-            auto key_metadata_buf = createReadBuffer(key_metadata_object_info, object_storage, context, log);
+            /// The manifest file may live outside the table's own storage, so read it from the storage its path resolves to.
+            auto [manifest_storage_to_use, manifest_key_in_storage] = resolveObjectStorageForPath(
+                persistent_table_components.table_location,
+                manifest_file.manifest_file_path.serialize(),
+                object_storage,
+                secondary_storages,
+                context,
+                persistent_table_components.path_resolver);
+            RelativePathWithMetadata key_metadata_object_info(manifest_key_in_storage);
+            auto key_metadata_buf = createReadBuffer(key_metadata_object_info, manifest_storage_to_use, context, log);
             AvroForIcebergDeserializer key_metadata_deserializer(std::move(key_metadata_buf), manifest_file.manifest_file_path, getFormatSettings(context));
             if (key_metadata_deserializer.hasPath(c_data_file_key_metadata))
             {
@@ -1463,7 +1480,7 @@ void compactIcebergManifests(
 
         /// Cheap pre-check: read just the current manifest list to decide whether the table is above the configured threshold.
         if (!isCurrentManifestListAboveThreshold(
-                metadata_object, persistent_table_components, object_storage_, context_, min_count_to_compact))
+                metadata_object, persistent_table_components, object_storage_, *secondary_storages_, context_, min_count_to_compact))
         {
             LOG_INFO(log, "Manifest compaction is not needed (manifest list is within threshold {})",
                      min_count_to_compact);
