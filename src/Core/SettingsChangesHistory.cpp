@@ -42,6 +42,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.6.2.20001.altinityantalya",
         {
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
+            {"input_format_parquet_max_io_threads", 0, 0, "New setting: size of the thread pool that issues reads for the Parquet reader. 0 derives it from `max_download_threads` and `max_parsing_threads`; the derived value is larger than the previous hard-coded `max_download_threads` (default 4)."},
+            {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single coalesced read issued by the Parquet reader. 0 derives it from the min-bytes-for-seek of the underlying storage, as before."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",

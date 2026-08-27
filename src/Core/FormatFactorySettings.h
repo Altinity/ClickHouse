@@ -248,6 +248,19 @@ Allow missing columns while reading Parquet input formats
     DECLARE(UInt64, input_format_parquet_local_file_min_bytes_for_seek, 8192, R"(
 Min bytes required for local read (file) to do seek, instead of read with ignore in Parquet input format
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_max_io_threads, 0, R"(
+Size of the thread pool that issues reads for the Parquet reader, shared by all files read by the
+query. `0` derives it as `max(max_download_threads, min(max_parsing_threads, 16))`.
+
+With too few reads in flight to cover the storage's response time, decoding threads end up waiting
+for reads.
+)", 0) \
+    DECLARE(UInt64, input_format_parquet_bytes_per_read_task, 0, R"(
+Target size of a single read issued by the Parquet reader; nearby column chunks and pages are
+coalesced up to this size. `0` derives it as four times the min-bytes-for-seek of the underlying
+storage. Bytes of a coalesced read become available to decoding as they arrive, so a large value
+does not delay the first row group of the read.
+)", 0) \
     DECLARE(Bool, input_format_parquet_enable_row_group_prefetch, true, R"(
 Enable row group prefetching during parquet parsing. Currently, only single-threaded parsing can prefetch.
 )", 0) \
