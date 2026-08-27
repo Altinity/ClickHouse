@@ -651,9 +651,8 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
         if (!can_schedule && !is_privileged)
             break;
 
-        /// Read ahead only while this file holds one of the active-file slots. Files without a slot
-        /// still read the row group they must deliver next (`is_privileged`), so this bounds how many
-        /// files compete for the IO pool without being able to stall the query.
+        /// Read ahead only while this file holds an active-file slot. Files without one still read
+        /// the row group they must deliver next, so this cannot stall the query.
         if (stage_idx == ReadStage::ColumnDataPrefetch && !is_privileged
             && reader.options.format.parquet.max_active_files != 0
             && !holds_prefetch_slot.load(std::memory_order_relaxed))

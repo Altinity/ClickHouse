@@ -468,9 +468,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     if (row_groups.empty())
         return; // all row groups were skipped
 
-    /// Tell the Prefetcher where row groups begin, so a single read never covers parts of two of
-    /// them. Row groups are delivered in order and `getRangeData` waits for a whole read, so a read
-    /// spanning a boundary makes the earlier row group wait for the later one's bytes.
+    /// So a single read never covers parts of two row groups; see Prefetcher::setRowGroupBounds.
     {
         std::vector<size_t> bounds;
         bounds.reserve(file_metadata.row_groups.size() + 1);
@@ -480,9 +478,8 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
             size_t end = 0;
             for (const auto & col : rg.columns)
             {
-                /// A column chunk starts at its dictionary page when it has one, otherwise at its
-                /// first data page. Some writers leave dictionary_page_offset unset even when a
-                /// dictionary is present, in which case data_page_offset already points at it.
+                /// Some writers leave dictionary_page_offset unset even with a dictionary present,
+                /// in which case data_page_offset already points at it.
                 size_t col_start = size_t(col.meta_data.data_page_offset);
                 if (col.meta_data.__isset.dictionary_page_offset && col.meta_data.dictionary_page_offset > 0)
                     col_start = std::min(col_start, size_t(col.meta_data.dictionary_page_offset));
@@ -490,11 +487,10 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
                 end = std::max(end, col_start + size_t(col.meta_data.total_compressed_size));
             }
             if (start == std::numeric_limits<size_t>::max() || end <= start)
-                continue; // unusable metadata, leave the layout unconstrained
+                continue; // unusable metadata
             if (!bounds.empty() && start < bounds.back())
             {
-                /// Row groups are expected to be laid out in order; if they aren't, don't guess.
-                bounds.clear();
+                bounds.clear(); // not laid out in order; don't guess
                 break;
             }
             bounds.push_back(start);
@@ -502,7 +498,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
         }
         if (!bounds.empty())
         {
-            /// Collapse to a sorted list of boundaries: adjacent row groups share an offset.
+            /// Adjacent row groups share an offset.
             std::sort(bounds.begin(), bounds.end());
             bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
             prefetcher.setRowGroupBounds(std::move(bounds));

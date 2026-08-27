@@ -34,8 +34,7 @@ void Prefetcher::init(ReadBuffer * reader_, const ReadOptions & options, FormatP
 {
     min_bytes_for_seek = options.min_bytes_for_seek;
     bytes_per_read_task = options.bytes_per_read_task;
-    /// While the IO pool has spare capacity we issue smaller reads so more of them can run at once.
-    /// Not smaller than `min_bytes_for_seek`, below which a read stops amortizing its round trip.
+    /// Below `min_bytes_for_seek` a read stops amortizing its round trip.
     min_bytes_per_read_task = std::max(min_bytes_for_seek, bytes_per_read_task / 4);
     parser_shared_resources = parser_shared_resources_;
     if (parser_shared_resources)
@@ -52,15 +51,14 @@ void Prefetcher::setRowGroupBounds(std::vector<size_t> bounds)
 
 std::pair<size_t, size_t> Prefetcher::rowGroupBoundsFor(size_t offset) const
 {
-    /// Called with `mutex` held (from pickRangesAndCreateTaskIfNotExists).
+    /// Called with `mutex` held.
     if (row_group_bounds.size() < 2)
         return {0, std::numeric_limits<size_t>::max()};
-    /// First boundary strictly greater than `offset` ends the row group containing it.
     auto hi = std::upper_bound(row_group_bounds.begin(), row_group_bounds.end(), offset);
     if (hi == row_group_bounds.begin())
-        return {0, *hi}; // before the first row group (metadata)
+        return {0, *hi}; // metadata, before the first row group
     if (hi == row_group_bounds.end())
-        return {row_group_bounds.back(), std::numeric_limits<size_t>::max()}; // after the last one
+        return {row_group_bounds.back(), std::numeric_limits<size_t>::max()};
     return {*(hi - 1), *hi};
 }
 
@@ -68,8 +66,7 @@ size_t Prefetcher::currentReadTaskBudget() const
 {
     if (min_bytes_per_read_task >= bytes_per_read_task)
         return bytes_per_read_task;
-    /// Hysteresis: split finely until the pool is full, and only go back to large reads once it is
-    /// comfortably busy, so the size doesn't flap around the threshold.
+    /// Hysteresis, so the size doesn't flap around the threshold.
     size_t in_flight = tasks_in_flight.load(std::memory_order_relaxed);
     if (in_flight >= io_concurrency_target * 2)
         return bytes_per_read_task;
@@ -349,16 +346,12 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     size_t end_idx = range_idx + 1;
     size_t total_length_of_covered_ranges = end_offset - start_offset;
 
-    /// How big this task is allowed to get. `bytes_per_read_task` used to be compared against the
-    /// distance from the *seed* range in each direction independently, so a task could grow to
-    /// `seed length + 2 * bytes_per_read_task`; measured request sizes came out ~1.4x the setting,
-    /// and setting it below the natural coalescing width did nothing at all. Compare against the
-    /// resulting span instead, so the value means what its name says.
+    /// Compared against the resulting span, not the distance from the seed range in each direction:
+    /// the latter let a task reach `seed length + 2 * bytes_per_read_task`.
     const size_t task_budget = currentReadTaskBudget();
 
-    /// Don't let one read span two row groups. `getRangeData` waits for the whole task - there is no
-    /// partial completion - so a consumer of the earlier row group would otherwise block until the
-    /// bytes of the next one have also arrived, serializing their in-order delivery.
+    /// One read must not span two row groups: `getRangeData` waits for the whole task, so the
+    /// earlier row group would wait for the later one's bytes and delivery would serialize.
     const auto [row_group_lo, row_group_hi] = rowGroupBoundsFor(start_offset);
 
     /// Go left.
@@ -469,17 +462,15 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
         task->buf = {};
         task->cached_region.reset();
     }
-    /// Cancelled before any thread picked it up, so nothing else will account for it. A task that is
-    /// already Running is still counted by whoever is running it; one that is Done was counted out
-    /// when it finished.
+    /// Cancelled before any thread picked it up, so nothing else will account for it. Running is
+    /// accounted by whoever runs it; Done was accounted when it finished.
     if (prev == Task::State::Scheduled && task->owner)
         task->owner->tasks_in_flight.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void Prefetcher::scheduleTask(Task * task)
 {
-    /// Counted from the moment the read is queued, not from when a thread picks it up: a queued read
-    /// is already committed work, and read-task sizing should react to it right away.
+    /// Counted from queueing, not from when a thread picks it up: it is already committed work.
     tasks_in_flight.fetch_add(1, std::memory_order_relaxed);
     if (parser_shared_resources && !parser_shared_resources->io_runner.isDisabled())
         parser_shared_resources->io_runner([this, task, _shutdown = shutdown]
@@ -501,9 +492,8 @@ std::span<const char> Prefetcher::getRangeData(const PrefetchHandle & request)
     {
         Stopwatch wait_time;
 
-        /// The read this range needs hasn't finished. Either it was never started and this thread
-        /// has to run it inline (losing the thread to IO), or it is in flight and this thread parks.
-        /// Both mean read-ahead didn't stay far enough in front of decoding.
+        /// Read-ahead didn't stay in front of decoding: this thread either runs the read inline or
+        /// parks until it lands.
         ProfileEvents::increment(ProfileEvents::ParquetPrefetchStarvation);
 
         if (s == Task::State::Scheduled)
@@ -613,7 +603,6 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
         task->cached_region.reset();
     }
 
-    /// The read is over, whichever way it ended; stop counting it against the IO pool.
     tasks_in_flight.fetch_sub(1, std::memory_order_relaxed);
 
     task->completion.notify();

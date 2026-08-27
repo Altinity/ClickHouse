@@ -57,10 +57,8 @@ ParquetV3BlockInputFormat::ParquetV3BlockInputFormat(
     , object_with_metadata(object_with_metadata_)
 {
     read_options.min_bytes_for_seek = min_bytes_for_seek;
-    /// How much of the file one read covers. Derived from the storage's min-bytes-for-seek unless it
-    /// is set explicitly: the two answer different questions - min_bytes_for_seek says when it is
-    /// cheaper to read across a gap than to start another request, while this says how big a single
-    /// request should get, which is bounded by how many requests we want in flight at once.
+    /// min_bytes_for_seek says when reading across a gap beats another request; this says how big one
+    /// request should get, which is bounded by how many we want in flight.
     read_options.bytes_per_read_task = format_settings.parquet.bytes_per_read_task != 0
         ? format_settings.parquet.bytes_per_read_task
         : min_bytes_for_seek * 4;
@@ -76,11 +74,8 @@ void ParquetV3BlockInputFormat::initializeIfNeeded()
         format_filter_info->initKeyConditionOnce(getPort().getHeader());
         parser_shared_resources->initOnce([&]
             {
-                /// Size of the pool that issues reads. `max_download_threads` defaults to 4, a value
-                /// picked for the URL engine; on object storage that is rarely enough to keep the
-                /// decoding threads fed, and they end up running the reads themselves or waiting.
-                /// Give the pool room to cover the storage's response time, but not so much that the
-                /// extra requests cost more than the concurrency buys.
+                /// `max_download_threads` defaults to 4, picked for the URL engine; on object storage
+                /// that rarely keeps the decoding threads fed.
                 size_t io_threads = format_settings.parquet.max_io_threads;
                 if (io_threads == 0)
                     io_threads = std::max(

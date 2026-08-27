@@ -259,27 +259,23 @@ Enable row group prefetching during parquet parsing. Currently, only single-thre
 )", 0) \
     DECLARE(UInt64, input_format_parquet_max_io_threads, 0, R"(
 Size of the thread pool that issues reads for the Parquet reader, shared by all files read by the
-query. `0` means derive it from `max_download_threads` and `max_parsing_threads`.
+query. `0` derives it from `max_download_threads` and `max_parsing_threads`.
 
-The reader needs enough reads in flight to cover the storage's response time; with too few, decoding
-threads end up running the reads themselves or waiting for them. The default of `max_download_threads`
-(4) was chosen for the URL engine and is usually too small for object storage.
+With too few reads in flight to cover the storage's response time, decoding threads end up running
+the reads themselves or waiting for them.
 )", 0) \
     DECLARE(UInt64, input_format_parquet_max_active_files, 0, R"(
-How many Parquet files may prefetch ahead at the same time when a query reads many files. `0` means
-no limit, which is the historical behaviour.
+How many Parquet files may read ahead at the same time when a query reads many files. `0` means no
+limit, which is the previous behaviour.
 
-All files share one IO pool, so with many files each gets too few reads in flight to cover the
-storage's response time and none of them finish early. Limiting the number of files that read ahead
-lets each active one run at a useful depth and release its buffers sooner; the rest are admitted as
-those drain. Files that do not hold a slot still read the row group they must deliver next.
+All files share one IO pool, so with many files each gets too few reads in flight and none finish
+early. Files that do not hold a slot still read the row group they must deliver next.
 )", 0) \
     DECLARE(UInt64, input_format_parquet_bytes_per_read_task, 0, R"(
-Target size of a single read issued by the Parquet reader. Nearby column chunks are coalesced into one
-read up to this size. `0` means derive it from the min-bytes-for-seek of the underlying storage.
+Target size of a single read issued by the Parquet reader; nearby column chunks are coalesced up to
+this size. `0` derives it from the min-bytes-for-seek of the underlying storage.
 
-A read is never allowed to span two row groups regardless of this setting, because row groups are
-delivered in order and a read completes as a whole.
+A read never spans two row groups regardless of this setting.
 )", 0) \
     DECLARE(Bool, input_format_arrow_allow_missing_columns, true, R"(
 Allow missing columns while reading Arrow input formats

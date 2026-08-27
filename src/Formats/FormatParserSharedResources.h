@@ -36,13 +36,9 @@ struct FormatParserSharedResources
 
     void finishStream();
 
-    /// Caps how many files prefetch ahead at the same time (input_format_parquet_max_active_files).
-    /// With many files sharing one IO pool, spreading it evenly leaves every file with too few reads
-    /// in flight to cover the storage's response time, and none of them finish early. Letting a few
-    /// files run at full depth and admitting the rest as those drain reads the same bytes with the
-    /// same bandwidth, but frees each file's read-ahead buffers sooner.
-    /// A reader that doesn't hold a slot still reads the row group it must deliver next, so a query
-    /// cannot stall on this.
+    /// See input_format_parquet_max_active_files. Spreading one IO pool across many files leaves
+    /// each with too few reads in flight to cover the storage's response time and none finishing
+    /// early. A reader without a slot still reads what it must deliver next, so this cannot stall.
     bool tryAcquirePrefetchSlot(size_t max_active);
     void releasePrefetchSlot();
 

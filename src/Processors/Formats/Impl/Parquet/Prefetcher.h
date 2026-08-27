@@ -41,10 +41,8 @@ public:
     /// Called at most once, after all registerRange calls and before all enqueue/getRangeData calls.
     void finalizeRanges();
 
-    /// Tells the Prefetcher where row groups start and end, so that one read never covers parts of
-    /// two of them. `bounds` must be sorted and hold the start offset of each row group followed by
-    /// the end offset of the last one. Called after the file metadata is parsed; reads issued before
-    /// that (footer, metadata) are unconstrained.
+    /// Keeps one read from covering parts of two row groups. `bounds` is sorted: the start offset of
+    /// each row group, then the end of the last. Reads issued before this (metadata) are unconstrained.
     void setRowGroupBounds(std::vector<size_t> bounds);
 
     /// Replace a requested range with a set of disjoint smaller ranges contained within it.
@@ -150,9 +148,7 @@ private:
         };
         std::optional<CachedReadRegion> cached_region;
 
-        /// The Prefetcher that owns this task. Needed because `decreaseTaskRefcount` is static (it is
-        /// called from PrefetchHandle, which doesn't know the Prefetcher) but has to account for a
-        /// task cancelled before any thread ran it.
+        /// `decreaseTaskRefcount` is static but has to account for a task cancelled before it ran.
         Prefetcher * owner = nullptr;
 
         std::atomic<State> state {State::Scheduled};
@@ -190,14 +186,11 @@ private:
     size_t min_bytes_for_seek{};
     size_t bytes_per_read_task{};
 
-    /// Sorted file offsets at which row groups start, followed by the end of the last row group.
-    /// Empty until `setRowGroupBounds` is called (metadata reads happen before that and are not
-    /// constrained). Used to keep a single read from spanning two row groups.
+    /// See setRowGroupBounds. Empty until it is called.
     std::vector<size_t> row_group_bounds;
 
-    /// How many reads are running or queued. Drives the read-task size: while the IO pool is not
-    /// busy we prefer more, smaller reads (they fill it faster); once it is busy we prefer fewer,
-    /// larger ones (each extra read costs a round trip to the storage).
+    /// Reads running or queued. Drives read-task size: smaller reads fill an idle pool faster, larger
+    /// ones amortize the round trip once it is busy.
     std::atomic<size_t> tasks_in_flight {0};
     size_t io_concurrency_target = 1;
     size_t min_bytes_per_read_task{};
@@ -217,10 +210,8 @@ private:
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
 
-    /// The half-open range [lo, hi) of the row group containing `offset`, or the whole file if the
-    /// row group layout isn't known yet (metadata reads).
+    /// [lo, hi) of the row group containing `offset`, or the whole file if the layout isn't known yet.
     std::pair<size_t, size_t> rowGroupBoundsFor(size_t offset) const;
-    /// Size limit for a read task, adapted to how busy the IO pool is (see `tasks_in_flight`).
     size_t currentReadTaskBudget() const;
 
     void determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options);
