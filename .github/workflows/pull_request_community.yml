@@ -34,7 +34,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-config_workflow
@@ -109,7 +109,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -147,7 +147,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-fast_test
@@ -170,7 +170,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -207,21 +207,21 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_DEBUG
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_debug
@@ -244,7 +244,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -281,42 +281,42 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_AMD_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_RELEASE
           path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: RPM_AMD_RELEASE
           path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TGZ_AMD_RELEASE
           path: ci/tmp/*64.tgz*
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_release
@@ -339,7 +339,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -376,28 +376,28 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_ASAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_ASAN
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_asan
@@ -420,7 +420,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -457,28 +457,28 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_TSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_TSAN
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_tsan
@@ -501,7 +501,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -538,28 +538,28 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_MSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_MSAM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_MSAM
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_msan
@@ -582,7 +582,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -619,28 +619,28 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_UBSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_UBSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_UBSAN
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_ubsan
@@ -663,7 +663,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -700,14 +700,14 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_BINARY
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_amd_binary
@@ -730,7 +730,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -767,42 +767,42 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_ARM_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_ARM_RELEASE
           path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: RPM_ARM_RELEASE
           path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TGZ_ARM_RELEASE
           path: ci/tmp/*64.tgz*
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_arm_release
@@ -825,7 +825,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -862,21 +862,21 @@ jobs:
           fi
 
       - name: Upload artifact CH_COV_BIN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_COV_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_COV
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_COV
           path: ci/tmp/*.deb
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_arm_coverage
@@ -899,7 +899,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -936,14 +936,14 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_BIN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-build_arm_binary
@@ -966,7 +966,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -992,7 +992,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: UNITTEST_AMD_ASAN
           path: ./ci/tmp
@@ -1010,7 +1010,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-unit_tests_asan
@@ -1033,7 +1033,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1059,7 +1059,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: UNITTEST_AMD_TSAN
           path: ./ci/tmp
@@ -1077,7 +1077,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-unit_tests_tsan
@@ -1100,7 +1100,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1126,7 +1126,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: UNITTEST_AMD_MSAN
           path: ./ci/tmp
@@ -1144,7 +1144,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-unit_tests_msan
@@ -1167,7 +1167,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1193,7 +1193,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: UNITTEST_AMD_UBSAN
           path: ./ci/tmp
@@ -1211,7 +1211,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-unit_tests_ubsan
@@ -1234,7 +1234,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1260,7 +1260,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1278,7 +1278,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_asan_distributed_plan_parallel_1_2
@@ -1301,7 +1301,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1327,7 +1327,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1345,7 +1345,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_asan_distributed_plan_parallel_2_2
@@ -1368,7 +1368,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1394,7 +1394,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1412,7 +1412,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_asan_distributed_plan_sequential
@@ -1435,7 +1435,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1461,7 +1461,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1479,7 +1479,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_parallel
@@ -1502,7 +1502,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1528,7 +1528,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1546,7 +1546,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_sequential
@@ -1569,7 +1569,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1595,7 +1595,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1613,7 +1613,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_binary_parallelreplicas_s3_storage_parallel
@@ -1636,7 +1636,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1662,7 +1662,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1680,7 +1680,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_binary_parallelreplicas_s3_storage_sequential
@@ -1703,7 +1703,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1729,7 +1729,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1747,7 +1747,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_asyncinsert_s3_storage_parallel
@@ -1770,7 +1770,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1796,7 +1796,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1814,7 +1814,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_asyncinsert_s3_storage_sequential
@@ -1837,7 +1837,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1863,7 +1863,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1881,7 +1881,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_parallel
@@ -1904,7 +1904,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1930,7 +1930,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1948,7 +1948,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_sequential
@@ -1971,7 +1971,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -1997,7 +1997,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2015,7 +2015,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_parallel_1_2
@@ -2038,7 +2038,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2064,7 +2064,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2082,7 +2082,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_parallel_2_2
@@ -2105,7 +2105,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2131,7 +2131,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2149,7 +2149,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_sequential_1_2
@@ -2172,7 +2172,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2198,7 +2198,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2216,7 +2216,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_sequential_2_2
@@ -2239,7 +2239,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2265,7 +2265,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -2283,7 +2283,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_msan_parallel_1_2
@@ -2306,7 +2306,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2332,7 +2332,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -2350,7 +2350,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_msan_parallel_2_2
@@ -2373,7 +2373,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2399,7 +2399,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -2417,7 +2417,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_msan_sequential_1_2
@@ -2440,7 +2440,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2466,7 +2466,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -2484,7 +2484,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_msan_sequential_2_2
@@ -2507,7 +2507,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2533,7 +2533,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2551,7 +2551,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_ubsan_parallel
@@ -2574,7 +2574,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2600,7 +2600,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2618,7 +2618,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_ubsan_sequential
@@ -2641,7 +2641,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2667,7 +2667,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2685,7 +2685,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_distributed_plan_s3_storage_parallel
@@ -2708,7 +2708,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2734,7 +2734,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2752,7 +2752,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_debug_distributed_plan_s3_storage_sequential
@@ -2775,7 +2775,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2801,7 +2801,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2819,7 +2819,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_s3_storage_parallel
@@ -2842,7 +2842,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2868,7 +2868,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2886,7 +2886,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_s3_storage_sequential_1_2
@@ -2909,7 +2909,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -2935,7 +2935,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2953,7 +2953,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_tsan_s3_storage_sequential_2_2
@@ -2976,7 +2976,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3002,7 +3002,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3020,7 +3020,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_arm_binary_parallel
@@ -3043,7 +3043,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3069,7 +3069,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3087,7 +3087,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_arm_binary_sequential
@@ -3110,7 +3110,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3136,7 +3136,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3154,7 +3154,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-stateless_tests_amd_asan_flaky_check
@@ -3177,7 +3177,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3203,7 +3203,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3221,7 +3221,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_1_6
@@ -3244,7 +3244,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3270,7 +3270,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3288,7 +3288,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_2_6
@@ -3311,7 +3311,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3337,7 +3337,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3355,7 +3355,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_3_6
@@ -3378,7 +3378,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3404,7 +3404,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3422,7 +3422,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_4_6
@@ -3445,7 +3445,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3471,7 +3471,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3489,7 +3489,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_5_6
@@ -3512,7 +3512,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3538,7 +3538,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3556,7 +3556,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_old_analyzer_6_6
@@ -3579,7 +3579,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3605,7 +3605,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3623,7 +3623,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_binary_1_5
@@ -3646,7 +3646,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3672,7 +3672,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3690,7 +3690,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_binary_2_5
@@ -3713,7 +3713,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3739,7 +3739,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3757,7 +3757,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_binary_3_5
@@ -3780,7 +3780,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3806,7 +3806,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3824,7 +3824,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_binary_4_5
@@ -3847,7 +3847,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3873,7 +3873,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3891,7 +3891,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_binary_5_5
@@ -3914,7 +3914,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -3940,7 +3940,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3958,7 +3958,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_arm_binary_distributed_plan_1_4
@@ -3981,7 +3981,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4007,7 +4007,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -4025,7 +4025,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_arm_binary_distributed_plan_2_4
@@ -4048,7 +4048,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4074,7 +4074,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -4092,7 +4092,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_arm_binary_distributed_plan_3_4
@@ -4115,7 +4115,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4141,7 +4141,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -4159,7 +4159,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_arm_binary_distributed_plan_4_4
@@ -4182,7 +4182,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4208,7 +4208,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4226,7 +4226,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_1_6
@@ -4249,7 +4249,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4275,7 +4275,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4293,7 +4293,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_2_6
@@ -4316,7 +4316,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4342,7 +4342,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4360,7 +4360,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_3_6
@@ -4383,7 +4383,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4409,7 +4409,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4427,7 +4427,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_4_6
@@ -4450,7 +4450,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4476,7 +4476,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4494,7 +4494,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_5_6
@@ -4517,7 +4517,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4543,7 +4543,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -4561,7 +4561,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_tsan_6_6
@@ -4584,7 +4584,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4610,7 +4610,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -4628,7 +4628,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-integration_tests_amd_asan_flaky_check
@@ -4651,7 +4651,7 @@ jobs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
@@ -4677,14 +4677,14 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
 
 
       - name: Download artifact DEB_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: DEB_AMD_DEBUG
           path: ./ci/tmp
@@ -4702,7 +4702,7 @@ jobs:
 
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-install_packages_amd_debug

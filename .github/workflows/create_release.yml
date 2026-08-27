@@ -70,7 +70,7 @@ jobs:
     runs-on: [self-hosted, release-maker]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f
+        uses: actions/checkout@v6
         with:
           token: ${{secrets.ROBOT_CLICKHOUSE_COMMIT_TOKEN}}
           fetch-depth: 0
@@ -149,7 +149,7 @@ jobs:
           git diff HEAD
       - name: Create ChangeLog PR
         if: ${{ inputs.type == 'patch' && ! inputs.dry-run && ! inputs.only-repo && ! inputs.only-docker }}
-        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6
+        uses: peter-evans/create-pull-request@v8
         with:
           author: "robot-clickhouse <robot-clickhouse@users.noreply.github.com>"
           token: ${{ secrets.ROBOT_CLICKHOUSE_COMMIT_TOKEN }}

@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: ⤵️ Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.ref }}
@@ -185,7 +185,7 @@ jobs:
         timeout-minutes: 20
         run: .github/upload_results_to_database.sh 1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: ${{ format('{0}{1}-artifacts-{2}{3}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '', inputs.runner_arch, contains(inputs.extra_args, '--use-keeper') && '_keeper' || '_zookeeper') }}

@@ -155,7 +155,7 @@ jobs:
       data: ${{{{ steps.run.outputs.DATA }}}}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{{{ env.CHECKOUT_REF }}}}
 {JOB_ADDONS}
@@ -212,7 +212,7 @@ jobs:
 
         TEMPLATE_PY_INSTALL = """
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: {PYTHON_VERSION}
 """
@@ -228,7 +228,7 @@ jobs:
 
         TEMPLATE_GH_UPLOAD = """
       - name: Upload artifact {NAME}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: {NAME}
           path: {PATH}
@@ -237,7 +237,7 @@ jobs:
         TEMPLATE_GH_UPLOAD_FAILURE_REPORT = """
       - name: Upload failure report artifact
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: failure-{JOB_NAME_NORMALIZED}
@@ -254,7 +254,7 @@ jobs:
 
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: {NAME}
           path: {PATH}

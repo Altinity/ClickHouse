@@ -115,9 +115,9 @@ class AltinityWorkflowTemplates:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
       - name: Finalize workflow report
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
@@ -136,9 +136,9 @@ class AltinityWorkflowTemplates:
         VERSION: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
     steps:
       - name: Check out repository code
-        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        uses: actions/checkout@v6
         with:
-          clear-repository: true
+          clean: true
           ref: ${{ fromJson(needs.config_workflow.outputs.data).git_ref }}
           submodules: true
           fetch-depth: 0
