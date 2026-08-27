@@ -520,8 +520,12 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
     while (main_ptr < row_group.subgroups.size())
     {
         RowSubgroup & next_subgroup = row_group.subgroups[main_ptr];
-        /// Only a subgroup nobody has started may be admitted.
-        ReadStage next_subgroup_stage = ReadStage::NotStarted;
+        /// `main_ptr` is either a subgroup nobody has started, or the current subgroup itself when
+        /// PREWHERE just dropped all of its rows (the ColumnData case above breaks out with
+        /// rows_pass == 0 without advancing read_ptr); the branch below then deallocates it and
+        /// moves on. Only one subgroup of a row group is in progress at a time, so the exchange
+        /// cannot hit anything else.
+        ReadStage next_subgroup_stage = next_subgroup.stage.load();
         if (!next_subgroup.stage.compare_exchange_strong(
                 next_subgroup_stage, ReadStage::OffsetIndex))
             break;
