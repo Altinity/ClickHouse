@@ -1550,6 +1550,10 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
     else
     {
         CreateFileSegmentSettings create_settings(FileSegmentKind::Regular);
+        /// Random-access reads must honour the per-query alignment like the sequential path does
+        /// (`nextFileSegmentsBatch`): a small read in the middle of a large aligned segment has to
+        /// download from the segment's committed frontier up to the requested end before it can
+        /// be served, so the alignment is the read amplification for small ranges.
         current_info.file_segments = cache->getOrSet(
             info.cache_key,
             /* offset */range_begin,
@@ -1557,7 +1561,8 @@ size_t CachedOnDiskReadBufferFromFile::readBigAt(
             file_size.value(),
             create_settings,
             /* batch_size */0,
-            origin);
+            origin,
+            info.cache_settings.boundary_alignment);
     }
 
     if (current_info.file_segments->empty())
