@@ -22,6 +22,9 @@ namespace ProfileEvents
     extern const Event ParquetPrefetcherReadRandomRead;
     extern const Event ParquetPrefetcherReadSeekAndRead;
     extern const Event ParquetPrefetcherReadEntireFile;
+    extern const Event ParquetPartialReadsServed;
+    extern const Event ParquetReadTasks;
+    extern const Event ParquetReadTaskBytes;
 }
 
 namespace DB::Parquet
@@ -90,7 +93,7 @@ void Prefetcher::determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOp
     }
 }
 
-void Prefetcher::readSync(char * to, size_t n, size_t offset)
+void Prefetcher::readSync(char * to, size_t n, size_t offset, const std::function<void(size_t)> & on_progress)
 {
     if (offset > file_size || n > file_size - offset)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "File read out of bounds: offset {}, length {}, file size {}", offset, n, file_size);
@@ -99,9 +102,16 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
     switch (read_mode)
     {
         case ReadMode::RandomRead:
-            nread = reader->readBigAt(to, n, offset, /*progress_callback*/ nullptr);
+        {
+            /// `readBigAt` reports cumulative bytes copied for this call; not every transport
+            /// calls it (local pread, Azure, HDFS don't), in which case readiness equals completion.
+            std::function<bool(size_t)> progress;
+            if (on_progress)
+                progress = [&](size_t copied) { on_progress(copied); return false; /* don't stop the read */ };
+            nread = reader->readBigAt(to, n, offset, progress);
             ProfileEvents::increment(ProfileEvents::ParquetPrefetcherReadRandomRead);
             break;
+        }
         case ReadMode::SeekAndRead:
         {
             std::lock_guard lock(read_mutex);
@@ -122,6 +132,8 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset)
     }
     if (nread != n)
         throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected eof: offset {}, length {}, bytes read {}, expected file size {}", offset, n, nread, file_size);
+    if (on_progress)
+        on_progress(n);
 }
 
 PrefetchHandle Prefetcher::registerRange(size_t offset, size_t length, bool likely_to_be_used)
@@ -372,6 +384,8 @@ void Prefetcher::pickRangesAndCreateTaskIfNotExists(RequestState * initial_req, 
     Task & task = tasks.emplace_back();
     task.offset = start_offset;
     task.length = end_offset - task.offset;
+    ProfileEvents::increment(ProfileEvents::ParquetReadTasks);
+    ProfileEvents::increment(ProfileEvents::ParquetReadTaskBytes, task.length);
     task.memory_amplification = 1. * static_cast<double>(task.length) / static_cast<double>(total_length_of_covered_ranges);
     size_t initial_refcount = end_idx - start_idx + 1;
     task.refcount.store(initial_refcount);
@@ -411,6 +425,62 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
         task->buf = {};
         task->cached_region.reset();
     }
+
+    /// This path only runs when no PrefetchHandle references the task any more, so nobody can be
+    /// waiting on it.
+    chassert(task->min_waiting_threshold.load() == std::numeric_limits<size_t>::max());
+}
+
+void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
+{
+    size_t prev = task->bytes_ready.load(std::memory_order_relaxed);
+    if (bytes_ready <= prev)
+        return;
+    task->bytes_ready.store(bytes_ready, std::memory_order_release);
+    if (bytes_ready >= task->min_waiting_threshold.load(std::memory_order_acquire))
+    {
+        /// Waiters re-register their threshold if they are still unsatisfied after waking.
+        task->min_waiting_threshold.store(std::numeric_limits<size_t>::max(), std::memory_order_release);
+        std::lock_guard lock(ready_mutex);
+        ready_cv.notify_all();
+    }
+}
+
+Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
+{
+    std::unique_lock lock(ready_mutex);
+    /// Clears our own registered threshold, if it's still ours to clear (nobody else has since
+    /// overwritten it with a smaller one). A task that already left Running will never call
+    /// publishBytesReady again, so nobody else would clear it, and decreaseTaskRefcount asserts the
+    /// threshold is back to "nobody waiting" once nothing references the task any more.
+    auto clear_own_threshold = [&]
+    {
+        size_t expected = need;
+        task->min_waiting_threshold.compare_exchange_strong(expected, std::numeric_limits<size_t>::max(), std::memory_order_acq_rel);
+    };
+    while (true)
+    {
+        Task::State s = task->state.load(std::memory_order_acquire);
+        if (s != Task::State::Running)
+        {
+            clear_own_threshold();
+            return s;
+        }
+        if (task->bytes_ready.load(std::memory_order_acquire) >= need)
+        {
+            clear_own_threshold();
+            return s;
+        }
+        /// Register the threshold, then re-check: the producer reads the threshold after storing
+        /// bytes_ready, we store the threshold before re-reading bytes_ready, so one of us sees the other.
+        size_t cur = task->min_waiting_threshold.load(std::memory_order_relaxed);
+        while (cur > need && !task->min_waiting_threshold.compare_exchange_weak(cur, need, std::memory_order_acq_rel))
+        {
+        }
+        if (task->bytes_ready.load(std::memory_order_acquire) >= need || task->state.load(std::memory_order_acquire) != Task::State::Running)
+            continue;
+        ready_cv.wait(lock);
+    }
 }
 
 void Prefetcher::scheduleTask(Task * task)
@@ -431,6 +501,7 @@ std::span<const char> Prefetcher::getRangeData(const PrefetchHandle & request)
     chassert(req->state == RequestState::State::HasTask);
     Task * task = req->task;
     Task::State s = task->state.load(std::memory_order_acquire);
+    const size_t need = req->task_offset + req->length;
     if (s == Task::State::Scheduled || s == Task::State::Running)
     {
         Stopwatch wait_time;
@@ -443,17 +514,18 @@ std::span<const char> Prefetcher::getRangeData(const PrefetchHandle & request)
 
         if (s == Task::State::Running) // (not `else`, the runTask above may return Running)
         {
-            task->completion.wait();
-            s = task->state.load();
+            s = waitForBytes(task, need);
+            if (s == Task::State::Running)
+                ProfileEvents::increment(ProfileEvents::ParquetPartialReadsServed);
         }
 
         ProfileEvents::increment(ProfileEvents::ParquetFetchWaitTimeMicroseconds, wait_time.elapsedMicroseconds());
     }
     if (s == Task::State::Exception)
         rethrowException(task);
-    chassert(s == Task::State::Done);
+    chassert(s == Task::State::Done || (s == Task::State::Running && task->bytes_ready.load(std::memory_order_acquire) >= need));
 
-    if (task->cached_region.has_value())
+    if (s == Task::State::Done && task->cached_region.has_value())
     {
         /// Zero-copy path: serve data directly from cache cells.
         size_t req_file_offset = task->offset + req->task_offset;
@@ -515,12 +587,14 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
                 }
             }
 
+            publishBytesReady(task, task->length);
             ProfileEvents::increment(ProfileEvents::ParquetPrefetcherReadRandomRead);
         }
         else
         {
             task->buf.resize(task->length);
-            readSync(task->buf.data(), task->length, task->offset);
+            readSync(task->buf.data(), task->length, task->offset,
+                [this, task](size_t copied) { publishBytesReady(task, copied); });
         }
     }
     catch (...)
@@ -540,6 +614,12 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
         chassert(s == Task::State::Deallocated);
         task->buf = {};
         task->cached_region.reset();
+    }
+
+    {
+        /// Wake partial waiters too: the task is Done, Exception or Deallocated now.
+        std::lock_guard lock(ready_mutex);
+        ready_cv.notify_all();
     }
 
     task->completion.notify();

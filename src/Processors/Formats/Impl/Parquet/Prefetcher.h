@@ -3,6 +3,9 @@
 #include <Common/PODArray.h>
 #include <Processors/Formats/Impl/Parquet/ReadCommon.h>
 
+#include <condition_variable>
+#include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 
@@ -59,7 +62,7 @@ public:
     std::span<const char> getRangeData(const PrefetchHandle & request);
 
     /// Pass-through read from the underlying ReadBuffer.
-    void readSync(char * to, size_t n, size_t offset);
+    void readSync(char * to, size_t n, size_t offset, const std::function<void(size_t /*cumulative*/)> & on_progress = {});
 
     size_t getFileSize() const { return file_size; }
 
@@ -149,6 +152,13 @@ private:
         std::atomic<size_t> refcount {};
         /// Notified when the state changes from Running to Done or Exception.
         CompletionNotification completion;
+        /// Bytes of `buf` (or `cached_region`) that have landed, counted from `offset`. Monotonic.
+        /// Ranges inside a task are sorted by offset and object storage streams a range request in
+        /// order, so a request whose end is <= bytes_ready can be served before the task finishes.
+        std::atomic<size_t> bytes_ready {0};
+        /// Lowest `bytes_ready` value some waiter is blocked on; SIZE_MAX if nobody waits.
+        /// The producer notifies `ready_cv` only when `bytes_ready` reaches it.
+        std::atomic<size_t> min_waiting_threshold {std::numeric_limits<size_t>::max()};
         std::exception_ptr exception;
     };
 
@@ -193,6 +203,17 @@ private:
 
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
+
+    /// For partial-readiness waits (see Task::bytes_ready). One pair for all tasks: waits are rare
+    /// (decode outran the read) and short.
+    std::mutex ready_mutex;
+    std::condition_variable ready_cv;
+
+    /// Blocks until `task->bytes_ready >= need` or the task left the Running state. Returns the
+    /// task state observed last.
+    Task::State waitForBytes(Task * task, size_t need);
+    /// Called from the read's progress callback and at completion.
+    void publishBytesReady(Task * task, size_t bytes_ready);
 
     void determineReadModeAndFileSize(ReadBuffer * reader_, const ReadOptions & options);
     /// Creates and starts a Task covering this request and possibly other nearby ranges.
