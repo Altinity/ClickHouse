@@ -65,6 +65,7 @@
 #include <Storages/registerStorages.h>
 #include <Dictionaries/registerDictionaries.h>
 #include <Disks/registerDisks.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobUploadPool.h>
 #include <Formats/registerFormats.h>
 #include <boost/program_options/options_description.hpp>
 #include <base/argsToConfig.h>
@@ -174,6 +175,10 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 parquet_metadata_cache_size;
     extern const ServerSettingsUInt64 parquet_metadata_cache_max_entries;
     extern const ServerSettingsDouble parquet_metadata_cache_size_ratio;
+    extern const ServerSettingsString puffin_files_cache_policy;
+    extern const ServerSettingsUInt64 puffin_files_cache_size;
+    extern const ServerSettingsUInt64 puffin_files_cache_max_entries;
+    extern const ServerSettingsDouble puffin_files_cache_size_ratio;
     extern const ServerSettingsUInt64 max_active_parts_loading_thread_pool_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_free_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_size;
@@ -201,6 +206,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_size;
     extern const ServerSettingsUInt64 max_format_parsing_thread_pool_free_size;
     extern const ServerSettingsUInt64 format_parsing_thread_pool_queue_size;
+    extern const ServerSettingsUInt64 cas_blob_upload_pool_size;
     extern const ServerSettingsUInt64 page_cache_history_window_ms;
     extern const ServerSettingsString page_cache_policy;
     extern const ServerSettingsDouble page_cache_size_ratio;
@@ -425,6 +431,11 @@ void LocalServer::initialize(Poco::Util::Application & self)
         server_settings[ServerSetting::max_format_parsing_thread_pool_size],
         server_settings[ServerSetting::max_format_parsing_thread_pool_free_size],
         server_settings[ServerSetting::format_parsing_thread_pool_queue_size]);
+
+    /// See the explanation near the same line in Server.cpp: `uploadPendingBlobs` reaches this
+    /// pool unconditionally once a `cas` disk commits a part, so every entry point
+    /// that can run a CA INSERT must initialize it, not only `clickhouse-server`.
+    DB::Cas::initializeBlobUploadPool(server_settings[ServerSetting::cas_blob_upload_pool_size]);
 }
 
 
@@ -900,6 +911,11 @@ void LocalServer::cleanup()
             suggest.reset();
 
         client_context.reset();
+
+        /// Joins any outstanding blob-upload fan-out tasks before the context they reference
+        /// is torn down. Idempotent and noexcept, so safe even if never initialized (e.g. no
+        /// `cas` disk was ever used).
+        DB::Cas::shutdownBlobUploadPool();
 
         if (global_context)
         {
@@ -1545,6 +1561,17 @@ void LocalServer::processConfig()
     }
     global_context->setParquetMetadataCache(parquet_metadata_cache_policy, parquet_metadata_cache_size, parquet_metadata_cache_max_entries, parquet_metadata_cache_size_ratio);
 #endif
+
+    String puffin_files_cache_policy = server_settings[ServerSetting::puffin_files_cache_policy];
+    size_t puffin_files_cache_size = server_settings[ServerSetting::puffin_files_cache_size];
+    size_t puffin_files_cache_max_entries = server_settings[ServerSetting::puffin_files_cache_max_entries];
+    double puffin_files_cache_size_ratio = server_settings[ServerSetting::puffin_files_cache_size_ratio];
+    if (puffin_files_cache_size > max_cache_size)
+    {
+        puffin_files_cache_size = max_cache_size;
+        LOG_INFO(log, "Lowered Puffin files cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(puffin_files_cache_size));
+    }
+    global_context->setPuffinFilesCache(puffin_files_cache_policy, puffin_files_cache_size, puffin_files_cache_max_entries, puffin_files_cache_size_ratio);
 
     Names allowed_disks_table_engines;
     splitInto<','>(allowed_disks_table_engines, server_settings[ServerSetting::allowed_disks_for_table_engines].value);
