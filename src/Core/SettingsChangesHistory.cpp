@@ -44,9 +44,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"use_puffin_files_cache", false, true, "Enables cache of parsed Puffin file content such as deletion vectors."},
             {"input_format_parquet_use_constant_column_optimization", false, true, "New setting: when a Parquet column chunk provably holds a single value in every row (per its min/max statistics), materialize that value directly instead of reading and decoding the column's data pages (reader v3)."},
             {"input_format_parquet_constant_column_sparse_ratio", 1.0, 0.9375, "New setting: a Parquet column chunk holding a single value plus nulls is materialized as a sparse column when the fraction of nulls is at least this ratio (reader v3)."},
-            {"input_format_parquet_max_io_threads", 0, 0, "New setting: size of the thread pool that issues reads for the Parquet reader (v3). 0 derives it from `max_download_threads` and `max_parsing_threads`; the derived value is larger than the previous hard-coded `max_download_threads`, which defaults to 4 and was chosen for the URL engine."},
-            {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single read issued by the Parquet reader (v3). 0 derives it from the min-bytes-for-seek of the underlying storage."},
-            {"input_format_parquet_max_active_files", 0, 0, "New setting: how many Parquet files may read ahead at the same time when a query reads many of them (v3). 0 means no limit, which is the previous behavior."},
+            {"input_format_parquet_max_io_threads", 0, 0, "New setting: size of the thread pool that issues reads for the Parquet reader. 0 derives it from `max_download_threads` and `max_parsing_threads`; the derived value is larger than the previous hard-coded `max_download_threads`, which defaults to 4 and was chosen for the URL engine."},
+            {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single read issued by the Parquet reader. 0 derives it from the min-bytes-for-seek of the underlying storage."},
+            {"input_format_parquet_max_active_files", 0, 0, "New setting: how many Parquet files may read ahead at the same time when a query reads many of them. 0 means no limit, which is the previous behavior."},
         });
 
         addSettingsChanges(settings_changes_history, "26.6",
