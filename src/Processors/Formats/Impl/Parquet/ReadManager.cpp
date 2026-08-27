@@ -130,6 +130,8 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
 ReadManager::~ReadManager()
 {
     shutdown->shutdown();
+    if (holds_prefetch_slot.exchange(false) && parser_shared_resources)
+        parser_shared_resources->releasePrefetchSlot();
 }
 
 void ReadManager::cancel() noexcept
@@ -648,6 +650,20 @@ void ReadManager::scheduleTasksIfNeeded(ReadStage stage_idx)
 
         if (!can_schedule && !is_privileged)
             break;
+
+        /// Read ahead only while this file holds one of the active-file slots. Files without a slot
+        /// still read the row group they must deliver next (`is_privileged`), so this bounds how many
+        /// files compete for the IO pool without being able to stall the query.
+        if (stage_idx == ReadStage::ColumnDataPrefetch && !is_privileged
+            && reader.options.format.parquet.max_active_files != 0
+            && !holds_prefetch_slot.load(std::memory_order_relaxed))
+        {
+            bool expected = false;
+            if (!parser_shared_resources->tryAcquirePrefetchSlot(reader.options.format.parquet.max_active_files))
+                break;
+            if (!holds_prefetch_slot.compare_exchange_strong(expected, true))
+                parser_shared_resources->releasePrefetchSlot(); // another thread got one first
+        }
 
         if (!stage.schedulable_row_groups.unset(row_group_idx, std::memory_order_acquire))
         {

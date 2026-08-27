@@ -361,6 +361,12 @@ struct FormatSettings
         UInt64 max_block_size = DEFAULT_BLOCK_SIZE;
         size_t prefer_block_bytes = DEFAULT_BLOCK_SIZE * 256;
         size_t local_read_min_bytes_for_seek = 8192;
+        /// 0 = derive from max_download_threads / max_parsing_threads.
+        size_t max_io_threads = 0;
+        /// 0 = derive from the storage's min-bytes-for-seek.
+        size_t bytes_per_read_task = 0;
+        /// 0 = no limit on how many files prefetch ahead concurrently.
+        size_t max_active_files = 0;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
         /// Reader scheduler knobs: share of the column-data memory budget given to compressed

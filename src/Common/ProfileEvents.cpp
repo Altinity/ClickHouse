@@ -1480,6 +1480,9 @@ The server successfully detected this situation and will download merged part fr
     M(ParquetConstantColumnChunksWithNulls, "The total number of parquet column chunks holding a single value plus nulls (per their statistics), for which only the definition levels were decoded and the value was taken from the statistics", ValueType::Number) \
     M(ParquetDecodingTasks, "Tasks issued by parquet reader", ValueType::Number) \
     M(ParquetDecodingTaskBatches, "Task groups sent to a thread pool by parquet reader", ValueType::Number) \
+    M(ParquetReadTasks, "The total number of coalesced read tasks created by DB::Parquet::Prefetcher. Divide by `ParquetReadRowGroups` to get reads per row group; below 1 means a single read spans several row groups, which serializes their in-order delivery", ValueType::Number) \
+    M(ParquetReadTaskBytes, "The total number of bytes covered by the read tasks counted in `ParquetReadTasks`, including bytes read incidentally to close short gaps between requested ranges", ValueType::Bytes) \
+    M(ParquetPrefetchStarvation, "The number of times a decoding thread asked for a range whose read had not finished yet, and had to run it inline or wait for it. High values relative to `ParquetReadTasks` mean read-ahead is too shallow", ValueType::Number) \
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadSeekAndRead, "The total number of reads with ReadMode::SeekAndRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadEntireFile, "The total number of read with ReadMode::EntireFileIsInMemory by DB::Parquet::Prefetcher", ValueType::Number) \

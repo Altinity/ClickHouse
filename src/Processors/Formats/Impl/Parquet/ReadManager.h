@@ -33,6 +33,11 @@ class ReadManager
 public:
     Reader reader;
 
+    /// Whether this reader is one of the files currently allowed to prefetch ahead
+    /// (input_format_parquet_max_active_files). Without a slot the reader still reads the row group
+    /// it must deliver next, so progress never depends on getting one.
+    std::atomic<bool> holds_prefetch_slot {false};
+
     /// To initialize ReadManager:
     ///  1. call manager.reader.prefetcher.init
     ///  2. call manager.reader.init
