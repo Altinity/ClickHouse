@@ -146,7 +146,7 @@ git commit -s -m "Parquet: derive the IO pool size from the query and make the r
 
 **Interfaces:**
 - Produces: `Prefetcher::readSync(char * to, size_t n, size_t offset, const std::function<void(size_t)> & on_progress)`; `Task::bytes_ready`; `Task::min_waiting_threshold`; `Prefetcher::waitForBytes(Task *, size_t need)`.
-- Consumes: `ReadBuffer::readBigAt(char *, size_t, size_t, const std::function<bool(size_t)> &)` — the callback receives *cumulative* bytes copied for this call (see `copyFromIStreamWithProgressCallback`).
+- Consumes: `ReadBuffer::readBigAt(char *, size_t, size_t, const std::function<bool(size_t)> &)` — the callback receives *cumulative* bytes copied for this call and its return value means **stop when `true`** (`copyFromIStreamWithProgressCallback` sets `is_cancelled` and returns early; `ParallelReadBuffer` uses it to abort a read another worker finished). Our callback must return `false` to keep reading.
 
 - [ ] **Step 1: Add the profile event**
 
@@ -212,7 +212,7 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset, const std::functio
             /// calls it (local pread, Azure, HDFS don't), in which case readiness equals completion.
             std::function<bool(size_t)> progress;
             if (on_progress)
-                progress = [&](size_t copied) { on_progress(copied); return true; };
+                progress = [&](size_t copied) { on_progress(copied); return false; }; // false = keep reading
             nread = reader->readBigAt(to, n, offset, progress);
             ProfileEvents::increment(ProfileEvents::ParquetPrefetcherReadRandomRead);
             break;
