@@ -103,11 +103,21 @@ void Prefetcher::readSync(char * to, size_t n, size_t offset, const std::functio
     {
         case ReadMode::RandomRead:
         {
-            /// `readBigAt` reports cumulative bytes copied for this call; not every transport
-            /// calls it (local pread, Azure, HDFS don't), in which case readiness equals completion.
+            /// `readBigAt`'s progress callback reports bytes copied so far, but only within the
+            /// current attempt: `ReadBufferFromS3::readBigAt` restarts the count near zero on every
+            /// retry, so it isn't cumulative across the whole call. `publishBytesReady`'s guard
+            /// against non-increasing values absorbs that. Not every transport calls the callback at
+            /// all (local `pread`, Azure, HDFS don't), in which case readiness equals completion.
             std::function<bool(size_t)> progress;
             if (on_progress)
-                progress = [&](size_t copied) { on_progress(copied); return false; /* don't stop the read */ };
+            {
+                /// Returning `false` means "don't stop the read" (see `copyFromIStreamWithProgressCallback`).
+                progress = [&](size_t copied)
+                {
+                    on_progress(copied);
+                    return false;
+                };
+            }
             nread = reader->readBigAt(to, n, offset, progress);
             ProfileEvents::increment(ProfileEvents::ParquetPrefetcherReadRandomRead);
             break;
@@ -426,21 +436,34 @@ void Prefetcher::decreaseTaskRefcount(Task * task, size_t amount)
         task->cached_region.reset();
     }
 
-    /// This path only runs when no PrefetchHandle references the task any more, so nobody can be
-    /// waiting on it.
-    chassert(task->min_waiting_threshold.load() == std::numeric_limits<size_t>::max());
+    /// This path only runs when no `PrefetchHandle` references the task any more, so nobody can be
+    /// blocked in `waitForBytes` for it.
+    chassert(task->waiters.load() == 0);
 }
 
 void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
 {
+    /// Only ever called on the one thread executing `runTask` for this task (the `Scheduled` ->
+    /// `Running` CAS and the progress callback both run there), so this read-modify-write of
+    /// `bytes_ready` doesn't race with another writer.
+    ///
+    /// `bytes_ready` isn't necessarily increasing from call to call: the S3/HTTP progress callback
+    /// restarts near zero on every retry attempt inside `readBigAt` (see `readSync`). This guard
+    /// against non-increasing values is what makes that safe.
     size_t prev = task->bytes_ready.load(std::memory_order_relaxed);
     if (bytes_ready <= prev)
         return;
-    task->bytes_ready.store(bytes_ready, std::memory_order_release);
-    if (bytes_ready >= task->min_waiting_threshold.load(std::memory_order_acquire))
+    /// The store here and the `waiters` load below must not be reordered with each other (nor with
+    /// the paired increment-then-load in `waitForBytes`), or a waiter could go to sleep just after
+    /// we've already published enough bytes and just before it increments `waiters`, and never get
+    /// woken by this call. Plain acquire/release on two different locations isn't enough to prevent
+    /// that (a `store-release` here and a `load-acquire` there can still each be reordered ahead of
+    /// an unrelated atomic on the same thread); `seq_cst` on both sides is. Worst case if we get it
+    /// wrong is a missed wakeup, not corruption: the waiter still wakes up (late) from the
+    /// unconditional `notify_all` when the task leaves `Running` in `runTask`.
+    task->bytes_ready.store(bytes_ready, std::memory_order_seq_cst);
+    if (task->waiters.load(std::memory_order_seq_cst) != 0)
     {
-        /// Waiters re-register their threshold if they are still unsatisfied after waking.
-        task->min_waiting_threshold.store(std::numeric_limits<size_t>::max(), std::memory_order_release);
         std::lock_guard lock(ready_mutex);
         ready_cv.notify_all();
     }
@@ -449,38 +472,21 @@ void Prefetcher::publishBytesReady(Task * task, size_t bytes_ready)
 Prefetcher::Task::State Prefetcher::waitForBytes(Task * task, size_t need)
 {
     std::unique_lock lock(ready_mutex);
-    /// Clears our own registered threshold, if it's still ours to clear (nobody else has since
-    /// overwritten it with a smaller one). A task that already left Running will never call
-    /// publishBytesReady again, so nobody else would clear it, and decreaseTaskRefcount asserts the
-    /// threshold is back to "nobody waiting" once nothing references the task any more.
-    auto clear_own_threshold = [&]
-    {
-        size_t expected = need;
-        task->min_waiting_threshold.compare_exchange_strong(expected, std::numeric_limits<size_t>::max(), std::memory_order_acq_rel);
-    };
+    /// See the seq_cst comment in `publishBytesReady`: the increment here and the `bytes_ready` load
+    /// below must not be reordered with each other, or with the store-then-load pair there.
+    task->waiters.fetch_add(1, std::memory_order_seq_cst);
+    Task::State s;
     while (true)
     {
-        Task::State s = task->state.load(std::memory_order_acquire);
+        s = task->state.load(std::memory_order_acquire);
         if (s != Task::State::Running)
-        {
-            clear_own_threshold();
-            return s;
-        }
-        if (task->bytes_ready.load(std::memory_order_acquire) >= need)
-        {
-            clear_own_threshold();
-            return s;
-        }
-        /// Register the threshold, then re-check: the producer reads the threshold after storing
-        /// bytes_ready, we store the threshold before re-reading bytes_ready, so one of us sees the other.
-        size_t cur = task->min_waiting_threshold.load(std::memory_order_relaxed);
-        while (cur > need && !task->min_waiting_threshold.compare_exchange_weak(cur, need, std::memory_order_acq_rel))
-        {
-        }
-        if (task->bytes_ready.load(std::memory_order_acquire) >= need || task->state.load(std::memory_order_acquire) != Task::State::Running)
-            continue;
+            break;
+        if (task->bytes_ready.load(std::memory_order_seq_cst) >= need)
+            break;
         ready_cv.wait(lock);
     }
+    task->waiters.fetch_sub(1, std::memory_order_seq_cst);
+    return s;
 }
 
 void Prefetcher::scheduleTask(Task * task)
@@ -587,7 +593,16 @@ Prefetcher::Task::State Prefetcher::runTask(Task * task)
                 }
             }
 
-            publishBytesReady(task, task->length);
+            /// Only publish for the buffered (multi-cell) case: `task->buf` holds real data there, so a
+            /// waiter reading `task->buf.data() + task_offset` right after seeing `bytes_ready` is
+            /// safe. For the single-cell zero-copy case `task->buf` is never filled (`cached_region`
+            /// is used instead), and `getRangeData` only reads from `cached_region` once `state` is
+            /// `Done` -- so publishing readiness here, before the state CAS below, would let a waiter
+            /// observe `Running` with enough `bytes_ready` and fall through to the (empty) `buf`
+            /// return. The unconditional `notify_all` after the state CAS still wakes waiters on the
+            /// zero-copy path once the task is actually `Done`.
+            if (!task->cached_region.has_value())
+                publishBytesReady(task, task->length);
             ProfileEvents::increment(ProfileEvents::ParquetPrefetcherReadRandomRead);
         }
         else

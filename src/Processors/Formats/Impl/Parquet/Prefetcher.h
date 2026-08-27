@@ -5,7 +5,6 @@
 
 #include <condition_variable>
 #include <functional>
-#include <limits>
 #include <optional>
 #include <span>
 
@@ -154,11 +153,14 @@ private:
         CompletionNotification completion;
         /// Bytes of `buf` (or `cached_region`) that have landed, counted from `offset`. Monotonic.
         /// Ranges inside a task are sorted by offset and object storage streams a range request in
-        /// order, so a request whose end is <= bytes_ready can be served before the task finishes.
+        /// order, so a request whose end is <= `bytes_ready` can be served before the task finishes.
+        /// Only ever written by the one thread executing `runTask` for this task (see
+        /// `publishBytesReady`), so the read-modify-write there isn't itself racing with another writer.
         std::atomic<size_t> bytes_ready {0};
-        /// Lowest `bytes_ready` value some waiter is blocked on; SIZE_MAX if nobody waits.
-        /// The producer notifies `ready_cv` only when `bytes_ready` reaches it.
-        std::atomic<size_t> min_waiting_threshold {std::numeric_limits<size_t>::max()};
+        /// Number of threads currently blocked in `waitForBytes` for this task. `publishBytesReady`
+        /// only bothers taking `ready_mutex` and notifying `ready_cv` when this is nonzero; each
+        /// waiter still re-checks its own `need` against `bytes_ready` after waking (see `waitForBytes`).
+        std::atomic<size_t> waiters {0};
         std::exception_ptr exception;
     };
 
@@ -204,7 +206,7 @@ private:
     /// (One mutex for all tasks because it's not used frequently.)
     std::mutex exception_mutex;
 
-    /// For partial-readiness waits (see Task::bytes_ready). One pair for all tasks: waits are rare
+    /// For partial-readiness waits (see `Task::bytes_ready`). One pair for all tasks: waits are rare
     /// (decode outran the read) and short.
     std::mutex ready_mutex;
     std::condition_variable ready_cv;
