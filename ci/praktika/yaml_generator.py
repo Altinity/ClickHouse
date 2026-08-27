@@ -248,6 +248,7 @@ jobs:
             ci/tmp/gtest.json
             ci/tmp/logs.tar.gz
             ci/tmp/configs.tar.gz
+            ci/tmp/output_dir/**
           if-no-files-found: ignore
           retention-days: 14
 """
