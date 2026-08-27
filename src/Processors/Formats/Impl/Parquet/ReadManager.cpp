@@ -330,9 +330,8 @@ void ReadManager::addTasksToReadColumns(size_t row_group_idx, size_t row_subgrou
                     LOG_TEST(getLogger("ParquetReadManager"), "addTasksToReadColumns: not added due locations empty i={} step_idx={} row_group_idx={} row_subgroup_idx={}", i, step_idx, row_group_idx, row_subgroup_idx);
                 }
             }
-            else
+            else if (stage == ReadStage::ColumnData)
             {
-                /// `stage` is ColumnDataPrefetch (issue reads) or ColumnData (decode).
                 LOG_TEST(getLogger("ParquetReadManager"), "addTasksToReadColumns: added {}: i={} step_idx={} row_group_idx={} row_subgroup_idx={}", magic_enum::enum_name(stage), i, step_idx, row_group_idx, row_subgroup_idx);
                 add_tasks.push_back(Task {
                     .stage = stage,
@@ -341,6 +340,20 @@ void ReadManager::addTasksToReadColumns(size_t row_group_idx, size_t row_subgrou
                     .row_subgroup_idx = row_subgroup_idx,
                     .column_idx = i});
             }
+        }
+
+        if (stage == ReadStage::ColumnDataPrefetch)
+        {
+            /// Issuing this subgroup's reads is one unit of work for the whole subgroup, not one per
+            /// column: it runs on the scheduling thread (see scheduleTask) and its runTask is empty,
+            /// so a task per column only bought a thread-pool round trip each and a wider barrier.
+            chassert(add_tasks.empty());
+            add_tasks.push_back(Task {
+                .stage = stage,
+                .step_idx = step_idx,
+                .row_group_idx = row_group_idx,
+                .row_subgroup_idx = row_subgroup_idx,
+                .column_idx = UINT64_MAX});
         }
 
         if (add_tasks.empty() && is_offset_index)
@@ -369,6 +382,32 @@ void ReadManager::addTasksToReadColumns(size_t row_group_idx, size_t row_subgrou
 
         break;
     }
+}
+
+void ReadManager::startSubgroupReadAhead(size_t row_group_idx, size_t current_subgroup_idx, MemoryUsageDiff & diff)
+{
+    if (reader.options.format.parquet.read_ahead_subgroups == 0)
+        return;
+
+    RowGroup & row_group = reader.row_groups[row_group_idx];
+    size_t next_idx = current_subgroup_idx + 1;
+    if (next_idx >= row_group.subgroups.size())
+        return;
+
+    RowSubgroup & next_subgroup = row_group.subgroups[next_idx];
+    /// Leave filtered-out subgroups to the normal path: it also deallocates them, and
+    /// determinePagesToPrefetch requires rows_pass > 0.
+    if (next_subgroup.filter.rows_pass == 0)
+        return;
+
+    /// Only claim a subgroup nobody has started. Losing this race is fine - it means the normal path
+    /// got there first.
+    ReadStage expected = ReadStage::NotStarted;
+    if (!next_subgroup.stage.compare_exchange_strong(expected, ReadStage::OffsetIndex))
+        return;
+
+    size_t first_step = reader.steps.empty() ? 0 : 1;
+    addTasksToReadColumns(row_group_idx, next_idx, ReadStage::OffsetIndex, first_step, diff);
 }
 
 void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgroup_idx, ReadStage stage, size_t step_idx, MemoryUsageDiff & diff)
@@ -466,6 +505,9 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
         {
             /// Data-page reads issued (in flight in the Prefetcher's io pool); now decode.
             addTasksToReadColumns(row_group_idx, row_subgroup_idx, ReadStage::ColumnData, step_idx, diff);
+            /// Get the next subgroup's reads moving while this one decodes, so the storage's response
+            /// time overlaps decoding instead of being paid again after it.
+            startSubgroupReadAhead(row_group_idx, row_subgroup_idx, diff);
             return;
         }
         case ReadStage::Deallocated:
@@ -483,7 +525,10 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
     while (main_ptr < row_group.subgroups.size())
     {
         RowSubgroup & next_subgroup = row_group.subgroups[main_ptr];
-        ReadStage next_subgroup_stage = next_subgroup.stage.load();
+        /// Only a subgroup nobody has started may be admitted. The CAS below takes its expected value
+        /// from the load, so it succeeds whatever the current stage is - without this check a subgroup
+        /// already admitted by read-ahead would be admitted a second time.
+        ReadStage next_subgroup_stage = ReadStage::NotStarted;
         if (!next_subgroup.stage.compare_exchange_strong(
                 next_subgroup_stage, ReadStage::OffsetIndex))
             break;
@@ -750,7 +795,35 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
     std::vector<PrefetchHandle *> prefetches;
     RowGroup & row_group = reader.row_groups[task.row_group_idx];
     ssize_t memory_before = diff.by_stage[size_t(diff.cur_stage)];
-    if (task.column_idx != UINT64_MAX)
+
+    if (task.stage == ReadStage::ColumnDataPrefetch)
+    {
+        /// Queue every column's data-page reads for this subgroup. Charged to the ColumnDataPrefetch
+        /// budget, which is separate from the decode budget and bounds how far read-ahead may run.
+        RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
+        if (row_subgroup.filter.rows_pass > 0)
+        {
+            for (size_t i = 0; i < reader.primitive_columns.size(); ++i)
+            {
+                if (reader.primitive_columns[i].first_step_to_calculate != task.step_idx)
+                    continue;
+                ColumnChunk & column = row_group.columns.at(i);
+                reader.determinePagesToPrefetch(column, row_subgroup, row_group, prefetches);
+
+                /// Side note: would be nice to avoid reading the dictionary if all dictionary-encoded
+                /// pages were filtered out (e.g. if it's a 100 MB column chunk with unique long strings,
+                /// typically only the first ~1 MB would be dictionary-encoded; if we only need a few
+                /// rows, we likely won't hit that 1 MB). But AFAICT parquet metadata doesn't have
+                /// enough information for that (there's no page encoding in offset/column indexes).
+                if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
+                    prefetches.push_back(&column.dictionary_page_prefetch);
+
+                if (column.data_pages.empty())
+                    prefetches.push_back(&column.data_pages_prefetch);
+            }
+        }
+    }
+    else if (task.column_idx != UINT64_MAX)
     {
         ColumnChunk & column = row_group.columns.at(task.column_idx);
         switch (task.stage)
@@ -773,32 +846,6 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
             case ReadStage::OffsetIndex:
                 prefetches.push_back(&column.offset_index_prefetch);
                 break;
-            case ReadStage::ColumnDataPrefetch:
-            {
-                RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
-                if (row_subgroup.filter.rows_pass == 0)
-                    break;
-                /// Queue this subgroup's data-page reads; startPrefetch (below) issues them and charges
-                /// compressed bytes to the ColumnDataPrefetch budget, separate from the decode budget,
-                /// so many row groups prefetch ahead while only a few decode at once.
-                reader.determinePagesToPrefetch(column, row_subgroup, row_group, prefetches);
-
-                /// Side note: would be nice to avoid reading the dictionary if all dictionary-encoded
-                /// pages were filtered out (e.g. if it's a 100 MB column chunk with unique long strings,
-                /// typically only the first ~1 MB would be dictionary-encoded; if we only need a few
-                /// rows, we likely won't hit that 1 MB). But AFAICT parquet metadata doesn't have
-                /// enough information for that (there's no page encoding in offset/column indexes).
-                if (!column.dictionary.isInitialized() && column.dictionary_page_prefetch)
-                {
-                    prefetches.push_back(&column.dictionary_page_prefetch);
-                }
-
-                if (column.data_pages.empty())
-                {
-                    prefetches.push_back(&column.data_pages_prefetch);
-                }
-                break;
-            }
             case ReadStage::ColumnData:
             {
                 RowSubgroup & row_subgroup = row_group.subgroups.at(task.row_subgroup_idx);
@@ -812,6 +859,7 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
                 subchunk.column_and_offsets_memory = MemoryUsageToken(column_memory, &diff);
                 break;
             }
+            case ReadStage::ColumnDataPrefetch: // handled above, for the whole subgroup at once
             case ReadStage::NotStarted:
             case ReadStage::Deliver:
             case ReadStage::Deallocated:
@@ -831,9 +879,8 @@ void ReadManager::scheduleTask(Task task, bool is_first_in_group, MemoryUsageDif
     reader.prefetcher.startPrefetch(prefetches, &diff);
 
     /// Group tiny tasks to reduce scheduling overhead, using predicted memory as a proxy for run time.
-    /// Exception: ColumnDataPrefetch does its work (startPrefetch) here and has an empty runTask, so
-    /// its run time is ~0 no matter how many compressed bytes it charges; report cost 0 so these tasks
-    /// collapse into one batch instead of being split across many no-op thread-pool dispatches.
+    /// ColumnDataPrefetch is the exception: its work happened above and its runTask is empty, so the
+    /// compressed bytes it charges say nothing about how long it takes to run.
     ssize_t memory_after = diff.by_stage[size_t(diff.cur_stage)];
     task.cost_estimate_bytes = task.stage == ReadStage::ColumnDataPrefetch
         ? 0

@@ -271,6 +271,15 @@ limit, which is the previous behaviour.
 All files share one IO pool, so with many files each gets too few reads in flight and none finish
 early. Files that do not hold a slot still read the row group they must deliver next.
 )", 0) \
+    DECLARE(UInt64, input_format_parquet_read_ahead_subgroups, 0, R"(
+How many row subgroups ahead the Parquet reader may issue reads for. `0` keeps the previous behaviour,
+where a subgroup's reads are issued only after its predecessor has been decoded and delivered, so the
+reader waits out the storage's response time on every subgroup. `1` issues the next subgroup's reads
+while the current one decodes. Values above `1` are not supported yet and are treated as `1`.
+
+Read-ahead is opportunistic: it is skipped when the compressed read-ahead budget
+(`input_format_parquet_prefetch_memory_fraction`) is already used up.
+)", 0) \
     DECLARE(UInt64, input_format_parquet_bytes_per_read_task, 0, R"(
 Target size of a single read issued by the Parquet reader; nearby column chunks are coalesced up to
 this size. `0` derives it from the min-bytes-for-seek of the underlying storage.

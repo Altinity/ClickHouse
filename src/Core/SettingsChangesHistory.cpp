@@ -46,6 +46,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_constant_column_sparse_ratio", 1.0, 0.9375, "New setting: a Parquet column chunk holding a single value plus nulls is materialized as a sparse column when the fraction of nulls is at least this ratio (reader v3)."},
             {"input_format_parquet_max_io_threads", 0, 0, "New setting: size of the thread pool that issues reads for the Parquet reader. 0 derives it from `max_download_threads` and `max_parsing_threads`; the derived value is larger than the previous hard-coded `max_download_threads`, which defaults to 4 and was chosen for the URL engine."},
             {"input_format_parquet_bytes_per_read_task", 0, 0, "New setting: target size of a single read issued by the Parquet reader. 0 derives it from the min-bytes-for-seek of the underlying storage."},
+            {"input_format_parquet_read_ahead_subgroups", 0, 0, "New setting: how many row subgroups ahead the Parquet reader may issue reads for. 0 keeps the previous behavior of issuing a subgroup's reads only after its predecessor was decoded and delivered."},
             {"input_format_parquet_max_active_files", 0, 0, "New setting: how many Parquet files may read ahead at the same time when a query reads many of them. 0 means no limit, which is the previous behavior."},
         });
 
