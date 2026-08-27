@@ -92,6 +92,10 @@ enum class ReadStage
     /// row groups prefetch ahead while only a few decode at once. Decouples fetch from decode depth.
     ColumnDataPrefetch,
     ColumnData,
+    /// Accounting only, never has tasks: compressed data pages issued ahead for later row subgroups
+    /// of a row group (see input_format_parquet_read_ahead_subgroups). Gets its own memory budget so
+    /// read-ahead cannot eat the ColumnDataPrefetch share that keeps other row groups moving.
+    ColumnDataReadAhead,
 
     Deliver,
 

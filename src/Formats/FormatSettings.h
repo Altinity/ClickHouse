@@ -369,6 +369,8 @@ struct FormatSettings
         size_t max_active_files = 0;
         /// 0 = issue a subgroup's reads only after its predecessor finished.
         size_t read_ahead_subgroups = 0;
+        /// Share of the prefetch memory budget reserved for read-ahead within a row group.
+        double read_ahead_memory_fraction = 0.25;
         size_t memory_low_watermark = 2ul << 20;
         size_t memory_high_watermark = 4ul << 30;
         /// Reader scheduler knobs: share of the column-data memory budget given to compressed

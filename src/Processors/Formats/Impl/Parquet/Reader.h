@@ -464,6 +464,11 @@ struct Reader
 
         std::atomic<ReadStage> stage {ReadStage::NotStarted};
         std::atomic<size_t> stage_tasks_remaining {0};
+
+        /// Set when the previous subgroup's ColumnDataPrefetch task also issued this subgroup's
+        /// first-step data-page reads (read-ahead), so this subgroup skips its own ColumnDataPrefetch
+        /// stage. Written before this subgroup is admitted (its `stage` CAS orders the read).
+        bool reads_issued_ahead = false;
     };
 
     struct RowGroup

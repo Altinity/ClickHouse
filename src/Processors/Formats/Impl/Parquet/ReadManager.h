@@ -36,10 +36,8 @@ public:
     /// See input_format_parquet_max_active_files. Progress never depends on holding a slot.
     std::atomic<bool> holds_prefetch_slot {false};
 
-    /// Admits the subgroup after `current_subgroup_idx` so its reads are issued while its predecessor
-    /// decodes. Opportunistic: does nothing when read-ahead is off, the subgroup is filtered out, or
-    /// another thread already started it. See input_format_parquet_read_ahead_subgroups.
-    void startSubgroupReadAhead(size_t row_group_idx, size_t current_subgroup_idx, MemoryUsageDiff & diff);
+    /// Index of the first PREWHERE step (1), or 0 when there are no steps.
+    size_t firstStep() const;
 
     /// To initialize ReadManager:
     ///  1. call manager.reader.prefetcher.init

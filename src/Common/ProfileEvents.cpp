@@ -1482,6 +1482,7 @@ The server successfully detected this situation and will download merged part fr
     M(ParquetDecodingTaskBatches, "Task groups sent to a thread pool by parquet reader", ValueType::Number) \
     M(ParquetReadTasks, "Coalesced read tasks created by the Parquet reader. Divided by `ParquetReadRowGroups`, values below 1 mean one read spans several row groups, which serializes their delivery", ValueType::Number) \
     M(ParquetReadTaskBytes, "Bytes covered by `ParquetReadTasks`, including bytes read to close short gaps between requested ranges", ValueType::Bytes) \
+    M(ParquetReadAheadSubgroups, "Row subgroups whose data-page reads the Parquet reader issued ahead, while the previous subgroup of the row group was still decoding (see `input_format_parquet_read_ahead_subgroups`)", ValueType::Number) \
     M(ParquetPrefetchStarvation, "Times a decoding thread asked for a range whose read had not finished. High relative to `ParquetReadTasks` means read-ahead is too shallow", ValueType::Number) \
     M(ParquetPrefetcherReadRandomRead, "The total number of reads with ReadMode::RandomRead by DB::Parquet::Prefetcher", ValueType::Number) \
     M(ParquetPrefetcherReadSeekAndRead, "The total number of reads with ReadMode::SeekAndRead by DB::Parquet::Prefetcher", ValueType::Number) \
